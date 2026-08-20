@@ -7,7 +7,7 @@
 即本设施的应用特例。
 """
 
-from gh_puller.benchmark.types import Answer
+from gh_puller.types import Answer
 
 
 class SequenceJudge:

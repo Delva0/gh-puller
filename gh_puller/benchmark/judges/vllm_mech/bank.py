@@ -23,7 +23,7 @@ from gh_puller.benchmark.judges.vllm_mech.utils import (
     auto_user_prompt,
     coerce_verdict,
 )
-from gh_puller.benchmark.types import Answer
+from gh_puller.types import Answer
 
 
 class VllmMechEvalMixin:
