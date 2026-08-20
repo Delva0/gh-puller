@@ -2,8 +2,9 @@
 
 评测器是底层静态工具:只有 evaluate 接口,无生命周期,被题库(上层)随意调用。
 入参/输出约定由各实现自定(question/ref/answer 均为 Any),统一见各实现 docstring:
-- LLM/Claude(自动评测):入参三字符串,输出 {"dimensions": {...}, "overall": 0-10, "reason": str},
-  维度与 prompt 组装见 utils.py;任一失败不得抛出,降级输出。
+- LLM/Claude(自动评测):半抽象基类,evaluate 机制由基类提供,评测内容
+  (请求体/agent 配置组装、判定解析、工具授权)由题库子类挂接,
+  配置示例见 judges/vllm_mech/utils.py;任一失败不得抛出,降级输出。
 - Human:入参三字符串,输出评审表单数据(结构由 judge_schema 定义)。
 """
 

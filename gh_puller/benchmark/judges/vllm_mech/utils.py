@@ -1,4 +1,8 @@
-"""自动评测共享部件:评分维度、prompt 组装、判定规范化(LLM/Claude 评测器共用)。"""
+"""vllm_mech 题库的自动评测配置:评分维度、提示词组装、判定解析、Claude 工具授权。
+
+LLM/Claude 评测器为半抽象基础设施,evaluate 机制由基类提供,评测内容
+(本文件)由题库提供并挂接为子类扩展点;扩展点即本题库的专属评判规则。
+"""
 
 # 自动评测共用的评分维度(每维 0-10)
 DIMENSIONS = {
@@ -10,6 +14,10 @@ DIMENSIONS = {
     "logic_depth": "补充问题背后的逻辑",
     "latent_need": "解决提问者潜在需求",
 }
+
+# Claude 评测器工具授权配置:本题库纯评分,不授任何工具;需要时在此扩展
+MCP_SERVERS: dict = {}
+SKILLS: list = []
 
 
 def auto_system_prompt() -> str:
