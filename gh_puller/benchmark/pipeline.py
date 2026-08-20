@@ -19,12 +19,12 @@ import httpx
 import jsonschema
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
+from gh_puller.benchmark.env import TIMEOUT  # 单题超时（秒，1 小时），全局统一入口
 from gh_puller.benchmark.types import Answer
 
 # ---------- 协议（改协议只改这一节） ----------
 ASK_PATH = "/ask"  # 唯一被测试的路由
 OPENAPI_PATH = "/openapi.json"  # 路由声明的读取入口
-TIMEOUT = 3600.0  # 单题超时（秒）
 RETRY_ATTEMPTS = 3  # 连接类错误的重试次数
 RESPONSE_SCHEMA = {
     "type": "object",

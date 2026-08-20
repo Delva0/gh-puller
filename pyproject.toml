@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "aiosqlite>=0.20",
+    "claude-agent-sdk>=0.2.142",
     "dash>=4.4.0",
     "dash-cytoscape>=1.0.2",
     "fastapi>=0.139.0",

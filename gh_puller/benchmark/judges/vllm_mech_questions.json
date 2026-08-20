@@ -1,0 +1,93 @@
+[
+  {
+    "id": "m01",
+    "question": "PagedAttention 解决了什么问题?其核心思想是什么?",
+    "ref_answer": [
+      "KV cache 按固定大小的块(block)分页管理,而非整段连续分配",
+      "解决显存内部碎片化与过度预留问题,提高 KV cache 显存利用率",
+      "通过 block table 维护逻辑块到物理块的映射",
+      "支持块级共享,多输出序列可共享相同前缀块"
+    ]
+  },
+  {
+    "id": "m02",
+    "question": "vLLM 的 continuous batching 相比静态 batching 有什么优势?",
+    "ref_answer": [
+      "请求完成即释放其调度槽位,新请求可立即进入 batch",
+      "无需等待整个 batch 全部结束,避免短请求被长请求拖慢",
+      "提高 GPU 利用率与整体吞吐量"
+    ]
+  },
+  {
+    "id": "m03",
+    "question": "vLLM 的 prefix caching(自动前缀缓存)的原理是什么?什么场景下收益明显?",
+    "ref_answer": [
+      "对相同 token 前缀的 KV cache 进行缓存与复用,命中时跳过重复 prefill",
+      "以 hash 匹配前缀(prefix hash),按块缓存",
+      "多轮对话、few-shot 提示词、共享系统提示词的场景收益明显"
+    ]
+  },
+  {
+    "id": "m04",
+    "question": "speculative decoding 的基本原理是什么?加速取决于什么?",
+    "ref_answer": [
+      "草稿模型(draft model)快速生成多个候选 token",
+      "大模型并行验证候选,只对未被接受的 token 重新计算",
+      "加速比取决于接受率(accept rate),接受率越高加速越明显"
+    ]
+  },
+  {
+    "id": "m05",
+    "question": "KV cache 在 LLM 推理中的作用是什么?vLLM 如何管理它的显存?",
+    "ref_answer": [
+      "缓存已生成 token 的 K/V 张量,避免每步重复计算历史部分",
+      "vLLM 通过 PagedAttention 分页管理 KV cache 显存",
+      "max_model_len 与 KV cache 显存预算共同决定可容纳的并发请求数"
+    ]
+  },
+  {
+    "id": "m06",
+    "question": "chunked prefill 解决什么问题?",
+    "ref_answer": [
+      "将长 prompt 的 prefill 拆分为小块(chunk)",
+      "与 decode 请求交错调度,避免长 prefill 独占 GPU 导致 decode 停滞",
+      "提高长 prompt 场景下的 GPU 利用率与整体吞吐"
+    ]
+  },
+  {
+    "id": "m07",
+    "question": "vLLM 高吞吐的核心来源是什么?",
+    "ref_answer": [
+      "请求级调度(request-level scheduling)与动态批处理(continuous batching)",
+      "PagedAttention 提高 KV cache 显存利用率,支撑更大并发",
+      "减少重复计算与空闲等待,充分利用 GPU 算力"
+    ]
+  },
+  {
+    "id": "m08",
+    "question": "为什么多轮对话场景下 prefix caching 特别有效?",
+    "ref_answer": [
+      "历史对话内容构成稳定重复的前缀,缓存命中率高",
+      "命中后无需对整段历史重新 prefill,显著降低首个 token 延迟",
+      "前缀随轮次累积,缓存收益持续累加"
+    ]
+  },
+  {
+    "id": "m09",
+    "question": "max-model-len 与 KV cache 显存预算之间是什么关系?",
+    "ref_answer": [
+      "vLLM 按请求可能达到的最大长度规划/预留 KV cache 空间",
+      "max-model-len 越大,显存预算内可容纳的并发请求数越少",
+      "两者共同决定显存占用,超限时触发显存不足或请求排队/抢占"
+    ]
+  },
+  {
+    "id": "m10",
+    "question": "vLLM 显存不足时如何处理(抢占机制)?",
+    "ref_answer": [
+      "调度器对未完成请求执行抢占(preemption),为其他请求腾出空间",
+      "被抢占请求的 KV cache 可交换到 CPU(swap)或丢弃后重新计算(recompute)",
+      "按调度策略选择被抢占对象,优先处理最早进入的请求"
+    ]
+  }
+]
