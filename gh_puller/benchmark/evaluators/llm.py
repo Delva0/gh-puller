@@ -7,11 +7,10 @@ LLM_JUDGE_URL / LLM_JUDGE_MODEL 覆盖,或由题库构造时传参。
 """
 
 import json
-import os
 
 import httpx
 
-from gh_puller.benchmark.env import TIMEOUT as GLOBAL_TIMEOUT  # 单题评分超时上限(1 小时)
+from gh_puller.benchmark.env import LLM_JUDGE_MODEL, LLM_JUDGE_URL, TIMEOUT as GLOBAL_TIMEOUT  # 单题评分超时上限(1 小时)
 
 # 单题评分超时:connect 短(端点不可达时快速降级),read 取全局单题超时上限
 TIMEOUT = httpx.Timeout(connect=5.0, read=GLOBAL_TIMEOUT, write=30.0, pool=5.0)
@@ -26,8 +25,8 @@ class LLMEvaluator:
     retry_nudge: str = "只输出 JSON,不要任何其他内容。"
 
     def __init__(self, url: str = "", model: str = ""):
-        self.url = url or os.environ.get("LLM_JUDGE_URL", "http://localhost:8000/v1")
-        self.model = model or os.environ.get("LLM_JUDGE_MODEL", "Qwen2.5-7B-Instruct")
+        self.url = url or LLM_JUDGE_URL
+        self.model = model or LLM_JUDGE_MODEL
 
     def make_payload(self, question: str, ref: str, answer: str) -> dict:
         """chat/completions 请求体组装(OpenAI 兼容契约:须含可追加的 messages 键);题库子类必须提供。"""

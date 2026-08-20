@@ -7,9 +7,10 @@ auto_* 提示词与 MCP_SERVERS/SKILLS。模型可用环境变量 CLAUDE_JUDGE_M
 """
 
 import json
-import os
 
 from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient, ResultMessage
+
+from gh_puller.benchmark.env import CLAUDE_JUDGE_MODEL
 
 
 class ClaudeEvaluator:
@@ -18,7 +19,7 @@ class ClaudeEvaluator:
     name = "claude"
 
     def __init__(self, model: str = ""):
-        self.model = model or os.environ.get("CLAUDE_JUDGE_MODEL", "")
+        self.model = model or CLAUDE_JUDGE_MODEL
 
     def make_options(self, question: str, ref: str, answer: str) -> ClaudeAgentOptions:
         """agent 配置组装(system_prompt/工具授权/模型等);题库子类必须提供。"""

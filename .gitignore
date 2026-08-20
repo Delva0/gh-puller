@@ -13,6 +13,6 @@ wheels/
 .env
 
 # Runtime artifacts
-playground
+playground/
 logs/
 archive/

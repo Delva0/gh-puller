@@ -8,11 +8,11 @@ judge 用自动评测器(LLM/Claude)按多维标准评分;也可注入 HumanEval
 """
 
 import json
-import os
 from pathlib import Path
 
 from claude_agent_sdk import ClaudeAgentOptions
 
+from gh_puller.benchmark.env import JUDGE_EVALUATOR
 from gh_puller.benchmark.evaluators import ClaudeEvaluator, LLMEvaluator
 from gh_puller.benchmark.judges.sequence import SequenceJudge
 from gh_puller.benchmark.judges.vllm_mech.utils import (
@@ -71,8 +71,8 @@ class VllmMechJudge(SequenceJudge):
     judge_name = "vllm-mech-v0.1"
 
     def __init__(self):
-        # 评测器选择:环境变量 JUDGE_EVALUATOR=claude 切到 Claude Code 评测器;默认 LLM 评测器
-        self.evaluator = VllmMechClaudeEvaluator() if os.environ.get("JUDGE_EVALUATOR") == "claude" else VllmMechLLMEvaluator()
+        # 评测器选择:JUDGE_EVALUATOR=claude 切到 Claude Code 评测器;默认 LLM 评测器
+        self.evaluator = VllmMechClaudeEvaluator() if JUDGE_EVALUATOR == "claude" else VllmMechLLMEvaluator()
 
     def load_questions(self) -> list:
         return json.loads((Path(__file__).parent / "questions.json").read_text())
