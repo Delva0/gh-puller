@@ -10,7 +10,7 @@ import json
 
 import httpx
 
-from gh_puller.benchmark.env import LLM_JUDGE_MODEL, LLM_JUDGE_URL, TIMEOUT as GLOBAL_TIMEOUT  # 单题评分超时上限(1 小时)
+from gh_puller.benchmark.env import LLM_JUDGE_API_KEY, LLM_JUDGE_MODEL, LLM_JUDGE_URL, TIMEOUT as GLOBAL_TIMEOUT  # 单题评分超时上限(1 小时)
 
 # 单题评分超时:connect 短(端点不可达时快速降级),read 取全局单题超时上限
 TIMEOUT = httpx.Timeout(connect=5.0, read=GLOBAL_TIMEOUT, write=30.0, pool=5.0)
@@ -38,13 +38,14 @@ class LLMEvaluator:
 
     async def evaluate(self, question: str, ref: str, answer: str) -> dict:
         payload = self.make_payload(question, ref, answer)
+        headers = {"Authorization": f"Bearer {LLM_JUDGE_API_KEY}"} if LLM_JUDGE_API_KEY else None
         async with httpx.AsyncClient(timeout=TIMEOUT) as client:
             last_err: Exception | None = None
             for nudge in (False, True):  # 解析失败重试 1 次(第二次追加"只输出 JSON"提示)
                 if nudge:
                     payload["messages"].append({"role": "user", "content": self.retry_nudge})
                 try:
-                    r = await client.post(f"{self.url}/chat/completions", json=payload)
+                    r = await client.post(f"{self.url}/chat/completions", json=payload, headers=headers)
                     r.raise_for_status()
                     content = r.json()["choices"][0]["message"]["content"]
                     return self.coerce(json.loads(content))

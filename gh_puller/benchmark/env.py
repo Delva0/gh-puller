@@ -10,6 +10,7 @@ JUDGE_EVALUATOR = os.environ.get("JUDGE_EVALUATOR", "llm")
 # LLM 评测器:vLLM OpenAI 兼容端点与评分模型(可被构造参数覆盖)
 LLM_JUDGE_URL = os.environ.get("LLM_JUDGE_URL", "http://localhost:8000/v1")
 LLM_JUDGE_MODEL = os.environ.get("LLM_JUDGE_MODEL", "Qwen2.5-7B-Instruct")
+LLM_JUDGE_API_KEY = os.environ.get("LLM_JUDGE_API_KEY", "")  # 端点认证密钥,留空不发 Authorization
 
 # Claude 评测器:评分模型(缺省用 SDK 默认模型),需要 ANTHROPIC_API_KEY
 CLAUDE_JUDGE_MODEL = os.environ.get("CLAUDE_JUDGE_MODEL", "")

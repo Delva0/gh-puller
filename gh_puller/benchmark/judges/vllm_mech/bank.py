@@ -14,7 +14,7 @@ from claude_agent_sdk import ClaudeAgentOptions
 
 from gh_puller.benchmark.env import JUDGE_EVALUATOR
 from gh_puller.benchmark.evaluators import ClaudeEvaluator, LLMEvaluator
-from gh_puller.benchmark.judges.sequence import SequenceJudge
+from gh_puller.benchmark.judges.parallel import ParallelJudge
 from gh_puller.benchmark.judges.vllm_mech.utils import (
     DIMENSIONS,
     MCP_SERVERS,
@@ -65,8 +65,8 @@ class VllmMechClaudeEvaluator(VllmMechEvalMixin, ClaudeEvaluator):
         return auto_user_prompt(question, ref, answer)
 
 
-class VllmMechJudge(SequenceJudge):
-    """应用特例:题目来自 questions.json,评判用评测器多维评分。"""
+class VllmMechJudge(ParallelJudge):
+    """应用特例:题目来自 questions.json,评判用评测器多维评分(并行,默认 LLM 评测器)。"""
 
     judge_name = "vllm-mech-v0.1"
 
