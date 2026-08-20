@@ -159,7 +159,7 @@ async def run_benchmark(module: ModuleType, url: str, name: str) -> BenchResult:
 def write_result(result: BenchResult, out_dir: Path) -> Path:
     """judge 完成后单对象序列化存档；judgment 不可序列化时兜底转 repr。"""
     out_dir.mkdir(parents=True, exist_ok=True)
-    path = out_dir / f"result_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.json"
+    path = out_dir / "result.json"  # 固定文件名,时间维度由输出目录（默认 outputs/<时间戳>）承担
     path.write_text(json.dumps(asdict(result), ensure_ascii=False, indent=2, default=repr))
     return path
 
@@ -172,12 +172,16 @@ def main() -> None:
     ap.add_argument("bank", type=Path, help="题库文件（导出 JUDGE 的 Python 文件，任意路径，位置参数）")
     ap.add_argument("--url", required=True, help="参赛方 base_url")
     ap.add_argument("--name", help="参赛方名，默认用 url")
-    ap.add_argument("--out", type=Path, default=Path("."))  # 默认输出到当前目录
+    ap.add_argument(
+        "--out-dir",
+        type=Path,
+        default=Path("outputs") / datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S"),
+    )  # 输出目录，默认 outputs/<时间戳>（parse_args 时求值一次，每次运行独立目录）
     args = ap.parse_args()
 
     module = load_bank(args.bank)
     result = asyncio.run(run_benchmark(module, args.url, args.name or args.url))
-    path = write_result(result, args.out)
+    path = write_result(result, args.out_dir)
     print(f"结果已写入 {path}", flush=True)
 
 
