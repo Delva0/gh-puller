@@ -1,8 +1,17 @@
-## Claude Code Behavioral Rules
+## Claude 代码行为规则
 
-- **Voice Typing Tolerance**: The user inputs via Speech-to-Text. Ignore literal typos, homophones, or filler words. Comprehend the overall intent and context.
-- **Strict Scope Control**: Do NOT perform any actions outside the explicit instructions. Never expand the task scope (e.g., do not auto-run/write tests, do not refactor adjacent code, and do not perform unsolicited exploration unless explicitly requested).
-- **Direct Execution (No Sub-agents)**: Never spawn sub-agents (Plan, Explore, etc.) or generate complex multi-step automated workflows. Once the plan is mutually agreed upon with the user, implement the requested changes directly and immediately in the main conversation.
-- **Interactive Alignment (Discuss Before Writing)**: Do not write code or implement changes immediately upon receiving a task. First, briefly state your understanding of the requirements and propose your planned approach. Wait for the user's confirmation or feedback before starting the implementation.
-- **Python Execution via UV**: Always use `uv run` to execute Python scripts or commands. Do not use standard `python` or `python3` commands.
-- **Code Style & Consistency**: Adopt a concise research or competitive programming style. Write zero redundant code with extremely minimal defensive programming. Write all comments in Chinese. Above all, maintain strict stylistic consistency with any existing core code in this project.
+- **语音输入容错率**：用户通过语音转文本输入。忽略字面意义上的拼写错误、同音词或填充词。理解整体意图和上下文。
+
+- **严格范围控制**：不得执行任何超出明确指示的操作。切勿扩展任务范围（例如，不要自动运行/编写测试，不要重构相邻代码，除非明确要求，否则不要进行未经请求的探索）。
+
+- **直接执行（不使用子代理）**：切勿生成子代理（例如，规划、探索等）或创建复杂的多步骤自动化工作流程。一旦与用户达成一致，请在主对话中直接立即实施请求的更改。
+
+- **交互式协调（编写前讨论）**：收到任务后，不要立即编写代码或实施更改。首先，简要说明您对需求的理解，并提出您的计划方案。在开始实施之前，请等待用户确认或反馈。
+
+- **通过 UV 执行 Python 代码**：始终使用 `uv run` 执行 Python 脚本或命令。请勿使用标准的 `python` 或 `python3` 命令。
+
+- **代码风格与一致性**：采用简洁的研究型或竞赛型编程风格。编写零冗余代码，并尽可能减少防御性编程。所有注释均使用中文。最重要的是，与本项目中所有现有核心代码保持严格的风格一致性。
+
+## 本代码仓
+- **允许查看范围**：gh_puller/
+- **不允许查看范围**：archive/

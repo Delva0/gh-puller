@@ -4,8 +4,50 @@ version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.13"
-dependencies = ["httpx", "python-dateutil", "python-dotenv"]
+dependencies = [
+    "aiosqlite>=0.20",
+    "dash>=4.4.0",
+    "dash-cytoscape>=1.0.2",
+    "fastapi>=0.139.0",
+    "flask",
+    "httpx",
+    "jsonschema>=4.26.0",
+    "openai>=2.45.0",
+    "python-dateutil",
+    "python-dotenv",
+    "tenacity>=9.1.4",
+    "uvicorn[standard]>=0.51.0",
+    "websockets>=16.1",
+]
 
+
+[project.scripts]
+benchmark = "gh_puller.benchmark.pipeline:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+
+[tool.setuptools.packages.find]
+include = ["gh_puller*"]
 
 [tool.ruff]
 line-length = 120
+
+[tool.ruff.lint]
+select = [
+    "E",
+    "W",
+    "F",
+    "I",
+    "UP",
+    "B",
+    "SIM",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+]

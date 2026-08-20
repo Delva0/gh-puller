@@ -1,0 +1,22 @@
+[
+  {
+    "id": "q001",
+    "question": "vllm 推理时显存不足（OOM）通常有哪些解决思路？",
+    "ref_answer": ["OOM", "vllm"]
+  },
+  {
+    "id": "q002",
+    "question": "vllm 支持哪些模型量化方式？",
+    "ref_answer": ["量化"]
+  },
+  {
+    "id": "q003",
+    "question": "vllm 的 continuous batching 机制主要解决了什么问题？",
+    "ref_answer": ["continuous batching"]
+  },
+  {
+    "id": "q004",
+    "question": "vllm 中如何为模型推理添加自定义 scheduler 策略？",
+    "ref_answer": ["scheduler"]
+  }
+]
