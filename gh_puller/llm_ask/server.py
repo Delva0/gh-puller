@@ -6,7 +6,7 @@
 import httpx
 from fastapi import FastAPI
 
-from gh_puller.llm_ask.env import LLM_ASK_MODEL, LLM_ASK_URL, TIMEOUT as GLOBAL_TIMEOUT
+from gh_puller.llm_ask.env import LLM_ASK_API_KEY, LLM_ASK_MODEL, LLM_ASK_URL, TIMEOUT as GLOBAL_TIMEOUT
 
 # 方法内 LLM 调用超时:connect 短(端点不可达时快速失败),read 取本方法超时上限
 TIMEOUT = httpx.Timeout(connect=5.0, read=GLOBAL_TIMEOUT, write=30.0, pool=5.0)
@@ -26,8 +26,9 @@ async def ask_llm(question: str) -> str:
         ],
         "temperature": 0,
     }
+    headers = {"Authorization": f"Bearer {LLM_ASK_API_KEY}"} if LLM_ASK_API_KEY else None
     async with httpx.AsyncClient(timeout=TIMEOUT) as client:
-        r = await client.post(f"{LLM_ASK_URL}/chat/completions", json=payload)
+        r = await client.post(f"{LLM_ASK_URL}/chat/completions", json=payload, headers=headers)
         r.raise_for_status()
         return r.json()["choices"][0]["message"]["content"]
 
