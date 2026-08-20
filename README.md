@@ -25,7 +25,7 @@ uv run uvicorn gh_puller.llm_ask.server:app --port 8001
 uv run benchmark gh_puller/benchmark/judges/vllm_mech/bank.py --url http://localhost:8001
 ```
 
-结果：当前目录生成 `result_<时间戳>.json`（单对象存档：`valid` / `invalid_reason` / `judgment` / `judge_error`）。
+结果：`outputs/<时间戳>/` 下生成 `result.json`（默认输出目录；`--out-dir` 可覆盖。单对象存档：`valid` / `invalid_reason` / `judgment` / `judge_error`）。
 
 ## 文档入口
 
