@@ -6,9 +6,9 @@
 |---|---|
 | `gh_puller/protocol.md` / `protocol.py` / `types.py` | 协议契约（唯一权威）：文档 + 常量 + 类型，调用方与服务方共引 |
 | `gh_puller/benchmark/` | 评测框架（独立发展） |
-| `gh_puller/methods/` | 内置方法（独立发展，与 benchmark 互不引用） |
+| `gh_puller/llm_ask/` 等 | 内置方法：位于 `gh_puller/` 顶层（独立发展，与 benchmark 互不引用） |
 
-`benchmark` 与 `methods` 独立发展，仅通过协议契约互操作；**协议改动影响两侧，必须单独提交**。
+`benchmark` 与内置方法独立发展，仅通过协议契约互操作；**协议改动影响两侧，必须单独提交**。
 
 ## 分支流程
 

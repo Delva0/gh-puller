@@ -6,7 +6,7 @@
 import httpx
 from fastapi import FastAPI
 
-from gh_puller.methods.llm_ask.env import LLM_ASK_MODEL, LLM_ASK_URL, TIMEOUT as GLOBAL_TIMEOUT
+from gh_puller.llm_ask.env import LLM_ASK_MODEL, LLM_ASK_URL, TIMEOUT as GLOBAL_TIMEOUT
 
 # 方法内 LLM 调用超时:connect 短(端点不可达时快速失败),read 取本方法超时上限
 TIMEOUT = httpx.Timeout(connect=5.0, read=GLOBAL_TIMEOUT, write=30.0, pool=5.0)

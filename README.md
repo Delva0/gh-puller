@@ -10,16 +10,16 @@
 |---|---|
 | `gh_puller/benchmark/` | 评测框架（正式代码）：pipeline 调度 + REST 协议 + 协议层类型 |
 | `gh_puller/benchmark/judges/` | 题库目录（预留）：出题人编写的真实题库放这里；编写约定见 protocol.md |
-| `gh_puller/methods/` | 内置方法目录：实现协议的服务（每种方法独立自包含）；约定见 methods/README.md |
+| `gh_puller/llm_ask/` | 内置方法：实现协议的服务（独立自包含，与 benchmark 独立发展） |
 | `archive/` | 旧代码归档（勿动） |
 
 ## 快速上手（端到端自测）
 
-> `benchmark/`（评测框架）与 `methods/`（内置方法）为两个独立发展的子包，仅通过 REST 协议互操作。
+> `benchmark/`（评测框架）与内置方法（如 `llm_ask/`）独立发展，仅通过 REST 协议互操作。
 
 ```bash
 # 终端 1：启动内置方法 llm_ask（纯 LLM 问答，需 LLM_ASK_URL 端点可达）
-uv run uvicorn gh_puller.methods.llm_ask.server:app --port 8001
+uv run uvicorn gh_puller.llm_ask.server:app --port 8001
 
 # 终端 2：跑一次评测（一个题库 + 一个 endpoint）
 uv run benchmark gh_puller/benchmark/judges/vllm_mech/bank.py --url http://localhost:8001
