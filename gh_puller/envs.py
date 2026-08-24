@@ -21,7 +21,7 @@ WIKI_AUTH_CODE = os.environ.get("DEEPWIKI_AUTH_CODE", "")
 # ---- wiki 任务调度(与 api/services/wiki/tasks.py 同式) ----
 MAX_CONCURRENT_WIKI_TASKS = int(os.environ.get(
     "DEEPWIKI_MAX_CONCURRENT_WIKI_TASKS", max(1, (os.cpu_count() or 2) // 2)))
-WIKI_PAGE_CONCURRENCY = int(os.environ.get("DEEPWIKI_WIKI_PAGE_CONCURRENCY", "1"))
+WIKI_PAGE_CONCURRENCY = int(os.environ.get("DEEPWIKI_WIKI_PAGE_CONCURRENCY", "4"))
 WIKI_PAGE_RETRIES = int(os.environ.get("DEEPWIKI_WIKI_PAGE_RETRIES", "2"))
 WIKI_TASK_TTL_SECONDS = int(os.environ.get("DEEPWIKI_WIKI_TASK_TTL_SECONDS", "300"))
 

@@ -209,6 +209,32 @@ def test_pending_pages_subtracts_done():
 
 
 @pytest.mark.asyncio
+async def test_generate_pages_concurrency_bounded(monkeypatch):
+    """页级并发:Semaphore 调用时读模块全局,并发=4 时同时至多 4 个在途页。"""
+    active = 0
+    max_active = 0
+
+    async def fake_generate(task, page):
+        nonlocal active, max_active
+        active += 1
+        max_active = max(max_active, active)
+        await asyncio.sleep(0.02)
+        active -= 1
+        return page.model_copy(update={"content": f"content-{page.id}"})
+
+    monkeypatch.setattr(deepwiki, "_generate_page_with_retry", fake_generate)
+    monkeypatch.setattr(deepwiki, "_WIKI_PAGE_CONCURRENCY", 4)
+    task = WikiTask(request=_make_request("conc-io", "demo"))
+    structure = _make_structure([f"p{i}" for i in range(8)])
+    pages = await _generate_pages(task, structure)
+    assert max_active == 4
+    assert len(pages) == 8 and len(task.generated_pages) == 8
+    assert task.pages_done == 8
+    assert task.current_page_ids == []
+    await delete_wiki_task_state("conc-io", "demo", "local", "en")
+
+
+@pytest.mark.asyncio
 async def test_registry_resume_restores_task(monkeypatch):
     """同仓库再次提交:命中落盘状态 → resumed=True,复用结构/进度恢复;state 快照胜出。"""
     structure = _make_structure(["p1", "p2", "p3"])
