@@ -1,0 +1,145 @@
+"""gh_puller.deepwiki 后端契约的 HTTP 端点测试(引擎在 gh_puller,见根 tests/test_deepwiki.py)。
+
+不调 Claude agent(不依赖 API key / CLI):
+- 环境变量要求:ANTHROPIC_API_KEY 不设;DEEPWIKI_ROOT 指向临时目录(见文件头)。
+- 覆盖:契约端点 smoke(prepare 走真实 graphify.extract,code_only 纯本地)、
+  未索引的错误语义(chat 425 / codemap NDJSON error)。
+"""
+
+import os
+import tempfile
+
+# envs 在模块导入时单点读取 —— 必须在 import gh_puller.deepwiki 前把产物根指向临时目录
+os.environ.setdefault("DEEPWIKI_ROOT", tempfile.mkdtemp(prefix="deepwiki-app-test-"))
+
+from fastapi.testclient import TestClient
+
+from app import app as server_app
+
+
+def _write_corpus(root) -> str:
+    """构造最小本地仓库(带 utils 子包,纳入代码 AST 提取)。"""
+    d = root / "corpus"
+    d.mkdir()
+    (d / "app.py").write_text(
+        "import utils\n\n\ndef main():\n    return utils.hello('x')\n", encoding="utf-8"
+    )
+    (d / "utils.py").write_text("def hello(name):\n    return f'hi {name}'\n", encoding="utf-8")
+    (d / "README.md").write_text("# Demo\n", encoding="utf-8")
+    return str(d)
+
+
+def _client():
+    return TestClient(server_app)
+
+
+# ---------------------------------------------------------------------------
+# 契约端点 smoke(无仓库时)
+# ---------------------------------------------------------------------------
+
+
+def test_health_root():
+    c = _client()
+    assert c.get("/health").json()["status"] == "healthy"
+    assert c.get("/").json()["version"] == "1.0.0"
+
+
+def test_lang_config():
+    lang = _client().get("/lang/config").json()
+    assert {"en", "zh"} == set(lang["supported_languages"])
+    assert lang["default"] == "en"
+
+
+def test_models_config():
+    cfg = _client().get("/models/config").json()
+    assert cfg["defaultProvider"] == "claude"
+    assert cfg["providers"][0]["id"] == "claude"
+    assert cfg["providers"][0]["supportsCustomModel"] is False
+
+
+def test_auth():
+    c = _client()
+    assert c.get("/auth/status").json() == {"auth_required": False}
+    assert c.post("/auth/validate", json={"code": "x"}).json() == {"success": False}
+
+
+def test_index_status_not_indexed(tmp_path):
+    raw_create = str(tmp_path / "empty_src")
+    os.makedirs(raw_create)
+    assert _client().get(
+        "/repo/index/status", params={"repo_url": str(raw_create), "type": "local"}
+    ).json() == {"ready": False}
+
+
+def test_wiki_cache_empty():
+    c = _client()
+    assert (
+        c.get(
+            "/api/wiki_cache",
+            params={"owner": "a", "repo": "b", "repo_type": "github", "language": "en"},
+        ).json()
+        is None
+    )
+    assert c.get("/api/processed_projects").json() == []
+    assert c.get("/wiki/tasks").json() == []
+    assert c.get("/wiki/tasks/nope").status_code == 404
+
+
+def test_local_repo_structure_errors():
+    c = _client()
+    assert c.get("/local_repo/structure").status_code == 400
+    assert c.get("/local_repo/structure", params={"path": "/nope"}).status_code == 404
+
+
+def test_chat_not_indexed_425(tmp_path):
+    raw = str(tmp_path / "empty_src")
+    os.makedirs(raw)
+    r = _client().post(
+        "/chat/completions/stream",
+        json={
+            "repo_url": raw,
+            "type": "local",
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+    )
+    assert r.status_code == 425
+    assert "尚未索引" in r.json()["detail"]
+
+
+def test_chat_validation_400():
+    c = _client()
+    assert (
+        c.post(
+            "/chat/completions/stream",
+            json={"repo_url": "/x", "type": "local", "messages": []},
+        ).status_code
+        == 400
+    )
+
+
+# ---------------------------------------------------------------------------
+# /repo/prepare:本地小仓库真实建图(SSE 事件流 + graph.json 落盘)
+# ---------------------------------------------------------------------------
+
+
+def test_prepare_local_repo(tmp_path):
+    raw = _write_corpus(tmp_path)
+    r = _client().post("/repo/prepare", json={"repo_url": raw, "type": "local"})
+    assert r.status_code == 200
+    assert "event: done" in r.text
+    assert "data: ok" in r.text
+    gp = os.path.join(raw, "graphify-out", "graph.json")
+    assert os.path.exists(gp)
+    # 索引后就绪探针翻转
+    assert _client().get(
+        "/repo/index/status", params={"repo_url": raw, "type": "local"}
+    ).json() == {"ready": True}
+
+
+def test_prepare_idempotent(tmp_path):
+    """已索引再次 prepare → ready 事件短路,不重跑 extract。"""
+    raw = _write_corpus(tmp_path)
+    c = _client()
+    c.post("/repo/prepare", json={"repo_url": raw, "type": "local"})
+    r2 = c.post("/repo/prepare", json={"repo_url": raw, "type": "local"})
+    assert "event: ready" in r2.text
