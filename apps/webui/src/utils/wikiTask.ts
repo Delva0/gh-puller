@@ -38,6 +38,7 @@ export interface WikiTaskSubmitResult {
   created: boolean;
   joined: boolean;
   from_cache: boolean;
+  resumed?: boolean; // 从落盘生成状态续跑(更新后与进程重启后再次提交)
 }
 
 export interface WikiTaskPageDto {

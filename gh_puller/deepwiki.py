@@ -3,7 +3,7 @@
 来源与协议:
 - 前端契约与提示词来自 deepwiki-open(MIT License, Copyright (c) 2024 Sheing Ng)。
 - 原后端 RAG(adalflow + FAISS chunk/embed 检索)整体切除:
-  索引 = `graphify.extract(code_only=True)` 的纯本地 AST 建图(输出 <repo>/graphify-out/graph.json);
+  索引 = `graphify.extract(code_only=True)` 的纯本地 AST 建图(输出 <DEEPWIKI_ROOT>/graphify/<repo>/graph.json);
   检索 = `graphify.query()` 封装为 Claude Code agent 的 graphify_query 工具,由 agent 按需调用。
 - chat / wiki 生成 / codemap 不再直接调 LLM API,统一走 claude_agent_sdk 的 Claude Code agent,
   提示词(chat / deep_research / codemap / wiki 页面与结构)全部为 deepwiki-open 原文。
@@ -16,8 +16,11 @@
 - 文件过滤为内嵌精简规则(与原 repo.json 全量规则有差异)。
 - 聊天记忆由单次 agent 会话内承,无持久会话库。
 
+wiki 生成进度中途落盘(deepwiki_taskstate_*,见文末任务状态机):结构确定后与每页
+完成后各写一次,进程重启后同仓库再次提交即从落盘状态续跑(结构/已完成页不再重做)。
+
 本模块为引擎+任务层(无 FastAPI 依赖,可被 apps/tui 等 CLI 复用):
-HTTP 端点层(FastAPI app/SSE/WS)已迁至 apps/webui/api/app.py。
+HTTP 端点层(FastAPI app/SSE/WS)已迁至 apps/webui/app.py。
 """
 
 import asyncio
@@ -55,9 +58,14 @@ def _log(msg: str) -> None:
 _CLONE_ROOT = os.path.join(envs.DEEPWIKI_ROOT, "repos")
 _WIKI_CACHE_DIR = os.path.join(envs.DEEPWIKI_ROOT, "wikicache")
 _WIKI_PREFIX = "deepwiki_cache_"
+# 生成中途状态文件前缀(与 deepwiki_cache_ 区分,避免被 list_wiki_cache 当成成品扫描)
+_WIKI_STATE_PREFIX = "deepwiki_taskstate_"
+# 状态写锁:并发页生成器的落盘写串行化(asyncio 3.10+ 的 Lock 不再绑定 loop,模块级安全)
+_state_write_lock = asyncio.Lock()
 os.makedirs(_WIKI_CACHE_DIR, exist_ok=True)
 
-# 页面/结构/图表生成所需的固定并发与重试(原 DEEPWIKI_* 缺省同式,见 envs.py)
+# 页面/结构/图表生成所需的固定并发与重试(原 DEEPWIKI_* 缺省同式,见 envs.py;
+# 页并发缺省 4:同时跑 4 个 agent 子进程,受 API 速限与机器内存约束)
 # 统一从 envs 读取
 _MAX_CONCURRENT_WIKI_TASKS = envs.MAX_CONCURRENT_WIKI_TASKS
 _WIKI_PAGE_CONCURRENCY = max(1, envs.WIKI_PAGE_CONCURRENCY)
@@ -658,6 +666,7 @@ class WikiTaskSubmitResult(BaseModel):
     created: bool = False
     joined: bool = False
     from_cache: bool = False
+    resumed: bool = False  # 从落盘状态续跑(同仓库再提交命中生成状态)
 
     @field_validator("status", mode="before")
     @classmethod
@@ -708,6 +717,19 @@ class WikiCacheData(BaseModel):
     repo: RepoInfo | None = None
     provider: str | None = None
     model: str | None = None
+
+
+class WikiTaskState(BaseModel):
+    """生成中途落盘状态:同仓库再次提交时据此续跑(结构与已完成页不再重生成)。"""
+
+    version: int = 1
+    request: WikiTaskRequest  # 全量快照:续跑沿用首次输入(comprehensive/model/filters 等)
+    status: TaskStatus  # 仅审计;恢复时按 wiki_structure 有无重新映射
+    wiki_structure: WikiStructureModel | None = None
+    generated_pages: dict[str, WikiPage] = Field(default_factory=dict)
+    default_branch: str = "main"
+    submitted_at: int  # 保留原始提交时间
+    error: str | None = None
 
 
 class WikiExportRequest(BaseModel):
@@ -1043,9 +1065,14 @@ def _ground_citations(codemap: CodeMap, repo_dir: str) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _graph_dir(repo: Repo) -> Path:
+    """单仓库图产物根(extract 的 out_dir):graphify/{type}_{name},无日期层,路径稳定以支持已缓存即跳过。"""
+    return Path(envs.DEEPWIKI_ROOT) / "graphify" / f"{repo.repo_type}_{repo.name}"
+
+
 def _graph_path(repo: Repo) -> Path:
-    """仓库图文件的规范路径(与 graphify.extract 输出锚定同式:<save_path>/graphify-out/graph.json)。"""
-    return Path(repo.save_path) / graphify._out_name() / "graph.json"
+    """graph.json 规范路径(extract 的 out_dir 即最终目录,无 graphify-out 层)。"""
+    return _graph_dir(repo) / "graph.json"
 
 
 def _index_ready(repo: Repo) -> bool:
@@ -1062,7 +1089,7 @@ async def _run_extract(repo: Repo, request: RepoRequestBase) -> dict:
         graphify.extract,
         path=repo.save_path,
         code_only=True,
-        out_dir=repo.save_path,
+        out_dir=_graph_dir(repo),
         extra_excludes=extra_excludes,
     )
 
@@ -1471,10 +1498,79 @@ async def save_wiki_cache(
 
 async def delete_wiki_cache(owner: str, repo: str, repo_type: str, language: str) -> bool:
     path = _wiki_cache_path(owner, repo, repo_type, language)
+    state_path = _wiki_state_path(owner, repo, repo_type, language)
+    deleted = False
+    if os.path.exists(path):
+        os.remove(path)
+        deleted = True
+    if os.path.exists(state_path):  # 删除缓存同时清续跑状态,避免裸 state 无清理途径
+        os.remove(state_path)
+        deleted = True
+    return deleted
+
+
+def _wiki_state_path(owner: str, repo: str, repo_type: str, language: str) -> str:
+    filename = f"{_WIKI_STATE_PREFIX}{repo_type}_{owner}_{repo}_{language}.json"
+    return os.path.join(_WIKI_CACHE_DIR, filename)
+
+
+async def write_wiki_task_state(state: WikiTaskState) -> bool:
+    """原子写生成状态(先写 .tmp 再 os.replace,崩溃不产生半截文件)。"""
+    path = _wiki_state_path(
+        state.request.owner, state.request.repo, state.request.type, state.request.language
+    )
+    tmp = f"{path}.tmp"
+    try:
+        await asyncio.to_thread(
+            lambda: Path(tmp).write_text(state.model_dump_json(), encoding="utf-8")
+        )
+        os.replace(tmp, path)
+        return True
+    except OSError as e:
+        _log(f"写生成状态失败: {path} - {e}")
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        return False
+
+
+async def read_wiki_task_state(
+    owner: str, repo: str, repo_type: str, language: str
+) -> WikiTaskState | None:
+    """读取生成状态;无文件或解析失败 → None(自动降级为全新生成)。"""
+    path = _wiki_state_path(owner, repo, repo_type, language)
+    if not os.path.exists(path):
+        return None
+    try:
+        text = await asyncio.to_thread(lambda: Path(path).read_text(encoding="utf-8"))
+        return WikiTaskState.model_validate_json(text)
+    except Exception:
+        _log(f"读取生成状态失败: {path}")
+        return None
+
+
+async def delete_wiki_task_state(owner: str, repo: str, repo_type: str, language: str) -> bool:
+    path = _wiki_state_path(owner, repo, repo_type, language)
     if not os.path.exists(path):
         return False
     os.remove(path)
     return True
+
+
+async def _persist_state(task: "WikiTask") -> None:
+    """把任务当前进度落盘(结构/已完成页/状态);并发写由模块锁串行。"""
+    state = WikiTaskState(
+        request=task.request,
+        status=task.status,
+        wiki_structure=task.wiki_structure,
+        generated_pages=dict(task.generated_pages),  # 浅拷贝快照:WikiPage 只整替换、不原地改
+        default_branch=task.default_branch,
+        submitted_at=task.submitted_at,
+        error=task.error,
+    )
+    async with _state_write_lock:
+        await write_wiki_task_state(state)
 
 
 async def list_wiki_cache() -> list[WikiTaskSummary]:
@@ -1818,6 +1914,7 @@ class WikiTask(BaseModel):
     status: TaskStatus = TaskStatus.PENDING
     pages_done: int = 0
     current_page_ids: list[str] = Field(default_factory=list)
+    generated_pages: dict[str, WikiPage] = Field(default_factory=dict)  # 完成页就地累积(续跑=已生成页)
     wiki_structure: WikiStructureModel | None = None
     default_branch: str = "main"  # 确定结构时设置,用于文件 URL
     error: str | None = None
@@ -1899,18 +1996,40 @@ class TaskRegistry:
                 return WikiTaskSubmitResult(
                     task_id=key, status=exist_task.status, joined=True
                 )
-            if wiki_cache_exists(
-                owner=task.request.owner,
-                repo=task.request.repo,
-                repo_type=task.request.type,
-                language=task.request.language,
-            ):
+            owner, repo, rtype, lang = (
+                task.request.owner,
+                task.request.repo,
+                task.request.type,
+                task.request.language,
+            )
+            if wiki_cache_exists(owner=owner, repo=repo, repo_type=rtype, language=lang):
+                # 缓存胜:顺带清掉陈旧状态(_save 后删状态前崩溃的残留)
+                await delete_wiki_task_state(owner, repo, rtype, lang)
                 return WikiTaskSubmitResult(
                     task_id=key, status=TaskStatus.COMPLETED, from_cache=True
                 )
+            state = await read_wiki_task_state(owner, repo, rtype, lang)
+            if state is not None:
+                # 续跑:复用落盘的结构/进度,跳过已完成部分(current_page_ids 不恢复:
+                #原进程的在途瞬态已失效)
+                task = WikiTask(
+                    request=state.request,
+                    status=(
+                        TaskStatus.GENERATING
+                        if state.wiki_structure is not None
+                        else TaskStatus.DETERMINING_STRUCTURE
+                    ),
+                    pages_done=len(state.generated_pages),
+                    wiki_structure=state.wiki_structure,
+                    default_branch=state.default_branch,
+                    submitted_at=state.submitted_at,  # 保留原始提交时间
+                    generated_pages=state.generated_pages,
+                )
             task.task = asyncio.create_task(self._run(task))
             self._tasks[key] = task
-            return WikiTaskSubmitResult(task_id=key, status=task.status, created=True)
+            return WikiTaskSubmitResult(
+                task_id=key, status=task.status, created=True, resumed=state is not None
+            )
 
     async def _run(self, task: WikiTask) -> None:
         async with self._semaphore:
@@ -1930,9 +2049,14 @@ registry = TaskRegistry()
 
 
 async def generate_repo_wiki(task: WikiTask) -> None:
-    """驱动一个任务走完状态机(索引 → 结构 → 页面 → 缓存),失败置 FAILED。"""
+    """驱动一个任务走完状态机(索引 → 结构 → 页面 → 缓存),失败置 FAILED。
+
+    进度中途落盘(deepwiki_taskstate_*):结构确定后与每页完成后各写一次,
+    失败/取消也尽力写;同仓库再次提交时从落盘状态续跑(见 TaskRegistry.submit)。
+    """
     r = task.request
     try:
+        await _persist_state(task)  # 入口即落盘:中断于索引/结构阶段的也能续跑
         repo = Repo(r.repo_url, r.type, access_token=r.token)
         # 索引:只建一次(v1 无增量;已存在即跳过)
         if not _index_ready(repo):
@@ -1944,19 +2068,26 @@ async def generate_repo_wiki(task: WikiTask) -> None:
             if result.get("error"):
                 raise RuntimeError(result["error"])
 
-        task.status = TaskStatus.DETERMINING_STRUCTURE
-        structure = await _determine_structure(task)
-        task.wiki_structure = structure
+        if task.wiki_structure is None:  # 续跑:结构已落盘则跳过 agent 调用
+            task.status = TaskStatus.DETERMINING_STRUCTURE
+            task.wiki_structure = await _determine_structure(task)
+            await _persist_state(task)
 
         task.status = TaskStatus.GENERATING
-        pages = await _generate_pages(task, structure)
+        pages = await _generate_pages(task, task.wiki_structure)
 
-        await _save(task, pages)
+        if not await _save(task, pages):
+            raise RuntimeError("写 wiki 缓存失败")  # 不删状态:再提交仅重试写缓存
+        await delete_wiki_task_state(r.owner, r.repo, r.type, r.language)
         task.status = TaskStatus.COMPLETED
         _log(f"wiki 任务完成: {task.repo_key}")
+    except asyncio.CancelledError:  # Ctrl+C/停机:尽力持久化一次后重新抛出
+        await _persist_state(task)
+        raise
     except Exception as e:
         task.status = TaskStatus.FAILED
         task.error = str(e)
+        await _persist_state(task)  # FAILED 也落盘,后续提交可续跑
         _log(f"wiki 任务失败: {task.repo_key} - {e}")
 
 
@@ -2008,25 +2139,32 @@ async def _generate_page_with_retry(task: WikiTask, page: WikiPage) -> WikiPage:
     return page.model_copy(update={"content": f"Error generating content: {last_error}"})
 
 
+def _pending_pages(structure: WikiStructureModel, done: dict[str, WikiPage]) -> list[WikiPage]:
+    """按结构顺序返回尚未生成的页面(done: 已完成页 id → 页)。"""
+    return [p for p in structure.pages if p.id not in done]
+
+
 async def _generate_pages(task: WikiTask, structure: WikiStructureModel) -> dict[str, WikiPage]:
-    """有界并发 + 每页重试地生成所有页面。"""
+    """有界并发 + 每页重试地生成所有页面;续跑跳过已落盘的页,每页完成后立即落盘。"""
     sema = asyncio.Semaphore(_WIKI_PAGE_CONCURRENCY)
-    pages: dict[str, WikiPage] = {}
+    task.pages_done = len(task.generated_pages)  # 续跑:从恢复的完成数起步
+    pending = _pending_pages(structure, task.generated_pages)
 
     async def one(page: WikiPage) -> None:
         async with sema:
             task.current_page_ids.append(page.id)
             try:
-                pages[page.id] = await _generate_page_with_retry(task, page)
+                task.generated_pages[page.id] = await _generate_page_with_retry(task, page)
             finally:
                 try:
                     task.current_page_ids.remove(page.id)
                 except ValueError:
                     pass
                 task.pages_done += 1
+            await _persist_state(task)  # 每页完成即落盘(锁内串行写)
 
-    await asyncio.gather(*(one(page) for page in structure.pages))
-    return pages
+    await asyncio.gather(*(one(page) for page in pending))
+    return task.generated_pages
 
 
 async def _save(task: WikiTask, pages: dict[str, WikiPage]) -> None:
