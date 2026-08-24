@@ -11,8 +11,18 @@ wheels/
 
 # Local environment
 .env
+.vscode
+playground/
+archive/
 
 # Runtime artifacts
-playground/
 logs/
-archive/
+outputs/
+
+# Test / lint caches
+.pytest_cache/
+.ruff_cache/
+
+# apps/webui (Next.js)
+apps/webui/node_modules/
+apps/webui/.next/
