@@ -4,15 +4,17 @@
 - 环境变量要求:ANTHROPIC_API_KEY 不设;DEEPWIKI_ROOT 指向临时目录(见文件头)。
 - 覆盖:纯函数层(结构解析 / 引用后处理 / snippet 定位 / JSON 修复)、Repo 克隆语义,
   与生成状态落盘/续跑(离线:生成函数全部 monkeypatch,真实写临时 wikicache)。
-- HTTP 端点契约测试(TestClient)在 apps/webui/tests/test_app.py(独立项目)。
+- HTTP 端点契约测试(TestClient)在 apps/deepwiki-webui/server/tests/test_app.py(独立项目)。
 """
 
 import asyncio
 import os
 import tempfile
 
-# envs 在模块导入时单点读取 —— 必须在 import gh_puller.deepwiki 前把产物根指向临时目录
-os.environ.setdefault("DEEPWIKI_ROOT", tempfile.mkdtemp(prefix="deepwiki-test-"))
+# envs 在模块导入时单点读取 —— 必须在 import gh_puller.deepwiki 前把产物根指向临时目录;
+# 用强制赋值而非 setdefault:即使外层环境或先导入的测试(如 agent 监控)已设 DEEPWIKI_ROOT,
+# 本测试也不落用户真实目录(测试隔离优先于外部配置)。
+os.environ["DEEPWIKI_ROOT"] = tempfile.mkdtemp(prefix="deepwiki-test-")
 
 import pytest
 
@@ -41,7 +43,6 @@ from gh_puller.deepwiki import (
     read_wiki_task_state,
     write_wiki_task_state,
 )
-
 
 # ---------------------------------------------------------------------------
 # Repo 克隆语义
@@ -198,6 +199,22 @@ async def test_wiki_task_state_roundtrip_atomic():
     assert await list_wiki_cache() == []
     assert await delete_wiki_task_state("state-io", "demo", "local", "en") is True
     assert not os.path.exists(path)
+
+
+@pytest.mark.asyncio
+async def test_agent_text_through_cc_stream(monkeypatch):
+    """迁移冒烟:deepwiki.agent 调用归一化为 agent.cc_stream(label 透传)."""
+    calls = []
+
+    async def fake_cc_stream(options, prompt, *, session=None, session_name=None, meta=None):
+        calls.append((session_name, prompt))
+        yield "a"
+        yield "b"
+
+    monkeypatch.setattr(deepwiki, "cc_stream", fake_cc_stream)
+    out = await deepwiki._agent_text("sys", "query", label="wiki:structure")
+    assert out == "ab"
+    assert calls == [("wiki:structure", "query")]
 
 
 def test_pending_pages_subtracts_done():

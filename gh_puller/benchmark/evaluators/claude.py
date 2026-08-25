@@ -8,9 +8,10 @@ auto_* 提示词与 MCP_SERVERS/SKILLS。模型可用环境变量 CLAUDE_JUDGE_M
 
 import json
 
-from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient, ResultMessage
+from claude_agent_sdk import ClaudeAgentOptions
 
-from gh_puller.benchmark.env import CLAUDE_JUDGE_MODEL
+from gh_puller.agent import cc_result
+from gh_puller.benchmark.envs import CLAUDE_JUDGE_MODEL
 
 
 class ClaudeEvaluator:
@@ -35,14 +36,10 @@ class ClaudeEvaluator:
 
     async def evaluate(self, question: str, ref: str, answer: str) -> dict:
         try:
-            async with ClaudeSDKClient(options=self.make_options(question, ref, answer)) as client:
-                await client.query(self.user_prompt(question, ref, answer))
-                result = None
-                async for msg in client.receive_response():
-                    if isinstance(msg, ResultMessage):
-                        result = msg.result
-            if result is None:
-                raise RuntimeError("agent 未产出最终结果")
+            result = await cc_result(
+                self.make_options(question, ref, answer), self.user_prompt(question, ref, answer),
+                session_name="judge:claude",
+            )
             return self.coerce(json.loads(result))
         except Exception as e:  # SDK/解析异常:降级输出,不抛出
             return {"dimensions": {}, "overall": 0, "reason": f"评测失败: {type(e).__name__}: {e}"}

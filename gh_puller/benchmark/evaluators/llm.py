@@ -10,7 +10,9 @@ import json
 
 import httpx
 
-from gh_puller.benchmark.env import LLM_JUDGE_API_KEY, LLM_JUDGE_MODEL, LLM_JUDGE_URL, TIMEOUT as GLOBAL_TIMEOUT  # 单题评分超时上限(1 小时)
+from gh_puller.agent import llm_complete
+from gh_puller.benchmark.envs import LLM_JUDGE_API_KEY, LLM_JUDGE_MODEL, LLM_JUDGE_URL  # 单题评分超时上限(1 小时)
+from gh_puller.benchmark.envs import TIMEOUT as GLOBAL_TIMEOUT
 
 # 单题评分超时:connect 短(端点不可达时快速降级),read 取全局单题超时上限
 TIMEOUT = httpx.Timeout(connect=5.0, read=GLOBAL_TIMEOUT, write=30.0, pool=5.0)
@@ -39,16 +41,16 @@ class LLMEvaluator:
     async def evaluate(self, question: str, ref: str, answer: str) -> dict:
         payload = self.make_payload(question, ref, answer)
         headers = {"Authorization": f"Bearer {LLM_JUDGE_API_KEY}"} if LLM_JUDGE_API_KEY else None
-        async with httpx.AsyncClient(timeout=TIMEOUT) as client:
-            last_err: Exception | None = None
-            for nudge in (False, True):  # 解析失败重试 1 次(第二次追加"只输出 JSON"提示)
-                if nudge:
-                    payload["messages"].append({"role": "user", "content": self.retry_nudge})
-                try:
-                    r = await client.post(f"{self.url}/chat/completions", json=payload, headers=headers)
-                    r.raise_for_status()
-                    content = r.json()["choices"][0]["message"]["content"]
-                    return self.coerce(json.loads(content))
-                except Exception as e:  # 网络/HTTP/解析失败:继续下一轮,耗尽后降级
-                    last_err = e
+        last_err: Exception | None = None
+        for nudge in (False, True):  # 解析失败重试 1 次(第二次追加"只输出 JSON"提示)
+            if nudge:
+                payload["messages"].append({"role": "user", "content": self.retry_nudge})
+            try:
+                content = await llm_complete(
+                    url=self.url, payload=payload, api_key=LLM_JUDGE_API_KEY,
+                    timeout=TIMEOUT, headers=headers, session_name="judge:llm",
+                )
+                return self.coerce(json.loads(content))
+            except Exception as e:  # 网络/HTTP/解析失败:继续下一轮,耗尽后降级
+                last_err = e
         return {"dimensions": {}, "overall": 0, "reason": f"评测失败: {type(last_err).__name__}: {last_err}"}

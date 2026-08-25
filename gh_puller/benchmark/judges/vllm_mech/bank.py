@@ -12,7 +12,7 @@ from pathlib import Path
 
 from claude_agent_sdk import ClaudeAgentOptions
 
-from gh_puller.benchmark.env import JUDGE_EVALUATOR
+from gh_puller.benchmark.envs import JUDGE_EVALUATOR
 from gh_puller.benchmark.evaluators import ClaudeEvaluator, LLMEvaluator
 from gh_puller.benchmark.judges.parallel import ParallelJudge
 from gh_puller.benchmark.judges.vllm_mech.utils import (

@@ -12,7 +12,7 @@ ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 CLAUDE_AGENT_MODEL = os.environ.get("CLAUDE_AGENT_MODEL", "")  # 空 → SDK 缺省模型
 
 # ---- 产物根目录:repos/ 克隆目录、graphify-out/ 索引、wikicache/ 缓存 ----
-DEEPWIKI_ROOT = os.path.expanduser(os.environ.get("DEEPWIKI_ROOT", "~/.adalflow"))
+DEEPWIKI_ROOT = os.path.expanduser(os.environ.get("DEEPWIKI_ROOT", "~/.gh-puller/deepwiki"))
 
 # ---- wiki 删除授权(与原后端同式:字符串真值判定) ----
 WIKI_AUTH_MODE = os.environ.get("DEEPWIKI_AUTH_MODE", "False").lower() in ["true", "1", "t"]
@@ -33,3 +33,10 @@ GRAPHIFY_OUT = os.environ.get("GRAPHIFY_OUT", "graphify-out")
 
 # ---- chat 输入上限的粗略估算(不引 tiktoken:以字符数/4 近似 token) ----
 CHAT_TOKEN_LIMIT_ESTIMATE = int(os.environ.get("DEEPWIKI_CHAT_TOKEN_LIMIT", "7500"))
+
+# ---- agent 流式监控(文件观测默认开;Web/WS 经 AGENT_MONITOR_WS_URL opt-in) ----
+AGENT_MONITOR_DIR = os.path.expanduser(os.environ.get("AGENT_MONITOR_DIR", "~/.gh-puller/agent-monitor"))
+AGENT_MONITOR_FILE = os.environ.get("AGENT_MONITOR_FILE", "1") not in ("0", "false")
+AGENT_MONITOR_WS_URL = os.environ.get("AGENT_MONITOR_WS_URL", "")  # 空 → 不启用 ws sink
+AGENT_MONITOR_PORT = int(os.environ.get("AGENT_MONITOR_PORT", "8765"))
+AGENT_MONITOR_OTEL_ENDPOINT = os.environ.get("AGENT_MONITOR_OTEL_ENDPOINT", "")  # 空 → 不启用 otel sink

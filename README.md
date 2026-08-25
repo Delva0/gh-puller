@@ -31,6 +31,7 @@ uv run benchmark gh_puller/benchmark/judges/vllm_mech/bank.py --url http://local
 
 - `gh_puller/protocol.md` —— **协议契约**（REST 协议 v1：唯一路由 `POST /ask`、请求/响应格式、接入检查）
 - `gh_puller/benchmark/protocol.md` —— **出题人约定**（题库文件 `JUDGE` 接口）
+- `docs/agent-monitor.md` —— **LLM 调用流式监控**（文件 sink 默认开 + Web/WS hub；CC 与 openai 调用统一观测）
 
 ## 核心设计（一句话）
 

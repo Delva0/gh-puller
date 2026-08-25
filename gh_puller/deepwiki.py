@@ -1,4 +1,4 @@
-"""DeepWiki 兼容后端:前端契约沿用 deepwiki-open(前端见 apps/webui/),运行引擎替换为 Claude Code agent + graphify。
+"""DeepWiki 兼容后端:前端契约沿用 deepwiki-open(前端见 apps/deepwiki-webui/web/),运行引擎替换为 Claude Code agent + graphify。
 
 来源与协议:
 - 前端契约与提示词来自 deepwiki-open(MIT License, Copyright (c) 2024 Sheing Ng)。
@@ -20,7 +20,7 @@ wiki 生成进度中途落盘(deepwiki_taskstate_*,见文末任务状态机):结
 完成后各写一次,进程重启后同仓库再次提交即从落盘状态续跑(结构/已完成页不再重做)。
 
 本模块为引擎+任务层(无 FastAPI 依赖,可被 apps/tui 等 CLI 复用):
-HTTP 端点层(FastAPI app/SSE/WS)已迁至 apps/webui/app.py。
+HTTP 端点层(FastAPI app/SSE/WS)已迁至 apps/deepwiki-webui/server/app.py。
 """
 
 import asyncio
@@ -39,10 +39,10 @@ from urllib.parse import quote, urlparse, urlunparse
 
 from pydantic import BaseModel, ConfigDict, Field, computed_field, field_validator
 
-from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient, create_sdk_mcp_server, tool
-from claude_agent_sdk.types import AssistantMessage, ResultMessage, StreamEvent
+from claude_agent_sdk import ClaudeAgentOptions, create_sdk_mcp_server, tool
 
 from . import envs, graphify
+from .agent import cc_stream, cc_text
 
 # ---------------------------------------------------------------------------
 # 日志与全局路径
@@ -1138,32 +1138,14 @@ def _agent_options(system_prompt: str, repo: Repo | None, model: str | None = No
 
 
 async def _agent_stream(
-    system_prompt: str, prompt: str, repo: Repo | None = None, model: str | None = None
+    system_prompt: str, prompt: str, repo: Repo | None = None, model: str | None = None,
+    label: str | None = None,
 ):
-    """agent 流式应答:转发文本增量(StreamEvent 优先,AssistantMessage 兜底);执行失败抛 RuntimeError。"""
+    """agent 流式应答:转发文本增量,语义与旧漏斗逐字节一致(见 agent.cc_stream);
+    label 作为监控会话名(chat:/codemap:/wiki: 前缀区分用途)。"""
     options = _agent_options(system_prompt, repo, model)
-    async with ClaudeSDKClient(options=options) as client:
-        await client.query(prompt)
-        yielded = False  # 已产出任一文本增量后,主题 AssistantMessage 不再兜底(否则重复)
-        async for msg in client.receive_response():
-            if isinstance(msg, StreamEvent):
-                event = msg.event
-                if event.get("type") == "content_block_delta":
-                    delta = event.get("delta") or {}
-                    if delta.get("type") == "text_delta" and delta.get("text"):
-                        yielded = True
-                        yield delta["text"]
-            elif isinstance(msg, AssistantMessage):
-                if not yielded:
-                    # 兜底:无 partial 事件时整块取文本(ThinkingBlock 无 text 属性,天然跳过)
-                    for block in msg.content:
-                        text = getattr(block, "text", None)
-                        if text:
-                            yield text
-            elif isinstance(msg, ResultMessage):
-                if msg.is_error:
-                    detail = (msg.errors or [])[-1] if msg.errors else msg.result
-                    raise RuntimeError(f"agent 执行失败: {detail or msg.subtype}")
+    async for chunk in cc_stream(options, prompt, session_name=label):
+        yield chunk
 
 
 def _agent_note() -> str:
@@ -1175,10 +1157,13 @@ def _agent_note() -> str:
     )
 
 
-async def _agent_text(system_prompt: str, prompt: str, repo: Repo | None = None, model: str | None = None) -> str:
+async def _agent_text(
+    system_prompt: str, prompt: str, repo: Repo | None = None, model: str | None = None,
+    label: str | None = None,
+) -> str:
     """agent 整收应答(用于 wiki 结构/页面、codemap 两阶段)。"""
     parts: list[str] = []
-    async for chunk in _agent_stream(system_prompt, prompt, repo, model):
+    async for chunk in _agent_stream(system_prompt, prompt, repo, model, label):
         parts.append(chunk)
     return "".join(parts)
 
@@ -1741,7 +1726,9 @@ async def chat_stream(request: ChatCompletionRequest):
 
     prompt = history + _agent_note() + f"<query>\n{last.content}\n</query>\n\nAssistant: "
     try:
-        async for chunk in _agent_stream(system, prompt, repo=repo, model=request.model):
+        async for chunk in _agent_stream(
+            system, prompt, repo=repo, model=request.model, label=f"chat:{repo.name}"
+        ):
             yield chunk
     except Exception as e:  # 执行期失败降级为可读错误文本(同原 stream_and_fallback 语义)
         _log(f"chat agent 错误: {e}")
@@ -1859,7 +1846,8 @@ async def generate_codemap(request: CodeMapRequest):
         for attempt in range(1, attempts + 1):
             try:
                 raw = await _agent_text(
-                    _CODEMAP_SKELETON_PROMPT.format(**fmt), prompt, repo=repo, model=request.model
+                    _CODEMAP_SKELETON_PROMPT.format(**fmt), prompt, repo=repo,
+                    model=request.model, label="codemap:skeleton",
                 )
                 return _extract_json(raw)
             except Exception as e:  # noqa: BLE001
@@ -1887,7 +1875,8 @@ async def generate_codemap(request: CodeMapRequest):
     final = skeleton
     try:
         raw = await _agent_text(
-            _CODEMAP_ENRICH_PROMPT.format(**fmt), enrich_prompt, repo=repo, model=request.model
+            _CODEMAP_ENRICH_PROMPT.format(**fmt), enrich_prompt, repo=repo,
+            model=request.model, label="codemap:enrich",
         )
         final = CodeMap.model_validate(_extract_json(raw))
         yield _phase("diagrams", "done")
@@ -2110,7 +2099,7 @@ async def _determine_structure(task: WikiTask) -> WikiStructureModel:
     prompt = _build_structure_prompt(
         r.owner, r.repo, "\n".join(file_tree), readme, r.comprehensive, r.language
     )
-    text = await _agent_text("", prompt, repo=repo, model=r.model)
+    text = await _agent_text("", prompt, repo=repo, model=r.model, label="wiki:structure")
     return parse_wiki_structure(text, comprehensive=r.comprehensive)
 
 
@@ -2121,7 +2110,7 @@ async def _generate_page(task: WikiTask, page: WikiPage) -> WikiPage:
     ctx = RepoUrlContext(type=r.type, repo_url=r.repo_url, default_branch=task.default_branch)
     file_links = "\n".join(f"- [{p}]({generate_file_url(p, ctx)})" for p in page.filePaths)
     prompt = _agent_note() + _build_page_prompt(page.title, file_links, r.language)
-    content = await _agent_text("", prompt, repo=repo, model=r.model)
+    content = await _agent_text("", prompt, repo=repo, model=r.model, label=f"wiki:page:{page.id}")
     content = _strip_markdown_fences(content)
     content = post_process_wiki_content(content, list(page.filePaths), ctx)
     return page.model_copy(update={"content": content})

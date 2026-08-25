@@ -19,7 +19,7 @@ import httpx
 import jsonschema
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
-from gh_puller.benchmark.env import TIMEOUT  # 单题超时（秒，1 小时），全局统一入口
+from gh_puller.benchmark.envs import TIMEOUT  # 单题超时（秒，1 小时），全局统一入口
 from gh_puller.protocol import ASK_PATH, OPENAPI_PATH, RESPONSE_SCHEMA
 from gh_puller.types import Answer
 
