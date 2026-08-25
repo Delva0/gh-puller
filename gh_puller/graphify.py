@@ -165,7 +165,7 @@ def extract(
     max_concurrency: int | None = None,  # None → 库缺省 4
     max_workers: int | None = None,  # AST 并发；经 GRAPHIFY_MAX_WORKERS env 透传（同 CLI）
     api_timeout: float | None = None,  # 经 GRAPHIFY_API_TIMEOUT env 透传（同 CLI）
-    out_dir: str | Path | None = None,  # None → <path>/<GRAPHIFY_OUT>
+    out_dir: str | Path | None = None,  # 给出即最终输出目录;None → <path>/<GRAPHIFY_OUT>
     force: bool = False,  # 跳过语义缓存读取（同 CLI --force）
     no_cluster: bool = False,  # 原始合并直写 graph.json，无社区
     no_dedup: bool = False,  # build(dedup=False)，放掉模糊合并
@@ -187,9 +187,11 @@ def extract(
     target = Path(path).expanduser().resolve()
     if not target.exists():
         raise FileNotFoundError(f"path not found: {target}")
-    out_root = Path(out_dir).expanduser().resolve() if out_dir else target
-    # 与 CLI 一致：输出锚定 <out_root>/graphify-out，而非 cwd（--out 语义）
-    gout = out_root / _out_name()
+    # out_dir 语义:给出即为最终输出目录(不再拼接 /<GRAPHIFY_OUT>);缺省 <path>/<GRAPHIFY_OUT>
+    gout = Path(out_dir).expanduser().resolve() if out_dir else target / _out_name()
+    # lib 内部会在 cache_root 下再拼 <GRAPHIFY_OUT> 层:给出 out_dir 时缓存落 <gout>/graphify-out/cache,
+    # 缺省时落 <gout>/cache(与旧行为一致)
+    cache_anchor = gout if out_dir else target
     gout.mkdir(parents=True, exist_ok=True)
     _msg = log or (lambda m: _log("extract", m))
     t0 = time.perf_counter()
@@ -218,7 +220,7 @@ def extract(
 
         _msg(f"scanning {target}")
         detection = detect(target, extra_excludes=extra_excludes or None,
-                           cache_root=out_root, gitignore=not no_gitignore)
+                           cache_root=cache_anchor, gitignore=not no_gitignore)
         files_by_type = detection.get("files", {})
         code_files = [Path(p) for p in files_by_type.get("code", [])]
         doc_files = [Path(p) for p in files_by_type.get("document", [])]
@@ -250,7 +252,7 @@ def extract(
         if code_files:
             _msg(f"AST extraction on {len(code_files)} code files...")
             try:
-                _ast_kwargs: dict = {"cache_root": out_root, "root": target}
+                _ast_kwargs: dict = {"cache_root": cache_anchor, "root": target}
                 if max_workers is not None:
                     _ast_kwargs["max_workers"] = max_workers
                 ast_result = _ast_extract(code_files, **_ast_kwargs)
@@ -291,7 +293,7 @@ def extract(
                 uncached_paths = list(paths_str)
             else:
                 cached_nodes, cached_edges, cached_hyperedges, uncached_paths = (
-                    check_semantic_cache(paths_str, root=target, cache_root=out_root,
+                    check_semantic_cache(paths_str, root=target, cache_root=cache_anchor,
                                          mode=sem_cache_mode, prompt=prompt)
                 )
             sem_cache_hits = len(semantic_files) - len(uncached_paths)
@@ -305,7 +307,7 @@ def extract(
             if uncached_paths:
                 _msg(f"semantic extraction on {len(uncached_paths)} files via {backend_eff}...")
                 corpus_kwargs: dict = {"backend": backend_eff, "model": model,
-                                       "root": target, "cache_root": out_root}
+                                       "root": target, "cache_root": cache_anchor}
                 if deep_mode:
                     corpus_kwargs["deep_mode"] = True
                 if max_concurrency is not None:
@@ -341,7 +343,7 @@ def extract(
                 try:
                     save_semantic_cache(fresh.get("nodes", []), fresh.get("edges", []),
                                         fresh.get("hyperedges", []), root=target,
-                                        cache_root=out_root, allowed_source_files=uncached_paths,
+                                        cache_root=cache_anchor, allowed_source_files=uncached_paths,
                                         mode=sem_cache_mode, prompt=prompt,
                                         partial_source_files=_partial_semantic or None)
                 except Exception as exc:

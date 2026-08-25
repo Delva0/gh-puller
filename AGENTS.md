@@ -1,4 +1,4 @@
-## Claude 代码行为规则
+## Agent 代码行为规则
 
 - **语音输入容错率**：用户通过语音转文本输入。忽略字面意义上的拼写错误、同音词或填充词。理解整体意图和上下文。
 
@@ -10,3 +10,5 @@
 
 ## 本代码仓
 - **不允许查看范围**：archive/
+- **apps/ 项目结构**：`apps/<name>/server/`(Python 后端,独立 uv 项目,path 依赖根 `gh-puller` 包)+ `apps/<name>/web/`(前端,根 pnpm 工作区成员)聚合为一个应用,一个应用一个家。命名用应用名本体(如 `deepwiki-webui`、`agent-dashboard`),无 `internal-*` 前缀。
+- **`ui/` 为本项目共享基础 UI 组件包 `@gh-puller/ui`**:`ui/` 下自持 package.json(exports 直指 `src/index.ts`,无构建,workspace 成员),apps 经 `workspace:*` 依赖直接 import 源码。
