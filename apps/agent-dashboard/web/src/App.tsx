@@ -5,17 +5,17 @@ import {
   MonitorChatView,
   MonitorConversation,
   MonitorSessionList,
+  MonitorStatusBar,
   MonitorTrajectoryView,
   StateBadge,
   ThemeToggle,
   useLanguage,
+  useMonitorSession,
+  useMonitorSocket,
 } from '@gh-puller/ui';
 import type { MonitorView, ToolCallView } from '@gh-puller/ui';
-import { useMonitorSocket } from './hooks/useMonitorSocket';
-import { useMonitorSession } from './hooks/useMonitorSession';
-import StatusBar from './components/StatusBar';
 
-const CHIP = 'rounded-md border border-zinc-200 px-2 py-0.5 font-mono text-[11px] text-zinc-600 dark:border-zinc-800 dark:text-zinc-400';
+const CHIP = 'rounded-md border border-[var(--border-color)] px-2 py-0.5 font-mono text-[11px] text-[var(--muted)]';
 
 export default function App() {
   const { t, lang, setLang } = useLanguage();
@@ -63,17 +63,17 @@ export default function App() {
       : '—';
 
   return (
-    <div className="flex h-full bg-zinc-100 text-zinc-800 dark:bg-zinc-950 dark:text-zinc-200">
+    <div className="flex h-full bg-[var(--background)] text-[var(--foreground)]">
       {/* 侧栏 */}
-      <aside className="flex w-72 shrink-0 flex-col border-r border-zinc-200 bg-white dark:border-zinc-800 dark:bg-zinc-900">
-        <div className="flex items-center justify-between border-b border-zinc-200 px-3 py-2 dark:border-zinc-800">
+      <aside className="flex w-72 shrink-0 flex-col border-r border-[var(--border-color)] bg-[var(--card-bg)]">
+        <div className="flex items-center justify-between border-b border-[var(--border-color)] px-3 py-2">
           <h1 className="text-sm font-semibold">{t('app.title')}</h1>
           <div className="flex items-center gap-1.5">
             <ThemeToggle />
             <button
               type="button"
               onClick={() => setLang(lang === 'zh' ? 'en' : 'zh')}
-              className="rounded-md border border-zinc-200 px-2 py-1 text-[11px] text-zinc-500 hover:border-zinc-400 dark:border-zinc-700 dark:text-zinc-400"
+              className="rounded-md border border-[var(--border-color)] px-2 py-1 text-[11px] text-[var(--muted)] hover:border-[var(--accent-secondary)]"
             >
               {t('toolbar.lang')}
             </button>
@@ -83,12 +83,12 @@ export default function App() {
           value={query}
           onChange={(e) => setQuery(e.target.value)}
           placeholder={t('sidebar.search')}
-          className="mx-3 mt-3 rounded-md border border-zinc-200 bg-transparent px-2 py-1.5 text-xs placeholder:text-zinc-400 focus:border-emerald-500 focus:outline-none dark:border-zinc-700"
+          className="mx-3 mt-3 rounded-md border border-[var(--border-color)] bg-transparent px-2 py-1.5 text-xs placeholder:text-[var(--muted)] focus:border-[var(--accent-primary)] focus:outline-none"
         />
         <select
           value={stateFilter}
           onChange={(e) => setStateFilter(e.target.value)}
-          className="mx-3 mt-2 rounded-md border border-zinc-200 bg-transparent px-2 py-1 text-xs text-zinc-500 dark:border-zinc-700 dark:text-zinc-400"
+          className="mx-3 mt-2 rounded-md border border-[var(--border-color)] bg-transparent px-2 py-1 text-xs text-[var(--muted)]"
         >
           <option value="all">{t('sidebar.filter.all')}</option>
           <option value="running">{t('session.state.running')}</option>
@@ -108,7 +108,7 @@ export default function App() {
 
       {/* 主区 */}
       <main className="flex min-w-0 flex-1 flex-col">
-        <header className="flex flex-wrap items-center gap-2 border-b border-zinc-200 px-4 py-2 dark:border-zinc-800">
+        <header className="flex flex-wrap items-center gap-2 border-b border-[var(--border-color)] px-4 py-2">
           {meta && (
             <>
               <StateBadge state={meta.state} label={t(`session.state.${meta.state}`)} />
@@ -126,7 +126,7 @@ export default function App() {
               )}
             </>
           )}
-          <label className="ml-auto flex cursor-pointer items-center gap-1 text-xs text-zinc-500">
+          <label className="ml-auto flex cursor-pointer items-center gap-1 text-xs text-[var(--muted)]">
             <input type="checkbox" checked={autoScroll} onChange={(e) => setAutoScroll(e.target.checked)} />
             {t('monitor.autoScroll')}
           </label>
@@ -134,7 +134,7 @@ export default function App() {
 
         <MonitorConversation view={view} onView={setView}>
           {m.current === null ? (
-            <div className="p-6 text-xs text-zinc-500 dark:text-zinc-600">{t('view.empty')}</div>
+            <div className="p-6 text-xs text-[var(--muted)]">{t('view.empty')}</div>
           ) : view === 'chat' ? (
             <MonitorChatView nodes={chat.chatNodes} partial={partial} toolsByCall={toolsByCall} autoScroll={autoScroll} />
           ) : (
@@ -142,7 +142,7 @@ export default function App() {
           )}
         </MonitorConversation>
 
-        <StatusBar status={m.status} current={m.current} events={events.length} />
+        <MonitorStatusBar status={m.status} current={m.current} events={events.length} />
       </main>
     </div>
   );

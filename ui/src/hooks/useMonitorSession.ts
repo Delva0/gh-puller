@@ -1,8 +1,10 @@
+'use client';
+
 // 单会话响应式 store(useSyncExternalStore,不引 zustand):
 // history 页/live evt → RunFold(seq 守卫 + 间隙可补片)→ 快照派生(对话节点/请求序)
 import { useSyncExternalStore } from 'react';
-import { RunFold, buildSnapshot } from '@gh-puller/ui';
-import type { EventEnvelope } from '@gh-puller/ui';
+import { RunFold, buildSnapshot } from '../monitor';
+import type { EventEnvelope } from '../monitor';
 
 interface SessionSnapshot {
   events: EventEnvelope[];

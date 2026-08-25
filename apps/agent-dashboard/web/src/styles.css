@@ -1,20 +1,9 @@
 @import "tailwindcss";
+/* 主题真源 @gh-puller/ui(令牌/暗色变体/风格类/字体);必须与 "tailwindcss" 同一条 Tailwind 处理链 */
+@import "../../../../ui/src/styles/theme.css";
 /* @gh-puller/ui 源码参与扫描(workspace 符号链接默认不被自动检测,须显式 @source) */
 @source "../../../../ui/src";
 @plugin "@tailwindcss/typography";
-/* 主题切换走 class(ThemeProvider attribute="class");Tailwind v4 默认 dark: 是 media,须自定义变体 */
-@custom-variant dark (&:where(.dark, .dark *));
-
-:root {
-  --border-color: #3f3f46; /* zinc-700(亮色主题框线) */
-  --foreground: #18181b; /* zinc-900 */
-  --accent-primary: #10b981; /* emerald-500 */
-  --accent-secondary: #34d399; /* emerald-400 */
-}
-.dark {
-  --border-color: #27272a; /* zinc-800 */
-  --foreground: #e4e4e7; /* zinc-200 */
-}
 
 html, body, #root {
   height: 100%;
@@ -22,13 +11,4 @@ html, body, #root {
 
 body {
   margin: 0;
-  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
-}
-
-/* 运行中状态点的呼吸闪烁(StateBadge 用) */
-.dot-blink {
-  animation: dot-blink 1.2s ease-in-out infinite;
-}
-@keyframes dot-blink {
-  50% { opacity: 0.2; }
 }

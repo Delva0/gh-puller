@@ -24,6 +24,7 @@ export type {
 } from './types/codemap';
 // 监控会话页(对话/轨迹;宿主 apps/agent-dashboard 主面板组装)
 export { default as MonitorSessionList } from './components/MonitorSessionList';
+export { default as MonitorStatusBar } from './components/MonitorStatusBar';
 export { default as MonitorConversation } from './components/MonitorConversation';
 export type { MonitorView } from './components/MonitorConversation';
 export { default as MonitorChatView } from './components/MonitorChatView';
@@ -38,3 +39,7 @@ export { default as MonitorTrajectoryTimeline } from './components/MonitorTrajec
 export { default as MonitorTrajectoryTable } from './components/MonitorTrajectoryTable';
 // 监控数据层(纯 TS 折叠/快照/时间轴/搜索;零 React)
 export * from './monitor';
+// 监控宿主接线层(hub 连接/会话 store;依赖 window,仅限浏览器端)
+export { useMonitorSocket } from './hooks/useMonitorSocket';
+export type { ConnStatus } from './hooks/useMonitorSocket';
+export { useMonitorSession, sessionStore } from './hooks/useMonitorSession';

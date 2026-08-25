@@ -49,10 +49,10 @@ const Markdown: React.FC<MarkdownProps> = ({ content, mermaidComponent: MermaidC
   // Define markdown components
   const MarkdownComponents: React.ComponentProps<typeof ReactMarkdown>['components'] = {
     p({ children, ...props }: { children?: React.ReactNode }) {
-      return <p className="mb-3 text-sm leading-relaxed dark:text-white" {...props}>{children}</p>;
+      return <p className="mb-3 text-sm leading-relaxed text-[var(--foreground)]" {...props}>{children}</p>;
     },
     h1({ children, ...props }: { children?: React.ReactNode }) {
-      return <h1 className="text-xl font-bold mt-6 mb-3 dark:text-white" {...props}>{children}</h1>;
+      return <h1 className="text-xl font-bold mt-6 mb-3 text-[var(--foreground)]" {...props}>{children}</h1>;
     },
     h2({ children, ...props }: { children?: React.ReactNode }) {
       // Special styling for ReAct headings
@@ -66,7 +66,7 @@ const Markdown: React.FC<MarkdownProps> = ({ content, mermaidComponent: MermaidC
                 text.includes('Action') ? 'bg-green-100 dark:bg-green-900/30 text-green-800 dark:text-green-300' :
                 text.includes('Observation') ? 'bg-amber-100 dark:bg-amber-900/30 text-amber-800 dark:text-amber-300' :
                 text.includes('Answer') ? 'bg-purple-100 dark:bg-purple-900/30 text-purple-800 dark:text-purple-300' :
-                'dark:text-white'
+                'text-[var(--foreground)]'
               }`}
               {...props}
             >
@@ -75,28 +75,28 @@ const Markdown: React.FC<MarkdownProps> = ({ content, mermaidComponent: MermaidC
           );
         }
       }
-      return <h2 className="text-lg font-bold mt-5 mb-3 dark:text-white" {...props}>{children}</h2>;
+      return <h2 className="text-lg font-bold mt-5 mb-3 text-[var(--foreground)]" {...props}>{children}</h2>;
     },
     h3({ children, ...props }: { children?: React.ReactNode }) {
-      return <h3 className="text-base font-semibold mt-4 mb-2 dark:text-white" {...props}>{children}</h3>;
+      return <h3 className="text-base font-semibold mt-4 mb-2 text-[var(--foreground)]" {...props}>{children}</h3>;
     },
     h4({ children, ...props }: { children?: React.ReactNode }) {
-      return <h4 className="text-sm font-semibold mt-3 mb-2 dark:text-white" {...props}>{children}</h4>;
+      return <h4 className="text-sm font-semibold mt-3 mb-2 text-[var(--foreground)]" {...props}>{children}</h4>;
     },
     ul({ children, ...props }: { children?: React.ReactNode }) {
-      return <ul className="list-disc pl-6 mb-4 text-sm dark:text-white space-y-2" {...props}>{children}</ul>;
+      return <ul className="list-disc pl-6 mb-4 text-sm text-[var(--foreground)] space-y-2" {...props}>{children}</ul>;
     },
     ol({ children, ...props }: { children?: React.ReactNode }) {
-      return <ol className="list-decimal pl-6 mb-4 text-sm dark:text-white space-y-2" {...props}>{children}</ol>;
+      return <ol className="list-decimal pl-6 mb-4 text-sm text-[var(--foreground)] space-y-2" {...props}>{children}</ol>;
     },
     li({ children, ...props }: { children?: React.ReactNode }) {
-      return <li className="mb-2 text-sm leading-relaxed dark:text-white" {...props}>{children}</li>;
+      return <li className="mb-2 text-sm leading-relaxed text-[var(--foreground)]" {...props}>{children}</li>;
     },
     a({ children, href, ...props }: { children?: React.ReactNode; href?: string }) {
       return (
         <a
           href={href}
-          className="text-purple-600 dark:text-purple-400 hover:underline font-medium"
+          className="text-[var(--link-color)] hover:underline font-medium"
           target="_blank"
           rel="noopener noreferrer"
           {...props}
@@ -108,7 +108,7 @@ const Markdown: React.FC<MarkdownProps> = ({ content, mermaidComponent: MermaidC
     blockquote({ children, ...props }: { children?: React.ReactNode }) {
       return (
         <blockquote
-          className="border-l-4 border-gray-300 dark:border-gray-700 pl-4 py-1 text-gray-700 dark:text-gray-300 italic my-4 text-sm"
+          className="border-l-4 border-[var(--border-color)] pl-4 py-1 text-[var(--foreground)] italic my-4 text-sm"
           {...props}
         >
           {children}
@@ -125,18 +125,18 @@ const Markdown: React.FC<MarkdownProps> = ({ content, mermaidComponent: MermaidC
       );
     },
     thead({ children, ...props }: { children?: React.ReactNode }) {
-      return <thead className="bg-gray-100 dark:bg-gray-800" {...props}>{children}</thead>;
+      return <thead className="bg-[var(--card-bg)]" {...props}>{children}</thead>;
     },
     tbody({ children, ...props }: { children?: React.ReactNode }) {
-      return <tbody className="divide-y divide-gray-200 dark:divide-gray-700" {...props}>{children}</tbody>;
+      return <tbody className="divide-y divide-[var(--border-color)]" {...props}>{children}</tbody>;
     },
     tr({ children, ...props }: { children?: React.ReactNode }) {
-      return <tr className="hover:bg-gray-50 dark:hover:bg-gray-900" {...props}>{children}</tr>;
+      return <tr className="hover:bg-[var(--muted)]/10" {...props}>{children}</tr>;
     },
     th({ children, ...props }: { children?: React.ReactNode }) {
       return (
         <th
-          className="px-4 py-3 text-left font-medium text-gray-700 dark:text-gray-300"
+          className="px-4 py-3 text-left font-medium text-[var(--foreground)]"
           {...props}
         >
           {children}
@@ -144,7 +144,7 @@ const Markdown: React.FC<MarkdownProps> = ({ content, mermaidComponent: MermaidC
       );
     },
     td({ children, ...props }: { children?: React.ReactNode }) {
-      return <td className="px-4 py-3 border-t border-gray-200 dark:border-gray-700" {...props}>{children}</td>;
+      return <td className="px-4 py-3 border-t border-[var(--border-color)]" {...props}>{children}</td>;
     },
     code(props: {
       inline?: boolean;
@@ -160,7 +160,7 @@ const Markdown: React.FC<MarkdownProps> = ({ content, mermaidComponent: MermaidC
       // Handle Mermaid diagrams(经注入组件渲染,如 webui 的 Mermaid.tsx)
       if (!inline && match && match[1] === 'mermaid' && MermaidComponent) {
         return (
-          <div className="my-8 bg-gray-50 dark:bg-gray-800 rounded-md overflow-hidden shadow-sm">
+          <div className="my-8 bg-[var(--card-bg)] rounded-md overflow-hidden shadow-sm">
             <MermaidComponent
               chart={codeContent}
               className="w-full max-w-full"
@@ -174,6 +174,7 @@ const Markdown: React.FC<MarkdownProps> = ({ content, mermaidComponent: MermaidC
       if (!inline && match) {
         return (
           <div className="my-6 rounded-md overflow-hidden text-sm shadow-sm">
+            {/* 代码块 chrome 保持深色岛:与 tomorrow 语法主题底色一体,豁免 token 化 */}
             <div className="bg-gray-800 text-gray-200 px-5 py-2 text-sm flex justify-between items-center">
               <span>{match[1]}</span>
               <button
@@ -218,7 +219,7 @@ const Markdown: React.FC<MarkdownProps> = ({ content, mermaidComponent: MermaidC
       // Handle inline code
       return (
         <code
-          className={`${className} font-mono bg-gray-100 dark:bg-gray-800 px-2 py-0.5 rounded text-pink-500 dark:text-pink-400 text-sm`}
+          className={`${className} font-mono bg-[var(--muted)]/15 px-2 py-0.5 rounded text-pink-500 dark:text-pink-400 text-sm`}
           {...otherProps}
         >
           {children}

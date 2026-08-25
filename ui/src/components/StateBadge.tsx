@@ -6,7 +6,7 @@ interface StateBadgeProps {
 
 const CLASS: Record<string, string> = {
   running: 'bg-emerald-500/15 text-emerald-500',
-  completed: 'bg-gray-500/15 text-gray-400',
+  completed: 'bg-[var(--muted)]/15 text-[var(--muted)]',
   aborted: 'bg-red-500/15 text-red-500',
 };
 

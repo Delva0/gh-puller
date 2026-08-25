@@ -8,7 +8,7 @@ import './styles.css';
 createRoot(document.getElementById('root')!).render(
   <StrictMode>
     <LanguageProvider>
-      <ThemeProvider attribute="class" defaultTheme="dark" enableSystem={false}>
+      <ThemeProvider attribute="data-theme" defaultTheme="system" enableSystem>
         <App />
       </ThemeProvider>
     </LanguageProvider>

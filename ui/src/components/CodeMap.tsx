@@ -71,18 +71,18 @@ const CodeMap: React.FC<CodeMapProps> = ({ data, phaseStatus, error, onCitationC
     const phase = activePhase(phaseStatus);
     const detail = PHASE_DETAIL[phase];
     return (
-      <div className="p-4 border-t border-gray-200 dark:border-gray-700">
+      <div className="p-4 border-t border-[var(--border-color)]">
         <div className="flex items-center space-x-2">
           <div className="animate-pulse flex space-x-1">
             <div className="h-2 w-2 bg-purple-600 rounded-full"></div>
             <div className="h-2 w-2 bg-purple-600 rounded-full"></div>
             <div className="h-2 w-2 bg-purple-600 rounded-full"></div>
           </div>
-          <span className="text-xs text-gray-500 dark:text-gray-400">
+          <span className="text-xs text-[var(--muted)]">
             📖 Codemap — {detail.header} in progress...
           </span>
         </div>
-        <div className="mt-2 text-xs text-gray-500 dark:text-gray-400 pl-5">
+        <div className="mt-2 text-xs text-[var(--muted)] pl-5">
           <div className="flex flex-col space-y-1">
             {detail.items.map((item, i) => (
               <div key={i} className="flex items-center">

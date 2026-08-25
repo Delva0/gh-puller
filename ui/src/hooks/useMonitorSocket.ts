@@ -1,9 +1,13 @@
+'use client';
+
 // 监控 hub 连接核心(协议 v2):连接/2s 退避重连/帧分发;
 // 订阅窗:subscribe → evt_ready{lastSeq} → history 尾页(loading 期间 live 帧入缓冲)→
 // applyBatch 合并;loading 外 live 经 seq 守卫入 fold,间隙(早/漏帧)→ history(beforeSeq) 补片。
+// 注:依赖 window.location(monitorWsUrl),仅限浏览器宿主使用(勿在 SSR 端导入)。
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { monitorWsUrl, mergeEvents } from '@gh-puller/ui';
-import type { EventEnvelope, HubFrame, SessionMeta } from '@gh-puller/ui';
+import { monitorWsUrl } from '../utils/monitorWs';
+import { mergeEvents } from '../monitor';
+import type { EventEnvelope, HubFrame, SessionMeta } from '../monitor';
 import { sessionStore } from './useMonitorSession';
 
 export type ConnStatus = 'connecting' | 'connected' | 'closed';
