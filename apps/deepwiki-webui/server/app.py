@@ -23,9 +23,9 @@ from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnec
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from fastapi.websockets import WebSocketState
-
 from gh_puller import envs
 from gh_puller.deepwiki import (
+    _LANGUAGE_NAMES,
     AuthorizationConfig,
     ChatCompletionRequest,
     CodeMapRequest,
@@ -33,11 +33,9 @@ from gh_puller.deepwiki import (
     ModelConfig,
     ProcessedProjectEntry,
     Provider,
-    Repo,
     RepoNotIndexedError,
     RepoPrepareRequest,
     RepoRequestBase,
-    TaskStatus,
     WikiCacheData,
     WikiExportRequest,
     WikiTask,
@@ -45,8 +43,6 @@ from gh_puller.deepwiki import (
     WikiTaskStatus,
     WikiTaskSubmitResult,
     WikiTaskSummary,
-    _LANGUAGE_NAMES,
-    _event,
     _index_ready,
     _log,
     _require_indexed,
@@ -57,10 +53,15 @@ from gh_puller.deepwiki import (
     generate_codemap,
     list_processed_projects,
     list_wiki_cache,
-    read_repo_file,
-    read_repo_file_tree,
     read_wiki_cache,
     registry,
+)
+from gh_puller.utils import (
+    Repo,
+    TaskStatus,
+    _event,
+    read_repo_file,
+    read_repo_file_tree,
 )
 
 # 语言与模型契约(仅 HTTP 层展示用;_LANGUAGE_NAMES 为引擎侧映射)
@@ -128,7 +129,7 @@ async def get_auth_status():
 
 @app.post("/auth/validate")
 async def validate_auth_code(request: AuthorizationConfig):
-    return {"success": envs.WIKI_AUTH_CODE == request.code}
+    return {"success": request.code == envs.WIKI_AUTH_CODE}
 
 
 # -- repo 索引(SSE 心跳,同原 repo.py) ----------------------------------------------------------
@@ -151,7 +152,7 @@ async def prepare_repo_index(request: RepoPrepareRequest):
             try:
                 # shield:心跳超时绝不能取消索引任务
                 await asyncio.wait_for(asyncio.shield(task), timeout=_HEARTBEAT_INTERVAL_SEC)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 elapsed += _HEARTBEAT_INTERVAL_SEC
                 yield f"event: progress\ndata: {json.dumps({'elapsed_sec': elapsed})}\n\n"
             except Exception:
@@ -349,7 +350,7 @@ async def delete_wiki(
     if language not in _LANG_CONFIG["supported_languages"]:
         raise HTTPException(status_code=400, detail="Language is not supported")
     if envs.WIKI_AUTH_MODE:
-        if not authorization_code or envs.WIKI_AUTH_CODE != authorization_code:
+        if not authorization_code or authorization_code != envs.WIKI_AUTH_CODE:
             raise HTTPException(status_code=401, detail="Authorization code is invalid")
     try:
         deleted = await delete_wiki_cache(owner, repo, repo_type, language)

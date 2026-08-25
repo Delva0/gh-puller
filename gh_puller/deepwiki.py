@@ -27,35 +27,48 @@ import asyncio
 import json
 import os
 import re
-import subprocess
-import sys
-import time
 import xml.etree.ElementTree as ET
 from datetime import datetime
-from enum import Enum
+from functools import partial
 from pathlib import Path
-from typing import Any, Callable, Literal
-from urllib.parse import quote, urlparse, urlunparse
-
-from pydantic import BaseModel, ConfigDict, Field, computed_field, field_validator
+from typing import Any, Literal
 
 from claude_agent_sdk import ClaudeAgentOptions, create_sdk_mcp_server, tool
+from pydantic import BaseModel, ConfigDict, Field, computed_field, field_validator
 
 from . import envs, graphify
-from .agent import cc_stream, cc_text, llm_stream
+from .agent import cc_stream, llm_stream
+from .utils import (
+    Repo,
+    RepoType,
+    Task,
+    TaskRegistry,
+    TaskStatus,
+    TaskSubmitResult,
+    _estimate_tokens,
+    _event,
+    _extract_json,
+    _find_readme_path,
+    _phase,
+    _sanitize_path_seg,
+    _strip_markdown_fences,
+    detect_default_branch,
+    read_repo_file_tree,
+)
+from .utils import (
+    _log as _utils_log,
+)
 
 # ---------------------------------------------------------------------------
 # 日志与全局路径
 # ---------------------------------------------------------------------------
 
 
-def _log(msg: str) -> None:
-    """进度日志走 stderr(同 graphify.py 约定)。"""
-    print(f"[deepwiki] {msg}", file=sys.stderr, flush=True)
+# 进度日志走 stderr(同 graphify.py 约定);prefix 固定 [deepwiki]
+_log = partial(_utils_log, prefix="deepwiki")
 
 
-# 克隆仓库与 wiki 缓存的根目录(repos 目录与原后端名不同:原为 <root>/repo,此处一致更新为 repos)
-_CLONE_ROOT = os.path.join(envs.DEEPWIKI_ROOT, "repos")
+# wiki 缓存根目录(克隆根 repos 随 Repo 族已移至 utils._CLONE_ROOT)
 _WIKI_CACHE_DIR = os.path.join(envs.DEEPWIKI_ROOT, "wikicache")
 _WIKI_PREFIX = "deepwiki_cache_"
 # 生成中途状态文件前缀(与 deepwiki_cache_ 区分,避免被 list_wiki_cache 当成成品扫描)
@@ -68,11 +81,6 @@ os.makedirs(_WIKI_CACHE_DIR, exist_ok=True)
 _AGENT_CACHE_DIRNAME = "agent_cache"
 # 纯 LLM 路径单文件内联截断(字符)
 _FILE_INLINE_CAP = 8000
-
-
-def _sanitize_path_seg(s: str) -> str:
-    """路径段安全化:page.id 等模型产出值可能含 '/' 或 '..',防目录穿越。"""
-    return re.sub(r"[^A-Za-z0-9._-]", "-", s)
 
 
 def _proj_key(r: Any) -> str:
@@ -443,35 +451,6 @@ Remember:
 """
 
 
-def _build_page_prompt_cc(title: str, file_paths: list[str], out_path: str, language: str) -> str:
-    """cc(agent)页面提示词(现代 agent 风格):只给相关文件相对路径,内容由 agent 自读;成品经 Write 落盘 out_path。"""
-    paths = "\n".join(f"- [{p}]({p})" for p in file_paths)
-    return (
-        "IMPORTANT: you are working INSIDE the repository (cwd = repository root). "
-        "The file contents are NOT inlined in this prompt — read the relevant source files "
-        "yourself with the Read/Grep/Glob tools. All paths below are relative to the repository root.\n\n"
-        + _build_page_prompt(title, paths, language)
-        + f"\n\nDELIVERABLE: Write the complete generated Markdown page to `{out_path}` using the "
-          "Write tool (create the file; do not use Edit). Do NOT return the page in your message "
-          "text — the written file is the only deliverable."
-    )
-
-
-def _build_page_prompt_llm(
-    title: str, file_links: str, content_blocks: list[tuple[str, str]], degraded: bool, language: str,
-) -> str:
-    """纯 LLM 页面提示词(deepwiki-open 同式 + 内联相关文件内容近似其 RAG 注入;超限降级仅链接)。"""
-    prompt = _build_page_prompt(title, file_links, language)
-    if content_blocks:
-        inline = "\n\n".join(f'<file path="{p}">\n{text}\n</file>' for p, text in content_blocks)
-        extra = f"\n\nFILE CONTENT (injected context for citation-accurate writing):\n{inline}"
-    elif degraded:
-        extra = "\n\n<note>输入超限,仅提供文件链接,请依代码检索。</note>"
-    else:
-        extra = ""
-    return prompt + extra
-
-
 _COMPREHENSIVE_STRUCTURE = """
 Create a structured wiki with the following main sections:
 - Overview (general information about the project)
@@ -550,125 +529,9 @@ Return your analysis in the following XML format:
 """
 
 
-def _build_structure_prompt(
-    owner: str,
-    repo_name: str,
-    file_tree: str,
-    readme: str,
-    comprehensive: bool,
-    language: str,
-) -> str:
-    """wiki 结构确定提示词(移植 determineWikiStructure)。"""
-    structure_format = _COMPREHENSIVE_STRUCTURE if comprehensive else _CONCISE_STRUCTURE
-    page_count = "8-12" if comprehensive else "4-6"
-    kind = "comprehensive" if comprehensive else "concise"
-    return f"""Analyze this GitHub repository {owner}/{repo_name} and create a wiki structure for it.
-
-1. The complete file tree of the project:
-<file_tree>
-{file_tree}
-</file_tree>
-
-2. The README file of the project:
-<readme>
-{readme}
-</readme>
-
-I want to create a wiki for this repository. Determine the most logical structure for a wiki based on the repository's content.
-
-IMPORTANT: The wiki content will be generated in {_language_name(language)} language.
-
-When designing the wiki structure, include pages that would benefit from visual diagrams, such as:
-- Architecture overviews
-- Data flow descriptions
-- Component relationships
-- Process workflows
-- State machines
-- Class hierarchies
-{structure_format}
-IMPORTANT FORMATTING INSTRUCTIONS:
-- Return ONLY the valid XML structure specified above
-- DO NOT wrap the XML in markdown code blocks (no ``` or ```xml)
-- DO NOT include any explanation text before or after the XML
-- Ensure the XML is properly formatted and valid
-- Start directly with <wiki_structure> and end with </wiki_structure>
-
-IMPORTANT:
-1. Create {page_count} pages that would make a {kind} wiki for this repository
-2. Each page should focus on a specific aspect of the codebase (e.g., architecture, key features, setup)
-3. The relevant_files should be actual files from the repository that would be used to generate that page
-4. Return ONLY valid XML with the structure specified above, with no markdown code block delimiters"""
-
-
-def _build_structure_prompt_cc(
-    owner: str,
-    repo_name: str,
-    file_tree: str,
-    readme_path: str | None,
-    repo_root: str,
-    comprehensive: bool,
-    language: str,
-    out_path: str,
-) -> str:
-    """cc(agent)结构提示词(现代 agent 风格):输入只给路径(文件树+README 路径),不内联内容;
-    成品 XML 由 agent 用 Write 工具直接落盘 out_path,而不是作为 result 文本返回。"""
-    structure_format = _COMPREHENSIVE_STRUCTURE if comprehensive else _CONCISE_STRUCTURE
-    page_count = "8-12" if comprehensive else "4-6"
-    kind = "comprehensive" if comprehensive else "concise"
-    readme_line = (
-        f"2. The README file of the project is at: {repo_root}/{readme_path}\n"
-        "   Read it yourself with the Read tool.\n"
-        if readme_path
-        else "2. No README file was found in this repository; skip it.\n"
-    )
-    return f"""IMPORTANT: you are working INSIDE the repository (cwd = repository root at {repo_root}).
-The file contents are NOT inlined in this prompt — read source files yourself with the
-Read/Grep/Glob tools. All paths below are relative to the repository root.
-
-Analyze this repository {owner}/{repo_name} and create a wiki structure for it.
-
-1. The complete relative file tree of the project:
-<file_tree>
-{file_tree}
-</file_tree>
-
-{readme_line}
-I want to create a wiki for this repository. Determine the most logical structure for a wiki based on the repository's content.
-
-IMPORTANT: The wiki content will be generated in {_language_name(language)} language.
-
-When designing the wiki structure, include pages that would benefit from visual diagrams, such as:
-- Architecture overviews
-- Data flow descriptions
-- Component relationships
-- Process workflows
-- State machines
-- Class hierarchies
-{structure_format}
-IMPORTANT FORMATTING INSTRUCTIONS:
-- Return ONLY the valid XML structure specified above
-- DO NOT wrap the XML in markdown code blocks (no ``` or ```xml)
-- DO NOT include any explanation text before or after the XML
-- Ensure the XML is properly formatted and valid
-- Start directly with <wiki_structure> and end with </wiki_structure>
-
-DELIVERABLE: Write the complete XML to the file {out_path} using the Write tool (create the file;
-do not use Edit). Do NOT return the XML in your message text — the written file is the only deliverable.
-
-IMPORTANT:
-1. Create {page_count} pages that would make a {kind} wiki for this repository
-2. Each page should focus on a specific aspect of the codebase (e.g., architecture, key features, setup)
-3. The relevant_files should be actual files from the repository that would be used to generate that page
-4. Do not inline file contents into this prompt — use your tools to read the files.
-{_agent_note()}"""
-
-
 # ---------------------------------------------------------------------------
 # Pydantic 契约模型(与 deepwiki-open api/schemas 同形)
 # ---------------------------------------------------------------------------
-
-RepoType = Literal["local", "github", "gitlab", "bitbucket"]
-
 
 class RepoRequestBase(BaseModel):
     repo_url: str = Field(..., description="URL or local path of the repository")
@@ -692,6 +555,13 @@ class RepoRequestBase(BaseModel):
     included_files: list[str] = Field(
         default_factory=list,
         description="List or newline-separated string of file patterns to include exclusively",
+    )
+    generator: str | None = Field(
+        default=None,
+        description=(
+            "生成模式快照(cc/llm);由 _persist_state 落盘时以 envs.DEEPWIKI_GENERATOR 盖戳,"
+            "续跑时据此校验,防止跨模式混用产物"
+        ),
     )
 
     @field_validator(
@@ -762,18 +632,6 @@ class CodeMapRequest(RepoRequestBase):
     question: str = Field(..., description="The user's how-to / usage question")
 
 
-class TaskStatus(str, Enum):
-    PENDING = "pending"
-    INDEXING = "indexing"
-    DETERMINING_STRUCTURE = "determining_structure"
-    GENERATING = "generating"
-    COMPLETED = "completed"
-    FAILED = "failed"
-
-    def is_terminal(self) -> bool:
-        return self in (TaskStatus.COMPLETED, TaskStatus.FAILED)
-
-
 class WikiTaskRequest(RepoRequestBase):
     owner: str
     repo: str
@@ -784,20 +642,8 @@ class WikiTaskRequest(RepoRequestBase):
         return f"{self.type}_{self.owner}_{self.repo}"
 
 
-class WikiTaskSubmitResult(BaseModel):
-    task_id: str
-    status: TaskStatus | str
-    created: bool = False
-    joined: bool = False
-    from_cache: bool = False
-    resumed: bool = False  # 从落盘状态续跑(同仓库再提交命中生成状态)
-
-    @field_validator("status", mode="before")
-    @classmethod
-    def _status_validate(cls, value):
-        if isinstance(value, str):
-            return TaskStatus(value.lower())
-        return value
+# 通用化:直接别名(task_id/status/from_cache/resumed 语义同 utils.TaskSubmitResult)
+WikiTaskSubmitResult = TaskSubmitResult
 
 
 class RepoInfo(BaseModel):
@@ -841,6 +687,7 @@ class WikiCacheData(BaseModel):
     repo: RepoInfo | None = None
     provider: str | None = None
     model: str | None = None
+    generator: str | None = None  # 生成模式快照(cc/llm);缓存命中时校验,防跨模式混用
 
 
 class WikiTaskState(BaseModel):
@@ -918,237 +765,7 @@ class AuthorizationConfig(BaseModel):
     code: str = Field(..., description="Authorization code")
 
 
-# ---------------------------------------------------------------------------
-# Repo:git CLI 克隆(local 路径直读)
-# ---------------------------------------------------------------------------
 
-
-def _path_is_url(path: str) -> bool:
-    """判别 URL 或本地路径(同原 repository.py)。"""
-    try:
-        result = urlparse(path)
-        return result.scheme in {"http", "https", "ftp"} and bool(result.netloc)
-    except Exception:
-        return False
-
-
-def _clone_url_with_token(repo_url: str, repo_type: str, token: str) -> str:
-    """按 host 方案把 PAT 注入克隆 URL(三 host 前缀不同,移植自原 repository.py)。"""
-    parsed = urlparse(repo_url)
-    quoted = quote(token, safe="")
-    if repo_type == "github":
-        netloc = f"{quoted}@{parsed.netloc}"
-    elif repo_type == "gitlab":
-        netloc = f"oauth2:{quoted}@{parsed.netloc}"
-    else:  # bitbucket:ATCTT 前缀的 HTTP access token 用 x-bitbucket-api-token-auth,app password 用 x-token-auth
-        scheme = "x-bitbucket-api-token-auth" if token.startswith("ATCTT") else "x-token-auth"
-        netloc = f"{scheme}:{quoted}@{parsed.netloc}"
-    return urlunparse((parsed.scheme, netloc, parsed.path, "", "", ""))
-
-
-class Repo:
-    """远程仓库或本地路径的统一句柄:URL → git CLI 克隆到 <root>/<name>,本地路径 → 直读。"""
-
-    def __init__(
-        self,
-        repo_url: str,
-        repo_type: str | None = None,
-        root_path: str = _CLONE_ROOT,
-        access_token: str | None = None,
-    ):
-        self.repo_url = repo_url
-        self.repo_type = repo_type or "github"
-        self.root_path = root_path
-        self.access_token = access_token
-        os.makedirs(root_path, exist_ok=True)
-
-    @staticmethod
-    def _extract_repo_name(repo_url: str, repo_type: str | None) -> str:
-        if _path_is_url(repo_url):
-            url_parts = repo_url.rstrip("/").split("/")
-            if repo_type in ("github", "gitlab", "bitbucket") and len(url_parts) >= 5:
-                # {owner}_{repo};gitlab 的多级 group 取最后两级(与原版同式)
-                return f"{url_parts[-2]}_{url_parts[-1].replace('.git', '')}"
-            return url_parts[-1].replace(".git", "")
-        return os.path.basename(os.path.normpath(repo_url))
-
-    @property
-    def name(self) -> str:
-        return self._extract_repo_name(self.repo_url, self.repo_type)
-
-    @property
-    def is_local(self) -> bool:
-        return not _path_is_url(self.repo_url)
-
-    @property
-    def save_path(self) -> str:
-        return self.repo_url if self.is_local else os.path.join(self.root_path, self.name)
-
-    @property
-    def downloaded(self) -> bool:
-        return os.path.exists(self.save_path) and bool(os.listdir(self.save_path))
-
-    def download(self, force: bool = False) -> None:
-        """git CLI 克隆(depth=1 单分支);失败转 ValueError,错误信息隐藏 token。"""
-        if force or (not self.downloaded and not self.is_local):
-            os.makedirs(self.save_path, exist_ok=True)
-            url = (
-                _clone_url_with_token(self.repo_url, self.repo_type, self.access_token)
-                if self.access_token
-                else self.repo_url
-            )
-            try:
-                subprocess.run(
-                    ["git", "clone", "--depth=1", "--single-branch", url, self.save_path],
-                    capture_output=True,
-                    text=True,
-                    check=True,
-                    timeout=600,
-                )
-            except FileNotFoundError as e:
-                raise RuntimeError("Missing `git` in current environment") from e
-            except subprocess.CalledProcessError as e:
-                msg = (e.stderr or str(e)).strip()
-                if self.access_token:  # 一律抹掉 token(原始与百分号编码两种形态)
-                    token = self.access_token
-                    msg = msg.replace(token, "***TOKEN***").replace(
-                        quote(token, safe=""), "***TOKEN***"
-                    )
-                raise ValueError(msg)
-
-    def __repr__(self) -> str:
-        return f"{self.repo_type}: {self.name}"
-
-
-# ---------------------------------------------------------------------------
-# 文件树与过滤(原 api/config.py 的 iterate_files + repo.json 规则精简内嵌)
-# ---------------------------------------------------------------------------
-
-
-def _should_process_file(
-    rel_parts: tuple[str, ...],
-    use_inclusion: bool,
-    included_dirs: list[str],
-    included_files: list[str],
-    excluded_dirs: list[str],
-    excluded_files: list[str],
-) -> bool:
-    """路径片段规则(与原版同逻辑:目录名任意一段包含匹配;文件名完全匹配或 endswith)。"""
-    name = rel_parts[-1]
-    if use_inclusion:
-        if included_dirs:
-            for included in included_dirs:
-                if included.strip("/") in rel_parts:
-                    return True
-        if included_files:
-            for included_file in included_files:
-                if name == included_file or name.endswith(included_file):
-                    return True
-        return not included_dirs and not included_files
-    for excluded in excluded_dirs:
-        if excluded.strip("/") in rel_parts:
-            return False
-    for excluded_file in excluded_files:
-        if name == excluded_file:
-            return False
-    return True
-
-
-def iterate_files(
-    root_dir: str,
-    included_files: list[str] | None = None,
-    included_dirs: list[str] | None = None,
-    excluded_files: list[str] | None = None,
-    excluded_dirs: list[str] | None = None,
-) -> list[str]:
-    """遍历仓库,返回值得处理的相对路径列表(扩展名限制 + include/exclude 规则)。"""
-    root = Path(root_dir).resolve()
-    use_inclusion = bool(included_dirs or included_files)
-    if use_inclusion:
-        inc_dirs = list(set(included_dirs or []))
-        inc_files = list(set(included_files or []))
-        exc_dirs: list[str] = []
-        exc_files: list[str] = []
-    else:
-        exc_dirs = list(set(_DEFAULT_EXCLUDED_DIRS).union(excluded_dirs or []))
-        exc_files = list(set(_DEFAULT_EXCLUDED_FILES).union(excluded_files or []))
-        inc_dirs = []
-        inc_files = []
-
-    results: list[str] = []
-    for p in root.rglob("*"):
-        if not p.is_file():
-            continue
-        if p.suffix.lower() not in _PROCESS_EXTENSIONS:
-            continue
-        rel_parts = tuple(p.relative_to(root).parts)
-        if _should_process_file(
-            rel_parts, use_inclusion, inc_dirs, inc_files, exc_dirs, exc_files
-        ):
-            results.append("/".join(rel_parts))
-    return results
-
-
-def read_repo_file_tree(
-    path: str,
-    included_files: list[str] | None = None,
-    included_dirs: list[str] | None = None,
-    excluded_files: list[str] | None = None,
-    excluded_dirs: list[str] | None = None,
-) -> tuple[list[str], str]:
-    """遍历克隆/本地仓库 → (文件列表, README.md 文本)。"""
-    files = iterate_files(
-        root_dir=path,
-        included_files=included_files,
-        included_dirs=included_dirs,
-        excluded_dirs=excluded_dirs,
-        excluded_files=excluded_files,
-    )
-    readme = ""
-    for file in sorted(files, key=len):
-        if os.path.splitext(file)[0].lower().endswith("readme"):
-            try:
-                readme = Path(path, file).read_text(encoding="utf-8")
-            except OSError as e:
-                _log(f"读取 README 失败: {file} - {e}")
-                readme = ""
-            break
-    return files, readme
-
-
-def _find_readme_path(files: list[str]) -> str | None:
-    """从文件列表选出 README 相对路径(与 read_repo_file_tree 的选取规则同式);无则 None。"""
-    for file in sorted(files, key=len):
-        if os.path.splitext(file)[0].lower().endswith("readme"):
-            return file
-    return None
-
-
-def detect_default_branch(path: str) -> str:
-    """返回当前检出分支;失败回退 "main"(与原版同)。"""
-    try:
-        result = subprocess.run(
-            ["git", "-C", path, "rev-parse", "--abbrev-ref", "HEAD"],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        return result.stdout.strip() or "main"
-    except (subprocess.SubprocessError, OSError):
-        return "main"
-
-
-def read_repo_file(repo_url: str, repo_type: str | None, file_path: str) -> str:
-    """读取仓库内文件,带路径穿越防护(原 codemap.py 同式)。"""
-    repo = Repo(repo_url=repo_url, repo_type=repo_type)
-    repo_dir = os.path.realpath(repo.save_path)
-    target = os.path.realpath(os.path.join(repo_dir, file_path))
-    if os.path.commonpath([repo_dir, target]) != repo_dir:
-        raise ValueError("Resolved path escapes the repository directory")
-    if not os.path.isfile(target):
-        raise FileNotFoundError(file_path)
-    with open(target, "r", encoding="utf-8", errors="replace") as f:
-        return f.read()
 
 
 def _locate_snippet(text: str, snippet: str) -> tuple[int, int] | None:
@@ -1180,7 +797,7 @@ def _ground_citations(codemap: CodeMap, repo_dir: str) -> None:
             if cit.file_path not in file_cache:
                 path = os.path.join(repo_dir, cit.file_path)
                 try:
-                    with open(path, "r", encoding="utf-8") as f:
+                    with open(path, encoding="utf-8") as f:
                         file_cache[cit.file_path] = f.read()
                 except (OSError, UnicodeDecodeError):
                     file_cache[cit.file_path] = None
@@ -1289,12 +906,15 @@ def _agent_options(
 
 async def _agent_stream(
     system_prompt: str, prompt: str, repo: Repo | None = None, model: str | None = None,
-    label: str | None = None,
+    label: str | None = None, *, run_id: str | None = None,
+    context: list[dict] | None = None, retry: dict | None = None,
 ):
     """agent 流式应答:转发文本增量,语义与旧漏斗逐字节一致(见 agent.cc_stream);
-    label 作为监控会话名(chat:/codemap:/wiki: 前缀区分用途)。"""
+    label 作为监控会话名(chat:/codemap:/wiki: 前缀区分用途);run_id 关联任务级
+    会话组;context = 上下文注入/修改说明事件;retry = 重试元数据(见 events.py)。"""
     options = _agent_options(system_prompt, repo, model)
-    async for chunk in cc_stream(options, prompt, session_name=label):
+    async for chunk in cc_stream(options, prompt, session_name=label, run_id=run_id,
+                                 context=context, retry=retry):
         yield chunk
 
 
@@ -1309,18 +929,21 @@ def _agent_note() -> str:
 
 async def _agent_text(
     system_prompt: str, prompt: str, repo: Repo | None = None, model: str | None = None,
-    label: str | None = None,
+    label: str | None = None, *, run_id: str | None = None,
+    context: list[dict] | None = None, retry: dict | None = None,
 ) -> str:
     """agent 整收应答(用于 wiki 结构/页面、codemap 两阶段)。"""
     parts: list[str] = []
-    async for chunk in _agent_stream(system_prompt, prompt, repo, model, label):
+    async for chunk in _agent_stream(system_prompt, prompt, repo, model, label,
+                                     run_id=run_id, context=context, retry=retry):
         parts.append(chunk)
     return "".join(parts)
 
 
 async def _agent_write_file(
     system_prompt: str, prompt: str, repo: Repo, model: str | None, out_path: Path,
-    label: str | None = None,
+    label: str | None = None, *, run_id: str | None = None,
+    context: list[dict] | None = None, retry: dict | None = None,
 ) -> str:
     """cc 交付件统一落盘口:提示词只给路径,agent 用自身工具读码并把成品写入 out_path;
     产生以文件为准(流式文本仅作监控/错误检测),未产出文件即任务失败。"""
@@ -1330,7 +953,8 @@ async def _agent_write_file(
         system_prompt, repo, model,
         agent_output_dir=str(out_path.parent), agent_write_mode=True,
     )
-    async for _ in cc_stream(options, prompt, session_name=label):
+    async for _ in cc_stream(options, prompt, session_name=label, run_id=run_id,
+                             context=context, retry=retry):
         pass
     text = await asyncio.to_thread(out_path.read_text, encoding="utf-8")
     if not text.strip():
@@ -1715,6 +1339,8 @@ async def delete_wiki_task_state(owner: str, repo: str, repo_type: str, language
 
 async def _persist_state(task: "WikiTask") -> None:
     """把任务当前进度落盘(结构/已完成页/状态);并发写由模块锁串行。"""
+    # 写盘即盖戳生成模式:续跑(load_resume)据此校验,跨模式切换后丢弃旧快照
+    task.request.generator = envs.DEEPWIKI_GENERATOR
     state = WikiTaskState(
         request=task.request,
         status=task.status,
@@ -1850,134 +1476,15 @@ def _format_request_fmt(request: RepoRequestBase) -> dict:
 
 
 async def chat_stream(request: ChatCompletionRequest):
-    """一次 chat 请求的流式应答(纯文本 chunk 序列,前后端协议同原 research_chat)。"""
-    if not request.messages:
-        raise ValueError("No messages provided")
-    last = request.messages[-1]
-    if last.role != "user":
-        raise ValueError("Last message must be from the user")
+    """一次 chat 请求的流式应答(纯文本 chunk 序列,前后端协议同原 research_chat);恒 agent 路。"""
+    async for chunk in _agent_pipeline().chat_stream(request):
+        yield chunk
 
-    # 注:未索引的前置校验已上移到端点层(_require_indexed),生成器内不再重复
-    repo = Repo(request.repo_url, request.type, access_token=request.token)
-
-    fmt = _format_request_fmt(request)
-    is_deep = last.mode == "deep_research"
-    if is_deep:
-        # continuation 回退:含 continue+research 时换回首个用户消息(移植 research.py)
-        if "continue" in last.content.lower() and "research" in last.content.lower():
-            for msg in request.messages:
-                if msg.role == "user" and "continue" not in msg.content.lower():
-                    last.content = msg.content.strip()
-                    break
-        if request.research_iteration == 1:
-            system = _DEEP_RESEARCH_FIRST_ITERATION_PROMPT.format(**fmt)
-        elif request.research_iteration >= 5:
-            system = _DEEP_RESEARCH_FINAL_ITERATION_PROMPT.format(**fmt)
-        else:
-            system = _DEEP_RESEARCH_INTERMEDIATE_ITERATION_PROMPT.format(
-                **fmt, research_iteration=request.research_iteration
-            )
-    else:
-        system = _SIMPLE_CHAT_SYSTEM_PROMPT.format(**fmt)
-
-    # 对话历史成对拼装;输入过大时省略历史(仿 prompt_builder 的简化路径)
-    history = ""
-    if len(request.messages) > 1:
-        if _estimate_tokens(last.content) > envs.CHAT_TOKEN_LIMIT_ESTIMATE:
-            _log(f"请求过大(估算 {_estimate_tokens(last.content)} tokens),省略对话历史")
-        else:
-            turns = ""
-            for i in range(0, len(request.messages) - 1, 2):
-                user, assistant = request.messages[i], request.messages[i + 1]
-                if user.role == "user" and assistant.role == "assistant":
-                    turns += f"<turn>\n<user>{user.content}</user>\n<assistant>{assistant.content}</assistant>\n</turn>\n"
-            if turns:
-                history = f"<conversation_history>\n{turns}</conversation_history>\n\n"
-
-    prompt = history + _agent_note() + f"<query>\n{last.content}\n</query>\n\nAssistant: "
-    try:
-        async for chunk in _agent_stream(
-            system, prompt, repo=repo, model=request.model, label=f"chat:{repo.name}"
-        ):
-            yield chunk
-    except Exception as e:  # 执行期失败降级为可读错误文本(同原 stream_and_fallback 语义)
-        _log(f"chat agent 错误: {e}")
-        yield "\n\n(抱歉,本次请求处理失败: {0})".format(e)
-
-
-def _estimate_tokens(text: str) -> int:
-    """粗略 token 估算:约 4 字符/token(不引 tiktoken,与原 MAX_INPUT_TOKENS 提示语义对齐)。"""
-    return max(1, len(text) // 4)
-
-
-def _strip_markdown_fences(content: str) -> str:
-    """剥离整体 markdown code fence(模型偶尔会包一层)。"""
-    content = re.sub(r"^```markdown\s*", "", content, flags=re.IGNORECASE)
-    content = re.sub(r"```\s*$", "", content)
-    return content
 
 
 # ---------------------------------------------------------------------------
 # codemap 服务(agent 版两阶段;NDJSON 事件协议同原)
 # ---------------------------------------------------------------------------
-
-
-def _event(**payload) -> str:
-    """序列化一行 NDJSON 事件。"""
-    return json.dumps(payload, ensure_ascii=False) + "\n"
-
-
-def _phase(phase: str, status: str, **extra) -> str:
-    return _event(type="phase", phase=phase, status=status, **extra)
-
-
-def _repair_json(candidate: str) -> str:
-    """修复常见 LLM JSON 瑕疵(尾逗号、`" "key":`)。"""
-    repaired = re.sub(r",\s*([}\]])", r"\1", candidate)  # trailing commas
-    repaired = re.sub(r'"\s+"(\w+)"\s*:', r'"\1":', repaired)
-    return repaired
-
-
-def _extract_json(text: str) -> dict:
-    """从模型输出中尽力提取单个 JSON 对象(剥 fence、平衡花括号扫描、瑕疵修复)。"""
-    if not text:
-        raise ValueError("Empty model response")
-    cleaned = text.strip()
-    if cleaned.startswith("```"):
-        cleaned = cleaned.split("\n", 1)[-1]
-        if cleaned.rstrip().endswith("```"):
-            cleaned = cleaned.rstrip()[:-3]
-    start = cleaned.find("{")
-    if start == -1:
-        raise ValueError("No JSON object found in model response")
-    depth = 0
-    in_str = False
-    escape = False
-    candidate = cleaned[start:]
-    for i in range(start, len(cleaned)):
-        ch = cleaned[i]
-        if in_str:
-            if escape:
-                escape = False
-            elif ch == "\\":
-                escape = True
-            elif ch == '"':
-                in_str = False
-            continue
-        if ch == '"':
-            in_str = True
-        elif ch == "{":
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0:
-                candidate = cleaned[start : i + 1]
-                break
-    try:
-        return json.loads(candidate)
-    except json.JSONDecodeError:
-        return json.loads(_repair_json(candidate))  # 仍可能抛 → 调用方重试
-
 
 def _codemap_note() -> str:
     """codemap 指引:先查图谱再构造,引用行号取自 Source 标记。"""
@@ -1990,95 +1497,26 @@ def _codemap_note() -> str:
 
 
 async def generate_codemap(request: CodeMapRequest):
-    """两阶段 codemap 生成(骨架 → 指南/图),NDJSON 事件流;阶段失败语义与原相同。"""
-    try:
-        repo = Repo(request.repo_url, request.type, access_token=request.token)
-    except Exception:
-        repo = Repo(request.repo_url, request.type)
-
-    yield _phase("analyzing", "start")
-    if not _index_ready(repo):
-        yield _phase("analyzing", "done", chunk_count=0)
-        yield _event(type="error", stage="analyzing", message=f"仓库尚未索引,请先 /repo/prepare: {repo.name}")
-        return
-    yield _phase("analyzing", "done", chunk_count=0)
-
-    fmt = {
-        "repo_type": request.type,
-        "repo_url": request.repo_url,
-        "repo_name": repo.name,
-        "language_name": _language_name(request.language or "en"),
-    }
-
-    async def _run_json(prompt: str, attempts: int = 3) -> dict:
-        """整收 + 解析 JSON,失败重试(每轮新 agent);system 恒用骨架提示词。"""
-        last_error: Exception | None = None
-        for attempt in range(1, attempts + 1):
-            try:
-                raw = await _agent_text(
-                    _CODEMAP_SKELETON_PROMPT.format(**fmt), prompt, repo=repo,
-                    model=request.model, label="codemap:skeleton",
-                )
-                return _extract_json(raw)
-            except Exception as e:  # noqa: BLE001
-                last_error = e
-                _log(f"codemap JSON 解析尝试 {attempt}/{attempts} 失败: {e}")
-        raise ValueError(f"Model did not return valid JSON after {attempts} attempts: {last_error}")
-
-    # 阶段 1:骨架
-    yield _phase("initial_codemap", "start")
-    skeleton_prompt = _codemap_note() + f"<query>\n{request.question}\n</query>\n\nAssistant: "
-    try:
-        skeleton = CodeMap.model_validate(await _run_json(skeleton_prompt))
-    except Exception as e:  # noqa: BLE001
-        _log(f"codemap 骨架失败: {e}")
-        yield _event(type="error", stage="initial_codemap", message=str(e))
-        return
-    yield _phase("initial_codemap", "done", section_count=len(skeleton.sections))
-
-    # 阶段 2:指南/图;i/骨架失败不致命 — 退化为骨架
-    yield _phase("diagrams", "start")
-    enrich_query = (
-        f"{request.question}\n\n<SKELETON>\n{skeleton.model_dump_json()}\n</SKELETON>"
-    )
-    enrich_prompt = _codemap_note() + f"<query>\n{enrich_query}\n</query>\n\nAssistant: "
-    final = skeleton
-    try:
-        raw = await _agent_text(
-            _CODEMAP_ENRICH_PROMPT.format(**fmt), enrich_prompt, repo=repo,
-            model=request.model, label="codemap:enrich",
-        )
-        final = CodeMap.model_validate(_extract_json(raw))
-        yield _phase("diagrams", "done")
-    except Exception as e:  # noqa: BLE001
-        _log(f"codemap 指南/图失败,使用骨架: {e}")
-        yield _phase("diagrams", "done", degraded=True)
-
-    _ground_citations(final, repo.save_path)
-    yield _event(type="codemap", data=final.model_dump())
-    yield _event(type="done")
+    """两阶段 codemap 生成(骨架 → 指南/图),NDJSON 事件流;阶段失败语义与原相同;恒 agent 路。"""
+    async for ev in _agent_pipeline().generate_codemap(request):
+        yield ev
 
 
 # ---------------------------------------------------------------------------
 # wiki 任务状态机(移植 api/services/wiki/tasks.py;RAG → agent + graphify)
+# 状态机/去重/并发/TTL 基类在 utils.TaskRegistry,此处仅注入 wiki 特化钩子
 # ---------------------------------------------------------------------------
 
 
-class WikiTask(BaseModel):
-    """单个仓库生成任务的内存态状态。"""
-
-    model_config = ConfigDict(arbitrary_types_allowed=True)
+class WikiTask(Task):
+    """单个仓库生成任务的内存态状态(状态/错误/提交时间/运行时任务由 Task 基类承担)。"""
 
     request: WikiTaskRequest
-    status: TaskStatus = TaskStatus.PENDING
     pages_done: int = 0
     current_page_ids: list[str] = Field(default_factory=list)
     generated_pages: dict[str, WikiPage] = Field(default_factory=dict)  # 完成页就地累积(续跑=已生成页)
     wiki_structure: WikiStructureModel | None = None
     default_branch: str = "main"  # 确定结构时设置,用于文件 URL
-    error: str | None = None
-    submitted_at: int = Field(default_factory=lambda: int(time.time() * 1000))
-    task: asyncio.Task | None = Field(default=None, repr=False)
 
     @computed_field
     @property
@@ -2094,6 +1532,10 @@ class WikiTask(BaseModel):
     @property
     def repo_key(self) -> str:
         return self.request.repo_key
+
+    @property
+    def key(self) -> str:
+        return self.repo_key
 
     def to_status(self) -> WikiTaskStatus:
         r = self.request
@@ -2129,82 +1571,531 @@ class WikiTask(BaseModel):
         )
 
 
-class TaskRegistry:
-    """提交/并发/TTL 迟移除(与原实现同式)。"""
+class WikiTaskRegistry(TaskRegistry):
+    """wiki 专属提交语义(缓存胜/续跑/生成器执行)经钩子注入;TTL 读模块全局供测试 monkeypatch。"""
 
-    def __init__(self, max_concurrent: int = _MAX_CONCURRENT_WIKI_TASKS):
-        self._tasks: dict[str, WikiTask] = {}
-        self._lock = asyncio.Lock()
-        self._semaphore = asyncio.Semaphore(max(1, max_concurrent))
+    async def run(self, task: WikiTask) -> None:
+        await generate_repo_wiki(task)  # 调用时经模块全局解析(monkeypatch 生效)
 
-    def get(self, id: str) -> WikiTask | None:
-        return self._tasks.get(id)
-
-    def active(self) -> list[WikiTask]:
-        return [t for t in self._tasks.values() if not t.status.is_terminal()]
-
-    async def remove(self, id: str) -> WikiTask | None:
-        async with self._lock:
-            return self._tasks.pop(id, None)
-
-    async def submit(self, task: WikiTask) -> WikiTaskSubmitResult:
-        key = task.repo_key
-        async with self._lock:
-            exist_task = self.get(key)
-            if exist_task and not exist_task.status.is_terminal():
-                return WikiTaskSubmitResult(
-                    task_id=key, status=exist_task.status, joined=True
-                )
-            owner, repo, rtype, lang = (
-                task.request.owner,
-                task.request.repo,
-                task.request.type,
-                task.request.language,
+    async def is_cached(self, task: WikiTask) -> bool:
+        r = task.request
+        if not wiki_cache_exists(owner=r.owner, repo=r.repo, repo_type=r.type, language=r.language):
+            return False
+        cache = await read_wiki_cache(r.owner, r.repo, r.type, r.language)
+        if cache is None:
+            return False
+        if cache.generator != envs.DEEPWIKI_GENERATOR:
+            _log(
+                f"成品缓存生成模式不匹配({cache.generator!r} vs {envs.DEEPWIKI_GENERATOR!r}),"
+                f"忽略并重新生成: {r.owner}/{r.repo}"
             )
-            if wiki_cache_exists(owner=owner, repo=repo, repo_type=rtype, language=lang):
-                # 缓存胜:顺带清掉陈旧状态(_save 后删状态前崩溃的残留)
-                await delete_wiki_task_state(owner, repo, rtype, lang)
-                return WikiTaskSubmitResult(
-                    task_id=key, status=TaskStatus.COMPLETED, from_cache=True
-                )
-            state = await read_wiki_task_state(owner, repo, rtype, lang)
-            if state is not None:
-                # 续跑:复用落盘的结构/进度,跳过已完成部分(current_page_ids 不恢复:
-                #原进程的在途瞬态已失效)
-                task = WikiTask(
-                    request=state.request,
-                    status=(
-                        TaskStatus.GENERATING
-                        if state.wiki_structure is not None
-                        else TaskStatus.DETERMINING_STRUCTURE
-                    ),
-                    pages_done=len(state.generated_pages),
-                    wiki_structure=state.wiki_structure,
-                    default_branch=state.default_branch,
-                    submitted_at=state.submitted_at,  # 保留原始提交时间
-                    generated_pages=state.generated_pages,
-                )
-            task.task = asyncio.create_task(self._run(task))
-            self._tasks[key] = task
-            return WikiTaskSubmitResult(
-                task_id=key, status=task.status, created=True, resumed=state is not None
+            return False
+        return True
+
+    async def on_cache_hit(self, task: WikiTask) -> None:
+        r = task.request
+        await delete_wiki_task_state(r.owner, r.repo, r.type, r.language)
+
+    async def load_resume(self, task: WikiTask) -> WikiTask | None:
+        r = task.request
+        state = await read_wiki_task_state(r.owner, r.repo, r.type, r.language)
+        if state is None:
+            return None
+        # 快照含首次输入(含 generator):生成模式不同则丢弃旧进度并清状态,避免跨模式混用产物
+        if state.request.generator != envs.DEEPWIKI_GENERATOR:
+            _log(
+                f"续跑状态生成模式不匹配({state.request.generator!r} vs {envs.DEEPWIKI_GENERATOR!r}),"
+                f"丢弃旧快照: {r.owner}/{r.repo}"
             )
+            await delete_wiki_task_state(r.owner, r.repo, r.type, r.language)
+            return None
+        return WikiTask(
+            request=state.request,
+            status=(
+                TaskStatus.GENERATING
+                if state.wiki_structure is not None
+                else TaskStatus.DETERMINING_STRUCTURE
+            ),
+            pages_done=len(state.generated_pages),
+            wiki_structure=state.wiki_structure,
+            default_branch=state.default_branch,
+            submitted_at=state.submitted_at,  # 保留原始提交时间
+            generated_pages=state.generated_pages,
+        )
 
-    async def _run(self, task: WikiTask) -> None:
-        async with self._semaphore:
-            await generate_repo_wiki(task)
-        self._schedule_remove(task)
-
-    def _schedule_remove(self, task: WikiTask) -> None:
-        async def remove() -> None:
-            await asyncio.sleep(_WIKI_TASK_TTL_SECONDS)
-            if self.get(task.repo_key) is task and task.status.is_terminal():
-                await self.remove(task.repo_key)
-
-        asyncio.create_task(remove())
+    def _ttl_seconds(self) -> float:
+        # call-time 读模块全局:tests monkeypatch deepwiki._WIKI_TASK_TTL_SECONDS
+        return _WIKI_TASK_TTL_SECONDS
 
 
-registry = TaskRegistry()
+registry = WikiTaskRegistry(
+    max_concurrent=_MAX_CONCURRENT_WIKI_TASKS,
+    ttl_seconds=_WIKI_TASK_TTL_SECONDS,
+)
+
+
+# ---------------------------------------------------------------------------
+# 双路包装类:llm 路与 cc(agent)路对外 API 的统一入口。
+# 分派:wiki 生成(结构/页面)按 envs.DEEPWIKI_GENERATOR 经 _wiki_pipeline() 选择;
+#       chat / codemap 恒 agent 路(经 _agent_pipeline(),不读 envs)。
+# 共用构建件与低层支撑保持模块级 helper(共享提示词段、XML 解析/引用后处理、
+# 图索引、任务状态机、agent/llm 流式通道);类方法体内一律以模块全局名引用
+# cc_stream / llm_stream / _agent_write_file / envs.*,保证调用时动态解析
+# (测试 monkeypatch 与 envs 切换均生效,不得实例捕获或模块级快照)。
+# ---------------------------------------------------------------------------
+
+
+class WikiPipeline:
+    """双路共同协议;基类默认实现即 llm 路语义(无交付文件、无续跑水合、占位不落盘)。"""
+
+    def needs_structure_regenerate(self, task: WikiTask) -> bool:
+        """结构是否需要强制重生成(cc 路:structure 交付文件缺失;llm 路恒 False)。"""
+        return False
+
+    async def hydrate_pages(self, task: WikiTask) -> None:
+        """以已落盘交付文件水合 generated_pages(cc 路;llm 路无交付文件,no-op)。"""
+
+    def write_error_page(self, task: WikiTask, page: WikiPage, content: str) -> None:
+        """重试耗尽后的占位页持久化(cc 路写交付文件供续跑跳过;llm 路 no-op)。"""
+
+    async def determine_structure(
+        self, task: WikiTask, repo: Repo, file_tree: list[str], readme: str,
+    ) -> WikiStructureModel:
+        raise NotImplementedError
+
+    async def generate_page(
+        self, task: WikiTask, repo: Repo, page: WikiPage, file_links: str,
+    ) -> str:
+        raise NotImplementedError
+
+    async def chat_stream(self, request: ChatCompletionRequest):
+        raise NotImplementedError
+
+    async def generate_codemap(self, request: CodeMapRequest):
+        raise NotImplementedError
+
+
+class AgentWikiPipeline(WikiPipeline):
+    """cc(agent)路对外 API 包装:Claude Code agent 自读仓库代码,交付件 Write 落盘(文件为权威)。"""
+
+    def needs_structure_regenerate(self, task: WikiTask) -> bool:
+        """structure 交付文件被删即强制重生成(续跑失效)。"""
+        return not _agent_cache_structure_path(task.request).exists()
+
+    async def determine_structure(
+        self, task: WikiTask, repo: Repo, file_tree: list[str], readme: str,
+    ) -> WikiStructureModel:
+        """cc(agent)结构:交付文件已存在即跳过 agent(续跑);否则 agent 落盘 structure.md 后读回解析。"""
+        r = task.request
+        struct_path = _agent_cache_structure_path(r)
+        if struct_path.exists():
+            content = await asyncio.to_thread(struct_path.read_text, encoding="utf-8")
+        else:
+            readme_path = _find_readme_path(file_tree)
+            prompt = self._build_structure_prompt(
+                r.owner, r.repo, "\n".join(file_tree), readme_path,
+                os.path.abspath(repo.save_path), r.comprehensive, r.language,
+                str(struct_path),
+            )
+            content = await _agent_write_file(
+                "", prompt, repo, r.model, struct_path, label="wiki:structure",
+                run_id=task.repo_key,
+            )
+        return parse_wiki_structure(content, comprehensive=r.comprehensive)
+
+    @staticmethod
+    def _build_structure_prompt(
+        owner: str, repo_name: str, file_tree: str, readme_path: str | None,
+        repo_root: str, comprehensive: bool, language: str, out_path: str,
+    ) -> str:
+        """cc(agent)结构提示词(现代 agent 风格):输入只给路径(文件树+README 路径),不内联内容;
+        成品 XML 由 agent 用 Write 工具直接落盘 out_path,而不是作为 result 文本返回。"""
+        structure_format = _COMPREHENSIVE_STRUCTURE if comprehensive else _CONCISE_STRUCTURE
+        page_count = "8-12" if comprehensive else "4-6"
+        kind = "comprehensive" if comprehensive else "concise"
+        readme_line = (
+            f"2. The README file of the project is at: {repo_root}/{readme_path}\n"
+            "   Read it yourself with the Read tool.\n"
+            if readme_path
+            else "2. No README file was found in this repository; skip it.\n"
+        )
+        return f"""IMPORTANT: you are working INSIDE the repository (cwd = repository root at {repo_root}).
+The file contents are NOT inlined in this prompt — read source files yourself with the
+Read/Grep/Glob tools. All paths below are relative to the repository root.
+
+Analyze this repository {owner}/{repo_name} and create a wiki structure for it.
+
+1. The complete relative file tree of the project:
+<file_tree>
+{file_tree}
+</file_tree>
+
+{readme_line}
+I want to create a wiki for this repository. Determine the most logical structure for a wiki based on the repository's content.
+
+IMPORTANT: The wiki content will be generated in {_language_name(language)} language.
+
+When designing the wiki structure, include pages that would benefit from visual diagrams, such as:
+- Architecture overviews
+- Data flow descriptions
+- Component relationships
+- Process workflows
+- State machines
+- Class hierarchies
+{structure_format}
+IMPORTANT FORMATTING INSTRUCTIONS:
+- Return ONLY the valid XML structure specified above
+- DO NOT wrap the XML in markdown code blocks (no ``` or ```xml)
+- DO NOT include any explanation text before or after the XML
+- Ensure the XML is properly formatted and valid
+- Start directly with <wiki_structure> and end with </wiki_structure>
+
+DELIVERABLE: Write the complete XML to the file {out_path} using the Write tool (create the file;
+do not use Edit). Do NOT return the XML in your message text — the written file is the only deliverable.
+
+IMPORTANT:
+1. Create {page_count} pages that would make a {kind} wiki for this repository
+2. Each page should focus on a specific aspect of the codebase (e.g., architecture, key features, setup)
+3. The relevant_files should be actual files from the repository that would be used to generate that page
+4. Do not inline file contents into this prompt — use your tools to read the files.
+{_agent_note()}"""
+
+    @staticmethod
+    def _build_page_prompt(title: str, file_paths: list[str], out_path: str, language: str) -> str:
+        """cc(agent)页面提示词(现代 agent 风格):只给相关文件相对路径,内容由 agent 自读;成品经 Write 落盘 out_path。"""
+        paths = "\n".join(f"- [{p}]({p})" for p in file_paths)
+        return (
+            "IMPORTANT: you are working INSIDE the repository (cwd = repository root). "
+            "The file contents are NOT inlined in this prompt — read the relevant source files "
+            "yourself with the Read/Grep/Glob tools. All paths below are relative to the repository root.\n\n"
+            + _build_page_prompt(title, paths, language)
+            + f"\n\nDELIVERABLE: Write the complete generated Markdown page to `{out_path}` using the "
+              "Write tool (create the file; do not use Edit). Do NOT return the page in your message "
+              "text — the written file is the only deliverable."
+        )
+
+    async def generate_page(
+        self, task: WikiTask, repo: Repo, page: WikiPage, file_links: str,
+    ) -> str:
+        """cc 路单页:交付文件已存在即读回(续跑,文件为权威);否则 agent 落盘 page_<id>.md。"""
+        r = task.request
+        out_path = _agent_cache_page_path(r, page.id)
+        if out_path.exists():
+            return await asyncio.to_thread(out_path.read_text, encoding="utf-8")
+        prompt = _agent_note() + self._build_page_prompt(page.title, list(page.filePaths), str(out_path), r.language)
+        return await _agent_write_file(
+            "", prompt, repo, r.model, out_path, label=f"wiki:page:{page.id}",
+            run_id=task.repo_key,
+        )
+
+    async def hydrate_pages(self, task: WikiTask) -> None:
+        """cc 路径:从已落盘的页交付文件水合 generated_pages(文件为权威,覆盖 state 旧文本);
+        无文件的页留给 _generate_pages(含每页完成即落盘的状态语义)。"""
+        structure = task.wiki_structure
+        if structure is None:
+            return
+        r = task.request
+        ctx = RepoUrlContext(type=r.type, repo_url=r.repo_url, default_branch=task.default_branch)
+        for page in structure.pages:
+            out_path = _agent_cache_page_path(r, page.id)
+            if not out_path.exists():
+                continue
+            content = await asyncio.to_thread(out_path.read_text, encoding="utf-8")
+            content = _strip_markdown_fences(content)
+            content = post_process_wiki_content(content, list(page.filePaths), ctx)
+            task.generated_pages[page.id] = page.model_copy(update={"content": content})
+        task.pages_done = len(task.generated_pages)
+
+    def write_error_page(self, task: WikiTask, page: WikiPage, content: str) -> None:
+        """重试耗尽(cc 路):占位文本也落盘,续跑跳过占位页;用户删除该文件即可重试。"""
+        try:
+            _agent_cache_page_path(task.request, page.id).write_text(content, encoding="utf-8")
+        except OSError as e:  # noqa: BLE001 - 占位写入失败不阻断任务完成
+            _log(f"写入占位页文件失败: {page.id} - {e}")
+
+    async def chat_stream(self, request: ChatCompletionRequest):
+        """一次 chat 请求的流式应答(纯文本 chunk 序列,前后端协议同原 research_chat)。"""
+        if not request.messages:
+            raise ValueError("No messages provided")
+        last = request.messages[-1]
+        if last.role != "user":
+            raise ValueError("Last message must be from the user")
+
+        # 注:未索引的前置校验已上移到端点层(_require_indexed),生成器内不再重复
+        repo = Repo(request.repo_url, request.type, access_token=request.token)
+
+        fmt = _format_request_fmt(request)
+        is_deep = last.mode == "deep_research"
+        if is_deep:
+            # continuation 回退:含 continue+research 时换回首个用户消息(移植 research.py)
+            if "continue" in last.content.lower() and "research" in last.content.lower():
+                for msg in request.messages:
+                    if msg.role == "user" and "continue" not in msg.content.lower():
+                        last.content = msg.content.strip()
+                        break
+            if request.research_iteration == 1:
+                system = _DEEP_RESEARCH_FIRST_ITERATION_PROMPT.format(**fmt)
+            elif request.research_iteration >= 5:
+                system = _DEEP_RESEARCH_FINAL_ITERATION_PROMPT.format(**fmt)
+            else:
+                system = _DEEP_RESEARCH_INTERMEDIATE_ITERATION_PROMPT.format(
+                    **fmt, research_iteration=request.research_iteration
+                )
+        else:
+            system = _SIMPLE_CHAT_SYSTEM_PROMPT.format(**fmt)
+
+        # 对话历史成对拼装;输入过大时省略历史(仿 prompt_builder 的简化路径)
+        # 裁剪/注记作为监控上下文说明事件(context/modify|inject)伴跑,不改变折叠结果
+        history = ""
+        context: list[dict] = []
+        if len(request.messages) > 1:
+            if _estimate_tokens(last.content) > envs.CHAT_TOKEN_LIMIT_ESTIMATE:
+                _log(f"请求过大(估算 {_estimate_tokens(last.content)} tokens),省略对话历史")
+                context.append({"type": "context/modify",
+                                "data": {"target": "chat-history", "kind": "trim",
+                                         "cause": "token-limit", "detail": "省略对话历史",
+                                         "removed": {"n_turns": len(request.messages) - 1,
+                                                     "est_tokens": _estimate_tokens(last.content)}}})
+            else:
+                turns = ""
+                for i in range(0, len(request.messages) - 1, 2):
+                    user, assistant = request.messages[i], request.messages[i + 1]
+                    if user.role == "user" and assistant.role == "assistant":
+                        turns += f"<turn>\n<user>{user.content}</user>\n<assistant>{assistant.content}</assistant>\n</turn>\n"
+                if turns:
+                    history = f"<conversation_history>\n{turns}</conversation_history>\n\n"
+        context.append({"type": "context/inject",
+                        "data": {"target": "user-message", "phase": "prompt-assembly",
+                                 "provenance": "deepwiki:note", "text": _agent_note()}})
+
+        prompt = history + _agent_note() + f"<query>\n{last.content}\n</query>\n\nAssistant: "
+        try:
+            async for chunk in _agent_stream(
+                system, prompt, repo=repo, model=request.model, label=f"chat:{repo.name}",
+                run_id=f"chat:{repo.name}", context=context,
+            ):
+                yield chunk
+        except Exception as e:  # 执行期失败降级为可读错误文本(同原 stream_and_fallback 语义)
+            _log(f"chat agent 错误: {e}")
+            yield f"\n\n(抱歉,本次请求处理失败: {e})"
+
+    async def generate_codemap(self, request: CodeMapRequest):
+        """两阶段 codemap 生成(骨架 → 指南/图),NDJSON 事件流;阶段失败语义与原相同。"""
+        try:
+            repo = Repo(request.repo_url, request.type, access_token=request.token)
+        except Exception:
+            repo = Repo(request.repo_url, request.type)
+
+        yield _phase("analyzing", "start")
+        if not _index_ready(repo):
+            yield _phase("analyzing", "done", chunk_count=0)
+            yield _event(type="error", stage="analyzing", message=f"仓库尚未索引,请先 /repo/prepare: {repo.name}")
+            return
+        yield _phase("analyzing", "done", chunk_count=0)
+
+        fmt = {
+            "repo_type": request.type,
+            "repo_url": request.repo_url,
+            "repo_name": repo.name,
+            "language_name": _language_name(request.language or "en"),
+        }
+
+        async def _run_json(prompt: str, attempts: int = 3) -> dict:
+            """整收 + 解析 JSON,失败重试(每轮新 agent);system 恒用骨架提示词。"""
+            last_error: Exception | None = None
+            for attempt in range(1, attempts + 1):
+                try:
+                    raw = await _agent_text(
+                        _CODEMAP_SKELETON_PROMPT.format(**fmt), prompt, repo=repo,
+                        model=request.model, label="codemap:skeleton",
+                        run_id=f"codemap:{repo.name}",
+                        retry={"attempt": attempt, "prev_error": str(last_error)} if last_error else None,
+                    )
+                    return _extract_json(raw)
+                except Exception as e:  # noqa: BLE001
+                    last_error = e
+                    _log(f"codemap JSON 解析尝试 {attempt}/{attempts} 失败: {e}")
+            raise ValueError(f"Model did not return valid JSON after {attempts} attempts: {last_error}")
+
+        # 阶段 1:骨架
+        yield _phase("initial_codemap", "start")
+        skeleton_prompt = _codemap_note() + f"<query>\n{request.question}\n</query>\n\nAssistant: "
+        try:
+            skeleton = CodeMap.model_validate(await _run_json(skeleton_prompt))
+        except Exception as e:  # noqa: BLE001
+            _log(f"codemap 骨架失败: {e}")
+            yield _event(type="error", stage="initial_codemap", message=str(e))
+            return
+        yield _phase("initial_codemap", "done", section_count=len(skeleton.sections))
+
+        # 阶段 2:指南/图;i/骨架失败不致命 — 退化为骨架
+        yield _phase("diagrams", "start")
+        enrich_query = (
+            f"{request.question}\n\n<SKELETON>\n{skeleton.model_dump_json()}\n</SKELETON>"
+        )
+        enrich_prompt = _codemap_note() + f"<query>\n{enrich_query}\n</query>\n\nAssistant: "
+        final = skeleton
+        try:
+            raw = await _agent_text(
+                _CODEMAP_ENRICH_PROMPT.format(**fmt), enrich_prompt, repo=repo,
+                model=request.model, label="codemap:enrich", run_id=f"codemap:{repo.name}",
+            )
+            final = CodeMap.model_validate(_extract_json(raw))
+            yield _phase("diagrams", "done")
+        except Exception as e:  # noqa: BLE001
+            _log(f"codemap 指南/图失败,使用骨架: {e}")
+            yield _phase("diagrams", "done", degraded=True)
+
+        _ground_citations(final, repo.save_path)
+        yield _event(type="codemap", data=final.model_dump())
+        yield _event(type="done")
+
+
+class LlmWikiPipeline(WikiPipeline):
+    """llm 路对外 API 包装:deepwiki-open 原式单次补全(内容内联进 prompt,无工具)。"""
+
+    async def determine_structure(
+        self, task: WikiTask, repo: Repo, file_tree: list[str], readme: str,
+    ) -> WikiStructureModel:
+        """llm 路结构:文件树+README 全文 → 单次流式补全(无工具)→ XML(与 deepwiki-open 同式)。"""
+        r = task.request
+        prompt = self._build_structure_prompt(
+            r.owner, r.repo, "\n".join(file_tree), readme, r.comprehensive, r.language
+        )
+        parts: list[str] = []
+        async for chunk in llm_stream(
+            url=envs.DEEPWIKI_LLM_URL,
+            payload={"model": envs.DEEPWIKI_LLM_MODEL,
+                     "messages": [{"role": "user", "content": prompt}]},
+            api_key=envs.DEEPWIKI_LLM_API_KEY or None,
+            session_name="wiki:structure", run_id=task.repo_key,
+        ):
+            parts.append(chunk)
+        return parse_wiki_structure("".join(parts), comprehensive=r.comprehensive)
+
+    @staticmethod
+    def _build_structure_prompt(
+        owner: str, repo_name: str, file_tree: str, readme: str,
+        comprehensive: bool, language: str,
+    ) -> str:
+        """wiki 结构确定提示词(移植 determineWikiStructure)。"""
+        structure_format = _COMPREHENSIVE_STRUCTURE if comprehensive else _CONCISE_STRUCTURE
+        page_count = "8-12" if comprehensive else "4-6"
+        kind = "comprehensive" if comprehensive else "concise"
+        return f"""Analyze this GitHub repository {owner}/{repo_name} and create a wiki structure for it.
+
+1. The complete file tree of the project:
+<file_tree>
+{file_tree}
+</file_tree>
+
+2. The README file of the project:
+<readme>
+{readme}
+</readme>
+
+I want to create a wiki for this repository. Determine the most logical structure for a wiki based on the repository's content.
+
+IMPORTANT: The wiki content will be generated in {_language_name(language)} language.
+
+When designing the wiki structure, include pages that would benefit from visual diagrams, such as:
+- Architecture overviews
+- Data flow descriptions
+- Component relationships
+- Process workflows
+- State machines
+- Class hierarchies
+{structure_format}
+IMPORTANT FORMATTING INSTRUCTIONS:
+- Return ONLY the valid XML structure specified above
+- DO NOT wrap the XML in markdown code blocks (no ``` or ```xml)
+- DO NOT include any explanation text before or after the XML
+- Ensure the XML is properly formatted and valid
+- Start directly with <wiki_structure> and end with </wiki_structure>
+
+IMPORTANT:
+1. Create {page_count} pages that would make a {kind} wiki for this repository
+2. Each page should focus on a specific aspect of the codebase (e.g., architecture, key features, setup)
+3. The relevant_files should be actual files from the repository that would be used to generate that page
+4. Return ONLY valid XML with the structure specified above, with no markdown code block delimiters"""
+
+    @staticmethod
+    def _build_page_prompt(
+        title: str, file_links: str, content_blocks: list[tuple[str, str]], degraded: bool, language: str,
+    ) -> str:
+        """纯 LLM 页面提示词(deepwiki-open 同式 + 内联相关文件内容近似其 RAG 注入;超限降级仅链接)。"""
+        prompt = _build_page_prompt(title, file_links, language)
+        if content_blocks:
+            inline = "\n\n".join(f'<file path="{p}">\n{text}\n</file>' for p, text in content_blocks)
+            extra = f"\n\nFILE CONTENT (injected context for citation-accurate writing):\n{inline}"
+        elif degraded:
+            extra = "\n\n<note>输入超限,仅提供文件链接,请依代码检索。</note>"
+        else:
+            extra = ""
+        return prompt + extra
+
+    async def generate_page(
+        self, task: WikiTask, repo: Repo, page: WikiPage, file_links: str,
+    ) -> str:
+        """llm 路单页:内联相关文件内容 → 单次流式补全(无工具调用)。"""
+        r = task.request
+        blocks, degraded = self._inline_page_files(repo.save_path, list(page.filePaths))
+        prompt = self._build_page_prompt(page.title, file_links, blocks, degraded, r.language)
+        # 内联文件块(str)计入注入说明;整体降级计入 modify —— 供轨迹还原"为什么这个 prompt"
+        context: list[dict] = []
+        for p, text in blocks:
+            context.append({"type": "context/inject",
+                            "data": {"target": "user-message", "phase": "page-prompt",
+                                     "provenance": f"deepwiki:inline:{p}", "text": text}})
+        if degraded:
+            context.append({"type": "context/modify",
+                            "data": {"target": "user-message", "kind": "degrade",
+                                     "cause": "token-limit",
+                                     "detail": "输入超限,仅提供文件链接,请依代码检索"}})
+        parts: list[str] = []
+        async for chunk in llm_stream(
+            url=envs.DEEPWIKI_LLM_URL,
+            payload={"model": envs.DEEPWIKI_LLM_MODEL,
+                     "messages": [{"role": "user", "content": prompt}]},
+            api_key=envs.DEEPWIKI_LLM_API_KEY or None,
+            session_name=f"wiki:page:{page.id}", run_id=task.repo_key, context=context,
+        ):
+            parts.append(chunk)
+        return "".join(parts)
+
+    def _inline_page_files(
+        self, save_path: str, file_paths: list[str],
+    ) -> tuple[list[tuple[str, str]], bool]:
+        """内联页面相关文件内容(纯 LLM 路径,近似 RAG 注入;单文件截断 8k 字符)。
+        累计超过 CHAT_TOKEN_LIMIT_ESTIMATE(字符/4 近似)即整体降级:返回 ([], True),
+        页面提示词将只提供文件链接(与 deepwiki-open 的 MAX_INPUT_TOKENS 降级同式)。"""
+        limit_chars = envs.CHAT_TOKEN_LIMIT_ESTIMATE * 4
+        total = 0
+        blocks: list[tuple[str, str]] = []
+        for p in file_paths:
+            try:
+                text = Path(save_path, p).read_text(encoding="utf-8")
+            except OSError:
+                continue
+            if len(text) > _FILE_INLINE_CAP:
+                text = text[:_FILE_INLINE_CAP]
+            if total + len(text) > limit_chars:
+                return [], True
+            total += len(text)
+            blocks.append((p, text))
+        return blocks, False
+
+
+def _wiki_pipeline() -> WikiPipeline:
+    """按 envs.DEEPWIKI_GENERATOR 选路;调用时读 envs(测试 monkeypatch 生效)。"""
+    return AgentWikiPipeline() if envs.DEEPWIKI_GENERATOR == "cc" else LlmWikiPipeline()
+
+
+def _agent_pipeline() -> AgentWikiPipeline:
+    """恒 agent 路(chat/codemap 不走 generator 分派)。"""
+    return AgentWikiPipeline()
+
+
 
 
 async def generate_repo_wiki(task: WikiTask) -> None:
@@ -2216,6 +2107,7 @@ async def generate_repo_wiki(task: WikiTask) -> None:
     r = task.request
     try:
         await _persist_state(task)  # 入口即落盘:中断于索引/结构阶段的也能续跑
+        pipeline = _wiki_pipeline()
         repo = Repo(r.repo_url, r.type, access_token=r.token)
         # 索引:只建一次(v1 无增量;已存在即跳过)
         if not _index_ready(repo):
@@ -2227,17 +2119,14 @@ async def generate_repo_wiki(task: WikiTask) -> None:
             if result.get("error"):
                 raise RuntimeError(result["error"])
 
-        if task.wiki_structure is None or (
-            envs.DEEPWIKI_GENERATOR == "cc"
-            and not _agent_cache_structure_path(r).exists()
-        ):  # 续跑:结构已落盘(cc 下以交付文件为准,被删则强制重生成)则跳过 agent 调用
+        if task.wiki_structure is None or pipeline.needs_structure_regenerate(task):
+            # 续跑:结构已落盘(cc 下以交付文件为准,被删则强制重生成)则跳过 agent 调用
             task.status = TaskStatus.DETERMINING_STRUCTURE
             task.wiki_structure = await _determine_structure(task)
             await _persist_state(task)
 
         task.status = TaskStatus.GENERATING
-        if envs.DEEPWIKI_GENERATOR == "cc":
-            await _hydrate_agent_cache_pages(task)  # 文件为权威,覆盖落盘 state 中的旧文本
+        await pipeline.hydrate_pages(task)  # cc 以文件为权威覆盖落盘 state 旧文本;llm no-op
         pages = await _generate_pages(task, task.wiki_structure)
 
         if not await _save(task, pages):
@@ -2271,50 +2160,7 @@ async def _determine_structure(task: WikiTask) -> WikiStructureModel:
         r.excluded_files,
         r.excluded_dirs,
     )
-    if envs.DEEPWIKI_GENERATOR == "cc":
-        return await _determine_structure_cc(task, repo, file_tree)
-    return await _determine_structure_llm(task, repo, file_tree, readme)
-
-
-async def _determine_structure_llm(
-    task: WikiTask, repo: Repo, file_tree: list[str], readme: str,
-) -> WikiStructureModel:
-    """llm 路结构:文件树+README 全文 → 单次流式补全(无工具)→ XML(与 deepwiki-open 同式)。"""
-    r = task.request
-    prompt = _build_structure_prompt(
-        r.owner, r.repo, "\n".join(file_tree), readme, r.comprehensive, r.language
-    )
-    parts: list[str] = []
-    async for chunk in llm_stream(
-        url=envs.DEEPWIKI_LLM_URL,
-        payload={"model": envs.DEEPWIKI_LLM_MODEL,
-                 "messages": [{"role": "user", "content": prompt}]},
-        api_key=envs.DEEPWIKI_LLM_API_KEY or None,
-        session_name="wiki:structure",
-    ):
-        parts.append(chunk)
-    return parse_wiki_structure("".join(parts), comprehensive=r.comprehensive)
-
-
-async def _determine_structure_cc(
-    task: WikiTask, repo: Repo, file_tree: list[str],
-) -> WikiStructureModel:
-    """cc 路结构:交付文件已存在即跳过 agent(续跑);否则 agent 落盘 structure.md 后读回解析。"""
-    r = task.request
-    struct_path = _agent_cache_structure_path(r)
-    if struct_path.exists():
-        content = await asyncio.to_thread(struct_path.read_text, encoding="utf-8")
-    else:
-        readme_path = _find_readme_path(file_tree)
-        prompt = _build_structure_prompt_cc(
-            r.owner, r.repo, "\n".join(file_tree), readme_path,
-            os.path.abspath(repo.save_path), r.comprehensive, r.language,
-            str(struct_path),
-        )
-        content = await _agent_write_file(
-            "", prompt, repo, r.model, struct_path, label="wiki:structure"
-        )
-    return parse_wiki_structure(content, comprehensive=r.comprehensive)
+    return await _wiki_pipeline().determine_structure(task, repo, file_tree, readme)
 
 
 async def _generate_page(task: WikiTask, page: WikiPage) -> WikiPage:
@@ -2323,69 +2169,10 @@ async def _generate_page(task: WikiTask, page: WikiPage) -> WikiPage:
     repo = Repo(r.repo_url, r.type, access_token=r.token)
     ctx = RepoUrlContext(type=r.type, repo_url=r.repo_url, default_branch=task.default_branch)
     file_links = "\n".join(f"- [{p}]({generate_file_url(p, ctx)})" for p in page.filePaths)
-    if envs.DEEPWIKI_GENERATOR == "cc":
-        content = await _generate_page_cc(task, repo, page, file_links)
-    else:
-        content = await _generate_page_llm(task, repo, page, file_links)
+    content = await _wiki_pipeline().generate_page(task, repo, page, file_links)
     content = _strip_markdown_fences(content)
     content = post_process_wiki_content(content, list(page.filePaths), ctx)
     return page.model_copy(update={"content": content})
-
-
-async def _generate_page_cc(
-    task: WikiTask, repo: Repo, page: WikiPage, file_links: str,
-) -> str:
-    """cc 路单页:交付文件已存在即读回(续跑,文件为权威);否则 agent 落盘 page_<id>.md。"""
-    r = task.request
-    out_path = _agent_cache_page_path(r, page.id)
-    if out_path.exists():
-        return await asyncio.to_thread(out_path.read_text, encoding="utf-8")
-    prompt = _agent_note() + _build_page_prompt_cc(page.title, list(page.filePaths), str(out_path), r.language)
-    return await _agent_write_file(
-        "", prompt, repo, r.model, out_path, label=f"wiki:page:{page.id}"
-    )
-
-
-async def _generate_page_llm(
-    task: WikiTask, repo: Repo, page: WikiPage, file_links: str,
-) -> str:
-    """llm 路单页:内联相关文件内容 → 单次流式补全(无工具调用)。"""
-    r = task.request
-    blocks, degraded = _inline_page_files(repo.save_path, list(page.filePaths))
-    prompt = _build_page_prompt_llm(page.title, file_links, blocks, degraded, r.language)
-    parts: list[str] = []
-    async for chunk in llm_stream(
-        url=envs.DEEPWIKI_LLM_URL,
-        payload={"model": envs.DEEPWIKI_LLM_MODEL,
-                 "messages": [{"role": "user", "content": prompt}]},
-        api_key=envs.DEEPWIKI_LLM_API_KEY or None,
-        session_name=f"wiki:page:{page.id}",
-    ):
-        parts.append(chunk)
-    return "".join(parts)
-
-
-def _inline_page_files(
-    save_path: str, file_paths: list[str],
-) -> tuple[list[tuple[str, str]], bool]:
-    """内联页面相关文件内容(纯 LLM 路径,近似 RAG 注入;单文件截断 8k 字符)。
-    累计超过 CHAT_TOKEN_LIMIT_ESTIMATE(字符/4 近似)即整体降级:返回 ([], True),
-    页面提示词将只提供文件链接(与 deepwiki-open 的 MAX_INPUT_TOKENS 降级同式)。"""
-    limit_chars = envs.CHAT_TOKEN_LIMIT_ESTIMATE * 4
-    total = 0
-    blocks: list[tuple[str, str]] = []
-    for p in file_paths:
-        try:
-            text = Path(save_path, p).read_text(encoding="utf-8")
-        except OSError:
-            continue
-        if len(text) > _FILE_INLINE_CAP:
-            text = text[:_FILE_INLINE_CAP]
-        if total + len(text) > limit_chars:
-            return [], True
-        total += len(text)
-        blocks.append((p, text))
-    return blocks, False
 
 
 async def _generate_page_with_retry(task: WikiTask, page: WikiPage) -> WikiPage:
@@ -2398,32 +2185,8 @@ async def _generate_page_with_retry(task: WikiTask, page: WikiPage) -> WikiPage:
             _log(f"页面 {page.id} 生成失败(尝试 {attempt + 1}/{_WIKI_PAGE_RETRIES + 1}): {e}")
     # 重试耗尽:回退错误占位页,保证整个 wiki 仍能完成
     content = f"Error generating content: {last_error}"
-    if envs.DEEPWIKI_GENERATOR == "cc":
-        # 占位文本也落盘:续跑跳过占位页;用户删除该文件即可重试
-        try:
-            _agent_cache_page_path(task.request, page.id).write_text(content, encoding="utf-8")
-        except OSError as e:  # noqa: BLE001 - 占位写入失败不阻断任务完成
-            _log(f"写入占位页文件失败: {page.id} - {e}")
+    _wiki_pipeline().write_error_page(task, page, content)
     return page.model_copy(update={"content": content})
-
-
-async def _hydrate_agent_cache_pages(task: WikiTask) -> None:
-    """cc 路径:从已落盘的页交付文件水合 generated_pages(文件为权威,覆盖 state 旧文本);
-    无文件的页留给 _generate_pages(含每页完成即落盘的状态语义)。"""
-    structure = task.wiki_structure
-    if structure is None:
-        return
-    r = task.request
-    ctx = RepoUrlContext(type=r.type, repo_url=r.repo_url, default_branch=task.default_branch)
-    for page in structure.pages:
-        out_path = _agent_cache_page_path(r, page.id)
-        if not out_path.exists():
-            continue
-        content = await asyncio.to_thread(out_path.read_text, encoding="utf-8")
-        content = _strip_markdown_fences(content)
-        content = post_process_wiki_content(content, list(page.filePaths), ctx)
-        task.generated_pages[page.id] = page.model_copy(update={"content": content})
-    task.pages_done = len(task.generated_pages)
 
 
 def _pending_pages(structure: WikiStructureModel, done: dict[str, WikiPage]) -> list[WikiPage]:
@@ -2464,6 +2227,7 @@ async def _save(task: WikiTask, pages: dict[str, WikiPage]) -> bool:
         wiki_cache=WikiCacheData(
             wiki_structure=task.wiki_structure,
             generated_pages=pages,
+            generator=envs.DEEPWIKI_GENERATOR,  # 成品缓存记模式,cache 命中时校验
             repo=RepoInfo(
                 owner=task.request.owner,
                 repo=task.request.repo,
@@ -2476,30 +2240,4 @@ async def _save(task: WikiTask, pages: dict[str, WikiPage]) -> bool:
         ),
     )
 
-
-
-
-# ---------------------------------------------------------------------------
-# 模块级文件过滤默认规则(嵌入精简版 repo.json 的 file_filters + extensions)
-# ---------------------------------------------------------------------------
-
-_DEFAULT_EXCLUDED_DIRS = {
-    ".venv", "venv", "env", "node_modules", "bower_components", "jspm_packages",
-    ".git", ".svn", ".hg", ".bzr", "vendor", "__pycache__", ".pytest_cache",
-    ".mypy_cache", ".ruff_cache", "dist", "build", "out", "target", "bin", "obj",
-    "docs", "_docs", "site-docs", "_site", ".idea", ".vscode", ".vs", ".eclipse",
-    ".settings", "logs", "log", "tmp", "temp",
-}
-_DEFAULT_EXCLUDED_FILES = {
-    "yarn.lock", "pnpm-lock.yaml", "npm-shrinkwrap.json", "poetry.lock",
-    "Pipfile.lock", "Cargo.lock", "composer.lock", ".DS_Store", ".gitignore",
-    ".gitattributes", ".gitmodules", "README.md", "readme.md", "pyproject.toml",
-    "tsconfig.json", "package.json", "package-lock.json",
-}
-# 与原 repo.json code_extensions(17) + doc_extensions(6) 并集;另补常见脚本与数据文件
-_PROCESS_EXTENSIONS = {
-    ".py", ".js", ".ts", ".java", ".cpp", ".c", ".h", ".hpp", ".go", ".rs",
-    ".jsx", ".tsx", ".html", ".css", ".php", ".swift", ".cs", ".md", ".txt",
-    ".rst", ".json", ".yaml", ".yml", ".sh", ".sql", ".toml", ".vue", ".svelte",
-}
 

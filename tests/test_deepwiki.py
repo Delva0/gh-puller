@@ -31,28 +31,34 @@ import pytest
 
 from gh_puller import deepwiki
 from gh_puller.deepwiki import (
-    Repo,
+    RepoInfo,
     RepoUrlContext,
-    TaskStatus,
+    WikiCacheData,
     WikiPage,
     WikiStructureModel,
     WikiTask,
     WikiTaskRequest,
     WikiTaskState,
-    _clone_url_with_token,
-    _extract_json,
     _generate_pages,
     _locate_snippet,
-    _path_is_url,
     _pending_pages,
-    _repair_json,
     _wiki_state_path,
+    delete_wiki_cache,
     delete_wiki_task_state,
     list_wiki_cache,
     parse_wiki_structure,
     post_process_wiki_content,
     read_wiki_task_state,
+    save_wiki_cache,
     write_wiki_task_state,
+)
+from gh_puller.utils import (
+    Repo,
+    TaskStatus,
+    _clone_url_with_token,
+    _extract_json,
+    _path_is_url,
+    _repair_json,
 )
 
 # ---------------------------------------------------------------------------
@@ -214,18 +220,52 @@ async def test_wiki_task_state_roundtrip_atomic():
 
 @pytest.mark.asyncio
 async def test_agent_text_through_cc_stream(monkeypatch):
-    """迁移冒烟:deepwiki.agent 调用归一化为 agent.cc_stream(label 透传)."""
+    """迁移冒烟:deepwiki.agent 调用归一化为 agent.cc_stream(label/run_id/context 透传)."""
     calls = []
 
-    async def fake_cc_stream(options, prompt, *, session=None, session_name=None, meta=None):
-        calls.append((session_name, prompt))
+    async def fake_cc_stream(options, prompt, *, session=None, session_name=None, run_id=None,
+                             context=None, retry=None, meta=None):
+        calls.append((session_name, prompt, run_id, context))
         yield "a"
         yield "b"
 
     monkeypatch.setattr(deepwiki, "cc_stream", fake_cc_stream)
-    out = await deepwiki._agent_text("sys", "query", label="wiki:structure")
+    ctx = [{"type": "context/inject", "data": {"text": "n"}}]
+    out = await deepwiki._agent_text("sys", "query", label="wiki:structure", run_id="r1", context=ctx)
     assert out == "ab"
-    assert calls == [("wiki:structure", "query")]
+    assert calls == [("wiki:structure", "query", "r1", ctx)]
+
+
+@pytest.mark.asyncio
+async def test_chat_stream_context_events(monkeypatch):
+    """chat 历史裁剪 → context/modify(trim);agent 注记 → context/inject;run_id 关联会话组。"""
+    captured = {}
+
+    async def fake_cc_stream(options, prompt, *, session=None, session_name=None, run_id=None,
+                             context=None, retry=None, meta=None):
+        captured.update(session=session_name, run_id=run_id, context=context, prompt=prompt)
+        yield "hi"
+
+    monkeypatch.setattr(deepwiki, "cc_stream", fake_cc_stream)
+    monkeypatch.setattr(deepwiki.envs, "CHAT_TOKEN_LIMIT_ESTIMATE", 0)  # 估算必超 → 触发裁剪
+    request = deepwiki.ChatCompletionRequest(
+        repo_url="/tmp/deepwiki-chat-test", type="local", owner="local", repo="demo",
+        language="en",
+        messages=[deepwiki.ChatMessage(role="user", content="q1"),
+                  deepwiki.ChatMessage(role="assistant", content="a1"),
+                  deepwiki.ChatMessage(role="user", content="q2")],
+    )
+    got = [chunk async for chunk in deepwiki.AgentWikiPipeline().chat_stream(request)]
+    assert "".join(got) == "hi"
+    assert captured["run_id"] == captured["session"]  # 会话组名与监控名同一来源(chat:<repo>)
+    assert captured["run_id"].startswith("chat:")
+    trim, note = captured["context"]
+    assert trim["type"] == "context/modify" and trim["data"]["kind"] == "trim"
+    assert trim["data"]["target"] == "chat-history" and trim["data"]["removed"]["n_turns"] == 2
+    assert note["type"] == "context/inject" and note["data"]["provenance"] == "deepwiki:note"
+    assert "注记全文入事件" not in captured["prompt"]  # 主题:注记仍原样在 prompt 里(非空即错),见下行
+    assert "<note>" in captured["prompt"] and "<query>\nq2\n</query>" in captured["prompt"]
+    assert "<conversation_history>" not in captured["prompt"]  # 被裁剪
 
 
 def test_pending_pages_subtracts_done():
@@ -267,7 +307,10 @@ async def test_registry_resume_restores_task(monkeypatch):
     """同仓库再次提交:命中落盘状态 → resumed=True,复用结构/进度恢复;state 快照胜出。"""
     structure = _make_structure(["p1", "p2", "p3"])
     state = WikiTaskState(
-        request=_make_request("resume-io", "demo"),
+        # 快照 generator 须与当前 env 同源(与 _persist_state 盖戳一致)才可续跑
+        request=_make_request("resume-io", "demo").model_copy(
+            update={"generator": deepwiki.envs.DEEPWIKI_GENERATOR}
+        ),
         status=TaskStatus.GENERATING,
         wiki_structure=structure,
         generated_pages={"p1": _make_page("p1"), "p2": _make_page("p2")},
@@ -301,6 +344,103 @@ async def test_registry_resume_restores_task(monkeypatch):
     finally:
         await deepwiki.registry.remove(key)
         await delete_wiki_task_state("resume-io", "demo", "local", "en")
+        await asyncio.sleep(0.25)  # 让 TTL 移除计时器自然结束,避免挂起的任务告警
+
+
+@pytest.mark.asyncio
+async def test_resume_drops_on_generator_mismatch(monkeypatch):
+    """续跑校验:快照 generator 与当前 env 不符 → 丢弃旧快照(不入队续跑,且清掉状态文件)。"""
+    state = WikiTaskState(
+        request=_make_request("gen-switch", "demo").model_copy(update={"generator": "cc"}),
+        status=TaskStatus.GENERATING,
+        wiki_structure=_make_structure(["p1", "p2"]),
+        generated_pages={"p1": _make_page("p1")},
+        default_branch="main",
+        submitted_at=424242,
+    )
+    assert await write_wiki_task_state(state) is True
+
+    async def fake_generate(task):
+        task.status = TaskStatus.COMPLETED
+
+    monkeypatch.setattr(deepwiki, "generate_repo_wiki", fake_generate)
+    monkeypatch.setattr(deepwiki, "_WIKI_TASK_TTL_SECONDS", 0.2)
+    monkeypatch.setattr(deepwiki.envs, "DEEPWIKI_GENERATOR", "cc")
+    key = "local_gen-switch_demo"
+    try:
+        # 同模式提交:命中旧快照,会走续跑 — 先验证模式相符路径不受影响
+        res_ok = await deepwiki.registry.submit(
+            WikiTask.from_wiki_request(_make_request("gen-switch", "demo"))
+        )
+        assert res_ok.resumed is True
+        task_ok = deepwiki.registry.get(key)
+        await task_ok.task
+        assert task_ok.status == TaskStatus.COMPLETED
+        await deepwiki.registry.remove(key)
+
+        # 切到 llm:快照(cc)与 env 不符 → 丢弃旧快照,全新一代
+        monkeypatch.setattr(deepwiki.envs, "DEEPWIKI_GENERATOR", "llm")
+        res = await deepwiki.registry.submit(
+            WikiTask.from_wiki_request(_make_request("gen-switch", "demo"))
+        )
+        assert res.created is True
+        assert res.resumed is False
+        assert not os.path.exists(_wiki_state_path("gen-switch", "demo", "local", "en"))
+        task = deepwiki.registry.get(key)
+        await task.task
+        assert task.status == TaskStatus.COMPLETED
+    finally:
+        await deepwiki.registry.remove(key)
+        await delete_wiki_task_state("gen-switch", "demo", "local", "en")
+        await asyncio.sleep(0.25)  # 让 TTL 移除计时器自然结束,避免挂起的任务告警
+
+
+@pytest.mark.asyncio
+async def test_cache_hit_respects_generator(monkeypatch):
+    """成品缓存校验:generator 与 env 相符才命中;不符则忽略旧成品、全新重新生成。"""
+    cache = WikiCacheData(
+        wiki_structure=_make_structure(["p1"]),
+        generated_pages={"p1": _make_page("p1")},
+        generator="cc",
+        repo=RepoInfo(
+            owner="gen-cache", repo="demo", type="local", repoUrl="/tmp/gh-puller-test-repo"
+        ),
+    )
+    assert await save_wiki_cache("gen-cache", "demo", "local", "en", cache) is True
+
+    calls = []
+
+    async def fake_run(task):
+        calls.append(task.key)
+        task.status = TaskStatus.COMPLETED
+
+    monkeypatch.setattr(deepwiki, "generate_repo_wiki", fake_run)
+    monkeypatch.setattr(deepwiki, "_WIKI_TASK_TTL_SECONDS", 0.2)
+    monkeypatch.setattr(deepwiki.envs, "DEEPWIKI_GENERATOR", "cc")
+    key = "local_gen-cache_demo"
+    try:
+        # 同模式(cc=cc):缓存命中,不运行
+        res_ok = await deepwiki.registry.submit(
+            WikiTask.from_wiki_request(_make_request("gen-cache", "demo"))
+        )
+        assert res_ok.from_cache is True
+        assert res_ok.status == TaskStatus.COMPLETED
+        assert calls == []
+
+        # 切到 llm:缓存(cc)与 env 不符 → 不命中,重新生成(旧 cc 成品不被复用)
+        monkeypatch.setattr(deepwiki.envs, "DEEPWIKI_GENERATOR", "llm")
+        res = await deepwiki.registry.submit(
+            WikiTask.from_wiki_request(_make_request("gen-cache", "demo"))
+        )
+        assert res.from_cache is False
+        assert res.created is True
+        task = deepwiki.registry.get(key)
+        await task.task
+        assert task.status == TaskStatus.COMPLETED
+        assert calls == [key]
+    finally:
+        await deepwiki.registry.remove(key)
+        await delete_wiki_cache("gen-cache", "demo", "local", "en")
         await asyncio.sleep(0.25)  # 让 TTL 移除计时器自然结束,避免挂起的任务告警
 
 
@@ -357,12 +497,12 @@ async def test_dispatch_structure_by_generator(monkeypatch):
         calls.append("llm")
         return _make_structure(["p1"])
 
-    async def fake_cc(task, repo, files):
+    async def fake_cc(task, repo, files, readme=None):
         calls.append("cc")
         return _make_structure(["p1"])
 
-    monkeypatch.setattr(deepwiki, "_determine_structure_llm", fake_llm)
-    monkeypatch.setattr(deepwiki, "_determine_structure_cc", fake_cc)
+    monkeypatch.setattr(deepwiki.LlmWikiPipeline, "determine_structure", staticmethod(fake_llm))
+    monkeypatch.setattr(deepwiki.AgentWikiPipeline, "determine_structure", staticmethod(fake_cc))
     task = WikiTask(request=_make_request("dispatch-io", "demo"))
 
     monkeypatch.setattr(deepwiki.envs, "DEEPWIKI_GENERATOR", "cc")
@@ -389,7 +529,9 @@ async def test_determine_structure_cc_skips_when_file_exists(monkeypatch):
     monkeypatch.setattr(deepwiki, "_agent_write_file", boom)
     monkeypatch.setattr(deepwiki.envs, "DEEPWIKI_GENERATOR", "cc")
     repo = Repo("/tmp/gh-puller-test-repo", "local")
-    s = await deepwiki._determine_structure_cc(WikiTask(request=request), repo, ["src/a.py"])
+    s = await deepwiki.AgentWikiPipeline().determine_structure(
+        WikiTask(request=request), repo, ["src/a.py"], ""
+    )
     assert [p.id for p in s.pages] == ["p1", "p2", "p3"]
 
 
@@ -402,8 +544,10 @@ async def test_determine_structure_cc_calls_agent_no_inline(tmp_path, monkeypatc
     request = WikiTaskRequest(repo_url=str(tmp_path), type="local", owner="local", repo="demo", language="en")
     captured = {}
 
-    async def fake_write(system_prompt, prompt, repo, model, out_path, label=None):
+    async def fake_write(system_prompt, prompt, repo, model, out_path, label=None,
+                         run_id=None, context=None, retry=None):
         captured["prompt"] = prompt
+        captured["run_id"] = run_id
         Path(out_path).parent.mkdir(parents=True, exist_ok=True)
         Path(out_path).write_text(_STRUCT_XML, encoding="utf-8")
         return _STRUCT_XML
@@ -411,12 +555,15 @@ async def test_determine_structure_cc_calls_agent_no_inline(tmp_path, monkeypatc
     monkeypatch.setattr(deepwiki, "_agent_write_file", fake_write)
     monkeypatch.setattr(deepwiki.envs, "DEEPWIKI_GENERATOR", "cc")
     repo = Repo(str(tmp_path), "local")
-    s = await deepwiki._determine_structure_cc(WikiTask(request=request), repo, ["src/a.py"])
+    s = await deepwiki.AgentWikiPipeline().determine_structure(
+        WikiTask(request=request), repo, ["src/a.py"], ""
+    )
     assert [p.id for p in s.pages] == ["p1", "p2", "p3"]
     assert "<file_tree>" in captured["prompt"]
     assert "src/a.py" in captured["prompt"]
     assert "SECRET_CODE_BODY" not in captured["prompt"]
     assert "SECRET_README_BODY" not in captured["prompt"]
+    assert captured["run_id"] == request.repo_key  # 任务级会话组关联
 
 
 @pytest.mark.asyncio
@@ -445,8 +592,10 @@ async def test_page_cc_calls_agent_and_reads_file(monkeypatch):
     request = _make_request("cc-page2", "demo")
     captured = {}
 
-    async def fake_write(system_prompt, prompt, repo, model, out_path, label=None):
+    async def fake_write(system_prompt, prompt, repo, model, out_path, label=None,
+                         run_id=None, context=None, retry=None):
         captured["prompt"] = prompt
+        captured["run_id"] = run_id
         Path(out_path).parent.mkdir(parents=True, exist_ok=True)
         Path(out_path).write_text("## PB-REAL\n\ncontent\n", encoding="utf-8")
         return "## PB-REAL\n\ncontent\n"
@@ -485,7 +634,9 @@ async def test_page_llm_inlines_files(tmp_path, monkeypatch):
         importance="medium", relatedPages=[],
     )
     repo = Repo(str(tmp_path), "local")
-    content = await deepwiki._generate_page_llm(task, repo, page, "- [src/a.py](src/a.py)")
+    content = await deepwiki.LlmWikiPipeline().generate_page(
+        task, repo, page, "- [src/a.py](src/a.py)"
+    )
     assert content == "LLM-CONTENT"
     assert captured["session"] == "wiki:page:p1"
     user_msg = captured["payload"]["messages"][0]["content"]
@@ -515,7 +666,9 @@ async def test_page_llm_degrades_over_limit(tmp_path, monkeypatch):
         importance="medium", relatedPages=[],
     )
     repo = Repo(str(tmp_path), "local")
-    assert await deepwiki._generate_page_llm(task, repo, page, "- [src/f0.py](src/f0.py)") == "DEGRADED"
+    assert await deepwiki.LlmWikiPipeline().generate_page(
+        task, repo, page, "- [src/f0.py](src/f0.py)"
+    ) == "DEGRADED"
     user_msg = captured["payload"]["messages"][0]["content"]
     assert "<file path=" not in user_msg
     assert "输入超限" in user_msg
@@ -582,7 +735,7 @@ async def test_determine_structure_llm_streams(monkeypatch):
     monkeypatch.setattr(deepwiki, "llm_stream", fake_llm_stream)
     task = WikiTask(request=_make_request("llm-struct", "demo"))
     repo = Repo("/tmp/gh-puller-test-repo", "local")
-    s = await deepwiki._determine_structure_llm(task, repo, ["app.py"], "")
+    s = await deepwiki.LlmWikiPipeline().determine_structure(task, repo, ["app.py"], "")
     assert [p.id for p in s.pages] == ["p1", "p2", "p3"]
     assert captured["session"] == "wiki:structure"
     # 输入仅文件树路径(含 <file_tree> 标签),无任何文件内容内联

@@ -21,7 +21,6 @@ OPENAI_BASE_URL / OPENAI_MODEL 等由 graphify 库层读取），本模块不接
 
 import json
 import os
-import sys
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -69,6 +68,8 @@ from graphify.tree_html import write_tree_html
 from graphify.watch import _git_head
 from networkx.readwrite import json_graph
 
+from .utils import _log as _utils_log
+
 _GRAPHIFY_OUT = "graphify-out"  # GRAPHIFY_OUT 缺省值（与 graphify.paths.py 同式）
 _DEFAULT_TOKEN_BUDGET = 60_000  # 与 CLI --token-budget 缺省一致
 _DEFAULT_TOKEN_BUDGET_QUERY = 2000  # 与 CLI query --budget 缺省一致
@@ -86,7 +87,7 @@ def _default_graph_path() -> Path:
 
 def _log(stage: str, msg: str) -> None:
     """进度日志走 stderr——stdout 留给调用方做机器结果（CLI 同样约定 [#698]）。"""
-    print(f"[graphify {stage}] {msg}", file=sys.stderr, flush=True)
+    _utils_log(msg, prefix=f"graphify {stage}")
 
 
 def _load_graph(graph_path: str | Path, *, preserve_direction: bool = False) -> tuple[Any, dict]:

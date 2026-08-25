@@ -13,9 +13,10 @@ import tempfile
 os.environ.setdefault("DEEPWIKI_ROOT", tempfile.mkdtemp(prefix="deepwiki-app-test-"))
 
 from fastapi.testclient import TestClient
+from gh_puller.deepwiki import _graph_path
+from gh_puller.utils import Repo
 
 from app import app as server_app
-from gh_puller.deepwiki import Repo, _graph_path
 
 
 def _write_corpus(root) -> str:
