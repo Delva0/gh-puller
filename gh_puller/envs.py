@@ -55,6 +55,8 @@ AGENT_MONITOR_WEBUI_URL = os.environ.get("AGENT_MONITOR_WEBUI_URL", "ws://localh
 AGENT_MONITOR_PORT = int(os.environ.get("AGENT_MONITOR_PORT", "8765"))
 # 启用条件:端点可达(ensure_bus 构建时 TCP 探活)+ opentelemetry 可导入
 AGENT_MONITOR_PHOENIX_URL = os.environ.get("AGENT_MONITOR_PHOENIX_URL", "http://localhost:6006/")
+# OTel 导出 service.name(缺省 gh-puller;OtelSink 构建读用)
+OTEL_SERVICE_NAME = os.environ.get("OTEL_SERVICE_NAME", "gh-puller")
 
 # ---- benchmark 评测(单题超时/评测器选择与端点) ----
 TIMEOUT = 3600.0  # 单题超时(秒,1 小时):参赛方 ask 与评测器评分的统一上限

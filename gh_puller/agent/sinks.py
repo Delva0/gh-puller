@@ -223,7 +223,7 @@ class OtelSink:
         self.tracer = tracer
         if self.tracer is None:
             tp = TracerProvider(
-                resource=Resource({"service.name": os.environ.get("OTEL_SERVICE_NAME", "gh-puller")})
+                resource=Resource({"service.name": envs.OTEL_SERVICE_NAME})
             )
             tp.add_span_processor(SimpleSpanProcessor(otel_exporter(endpoint=endpoint)))
             self.tracer = tp.get_tracer("gh-puller.agent-monitor")
