@@ -2,35 +2,53 @@
 
 将 GitHub 开源仓库（含 PR/Issue）构建为知识库并搭载 agent，对外暴露 REST 接口，回答任何与代码库相关的问题。
 
-当前阶段：**benchmark 评测框架**（评估参赛后端答案质量的测试管线）。
+## 功能
 
-## 目录结构
+- **DeepWiki 兼容问答**：`gh_puller/deepwiki.py`（引擎）+ `apps/deepwiki-webui`（FastAPI 后端 + Next.js 前端）。前端契约沿用 deepwiki-open，引擎替换为 Claude Code agent + graphify；生成双路（cc/llm），wiki 生成中途落盘、重启可续跑
+- **graphify 库索引**：`gh_puller/graphify.py` 封装 graphify CLI（extract/export/query）——纯本地 AST 建图，无 embedding/RAG；检索由 agent 按需调用 `graphify_query` 工具完成
+- **agent 统一入口 + 流式监控**：`gh_puller/agent/` 事件溯源式事件模型 + 文件/WS/OTel 观测通道；`apps/agent-dashboard` 实时查看 CC 与 LLM 调用过程
+- **benchmark 评测框架**：`gh_puller/benchmark/` 按 REST 协议 v1 单点评测——一个题库 + 一个参赛方 endpoint，题库（`JUDGE`）自治
+- **共享 UI**：`ui/` 基础组件包 `@gh-puller/ui`，apps 经 `workspace:*` 直引源码
 
-| 路径 | 说明 |
-|---|---|
-| `gh_puller/benchmark/` | 评测框架（正式代码）：pipeline 调度 + REST 协议 + 协议层类型 |
-| `gh_puller/benchmark/judges/` | 题库目录：出题人编写的真实题库放这里（内置 vllm_mechanism/）；编写约定见 README.md |
-| `archive/` | 旧代码归档（勿动） |
+## 哲学
 
-## 快速上手（端到端自测）
+- **协议契约代码化**：`benchmark/protocol.py` + `types.py` 是 ask 请求/响应的唯一权威定义，调用方与服务方共用；未知字段不拒绝，协议前向兼容
+- **管线零认知**：pipeline 只认识 ask 接口签名、题库导出的 `JUDGE`、judgment 原样存档——题目形态、评判逻辑全由出题人自拟，pipeline 只存档、不解释
+- **双方独立发展**：参赛方（服务方）与评测框架互不见面，仅通过 REST 协议互操作
+- **不建 RAG，建图**：索引是代码本体的 AST 建图，检索交给 agent 按需查工具，而非 chunk-embed 相似度检索
+- **事件溯源**：监控日志无损 append-only；LLM 消息上下文是 surface 节点的派生，不是快照
 
-> 参赛方（服务方）与 `benchmark/`（评测框架）独立发展，仅通过 REST 协议互操作。
-
-先启动一个参赛方服务：任意实现 REST 协议 v1 的服务（唯一路由 `POST /ask`，见
-`gh_puller/benchmark/README.md`），记下其 `base_url`（如 `http://localhost:8001`）。
-然后跑一次评测（一个题库 + 一个 endpoint）：
+## 快速上手
 
 ```bash
-uv run benchmark gh_puller/benchmark/judges/vllm_mechanism/bank.py --url http://localhost:8001
+# 依赖安装（仓库根，单一 pnpm lockfile）
+pnpm install
 ```
 
-结果：`outputs/<时间戳>/` 下生成 `result.json`（默认输出目录；`--out-dir` 可覆盖。单对象存档：`valid` / `invalid_reason` / `judgment` / `judge_error`）。
+**问答服务（deepwiki-webui）**
 
-## 文档入口
+```bash
+# 终端 1：后端（默认 :8001）
+cd apps/deepwiki-webui/server && uv run uvicorn app:app --port 8001
+# 终端 2：前端（默认 :3000）
+cd apps/deepwiki-webui/web && pnpm dev
+```
 
-- `gh_puller/benchmark/README.md` —— **协议契约**（REST 协议 v1：唯一路由 `POST /ask`、请求/响应格式、接入检查）+ **出题人约定**（题库文件 `JUDGE` 接口）
-- `docs/agent-monitor.md` —— **LLM 调用流式监控**（文件 sink 默认开 + Web/WS hub；CC 与 openai 调用统一观测）
+浏览器打开 `http://localhost:3000`。
 
-## 核心设计（一句话）
+**评测（benchmark）**
 
-题库自治 + 接口注入：pipeline 把参赛方接口封装成 `ask(question) -> Answer` 注入 `judge.__call__(ask)`，judge 自行加载题目数据、问参赛方、评判并组织输出；pipeline 对判定结果只存档、不解释。
+```bash
+# 先启动一个实现协议 v1 的参赛方服务（唯一路由 POST /ask，如 :8001），然后：
+uv run benchmark gh_puller/benchmark/judges/vllm_mechanism/bank.py --url http://localhost:8001
+# 产物：outputs/<时间戳>/result.json
+```
+
+**agent 监控（agent-dashboard，可选）**
+
+```bash
+cd apps/agent-dashboard/server && uv run uvicorn hub:app --port 8765
+# 浏览器 :8765；LLM 调用默认自动对接（AGENT_MONITOR_WEBUI_URL 默认 ws://localhost:8765/ws）
+```
+
+更多文档：`gh_puller/benchmark/README.md`（协议契约 + 出题人约定）、`docs/agent-monitor.md`（流式监控）。
