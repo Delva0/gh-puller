@@ -1,5 +1,0 @@
-# pnpm 11.x 配置:放行这三个依赖的 postinstall 构建脚本(原生二进制校验/回退,与原安装行为一致)
-allowBuilds:
-  '@parcel/watcher': true
-  '@swc/core': true
-  sharp: true

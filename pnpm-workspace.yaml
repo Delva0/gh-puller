@@ -1,0 +1,11 @@
+# ui 为本项目共享 UI 组件包(@gh-puller/ui,自持 package.json,apps 经 workspace:* 依赖);
+# 与根 pyproject.toml / uv.lock 共存,uv 管 Python、pnpm 管 JS
+packages:
+  - ui
+  - apps/deepwiki-webui/web
+  - apps/agent-dashboard/web
+allowBuilds:
+  esbuild: true
+  '@parcel/watcher': true
+  '@swc/core': true
+  sharp: true

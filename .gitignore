@@ -23,6 +23,10 @@ outputs/
 .pytest_cache/
 .ruff_cache/
 
-# apps/webui (Next.js)
-apps/webui/node_modules/
-apps/webui/.next/
+# Node(根 pnpm 工作区:ui(@gh-puller/ui) 与 apps/*/web 为成员)
+node_modules/
+.next/
+*.tsbuildinfo
+
+# agent-dashboard 构建产物(vite 单文件,由仓库根 pnpm -r build 生成)
+apps/agent-dashboard/server/static/
