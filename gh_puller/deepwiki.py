@@ -5,14 +5,22 @@
 - 原后端 RAG(adalflow + FAISS chunk/embed 检索)整体切除:
   索引 = `graphify.extract(code_only=True)` 的纯本地 AST 建图(输出 <DEEPWIKI_ROOT>/graphify/<repo>/graph.json);
   检索 = `graphify.query()` 封装为 Claude Code agent 的 graphify_query 工具,由 agent 按需调用。
-- chat / wiki 生成 / codemap 不再直接调 LLM API,统一走 claude_agent_sdk 的 Claude Code agent,
-  提示词(chat / deep_research / codemap / wiki 页面与结构)全部为 deepwiki-open 原文。
+- 双路生成(envs.DEEPWIKI_GENERATOR 统一开关,cc/llm 可选):
+  cc(agent)路 = Claude Code agent(自读代码 + graphify_query 工具;wiki 交付件 Write 落盘;
+  chat/codemap 每请求一次提问,agent 内部多轮工具调用完成);
+  llm 路 = deepwiki-open 原式补全(chat/codemap 的检索上下文 = graphify 子图 →
+  真实代码行窗注入,即原 dense RAG 的对应物)。
+  提示词(chat / deep_research / codemap / wiki 页面与结构)全部为 deepwiki-open 原文,
+  且全部为英文(模型面向文本不出中文;日志/端点消息/注释可为中文)。
+  单路生成协议 helper 收进对应 pipeline 类(self._xxx),共用/通道/任务机保持模块级
+  (见下『双路包装类』节首的边界注释)。
 
 已知简化(v1,详见 gh_puller/envs.py):
 - repo 克隆用 git CLI(subprocess,不引 gitpython);远程 URL 的 token 注入沿用原后端三 host 方案。
 - token 上限粗略估算(字符数/4,不引 tiktoken)。
 - 语言仅 en/zh(与前端裁剪的 messages/{en,zh}.json 同步)。
-- 模型仅 claude 单一 provider(由 CLAUDE_AGENT_MODEL 或 SDK 缺省)。
+- 模型:cc 路 claude 单一 provider(CLAUDE_AGENT_MODEL 或 SDK 缺省);
+  llm 路 OpenAI 兼容端点(envs.DEEPWIKI_LLM_URL/MODEL/API_KEY,缺省回退 LLM_JUDGE_*)。
 - 文件过滤为内嵌精简规则(与原 repo.json 全量规则有差异)。
 - 聊天记忆由单次 agent 会话内承,无持久会话库。
 
@@ -37,7 +45,7 @@ from claude_agent_sdk import ClaudeAgentOptions, create_sdk_mcp_server, tool
 from pydantic import BaseModel, ConfigDict, Field, computed_field, field_validator
 
 from . import envs, graphify
-from .agent import cc_stream, llm_stream
+from .agent import cc_stream, llm_complete, llm_stream
 from .utils import (
     Repo,
     RepoType,
@@ -79,29 +87,8 @@ os.makedirs(_WIKI_CACHE_DIR, exist_ok=True)
 
 # cc(agent)交付件目录名:wikicache/agent_cache/{proj}-{structure,page_<id>}.md
 _AGENT_CACHE_DIRNAME = "agent_cache"
-# 纯 LLM 路径单文件内联截断(字符)
-_FILE_INLINE_CAP = 8000
 
 
-def _proj_key(r: Any) -> str:
-    """项目键 {type}_{owner}_{repo}(如 local_local_deepwiki-open,与 _wiki_cache_path 命名对齐)。"""
-    return _sanitize_path_seg(f"{r.type}_{r.owner}_{r.repo}")
-
-
-def _agent_cache_dir(r: Any) -> Path:
-    return Path(_WIKI_CACHE_DIR) / _AGENT_CACHE_DIRNAME / _proj_key(r)
-
-
-def _agent_cache_structure_path(r: Any) -> Path:
-    """cc 结构交付文件:{proj}-structure.md。"""
-    return _agent_cache_dir(r) / f"{_proj_key(r)}-structure.md"
-
-
-def _agent_cache_page_path(r: Any, page_id: str) -> Path:
-    """cc 页面交付文件:{proj}-<id>.md(id 形如 page-N 时直接采用,否则 {proj}-page_<id>;id 经安全化)。"""
-    seg = _sanitize_path_seg(page_id)
-    name = f"{_proj_key(r)}-{seg}" if seg.startswith("page-") else f"{_proj_key(r)}-page_{seg}"
-    return _agent_cache_dir(r) / f"{name}.md"
 
 # 页面/结构/图表生成所需的固定并发与重试(原 DEEPWIKI_* 缺省同式,见 envs.py;
 # 页并发缺省 4:同时跑 4 个 agent 子进程,受 API 速限与机器内存约束)
@@ -179,98 +166,7 @@ This file contains...
 - Use markdown formatting to improve readability
 </style>"""
 
-_DEEP_RESEARCH_FIRST_ITERATION_PROMPT = """<role>
-You are an expert code analyst examining the {repo_type} repository: {repo_url} ({repo_name}).
-You are conducting a multi-turn Deep Research process to thoroughly investigate the specific topic in the user's query.
-Your goal is to provide detailed, focused information EXCLUSIVELY about this topic.
-IMPORTANT:You MUST respond in {language_name} language.
-</role>
 
-<guidelines>
-- This is the first iteration of a multi-turn research process focused EXCLUSIVELY on the user's query
-- Start your response with "## Research Plan"
-- Outline your approach to investigating this specific topic
-- If the topic is about a specific file or feature (like "Dockerfile"), focus ONLY on that file or feature
-- Clearly state the specific topic you're researching to maintain focus throughout all iterations
-- Identify the key aspects you'll need to research
-- Provide initial findings based on the information available
-- End with "## Next Steps" indicating what you'll investigate in the next iteration
-- Do NOT provide a final conclusion yet - this is just the beginning of the research
-- Do NOT include general repository information unless directly relevant to the query
-- Focus EXCLUSIVELY on the specific topic being researched - do not drift to related topics
-- Your research MUST directly address the original question
-- NEVER respond with just "Continue the research" as an answer - always provide substantive research findings
-- Remember that this topic will be maintained across all research iterations
-</guidelines>
-
-<style>
-- Be concise but thorough
-- Use markdown formatting to improve readability
-- Cite specific files and code sections when relevant
-</style>"""
-
-_DEEP_RESEARCH_INTERMEDIATE_ITERATION_PROMPT = """<role>
-You are an expert code analyst examining the {repo_type} repository: {repo_url} ({repo_name}).
-You are currently in iteration {research_iteration} of a Deep Research process focused EXCLUSIVELY on the latest user query.
-Your goal is to build upon previous research iterations and go deeper into this specific topic without deviating from it.
-IMPORTANT:You MUST respond in {language_name} language.
-</role>
-
-<guidelines>
-- CAREFULLY review the conversation history to understand what has been researched so far
-- Your response MUST build on previous research iterations - do not repeat information already covered
-- Identify gaps or areas that need further exploration related to this specific topic
-- Focus on one specific aspect that needs deeper investigation in this iteration
-- Start your response with "## Research Update {research_iteration}"
-- Clearly explain what you're investigating in this iteration
-- Provide new insights that weren't covered in previous iterations
-- If this is iteration 3, prepare for a final conclusion in the next iteration
-- Do NOT include general repository information unless directly relevant to the query
-- Focus EXCLUSIVELY on the specific topic being researched - do not drift to related topics
-- If the topic is about a specific file or feature (like "Dockerfile"), focus ONLY on that file or feature
-- NEVER respond with just "Continue the research" as an answer - always provide substantive research findings
-- Your research MUST directly address the original question
-- Maintain continuity with previous research iterations - this is a continuous investigation
-</guidelines>
-
-<style>
-- Be concise but thorough
-- Focus on providing new information, not repeating what's already been covered
-- Use markdown formatting to improve readability
-- Cite specific files and code sections when relevant
-</style>"""
-
-_DEEP_RESEARCH_FINAL_ITERATION_PROMPT = """<role>
-You are an expert code analyst examining the {repo_type} repository: {repo_url} ({repo_name}).
-You are in the final iteration of a Deep Research process focused EXCLUSIVELY on the latest user query.
-Your goal is to synthesize all previous findings and provide a comprehensive conclusion that directly addresses this specific topic and ONLY this topic.
-IMPORTANT:You MUST respond in {language_name} language.
-</role>
-
-<guidelines>
-- This is the final iteration of the research process
-- CAREFULLY review the entire conversation history to understand all previous findings
-- Synthesize ALL findings from previous iterations into a comprehensive conclusion
-- Start with "## Final Conclusion"
-- Your conclusion MUST directly address the original question
-- Stay STRICTLY focused on the specific topic - do not drift to related topics
-- Include specific code references and implementation details related to the topic
-- Highlight the most important discoveries and insights about this specific functionality
-- Provide a complete and definitive answer to the original question
-- Do NOT include general repository information unless directly relevant to the query
-- Focus exclusively on the specific topic being researched
-- NEVER respond with "Continue the research" as an answer - always provide a complete conclusion
-- If the topic is about a specific file or feature (like "Dockerfile"), focus ONLY on that file or feature
-- Ensure your conclusion builds on and references key findings from previous iterations
-</guidelines>
-
-<style>
-- Be concise but thorough
-- Use markdown formatting to improve readability
-- Cite specific files and code sections when relevant
-- Structure your response with clear headings
-- End with actionable insights or recommendations when appropriate
-</style>"""
 
 # codemap 生成 - 阶段 1:分析代码并产出 codemap 骨架(带 JSON 输出格式与引用接地规则)
 _CODEMAP_SKELETON_PROMPT = """<role>
@@ -843,6 +739,8 @@ async def _run_extract(repo: Repo, request: RepoRequestBase) -> dict:
     )
 
 
+
+
 def _graphify_server(repo: Repo):
     """进程内 MCP server:把 graphify.query 封装为 graphify_query 工具(闭包绑定图路径)。"""
 
@@ -850,8 +748,9 @@ def _graphify_server(repo: Repo):
 
     @tool(
         "graphify_query",
-        "查询仓库代码图谱,返回与该问题相关的代码子图(函数/类/调用关系文本),"
-        "并带 `Source: <文件路径> L<行号>` 形式的来源标记。适合获取代码结构与行号引用。",
+        "Query this repository's code graph and return the related code subgraph "
+        "(functions/classes/call relationships as text), with `Source: <file path> L<line> "
+        "markers. Use it to get code structure and line-number references.",
         {"question": str},
     )
     async def graphify_query(args: dict) -> dict:
@@ -860,8 +759,8 @@ def _graphify_server(repo: Repo):
             result = graphify.query(question, graph_path=graph_path)
             text = result.get("answer") or ""
         except Exception as exc:
-            text = f"查询图谱失败: {type(exc).__name__}: {exc}"
-        return {"content": [{"type": "text", "text": text.strip() or "(图谱无匹配结果)"}]}
+            text = f"Graph query failed: {type(exc).__name__}: {exc}"
+        return {"content": [{"type": "text", "text": text.strip() or "(No matching results in code graph)"}]}
 
     return create_sdk_mcp_server("graphify", tools=[graphify_query])
 
@@ -882,8 +781,9 @@ def _agent_options(
     """组装 agent 选项;repo 非空时挂 graphify 工具并把 cwd 固定到仓库根
     (SDK 缺省 = 进程 cwd,曾导致 agent 串到 gh-puller 并把 docs 写入其中);
     model 优先级:envs.CLAUDE_AGENT_MODEL > 请求 model > SDK 缺省。
-    agent_write_mode(cc 交付件落盘)追加 agent_cache 写目录(add_dirs)与
-    acceptEdits,工具集放开 Read/Grep/Glob/Write 供 agent 自读代码并落盘成品。"""
+    默认模式开放 Read/Grep/Glob(chat/codemap 的 agent 自读代码,无落盘);
+    agent_write_mode(cc 交付件落盘,wiki 结构/页面)在此基础上追加 Write 并提供
+    agent_cache 写目录(add_dirs)与 acceptEdits,成品经 Write 落盘。"""
     kwargs: dict[str, Any] = {
         "system_prompt": system_prompt,
         "include_partial_messages": True,
@@ -894,12 +794,12 @@ def _agent_options(
     if repo is not None:
         kwargs["cwd"] = os.path.abspath(repo.save_path)
         kwargs["mcp_servers"] = {"graphify": _graphify_server(repo)}
-        tools = ["graphify_query", "mcp__graphify__graphify_query"]
+        tools = ["Read", "Grep", "Glob", "graphify_query", "mcp__graphify__graphify_query"]
         if agent_write_mode:
             if agent_output_dir:
                 kwargs["add_dirs"] = [os.path.abspath(agent_output_dir)]
             kwargs["permission_mode"] = "acceptEdits"
-            tools = ["Read", "Grep", "Glob", "Write", *tools]
+            tools = ["Write", *tools]
         kwargs["allowed_tools"] = tools
     return ClaudeAgentOptions(**kwargs)
 
@@ -1447,7 +1347,7 @@ def export_wiki(
 
 
 # ---------------------------------------------------------------------------
-# chat 服务(agent 版;协议/错误语义与原 research.py 对齐)
+# chat 服务(双路;协议/错误语义与原 research.py 对齐)
 # ---------------------------------------------------------------------------
 
 
@@ -1475,30 +1375,29 @@ def _format_request_fmt(request: RepoRequestBase) -> dict:
     }
 
 
+def _resolve_chat_continuation(last: ChatMessage, messages: list[ChatMessage]) -> None:
+    """continuation 回退(移植 research.py):末条含 continue+research 时换回首个用户消息(就地改 last.content)。"""
+    if "continue" in last.content.lower() and "research" in last.content.lower():
+        for msg in messages:
+            if msg.role == "user" and "continue" not in msg.content.lower():
+                last.content = msg.content.strip()
+                break
+
+
 async def chat_stream(request: ChatCompletionRequest):
-    """一次 chat 请求的流式应答(纯文本 chunk 序列,前后端协议同原 research_chat);恒 agent 路。"""
-    async for chunk in _agent_pipeline().chat_stream(request):
+    """一次 chat 请求的流式应答(纯文本 chunk 序列,前后端协议同原 research_chat);按 generator 双路。"""
+    async for chunk in _service_pipeline().chat_stream(request):
         yield chunk
 
 
 
 # ---------------------------------------------------------------------------
-# codemap 服务(agent 版两阶段;NDJSON 事件协议同原)
+# codemap 服务(双路两阶段;NDJSON 事件协议同原)
 # ---------------------------------------------------------------------------
 
-def _codemap_note() -> str:
-    """codemap 指引:先查图谱再构造,引用行号取自 Source 标记。"""
-    return (
-        "<note>Before answering, use the graphify_query tool to inspect the repository "
-        "code graph (its result carries `Source: <file path> L<line>` markers). "
-        "When filling citation.file_path / start_line / end_line, use those paths and line "
-        "numbers, and make the 'snippet' a verbatim substring of the code shown in the result.</note>\n\n"
-    )
-
-
 async def generate_codemap(request: CodeMapRequest):
-    """两阶段 codemap 生成(骨架 → 指南/图),NDJSON 事件流;阶段失败语义与原相同;恒 agent 路。"""
-    async for ev in _agent_pipeline().generate_codemap(request):
+    """两阶段 codemap 生成(骨架 → 指南/图),NDJSON 事件流;阶段失败语义与原相同;按 generator 双路。"""
+    async for ev in _service_pipeline().generate_codemap(request):
         yield ev
 
 
@@ -1637,10 +1536,12 @@ registry = WikiTaskRegistry(
 # ---------------------------------------------------------------------------
 # 双路包装类:llm 路与 cc(agent)路对外 API 的统一入口。
 # 分派:wiki 生成(结构/页面)按 envs.DEEPWIKI_GENERATOR 经 _wiki_pipeline() 选择;
-#       chat / codemap 恒 agent 路(经 _agent_pipeline(),不读 envs)。
-# 共用构建件与低层支撑保持模块级 helper(共享提示词段、XML 解析/引用后处理、
-# 图索引、任务状态机、agent/llm 流式通道);类方法体内一律以模块全局名引用
-# cc_stream / llm_stream / _agent_write_file / envs.*,保证调用时动态解析
+#       chat / codemap 同开关经 _service_pipeline()(双路均读 envs,不区分恒 agent)。
+# 边界:语义属于单路生成协议的 helper(提示词组装/历史转写/检索上下文注入/
+# cc 交付件路径/llm 一次问答生成链)收进对应 pipeline 类为 self._xxx();
+# 共用构建件与低层支撑(共享提示词段、XML 解析/引用后处理、图索引、任务状态机、
+# agent SDK/llm 端点通道)保持模块级。类方法体内一律以模块全局名引用
+# cc_stream / llm_stream / llm_complete / envs.*,保证调用时动态解析
 # (测试 monkeypatch 与 envs 切换均生效,不得实例捕获或模块级快照)。
 # ---------------------------------------------------------------------------
 
@@ -1678,16 +1579,88 @@ class WikiPipeline:
 class AgentWikiPipeline(WikiPipeline):
     """cc(agent)路对外 API 包装:Claude Code agent 自读仓库代码,交付件 Write 落盘(文件为权威)。"""
 
+    # deep_research 折叠版(cc/agent 路专用):一次回答完成整轮研究(agent 内部
+    # 多轮工具调用);LLM 路仍走 LlmWikiPipeline 的 FIRST/INTERMEDIATE/FINAL 三模板(原版 5 轮协议)。
+    # 标题字符串必须逐字匹配前端 Ask.tsx 的提取/完成判定正则(Research Plan /
+    # Research Update {n} / Final Conclusion);禁 "## Next Steps"(它会截断 plan 提取
+    # 并影响完成判定)与 "## Conclusion"/"## Summary"(完成判定的次选触发词)。
+    _DEEP_RESEARCH_ONE_SHOT_PROMPT = """<role>
+You are an expert code analyst examining the {repo_type} repository: {repo_url} ({repo_name}).
+You are conducting a COMPLETE single-run Deep Research of the latest user query, aimed at a definitive answer rather than an intermediate round.
+IMPORTANT:You MUST respond in {language_name} language.
+</role>
+
+<guidelines>
+- This is the ONLY response of the research process: finish the entire investigation in this one answer.
+- USE YOUR TOOLS (Read / Grep / Glob / graphify_query) to inspect the repository code for evidence before writing; repeated tool rounds are expected.
+- Your answer MUST contain EXACTLY these sections, in this order:
+  1. Begin with "## Research Plan" - the approach and initial findings for the investigation
+  2. Then one or more progress sections "## Research Update 1", "## Research Update 2", ... with deeper findings from your tool exploration
+  3. End with "## Final Conclusion" - a complete, definitive answer to the original question, citing specific files and line numbers
+- NEVER stop after the Plan section: keep investigating until you can write a Final Conclusion.
+- NEVER write "## Next Steps"; NEVER respond with "Continue the research".
+- Do NOT use "## Conclusion" or "## Summary" as section headings (only "## Final Conclusion").
+- Focus EXCLUSIVELY on the user's query; cite specific files and code sections when relevant.
+</guidelines>"""
+
+    def _proj_key(self, r: Any) -> str:
+        """项目键 {type}_{owner}_{repo}(如 local_local_deepwiki-open,与 _wiki_cache_path 命名对齐)。"""
+        return _sanitize_path_seg(f"{r.type}_{r.owner}_{r.repo}")
+
+    def _agent_cache_dir(self, r: Any) -> Path:
+        return Path(_WIKI_CACHE_DIR) / _AGENT_CACHE_DIRNAME / self._proj_key(r)
+
+    def _agent_cache_structure_path(self, r: Any) -> Path:
+        """cc 结构交付文件:{proj}-structure.md。"""
+        return self._agent_cache_dir(r) / f"{self._proj_key(r)}-structure.md"
+
+    def _agent_cache_page_path(self, r: Any, page_id: str) -> Path:
+        """cc 页面交付文件:{proj}-<id>.md(id 形如 page-N 时直接采用,否则 {proj}-page_<id>;id 经安全化)。"""
+        seg = _sanitize_path_seg(page_id)
+        name = f"{self._proj_key(r)}-{seg}" if seg.startswith("page-") else f"{self._proj_key(r)}-page_{seg}"
+        return self._agent_cache_dir(r) / f"{name}.md"
+
+    def _render_natural_history(self, messages: list[ChatMessage]) -> tuple[str, list[dict]]:
+        """agent 路对话历史:自然转写(无 <turn>/<conversation_history> 伪标签),含裁剪说明事件。"""
+        history_parts: list[str] = []
+        context: list[dict] = []
+        if len(messages) > 1:
+            last = messages[-1]
+            if _estimate_tokens(last.content) > envs.CHAT_TOKEN_LIMIT_ESTIMATE:
+                _log(f"请求过大(估算 {_estimate_tokens(last.content)} tokens),省略对话历史")
+                context.append({"type": "context/modify",
+                                "data": {"target": "chat-history", "kind": "trim",
+                                         "cause": "token-limit", "detail": "省略对话历史",
+                                         "removed": {"n_turns": len(messages) - 1,
+                                                     "est_tokens": _estimate_tokens(last.content)}}})
+            else:
+                for i in range(0, len(messages) - 1, 2):
+                    user, assistant = messages[i], messages[i + 1]
+                    if user.role == "user" and assistant.role == "assistant":
+                        history_parts.append(f"User: {user.content}\nAssistant: {assistant.content}")
+        if history_parts:
+            return "Previous conversation:\n" + "\n\n".join(history_parts) + "\n\n", context
+        return "", context
+
+    def _codemap_note(self) -> str:
+        """codemap 指引(仅 cc/agent 路用):先查图谱再构造,引用行号取自 Source 标记。"""
+        return (
+            "<note>Before answering, use the graphify_query tool to inspect the repository "
+            "code graph (its result carries `Source: <file path> L<line>` markers). "
+            "When filling citation.file_path / start_line / end_line, use those paths and line "
+            "numbers, and make the 'snippet' a verbatim substring of the code shown in the result.</note>\n\n"
+        )
+
     def needs_structure_regenerate(self, task: WikiTask) -> bool:
         """structure 交付文件被删即强制重生成(续跑失效)。"""
-        return not _agent_cache_structure_path(task.request).exists()
+        return not self._agent_cache_structure_path(task.request).exists()
 
     async def determine_structure(
         self, task: WikiTask, repo: Repo, file_tree: list[str], readme: str,
     ) -> WikiStructureModel:
         """cc(agent)结构:交付文件已存在即跳过 agent(续跑);否则 agent 落盘 structure.md 后读回解析。"""
         r = task.request
-        struct_path = _agent_cache_structure_path(r)
+        struct_path = self._agent_cache_structure_path(r)
         if struct_path.exists():
             content = await asyncio.to_thread(struct_path.read_text, encoding="utf-8")
         else:
@@ -1779,7 +1752,7 @@ IMPORTANT:
     ) -> str:
         """cc 路单页:交付文件已存在即读回(续跑,文件为权威);否则 agent 落盘 page_<id>.md。"""
         r = task.request
-        out_path = _agent_cache_page_path(r, page.id)
+        out_path = self._agent_cache_page_path(r, page.id)
         if out_path.exists():
             return await asyncio.to_thread(out_path.read_text, encoding="utf-8")
         prompt = _agent_note() + self._build_page_prompt(page.title, list(page.filePaths), str(out_path), r.language)
@@ -1797,7 +1770,7 @@ IMPORTANT:
         r = task.request
         ctx = RepoUrlContext(type=r.type, repo_url=r.repo_url, default_branch=task.default_branch)
         for page in structure.pages:
-            out_path = _agent_cache_page_path(r, page.id)
+            out_path = self._agent_cache_page_path(r, page.id)
             if not out_path.exists():
                 continue
             content = await asyncio.to_thread(out_path.read_text, encoding="utf-8")
@@ -1809,12 +1782,13 @@ IMPORTANT:
     def write_error_page(self, task: WikiTask, page: WikiPage, content: str) -> None:
         """重试耗尽(cc 路):占位文本也落盘,续跑跳过占位页;用户删除该文件即可重试。"""
         try:
-            _agent_cache_page_path(task.request, page.id).write_text(content, encoding="utf-8")
+            self._agent_cache_page_path(task.request, page.id).write_text(content, encoding="utf-8")
         except OSError as e:  # noqa: BLE001 - 占位写入失败不阻断任务完成
             _log(f"写入占位页文件失败: {page.id} - {e}")
 
     async def chat_stream(self, request: ChatCompletionRequest):
-        """一次 chat 请求的流式应答(纯文本 chunk 序列,前后端协议同原 research_chat)。"""
+        """一次 chat 请求的流式应答(纯文本 chunk 序列,前后端协议同原 research_chat);
+        现代 agent 模式:一次提问,agent 内部多轮工具调用完成,不做协议级轮转。"""
         if not request.messages:
             raise ValueError("No messages provided")
         last = request.messages[-1]
@@ -1827,43 +1801,16 @@ IMPORTANT:
         fmt = _format_request_fmt(request)
         is_deep = last.mode == "deep_research"
         if is_deep:
-            # continuation 回退:含 continue+research 时换回首个用户消息(移植 research.py)
-            if "continue" in last.content.lower() and "research" in last.content.lower():
-                for msg in request.messages:
-                    if msg.role == "user" and "continue" not in msg.content.lower():
-                        last.content = msg.content.strip()
-                        break
-            if request.research_iteration == 1:
-                system = _DEEP_RESEARCH_FIRST_ITERATION_PROMPT.format(**fmt)
-            elif request.research_iteration >= 5:
-                system = _DEEP_RESEARCH_FINAL_ITERATION_PROMPT.format(**fmt)
-            else:
-                system = _DEEP_RESEARCH_INTERMEDIATE_ITERATION_PROMPT.format(
-                    **fmt, research_iteration=request.research_iteration
-                )
+            # 折叠:一次回答完成整轮研究(agent 内部多轮工具调用);continuation 回退
+            # 保留作偏差兜底(首轮缺 Final Conclusion 时前端续跑轮为同一问题重跑)
+            _resolve_chat_continuation(last, request.messages)
+            system = self._DEEP_RESEARCH_ONE_SHOT_PROMPT.format(**fmt)
         else:
             system = _SIMPLE_CHAT_SYSTEM_PROMPT.format(**fmt)
 
-        # 对话历史成对拼装;输入过大时省略历史(仿 prompt_builder 的简化路径)
+        # 对话历史自然转写(无 <turn> 伪标签);输入过大时省略历史。
         # 裁剪/注记作为监控上下文说明事件(context/modify|inject)伴跑,不改变折叠结果
-        history = ""
-        context: list[dict] = []
-        if len(request.messages) > 1:
-            if _estimate_tokens(last.content) > envs.CHAT_TOKEN_LIMIT_ESTIMATE:
-                _log(f"请求过大(估算 {_estimate_tokens(last.content)} tokens),省略对话历史")
-                context.append({"type": "context/modify",
-                                "data": {"target": "chat-history", "kind": "trim",
-                                         "cause": "token-limit", "detail": "省略对话历史",
-                                         "removed": {"n_turns": len(request.messages) - 1,
-                                                     "est_tokens": _estimate_tokens(last.content)}}})
-            else:
-                turns = ""
-                for i in range(0, len(request.messages) - 1, 2):
-                    user, assistant = request.messages[i], request.messages[i + 1]
-                    if user.role == "user" and assistant.role == "assistant":
-                        turns += f"<turn>\n<user>{user.content}</user>\n<assistant>{assistant.content}</assistant>\n</turn>\n"
-                if turns:
-                    history = f"<conversation_history>\n{turns}</conversation_history>\n\n"
+        history, context = self._render_natural_history(request.messages)
         context.append({"type": "context/inject",
                         "data": {"target": "user-message", "phase": "prompt-assembly",
                                  "provenance": "deepwiki:note", "text": _agent_note()}})
@@ -1919,7 +1866,7 @@ IMPORTANT:
 
         # 阶段 1:骨架
         yield _phase("initial_codemap", "start")
-        skeleton_prompt = _codemap_note() + f"<query>\n{request.question}\n</query>\n\nAssistant: "
+        skeleton_prompt = self._codemap_note() + f"<query>\n{request.question}\n</query>\n\nAssistant: "
         try:
             skeleton = CodeMap.model_validate(await _run_json(skeleton_prompt))
         except Exception as e:  # noqa: BLE001
@@ -1933,7 +1880,7 @@ IMPORTANT:
         enrich_query = (
             f"{request.question}\n\n<SKELETON>\n{skeleton.model_dump_json()}\n</SKELETON>"
         )
-        enrich_prompt = _codemap_note() + f"<query>\n{enrich_query}\n</query>\n\nAssistant: "
+        enrich_prompt = self._codemap_note() + f"<query>\n{enrich_query}\n</query>\n\nAssistant: "
         final = skeleton
         try:
             raw = await _agent_text(
@@ -1954,20 +1901,361 @@ IMPORTANT:
 class LlmWikiPipeline(WikiPipeline):
     """llm 路对外 API 包装:deepwiki-open 原式单次补全(内容内联进 prompt,无工具)。"""
 
-    async def determine_structure(
-        self, task: WikiTask, repo: Repo, file_tree: list[str], readme: str,
-    ) -> WikiStructureModel:
-        """llm 路结构:文件树+README 全文 → 单次流式补全(无工具)→ XML(与 deepwiki-open 同式)。"""
-        r = task.request
-        prompt = self._build_structure_prompt(
-            r.owner, r.repo, "\n".join(file_tree), readme, r.comprehensive, r.language
-        )
-        parts: list[str] = []
+    # 纯 LLM 路径单文件内联截断(字符)
+    _FILE_INLINE_CAP = 8000
+
+    _DEEP_RESEARCH_FIRST_ITERATION_PROMPT = """<role>
+You are an expert code analyst examining the {repo_type} repository: {repo_url} ({repo_name}).
+You are conducting a multi-turn Deep Research process to thoroughly investigate the specific topic in the user's query.
+Your goal is to provide detailed, focused information EXCLUSIVELY about this topic.
+IMPORTANT:You MUST respond in {language_name} language.
+</role>
+
+<guidelines>
+- This is the first iteration of a multi-turn research process focused EXCLUSIVELY on the user's query
+- Start your response with "## Research Plan"
+- Outline your approach to investigating this specific topic
+- If the topic is about a specific file or feature (like "Dockerfile"), focus ONLY on that file or feature
+- Clearly state the specific topic you're researching to maintain focus throughout all iterations
+- Identify the key aspects you'll need to research
+- Provide initial findings based on the information available
+- End with "## Next Steps" indicating what you'll investigate in the next iteration
+- Do NOT provide a final conclusion yet - this is just the beginning of the research
+- Do NOT include general repository information unless directly relevant to the query
+- Focus EXCLUSIVELY on the specific topic being researched - do not drift to related topics
+- Your research MUST directly address the original question
+- NEVER respond with just "Continue the research" as an answer - always provide substantive research findings
+- Remember that this topic will be maintained across all research iterations
+</guidelines>
+
+<style>
+- Be concise but thorough
+- Use markdown formatting to improve readability
+- Cite specific files and code sections when relevant
+</style>"""
+
+    _DEEP_RESEARCH_INTERMEDIATE_ITERATION_PROMPT = """<role>
+You are an expert code analyst examining the {repo_type} repository: {repo_url} ({repo_name}).
+You are currently in iteration {research_iteration} of a Deep Research process focused EXCLUSIVELY on the latest user query.
+Your goal is to build upon previous research iterations and go deeper into this specific topic without deviating from it.
+IMPORTANT:You MUST respond in {language_name} language.
+</role>
+
+<guidelines>
+- CAREFULLY review the conversation history to understand what has been researched so far
+- Your response MUST build on previous research iterations - do not repeat information already covered
+- Identify gaps or areas that need further exploration related to this specific topic
+- Focus on one specific aspect that needs deeper investigation in this iteration
+- Start your response with "## Research Update {research_iteration}"
+- Clearly explain what you're investigating in this iteration
+- Provide new insights that weren't covered in previous iterations
+- If this is iteration 3, prepare for a final conclusion in the next iteration
+- Do NOT include general repository information unless directly relevant to the query
+- Focus EXCLUSIVELY on the specific topic being researched - do not drift to related topics
+- If the topic is about a specific file or feature (like "Dockerfile"), focus ONLY on that file or feature
+- NEVER respond with just "Continue the research" as an answer - always provide substantive research findings
+- Your research MUST directly address the original question
+- Maintain continuity with previous research iterations - this is a continuous investigation
+</guidelines>
+
+<style>
+- Be concise but thorough
+- Focus on providing new information, not repeating what's already been covered
+- Use markdown formatting to improve readability
+- Cite specific files and code sections when relevant
+</style>"""
+
+    _DEEP_RESEARCH_FINAL_ITERATION_PROMPT = """<role>
+You are an expert code analyst examining the {repo_type} repository: {repo_url} ({repo_name}).
+You are in the final iteration of a Deep Research process focused EXCLUSIVELY on the latest user query.
+Your goal is to synthesize all previous findings and provide a comprehensive conclusion that directly addresses this specific topic and ONLY this topic.
+IMPORTANT:You MUST respond in {language_name} language.
+</role>
+
+<guidelines>
+- This is the final iteration of the research process
+- CAREFULLY review the entire conversation history to understand all previous findings
+- Synthesize ALL findings from previous iterations into a comprehensive conclusion
+- Start with "## Final Conclusion"
+- Your conclusion MUST directly address the original question
+- Stay STRICTLY focused on the specific topic - do not drift to related topics
+- Include specific code references and implementation details related to the topic
+- Highlight the most important discoveries and insights about this specific functionality
+- Provide a complete and definitive answer to the original question
+- Do NOT include general repository information unless directly relevant to the query
+- Focus exclusively on the specific topic being researched
+- NEVER respond with "Continue the research" as an answer - always provide a complete conclusion
+- If the topic is about a specific file or feature (like "Dockerfile"), focus ONLY on that file or feature
+- Ensure your conclusion builds on and references key findings from previous iterations
+</guidelines>
+
+<style>
+- Be concise but thorough
+- Use markdown formatting to improve readability
+- Cite specific files and code sections when relevant
+- Structure your response with clear headings
+- End with actionable insights or recommendations when appropriate
+</style>"""
+
+    def _subgraph_hits(self, answer: str) -> dict[str, list[int]]:
+        """解析 graphify.query 的 answer 标注 → {file: [行号...]}。
+
+        NODE 行形如 `NODE <label> [src=<file> loc=L<line> community=<cid>]`,
+        EDGE 行以 ` at=<file>:L<line>` 结尾;容忍 [i] TRUNCATED / over-budget
+        前缀行与 ... (truncated 尾行;非匹配行忽略,loc 缺失/为空的文件跳过)。
+        """
+        hits: dict[str, list[int]] = {}
+        for raw in answer.splitlines():
+            m = re.match(r"^NODE\s+.+?\s+\[([^\]]*)\]$", raw)
+            if m:
+                src = re.search(r"\bsrc=(\S+)\b", m.group(1))
+                loc = re.search(r"\bloc=(L?\d+)\b", m.group(1))
+                if src and loc:
+                    hits.setdefault(src.group(1), []).append(int(loc.group(1).lstrip("L")))
+                continue
+            m = re.search(r"\bat=([^:\s]+):(L\d+)$", raw)
+            if m:
+                hits.setdefault(m.group(1), []).append(int(m.group(2)[1:]))
+        return {p: sorted(set(lines)) for p, lines in hits.items()}
+
+    def _subgraph_src_blocks(
+        self, save_path: str,
+        hits: dict[str, list[int]],
+        *,
+        radius: int = 12,
+        per_file_cap: int = _FILE_INLINE_CAP,
+        budget_chars: int | None = None,
+    ) -> tuple[list[dict[str, Any]], bool]:
+        """命中行窗提取:{file: [行号]} → [{path,text,start_line,end_line}...], (blocks, degraded)。
+
+        每文件:命中行 ±radius 展开、相邻窗(间距 ≤ 2*radius)合并、夹到文件行界;
+        单文件累计字符封顶 per_file_cap(溢出窗截断,后续窗丢弃);
+        全量累计超 budget_chars(缺省 CHAT_TOKEN_LIMIT_ESTIMATE*4)即整组降级
+        (返回 ([], True));调用方据此跳过注入(提示词注"无检索增强"note)。
+        OSError/解码失败的文件跳过(其余文件正常)。
+        """
+        budget = budget_chars if budget_chars is not None else envs.CHAT_TOKEN_LIMIT_ESTIMATE * 4
+        blocks: list[dict[str, Any]] = []
+        total = 0
+        for path in sorted(hits):
+            try:
+                full_text = Path(save_path, path).read_text(encoding="utf-8")
+            except OSError:
+                continue
+            lines = full_text.splitlines()
+            n_lines = len(lines)
+            # 命中行 → 合并后的窗区间
+            windows: list[tuple[int, int]] = []
+            for line in sorted(set(hits[path])):
+                start = max(1, line - radius)
+                end = min(n_lines, line + radius)
+                if windows and start <= windows[-1][1] + 1:
+                    windows[-1] = (windows[-1][0], max(windows[-1][1], end))
+                else:
+                    windows.append((start, end))
+            file_chars = 0
+            for start, end in windows:
+                seg_text = "\n".join(lines[start - 1:end])
+                if not seg_text.strip():
+                    continue
+                remain = per_file_cap - file_chars
+                if len(seg_text) > remain:
+                    if remain <= 0:
+                        break
+                    seg_text = seg_text[:remain]
+                    end = start + seg_text.count("\n")
+                file_chars += len(seg_text)
+                if total + len(seg_text) > budget:  # 先按单文件截断,再整体预算判断
+                    return [], True
+                blocks.append({"path": path, "text": seg_text, "start_line": start, "end_line": end})
+                total += len(seg_text)
+        return blocks, False
+
+    def _format_subgraph_context(self, blocks: list[dict[str, Any]]) -> str:
+        """代码窗 → 原版 _format_context 同式文本(chat/codemap 共用)。
+
+        按文件分组:每组 `## File Path: {path}` 头 + 每窗 `[lines A-B]\n<code>`
+        (窗间空行);文件段以原版同式(`"\\n\\n" + "-"*10 + "\\n\\n".join(parts)`)
+        联结。空输入 → ""(上层 prompt_builder 会注入"无检索增强"note)。"""
+        if not blocks:
+            return ""  # 原版由调用方兜底(无文档时不调用);空输入保持 "" 供 prompt_builder 注 note
+        groups: dict[str, list[dict[str, Any]]] = {}
+        for b in blocks:
+            groups.setdefault(b["path"], []).append(b)
+        context_parts: list[str] = []
+        for path, blks in groups.items():
+            chunk_texts = [f"[lines {b['start_line']}-{b['end_line']}]\n{b['text']}" for b in blks]
+            context_parts.append(f"## File Path: {path}\n\n" + "\n\n".join(chunk_texts))
+        return "\n\n" + ("-" * 10) + "\n\n".join(context_parts)
+
+    async def _graphify_context(self, repo: Repo, question: str) -> dict[str, Any]:
+        """graphify.query + 子图 → 真实代码行窗;任何失败吞掉置 error(服务降级,不抛)。"""
+        try:
+            result = await asyncio.to_thread(
+                graphify.query, question, graph_path=str(_graph_path(repo))
+            )
+            answer = result.get("answer") or ""
+        except Exception as exc:
+            _log(f"图谱查询失败,降级: {type(exc).__name__}: {exc}")
+            return {"hits": {}, "blocks": [], "degraded": False, "error": f"{type(exc).__name__}: {exc}"}
+        hits = self._subgraph_hits(answer)
+        if not hits:
+            return {"hits": {}, "blocks": [], "degraded": False, "error": None}
+        blocks, degraded = self._subgraph_src_blocks(repo.save_path, hits)
+        return {"hits": hits, "blocks": blocks, "degraded": degraded, "error": None}
+
+    def _build_turn_history(self, messages: list[ChatMessage]) -> str:
+        """LLM 路对话历史:恒拼 <turn> 成对序列(原版无裁剪;输入过大仅跳过检索上下文)。"""
+        turns = ""
+        for i in range(0, len(messages) - 1, 2):
+            user, assistant = messages[i], messages[i + 1]
+            if user.role == "user" and assistant.role == "assistant":
+                turns += f"<turn>\n<user>{user.content}</user>\n<assistant>{assistant.content}</assistant>\n</turn>\n"
+        return f"<conversation_history>\n{turns}</conversation_history>\n\n" if turns else ""
+
+    def _build_service_prompt(
+        self, system_prompt: str, query: str, *, conversation_history: str = "", context: str = "",
+        simplify: bool = False,
+    ) -> str:
+        """原版 api/chat/_prompts.py prompt_builder 逐字移植(单条 user 消息)。
+
+        结构:/no_think + 系统提示词 → <conversation_history> → 检索上下文
+        (<START_OF_CONTEXT> 包裹;为空注"无检索增强"note)或简化 note(输入超限时)
+        → <query>…</query> + Assistant:。"""
+        prompt = f"/no_think {system_prompt}\n\n"
+        if conversation_history:
+            prompt += f"<conversation_history>\n{conversation_history}</conversation_history>\n\n"
+        if not simplify:
+            if context.strip():
+                prompt += f"<START_OF_CONTEXT>\n{context}\n<END_OF_CONTEXT>\n\n"
+            else:
+                prompt += "<note>Answering without retrieval augmentation.</note>\n\n"
+        else:
+            prompt += "<note>Answering without retrieval augmentation due to input size constraints.</note>\n\n"
+        return prompt + f"<query>\n{query}\n</query>\n\nAssistant: "
+
+    def _is_token_limit_error(self, exc: Exception) -> bool:
+        """原版 api/chat/__init__.py is_token_limit_error 的判断子串(大小写不敏感)。"""
+        error_message = str(exc).lower()
+        return any(k in error_message for k in (
+            "maximum context length", "token limit", "too many tokens",
+        ))
+
+    async def _llm_stream_user(self, prompt: str, *, session_name: str, run_id: str,
+                               context: list[dict] | None = None):
+        """llm 路统一流式补全口(OpenAI 兼容端点;单条 user 消息,同原版 streamer;
+        envs 调用时解析,测试 monkeypatch 生效)。"""
         async for chunk in llm_stream(
             url=envs.DEEPWIKI_LLM_URL,
             payload={"model": envs.DEEPWIKI_LLM_MODEL,
                      "messages": [{"role": "user", "content": prompt}]},
             api_key=envs.DEEPWIKI_LLM_API_KEY or None,
+            session_name=session_name, run_id=run_id, context=context,
+        ):
+            yield chunk
+
+    async def _llm_complete_user(self, prompt: str, *, session_name: str, run_id: str,
+                                 context: list[dict] | None = None) -> str:
+        """llm 路统一整收补全口(OpenAI 兼容端点;单条 user 消息;envs 调用时解析)。"""
+        return await llm_complete(
+            url=envs.DEEPWIKI_LLM_URL,
+            payload={"model": envs.DEEPWIKI_LLM_MODEL,
+                     "messages": [{"role": "user", "content": prompt}]},
+            api_key=envs.DEEPWIKI_LLM_API_KEY or None,
+            session_name=session_name, run_id=run_id, context=context,
+        )
+
+    async def _llm_research_chat(
+        self, system: str, query: str, *, repo: Repo, session_name: str, run_id: str,
+        conversation_history: str = "",
+    ):
+        """原版 research_chat 等价(LLM 路流式):见 _llm_research_stream 所述语义;
+        失败语义与原版一致(错误文本进流,不抛出)。"""
+        async for chunk in self._llm_research_stream(
+            system, query, repo=repo, session_name=session_name, run_id=run_id,
+            conversation_history=conversation_history,
+        ):
+            yield chunk
+
+    async def _llm_research_stream(
+        self, system: str, query: str, *, repo: Repo, session_name: str, run_id: str,
+        conversation_history: str = "",
+    ):
+        """原版 research_chat 语义(LLM 路逐段对齐):
+
+        - 最后一问估算超 CHAT_TOKEN_LIMIT_ESTIMATE(原 MAX_INPUT_TOKENS=7500)→ 跳过检索;
+        - 检索上下文 = 图谱子图→真实代码窗(原 RAG 的适配点),经 prompt_builder 同式拼装
+          (<START_OF_CONTEXT> 包裹;为空注"无检索增强"note);
+        - stream_and_fallback:token 超限 → 简化提示词重试(去掉检索上下文)→ 致歉;
+          其余异常 → "Error with openai API: {e}" 文本进流。
+        """
+        context: list[dict] = []
+        context_text = ""
+        if _estimate_tokens(query) > envs.CHAT_TOKEN_LIMIT_ESTIMATE:
+            _log(f"请求过大(估算 {_estimate_tokens(query)} tokens),跳过检索上下文(原版 MAX_INPUT_TOKENS 语义)")
+            context.append({"type": "context/modify",
+                            "data": {"target": "query", "kind": "trim",
+                                     "cause": "token-limit", "detail": "输入过大,跳过检索"}})
+        else:
+            ctx = await self._graphify_context(repo, query)
+            for b in ctx["blocks"]:
+                context.append({"type": "context/inject",
+                                "data": {"target": "query", "phase": "prompt-assembly",
+                                         "provenance": f"deepwiki:graph:{b['path']}",
+                                         "text": b["text"]}})
+            if ctx["degraded"]:
+                context.append({"type": "context/modify",
+                                "data": {"target": "query", "kind": "degrade",
+                                         "cause": "token-limit", "detail": "检索上下文超限"}})
+            if ctx["error"]:
+                context.append({"type": "context/modify",
+                                "data": {"target": "query", "kind": "degrade",
+                                         "cause": "graph-error",
+                                         "detail": f"代码图谱不可用: {ctx['error']}"}})
+            context_text = self._format_subgraph_context(ctx["blocks"])
+
+        prompt = self._build_service_prompt(
+            system, query, conversation_history=conversation_history, context=context_text
+        )
+        simplified = self._build_service_prompt(
+            system, query, conversation_history=conversation_history, simplify=True
+        )
+        try:
+            async for chunk in self._llm_stream_user(
+                prompt, session_name=session_name, run_id=run_id, context=context,
+            ):
+                yield chunk
+        except Exception as e:
+            if self._is_token_limit_error(e):
+                _log("token 超限,简化为无检索上下文重试")
+                try:
+                    async for chunk in self._llm_stream_user(
+                        simplified, session_name=session_name, run_id=run_id, context=context,
+                    ):
+                        yield chunk
+                except Exception as e2:  # noqa: BLE001 - 简化重试失败 → 致歉文本(原版同式)
+                    _log(f"简化重试失败: {e2}")
+                    yield (
+                        "\nI apologize, but your request is too large for me to process. "
+                        "Please try a shorter query or break it into smaller parts."
+                    )
+            else:
+                _log(f"chat llm 错误: {e}")
+                yield f"\nError with openai API: {e}"
+
+    async def determine_structure(
+        self, task: WikiTask, repo: Repo, file_tree: list[str], readme: str,
+    ) -> WikiStructureModel:
+        """llm 路结构:原版经 research_chat(结构提示词为查询,SIMPLE 角色模板 +
+        检索上下文注入 + prompt_builder 拼装);内容错误时解析失败使任务 FAILED。"""
+        r = task.request
+        prompt = self._build_structure_prompt(
+            r.owner, r.repo, "\n".join(file_tree), readme, r.comprehensive, r.language
+        )
+        system = _SIMPLE_CHAT_SYSTEM_PROMPT.format(**_format_request_fmt(r))
+        parts: list[str] = []
+        async for chunk in self._llm_research_chat(
+            system, prompt, repo=repo,
             session_name="wiki:structure", run_id=task.repo_key,
         ):
             parts.append(chunk)
@@ -2019,71 +2307,147 @@ IMPORTANT:
 3. The relevant_files should be actual files from the repository that would be used to generate that page
 4. Return ONLY valid XML with the structure specified above, with no markdown code block delimiters"""
 
-    @staticmethod
-    def _build_page_prompt(
-        title: str, file_links: str, content_blocks: list[tuple[str, str]], degraded: bool, language: str,
-    ) -> str:
-        """纯 LLM 页面提示词(deepwiki-open 同式 + 内联相关文件内容近似其 RAG 注入;超限降级仅链接)。"""
-        prompt = _build_page_prompt(title, file_links, language)
-        if content_blocks:
-            inline = "\n\n".join(f'<file path="{p}">\n{text}\n</file>' for p, text in content_blocks)
-            extra = f"\n\nFILE CONTENT (injected context for citation-accurate writing):\n{inline}"
-        elif degraded:
-            extra = "\n\n<note>输入超限,仅提供文件链接,请依代码检索。</note>"
-        else:
-            extra = ""
-        return prompt + extra
-
     async def generate_page(
         self, task: WikiTask, repo: Repo, page: WikiPage, file_links: str,
     ) -> str:
-        """llm 路单页:内联相关文件内容 → 单次流式补全(无工具调用)。"""
+        """llm 路单页:原版 _generate_page 同式——页面提示词(仅文件链接,不内联内容)
+        作为查询经 research_chat 等价流(检索上下文注入;流错误为内容而非抛出,
+        _generate_page_with_retry 只对校验/检索前置异常重试——与原版一致)。"""
         r = task.request
-        blocks, degraded = self._inline_page_files(repo.save_path, list(page.filePaths))
-        prompt = self._build_page_prompt(page.title, file_links, blocks, degraded, r.language)
-        # 内联文件块(str)计入注入说明;整体降级计入 modify —— 供轨迹还原"为什么这个 prompt"
-        context: list[dict] = []
-        for p, text in blocks:
-            context.append({"type": "context/inject",
-                            "data": {"target": "user-message", "phase": "page-prompt",
-                                     "provenance": f"deepwiki:inline:{p}", "text": text}})
-        if degraded:
-            context.append({"type": "context/modify",
-                            "data": {"target": "user-message", "kind": "degrade",
-                                     "cause": "token-limit",
-                                     "detail": "输入超限,仅提供文件链接,请依代码检索"}})
+        prompt = _build_page_prompt(page.title, file_links, r.language)
+        system = _SIMPLE_CHAT_SYSTEM_PROMPT.format(**_format_request_fmt(r))
         parts: list[str] = []
-        async for chunk in llm_stream(
-            url=envs.DEEPWIKI_LLM_URL,
-            payload={"model": envs.DEEPWIKI_LLM_MODEL,
-                     "messages": [{"role": "user", "content": prompt}]},
-            api_key=envs.DEEPWIKI_LLM_API_KEY or None,
-            session_name=f"wiki:page:{page.id}", run_id=task.repo_key, context=context,
+        async for chunk in self._llm_research_chat(
+            system, prompt, repo=repo,
+            session_name=f"wiki:page:{page.id}", run_id=task.repo_key,
         ):
             parts.append(chunk)
         return "".join(parts)
 
-    def _inline_page_files(
-        self, save_path: str, file_paths: list[str],
-    ) -> tuple[list[tuple[str, str]], bool]:
-        """内联页面相关文件内容(纯 LLM 路径,近似 RAG 注入;单文件截断 8k 字符)。
-        累计超过 CHAT_TOKEN_LIMIT_ESTIMATE(字符/4 近似)即整体降级:返回 ([], True),
-        页面提示词将只提供文件链接(与 deepwiki-open 的 MAX_INPUT_TOKENS 降级同式)。"""
-        limit_chars = envs.CHAT_TOKEN_LIMIT_ESTIMATE * 4
-        total = 0
-        blocks: list[tuple[str, str]] = []
-        for p in file_paths:
-            try:
-                text = Path(save_path, p).read_text(encoding="utf-8")
-            except OSError:
-                continue
-            if len(text) > _FILE_INLINE_CAP:
-                text = text[:_FILE_INLINE_CAP]
-            if total + len(text) > limit_chars:
-                return [], True
-            total += len(text)
-            blocks.append((p, text))
-        return blocks, False
+    async def chat_stream(self, request: ChatCompletionRequest):
+        """llm 路 chat:原版 research_chat 等价(模式/迭代选模板、原版历史拼接、
+        输入过大跳过检索、prompt_builder 拼装、token 超限简化重试)。"""
+        if not request.messages:
+            raise ValueError("No messages provided")
+        last = request.messages[-1]
+        if last.role != "user":
+            raise ValueError("Last message must be from the user")
+
+        repo = Repo(request.repo_url, request.type, access_token=request.token)
+        fmt = _format_request_fmt(request)
+        is_deep = last.mode == "deep_research"
+        if is_deep:
+            # 原版复刻:5 轮迭代由前端驱动,后端只按迭代号选模板 + 拼历史
+            _resolve_chat_continuation(last, request.messages)
+            if request.research_iteration == 1:
+                system = self._DEEP_RESEARCH_FIRST_ITERATION_PROMPT.format(**fmt)
+            elif request.research_iteration >= 5:
+                system = self._DEEP_RESEARCH_FINAL_ITERATION_PROMPT.format(**fmt)
+            else:
+                system = self._DEEP_RESEARCH_INTERMEDIATE_ITERATION_PROMPT.format(
+                    **fmt, research_iteration=request.research_iteration
+                )
+        else:
+            system = _SIMPLE_CHAT_SYSTEM_PROMPT.format(**fmt)
+
+        history = self._build_turn_history(request.messages)
+        async for chunk in self._llm_research_chat(
+            system, last.content, repo=repo,
+            session_name=f"chat:{repo.name}", run_id=f"chat:{repo.name}",
+            conversation_history=history,
+        ):
+            yield chunk
+
+    async def generate_codemap(self, request: CodeMapRequest):
+        """llm 路 codemap(原版等价):analyzing 阶段完成检索(chunk_count=窗口数);
+        双提示词经 prompt_builder(与 chat 同构);JSON 解析失败重试——骨架 3 次、
+        富化 2 次(传输错误直接上抛);富化失败 degraded;引用接地两路共用。"""
+        try:
+            repo = Repo(request.repo_url, request.type, access_token=request.token)
+        except Exception:
+            repo = Repo(request.repo_url, request.type)
+
+        # ---- 阶段 1a:analyzing(原版 RAG 检索;此处 = 图谱子图→真实代码窗) ----
+        yield _phase("analyzing", "start")
+        if not _index_ready(repo):
+            yield _phase("analyzing", "done", chunk_count=0)
+            yield _event(type="error", stage="analyzing", message=f"仓库尚未索引,请先 /repo/prepare: {repo.name}")
+            return
+        ctx = await self._graphify_context(repo, request.question)
+        yield _phase("analyzing", "done", chunk_count=len(ctx["blocks"]))
+
+        fmt = {
+            "repo_type": request.type,
+            "repo_url": request.repo_url,
+            "repo_name": repo.name,
+            "language_name": _language_name(request.language or "en"),
+        }
+        context: list[dict] = []
+        for b in ctx["blocks"]:
+            context.append({"type": "context/inject",
+                            "data": {"target": "codemap", "phase": "prompt-assembly",
+                                     "provenance": f"deepwiki:graph:{b['path']}", "text": b["text"]}})
+        if ctx["degraded"]:
+            context.append({"type": "context/modify",
+                            "data": {"target": "codemap", "kind": "degrade",
+                                     "cause": "token-limit", "detail": "检索上下文超限"}})
+        if ctx["error"]:
+            context.append({"type": "context/modify",
+                            "data": {"target": "codemap", "kind": "degrade",
+                                     "cause": "graph-error",
+                                     "detail": f"代码图谱不可用: {ctx['error']}"}})
+        context_text = self._format_subgraph_context(ctx["blocks"])
+
+        async def _run_llm_json(prompt: str, attempts: int, session_name: str) -> dict:
+            """整收 + 解析 JSON;仅解析失败重试(原版 _generate_json 语义:
+            传输异常直接上抛,由阶段 try 处理)。"""
+            last_error: Exception | None = None
+            for attempt in range(1, attempts + 1):
+                raw = await self._llm_complete_user(
+                    prompt, session_name=session_name, run_id=f"codemap:{repo.name}",
+                    context=context,
+                )
+                try:
+                    return _extract_json(raw)
+                except Exception as e:  # noqa: BLE001
+                    last_error = e
+                    _log(f"codemap JSON 解析尝试 {attempt}/{attempts} 失败: {e}")
+            raise ValueError(f"Model did not return valid JSON after {attempts} attempts: {last_error}")
+
+        # ---- 阶段 1b:骨架 ----------------------------------------------------
+        yield _phase("initial_codemap", "start")
+        skeleton_prompt = self._build_service_prompt(
+            _CODEMAP_SKELETON_PROMPT.format(**fmt), request.question, context=context_text
+        )
+        try:
+            skeleton = CodeMap.model_validate(await _run_llm_json(skeleton_prompt, 3, "codemap:skeleton"))
+        except Exception as e:  # noqa: BLE001
+            _log(f"codemap 骨架失败: {e}")
+            yield _event(type="error", stage="initial_codemap", message=str(e))
+            return
+        yield _phase("initial_codemap", "done", section_count=len(skeleton.sections))
+
+        # ---- 阶段 2:指南/图;失败不致命 — 退化为骨架 -------------------------
+        yield _phase("diagrams", "start")
+        enrich_query = (
+            f"{request.question}\n\n<SKELETON>\n{skeleton.model_dump_json()}\n</SKELETON>"
+        )
+        enrich_prompt = self._build_service_prompt(
+            _CODEMAP_ENRICH_PROMPT.format(**fmt), enrich_query, context=context_text
+        )
+        final = skeleton
+        try:
+            final = CodeMap.model_validate(
+                await _run_llm_json(enrich_prompt, 2, "codemap:enrich")
+            )
+            yield _phase("diagrams", "done")
+        except Exception as e:  # noqa: BLE001
+            _log(f"codemap 指南/图失败,使用骨架: {e}")
+            yield _phase("diagrams", "done", degraded=True)
+
+        _ground_citations(final, repo.save_path)
+        yield _event(type="codemap", data=final.model_dump())
+        yield _event(type="done")
 
 
 def _wiki_pipeline() -> WikiPipeline:
@@ -2091,9 +2455,9 @@ def _wiki_pipeline() -> WikiPipeline:
     return AgentWikiPipeline() if envs.DEEPWIKI_GENERATOR == "cc" else LlmWikiPipeline()
 
 
-def _agent_pipeline() -> AgentWikiPipeline:
-    """恒 agent 路(chat/codemap 不走 generator 分派)。"""
-    return AgentWikiPipeline()
+def _service_pipeline() -> WikiPipeline:
+    """chat/codemap 服务分派:与 wiki 同开关(envs.DEEPWIKI_GENERATOR),调用时读 envs(测试 monkeypatch 生效)。"""
+    return AgentWikiPipeline() if envs.DEEPWIKI_GENERATOR == "cc" else LlmWikiPipeline()
 
 
 

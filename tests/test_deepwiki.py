@@ -458,21 +458,23 @@ _STRUCT_XML = """<wiki_structure>
 
 def test_agent_cache_naming():
     request = WikiTaskRequest(repo_url="/x", type="local", owner="local", repo="deepwiki-open", language="en")
-    assert deepwiki._agent_cache_structure_path(request).name == "local_local_deepwiki-open-structure.md"
-    assert deepwiki._agent_cache_page_path(request, "page-1").name == "local_local_deepwiki-open-page-1.md"
-    assert deepwiki._agent_cache_page_path(request, "overview").name == "local_local_deepwiki-open-page_overview.md"
+    pipeline = deepwiki.AgentWikiPipeline()
+    assert pipeline._agent_cache_structure_path(request).name == "local_local_deepwiki-open-structure.md"
+    assert pipeline._agent_cache_page_path(request, "page-1").name == "local_local_deepwiki-open-page-1.md"
+    assert pipeline._agent_cache_page_path(request, "overview").name == "local_local_deepwiki-open-page_overview.md"
 
 
 def test_sanitize_page_id_no_escape():
     r = _make_request("sanitize-io", "demo")
-    out = deepwiki._agent_cache_page_path(r, "../../evil")
-    assert out.parent == deepwiki._agent_cache_dir(r)
-    assert out.relative_to(deepwiki._agent_cache_dir(r)).parent == Path(".")
+    pipeline = deepwiki.AgentWikiPipeline()
+    out = pipeline._agent_cache_page_path(r, "../../evil")
+    assert out.parent == pipeline._agent_cache_dir(r)
+    assert out.relative_to(pipeline._agent_cache_dir(r)).parent == Path(".")
 
 
 def test_agent_options_cc_delivery(tmp_path):
-    """写入模式:cwd 固定仓库根,add_dirs 指向交付目录,acceptEdits + 读工具放开;
-    默认模式只有 cwd(chat/codemap 场景),无写权限。"""
+    """写入模式:cwd 固定仓库根,add_dirs 指向交付目录,acceptEdits + 写工具;
+    默认模式(chat/codemap):cwd + Read/Grep/Glob 自读代码,无 Write/写目录/acceptEdits。"""
     repo = Repo(str(tmp_path), "local")
     opts = deepwiki._agent_options(
         "", repo, model="m", agent_output_dir=str(tmp_path / "out"), agent_write_mode=True
@@ -486,6 +488,9 @@ def test_agent_options_cc_delivery(tmp_path):
     assert opts2.cwd == str(tmp_path)
     assert opts2.add_dirs == []
     assert opts2.permission_mode is None
+    for t in ("Read", "Grep", "Glob", "graphify_query"):
+        assert t in opts2.allowed_tools, t
+    assert "Write" not in opts2.allowed_tools
 
 
 @pytest.mark.asyncio
@@ -519,7 +524,7 @@ async def test_dispatch_structure_by_generator(monkeypatch):
 async def test_determine_structure_cc_skips_when_file_exists(monkeypatch):
     """cc 结构续跑:structure.md 已存在则直接解析,不启动 agent。"""
     request = _make_request("cc-struct", "demo")
-    struct_path = deepwiki._agent_cache_structure_path(request)
+    struct_path = deepwiki.AgentWikiPipeline()._agent_cache_structure_path(request)
     struct_path.parent.mkdir(parents=True, exist_ok=True)
     struct_path.write_text(_STRUCT_XML, encoding="utf-8")
 
@@ -570,7 +575,7 @@ async def test_determine_structure_cc_calls_agent_no_inline(tmp_path, monkeypatc
 async def test_page_cc_skips_when_file_exists(monkeypatch):
     """cc 页续跑:page_<id>.md 已存在则直接读回(文件为权威),不启动 agent。"""
     request = _make_request("cc-page", "demo")
-    out = deepwiki._agent_cache_page_path(request, "p1")
+    out = deepwiki.AgentWikiPipeline()._agent_cache_page_path(request, "p1")
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text("## PA-REAL\n\nbody\n", encoding="utf-8")
 
@@ -612,11 +617,16 @@ async def test_page_cc_calls_agent_and_reads_file(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_page_llm_inlines_files(tmp_path, monkeypatch):
-    """llm 页:内联相关文件内容入 payload(无 agent/无工具),单次流式。"""
+async def test_page_llm_through_research_chat(tmp_path, monkeypatch):
+    """llm 页(原版同式):页面提示词(仅链接,不内联内容)作为查询经 research_chat
+    等价流;SIMPLE 角色 + /no_think + 检索上下文 <START_OF_CONTEXT> 注入。"""
     (tmp_path / "src").mkdir()
-    (tmp_path / "src" / "a.py").write_text("SECRET_CODE_BODY", encoding="utf-8")
+    (tmp_path / "src" / "a.py").write_text("x = 1\n", encoding="utf-8")
     captured = {}
+
+    def fake_query(question, **kw):
+        captured["query"] = question
+        return {"answer": "NODE f [src=src/a.py loc=L1 community=c0]\n"}
 
     async def fake_llm_stream(*, url, payload, api_key=None, session_name=None, **kw):
         captured["url"] = url
@@ -625,6 +635,7 @@ async def test_page_llm_inlines_files(tmp_path, monkeypatch):
         captured["payload"] = payload
         yield "LLM-CONTENT"
 
+    monkeypatch.setattr(deepwiki.graphify, "query", fake_query)
     monkeypatch.setattr(deepwiki, "llm_stream", fake_llm_stream)
     request = _make_request("llm-page", "demo")
     task = WikiTask(request=request)
@@ -639,39 +650,49 @@ async def test_page_llm_inlines_files(tmp_path, monkeypatch):
     )
     assert content == "LLM-CONTENT"
     assert captured["session"] == "wiki:page:p1"
-    user_msg = captured["payload"]["messages"][0]["content"]
-    assert '<file path="src/a.py">' in user_msg
-    assert "SECRET_CODE_BODY" in user_msg
+    assert captured["url"] == deepwiki.envs.DEEPWIKI_LLM_URL
     assert captured["payload"]["model"] == deepwiki.envs.DEEPWIKI_LLM_MODEL
+    assert len(captured["payload"]["messages"]) == 1
+    user_msg = captured["payload"]["messages"][0]["content"]
+    assert "/no_think " in user_msg and "expert code analyst" in user_msg  # SIMPLE 角色模板
+    assert "<START_OF_CONTEXT>" in user_msg and "<END_OF_CONTEXT>" in user_msg
+    assert "## File Path: src/a.py" in user_msg and "[lines 1-1]" in user_msg
+    assert "<details>" in user_msg and "Page p1" in user_msg  # 页面提示词为查询
+    assert "<file path=\"" not in user_msg  # 不再内联内容(原版由检索上下文提供)
+    assert "<query>\n" in user_msg and "\nAssistant: " in user_msg
+    assert captured["query"].startswith("You are an expert technical writer")
 
 
 @pytest.mark.asyncio
-async def test_page_llm_degrades_over_limit(tmp_path, monkeypatch):
-    """llm 页超限降级:内联累计超过 token 上限 → 无内联块,仅文件链接 + 降级 note。"""
-    for i in range(5):
-        d = tmp_path / "src"
-        d.mkdir(exist_ok=True)
-        (d / f"f{i}.py").write_text("x" * 15000, encoding="utf-8")
+async def test_page_llm_input_too_large_skips_retrieval(tmp_path, monkeypatch):
+    """llm 页(原版 MAX_INPUT_TOKENS 语义):查询估算超限 → 跳过检索,注入
+    "Answering without retrieval augmentation." note,历史/页提示词照常。"""
     captured = {}
+
+    def fake_query(question, **kw):
+        captured["query"] = question
+        return {"answer": ""}
 
     async def fake_llm_stream(*, url, payload, api_key=None, session_name=None, **kw):
         captured["payload"] = payload
-        yield "DEGRADED"
+        yield "HUGE"
 
+    monkeypatch.setattr(deepwiki.graphify, "query", fake_query)
     monkeypatch.setattr(deepwiki, "llm_stream", fake_llm_stream)
-    task = WikiTask(request=_make_request("llm-deg", "demo"))
+    task = WikiTask(request=_make_request("llm-huge", "demo"))
     task.default_branch = "main"
     page = WikiPage(
-        id="p1", title="P", content="", filePaths=[f"src/f{i}.py" for i in range(5)],
+        id="p1", title="x" * 40000, content="", filePaths=[],
         importance="medium", relatedPages=[],
     )
     repo = Repo(str(tmp_path), "local")
     assert await deepwiki.LlmWikiPipeline().generate_page(
-        task, repo, page, "- [src/f0.py](src/f0.py)"
-    ) == "DEGRADED"
+        task, repo, page, ""
+    ) == "HUGE"
+    assert "query" not in captured  # 检索未被调用
     user_msg = captured["payload"]["messages"][0]["content"]
-    assert "<file path=" not in user_msg
-    assert "输入超限" in user_msg
+    assert "Answering without retrieval augmentation." in user_msg
+    assert "\nAssistant: " in user_msg
 
 
 @pytest.mark.asyncio
@@ -691,11 +712,12 @@ async def test_generate_repo_wiki_cc_assemble_and_resume(tmp_path, monkeypatch):
     graph_dir.mkdir(parents=True, exist_ok=True)
     (graph_dir / "graph.json").write_text("{}", encoding="utf-8")
     # 预置结构 + 全部页面交付文件
-    struct_path = deepwiki._agent_cache_structure_path(request)
+    pipeline = deepwiki.AgentWikiPipeline()
+    struct_path = pipeline._agent_cache_structure_path(request)
     struct_path.parent.mkdir(parents=True, exist_ok=True)
     struct_path.write_text(_STRUCT_XML, encoding="utf-8")
     for pid in ("p1", "p2", "p3"):
-        deepwiki._agent_cache_page_path(request, pid).write_text(
+        pipeline._agent_cache_page_path(request, pid).write_text(
             f"## {pid}-REAL\n\nbody\n", encoding="utf-8"
         )
 
@@ -724,7 +746,8 @@ def test_save_llm_restores_generator_default():
 
 @pytest.mark.asyncio
 async def test_determine_structure_llm_streams(monkeypatch):
-    """llm 路结构:单次 llm_stream 补全(无 agent/无工具),解析 XML。"""
+    """llm 路结构(原版同式):结构提示词作为查询经 research_chat 等价流,
+    /no_think + SIMPLE 角色 + 无命中时"无检索增强"note,解析 XML。"""
     captured = {}
 
     async def fake_llm_stream(*, url, payload, api_key=None, session_name=None, **kw):
@@ -732,12 +755,485 @@ async def test_determine_structure_llm_streams(monkeypatch):
         captured["payload"] = payload
         yield _STRUCT_XML
 
+    def fake_query(question, **kw):
+        captured["query"] = question
+        return {"answer": ""}
+
     monkeypatch.setattr(deepwiki, "llm_stream", fake_llm_stream)
+    monkeypatch.setattr(deepwiki.graphify, "query", fake_query)
     task = WikiTask(request=_make_request("llm-struct", "demo"))
     repo = Repo("/tmp/gh-puller-test-repo", "local")
     s = await deepwiki.LlmWikiPipeline().determine_structure(task, repo, ["app.py"], "")
     assert [p.id for p in s.pages] == ["p1", "p2", "p3"]
     assert captured["session"] == "wiki:structure"
+    user_msg = captured["payload"]["messages"][0]["content"]
+    assert "/no_think " in user_msg and "expert code analyst" in user_msg
+    assert "Answering without retrieval augmentation." in user_msg
+    assert captured["query"].startswith("Analyze this GitHub repository llm-struct/demo")
     # 输入仅文件树路径(含 <file_tree> 标签),无任何文件内容内联
-    assert "<file_tree>" in captured["payload"]["messages"][0]["content"]
-    assert "app.py" in captured["payload"]["messages"][0]["content"]
+    assert "<file_tree>" in user_msg
+    assert "app.py" in user_msg
+
+
+# ---------------------------------------------------------------------------
+# 子图 → 真实代码上下文(llm 路 chat/codemap 的 RAG 式注入)
+# ---------------------------------------------------------------------------
+
+_SUBGRAPH_ANSWER = """Graph: /tmp/g.json (10 nodes) | Traversal: BFS depth=2 | Start: ['x'] | 4 nodes found
+
+NODE a [src=src/a.py loc=L5 community=c1]
+NODE long label [src=src/a.py loc=L40 community=c2]
+EDGE a --calls [EXTRACTED]--> b at=src/a.py:L12
+[!] TRUNCATED: showing 3 of 10 nodes (~500-token budget)...
+... (truncated - remaining nodes omitted)
+[i] Complete answer over budget: 2200 tokens (budget 2000)
+NODE c [src=src/b.py loc= community=c1]
+NODE d [src=src/c.py community=c1]
+"""
+
+
+def test_subgraph_hits_parse():
+    """解析 NODE(src/loc)/EDGE(at=) 标注:容忍截断前缀行,空 loc 或无 loc 跳过。"""
+    pipeline = deepwiki.LlmWikiPipeline()
+    hits = pipeline._subgraph_hits(_SUBGRAPH_ANSWER)
+    assert hits == {"src/a.py": [5, 12, 40]}
+    assert "src/b.py" not in hits and "src/c.py" not in hits
+    assert pipeline._subgraph_hits("no matches here\n") == {}
+
+
+@pytest.mark.asyncio
+async def test_subgraph_src_blocks_windows_merge(tmp_path, monkeypatch):
+    """相邻命中行合并为一个窗(radius=8):L5/L9 → (1,17);L5/L45 → 两个窗。"""
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "a.py").write_text(
+        "\n".join(f"line {i}" for i in range(1, 101)), encoding="utf-8"
+    )
+    monkeypatch.setattr(deepwiki.envs, "CHAT_TOKEN_LIMIT_ESTIMATE", 20000)
+    pipeline = deepwiki.LlmWikiPipeline()
+    blocks, degraded = pipeline._subgraph_src_blocks(
+        str(tmp_path), {"src/a.py": [5, 9]}, radius=8
+    )
+    assert not degraded and len(blocks) == 1
+    assert blocks[0]["start_line"] == 1 and blocks[0]["end_line"] == 17
+    assert blocks[0]["text"] == "\n".join(f"line {i}" for i in range(1, 18))
+    blocks, degraded = pipeline._subgraph_src_blocks(
+        str(tmp_path), {"src/a.py": [5, 45]}, radius=8
+    )
+    assert not degraded and len(blocks) == 2
+    assert [b["start_line"] for b in blocks] == [1, 37]
+    assert [b["end_line"] for b in blocks] == [13, 53]
+
+
+def test_subgraph_src_blocks_per_file_cap_and_budget(tmp_path):
+    """单文件超 cap 截断;全局超 budget 整体降级([] , True);缺文件跳过。"""
+    d = tmp_path / "src"
+    d.mkdir()
+    (d / "a.py").write_text("\n".join(f"line {i}" for i in range(1, 51)), encoding="utf-8")
+    pipeline = deepwiki.LlmWikiPipeline()
+    blocks, degraded = pipeline._subgraph_src_blocks(
+        str(tmp_path), {"src/a.py": [25]}, radius=8, per_file_cap=30,
+    )
+    assert not degraded and len(blocks) == 1
+    assert len(blocks[0]["text"]) == 30
+    assert blocks[0]["end_line"] == blocks[0]["start_line"] + blocks[0]["text"].count("\n")
+    blocks, degraded = pipeline._subgraph_src_blocks(
+        str(tmp_path), {"src/a.py": [25]}, radius=8, budget_chars=5,
+    )
+    assert (blocks, degraded) == ([], True)
+    blocks, degraded = pipeline._subgraph_src_blocks(str(tmp_path), {"nope.py": [1]})
+    assert (blocks, degraded) == ([], False)
+
+
+def test_format_subgraph_context():
+    """原版 _format_context 同式:按文件分组,单文件多窗合并头,文件段以原版
+    ("\\n\\n" + "-"*10 + "\\n\\n".join(parts)) 联结;空输入 → ""。"""
+    blocks = [
+        {"path": "src/a.py", "text": "x = 1", "start_line": 1, "end_line": 1},
+        {"path": "src/a.py", "text": "y = 2", "start_line": 10, "end_line": 20},
+        {"path": "src/b.py", "text": "z = 3", "start_line": 5, "end_line": 9},
+    ]
+    pipeline = deepwiki.LlmWikiPipeline()
+    text = pipeline._format_subgraph_context(blocks)
+    assert text.startswith("\n\n----------## File Path: src/a.py\n\n")  # 原版联结式
+    assert text.count("## File Path:") == 2
+    assert "[lines 1-1]\nx = 1" in text and "[lines 10-20]\ny = 2" in text
+    assert "## File Path: src/b.py\n\n[lines 5-9]\nz = 3" in text
+    assert pipeline._format_subgraph_context([]) == ""
+    assert pipeline._format_subgraph_context([{"path": "a.py", "text": "t", "start_line": 1, "end_line": 1}]) \
+        .startswith("\n\n----------## File Path: a.py")
+
+
+# ---------------------------------------------------------------------------
+# LLM 路 chat / codemap(fake graphify.query + fake llm_stream/llm_complete,全离线)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_llm_chat_stream_prompt_and_context(monkeypatch, tmp_path):
+    """llm chat(原版 prompt_builder 同构):单条 user 消息含 /no_think+SIMPLE 角色
+    +历史拼接+检索上下文(<START_OF_CONTEXT> + ## File Path + [lines A-B]);查询词为末条。"""
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "a.py").write_text("x = 1\n", encoding="utf-8")
+    captured = {}
+
+    def fake_query(question, **kw):
+        captured["query"] = question
+        return {"answer": "NODE f [src=src/a.py loc=L1 community=c0]\n"}
+
+    async def fake_llm_stream(*, url, payload, api_key=None, session_name=None, **kw):
+        captured.update(url=url, api_key=api_key, session=session_name, payload=payload)
+        yield "HELLO"
+
+    monkeypatch.setattr(deepwiki.graphify, "query", fake_query)
+    monkeypatch.setattr(deepwiki, "llm_stream", fake_llm_stream)
+    request = deepwiki.ChatCompletionRequest(
+        repo_url=str(tmp_path), type="local", language="en",
+        messages=[deepwiki.ChatMessage(role="user", content="q1"),
+                  deepwiki.ChatMessage(role="assistant", content="a1"),
+                  deepwiki.ChatMessage(role="user", content="how does src/a.py work?")],
+    )
+    got = [c async for c in deepwiki.LlmWikiPipeline().chat_stream(request)]
+    assert "".join(got) == "HELLO"
+    assert captured["url"] == deepwiki.envs.DEEPWIKI_LLM_URL
+    assert captured["payload"]["model"] == deepwiki.envs.DEEPWIKI_LLM_MODEL
+    assert captured["session"] == f"chat:{deepwiki.Repo(str(tmp_path), 'local').name}"
+    assert len(captured["payload"]["messages"]) == 1  # 原版单条 user 消息(无 system role)
+    msg = captured["payload"]["messages"][0]["content"]
+    assert msg.startswith("/no_think ")
+    assert "expert code analyst" in msg  # SIMPLE 角色模板
+    assert "<conversation_history>" in msg and "<turn>" in msg
+    assert "<START_OF_CONTEXT>" in msg and "<END_OF_CONTEXT>" in msg
+    assert "## File Path: src/a.py" in msg and "[lines 1-1]\nx = 1" in msg
+    assert "<file path=\"" not in msg  # 不再 <file> 块(原版格式)
+    assert "<query>\nhow does src/a.py work?\n</query>" in msg
+    assert "\nAssistant: " in msg
+    assert captured["query"] == "how does src/a.py work?"
+
+
+@pytest.mark.asyncio
+async def test_llm_chat_continuation_and_iteration_templates(monkeypatch, tmp_path):
+    """continuation 回退(查询词换回首条用户消息);迭代模板按 research_iteration 选。"""
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "a.py").write_text("x = 1\n", encoding="utf-8")
+    captured = {}
+
+    def fake_query(question, **kw):
+        captured["query"] = question
+        return {"answer": ""}
+
+    async def fake_llm_stream(*, url, payload, api_key=None, session_name=None, **kw):
+        captured["payload"] = payload
+        yield ""
+
+    monkeypatch.setattr(deepwiki.graphify, "query", fake_query)
+    monkeypatch.setattr(deepwiki, "llm_stream", fake_llm_stream)
+    request = deepwiki.ChatCompletionRequest(
+        repo_url=str(tmp_path), type="local", language="en", research_iteration=3,
+        messages=[deepwiki.ChatMessage(role="user", content="what is this repo about?"),
+                  deepwiki.ChatMessage(role="assistant", content="## Research Plan\nx"),
+                  deepwiki.ChatMessage(role="user", content="Continue the research",
+                                       mode="deep_research")],
+    )
+    _ = [c async for c in deepwiki.LlmWikiPipeline().chat_stream(request)]
+    assert captured["query"] == "what is this repo about?"
+    assert "iteration 3" in captured["payload"]["messages"][0]["content"]
+    request_final = request.model_copy(update={"research_iteration": 5})
+    _ = [c async for c in deepwiki.LlmWikiPipeline().chat_stream(request_final)]
+    assert "## Final Conclusion" in captured["payload"]["messages"][0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_llm_chat_error_fallbacks(monkeypatch, tmp_path):
+    """llm chat 失败语义(原版 stream_and_fallback):graph 失败/无命中→"无检索增强"
+    note;非 token 错误→"Error with openai API:";token 超限→简化重试;重试也败→致歉。"""
+    captured = {}
+
+    def fake_query(question, **kw):
+        return {"answer": ""}
+
+    monkeypatch.setattr(deepwiki.graphify, "query", fake_query)
+
+    async def fake_llm_stream(*, url, payload, api_key=None, session_name=None, **kw):
+        captured["payload"] = payload
+        yield "ok"
+
+    monkeypatch.setattr(deepwiki, "llm_stream", fake_llm_stream)
+    request = deepwiki.ChatCompletionRequest(
+        repo_url=str(tmp_path), type="local", language="en",
+        messages=[deepwiki.ChatMessage(role="user", content="hi")],
+    )
+    got = [c async for c in deepwiki.LlmWikiPipeline().chat_stream(request)]
+    assert "".join(got) == "ok"  # 图无命中也一样回答
+    assert "Answering without retrieval augmentation." in captured["payload"]["messages"][0]["content"]
+    # 图谱查询失败 → 同样降级 note(不引入任何错误文本)
+    def boom(question, **kw):
+        raise RuntimeError("graph is gone")
+
+    monkeypatch.setattr(deepwiki.graphify, "query", boom)
+    got = [c async for c in deepwiki.LlmWikiPipeline().chat_stream(request)]
+    assert "".join(got) == "ok"
+    assert "Answering without retrieval augmentation." in captured["payload"]["messages"][0]["content"]
+    # 非 token 错误 → "Error with openai API: ..." 原版式文本进流
+    async def err_stream(**kw):
+        raise RuntimeError("llm down")
+        yield  # 保持 async generator
+
+    monkeypatch.setattr(deepwiki, "llm_stream", err_stream)
+    got = [c async for c in deepwiki.LlmWikiPipeline().chat_stream(request)]
+    assert "Error with openai API: llm down" in "".join(got)
+    # token 超限 → 简化提示词重试一次
+    calls = []
+
+    async def token_stream(*, url, payload, api_key=None, session_name=None, **kw):
+        calls.append(payload)
+        if len(calls) == 1:
+            raise RuntimeError("maximum context length exceeded")
+        yield "SIMPLIFIED"
+
+    monkeypatch.setattr(deepwiki, "llm_stream", token_stream)
+    got = [c async for c in deepwiki.LlmWikiPipeline().chat_stream(request)]
+    assert "".join(got) == "SIMPLIFIED"
+    assert len(calls) == 2
+    assert "due to input size constraints" in calls[1]["messages"][0]["content"]
+    # 简化重试也失败 → 原版致歉文本
+    async def token_stream2(**kw):
+        raise RuntimeError("too many tokens")
+        yield
+
+    monkeypatch.setattr(deepwiki, "llm_stream", token_stream2)
+    got = [c async for c in deepwiki.LlmWikiPipeline().chat_stream(request)]
+    assert "I apologize, but your request is too large for me to process" in "".join(got)
+
+
+@pytest.mark.asyncio
+async def test_llm_codemap_events_sequence(monkeypatch, tmp_path):
+    """llm codemap:NDJSON 事件序列与 agent 路同形;一次 graphify 查询两阶段复用;
+    _ground_citations 以真实源码覆盖行号。"""
+    repo_dir = tmp_path / "repo"
+    (repo_dir / "src").mkdir(parents=True)
+    (repo_dir / "src" / "a.py").write_text("def f():\n    return 42\n", encoding="utf-8")
+    fake_repo = Repo(str(repo_dir), "local")
+    graph_dir = deepwiki._graph_dir(fake_repo)
+    graph_dir.mkdir(parents=True, exist_ok=True)
+    (graph_dir / "graph.json").write_text("{}", encoding="utf-8")
+
+    calls = []
+
+    def fake_query(question, **kw):
+        calls.append(("query", question))
+        return {"answer": "NODE f [src=src/a.py loc=L1 community=c0]\n"}
+
+    skeleton = {
+        "title": "How to f", "summary": "s",
+        "sections": [{
+            "id": "1", "title": "Do it", "guide": "", "diagram": "",
+            "steps": [{"id": "1a", "label": "call f", "code": "f()",
+                       "citation": {"file_path": "src/a.py", "start_line": 99,
+                                    "end_line": 99, "snippet": "    return 42"}}],
+        }],
+    }
+
+    async def fake_llm_complete(*, url, payload, api_key=None, session_name=None, **kw):
+        calls.append(("complete", session_name, payload))
+        if session_name == "codemap:skeleton":
+            return json.dumps(skeleton)
+        return json.dumps({**skeleton, "sections": [
+            {**skeleton["sections"][0], "guide": "g", "diagram": "graph TD"}]})
+
+    monkeypatch.setattr(deepwiki.graphify, "query", fake_query)
+    monkeypatch.setattr(deepwiki, "llm_complete", fake_llm_complete)
+    request = deepwiki.CodeMapRequest(
+        repo_url=str(repo_dir), type="local", language="en", question="how to call f?"
+    )
+    events = [json.loads(ev) async for ev in deepwiki.LlmWikiPipeline().generate_codemap(request)]
+    assert [e["type"] for e in events] == ["phase", "phase", "phase", "phase",
+                                           "phase", "phase", "codemap", "done"]
+    assert events[0] == {"type": "phase", "phase": "analyzing", "status": "start"}
+    assert events[1] == {"type": "phase", "phase": "analyzing", "status": "done",
+                         "chunk_count": 1}  # analyzing 阶段内完成检索(原版 chunk_count=len(documents))
+    assert events[2] == {"type": "phase", "phase": "initial_codemap", "status": "start"}
+    assert events[3] == {"type": "phase", "phase": "initial_codemap", "status": "done",
+                         "section_count": 1}
+    assert events[4] == {"type": "phase", "phase": "diagrams", "status": "start"}
+    assert events[5] == {"type": "phase", "phase": "diagrams", "status": "done"}
+    assert [c[0] for c in calls].count("query") == 1  # 一次查询、两阶段复用
+    data = events[6]["data"]
+    assert data["sections"][0]["guide"] == "g"
+    cit = data["sections"][0]["steps"][0]["citation"]
+    assert (cit["start_line"], cit["end_line"]) == (2, 2)  # 真实行号覆盖 99/99
+    skel_payload = [c[2] for c in calls if c[1] == "codemap:skeleton"][0]
+    assert skel_payload["model"] == deepwiki.envs.DEEPWIKI_LLM_MODEL
+    assert len(skel_payload["messages"]) == 1  # 原版单条 user 消息(prompt_builder)
+    user = skel_payload["messages"][0]["content"]
+    assert user.startswith("/no_think ")
+    assert "<START_OF_CONTEXT>" in user
+    assert "## File Path: src/a.py" in user and "[lines 1-2]" in user
+    assert "expert code analyst" in user and "codemap" in user  # 骨架提示词正文
+
+
+@pytest.mark.asyncio
+async def test_llm_codemap_not_indexed_and_retry_and_degraded(monkeypatch, tmp_path):
+    """未索引 → analyzing error 事件且不调补全;骨架 3 次废文本 → initial_codemap error;
+    enrich 失败 → degraded=True 且 codemap 事件为骨架内容。"""
+    repo_dir = tmp_path / "fresh-repo"
+    repo_dir.mkdir()
+    complete_calls = []
+
+    async def fake_llm_complete(*, url, payload, api_key=None, session_name=None, **kw):
+        complete_calls.append(session_name)
+        raise RuntimeError("unreachable")  # 不应被调用段在此触发前提供有效返回
+
+    monkeypatch.setattr(deepwiki, "llm_complete", fake_llm_complete)
+    request = deepwiki.CodeMapRequest(
+        repo_url=str(repo_dir), type="local", language="en", question="q"
+    )
+    events = [json.loads(ev) async for ev in deepwiki.LlmWikiPipeline().generate_codemap(request)]
+    assert events[1] == {"type": "phase", "phase": "analyzing", "status": "done",
+                         "chunk_count": 0}
+    assert events[2]["type"] == "error" and events[2]["stage"] == "analyzing"
+    assert complete_calls == []
+    assert [e["type"] for e in events].count("done") == 0
+
+
+@pytest.mark.asyncio
+async def test_llm_codemap_skeleton_retry_and_enrich_degrade(monkeypatch, tmp_path):
+    repo_dir = tmp_path / "repo"
+    (repo_dir / "src").mkdir(parents=True)
+    (repo_dir / "src" / "a.py").write_text("def f():\n    return 42\n", encoding="utf-8")
+    fake_repo = Repo(str(repo_dir), "local")
+    graph_dir = deepwiki._graph_dir(fake_repo)
+    graph_dir.mkdir(parents=True, exist_ok=True)
+    (graph_dir / "graph.json").write_text("{}", encoding="utf-8")
+
+    skeleton = {"title": "How to f", "summary": "s",
+                "sections": [{"id": "1", "title": "S", "guide": "", "diagram": "",
+                              "steps": [{"id": "1a", "label": "s", "code": "", "citation": None}]}]}
+    complete_calls = []
+
+    def fake_query(question, **kw):
+        return {"answer": "NODE f [src=src/a.py loc=L1 community=c0]\n"}
+
+    async def fake_llm_complete(*, url, payload, api_key=None, session_name=None, **kw):
+        complete_calls.append(session_name)
+        if session_name == "codemap:skeleton":
+            return json.dumps(skeleton)
+        return "this is not json"
+
+    monkeypatch.setattr(deepwiki.graphify, "query", fake_query)
+    monkeypatch.setattr(deepwiki, "llm_complete", fake_llm_complete)
+    request = deepwiki.CodeMapRequest(
+        repo_url=str(repo_dir), type="local", language="en", question="how to call f?"
+    )
+    events = [json.loads(ev) async for ev in deepwiki.LlmWikiPipeline().generate_codemap(request)]
+    assert events[4] == {"type": "phase", "phase": "diagrams", "status": "start"}
+    assert events[5]["status"] == "done" and events[5]["degraded"] is True
+    assert events[6]["type"] == "codemap" and events[6]["data"]["sections"][0]["guide"] == ""
+    assert events[7] == {"type": "done"}
+    assert complete_calls == ["codemap:skeleton", "codemap:enrich", "codemap:enrich"]  # 富化重试 2 次(原版)
+    # 骨架重试耗尽 → error 事件,无 codemap/done
+    async def garbage(*, url, payload, api_key=None, session_name=None, **kw):
+        return "not json"
+
+    monkeypatch.setattr(deepwiki, "llm_complete", garbage)
+    events = [json.loads(ev) async for ev in deepwiki.LlmWikiPipeline().generate_codemap(request)]
+    assert events[3]["type"] == "error" and events[3]["stage"] == "initial_codemap"
+    assert events[3]["message"].startswith("Model did not return valid JSON")
+    assert [e["type"] for e in events].count("codemap") == 0
+
+
+# ---------------------------------------------------------------------------
+# agent 路现代化(自然历史 + deep 折叠)与分派
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_agent_chat_natural_history(monkeypatch):
+    """agent chat:历史自然转写(无 <turn>/<conversation_history> 伪标签)。"""
+    captured = {}
+
+    async def fake_cc_stream(options, prompt, *, session=None, session_name=None, run_id=None,
+                             context=None, retry=None, meta=None):
+        captured.update(system=options.system_prompt, prompt=prompt, run_id=run_id,
+                        session=session_name)
+        yield "hi"
+
+    monkeypatch.setattr(deepwiki, "cc_stream", fake_cc_stream)
+    request = deepwiki.ChatCompletionRequest(
+        repo_url="/tmp/gh-puller-chat-natural", type="local", language="en",
+        messages=[deepwiki.ChatMessage(role="user", content="q1"),
+                  deepwiki.ChatMessage(role="assistant", content="a1"),
+                  deepwiki.ChatMessage(role="user", content="q2")],
+    )
+    got = [c async for c in deepwiki.AgentWikiPipeline().chat_stream(request)]
+    assert "".join(got) == "hi"
+    assert captured["session"] == captured["run_id"]
+    p = captured["prompt"]
+    assert "Previous conversation:" in p and "User: q1" in p and "Assistant: a1" in p
+    assert "<turn>" not in p and "<conversation_history>" not in p
+    assert "<query>\nq2\n</query>" in p
+
+
+@pytest.mark.asyncio
+async def test_agent_chat_deep_one_shot(monkeypatch):
+    """deep 折叠:system 恒 one-shot 模板(含 ## Final Conclusion),不再按迭代选三模板;
+    continuation 回退用于查询词。"""
+    captured = {}
+
+    async def fake_cc_stream(options, prompt, *, session=None, session_name=None, run_id=None,
+                             context=None, retry=None, meta=None):
+        captured["system"] = options.system_prompt
+        captured["prompt"] = prompt
+        yield "hi"
+
+    monkeypatch.setattr(deepwiki, "cc_stream", fake_cc_stream)
+    request = deepwiki.ChatCompletionRequest(
+        repo_url="/tmp/gh-puller-chat-natural", type="local", language="en",
+        messages=[deepwiki.ChatMessage(role="user", content="what is this repo about?"),
+                  deepwiki.ChatMessage(role="assistant", content="half"),
+                  deepwiki.ChatMessage(role="user", content="Continue the research",
+                                       mode="deep_research")],
+    )
+    _ = [c async for c in deepwiki.AgentWikiPipeline().chat_stream(request)]
+    assert "single-run Deep Research" in captured["system"]
+    assert "## Final Conclusion" in captured["system"]
+    assert "first iteration of a multi-turn" not in captured["system"]
+    assert "<query>\nwhat is this repo about?\n</query>" in captured["prompt"]
+
+
+@pytest.mark.asyncio
+async def test_chat_and_codemap_dispatch_by_generator(monkeypatch):
+    """chat/codemap 顶层分派:与 wiki 同开关(DEEPWIKI_GENERATOR)。"""
+    calls = []
+
+    async def fake_cc_chat(self, request):
+        calls.append("cc")
+        yield "c"
+
+    async def fake_llm_chat(self, request):
+        calls.append("llm")
+        yield "l"
+
+    async def fake_cc_codemap(self, request):
+        calls.append("cc-codemap")
+        yield "c"
+
+    async def fake_llm_codemap(self, request):
+        calls.append("llm-codemap")
+        yield "l"
+
+    monkeypatch.setattr(deepwiki.AgentWikiPipeline, "chat_stream", fake_cc_chat)
+    monkeypatch.setattr(deepwiki.LlmWikiPipeline, "chat_stream", fake_llm_chat)
+    monkeypatch.setattr(deepwiki.AgentWikiPipeline, "generate_codemap", fake_cc_codemap)
+    monkeypatch.setattr(deepwiki.LlmWikiPipeline, "generate_codemap", fake_llm_codemap)
+    chat_req = deepwiki.ChatCompletionRequest(
+        repo_url="/tmp/x", type="local", language="en",
+        messages=[deepwiki.ChatMessage(role="user", content="hi")],
+    )
+    codemap_req = deepwiki.CodeMapRequest(repo_url="/tmp/x", type="local", language="en", question="q")
+    monkeypatch.setattr(deepwiki.envs, "DEEPWIKI_GENERATOR", "cc")
+    assert [c async for c in deepwiki.chat_stream(chat_req)] == ["c"]
+    assert [ev async for ev in deepwiki.generate_codemap(codemap_req)] == ["c"]
+    monkeypatch.setattr(deepwiki.envs, "DEEPWIKI_GENERATOR", "llm")
+    assert [c async for c in deepwiki.chat_stream(chat_req)] == ["l"]
+    assert [ev async for ev in deepwiki.generate_codemap(codemap_req)] == ["l"]
+    assert calls == ["cc", "cc-codemap", "llm", "llm-codemap"]

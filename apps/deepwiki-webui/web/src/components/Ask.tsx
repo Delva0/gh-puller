@@ -585,9 +585,8 @@ const Ask: React.FC<AskProps> = ({
         // every request falls back to HTTP (the WebSocket never connects).
         const iter = requestBody.research_iteration ?? 1;
         if (iter === 1) {
-          // Iteration 1 is the research plan — always advance into the
-          // subsequent iterations. Advancing here (after the stream finishes)
-          // means the next turn captures this real answer, not a stale note.
+          // Reset to iteration 1; whether research continues is decided by the
+          // effect above (agent 折叠路首轮含 ## Final Conclusion 即停)。
           setResearchComplete(false);
           setResearchIteration(1);
         } else if (iter >= 5) {
@@ -617,9 +616,11 @@ const Ask: React.FC<AskProps> = ({
   // Effect to continue research when response is updated
   useEffect(() => {
     if (deepResearch && response && !isLoading && !researchComplete) {
-      // Iteration 1 is the plan and is never "complete"; only apply the
-      // completion heuristic from the second iteration onward.
-      const isComplete = researchIteration >= 2 && checkIfResearchComplete(response);
+      // Agent(cc)路折叠:第 1 轮即产出全篇,以含 ## Final Conclusion 判定完成;
+      // LLM 路第 1 轮(FIRST 模板)不含该标题,照旧自动推进后续迭代。
+      const isComplete = researchIteration === 1
+        ? response.includes('## Final Conclusion')
+        : checkIfResearchComplete(response);
       if (isComplete) {
         setResearchComplete(true);
       } else if (researchIteration > 0 && researchIteration < 5) {
@@ -888,9 +889,8 @@ const Ask: React.FC<AskProps> = ({
           if (fallbackActiveRef.current) return;
           // If deep research is enabled, check if we should continue
           if (deepResearch) {
-            // Iteration 1 is the initial research plan — always continue into
-            // the deeper iterations instead of letting the completion
-            // heuristic (which can false-positive on the plan text) stop here.
+            // Reset to iteration 1. Whether research continues is decided by
+            // the effect below (agent 折叠路首轮含 ## Final Conclusion 即停)。
             setResearchComplete(false);
             setResearchIteration(1);
             // The continueResearch function will be triggered by the useEffect.
