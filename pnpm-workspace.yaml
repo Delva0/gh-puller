@@ -4,6 +4,8 @@ packages:
   - ui
   - apps/deepwiki-webui/web
   - apps/agent-dashboard/web
+  # dsh 插件(TS 源 + vitest,构建产物 lib/ 提交;server/ 为 Python 侧,由 uv 管)
+  - apps/dsh-gh-puller
 allowBuilds:
   esbuild: true
   '@parcel/watcher': true

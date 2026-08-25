@@ -1,0 +1,43 @@
+[project]
+name = "gh-puller-dsh"
+version = "0.1.0"
+description = "dsh 插件侧 graphify worker(常驻子进程,NDJSON stdio);core 语义镜像 deepwiki._graphify_server"
+requires-python = ">=3.13"
+dependencies = [
+    "gh-puller",
+    "python-dotenv>=1.2.3",
+]
+
+[project.scripts]
+gh-graphify-worker = "gh_puller_dsh.worker:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.uv.sources]
+gh-puller = { path = "../../..", editable = true }
+graphifyy = { path = "../../../../graphify", editable = true }
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+select = [
+    "E",
+    "W",
+    "F",
+    "I",
+    "UP",
+    "B",
+    "SIM",
+]

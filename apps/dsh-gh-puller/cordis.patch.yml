@@ -1,0 +1,7 @@
+# dsh 插件行:原生工具注册 graphify_query / graphify_index(不经 MCP)。
+# 前提:uv 可用;插件随包内 ../server(uv 项目)定位 Python worker,uv sync 一次即可。
+# config 可选:serverDir(worker 所在目录,缺省插件包内 ../server)、defaultGraph(缺省图路径)。
+- insert:
+    - id: graphify
+      name: dsh-gh-puller
+      config: {}
