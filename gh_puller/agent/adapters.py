@@ -7,6 +7,9 @@ ClaudeSDKClient / httpx(无感,对外语义不变):
   ResultMessage.is_error → RuntimeError("agent 执行失败: ...") —— 与 deepwiki
   原 `_agent_stream` 漏斗逐字节一致;thinking/工具增量只进监控事件流,不改变产出。
 - llm_complete / llm_stream:OpenAI 兼容端点(httpx);异常原样抛,重试留给调用方。
+- dsh_stream / dsh_text / dsh_result:DeepSeek Harness(SDK)调用。dsh 原生 session
+  事件 1:1 投影为监控事件流(事件模型同源,events.py);finish_reason 非 completed
+  → RuntimeError("agent 执行失败: ...")(与 cc is_error 语义对齐)。
 
 事件语义(对齐 deepseek-harness 事件溯源模型,规范见 gh_puller.agent.events):
 单次运行一个 session(流式事件流内 seq 从 0 连续);进入即 session/start →
@@ -24,13 +27,18 @@ session_name → "agent"),见 _session_id;文件侧只落非流式事件流
 publish 仅 put_nowait 到每 sink 的 asyncio.Queue,永不阻塞调用)→ sink worker 消费。
 """
 
+import asyncio
+import contextlib
+import hashlib
 import json
+import tempfile
 import time
 import uuid
+from pathlib import Path
 
 import httpx
 
-from .events import new_event
+from .events import TAXONOMY, new_event
 from .sinks import ensure_bus
 
 # ---------------------------------------------------------------------------
@@ -98,15 +106,21 @@ class _Run:
         bus.publish(evt)
         return evt
 
-    def start(self, *, context: list[dict] | None = None, retry: dict | None = None) -> None:
-        """运行进入:session/start(带 retry 元数据)→ context 说明事件 → turn/start → step/start。"""
+    def start(self, *, context: list[dict] | None = None, retry: dict | None = None,
+              prologue: bool = True) -> None:
+        """运行进入:session/start(带 retry 元数据)→ context 说明事件 → turn/start → step/start。
+
+        prologue=False(dsh 投影路径专用):turn/step 生命周期由 dsh 原生事件自带,
+        不合成 turn/start + step/start,且 _step_open 保持 False(dsh 路径不调 step_boundary)。
+        """
         self.event("session/start", run_id=self.run_id, label=self.label, provider=self.provider,
                    model=self.model, retry=retry, meta=self.meta)
         for ctx in context or []:
             self.event(ctx["type"], **ctx["data"])  # 日志型说明事件:重放于 turn 之前
-        self.event("turn/start", turn=self.turn)
-        self.event("step/start", turn=self.turn, step=self.step)
-        self._step_open = True
+        if prologue:
+            self.event("turn/start", turn=self.turn)
+            self.event("step/start", turn=self.turn, step=self.step)
+            self._step_open = True
 
     def step_boundary(self) -> None:
         """上一步完成、新一步开始(工具结果后新一轮 LLM 请求);本 step 增量清空。"""
@@ -157,8 +171,12 @@ class _Run:
         self.result_stop_reason = getattr(msg, "stop_reason", None)
         self.result_cost_usd = getattr(msg, "total_cost_usd", None)
 
-    def finish(self, ok: bool) -> None:
-        """finally 兜底:step/end → turn/end → session/end(幂等)。"""
+    def finish(self, ok: bool, *, epilogue: bool = True) -> None:
+        """finally 兜底:step/end → turn/end → session/end(幂等)。
+
+        epilogue=False(dsh 投影路径专用):turn/step 终局事件已由 dsh 原生事件转发,
+        只收尾 session/end(状态汇总字段组装不变)。
+        """
         if self._ended:
             return
         self._ended = True
@@ -172,10 +190,11 @@ class _Run:
                 data[k] = v
         if not ok and self._reason:
             data["reason"] = self._reason
-        if self._step_open:
-            self.event("step/end", turn=self.turn, step=self.step)
-            self._step_open = False
-        self.event("turn/end", turn=self.turn, reason="completed" if ok else "error")
+        if epilogue:
+            if self._step_open:
+                self.event("step/end", turn=self.turn, step=self.step)
+                self._step_open = False
+            self.event("turn/end", turn=self.turn, reason="completed" if ok else "error")
         self.event("session/end", **data)
 
     def error(self, exc: Exception, stage: str) -> None:
@@ -208,9 +227,9 @@ def _normalize_usage(u) -> dict | None:
     if not u:
         return None
     return {
-        "input_tokens": _norm_token(u, ("input_tokens", "prompt_tokens")),
-        "output_tokens": _norm_token(u, ("output_tokens", "completion_tokens")),
-        "cache_read_input_tokens": _norm_token(u, ("cache_read_input_tokens",)),
+        "input_tokens": _norm_token(u, ("input_tokens", "prompt_tokens", "inputTokens")),
+        "output_tokens": _norm_token(u, ("output_tokens", "completion_tokens", "outputTokens")),
+        "cache_read_input_tokens": _norm_token(u, ("cache_read_input_tokens", "cacheReadTokens")),
     }
 
 
@@ -221,6 +240,129 @@ def _stage_of(exc: Exception) -> str:
     if isinstance(exc, (json.JSONDecodeError, KeyError, IndexError, TypeError, ValueError)):
         return "parse"
     return "run"
+
+
+def _dsh_session_id(session: str) -> str:
+    """gh session id → dsh session_id:取最后一个 '/' 之后(与 FileSink 文件名规则一致)。"""
+    return (session or "agent").rsplit("/", 1)[-1]
+
+
+def _dsh_options_fields(options) -> dict:
+    """鸭子类型 dsh options → DeepSeekHarness 构造 kwargs(None 跳过 → 走 SDK 配置缺省)。
+
+    DeepSeekHarnessConfig 是 dataclass 而非 pydantic(无 model_dump),且
+    DeepSeekHarness.__init__(config=None, **kwargs) 同时传 config 与 kwargs 会
+    TypeError —— 恒走 kwargs;调用方自组装 options(仿 cc 的 ClaudeAgentOptions 透传)。
+    """
+    names = ("provider", "model", "max_tokens", "cwd", "runtime_cwd", "session_root",
+             "cordis", "env", "runtime_bin", "launch_args_override",
+             "request_timeout_seconds", "shutdown_timeout_seconds", "base_url", "api_key")
+    return {k: v for k in names if (v := getattr(options, k, None)) is not None}
+
+
+def _dsh_stage(exc: Exception, protocol_errors: tuple) -> str:
+    """dsh 异常 stage:协议解析失败(SdkProtocolError/JsonRpcError)归 parse,其余沿 _stage_of。
+
+    protocol_errors = 函数内 lazy import 的错误类元组(测试经假模块注入)。
+    """
+    if isinstance(exc, protocol_errors):
+        return "parse"
+    return _stage_of(exc)
+
+
+_DSH_CORDIS_FILE: str | None = None  # 内容哈希键控缓存(每次调用少写盘;内容变了自然换文件名)
+
+
+def dsh_cordis_path() -> str:
+    """dsh 内置隔离组合文件路径(DSH_CORDIS_CONFIG 只认文件路径;按内容哈希落盘一次)。
+
+    组合蓝图见下方 `_DSH_CORDIS_YAML`(镜像 dsh 官方 minimal.cordis.yml;SDK/
+    JSON-RPC 路径只读这一个文件,无用户级 patch 层/无 XDG 配置 —— 组合即隔离
+    边界)。语义同 cc `setting_sources=[]` 的默认位:上层不传 cordis(None)时,
+    dsh_stream 回退本组合(默认隔离);上层显式提供 cordis(如
+    envs.DEEPWIKI_DSH_CORDIS)则全权交给上层(隔离与否由上层组合保证)。
+    """
+    global _DSH_CORDIS_FILE
+    if _DSH_CORDIS_FILE is None:
+        digest = hashlib.sha1(_DSH_CORDIS_YAML.encode()).hexdigest()[:8]
+        path = Path(tempfile.gettempdir()) / "gh-puller" / f"dsh-cordis-{digest}.yml"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if not path.exists():
+            path.write_text(_DSH_CORDIS_YAML, encoding="utf-8")
+        _DSH_CORDIS_FILE = str(path)
+    return _DSH_CORDIS_FILE
+
+
+# 组合层隔离逐项(cordis.yml 之外再无配置注入面;余下环境残留 DSH_HOME/之类
+# 无任何已装载组件读取 —— SDK 路径无 home patch/settings/credentials 装载):
+# workspaceContext(禁 $DSH_HOME/AGENTS.md 与 checkout 的 AGENTS.md/CLAUDE.md 链)、
+# skills(禁用户 $DSH_HOME/skills、$DSH_AGENTS_HOME/skills、项目 .dsh/skills 与
+# 捆绑技能目录)、includeHarnessIdentity/includeRuntimeContext(提示词注入)、
+# toolBash/toolJobs/goals(面模型工具域);随后显式装载 graphify(内置 mcp-client
+# 单服务器行,无 .mcp.json/全局发现;graphifyy 自带 stdio MCP,工具对 agent 为
+# mcp__graphify__query_graph)。hooks 未装载(配置文件型,须显式挂)。
+_DSH_CORDIS_YAML = """- id: sdk-jsonrpc-server
+  name: '@deepseek-ai/dsh-sdk-jsonrpc-server'
+  config:
+    maxTokensAsSuccess: false
+- id: llm-deepseek
+  name: '@deepseek-ai/dsh-llm-deepseek'
+- id: sandbox
+  name: '@deepseek-ai/dsh-sandbox-local'
+- id: sandbox-policy
+  name: '@deepseek-ai/dsh-sandbox-policy'
+  config:
+    mode: danger-full-access
+    workspaceRoot: !!js process.env.DSH_CWD ?? process.cwd()
+- id: subprocess
+  name: '@deepseek-ai/dsh-subprocess-local'
+- id: pty
+  name: '@deepseek-ai/dsh-terminal'
+- id: terminal-bash
+  name: '@deepseek-ai/dsh-terminal-bash'
+  config:
+    timeoutMs: 300000
+- id: fs-local
+  name: '@deepseek-ai/dsh-fs-local'
+  config:
+    cwd: !!js process.env.DSH_CWD ?? process.cwd()
+- id: agent-spine
+  name: '@deepseek-ai/dsh-agent-spine-demo'
+  config:
+    includeHarnessIdentity: false
+    includeRuntimeContext: false
+    persona: !!js process.env.DSH_SYSTEM_PROMPT ?? 'You are a helpful software engineer assistant.'
+    workspaceContext: false
+    skills:
+      enabled: false
+    toolBash: false
+    toolJobs: false
+    goals: false
+- id: persistent-bash
+  name: '@deepseek-ai/dsh-tool-bash-persistent'
+  config:
+    timeoutMs: 300000
+- id: str-replace-editor
+  name: '@deepseek-ai/dsh-tool-str-replace-editor'
+  config:
+    maxOutputChars: 16000
+- id: mcp-graphify
+  name: '@deepseek-ai/dsh-mcp-client'
+  config:
+    serverName: graphify
+    transport: stdio
+    command: !!js process.env.GRAPHIFY_MCP_PYTHON ?? 'python3'
+    args: ['-m', 'graphify.serve']
+    cwd: !!js process.env.DSH_CWD ?? process.cwd()
+    failOnStartupError: true
+    reconnect:
+      enabled: false
+- id: sessions
+  name: '@deepseek-ai/dsh-session-persistence-jsonl'
+  config:
+    root: !!js process.env.DSH_SESSION_ROOT ?? './.sessions'
+    compression: none
+"""
 
 
 def _handle_stream_event(run: _Run, event: dict) -> None:
@@ -623,3 +765,370 @@ async def llm_stream(
         raise
     finally:
         run.finish(ok)
+
+
+# ---------------------------------------------------------------------------
+# DeepSeek Harness(SDK)包装:dsh_stream / dsh_text / dsh_result
+# ---------------------------------------------------------------------------
+
+
+class _DshProj:
+    """dsh 会话事件 → gh 事件流的投影状态(单次 dsh_stream 调用一个实例)。
+
+    seq_map: dsh session 事件 seq → gh 封套 seq。dsh seq 统计包括被跳过的插件
+    事件(字段悬空),gh seq 只算本项目 TAXONOMY 投影 —— sourceEventSeqs 必须
+    经本表映射为 gh sourceSeqs,未映射者丢弃;任何时刻不拷贝原始 dsh seq。
+    tool_names: callId → 工具名(tool/result 补 name,来自 dsh tool/call 转发);
+    tool_pieces: 本 step 内块 index → {id, name, pieces}(tool-call-delta 碎片,
+    step/start 归零 —— 块 index 每 step 从 0 重新计数);
+    saw_user_message / saw_turn_end:兜底与终局判定;last_finish_kind:最近 finish
+    chunk 的 reason(assistant/message 与 session/end 的 stop_reason 来源)。
+    """
+
+    def __init__(self, run: _Run, prompt: str, session_id: str):
+        self.run = run
+        self.prompt = prompt
+        self.session_id = session_id  # dsh session_id(JSONL 文件名;子代理会话过滤用)
+        self.seq_map: dict[int, int] = {}
+        self.tool_names: dict[str, str] = {}
+        self.tool_pieces: dict[int, dict] = {}
+        self.synth: dict[str, int] = {}  # callId → 块端已合成 tool/call 的 gh seq(显式事件去重)
+        self.saw_user_message = False
+        self.saw_turn_end = False
+        self.last_finish_kind: str | None = None
+
+    def track(self, dsh_seq: int, action) -> int | None:
+        """执行一次恰好发布单事件的 action(如 run.text/tool_call),记录 dsh_seq → gh seq。
+
+        bus disabled 时 run.seq 不增长(事件不构造)→ 不记录映射,防悬空 seq;
+        返回 gh seq(未发布返回 None)。
+        """
+        before = self.run.seq
+        action()
+        if self.run.seq > before and dsh_seq is not None:
+            self.seq_map[dsh_seq] = self.run.seq - 1
+            return self.run.seq - 1
+        return None
+
+    def forward(self, dsh_seq: int, evt_type: str, **data) -> dict | None:
+        """发布 gh 事件并记录 seq 映射;返回事件(无 sink 时 None)。"""
+        evt = self.run.event(evt_type, **data)
+        if evt is not None and dsh_seq is not None:
+            self.seq_map[dsh_seq] = evt["seq"]
+        return evt
+
+    def source_seqs(self, envelope: dict) -> list[int]:
+        """dsh sourceEventSeqs → gh sourceSeqs(经 seq_map 映射;未映射者丢弃)。"""
+        return [self.seq_map[s] for s in (envelope.get("sourceEventSeqs") or [])
+                if s in self.seq_map]
+
+
+def _project_dsh_chunk(run: _Run, proj: _DshProj, dsh_seq, chunk: dict) -> list[str]:
+    """dsh StreamChunk → gh assistant/chunk 增量投影(逐条),返回文本增量。
+
+    文本增量走 run.text(计入 text_chars 且 yield);thinking/tool_input 只进
+    事件流不改变产出(与 cc 漏斗一致);tool-call 收尾经 block-end 的完整
+    arguments 合成 tool/call(整串优先,缺失时拼 delta 碎片)。
+    """
+    ctype = chunk.get("type")
+    if ctype == "text-delta":
+        text = chunk.get("text") or ""
+        proj.track(dsh_seq, lambda: run.text(text, index=chunk.get("index", 0)))
+        return [text] if text else []
+    if ctype == "reasoning-delta":
+        proj.track(dsh_seq, lambda: run.chunk({"type": "thinking", "index": chunk.get("index", 0),
+                                               "text": chunk.get("text") or ""}))
+        return []
+    if ctype == "tool-call-delta":
+        idx = chunk.get("index", -1)
+        slot = proj.tool_pieces.setdefault(
+            idx, {"id": chunk.get("id") or "", "name": chunk.get("name") or "", "pieces": []})
+        if chunk.get("name"):
+            slot["name"] = chunk["name"]
+        piece = chunk.get("argumentsDelta") or ""
+        slot["pieces"].append(piece)
+        proj.track(dsh_seq, lambda: run.chunk({"type": "tool_input", "index": idx,
+                                               "partial_json": piece}))
+        return []
+    if ctype == "block-end":
+        block = chunk.get("block") or {}
+        if block.get("type") == "tool-call":
+            slot = proj.tool_pieces.pop(chunk.get("index", -1), None)
+            call_id = block.get("id") or (slot or {}).get("id") or ""
+            name = block.get("name") or (slot or {}).get("name")
+            if call_id and name:
+                proj.tool_names[call_id] = name
+            args = block.get("arguments")
+            if not isinstance(args, str) or args == "":
+                args = "".join((slot or {}).get("pieces", []))
+            # 会话日志随后仍有显式 tool/call 同 id 事件:先合成,后者去重映射(见 tool/call 分支)
+            gh_seq = proj.track(dsh_seq, lambda: run.tool_call(call_id, name, args or ""))
+            if gh_seq is not None and call_id:
+                proj.synth[call_id] = gh_seq
+        return []
+    if ctype == "usage":
+        usage = chunk.get("usage")
+        if usage:
+            run.result_usage = _normalize_usage(usage)
+        return []
+    if ctype == "finish":
+        reason = chunk.get("reason")
+        kind = reason.get("kind") if isinstance(reason, dict) else reason
+        if kind:
+            proj.last_finish_kind = kind
+            run.result_stop_reason = kind
+        return []
+    return []  # block-start 与未知块:信息无需事件(增量已逐条投影)
+
+
+def _project_dsh_event(run: _Run, proj: _DshProj, notif) -> list[str]:
+    """dsh 通知 → gh TAXONOMY 事件投影(纯 dict 构造,测试可喂假 Notification)。
+
+    返回本事件产生的文本增量(供 dsh_stream yield)。规则:
+    - 只认 session.event 且 sessionId 匹配本运行(SDK 在过滤前即回调所有会话通知,
+      子代理等其它会话在此静默丢弃);
+    - 非 TAXONOMY 类型(dsh 插件扩展事件)静默跳过 —— new_event 对未知 type 抛 ValueError;
+    - surfaceOp/sourceEventSeqs 在信封层(sourceEventSeqs 经 proj.seq_map 映射);
+    - user/message 扁平化重塑、tool/result 卡片改名(规范见 events.py 折叠契约)。
+    """
+    if getattr(notif, "method", None) != "session.event":
+        return []
+    payload = getattr(notif, "payload", None) or {}
+    if payload.get("sessionId") != proj.session_id:
+        return []
+    envelope = payload.get("event") or {}
+    evt_type = envelope.get("type")
+    if evt_type not in TAXONOMY:
+        return []
+    data = envelope.get("data") or {}
+    dsh_seq = envelope.get("seq")
+
+    # 兜底:极罕见流缺 user/message 时,首个 assistant 事件前合成 prompt 消息
+    # (绝不在 prologue 预发 —— dsh 会发自己的,且含插件/注入消息)。
+    if evt_type.startswith("assistant/") and not proj.saw_user_message:
+        proj.saw_user_message = True
+        run.user_message({"role": "user",
+                          "content": [{"type": "text", "text": proj.prompt}]})
+
+    if evt_type == "turn/start":
+        run.turn = data.get("turn", run.turn)
+        proj.forward(dsh_seq, "turn/start", turn=run.turn)
+    elif evt_type == "step/start":
+        run.turn = data.get("turn", run.turn)
+        run.step = data.get("step", run.step)
+        proj.tool_pieces = {}  # 块 index 每 step 从 0 重新计数
+        run._step_open = True  # 崩溃路径(无 step/end)epilogue 有可合的 step/end
+        proj.forward(dsh_seq, "step/start", turn=run.turn, step=run.step)
+    elif evt_type == "step/end":
+        run.turn = data.get("turn", run.turn)
+        run.step = data.get("step", run.step)
+        run._step_open = False
+        proj.forward(dsh_seq, "step/end", turn=run.turn, step=run.step)
+    elif evt_type == "turn/end":
+        run.turn = data.get("turn", run.turn)
+        proj.saw_turn_end = True
+        reason = data.get("reason")
+        kind = reason.get("kind") if isinstance(reason, dict) else reason
+        detail = {"turn": run.turn, "reason": kind}
+        if isinstance(reason, dict):
+            rest = {k: v for k, v in reason.items() if k != "kind"}
+            if rest:
+                detail["detail"] = rest  # 结构化失败细目透传(UI 排查素材)
+        if not proj.last_finish_kind and kind:
+            run.result_stop_reason = kind  # 无 finish chunk 的兜底 source
+        proj.forward(dsh_seq, "turn/end", **detail)
+    elif evt_type == "user/message":
+        proj.saw_user_message = True
+        message = {"role": data.get("role", "user"), "content": data.get("content") or []}
+        proj.track(dsh_seq, lambda: run.user_message(
+            message, source=data.get("source"),
+            surface_op=envelope.get("surfaceOp") or "append"))
+    elif evt_type == "request/header":
+        proj.forward(dsh_seq, "request/header", **data)  # 完整 header(真实 system/tools)
+    elif evt_type == "request/context":
+        proj.forward(dsh_seq, "request/context", **data)
+    elif evt_type == "assistant/chunk":
+        run.turn = data.get("turn", run.turn)
+        run.step = data.get("step", run.step)
+        return _project_dsh_chunk(run, proj, dsh_seq, data.get("chunk") or {})
+    elif evt_type == "assistant/message":
+        run.turn = data.get("turn", run.turn)
+        run.step = data.get("step", run.step)
+        evt_data = {
+            "turn": run.turn, "step": run.step,
+            "message": data.get("message") or {},
+            "surfaceOp": envelope.get("surfaceOp") or "append",
+        }
+        if "usage" in data:
+            evt_data["usage"] = _normalize_usage(data["usage"])
+        if data.get("interrupted"):
+            evt_data["interrupted"] = True
+        if proj.last_finish_kind:
+            evt_data["stop_reason"] = proj.last_finish_kind
+        src = proj.source_seqs(envelope)
+        if src:
+            evt_data["sourceSeqs"] = src
+        proj.forward(dsh_seq, "assistant/message", **evt_data)
+        if data.get("usage"):
+            run.result_usage = _normalize_usage(data["usage"])  # 末条为准 → session/end
+    elif evt_type == "tool/call":
+        run.turn = data.get("turn", run.turn)
+        run.step = data.get("step", run.step)
+        call_id = data.get("callId") or ""
+        name = data.get("name")
+        if call_id and name:
+            proj.tool_names[call_id] = name
+        if call_id in proj.synth:
+            # 块端(assistant/chunk block-end)已合成同 id 的 tool/call:显式事件不再重复,
+            # 其 dsh seq 映射到已合成事件 —— 供 tool/result.sourceEventSeqs 溯源到同一 gh 事件
+            if dsh_seq is not None:
+                proj.seq_map[dsh_seq] = proj.synth[call_id]
+        else:
+            proj.track(dsh_seq, lambda: run.tool_call(call_id, name, data.get("arguments") or ""))
+    elif evt_type == "tool/result":
+        run.turn = data.get("turn", run.turn)
+        run.step = data.get("step", run.step)
+        msg = data.get("message") or {}
+        card = ((msg.get("content") or [{}])[0]
+                if isinstance(msg.get("content"), list) else {})
+        call_id = (msg.get("source") or {}).get("callId") or (card.get("toolCallId") or "")
+        is_error = bool(card.get("isError"))
+        # 卡片改名:dsh tool-result/toolCallId/isError → gh tool_result/tool_use_id/is_error;
+        # 文本块拼接为 content 字符串(cc 先例:全量不截断)
+        text = "".join(b.get("text") or "" for b in (card.get("content") or [])
+                       if isinstance(b, dict) and b.get("type") == "text")
+        evt_data = {
+            "turn": run.turn, "step": run.step,
+            "message": {"role": "user", "content": [{"type": "tool_result",
+                                                     "tool_use_id": call_id,
+                                                     "content": text, "is_error": is_error}]},
+            "callId": call_id, "is_error": is_error, "surfaceOp": "append",
+        }
+        if call_id in proj.tool_names:
+            evt_data["name"] = proj.tool_names[call_id]
+        src = proj.source_seqs(envelope)
+        if src:
+            evt_data["sourceSeqs"] = src
+        if isinstance(data.get("error"), dict):
+            evt_data["error"] = data["error"]
+        proj.forward(dsh_seq, "tool/result", **evt_data)
+    return []
+
+
+def _dsh_worker(fields: dict, prompt: str, session_id: str, pump):
+    """同步线程体:构造 harness(子进程 spawn + initialize)→ 阻塞 run 至 idle。
+
+    整个体在 executor 线程执行;即使外层 asyncio task 被取消(消费者提前退场),
+    线程仍会自然跑完 —— with 块负责回收子进程,不泄漏。
+    """
+    from deepseek_harness import DeepSeekHarness  # lazy:调用时构造(与 cc 同法)
+
+    with DeepSeekHarness(**fields) as harness:
+        return harness.run(prompt, session_id=session_id, on_notification=pump)
+
+
+async def dsh_stream(
+    options, prompt: str, *, session: str | None = None,
+    session_name: str | None = None, run_id: str | None = None,
+    session_ns: str | None = None,
+    context: list[dict] | None = None, retry: dict | None = None,
+    meta: dict | None = None,
+):
+    """dsh(DeepSeek Harness SDK)流式应答(监控 + 执行)。
+
+    对外产出:与 cc_stream 同契约 —— 文本增量(assistant/chunk 的 text-delta),
+    非 completed 的 finish_reason → RuntimeError("agent 执行失败: ...");
+    thinking/工具增量只进事件流,不改变产出。dsh 原生事件 1:1 投影为监控
+    事件流(turn/step/stop_reason 均取自主干事件,见 _project_dsh_event);
+    session/start|end 由本层合成(dsh 仅有 session/end-seed)。
+
+    options = 调用方组装的鸭子类型配置(仿 cc 的 options 透传):provider(缺省
+    "deepseek-official" 经 SDK 侧域)、model、cwd、session_root、cordis、env、
+    max_tokens、base_url、api_key 等,None 跳过(见 _dsh_options_fields);其中
+    **cordis 缺省回退内置隔离组合**(dsh_cordis_path,上层未提供即默认隔离;
+    显式提供则全权交上层)。
+
+    SDK run() 为同步阻塞:经 asyncio.to_thread 执行,on_notification 回调在线程
+    侧经 call_soon_threadsafe 泵入队列,本生成器逐条消费 —— 保持 asyncio 接口
+    形态不变。阻塞性:单次运行一 turn to_idle,无逐 prompt 取消(见 dsh 协议)。
+    """
+    from deepseek_harness import errors as _dsh_errors
+
+    run = _Run(
+        _session_id(session, session_ns, run_id, session_name), "dsh",
+        getattr(options, "model", None) or "",
+        label=session_name, run_id=run_id, meta=meta,
+    )
+    proj = _DshProj(run, prompt, _dsh_session_id(run.session))
+    fields = _dsh_options_fields(options)
+    fields.setdefault("cordis", dsh_cordis_path())  # 上层未提供 → 缺省隔离组合(见 dsh_cordis_path)
+    queue: asyncio.Queue = asyncio.Queue()  # 无界:1:1 于运行时事件流,永不阻塞发布侧
+    loop = asyncio.get_running_loop()
+
+    def pump(notif) -> None:  # 运行时线程回调:跨线程入队(loop 已关闭竞态静默丢)
+        with contextlib.suppress(RuntimeError):
+            loop.call_soon_threadsafe(queue.put_nowait, ("notif", notif))
+
+
+
+    async def _worker() -> None:
+        try:
+            result = await asyncio.to_thread(_dsh_worker, fields, prompt, proj.session_id, pump)
+            loop.call_soon_threadsafe(queue.put_nowait, ("done", result))
+        except Exception as exc:  # noqa: BLE001 —— 异常经队列送消费侧统一 error/finish
+            loop.call_soon_threadsafe(queue.put_nowait, ("exc", exc))
+
+    ok = False
+    try:
+        run.start(context=context, retry=retry, prologue=False)  # dsh 自带 turn/step 生命周期
+        task = asyncio.create_task(_worker())
+        try:
+            while True:
+                kind, item = await queue.get()
+                if kind == "notif":
+                    for delta in _project_dsh_event(run, proj, item):
+                        yield delta
+                elif kind == "exc":
+                    raise item
+                else:  # ("done", RunResult):run() 返回前所有通知已交付,无竞态
+                    if item.finish_reason != "completed":
+                        raise RuntimeError(f"agent 执行失败: {item.finish_reason}")
+                    ok = True
+                    break
+        finally:
+            if not task.done():
+                task.cancel()  # 消费者提前退场:executor 线程继续自然跑完(见 _dsh_worker)
+    except Exception as exc:
+        run.error(exc, _dsh_stage(exc, (_dsh_errors.SdkProtocolError, _dsh_errors.JsonRpcError)))
+        raise
+    finally:
+        run.finish(ok, epilogue=not proj.saw_turn_end)
+
+
+async def dsh_text(options, prompt: str, *, session: str | None = None,
+                   session_name: str | None = None, run_id: str | None = None,
+                   session_ns: str | None = None,
+                   context: list[dict] | None = None, retry: dict | None = None,
+                   meta: dict | None = None) -> str:
+    """dsh agent 整收应答(流式转整收,监控走与 dsh_stream 同一条路径)。"""
+    parts: list[str] = []
+    async for chunk in dsh_stream(options, prompt, session=session, session_name=session_name,
+                                  run_id=run_id, session_ns=session_ns,
+                                  context=context, retry=retry, meta=meta):
+        parts.append(chunk)
+    return "".join(parts)
+
+
+async def dsh_result(options, prompt: str, *, session: str | None = None,
+                     session_name: str | None = None, run_id: str | None = None,
+                     session_ns: str | None = None,
+                     context: list[dict] | None = None, retry: dict | None = None,
+                     meta: dict | None = None) -> str:
+    """dsh 非流式最终结果:失败(非 completed,兼 runtime 异常)或无结果 → RuntimeError
+    (与 cc_result 语义一致:dsh_stream 已对非 completed 抛错,此处仅补空结果检查)。"""
+    text = await dsh_text(options, prompt, session=session, session_name=session_name,
+                          run_id=run_id, session_ns=session_ns,
+                          context=context, retry=retry, meta=meta)
+    if not text:
+        raise RuntimeError("agent 未产出最终结果")
+    return text

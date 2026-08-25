@@ -9,6 +9,7 @@ dependencies = [
     "claude-agent-sdk>=0.2.142",
     "dash>=4.4.0",
     "dash-cytoscape>=1.0.2",
+    "deepseek-harness-sdk",
     "fastapi>=0.139.0",
     "flask",
     "graphifyy[chinese,leiden,openai,svg]",
@@ -54,6 +55,8 @@ select = [
 
 [tool.uv.sources]
 graphifyy = { path = "../graphify", editable = true }
+deepseek-harness-sdk = { path = "../deepseek-harness/python/sdk", editable = true }
+deepseek-harness-runtime-bin = { path = "../deepseek-harness/python/sdk-runtime", editable = true }
 
 [dependency-groups]
 dev = [

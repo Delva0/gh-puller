@@ -39,13 +39,14 @@ import xml.etree.ElementTree as ET
 from datetime import datetime
 from functools import partial
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Literal
 
 from claude_agent_sdk import ClaudeAgentOptions, create_sdk_mcp_server, tool
 from pydantic import BaseModel, ConfigDict, Field, computed_field, field_validator
 
 from . import envs, graphify
-from .agent import cc_stream, llm_complete, llm_stream
+from .agent import cc_stream, dsh_stream, llm_complete, llm_stream
 from .utils import (
     Repo,
     RepoType,
@@ -583,7 +584,7 @@ class WikiCacheData(BaseModel):
     repo: RepoInfo | None = None
     provider: str | None = None
     model: str | None = None
-    generator: str | None = None  # 生成模式快照(cc/llm);缓存命中时校验,防跨模式混用
+    generator: str | None = None  # 生成模式快照(cc/dsh/llm);缓存命中时校验,防跨模式混用
 
 
 class WikiTaskState(BaseModel):
@@ -787,6 +788,7 @@ def _agent_options(
     kwargs: dict[str, Any] = {
         "system_prompt": system_prompt,
         "include_partial_messages": True,
+        "setting_sources": [],  # 完全隔离本地 claude 配置(用户级 MCP/skills/hooks 不掺入 agent)
     }
     model_name = envs.CLAUDE_AGENT_MODEL or model or ""
     if model_name:
@@ -804,14 +806,61 @@ def _agent_options(
     return ClaudeAgentOptions(**kwargs)
 
 
+def _dsh_options(
+    system_prompt: str,
+    repo: Repo | None,
+    model: str | None = None,
+    *,
+    agent_output_dir: str | None = None,
+    agent_write_mode: bool = False,
+) -> SimpleNamespace:
+    """组装 dsh 选项(鸭子类型,适配器按 attr 取;与 cc 的 _agent_options 同构):
+
+    - 组合缺省在适配器层(dsh_stream 对未提供的 cordis 回退隔离默认组合;
+      graphify 工具经组合内置 mcp-client 装载,对 agent 为 mcp__graphify__query_graph,
+      见 _agent_note)—— 本层仅经 envs.DEEPWIKI_DSH_CORDIS 提供显式覆写
+      (上层给配置 = 全责,隔离与否由该配置保证);
+    - system_prompt 经 env.DSH_SYSTEM_PROMPT 注入组合 persona(cc 同构);
+    - model 优先级 envs.DSH_MODEL > 请求 model > 组合缺省(deepseek-v4-flash);
+    - cwd 固定仓库根(与 cc 同:防 agent 串到 gh-puller 工作区);
+    - 密钥/端点显式走 options.api_key/base_url(空则由 SDK 读进程环境)。
+    """
+    kwargs: dict[str, Any] = {
+        "provider": "deepseek-official",
+        "session_root": envs.DSH_SESSION_ROOT,
+        "runtime_cwd": envs.DSH_RUNTIME_CWD,  # .env 加载点越过任务 checkout(见 envs)
+        "env": {"DSH_SYSTEM_PROMPT": system_prompt},
+    }
+    if envs.DEEPWIKI_DSH_CORDIS:
+        kwargs["cordis"] = envs.DEEPWIKI_DSH_CORDIS
+    model_name = envs.DSH_MODEL or model or ""
+    if model_name:
+        kwargs["model"] = model_name
+    if repo is not None:
+        kwargs["cwd"] = os.path.abspath(repo.save_path)
+    if envs.DEEPSEEK_API_KEY:
+        kwargs["api_key"] = envs.DEEPSEEK_API_KEY
+    if envs.DEEPSEEK_BASE_URL:
+        kwargs["base_url"] = envs.DEEPSEEK_BASE_URL
+    return SimpleNamespace(**kwargs)
+
+
 async def _agent_stream(
     system_prompt: str, prompt: str, repo: Repo | None = None, model: str | None = None,
     label: str | None = None, *, run_id: str | None = None,
     context: list[dict] | None = None, retry: dict | None = None,
 ):
     """agent 流式应答:转发文本增量,语义与旧漏斗逐字节一致(见 agent.cc_stream);
-    label 作为监控会话名(chat:/codemap:/wiki: 前缀区分用途);run_id 关联任务级
-    会话组;context = 上下文注入/修改说明事件;retry = 重试元数据(见 events.py)。"""
+    envs.DEEPWIKI_GENERATOR == "dsh" 时走 dsh_stream(工具 = dsh 组合原生工具 +
+    graphify MCP,与 cc 工具桌面同构,装载见 _dsh_options);label 作为监控会话名
+    (chat:/codemap:/wiki: 前缀区分用途);run_id 关联任务级会话组;
+    context = 上下文注入/修改说明事件;retry = 重试元数据(见 events.py)。"""
+    if envs.DEEPWIKI_GENERATOR == "dsh":
+        options = _dsh_options(system_prompt, repo, model)
+        async for chunk in dsh_stream(options, prompt, session_name=label, run_id=run_id,
+                                      context=context, retry=retry):
+            yield chunk
+        return
     options = _agent_options(system_prompt, repo, model)
     async for chunk in cc_stream(options, prompt, session_name=label, run_id=run_id,
                                  context=context, retry=retry):
@@ -819,7 +868,19 @@ async def _agent_stream(
 
 
 def _agent_note() -> str:
-    """注入到 user 消息的指引段(供 agent 知道用 graphify_query 工具获取带行号的代码上下文)。"""
+    """注入到 user 消息的指引段(供 agent 知道用图工具获取带行号的代码上下文)。
+
+    dsh 后端的图工具名不同(组合经内置 mcp-client 装载 graphify,对 agent 为
+    mcp__graphify__query_graph;cc 为 graphify_query)—— 指引按后端切换,防
+    agent 找错工具名而放弃图语境。
+    """
+    if envs.DEEPWIKI_GENERATOR == "dsh":
+        return (
+            "<note>You may use the mcp__graphify__query_graph tool to inspect this "
+            "repository's code graph whenever you need code context or exact file/line "
+            "references for citations. "
+            "Its results mark sources as `Source: <file path> L<line number>`.</note>\n\n"
+        )
     return (
         "<note>You may use the graphify_query tool to inspect this repository's code graph "
         "whenever you need code context or exact file/line references for citations. "
@@ -849,12 +910,21 @@ async def _agent_write_file(
     产生以文件为准(流式文本仅作监控/错误检测),未产出文件即任务失败。"""
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)  # add_dirs 指向目录须先存在(agent Write 可直接落)
-    options = _agent_options(
-        system_prompt, repo, model,
-        agent_output_dir=str(out_path.parent), agent_write_mode=True,
-    )
-    async for _ in cc_stream(options, prompt, session_name=label, run_id=run_id,
-                             context=context, retry=retry):
+    if envs.DEEPWIKI_GENERATOR == "dsh":
+        options = _dsh_options(
+            system_prompt, repo, model,
+            agent_output_dir=str(out_path.parent), agent_write_mode=True,
+        )
+        runner = dsh_stream(options, prompt, session_name=label, run_id=run_id,
+                            context=context, retry=retry)
+    else:
+        options = _agent_options(
+            system_prompt, repo, model,
+            agent_output_dir=str(out_path.parent), agent_write_mode=True,
+        )
+        runner = cc_stream(options, prompt, session_name=label, run_id=run_id,
+                           context=context, retry=retry)
+    async for _ in runner:
         pass
     text = await asyncio.to_thread(out_path.read_text, encoding="utf-8")
     if not text.strip():
@@ -1534,14 +1604,14 @@ registry = WikiTaskRegistry(
 
 
 # ---------------------------------------------------------------------------
-# 双路包装类:llm 路与 cc(agent)路对外 API 的统一入口。
+# 双路包装类:llm 路与 agent(cc/dsh)路对外 API 的统一入口。
 # 分派:wiki 生成(结构/页面)按 envs.DEEPWIKI_GENERATOR 经 _wiki_pipeline() 选择;
-#       chat / codemap 同开关经 _service_pipeline()(双路均读 envs,不区分恒 agent)。
+#       chat / codemap 同开关经 _service_pipeline()(均读 envs,不区分恒 agent)。
 # 边界:语义属于单路生成协议的 helper(提示词组装/历史转写/检索上下文注入/
-# cc 交付件路径/llm 一次问答生成链)收进对应 pipeline 类为 self._xxx();
+# agent 交付件路径/llm 一次问答生成链)收进对应 pipeline 类为 self._xxx();
 # 共用构建件与低层支撑(共享提示词段、XML 解析/引用后处理、图索引、任务状态机、
 # agent SDK/llm 端点通道)保持模块级。类方法体内一律以模块全局名引用
-# cc_stream / llm_stream / llm_complete / envs.*,保证调用时动态解析
+# cc_stream / dsh_stream / llm_stream / llm_complete / envs.*,保证调用时动态解析
 # (测试 monkeypatch 与 envs 切换均生效,不得实例捕获或模块级快照)。
 # ---------------------------------------------------------------------------
 
@@ -2451,13 +2521,17 @@ IMPORTANT:
 
 
 def _wiki_pipeline() -> WikiPipeline:
-    """按 envs.DEEPWIKI_GENERATOR 选路;调用时读 envs(测试 monkeypatch 生效)。"""
-    return AgentWikiPipeline() if envs.DEEPWIKI_GENERATOR == "cc" else LlmWikiPipeline()
+    """按 envs.DEEPWIKI_GENERATOR 选路;调用时读 envs(测试 monkeypatch 生效)。
+
+    agent 类后段(cc/dsh)共用 AgentWikiPipeline —— 内部 _agent_stream/_agent_write_file
+    按开关分派到 cc_stream/dsh_stream,管线逻辑(结构/页面/缓存)后端无关。
+    """
+    return AgentWikiPipeline() if envs.DEEPWIKI_GENERATOR in ("cc", "dsh") else LlmWikiPipeline()
 
 
 def _service_pipeline() -> WikiPipeline:
     """chat/codemap 服务分派:与 wiki 同开关(envs.DEEPWIKI_GENERATOR),调用时读 envs(测试 monkeypatch 生效)。"""
-    return AgentWikiPipeline() if envs.DEEPWIKI_GENERATOR == "cc" else LlmWikiPipeline()
+    return AgentWikiPipeline() if envs.DEEPWIKI_GENERATOR in ("cc", "dsh") else LlmWikiPipeline()
 
 
 

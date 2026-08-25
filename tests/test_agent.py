@@ -462,6 +462,520 @@ async def test_cc_stream_error_semantics(monkeypatch, tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# dsh 适配器(DeepSeek Harness SDK):假模块注入 + 同步 to_thread(零 SDK/网络/token)
+# ---------------------------------------------------------------------------
+
+
+class _DshSdkProtocolError(Exception):
+    pass
+
+
+class _DshJsonRpcError(Exception):
+    pass
+
+
+class _FakeNotification:
+    """形似 dsh Notification 的假通知(dataclass:method/payload)。"""
+
+    def __init__(self, method, payload):
+        self.method = method
+        self.payload = payload
+
+
+class _FakeHarness:
+    """形似 DeepSeekHarness 的假 harness:run() 同步重放通知脚本后返回注入结果。"""
+
+    notifs: list = []
+    result: types.SimpleNamespace | None = None
+    raise_on_run: Exception | None = None
+    calls: list = []  # (kwargs, input, session_id)
+
+    def __init__(self, config=None, **kwargs):
+        self.kwargs = kwargs
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def run(self, input, *, session_id=None, on_notification=None):
+        type(self).calls.append((self.kwargs, input, session_id))
+        if type(self).raise_on_run is not None:
+            raise type(self).raise_on_run
+        for n in type(self).notifs:
+            on_notification(n)
+        return type(self).result
+
+
+def _dsh_note(evt_type, *, data=None, seq=0, surface_op=None, source_seqs=None,
+              session_id="sid"):
+    """dsh session.event 通知构造(fixture 形状:surfaceOp/sourceEventSeqs 在信封层)。"""
+    evt = {"type": evt_type, "seq": seq, "time": 0, "data": data or {}}
+    if surface_op is not None:
+        evt["surfaceOp"] = surface_op
+    if source_seqs is not None:
+        evt["sourceEventSeqs"] = source_seqs
+    return _FakeNotification("session.event", {"sessionId": session_id, "event": evt})
+
+
+def _dsh_chunk(ctype, **fields):
+    return {"type": ctype, **fields}
+
+
+def _dsh_options(**kw):
+    """dsh options 鸭子类型(provider 缺省 deepseek-official)。"""
+    return types.SimpleNamespace(provider="deepseek-official", model="m1",
+                                 session_root="/tmp/x", **kw)
+
+
+def _fake_dsh(monkeypatch, notifs, *, finish_reason="completed", final_response="hi好",
+              session_id="sid", sdk_raise=None):
+    """注入假 deepseek_harness(errors 子模块一并)并把 to_thread 同步化。
+
+    to_thread 同步化后泵路径原样执行(call_soon_threadsafe 按序落地):
+    确定性、零网络、零 SDK、零 token。
+    """
+    mod = types.ModuleType("deepseek_harness")
+    errors = types.ModuleType("deepseek_harness.errors")
+    errors.SdkProtocolError = _DshSdkProtocolError
+    errors.JsonRpcError = _DshJsonRpcError
+    mod.errors = errors
+    mod.DeepSeekHarness = _FakeHarness
+    mod.RunResult = types.SimpleNamespace
+    monkeypatch.setitem(sys.modules, "deepseek_harness", mod)
+    monkeypatch.setitem(sys.modules, "deepseek_harness.errors", errors)
+    _FakeHarness.notifs = notifs
+    _FakeHarness.result = types.SimpleNamespace(
+        session_id=session_id, final_response=final_response, finish_reason=finish_reason,
+        events=[], notifications=list(notifs), session_root=None)
+    _FakeHarness.raise_on_run = sdk_raise
+    _FakeHarness.calls = []
+
+    async def _to_thread_sync(fn, *a, **kw):
+        return fn(*a, **kw)
+
+    monkeypatch.setattr(asyncio, "to_thread", _to_thread_sync)
+
+
+@pytest.mark.asyncio
+async def test_dsh_stream_yields_and_projects_taxonomy(monkeypatch):
+    """dsh 流 → 文本增量逐字节一致 + 全事件投影(seq 稠密/usage 归一化/step 追踪)。"""
+    agent.configure(file=False, ws_urls=[], otel_urls=[])
+    got = []
+    sinks.ensure_bus().add(_recv(got))
+    sid = "0460e1e9-5155-4014-9054-a39986462b20"
+    notes = [
+        _dsh_note("turn/start", seq=0, session_id=sid, data={"turn": 1}),
+        _dsh_note("step/start", seq=1, session_id=sid, data={"turn": 1, "step": 1}),
+        _dsh_note("user/message", seq=2, session_id=sid, surface_op="append",
+                  data={"content": [{"type": "text", "text": "prompt"}],
+                        "source": {"kind": "user"}, "role": "user", "id": sid}),
+        _dsh_note("request/header", seq=3, session_id=sid,
+                  data={"header": {"config": {"provider": "deepseek-official", "model": "m1"},
+                                   "system": "sys", "tools": []},
+                        "reason": "initial"}),
+        _dsh_note("request/context", seq=4, session_id=sid,
+                  data={"provider": "deepseek-official", "model": "m1"}),
+        # 第 1 步:正文 + 思考增量
+        _dsh_note("assistant/chunk", seq=5, session_id=sid,
+                  data={"turn": 1, "step": 1, "chunk": _dsh_chunk("text-delta", index=0, text="hi")}),
+        _dsh_note("assistant/chunk", seq=6, session_id=sid,
+                  data={"turn": 1, "step": 1, "chunk": _dsh_chunk("reasoning-delta", index=1, text="想")}),
+        _dsh_note("assistant/chunk", seq=7, session_id=sid,
+                  data={"turn": 1, "step": 1, "chunk": _dsh_chunk("text-delta", index=0, text="好")}),
+        # 工具块:碎片增量 + block-end 完整 arguments → 块端合成 tool/call
+        _dsh_note("assistant/chunk", seq=8, session_id=sid,
+                  data={"turn": 1, "step": 1,
+                        "chunk": _dsh_chunk("tool-call-delta", index=2, id="t1",
+                                            name="graphify_query", argumentsDelta='{"q"')}),
+        _dsh_note("assistant/chunk", seq=9, session_id=sid,
+                  data={"turn": 1, "step": 1,
+                        "chunk": _dsh_chunk("tool-call-delta", index=2, id="t1",
+                                            argumentsDelta=': "x"}')}),
+        _dsh_note("assistant/chunk", seq=10, session_id=sid,
+                  data={"turn": 1, "step": 1,
+                        "chunk": _dsh_chunk("block-end", index=2,
+                                            block={"type": "tool-call", "id": "t1",
+                                                   "name": "graphify_query",
+                                                   "arguments": '{"q": "x"}'})}),
+        _dsh_note("assistant/chunk", seq=11, session_id=sid,
+                  data={"turn": 1, "step": 1,
+                        "chunk": _dsh_chunk("usage", usage={"inputTokens": 11, "outputTokens": 3,
+                                                            "cacheReadTokens": 2})}),
+        _dsh_note("assistant/chunk", seq=12, session_id=sid,
+                  data={"turn": 1, "step": 1, "chunk": _dsh_chunk("finish", reason={"kind": "tool-calls"})}),
+        # 整块消息 → 显式 tool/call(同 id,块端已合成 → 去重映射)→ tool/result
+        _dsh_note("assistant/message", seq=13, session_id=sid, surface_op="append",
+                  source_seqs=[5, 7],
+                  data={"turn": 1, "step": 1,
+                        "message": {"role": "assistant", "content": [{"type": "text", "text": "hi好"}]},
+                        "usage": {"inputTokens": 11, "outputTokens": 3, "cacheReadTokens": 2}}),
+        _dsh_note("tool/call", seq=14, session_id=sid,
+                  data={"turn": 1, "step": 1, "callId": "t1", "name": "graphify_query",
+                        "arguments": '{"q": "x"}'}),
+        _dsh_note("tool/result", seq=15, session_id=sid, source_seqs=[14],
+                  data={"turn": 1, "step": 1,
+                        "message": {"source": {"kind": "tool", "callId": "t1"}, "role": "user",
+                                    "content": [{"type": "tool-result", "toolCallId": "t1",
+                                                 "isError": False,
+                                                 "content": [{"type": "text", "text": "结果"}]}]}}),
+        _dsh_note("step/end", seq=16, session_id=sid, data={"turn": 1, "step": 1}),
+        _dsh_note("step/start", seq=17, session_id=sid, data={"turn": 1, "step": 2}),
+        _dsh_note("assistant/chunk", seq=18, session_id=sid,
+                  data={"turn": 1, "step": 2, "chunk": _dsh_chunk("text-delta", index=0, text="!")}),
+        _dsh_note("assistant/chunk", seq=19, session_id=sid,
+                  data={"turn": 1, "step": 2, "chunk": _dsh_chunk("finish", reason={"kind": "stop"})}),
+        _dsh_note("assistant/message", seq=20, session_id=sid, surface_op="append",
+                  source_seqs=[18],
+                  data={"turn": 1, "step": 2,
+                        "message": {"role": "assistant", "content": [{"type": "text", "text": "hi好!"}]}}),
+        _dsh_note("step/end", seq=21, session_id=sid, data={"turn": 1, "step": 2}),
+        _dsh_note("turn/end", seq=22, session_id=sid, data={"turn": 1, "reason": {"kind": "completed"}}),
+    ]
+    _fake_dsh(monkeypatch, notes, finish_reason="completed", final_response="hi好!", session_id=sid)
+    chunks = [c async for c in agent.dsh_stream(_dsh_options(), "prompt",
+                                                session=f"deepwiki:wiki/{sid}",
+                                                session_name="wiki:structure")]
+    assert "".join(chunks) == "hi好!"
+    await asyncio.sleep(0.05)
+    types_ = [g["type"] for g in got]
+    assert types_[0] == "session/start" and got[0]["provider"] == "dsh"
+    assert types_[:4] == ["session/start", "turn/start", "step/start", "user/message"]
+    assert [g["seq"] for g in got] == list(range(len(got)))  # 投影流 seq 稠密
+    # user/message 重塑:扁平化 → gh 嵌套 message + source
+    um = next(g for g in got if g["type"] == "user/message")
+    assert um["data"]["message"] == {"role": "user", "content": [{"type": "text", "text": "prompt"}]}
+    assert um["data"]["source"] == {"kind": "user"}
+    # 工具:块端 tool_input 增量与合成 tool/call(显式同 id 事件去重 → 恰一条)
+    tool_inputs = [g for g in got if g["type"] == "assistant/chunk"
+                   and g["data"]["chunk"].get("type") == "tool_input"]
+    assert [t["data"]["chunk"]["partial_json"] for t in tool_inputs] == ['{"q"', ': "x"}']
+    tc = [g for g in got if g["type"] == "tool/call"]
+    assert len(tc) == 1 and tc[0]["data"]["arguments"] == '{"q": "x"}'
+    assert tc[0]["data"]["name"] == "graphify_query" and tc[0]["data"]["step"] == 1
+    # tool/result:卡片改名 + sourceSeqs 溯源到合成事件
+    tr = next(g for g in got if g["type"] == "tool/result")
+    assert tr["data"]["message"]["content"][0] == {"type": "tool_result", "tool_use_id": "t1",
+                                                   "content": "结果", "is_error": False}
+    assert tr["data"]["sourceSeqs"] == [tc[0]["seq"]]
+    # assistant/message:step1 usage 归一化 + stop_reason(finish chunk)
+    am1 = next(g for g in got if g["type"] == "assistant/message" and g["data"]["step"] == 1)
+    assert am1["data"]["usage"] == {"input_tokens": 11, "output_tokens": 3,
+                                    "cache_read_input_tokens": 2}
+    assert am1["data"]["stop_reason"] == "tool-calls"
+    am2 = next(g for g in got if g["type"] == "assistant/message" and g["data"]["step"] == 2)
+    assert am2["data"]["stop_reason"] == "stop" and "usage" not in am2["data"]
+    # step 追踪 dsh 值:第 2 步增量归属 step 2
+    assert [g["data"]["step"] for g in got if g["type"] == "assistant/chunk"][-1] == 2
+    # session/end 汇总:completed + usage 归一到末条
+    end = got[-1]
+    assert end["type"] == "session/end" and end["data"]["state"] == "completed"
+    assert end["data"]["usage"] == {"input_tokens": 11, "output_tokens": 3,
+                                    "cache_read_input_tokens": 2}
+    assert end["data"]["stop_reason"] == "stop"
+
+
+@pytest.mark.asyncio
+async def test_dsh_stream_source_seqs_mapped(monkeypatch):
+    """跳过的插件事件使 dsh seq 稀疏:sourceSeqs 映射为 gh seq 而非裸 dsh seq。"""
+    agent.configure(file=False, ws_urls=[], otel_urls=[])
+    got = []
+    sinks.ensure_bus().add(_recv(got))
+    sid = "sparse"
+    notes = [
+        _dsh_note("agent/inbox/spliced", seq=0, session_id=sid, data={"x": 1}),  # 跳过
+        _dsh_note("turn/start", seq=1, session_id=sid, data={"turn": 1}),
+        _dsh_note("step/start", seq=2, session_id=sid, data={"turn": 1, "step": 1}),
+        _dsh_note("permission/preset", seq=3, session_id=sid, data={"mode": "deny"}),  # 跳过
+        _dsh_note("user/message", seq=4, session_id=sid, surface_op="append",
+                  data={"content": [{"type": "text", "text": "q"}], "source": {"kind": "user"},
+                        "role": "user", "id": sid}),
+        _dsh_note("assistant/chunk", seq=5, session_id=sid,
+                  data={"turn": 1, "step": 1, "chunk": _dsh_chunk("text-delta", index=0, text="A")}),
+        _dsh_note("session/title", seq=6, session_id=sid, data={"title": "x"}),  # 跳过
+        _dsh_note("assistant/chunk", seq=7, session_id=sid,
+                  data={"turn": 1, "step": 1, "chunk": _dsh_chunk("text-delta", index=0, text="B")}),
+        _dsh_note("assistant/message", seq=8, session_id=sid, surface_op="append",
+                  source_seqs=[5, 7],
+                  data={"turn": 1, "step": 1,
+                        "message": {"role": "assistant", "content": [{"type": "text", "text": "AB"}]}}),
+        _dsh_note("step/end", seq=9, session_id=sid, data={"turn": 1, "step": 1}),
+        _dsh_note("turn/end", seq=10, session_id=sid, data={"turn": 1, "reason": {"kind": "completed"}}),
+    ]
+    _fake_dsh(monkeypatch, notes, session_id=sid)
+    assert await agent.dsh_text(_dsh_options(), "q", session=f"deepwiki:wiki/{sid}") == "AB"
+    await asyncio.sleep(0.05)
+    chunks = [g for g in got if g["type"] == "assistant/chunk"]
+    assert [g["seq"] for g in chunks] == [4, 5]  # gh seq(dsh 5/7 → 投影后 4/5)
+    am = next(g for g in got if g["type"] == "assistant/message")
+    assert am["data"]["sourceSeqs"] == [4, 5]
+    assert 6 not in am["data"]["sourceSeqs"]  # 无裸 dsh seq
+
+
+@pytest.mark.asyncio
+async def test_dsh_stream_skips_non_taxonomy_events(monkeypatch):
+    """插件/生命周期事件不投影不报错;异 sessionId 的子代理通知丢弃。"""
+    agent.configure(file=False, ws_urls=[], otel_urls=[])
+    got = []
+    sinks.ensure_bus().add(_recv(got))
+    sid = "skips"
+    notes = [
+        _dsh_note("session/end-seed", seq=0, session_id=sid, data={}),
+        _dsh_note("approval/asked", seq=1, session_id=sid, data={"a": 1}),
+        _dsh_note("sandbox/mode", seq=2, session_id=sid, data={"mode": "a"}),
+        _dsh_note("todo/write", seq=3, session_id=sid, data={"todos": []}),
+        _dsh_note("turn/start", seq=4, session_id=sid, data={"turn": 1}),
+        _dsh_note("step/start", seq=5, session_id=sid, data={"turn": 1, "step": 1}),
+        # 子代理会话泄漏(SDK 在过滤前回调全部会话通知):sessionId 不同 → 丢弃
+        _dsh_note("assistant/chunk", seq=6, session_id="other",
+                  data={"turn": 1, "step": 1, "chunk": _dsh_chunk("text-delta", index=0, text="leak")}),
+        _dsh_note("user/message", seq=7, session_id=sid, surface_op="append",
+                  data={"content": [{"type": "text", "text": "q"}], "source": {"kind": "subagent"},
+                        "role": "user", "id": sid}),
+        _dsh_note("assistant/chunk", seq=8, session_id=sid,
+                  data={"turn": 1, "step": 1, "chunk": _dsh_chunk("text-delta", index=0, text="ok")}),
+        _dsh_note("assistant/message", seq=9, session_id=sid, surface_op="append",
+                  data={"turn": 1, "step": 1,
+                        "message": {"role": "assistant", "content": [{"type": "text", "text": "ok"}]}}),
+        _dsh_note("step/end", seq=10, session_id=sid, data={"turn": 1, "step": 1}),
+        _dsh_note("turn/end", seq=11, session_id=sid, data={"turn": 1, "reason": {"kind": "completed"}}),
+    ]
+    _fake_dsh(monkeypatch, notes, session_id=sid)
+    assert await agent.dsh_text(_dsh_options(), "q", session=f"deepwiki:wiki/{sid}") == "ok"
+    await asyncio.sleep(0.05)
+    assert set(g["type"] for g in got) <= set(agent.TAXONOMY)  # 无 ValueError,只出 TAXONOMY
+    texts = [g["data"]["chunk"].get("text") for g in got
+             if g["type"] == "assistant/chunk" and g["data"]["chunk"].get("type") == "text"]
+    assert texts == ["ok"]
+
+
+@pytest.mark.asyncio
+async def test_dsh_stream_tool_result_reshaped(monkeypatch):
+    """tool/result:卡片改名(文本块拼接全量)、data.error 透传、name 来自块端工具名。"""
+    agent.configure(file=False, ws_urls=[], otel_urls=[])
+    got = []
+    sinks.ensure_bus().add(_recv(got))
+    sid = "toolr"
+    notes = [
+        _dsh_note("turn/start", seq=0, session_id=sid, data={"turn": 1}),
+        _dsh_note("step/start", seq=1, session_id=sid, data={"turn": 1, "step": 1}),
+        _dsh_note("user/message", seq=2, session_id=sid, surface_op="append",
+                  data={"content": [{"type": "text", "text": "q"}], "source": {"kind": "user"},
+                        "role": "user", "id": sid}),
+        _dsh_note("assistant/chunk", seq=3, session_id=sid,
+                  data={"turn": 1, "step": 1,
+                        "chunk": _dsh_chunk("block-end", index=0,
+                                            block={"type": "tool-call", "id": "t9", "name": "lookup",
+                                                   "arguments": '{"k": "v"}'})}),
+        _dsh_note("tool/result", seq=4, session_id=sid, source_seqs=[3],
+                  data={"turn": 1, "step": 1,
+                        "error": {"name": "GoalError", "code": "GOAL_NOT_FOUND"},
+                        "message": {"source": {"kind": "tool", "callId": "t9"}, "role": "user",
+                                    "content": [{"type": "tool-result", "toolCallId": "t9",
+                                                 "isError": True,
+                                                 "content": [{"type": "text", "text": "第一段"},
+                                                             {"type": "text", "text": "第二段"}]}]}}),
+        _dsh_note("step/end", seq=5, session_id=sid, data={"turn": 1, "step": 1}),
+        _dsh_note("turn/end", seq=6, session_id=sid, data={"turn": 1, "reason": {"kind": "completed"}}),
+    ]
+    _fake_dsh(monkeypatch, notes, session_id=sid, final_response="")
+    await agent.dsh_text(_dsh_options(), "q", session=f"deepwiki:wiki/{sid}")
+    await asyncio.sleep(0.05)
+    tr = next(g for g in got if g["type"] == "tool/result")
+    assert tr["data"]["message"]["content"][0] == {"type": "tool_result", "tool_use_id": "t9",
+                                                   "content": "第一段第二段", "is_error": True}
+    assert tr["data"]["error"] == {"name": "GoalError", "code": "GOAL_NOT_FOUND"}
+    assert tr["data"]["name"] == "lookup"  # 无独立 tool/call 事件 → 块端工具名
+    assert tr["data"]["is_error"] is True
+
+
+@pytest.mark.asyncio
+async def test_dsh_stream_reasoning_delta_is_thinking_chunk(monkeypatch):
+    """reasoning-delta:不产出文本,只发 thinking chunk(与 cc 漏斗一致)。"""
+    agent.configure(file=False, ws_urls=[], otel_urls=[])
+    got = []
+    sinks.ensure_bus().add(_recv(got))
+    sid = "think"
+    notes = [
+        _dsh_note("turn/start", seq=0, session_id=sid, data={"turn": 1}),
+        _dsh_note("step/start", seq=1, session_id=sid, data={"turn": 1, "step": 1}),
+        _dsh_note("user/message", seq=2, session_id=sid, surface_op="append",
+                  data={"content": [{"type": "text", "text": "q"}], "source": {"kind": "user"},
+                        "role": "user", "id": sid}),
+        _dsh_note("assistant/chunk", seq=3, session_id=sid,
+                  data={"turn": 1, "step": 1, "chunk": _dsh_chunk("reasoning-delta", index=0, text="深")}),
+        _dsh_note("assistant/chunk", seq=4, session_id=sid,
+                  data={"turn": 1, "step": 1, "chunk": _dsh_chunk("text-delta", index=1, text="回答")}),
+        _dsh_note("assistant/message", seq=5, session_id=sid, surface_op="append",
+                  data={"turn": 1, "step": 1,
+                        "message": {"role": "assistant", "content": [{"type": "text", "text": "回答"}]}}),
+        _dsh_note("step/end", seq=6, session_id=sid, data={"turn": 1, "step": 1}),
+        _dsh_note("turn/end", seq=7, session_id=sid, data={"turn": 1, "reason": {"kind": "completed"}}),
+    ]
+    _fake_dsh(monkeypatch, notes, session_id=sid)
+    assert await agent.dsh_text(_dsh_options(), "q", session=f"deepwiki:wiki/{sid}") == "回答"
+    await asyncio.sleep(0.05)
+    th = next(g for g in got if g["type"] == "assistant/chunk"
+              and g["data"]["chunk"].get("type") == "thinking")
+    assert th["data"]["chunk"]["text"] == "深"
+
+
+@pytest.mark.asyncio
+async def test_dsh_stream_non_completed_reason_raises(monkeypatch):
+    """finish_reason 非 completed → RuntimeError(cc 同文案);turn/end 恰一条(不双发)。"""
+    agent.configure(file=False, ws_urls=[], otel_urls=[])
+    got = []
+    sinks.ensure_bus().add(_recv(got))
+    sid = "maxt"
+    notes = [
+        _dsh_note("turn/start", seq=0, session_id=sid, data={"turn": 1}),
+        _dsh_note("step/start", seq=1, session_id=sid, data={"turn": 1, "step": 1}),
+        _dsh_note("user/message", seq=2, session_id=sid, surface_op="append",
+                  data={"content": [{"type": "text", "text": "q"}], "source": {"kind": "user"},
+                        "role": "user", "id": sid}),
+        _dsh_note("assistant/chunk", seq=3, session_id=sid,
+                  data={"turn": 1, "step": 1, "chunk": _dsh_chunk("text-delta", index=0, text="部分")}),
+        _dsh_note("step/end", seq=4, session_id=sid, data={"turn": 1, "step": 1}),
+        _dsh_note("turn/end", seq=5, session_id=sid,
+                  data={"turn": 1, "reason": {"kind": "max-tokens"}}),
+    ]
+    _fake_dsh(monkeypatch, notes, finish_reason="max-tokens", final_response="部分", session_id=sid)
+    with pytest.raises(RuntimeError, match="agent 执行失败: max-tokens"):
+        async for _ in agent.dsh_stream(_dsh_options(), "q", session=f"deepwiki:wiki/{sid}"):
+            pass
+    await asyncio.sleep(0.05)
+    assert [g["type"] for g in got].count("turn/end") == 1  # dsh 已转发 → 不合成(epilogue=False)
+    end = got[-1]
+    assert end["type"] == "session/end" and end["data"]["state"] == "aborted"
+    assert end["data"]["reason"] == "agent 执行失败: max-tokens"  # str(exc) 无前缀(cc 同规)
+    assert any(g["type"] == "error" and g["data"]["stage"] == "run" for g in got)
+
+
+@pytest.mark.asyncio
+async def test_dsh_stream_sdk_protocol_error_stage_parse(monkeypatch):
+    """SDK 协议错误:原样重抛、error 事件 stage=parse;无 dsh turn/end → 合成终局。"""
+    agent.configure(file=False, ws_urls=[], otel_urls=[])
+    got = []
+    sinks.ensure_bus().add(_recv(got))
+    sid = "proto"
+    notes = [
+        _dsh_note("turn/start", seq=0, session_id=sid, data={"turn": 1}),
+        _dsh_note("step/start", seq=1, session_id=sid, data={"turn": 1, "step": 1}),
+    ]
+    _fake_dsh(monkeypatch, notes, session_id=sid, sdk_raise=_DshSdkProtocolError("boom"))
+    with pytest.raises(_DshSdkProtocolError, match="boom"):
+        await agent.dsh_text(_dsh_options(), "q", session=f"deepwiki:wiki/{sid}")
+    await asyncio.sleep(0.05)
+    err = next(g for g in got if g["type"] == "error")
+    assert err["data"]["stage"] == "parse"
+    assert err["data"]["exc_type"] == "_DshSdkProtocolError"
+    assert [g["type"] for g in got].count("turn/end") == 1  # 崩溃路径 epilogue 合成
+    assert got[-1]["type"] == "session/end" and got[-1]["data"]["state"] == "aborted"
+
+
+@pytest.mark.asyncio
+async def test_dsh_result_empty_final_response_raises(monkeypatch):
+    """completed 但无最终文本 → dsh_result RuntimeError(cc_result 同文案)。"""
+    agent.configure(file=False, ws_urls=[], otel_urls=[])
+    sid = "empty"
+    notes = [
+        _dsh_note("turn/start", seq=0, session_id=sid, data={"turn": 1}),
+        _dsh_note("step/start", seq=1, session_id=sid, data={"turn": 1, "step": 1}),
+        _dsh_note("user/message", seq=2, session_id=sid, surface_op="append",
+                  data={"content": [{"type": "text", "text": "q"}], "source": {"kind": "user"},
+                        "role": "user", "id": sid}),
+        _dsh_note("step/end", seq=3, session_id=sid, data={"turn": 1, "step": 1}),
+        _dsh_note("turn/end", seq=4, session_id=sid, data={"turn": 1, "reason": {"kind": "completed"}}),
+    ]
+    _fake_dsh(monkeypatch, notes, finish_reason="completed", final_response="", session_id=sid)
+    with pytest.raises(RuntimeError, match="agent 未产出最终结果"):
+        await agent.dsh_result(_dsh_options(), "q", session=f"deepwiki:wiki/{sid}")
+
+
+@pytest.mark.asyncio
+async def test_dsh_harness_fields_and_session_id(monkeypatch):
+    """options → DeepSeekHarness kwargs(None 跳过 → SDK 缺省);gh session → dsh id 取尾段。"""
+    agent.configure(file=False, ws_urls=[], otel_urls=[])
+    sid = "0460e1e9-5155-4014-9054-a39986462b20"
+    notes = [
+        _dsh_note("turn/start", seq=0, session_id=sid, data={"turn": 1}),
+        _dsh_note("step/start", seq=1, session_id=sid, data={"turn": 1, "step": 1}),
+        _dsh_note("user/message", seq=2, session_id=sid, surface_op="append",
+                  data={"content": [{"type": "text", "text": "job"}], "source": {"kind": "user"},
+                        "role": "user", "id": sid}),
+        _dsh_note("assistant/chunk", seq=3, session_id=sid,
+                  data={"turn": 1, "step": 1, "chunk": _dsh_chunk("text-delta", index=0, text="hi好")}),
+        _dsh_note("turn/end", seq=4, session_id=sid, data={"turn": 1, "reason": {"kind": "completed"}}),
+    ]
+    _fake_dsh(monkeypatch, notes, session_id=sid)
+    options = types.SimpleNamespace(provider="deepseek-official", model="m1", cwd="/repo",
+                                    session_root="/dsh-sessions", env={"A": "1"},
+                                    shutdown_timeout_seconds=None)
+    assert await agent.dsh_text(options, "job", session=f"judge:llm/{sid}") == "hi好"
+    kwargs, input, session_id = _FakeHarness.calls[0]
+    assert kwargs == {"provider": "deepseek-official", "model": "m1", "cwd": "/repo",
+                      "session_root": "/dsh-sessions", "env": {"A": "1"},
+                      "cordis": agent.dsh_cordis_path()}  # None 跳过;cordis 未设 → 缺省隔离组合
+    assert session_id == sid and input == "job"
+
+
+@pytest.mark.asyncio
+async def test_run_epilogue_and_prologue_preserve_cc_defaults():
+    """回归:start/finish 缺省行为(合成 turn/step 生命周期)零变化;双 False 只留封套端点。"""
+    agent.configure(file=False, ws_urls=[], otel_urls=[])
+    got = []
+    sinks.ensure_bus().add(_recv(got))
+    run = _Run("s1", "claude", "", label="t")
+    run.start()
+    run.finish(True)
+    await asyncio.sleep(0.05)
+    assert [g["type"] for g in got] == ["session/start", "turn/start", "step/start",
+                                        "step/end", "turn/end", "session/end"]
+    got.clear()
+    run2 = _Run("s2", "dsh", "", label="t")
+    run2.start(prologue=False)
+    run2.finish(True, epilogue=False)
+    await asyncio.sleep(0.05)
+    assert [g["type"] for g in got] == ["session/start", "session/end"]
+
+
+def test_normalize_usage_accepts_camel_case():
+    """dsh TokenUsage(camelCase)→ gh 键;reasoningTokens 等额外键忽略。"""
+    u = {"inputTokens": 1, "outputTokens": 2, "cacheReadTokens": 3, "reasoningTokens": 9}
+    assert _normalize_usage(u) == {"input_tokens": 1, "output_tokens": 2,
+                                   "cache_read_input_tokens": 3}
+
+
+@pytest.mark.asyncio
+async def test_dsh_stream_user_message_fallback(monkeypatch):
+    """流缺 user/message:首个 assistant 事件前合成 prompt 消息(可折叠、不预发重复)。"""
+    agent.configure(file=False, ws_urls=[], otel_urls=[])
+    got = []
+    sinks.ensure_bus().add(_recv(got))
+    sid = "nouser"
+    notes = [
+        _dsh_note("turn/start", seq=0, session_id=sid, data={"turn": 1}),
+        _dsh_note("step/start", seq=1, session_id=sid, data={"turn": 1, "step": 1}),
+        _dsh_note("assistant/chunk", seq=2, session_id=sid,
+                  data={"turn": 1, "step": 1, "chunk": _dsh_chunk("text-delta", index=0, text="a")}),
+        _dsh_note("assistant/message", seq=3, session_id=sid, surface_op="append",
+                  data={"turn": 1, "step": 1,
+                        "message": {"role": "assistant", "content": [{"type": "text", "text": "a"}]}}),
+        _dsh_note("step/end", seq=4, session_id=sid, data={"turn": 1, "step": 1}),
+        _dsh_note("turn/end", seq=5, session_id=sid, data={"turn": 1, "reason": {"kind": "completed"}}),
+    ]
+    _fake_dsh(monkeypatch, notes, session_id=sid)
+    assert await agent.dsh_text(_dsh_options(), "prompt", session=f"deepwiki:wiki/{sid}") == "a"
+    await asyncio.sleep(0.05)
+    ums = [g for g in got if g["type"] == "user/message"]
+    assert len(ums) == 1
+    assert ums[0]["data"]["message"]["content"][0]["text"] == "prompt"
+    chunk_seq = next(g["seq"] for g in got if g["type"] == "assistant/chunk")
+    assert ums[0]["seq"] < chunk_seq  # 合成于首个 assistant 增量之前
+
+
+# ---------------------------------------------------------------------------
 # WsSink 跨进程契约(仅转发原始事件;聚合只发生在消费端)
 # ---------------------------------------------------------------------------
 

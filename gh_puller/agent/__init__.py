@@ -6,6 +6,9 @@
   ResultMessage.is_error → RuntimeError("agent 执行失败: ...") —— 与 deepwiki
   原 `_agent_stream` 漏斗逐字节一致;thinking/工具增量只进监控事件流,不改变产出。
 - llm_complete / llm_stream(adapters.py):OpenAI 兼容端点(httpx);异常原样抛,重试留给调用方。
+- dsh_stream / dsh_text / dsh_result(adapters.py):DeepSeek Harness(SDK)调用。
+  dsh 原生事件 1:1 投影为监控事件流;非 completed 的 finish_reason →
+  RuntimeError("agent 执行失败: ...")(与 cc is_error 语义对齐)。
 - configure / ensure_bus / EventBus / FileSink / WsSink(sinks.py):监控运行时重配、
   惰性构建总线与文件/WS 观测通道(AGENT_MONITOR_DIR / AGENT_MONITOR_WEBUI_URL,
   逗号分隔多地址,每地址一个 sink 实例;OtelSink 亦在 sinks.py,经
@@ -20,7 +23,17 @@ put_nowait 到每 sink 的 asyncio.Queue,永不阻塞调用)→ sink worker 消�
 须自行经 loop.call_soon_threadsafe 转发。
 """
 
-from .adapters import cc_result, cc_stream, cc_text, llm_complete, llm_stream
+from .adapters import (
+                       cc_result,
+                       cc_stream,
+                       cc_text,
+                       dsh_cordis_path,
+                       dsh_result,
+                       dsh_stream,
+                       dsh_text,
+                       llm_complete,
+                       llm_stream,
+)
 from .events import LOG_TYPES, SURFACE_TYPES, TAXONOMY, new_event, truncate, type_of
 from .sinks import EventBus, FileSink, WsSink, configure, ensure_bus
 
@@ -39,6 +52,10 @@ __all__ = [
     "cc_stream",
     "cc_text",
     "cc_result",
+    "dsh_stream",
+    "dsh_text",
+    "dsh_result",
+    "dsh_cordis_path",
     "llm_complete",
     "llm_stream",
 ]

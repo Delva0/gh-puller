@@ -237,6 +237,97 @@ async def test_agent_text_through_cc_stream(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_agent_text_through_dsh_stream(monkeypatch):
+    """dsh 后端镜像 cc 的迁移冒烟:deepwiki.agent 调用归一化为 agent.dsh_stream
+    (label/run_id/context 透传);options 由 _dsh_options 组装(隔离 + 图 MCP 组合)。"""
+    monkeypatch.setattr(deepwiki.envs, "DEEPWIKI_GENERATOR", "dsh")
+    monkeypatch.setattr(deepwiki.envs, "DEEPWIKI_DSH_CORDIS", "")
+    calls = []
+
+    async def fake_dsh_stream(options, prompt, *, session=None, session_name=None, run_id=None,
+                              context=None, retry=None, meta=None):
+        calls.append((options, session_name, prompt, run_id, context))
+        yield "a"
+        yield "b"
+
+    monkeypatch.setattr(deepwiki, "dsh_stream", fake_dsh_stream)
+    ctx = [{"type": "context/inject", "data": {"text": "n"}}]
+    out = await deepwiki._agent_text("sys", "query", label="wiki:structure", run_id="r1", context=ctx)
+    assert out == "ab"
+    options, session_name, prompt, run_id, ctx_got = calls[0]
+    assert (session_name, prompt, run_id, ctx_got) == ("wiki:structure", "query", "r1", ctx)
+    # 组装面:provider 固定路由、system_prompt 经 env 注入;cordis 未设 → 适配器层
+    # 缺省回退隔离组合(dsh_stream 的 fields.setdefault,见 adapters.dsh_cordis_path)
+    assert options.provider == "deepseek-official"
+    assert options.env == {"DSH_SYSTEM_PROMPT": "sys"}
+    assert not hasattr(options, "cordis")
+
+
+def test_dsh_options_config(monkeypatch, tmp_path):
+    """_dsh_options 与 cc 同构:cwd 固定仓库根,runtime_cwd 越过 checkout(.env 加载点);
+    model 优先级 envs.DSH_MODEL > 请求 model;密钥/端点显式透传。"""
+    monkeypatch.setattr(deepwiki.envs, "DSH_MODEL", "")
+    monkeypatch.setattr(deepwiki.envs, "DEEPSEEK_API_KEY", "k")
+    monkeypatch.setattr(deepwiki.envs, "DEEPSEEK_BASE_URL", "http://mock/v1")
+    repo = Repo(str(tmp_path), "local")
+    opts = deepwiki._dsh_options("sys", repo, model="m")
+    assert opts.cwd == str(tmp_path)
+    assert opts.model == "m"
+    assert opts.api_key == "k" and opts.base_url == "http://mock/v1"
+    assert opts.session_root.endswith("dsh-sessions")
+    assert "dsh-runtime" in opts.runtime_cwd  # 与任务 checkout 隔离(见 envs.DSH_RUNTIME_CWD)
+    assert not hasattr(opts, "cordis")  # 默认不传 → 适配器缺省隔离组合
+    opts2 = deepwiki._dsh_options("sys", None, model=None)
+    assert not hasattr(opts2, "cwd")  # repo 空:不固定 cwd(走进程缺省)
+    assert not hasattr(opts2, "model")  # 缺省交给组合(deepseek-v4-flash)
+    # 显式覆写:envs.DEEPWIKI_DSH_CORDIS 提供即传递(全责在上层组合)
+    monkeypatch.setattr(deepwiki.envs, "DEEPWIKI_DSH_CORDIS", "/custom/cordis.yml")
+    assert deepwiki._dsh_options("sys", None).cordis == "/custom/cordis.yml"
+
+
+def test_dsh_cordis_isolation_and_graphify():
+    """内置组合 = 完全隔离(逐项关断本地/用户级配置)+ 显式装载 graphify MCP。
+
+    与 cc 的 setting_sources=[] 同语义:workspaceContext(本地 AGENTS.md 链)/
+    skills(用户/项目/捆绑技能)关断;graphify 仅经单服务器 mcp-client 行显式装载。
+    """
+    from gh_puller.agent import dsh_cordis_path
+
+    text = Path(dsh_cordis_path()).read_text(encoding="utf-8")
+    assert "workspaceContext: false" in text
+    assert "includeHarnessIdentity: false" in text
+    assert "includeRuntimeContext: false" in text
+    assert "toolBash: false" in text and "toolJobs: false" in text
+    assert "goals: false" in text
+    assert "- id: mcp-graphify" in text
+    assert "serverName: graphify" in text
+    assert "-m" in text and "graphify.serve" in text
+
+
+def test_wiki_pipeline_dsh_uses_agent(monkeypatch):
+    """分派:dsh 与 cc 同为 agent 路(AgentWikiPipeline);llm 路不受扰。"""
+    monkeypatch.setattr(deepwiki.envs, "DEEPWIKI_GENERATOR", "dsh")
+    assert isinstance(deepwiki._wiki_pipeline(), deepwiki.AgentWikiPipeline)
+    assert isinstance(deepwiki._service_pipeline(), deepwiki.AgentWikiPipeline)
+
+
+def test_agent_note_tool_name_by_generator(monkeypatch):
+    """图工具指引按后端切换(cc 的 graphify_query / dsh 的 mcp__graphify__query_graph)。"""
+    monkeypatch.setattr(deepwiki.envs, "DEEPWIKI_GENERATOR", "cc")
+    assert "graphify_query" in deepwiki._agent_note()
+    assert "mcp__graphify__query_graph" not in deepwiki._agent_note()
+    monkeypatch.setattr(deepwiki.envs, "DEEPWIKI_GENERATOR", "dsh")
+    assert "mcp__graphify__query_graph" in deepwiki._agent_note()
+    assert "graphify_query" not in deepwiki._agent_note()
+
+
+def test_agent_options_cc_setting_sources_isolated():
+    """cc 完全隔离本地 claude 配置(setting_sources=[]):用户级 MCP/skills/hooks 不掺入 agent。"""
+    opts = deepwiki._agent_options("sys", None)
+    assert opts.setting_sources == []
+
+
+@pytest.mark.asyncio
 async def test_chat_stream_context_events(monkeypatch):
     """chat 历史裁剪 → context/modify(trim);agent 注记 → context/inject;run_id 关联会话组。"""
     captured = {}

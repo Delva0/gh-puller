@@ -12,6 +12,17 @@ import os
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 CLAUDE_AGENT_MODEL = os.environ.get("CLAUDE_AGENT_MODEL", "")  # 空 → SDK 缺省模型
 
+# ---- dsh(DeepSeek Harness)agent:SDK 凭证缝读 DEEPSEEK_API_KEY(与 ANTHROPIC 同法) ----
+DSH_MODEL = os.environ.get("DSH_MODEL", "")  # 空 → dsh 组合缺省(deepseek-v4-flash)
+DSH_SESSION_ROOT = os.path.expanduser(os.environ.get("DSH_SESSION_ROOT", "~/.gh-puller/dsh-sessions"))
+# runtime 进程 cwd(也是它读取 .env 的加载点):必须远离任务 checkout —— 仓库自带
+# .env(可含 DEEPSEEK_*/其它字面键)会注入子进程(隔离链上唯一真实泄漏口,runtime_cwd
+# 缺省 = 任务仓库 cwd)。cc 路径无此面(SDK 不做 cwd .env 加载)。
+DSH_RUNTIME_CWD = os.path.expanduser(os.environ.get("DSH_RUNTIME_CWD", "~/.gh-puller/dsh-runtime"))
+DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")  # 显式走 options.api_key;空由 SDK 读进程环境
+DEEPSEEK_BASE_URL = os.environ.get("DEEPSEEK_BASE_URL", "")  # 端点覆写(本地 proxy/mock),空走官方
+DEEPWIKI_DSH_CORDIS = os.environ.get("DEEPWIKI_DSH_CORDIS", "")  # 自定义组合文件;空 → 内置最小组合
+
 # ---- 产物根目录:repos/ 克隆目录、graphify-out/ 索引、wikicache/ 缓存 ----
 DEEPWIKI_ROOT = os.path.expanduser(os.environ.get("DEEPWIKI_ROOT", "~/.gh-puller/deepwiki"))
 
@@ -57,7 +68,8 @@ LLM_JUDGE_MODEL = os.environ.get("LLM_JUDGE_MODEL", "Qwen2.5-7B-Instruct")
 LLM_JUDGE_API_KEY = os.environ.get("LLM_JUDGE_API_KEY", "")  # 端点认证密钥,留空不发 Authorization
 
 # ---- wiki 生成器开关与纯 LLM 端点(缺省回退 LLM_JUDGE_* 现值) ----
-DEEPWIKI_GENERATOR = os.environ.get("DEEPWIKI_GENERATOR", "cc")  # "cc"=Claude Code agent;"llm"=纯 LLM 单次补全
+# "cc"=Claude Code agent;"dsh"=DeepSeek Harness agent;"llm"=纯 LLM 单次补全
+DEEPWIKI_GENERATOR = os.environ.get("DEEPWIKI_GENERATOR", "cc")
 DEEPWIKI_LLM_URL = os.environ.get("DEEPWIKI_LLM_URL", LLM_JUDGE_URL)
 DEEPWIKI_LLM_MODEL = os.environ.get("DEEPWIKI_LLM_MODEL", LLM_JUDGE_MODEL)
 DEEPWIKI_LLM_API_KEY = os.environ.get("DEEPWIKI_LLM_API_KEY", LLM_JUDGE_API_KEY)
