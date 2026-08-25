@@ -56,5 +56,11 @@ LLM_JUDGE_URL = os.environ.get("LLM_JUDGE_URL", "http://localhost:8000/v1")
 LLM_JUDGE_MODEL = os.environ.get("LLM_JUDGE_MODEL", "Qwen2.5-7B-Instruct")
 LLM_JUDGE_API_KEY = os.environ.get("LLM_JUDGE_API_KEY", "")  # 端点认证密钥,留空不发 Authorization
 
+# ---- wiki 生成器开关与纯 LLM 端点(缺省回退 LLM_JUDGE_* 现值) ----
+DEEPWIKI_GENERATOR = os.environ.get("DEEPWIKI_GENERATOR", "cc")  # "cc"=Claude Code agent;"llm"=纯 LLM 单次补全
+DEEPWIKI_LLM_URL = os.environ.get("DEEPWIKI_LLM_URL", LLM_JUDGE_URL)
+DEEPWIKI_LLM_MODEL = os.environ.get("DEEPWIKI_LLM_MODEL", LLM_JUDGE_MODEL)
+DEEPWIKI_LLM_API_KEY = os.environ.get("DEEPWIKI_LLM_API_KEY", LLM_JUDGE_API_KEY)
+
 # Claude 评测器:评分模型(缺省用 SDK 默认模型),需要 ANTHROPIC_API_KEY
 CLAUDE_JUDGE_MODEL = os.environ.get("CLAUDE_JUDGE_MODEL", "")

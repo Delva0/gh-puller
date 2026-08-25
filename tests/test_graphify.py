@@ -142,3 +142,41 @@ def test_default_graph_path_env_override(monkeypatch):
     # env 覆盖生效：封装的默认路径自行读 env，不依赖 graphify.paths 的导入时快照
     monkeypatch.setenv("GRAPHIFY_OUT", "custom-out")
     assert _default_graph_path() == Path.cwd() / "custom-out" / "graph.json"
+
+
+# ---------------------------------------------------------------------------
+# cache_root_final:out_dir=最终目录时缓存落 <out_dir>/cache(960ab73 遗留 bug 回归)
+# ---------------------------------------------------------------------------
+
+
+def _tiny_corpus(d: Path) -> Path:
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "app.py").write_text("def main():\n    return 42\n", encoding="utf-8")
+    (d / "util.py").write_text("def util():\n    return 1\n", encoding="utf-8")
+    return d
+
+
+def test_extract_out_dir_cache_layout(tmp_path):
+    """给出 out_dir(=最终输出目录)时:graph.json 在 out_dir 下,缓存落 <out_dir>/cache,
+    不再出现 <out_dir>/graphify-out 层;二次运行命中新位置缓存(真实 lib,AST 本地无费用)。"""
+    corpus = _tiny_corpus(tmp_path / "repo")
+    out = tmp_path / "out"
+    r = extract(corpus, code_only=True, out_dir=str(out))
+    assert r["error"] is None
+    assert Path(r["graph_json"]).parent == out
+    assert (out / "cache").is_dir()
+    assert not (out / "graphify-out").exists()
+    assert not (corpus / "graphify-out").exists()
+    # 二跑命中 <out>/cache 的 AST 缓存(无语义文件,纯本地)
+    r2 = extract(corpus, code_only=True, out_dir=str(out))
+    assert r2["error"] is None
+    assert any((out / "cache").rglob("*.json"))
+
+
+def test_extract_default_cache_layout_unchanged(tmp_path):
+    """未给出 out_dir 时行为不变:缓存仍在 <target>/graphify-out/cache。"""
+    corpus = _tiny_corpus(tmp_path / "repo")
+    r = extract(corpus, code_only=True)
+    assert r["error"] is None
+    assert (corpus / "graphify-out" / "cache").is_dir()
+    assert Path(r["graph_json"]).parent == corpus / "graphify-out"

@@ -189,9 +189,11 @@ def extract(
         raise FileNotFoundError(f"path not found: {target}")
     # out_dir 语义:给出即为最终输出目录(不再拼接 /<GRAPHIFY_OUT>);缺省 <path>/<GRAPHIFY_OUT>
     gout = Path(out_dir).expanduser().resolve() if out_dir else target / _out_name()
-    # lib 内部会在 cache_root 下再拼 <GRAPHIFY_OUT> 层:给出 out_dir 时缓存落 <gout>/graphify-out/cache,
-    # 缺省时落 <gout>/cache(与旧行为一致)
-    cache_anchor = gout if out_dir else target
+    # cache_root 统一为最终基座(gout):经 cache_root_final=True 让 lib 不拼
+    # <GRAPHIFY_OUT> 层,缓存落 <gout>/cache;缺省 out_dir 时同样落
+    # <target>/<GRAPHIFY_OUT>/cache(与旧行为一致)。历史上(960ab73 期间)的
+    # 错位缓存 <gout>/graphify-out/cache 不迁移,已人工清理。
+    cache_root = gout
     gout.mkdir(parents=True, exist_ok=True)
     _msg = log or (lambda m: _log("extract", m))
     t0 = time.perf_counter()
@@ -220,7 +222,8 @@ def extract(
 
         _msg(f"scanning {target}")
         detection = detect(target, extra_excludes=extra_excludes or None,
-                           cache_root=cache_anchor, gitignore=not no_gitignore)
+                           cache_root=cache_root, gitignore=not no_gitignore,
+                           cache_root_final=True)
         files_by_type = detection.get("files", {})
         code_files = [Path(p) for p in files_by_type.get("code", [])]
         doc_files = [Path(p) for p in files_by_type.get("document", [])]
@@ -252,7 +255,7 @@ def extract(
         if code_files:
             _msg(f"AST extraction on {len(code_files)} code files...")
             try:
-                _ast_kwargs: dict = {"cache_root": cache_anchor, "root": target}
+                _ast_kwargs: dict = {"cache_root": cache_root, "root": target, "cache_root_final": True}
                 if max_workers is not None:
                     _ast_kwargs["max_workers"] = max_workers
                 ast_result = _ast_extract(code_files, **_ast_kwargs)
@@ -293,8 +296,9 @@ def extract(
                 uncached_paths = list(paths_str)
             else:
                 cached_nodes, cached_edges, cached_hyperedges, uncached_paths = (
-                    check_semantic_cache(paths_str, root=target, cache_root=cache_anchor,
-                                         mode=sem_cache_mode, prompt=prompt)
+                    check_semantic_cache(paths_str, root=target, cache_root=cache_root,
+                                         mode=sem_cache_mode, prompt=prompt,
+                                         cache_root_final=True)
                 )
             sem_cache_hits = len(semantic_files) - len(uncached_paths)
             sem_cache_misses = len(uncached_paths)
@@ -307,7 +311,8 @@ def extract(
             if uncached_paths:
                 _msg(f"semantic extraction on {len(uncached_paths)} files via {backend_eff}...")
                 corpus_kwargs: dict = {"backend": backend_eff, "model": model,
-                                       "root": target, "cache_root": cache_anchor}
+                                       "root": target, "cache_root": cache_root,
+                                       "cache_root_final": True}
                 if deep_mode:
                     corpus_kwargs["deep_mode"] = True
                 if max_concurrency is not None:
@@ -343,9 +348,10 @@ def extract(
                 try:
                     save_semantic_cache(fresh.get("nodes", []), fresh.get("edges", []),
                                         fresh.get("hyperedges", []), root=target,
-                                        cache_root=cache_anchor, allowed_source_files=uncached_paths,
+                                        cache_root=cache_root, allowed_source_files=uncached_paths,
                                         mode=sem_cache_mode, prompt=prompt,
-                                        partial_source_files=_partial_semantic or None)
+                                        partial_source_files=_partial_semantic or None,
+                                        cache_root_final=True)
                 except Exception as exc:
                     _msg(f"warning: could not write semantic cache: {exc}")
                 _strip_partial_markers(fresh)

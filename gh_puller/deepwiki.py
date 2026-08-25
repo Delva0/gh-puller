@@ -42,7 +42,7 @@ from pydantic import BaseModel, ConfigDict, Field, computed_field, field_validat
 from claude_agent_sdk import ClaudeAgentOptions, create_sdk_mcp_server, tool
 
 from . import envs, graphify
-from .agent import cc_stream, cc_text
+from .agent import cc_stream, cc_text, llm_stream
 
 # ---------------------------------------------------------------------------
 # 日志与全局路径
@@ -63,6 +63,37 @@ _WIKI_STATE_PREFIX = "deepwiki_taskstate_"
 # 状态写锁:并发页生成器的落盘写串行化(asyncio 3.10+ 的 Lock 不再绑定 loop,模块级安全)
 _state_write_lock = asyncio.Lock()
 os.makedirs(_WIKI_CACHE_DIR, exist_ok=True)
+
+# cc(agent)交付件目录名:wikicache/agent_cache/{proj}-{structure,page_<id>}.md
+_AGENT_CACHE_DIRNAME = "agent_cache"
+# 纯 LLM 路径单文件内联截断(字符)
+_FILE_INLINE_CAP = 8000
+
+
+def _sanitize_path_seg(s: str) -> str:
+    """路径段安全化:page.id 等模型产出值可能含 '/' 或 '..',防目录穿越。"""
+    return re.sub(r"[^A-Za-z0-9._-]", "-", s)
+
+
+def _proj_key(r: Any) -> str:
+    """项目键 {type}_{owner}_{repo}(如 local_local_deepwiki-open,与 _wiki_cache_path 命名对齐)。"""
+    return _sanitize_path_seg(f"{r.type}_{r.owner}_{r.repo}")
+
+
+def _agent_cache_dir(r: Any) -> Path:
+    return Path(_WIKI_CACHE_DIR) / _AGENT_CACHE_DIRNAME / _proj_key(r)
+
+
+def _agent_cache_structure_path(r: Any) -> Path:
+    """cc 结构交付文件:{proj}-structure.md。"""
+    return _agent_cache_dir(r) / f"{_proj_key(r)}-structure.md"
+
+
+def _agent_cache_page_path(r: Any, page_id: str) -> Path:
+    """cc 页面交付文件:{proj}-<id>.md(id 形如 page-N 时直接采用,否则 {proj}-page_<id>;id 经安全化)。"""
+    seg = _sanitize_path_seg(page_id)
+    name = f"{_proj_key(r)}-{seg}" if seg.startswith("page-") else f"{_proj_key(r)}-page_{seg}"
+    return _agent_cache_dir(r) / f"{name}.md"
 
 # 页面/结构/图表生成所需的固定并发与重试(原 DEEPWIKI_* 缺省同式,见 envs.py;
 # 页并发缺省 4:同时跑 4 个 agent 子进程,受 API 速限与机器内存约束)
@@ -412,6 +443,35 @@ Remember:
 """
 
 
+def _build_page_prompt_cc(title: str, file_paths: list[str], out_path: str, language: str) -> str:
+    """cc(agent)页面提示词(现代 agent 风格):只给相关文件相对路径,内容由 agent 自读;成品经 Write 落盘 out_path。"""
+    paths = "\n".join(f"- [{p}]({p})" for p in file_paths)
+    return (
+        "IMPORTANT: you are working INSIDE the repository (cwd = repository root). "
+        "The file contents are NOT inlined in this prompt — read the relevant source files "
+        "yourself with the Read/Grep/Glob tools. All paths below are relative to the repository root.\n\n"
+        + _build_page_prompt(title, paths, language)
+        + f"\n\nDELIVERABLE: Write the complete generated Markdown page to `{out_path}` using the "
+          "Write tool (create the file; do not use Edit). Do NOT return the page in your message "
+          "text — the written file is the only deliverable."
+    )
+
+
+def _build_page_prompt_llm(
+    title: str, file_links: str, content_blocks: list[tuple[str, str]], degraded: bool, language: str,
+) -> str:
+    """纯 LLM 页面提示词(deepwiki-open 同式 + 内联相关文件内容近似其 RAG 注入;超限降级仅链接)。"""
+    prompt = _build_page_prompt(title, file_links, language)
+    if content_blocks:
+        inline = "\n\n".join(f'<file path="{p}">\n{text}\n</file>' for p, text in content_blocks)
+        extra = f"\n\nFILE CONTENT (injected context for citation-accurate writing):\n{inline}"
+    elif degraded:
+        extra = "\n\n<note>输入超限,仅提供文件链接,请依代码检索。</note>"
+    else:
+        extra = ""
+    return prompt + extra
+
+
 _COMPREHENSIVE_STRUCTURE = """
 Create a structured wiki with the following main sections:
 - Overview (general information about the project)
@@ -538,6 +598,70 @@ IMPORTANT:
 2. Each page should focus on a specific aspect of the codebase (e.g., architecture, key features, setup)
 3. The relevant_files should be actual files from the repository that would be used to generate that page
 4. Return ONLY valid XML with the structure specified above, with no markdown code block delimiters"""
+
+
+def _build_structure_prompt_cc(
+    owner: str,
+    repo_name: str,
+    file_tree: str,
+    readme_path: str | None,
+    repo_root: str,
+    comprehensive: bool,
+    language: str,
+    out_path: str,
+) -> str:
+    """cc(agent)结构提示词(现代 agent 风格):输入只给路径(文件树+README 路径),不内联内容;
+    成品 XML 由 agent 用 Write 工具直接落盘 out_path,而不是作为 result 文本返回。"""
+    structure_format = _COMPREHENSIVE_STRUCTURE if comprehensive else _CONCISE_STRUCTURE
+    page_count = "8-12" if comprehensive else "4-6"
+    kind = "comprehensive" if comprehensive else "concise"
+    readme_line = (
+        f"2. The README file of the project is at: {repo_root}/{readme_path}\n"
+        "   Read it yourself with the Read tool.\n"
+        if readme_path
+        else "2. No README file was found in this repository; skip it.\n"
+    )
+    return f"""IMPORTANT: you are working INSIDE the repository (cwd = repository root at {repo_root}).
+The file contents are NOT inlined in this prompt — read source files yourself with the
+Read/Grep/Glob tools. All paths below are relative to the repository root.
+
+Analyze this repository {owner}/{repo_name} and create a wiki structure for it.
+
+1. The complete relative file tree of the project:
+<file_tree>
+{file_tree}
+</file_tree>
+
+{readme_line}
+I want to create a wiki for this repository. Determine the most logical structure for a wiki based on the repository's content.
+
+IMPORTANT: The wiki content will be generated in {_language_name(language)} language.
+
+When designing the wiki structure, include pages that would benefit from visual diagrams, such as:
+- Architecture overviews
+- Data flow descriptions
+- Component relationships
+- Process workflows
+- State machines
+- Class hierarchies
+{structure_format}
+IMPORTANT FORMATTING INSTRUCTIONS:
+- Return ONLY the valid XML structure specified above
+- DO NOT wrap the XML in markdown code blocks (no ``` or ```xml)
+- DO NOT include any explanation text before or after the XML
+- Ensure the XML is properly formatted and valid
+- Start directly with <wiki_structure> and end with </wiki_structure>
+
+DELIVERABLE: Write the complete XML to the file {out_path} using the Write tool (create the file;
+do not use Edit). Do NOT return the XML in your message text — the written file is the only deliverable.
+
+IMPORTANT:
+1. Create {page_count} pages that would make a {kind} wiki for this repository
+2. Each page should focus on a specific aspect of the codebase (e.g., architecture, key features, setup)
+3. The relevant_files should be actual files from the repository that would be used to generate that page
+4. Do not inline file contents into this prompt — use your tools to read the files.
+{_agent_note()}"""
+
 
 # ---------------------------------------------------------------------------
 # Pydantic 契约模型(与 deepwiki-open api/schemas 同形)
@@ -992,6 +1116,14 @@ def read_repo_file_tree(
     return files, readme
 
 
+def _find_readme_path(files: list[str]) -> str | None:
+    """从文件列表选出 README 相对路径(与 read_repo_file_tree 的选取规则同式);无则 None。"""
+    for file in sorted(files, key=len):
+        if os.path.splitext(file)[0].lower().endswith("readme"):
+            return file
+    return None
+
+
 def detect_default_branch(path: str) -> str:
     """返回当前检出分支;失败回退 "main"(与原版同)。"""
     try:
@@ -1122,8 +1254,19 @@ def _graphify_server(repo: Repo):
 # ---------------------------------------------------------------------------
 
 
-def _agent_options(system_prompt: str, repo: Repo | None, model: str | None = None) -> ClaudeAgentOptions:
-    """组装 agent 选项;repo 非空时挂 graphify 工具;model 优先级:envs.CLAUDE_AGENT_MODEL > 请求 model > SDK 缺省。"""
+def _agent_options(
+    system_prompt: str,
+    repo: Repo | None,
+    model: str | None = None,
+    *,
+    agent_output_dir: str | None = None,
+    agent_write_mode: bool = False,
+) -> ClaudeAgentOptions:
+    """组装 agent 选项;repo 非空时挂 graphify 工具并把 cwd 固定到仓库根
+    (SDK 缺省 = 进程 cwd,曾导致 agent 串到 gh-puller 并把 docs 写入其中);
+    model 优先级:envs.CLAUDE_AGENT_MODEL > 请求 model > SDK 缺省。
+    agent_write_mode(cc 交付件落盘)追加 agent_cache 写目录(add_dirs)与
+    acceptEdits,工具集放开 Read/Grep/Glob/Write 供 agent 自读代码并落盘成品。"""
     kwargs: dict[str, Any] = {
         "system_prompt": system_prompt,
         "include_partial_messages": True,
@@ -1132,8 +1275,15 @@ def _agent_options(system_prompt: str, repo: Repo | None, model: str | None = No
     if model_name:
         kwargs["model"] = model_name
     if repo is not None:
+        kwargs["cwd"] = os.path.abspath(repo.save_path)
         kwargs["mcp_servers"] = {"graphify": _graphify_server(repo)}
-        kwargs["allowed_tools"] = ["graphify_query", "mcp__graphify__graphify_query"]
+        tools = ["graphify_query", "mcp__graphify__graphify_query"]
+        if agent_write_mode:
+            if agent_output_dir:
+                kwargs["add_dirs"] = [os.path.abspath(agent_output_dir)]
+            kwargs["permission_mode"] = "acceptEdits"
+            tools = ["Read", "Grep", "Glob", "Write", *tools]
+        kwargs["allowed_tools"] = tools
     return ClaudeAgentOptions(**kwargs)
 
 
@@ -1166,6 +1316,26 @@ async def _agent_text(
     async for chunk in _agent_stream(system_prompt, prompt, repo, model, label):
         parts.append(chunk)
     return "".join(parts)
+
+
+async def _agent_write_file(
+    system_prompt: str, prompt: str, repo: Repo, model: str | None, out_path: Path,
+    label: str | None = None,
+) -> str:
+    """cc 交付件统一落盘口:提示词只给路径,agent 用自身工具读码并把成品写入 out_path;
+    产生以文件为准(流式文本仅作监控/错误检测),未产出文件即任务失败。"""
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)  # add_dirs 指向目录须先存在(agent Write 可直接落)
+    options = _agent_options(
+        system_prompt, repo, model,
+        agent_output_dir=str(out_path.parent), agent_write_mode=True,
+    )
+    async for _ in cc_stream(options, prompt, session_name=label):
+        pass
+    text = await asyncio.to_thread(out_path.read_text, encoding="utf-8")
+    if not text.strip():
+        raise RuntimeError(f"agent 未产出交付文件: {out_path}")
+    return text
 
 
 # ---------------------------------------------------------------------------
@@ -2057,12 +2227,17 @@ async def generate_repo_wiki(task: WikiTask) -> None:
             if result.get("error"):
                 raise RuntimeError(result["error"])
 
-        if task.wiki_structure is None:  # 续跑:结构已落盘则跳过 agent 调用
+        if task.wiki_structure is None or (
+            envs.DEEPWIKI_GENERATOR == "cc"
+            and not _agent_cache_structure_path(r).exists()
+        ):  # 续跑:结构已落盘(cc 下以交付文件为准,被删则强制重生成)则跳过 agent 调用
             task.status = TaskStatus.DETERMINING_STRUCTURE
             task.wiki_structure = await _determine_structure(task)
             await _persist_state(task)
 
         task.status = TaskStatus.GENERATING
+        if envs.DEEPWIKI_GENERATOR == "cc":
+            await _hydrate_agent_cache_pages(task)  # 文件为权威,覆盖落盘 state 中的旧文本
         pages = await _generate_pages(task, task.wiki_structure)
 
         if not await _save(task, pages):
@@ -2081,7 +2256,7 @@ async def generate_repo_wiki(task: WikiTask) -> None:
 
 
 async def _determine_structure(task: WikiTask) -> WikiStructureModel:
-    """确定 wiki 结构(agent + Deepwiki 结构提示词 → 解析 XML);失败上抛使任务 FAILED。"""
+    """确定 wiki 结构(按 DEEPWIKI_GENERATOR 分派 cc/llm);失败上抛使任务 FAILED。"""
     r = task.request
     repo = Repo(r.repo_url, r.type, access_token=r.token)
     if not repo.is_local and not repo.downloaded:
@@ -2096,24 +2271,121 @@ async def _determine_structure(task: WikiTask) -> WikiStructureModel:
         r.excluded_files,
         r.excluded_dirs,
     )
+    if envs.DEEPWIKI_GENERATOR == "cc":
+        return await _determine_structure_cc(task, repo, file_tree)
+    return await _determine_structure_llm(task, repo, file_tree, readme)
+
+
+async def _determine_structure_llm(
+    task: WikiTask, repo: Repo, file_tree: list[str], readme: str,
+) -> WikiStructureModel:
+    """llm 路结构:文件树+README 全文 → 单次流式补全(无工具)→ XML(与 deepwiki-open 同式)。"""
+    r = task.request
     prompt = _build_structure_prompt(
         r.owner, r.repo, "\n".join(file_tree), readme, r.comprehensive, r.language
     )
-    text = await _agent_text("", prompt, repo=repo, model=r.model, label="wiki:structure")
-    return parse_wiki_structure(text, comprehensive=r.comprehensive)
+    parts: list[str] = []
+    async for chunk in llm_stream(
+        url=envs.DEEPWIKI_LLM_URL,
+        payload={"model": envs.DEEPWIKI_LLM_MODEL,
+                 "messages": [{"role": "user", "content": prompt}]},
+        api_key=envs.DEEPWIKI_LLM_API_KEY or None,
+        session_name="wiki:structure",
+    ):
+        parts.append(chunk)
+    return parse_wiki_structure("".join(parts), comprehensive=r.comprehensive)
+
+
+async def _determine_structure_cc(
+    task: WikiTask, repo: Repo, file_tree: list[str],
+) -> WikiStructureModel:
+    """cc 路结构:交付文件已存在即跳过 agent(续跑);否则 agent 落盘 structure.md 后读回解析。"""
+    r = task.request
+    struct_path = _agent_cache_structure_path(r)
+    if struct_path.exists():
+        content = await asyncio.to_thread(struct_path.read_text, encoding="utf-8")
+    else:
+        readme_path = _find_readme_path(file_tree)
+        prompt = _build_structure_prompt_cc(
+            r.owner, r.repo, "\n".join(file_tree), readme_path,
+            os.path.abspath(repo.save_path), r.comprehensive, r.language,
+            str(struct_path),
+        )
+        content = await _agent_write_file(
+            "", prompt, repo, r.model, struct_path, label="wiki:structure"
+        )
+    return parse_wiki_structure(content, comprehensive=r.comprehensive)
 
 
 async def _generate_page(task: WikiTask, page: WikiPage) -> WikiPage:
-    """生成单个页面:agent 整收 → 剥 fence → 引用后处理。"""
+    """生成单个页面:cc 落盘读回 / llm 单次补全 → 剥 fence → 引用后处理。"""
     r = task.request
     repo = Repo(r.repo_url, r.type, access_token=r.token)
     ctx = RepoUrlContext(type=r.type, repo_url=r.repo_url, default_branch=task.default_branch)
     file_links = "\n".join(f"- [{p}]({generate_file_url(p, ctx)})" for p in page.filePaths)
-    prompt = _agent_note() + _build_page_prompt(page.title, file_links, r.language)
-    content = await _agent_text("", prompt, repo=repo, model=r.model, label=f"wiki:page:{page.id}")
+    if envs.DEEPWIKI_GENERATOR == "cc":
+        content = await _generate_page_cc(task, repo, page, file_links)
+    else:
+        content = await _generate_page_llm(task, repo, page, file_links)
     content = _strip_markdown_fences(content)
     content = post_process_wiki_content(content, list(page.filePaths), ctx)
     return page.model_copy(update={"content": content})
+
+
+async def _generate_page_cc(
+    task: WikiTask, repo: Repo, page: WikiPage, file_links: str,
+) -> str:
+    """cc 路单页:交付文件已存在即读回(续跑,文件为权威);否则 agent 落盘 page_<id>.md。"""
+    r = task.request
+    out_path = _agent_cache_page_path(r, page.id)
+    if out_path.exists():
+        return await asyncio.to_thread(out_path.read_text, encoding="utf-8")
+    prompt = _agent_note() + _build_page_prompt_cc(page.title, list(page.filePaths), str(out_path), r.language)
+    return await _agent_write_file(
+        "", prompt, repo, r.model, out_path, label=f"wiki:page:{page.id}"
+    )
+
+
+async def _generate_page_llm(
+    task: WikiTask, repo: Repo, page: WikiPage, file_links: str,
+) -> str:
+    """llm 路单页:内联相关文件内容 → 单次流式补全(无工具调用)。"""
+    r = task.request
+    blocks, degraded = _inline_page_files(repo.save_path, list(page.filePaths))
+    prompt = _build_page_prompt_llm(page.title, file_links, blocks, degraded, r.language)
+    parts: list[str] = []
+    async for chunk in llm_stream(
+        url=envs.DEEPWIKI_LLM_URL,
+        payload={"model": envs.DEEPWIKI_LLM_MODEL,
+                 "messages": [{"role": "user", "content": prompt}]},
+        api_key=envs.DEEPWIKI_LLM_API_KEY or None,
+        session_name=f"wiki:page:{page.id}",
+    ):
+        parts.append(chunk)
+    return "".join(parts)
+
+
+def _inline_page_files(
+    save_path: str, file_paths: list[str],
+) -> tuple[list[tuple[str, str]], bool]:
+    """内联页面相关文件内容(纯 LLM 路径,近似 RAG 注入;单文件截断 8k 字符)。
+    累计超过 CHAT_TOKEN_LIMIT_ESTIMATE(字符/4 近似)即整体降级:返回 ([], True),
+    页面提示词将只提供文件链接(与 deepwiki-open 的 MAX_INPUT_TOKENS 降级同式)。"""
+    limit_chars = envs.CHAT_TOKEN_LIMIT_ESTIMATE * 4
+    total = 0
+    blocks: list[tuple[str, str]] = []
+    for p in file_paths:
+        try:
+            text = Path(save_path, p).read_text(encoding="utf-8")
+        except OSError:
+            continue
+        if len(text) > _FILE_INLINE_CAP:
+            text = text[:_FILE_INLINE_CAP]
+        if total + len(text) > limit_chars:
+            return [], True
+        total += len(text)
+        blocks.append((p, text))
+    return blocks, False
 
 
 async def _generate_page_with_retry(task: WikiTask, page: WikiPage) -> WikiPage:
@@ -2125,7 +2397,33 @@ async def _generate_page_with_retry(task: WikiTask, page: WikiPage) -> WikiPage:
             last_error = e
             _log(f"页面 {page.id} 生成失败(尝试 {attempt + 1}/{_WIKI_PAGE_RETRIES + 1}): {e}")
     # 重试耗尽:回退错误占位页,保证整个 wiki 仍能完成
-    return page.model_copy(update={"content": f"Error generating content: {last_error}"})
+    content = f"Error generating content: {last_error}"
+    if envs.DEEPWIKI_GENERATOR == "cc":
+        # 占位文本也落盘:续跑跳过占位页;用户删除该文件即可重试
+        try:
+            _agent_cache_page_path(task.request, page.id).write_text(content, encoding="utf-8")
+        except OSError as e:  # noqa: BLE001 - 占位写入失败不阻断任务完成
+            _log(f"写入占位页文件失败: {page.id} - {e}")
+    return page.model_copy(update={"content": content})
+
+
+async def _hydrate_agent_cache_pages(task: WikiTask) -> None:
+    """cc 路径:从已落盘的页交付文件水合 generated_pages(文件为权威,覆盖 state 旧文本);
+    无文件的页留给 _generate_pages(含每页完成即落盘的状态语义)。"""
+    structure = task.wiki_structure
+    if structure is None:
+        return
+    r = task.request
+    ctx = RepoUrlContext(type=r.type, repo_url=r.repo_url, default_branch=task.default_branch)
+    for page in structure.pages:
+        out_path = _agent_cache_page_path(r, page.id)
+        if not out_path.exists():
+            continue
+        content = await asyncio.to_thread(out_path.read_text, encoding="utf-8")
+        content = _strip_markdown_fences(content)
+        content = post_process_wiki_content(content, list(page.filePaths), ctx)
+        task.generated_pages[page.id] = page.model_copy(update={"content": content})
+    task.pages_done = len(task.generated_pages)
 
 
 def _pending_pages(structure: WikiStructureModel, done: dict[str, WikiPage]) -> list[WikiPage]:
@@ -2156,9 +2454,9 @@ async def _generate_pages(task: WikiTask, structure: WikiStructureModel) -> dict
     return task.generated_pages
 
 
-async def _save(task: WikiTask, pages: dict[str, WikiPage]) -> None:
+async def _save(task: WikiTask, pages: dict[str, WikiPage]) -> bool:
     assert task.wiki_structure is not None
-    await save_wiki_cache(
+    return await save_wiki_cache(
         owner=task.request.owner,
         repo=task.request.repo,
         repo_type=task.request.type,

@@ -8,13 +8,24 @@
 """
 
 import asyncio
+import json
 import os
+import sys
 import tempfile
+from pathlib import Path
 
-# envs 在模块导入时单点读取 —— 必须在 import gh_puller.deepwiki 前把产物根指向临时目录;
-# 用强制赋值而非 setdefault:即使外层环境或先导入的测试(如 agent 监控)已设 DEEPWIKI_ROOT,
-# 本测试也不落用户真实目录(测试隔离优先于外部配置)。
+# envs 在模块导入时单点读取 —— 必须在 import gh_puller.deepwiki 前把产物根指向临时目录。
+# 用强制赋值而非 setdefault:即使外层环境已设 DEEPWIKI_ROOT,本测试也不落用户真实目录
+# (测试隔离优先于外部配置)。且全量套件下 agent-monitor 等测试会先 import gh_puller.agent
+# → 其模块级 `from .. import envs` 已把真实根快照进 sys.modules 的 gh_puller.envs,
+# 之后再设环境变量无效 —— 必须 pop + 清除包属性(仅 pop 时 `from pkg import mod` 会命中
+# 包上的缓存属性,仍需 delattr),让 envs 以临时根重新加载(agent 侧继续用旧对象,互不影响)。
 os.environ["DEEPWIKI_ROOT"] = tempfile.mkdtemp(prefix="deepwiki-test-")
+sys.modules.pop("gh_puller.envs", None)
+try:
+    delattr(sys.modules["gh_puller"], "envs")
+except (AttributeError, KeyError):
+    pass
 
 import pytest
 
@@ -291,3 +302,289 @@ async def test_registry_resume_restores_task(monkeypatch):
         await deepwiki.registry.remove(key)
         await delete_wiki_task_state("resume-io", "demo", "local", "en")
         await asyncio.sleep(0.25)  # 让 TTL 移除计时器自然结束,避免挂起的任务告警
+
+
+# ---------------------------------------------------------------------------
+# cc/llm 双路径(离线:交付文件预置 / agent 与 llm_stream 全部 monkeypatch)
+# ---------------------------------------------------------------------------
+
+_STRUCT_XML = """<wiki_structure>
+<title>T</title>
+<page id="p1"><title>A</title><file_path>src/a.py</file_path></page>
+<page id="p2"><title>B</title><file_path>src/b.py</file_path></page>
+<page id="p3"><title>C</title><file_path>src/c.py</file_path></page>
+</wiki_structure>"""
+
+
+def test_agent_cache_naming():
+    request = WikiTaskRequest(repo_url="/x", type="local", owner="local", repo="deepwiki-open", language="en")
+    assert deepwiki._agent_cache_structure_path(request).name == "local_local_deepwiki-open-structure.md"
+    assert deepwiki._agent_cache_page_path(request, "page-1").name == "local_local_deepwiki-open-page-1.md"
+    assert deepwiki._agent_cache_page_path(request, "overview").name == "local_local_deepwiki-open-page_overview.md"
+
+
+def test_sanitize_page_id_no_escape():
+    r = _make_request("sanitize-io", "demo")
+    out = deepwiki._agent_cache_page_path(r, "../../evil")
+    assert out.parent == deepwiki._agent_cache_dir(r)
+    assert out.relative_to(deepwiki._agent_cache_dir(r)).parent == Path(".")
+
+
+def test_agent_options_cc_delivery(tmp_path):
+    """写入模式:cwd 固定仓库根,add_dirs 指向交付目录,acceptEdits + 读工具放开;
+    默认模式只有 cwd(chat/codemap 场景),无写权限。"""
+    repo = Repo(str(tmp_path), "local")
+    opts = deepwiki._agent_options(
+        "", repo, model="m", agent_output_dir=str(tmp_path / "out"), agent_write_mode=True
+    )
+    assert opts.cwd == str(tmp_path)
+    assert opts.add_dirs == [str(tmp_path / "out")]
+    assert opts.permission_mode == "acceptEdits"
+    for t in ("Read", "Grep", "Glob", "Write", "graphify_query"):
+        assert t in opts.allowed_tools, t
+    opts2 = deepwiki._agent_options("", repo, model="m")
+    assert opts2.cwd == str(tmp_path)
+    assert opts2.add_dirs == []
+    assert opts2.permission_mode is None
+
+
+@pytest.mark.asyncio
+async def test_dispatch_structure_by_generator(monkeypatch):
+    """DEEPWIKI_GENERATOR 分派:cc 只走 _determine_structure_cc,llm 只走 _determine_structure_llm。"""
+    calls = []
+
+    async def fake_llm(task, repo, files, readme):
+        calls.append("llm")
+        return _make_structure(["p1"])
+
+    async def fake_cc(task, repo, files):
+        calls.append("cc")
+        return _make_structure(["p1"])
+
+    monkeypatch.setattr(deepwiki, "_determine_structure_llm", fake_llm)
+    monkeypatch.setattr(deepwiki, "_determine_structure_cc", fake_cc)
+    task = WikiTask(request=_make_request("dispatch-io", "demo"))
+
+    monkeypatch.setattr(deepwiki.envs, "DEEPWIKI_GENERATOR", "cc")
+    await deepwiki._determine_structure(task)
+    assert calls == ["cc"]
+
+    calls.clear()
+    monkeypatch.setattr(deepwiki.envs, "DEEPWIKI_GENERATOR", "llm")
+    await deepwiki._determine_structure(task)
+    assert calls == ["llm"]
+
+
+@pytest.mark.asyncio
+async def test_determine_structure_cc_skips_when_file_exists(monkeypatch):
+    """cc 结构续跑:structure.md 已存在则直接解析,不启动 agent。"""
+    request = _make_request("cc-struct", "demo")
+    struct_path = deepwiki._agent_cache_structure_path(request)
+    struct_path.parent.mkdir(parents=True, exist_ok=True)
+    struct_path.write_text(_STRUCT_XML, encoding="utf-8")
+
+    async def boom(*args, **kwargs):
+        raise AssertionError("agent must not be called")
+
+    monkeypatch.setattr(deepwiki, "_agent_write_file", boom)
+    monkeypatch.setattr(deepwiki.envs, "DEEPWIKI_GENERATOR", "cc")
+    repo = Repo("/tmp/gh-puller-test-repo", "local")
+    s = await deepwiki._determine_structure_cc(WikiTask(request=request), repo, ["src/a.py"])
+    assert [p.id for p in s.pages] == ["p1", "p2", "p3"]
+
+
+@pytest.mark.asyncio
+async def test_determine_structure_cc_calls_agent_no_inline(tmp_path, monkeypatch):
+    """cc 结构走 agent 并读回文件;提示词只有文件树路径,不内联任何文件内容。"""
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "a.py").write_text("SECRET_CODE_BODY", encoding="utf-8")
+    (tmp_path / "README.md").write_text("SECRET_README_BODY", encoding="utf-8")
+    request = WikiTaskRequest(repo_url=str(tmp_path), type="local", owner="local", repo="demo", language="en")
+    captured = {}
+
+    async def fake_write(system_prompt, prompt, repo, model, out_path, label=None):
+        captured["prompt"] = prompt
+        Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+        Path(out_path).write_text(_STRUCT_XML, encoding="utf-8")
+        return _STRUCT_XML
+
+    monkeypatch.setattr(deepwiki, "_agent_write_file", fake_write)
+    monkeypatch.setattr(deepwiki.envs, "DEEPWIKI_GENERATOR", "cc")
+    repo = Repo(str(tmp_path), "local")
+    s = await deepwiki._determine_structure_cc(WikiTask(request=request), repo, ["src/a.py"])
+    assert [p.id for p in s.pages] == ["p1", "p2", "p3"]
+    assert "<file_tree>" in captured["prompt"]
+    assert "src/a.py" in captured["prompt"]
+    assert "SECRET_CODE_BODY" not in captured["prompt"]
+    assert "SECRET_README_BODY" not in captured["prompt"]
+
+
+@pytest.mark.asyncio
+async def test_page_cc_skips_when_file_exists(monkeypatch):
+    """cc 页续跑:page_<id>.md 已存在则直接读回(文件为权威),不启动 agent。"""
+    request = _make_request("cc-page", "demo")
+    out = deepwiki._agent_cache_page_path(request, "p1")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text("## PA-REAL\n\nbody\n", encoding="utf-8")
+
+    async def boom(*args, **kwargs):
+        raise AssertionError("agent must not be called")
+
+    monkeypatch.setattr(deepwiki, "_agent_write_file", boom)
+    monkeypatch.setattr(deepwiki.envs, "DEEPWIKI_GENERATOR", "cc")
+    task = WikiTask(request=request)
+    task.default_branch = "main"
+    got = await deepwiki._generate_page(task, _make_page("p1"))
+    assert "PA-REAL" in got.content
+    assert got.id == "p1"
+
+
+@pytest.mark.asyncio
+async def test_page_cc_calls_agent_and_reads_file(monkeypatch):
+    """cc 页走 agent 落盘后读回;提示词只给路径并含交付指令,不内联文件内容。"""
+    request = _make_request("cc-page2", "demo")
+    captured = {}
+
+    async def fake_write(system_prompt, prompt, repo, model, out_path, label=None):
+        captured["prompt"] = prompt
+        Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+        Path(out_path).write_text("## PB-REAL\n\ncontent\n", encoding="utf-8")
+        return "## PB-REAL\n\ncontent\n"
+
+    monkeypatch.setattr(deepwiki, "_agent_write_file", fake_write)
+    monkeypatch.setattr(deepwiki.envs, "DEEPWIKI_GENERATOR", "cc")
+    task = WikiTask(request=request)
+    task.default_branch = "main"
+    got = await deepwiki._generate_page(task, _make_page("p2"))
+    assert "PB-REAL" in got.content
+    assert "- [src/main.py](src/main.py)" in captured["prompt"]
+    assert "DELIVERABLE" in captured["prompt"]
+    assert "SECRET" not in captured["prompt"]
+
+
+@pytest.mark.asyncio
+async def test_page_llm_inlines_files(tmp_path, monkeypatch):
+    """llm 页:内联相关文件内容入 payload(无 agent/无工具),单次流式。"""
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "a.py").write_text("SECRET_CODE_BODY", encoding="utf-8")
+    captured = {}
+
+    async def fake_llm_stream(*, url, payload, api_key=None, session_name=None, **kw):
+        captured["url"] = url
+        captured["api_key"] = api_key
+        captured["session"] = session_name
+        captured["payload"] = payload
+        yield "LLM-CONTENT"
+
+    monkeypatch.setattr(deepwiki, "llm_stream", fake_llm_stream)
+    request = _make_request("llm-page", "demo")
+    task = WikiTask(request=request)
+    task.default_branch = "main"
+    page = WikiPage(
+        id="p1", title="Page p1", content="", filePaths=["src/a.py"],
+        importance="medium", relatedPages=[],
+    )
+    repo = Repo(str(tmp_path), "local")
+    content = await deepwiki._generate_page_llm(task, repo, page, "- [src/a.py](src/a.py)")
+    assert content == "LLM-CONTENT"
+    assert captured["session"] == "wiki:page:p1"
+    user_msg = captured["payload"]["messages"][0]["content"]
+    assert '<file path="src/a.py">' in user_msg
+    assert "SECRET_CODE_BODY" in user_msg
+    assert captured["payload"]["model"] == deepwiki.envs.DEEPWIKI_LLM_MODEL
+
+
+@pytest.mark.asyncio
+async def test_page_llm_degrades_over_limit(tmp_path, monkeypatch):
+    """llm 页超限降级:内联累计超过 token 上限 → 无内联块,仅文件链接 + 降级 note。"""
+    for i in range(5):
+        d = tmp_path / "src"
+        d.mkdir(exist_ok=True)
+        (d / f"f{i}.py").write_text("x" * 15000, encoding="utf-8")
+    captured = {}
+
+    async def fake_llm_stream(*, url, payload, api_key=None, session_name=None, **kw):
+        captured["payload"] = payload
+        yield "DEGRADED"
+
+    monkeypatch.setattr(deepwiki, "llm_stream", fake_llm_stream)
+    task = WikiTask(request=_make_request("llm-deg", "demo"))
+    task.default_branch = "main"
+    page = WikiPage(
+        id="p1", title="P", content="", filePaths=[f"src/f{i}.py" for i in range(5)],
+        importance="medium", relatedPages=[],
+    )
+    repo = Repo(str(tmp_path), "local")
+    assert await deepwiki._generate_page_llm(task, repo, page, "- [src/f0.py](src/f0.py)") == "DEGRADED"
+    user_msg = captured["payload"]["messages"][0]["content"]
+    assert "<file path=" not in user_msg
+    assert "输入超限" in user_msg
+
+
+@pytest.mark.asyncio
+async def test_generate_repo_wiki_cc_assemble_and_resume(tmp_path, monkeypatch):
+    """cc 端到端(离线):structure/全部页文件预落盘 → 零 agent 调用完成;
+    JSON 正文与文件一致、taskstate 清理、页面完成数按文件水合。"""
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    (repo_dir / "src").mkdir()
+    (repo_dir / "src" / "a.py").write_text("def a():\n    return 1\n", encoding="utf-8")
+    request = WikiTaskRequest(
+        repo_url=str(repo_dir), type="local", owner="local", repo="demo", language="en",
+    )
+    # 预置假索引(与 _graph_dir 命名对齐)
+    fake_repo = Repo(str(repo_dir), "local")
+    graph_dir = deepwiki._graph_dir(fake_repo)
+    graph_dir.mkdir(parents=True, exist_ok=True)
+    (graph_dir / "graph.json").write_text("{}", encoding="utf-8")
+    # 预置结构 + 全部页面交付文件
+    struct_path = deepwiki._agent_cache_structure_path(request)
+    struct_path.parent.mkdir(parents=True, exist_ok=True)
+    struct_path.write_text(_STRUCT_XML, encoding="utf-8")
+    for pid in ("p1", "p2", "p3"):
+        deepwiki._agent_cache_page_path(request, pid).write_text(
+            f"## {pid}-REAL\n\nbody\n", encoding="utf-8"
+        )
+
+    async def boom(*args, **kwargs):
+        raise AssertionError("agent must not be called")
+
+    monkeypatch.setattr(deepwiki, "_agent_write_file", boom)
+    monkeypatch.setattr(deepwiki.envs, "DEEPWIKI_GENERATOR", "cc")
+    task = WikiTask(request=request)
+    await deepwiki.generate_repo_wiki(task)
+    assert task.status == TaskStatus.COMPLETED
+    cache_path = Path(deepwiki._WIKI_CACHE_DIR) / "deepwiki_cache_local_local_demo_en.json"
+    assert cache_path.exists()
+    data = json.loads(cache_path.read_text(encoding="utf-8"))
+    assert set(data["generated_pages"]) == {"p1", "p2", "p3"}
+    for pid in ("p1", "p2", "p3"):
+        assert f"{pid}-REAL" in data["generated_pages"][pid]["content"]
+    assert not Path(deepwiki._wiki_state_path("local", "demo", "local", "en")).exists()
+    assert task.pages_done == 3
+
+
+def test_save_llm_restores_generator_default():
+    """env 缺省即 cc(默认走 agent 路径)。"""
+    assert deepwiki.envs.DEEPWIKI_GENERATOR == "cc"
+
+
+@pytest.mark.asyncio
+async def test_determine_structure_llm_streams(monkeypatch):
+    """llm 路结构:单次 llm_stream 补全(无 agent/无工具),解析 XML。"""
+    captured = {}
+
+    async def fake_llm_stream(*, url, payload, api_key=None, session_name=None, **kw):
+        captured["session"] = session_name
+        captured["payload"] = payload
+        yield _STRUCT_XML
+
+    monkeypatch.setattr(deepwiki, "llm_stream", fake_llm_stream)
+    task = WikiTask(request=_make_request("llm-struct", "demo"))
+    repo = Repo("/tmp/gh-puller-test-repo", "local")
+    s = await deepwiki._determine_structure_llm(task, repo, ["app.py"], "")
+    assert [p.id for p in s.pages] == ["p1", "p2", "p3"]
+    assert captured["session"] == "wiki:structure"
+    # 输入仅文件树路径(含 <file_tree> 标签),无任何文件内容内联
+    assert "<file_tree>" in captured["payload"]["messages"][0]["content"]
+    assert "app.py" in captured["payload"]["messages"][0]["content"]
