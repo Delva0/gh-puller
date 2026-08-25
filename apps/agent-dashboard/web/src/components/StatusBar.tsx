@@ -5,7 +5,6 @@ import type { ConnStatus } from '../hooks/useMonitorSocket';
 interface Props {
   status: ConnStatus;
   current: string | null;
-  lines: number;
   events: number;
 }
 
@@ -15,7 +14,7 @@ const DOT: Record<ConnStatus, string> = {
   closed: 'bg-red-500',
 };
 
-export default function StatusBar({ status, current, lines, events }: Props) {
+export default function StatusBar({ status, current, events }: Props) {
   const { t } = useLanguage();
   return (
     <div className="flex items-center gap-3 border-t border-zinc-200 px-3 py-1.5 text-xs text-zinc-500 dark:border-zinc-800 dark:text-zinc-500">
@@ -25,7 +24,7 @@ export default function StatusBar({ status, current, lines, events }: Props) {
       </span>
       {current && <span className="truncate font-mono">{current}</span>}
       <span className="ml-auto font-mono">
-        {t('statusbar.lines')} {lines} · {t('statusbar.events')} {events}
+        {t('statusbar.events')} {events}
       </span>
     </div>
   );

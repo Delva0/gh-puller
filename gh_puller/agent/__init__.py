@@ -11,34 +11,25 @@
   逗号分隔多地址,每地址一个 sink 实例;OtelSink 亦在 sinks.py,经
   AGENT_MONITOR_PHOENIX_URL 启用 —— 端点可达 + opentelemetry 可导入才注册,
   置空关闭;需显式 `from gh_puller.agent.sinks import OtelSink`,本模块不导出)。
-- KINDS / LLM_STREAM_TYPES / LlmAggregator / new_event / truncate(events.py):
-  纯 dict 事件模型与 LLM 流聚合器,零 SDK 依赖,FS/hub 共用。
+- TAXONOMY / SURFACE_TYPES / LOG_TYPES / new_event / type_of / truncate(events.py):
+  事件溯源式纯 dict 事件模型(折叠恢复规范见 events.py 模块 docstring),零 SDK 依赖。
 
-管道:适配器归一化 SDK/HTTP 对象 → 事件流 dict → EventBus 扇出(publish 仅
+管道:适配器归一化 SDK/HTTP 对象 → 事件 dict(envelope) → EventBus 扇出(publish 仅
 put_nowait 到每 sink 的 asyncio.Queue,永不阻塞调用)→ sink worker 消费(文件写盘)。
 线程模型:v1 只有异步调用方,publish 为 loop-affine;若未来出现线程调用方,
 须自行经 loop.call_soon_threadsafe 转发。
 """
 
 from .adapters import cc_result, cc_stream, cc_text, llm_complete, llm_stream
-from .events import (
-    KINDS,
-    LLM_STREAM_TYPES,
-    LlmAggregator,
-    aggregate_all,
-    kind_of,
-    new_event,
-    truncate,
-)
+from .events import LOG_TYPES, SURFACE_TYPES, TAXONOMY, new_event, truncate, type_of
 from .sinks import EventBus, FileSink, WsSink, configure, ensure_bus
 
 __all__ = [
-    "KINDS",
-    "LLM_STREAM_TYPES",
-    "LlmAggregator",
-    "aggregate_all",
-    "kind_of",
+    "TAXONOMY",
+    "SURFACE_TYPES",
+    "LOG_TYPES",
     "new_event",
+    "type_of",
     "truncate",
     "EventBus",
     "FileSink",

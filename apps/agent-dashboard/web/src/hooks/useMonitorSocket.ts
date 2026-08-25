@@ -1,26 +1,23 @@
-// 监控 hub 连接核心:连接/2s 退避重连/帧分发/双 id 去重/事件环形缓冲
+// 监控 hub 连接核心(协议 v2):连接/2s 退避重连/帧分发;
+// 订阅窗:subscribe → evt_ready{lastSeq} → history 尾页(loading 期间 live 帧入缓冲)→
+// applyBatch 合并;loading 外 live 经 seq 守卫入 fold,间隙(早/漏帧)→ history(beforeSeq) 补片。
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { monitorWsUrl } from '@gh-puller/ui';
-import type { LlmLine, MonitorFrame, SessionMeta } from '../types';
+import { monitorWsUrl, mergeEvents } from '@gh-puller/ui';
+import type { EventEnvelope, HubFrame, SessionMeta } from '@gh-puller/ui';
+import { sessionStore } from './useMonitorSession';
 
 export type ConnStatus = 'connecting' | 'connected' | 'closed';
-
-const EVT_RING = 500; // 事件环形缓冲上限(与 hub 事件环同量级,drop-oldest)
 
 export function useMonitorSocket() {
   const [status, setStatus] = useState<ConnStatus>('connecting');
   const [sessions, setSessions] = useState<SessionMeta[]>([]);
   const [current, setCurrent] = useState<string | null>(null);
-  const [lines, setLines] = useState<LlmLine[]>([]);
-  const [events, setEvents] = useState<Record<string, unknown>[]>([]);
-  const [llmReady, setLlmReady] = useState(false);
-  const [evtReady, setEvtReady] = useState(false);
 
   const wsRef = useRef<WebSocket | null>(null);
   const timerRef = useRef<number | null>(null);
   const currentRef = useRef<string | null>(null);
-  const seenLlmRef = useRef<Set<number>>(new Set());
-  const seenEvtRef = useRef<Set<string>>(new Set());
+  const loadingRef = useRef(false); // history 尾页加载中:live 帧入缓冲
+  const pendingRef = useRef<EventEnvelope[]>([]);
 
   const send = useCallback((obj: unknown) => {
     const ws = wsRef.current;
@@ -29,50 +26,48 @@ export function useMonitorSocket() {
     }
   }, []);
 
-  // 选会话:清空状态并重置去重,同时订 LLM 行与原始事件(幂等:hub 无视重复帧)
+  const requestHistory = useCallback((beforeSeq?: number) => {
+    send({ type: 'history', session: currentRef.current, beforeSeq, max: 200 });
+  }, [send]);
+
   const select = useCallback((session: string) => {
     currentRef.current = session;
-    seenLlmRef.current.clear();
-    seenEvtRef.current.clear();
-    setLines([]);
-    setEvents([]);
-    setLlmReady(false);
-    setEvtReady(false);
+    pendingRef.current = [];
+    loadingRef.current = true;
+    sessionStore.reset(); // 清空旧会话折叠与快照
     setCurrent(session);
-    send({ type: 'llm-subscribe', session });
-    send({ type: 'evt-subscribe', session });
+    send({ type: 'subscribe', session });
+    // 尾页请求在 subscribe 应答(evt_ready)后发出:先登记订阅,再拉历史,无缝衔接
   }, [send]);
 
   useEffect(() => {
     let disposed = false;
 
-    const handleFrame = (frame: MonitorFrame) => {
+    const handleFrame = (frame: HubFrame) => {
       if (frame.type === 'index') {
         setSessions(frame.sessions);
-      } else if (frame.type === 'llm') {
-        if (frame.session !== currentRef.current || seenLlmRef.current.has(frame.id)) {
+      } else if (frame.type === 'evt_ready') {
+        sessionStore.ready(frame.lastSeq);
+        requestHistory();
+      } else if (frame.type === 'history') {
+        const events = mergeEvents(frame.events, pendingRef.current);
+        pendingRef.current = [];
+        loadingRef.current = false;
+        sessionStore.applyBatch(events);
+        // 余量预告:漏页继续翻(单页 200 上限,超长会话翻旧)
+        if (frame.hasMore && frame.nextBeforeSeq !== null) {
+          requestHistory(frame.nextBeforeSeq);
+        }
+      } else if (frame.type === 'evt') {
+        if (loadingRef.current) {
+          pendingRef.current.push(frame.event);
           return;
         }
-        seenLlmRef.current.add(frame.id);
-        // 回放以 session.start 起始:重连重放时整体重建,避免与 live 乱序拼接
-        setLines((prev) => (
-          frame.line.type === 'session.start' ? [frame.line] : prev.concat(frame.line)
-        ));
-      } else if (frame.type === 'evt') {
-        if (frame.session !== currentRef.current) return;
-        const id = String((frame.event as { id?: unknown }).id ?? '');
-        if (id) {
-          if (seenEvtRef.current.has(id)) return;
-          seenEvtRef.current.add(id);
+        const r = sessionStore.ingest(frame.event);
+        if (r === 'gap') {
+          const from = sessionStore.snapshot().gapFrom;
+          if (from !== null) requestHistory(from);
         }
-        setEvents((prev) => {
-          const next = prev.concat(frame.event);
-          return next.length > EVT_RING ? next.slice(next.length - EVT_RING) : next;
-        });
-      } else if (frame.type === 'llm_ready') {
-        setLlmReady(true);
-      } else if (frame.type === 'evt_ready') {
-        setEvtReady(true);
       }
     };
 
@@ -86,13 +81,12 @@ export function useMonitorSocket() {
         setStatus('connected');
         send({ type: 'index' });
         if (currentRef.current) {
-          send({ type: 'llm-subscribe', session: currentRef.current });
-          send({ type: 'evt-subscribe', session: currentRef.current });
+          select(currentRef.current);
         }
       };
       ws.onmessage = (m) => {
         try {
-          handleFrame(JSON.parse(m.data as string) as MonitorFrame);
+          handleFrame(JSON.parse(m.data as string) as HubFrame);
         } catch {
           /* 非 JSON 帧忽略 */
         }
@@ -110,8 +104,8 @@ export function useMonitorSocket() {
       if (timerRef.current !== null) window.clearTimeout(timerRef.current);
       wsRef.current?.close();
     };
-    // 只跑一次:send 经 ref 取当前 ws,闭包稳定
-  }, [send]);
+    // 只跑一次:send/select 经 ref 取当前 ws,闭包稳定
+  }, [send, select, requestHistory]);
 
-  return { status, sessions, current, lines, events, llmReady, evtReady, select };
+  return { status, sessions, current, select };
 }

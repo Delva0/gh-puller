@@ -3,7 +3,9 @@
 零 SDK / 零网络 / 零 token:SDK 以假模块注入 sys.modules,HTTP 不发起(禁用路径),
 只驱动假事件 dict 与假消息对象。
 - 覆盖:bus 扇出(顺序/一致性/有界丢最旧)、configure 停用短路、FileSink 三态目录
-  布局与终态原子迁移、适配器归一化(流事件/整块消息/usage)、无副作用与错误语义。
+  布局与终态原子迁移(原始事件逐行)、适配器归一化(事件溯源模型:chunk/tool.call/
+  tool.result 全量)、assistant 消息无重复兜底、WsSink 原样转发、OtelSink span 树、
+  无副作用与错误语义。
 """
 
 import asyncio
@@ -19,8 +21,8 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanE
 from opentelemetry.trace import StatusCode
 
 from gh_puller import agent
-from gh_puller.agent import EventBus, FileSink, WsSink, new_event, sinks
-from gh_puller.agent.adapters import _Run, _handle_assistant_message, _handle_stream_event, _normalize_usage
+from gh_puller.agent import EventBus, FileSink, new_event, sinks
+from gh_puller.agent.adapters import _handle_assistant_message, _handle_stream_event, _normalize_usage, _Run
 from gh_puller.agent.sinks import OtelSink
 
 
@@ -29,6 +31,15 @@ async def _monitor_cleanup():
     yield
     agent.configure(file=False, ws_urls=[], otel_urls=[])  # 停用并取消 sink worker 任务
     await asyncio.sleep(0.01)  # 轮转一拍,让被取消的 worker 退场
+
+
+def _recv(got):
+    """消息收集协程。"""
+
+    async def recv(evt):
+        got.append(evt)
+
+    return recv
 
 
 # ---------------------------------------------------------------------------
@@ -80,56 +91,63 @@ def test_configure_disabled_short_circuits():
     """file/ws 全关:bus 无 sink,事件不构造(无 uuid/json 开销)、目录不建。"""
     agent.configure(file=False, ws_urls=[], otel_urls=[])
     run = _Run("s1", "claude", "", label="t")
-    run.event("run.start", prompt_chars=1, prompt_preview="p", n_messages=1, system_chars=0, tool_names=[])
+    run.event("session/start", run_id=None, label="t", provider="claude", model="")
     bus = sinks._bus
     assert bus is not None and bus.enabled is False
 
 
 # ---------------------------------------------------------------------------
-# FileSink 布局与状态迁移
+# FileSink 布局与状态迁移(原始事件逐行)
 # ---------------------------------------------------------------------------
 
 
-def _evt(kind: str, session: str = "s1", seq: int = 0, round: int = 0, **fields) -> dict:
-    return new_event(kind, session=session, label="wiki:structure", provider="claude", model="",
-                     seq=seq, round=round, **fields)
+def _evt(evt_type: str, session: str = "s1", seq: int = 0, **data) -> dict:
+    """测试用具:built 信封事件(seq 显式,data 经 new_event 校验)。"""
+    return {**new_event(evt_type, **data), "session": session, "label": "wiki:structure",
+            "provider": "claude", "model": "", "run_id": None, "seq": seq}
 
 
 @pytest.mark.asyncio
 async def test_file_sink_layout_and_finalized(tmp_path):
     sink = FileSink(str(tmp_path))
-    # run.start → running/ 即创建,append 实时可见(行即 LLM 流)
-    await sink.consume(_evt("run.start", prompt_chars=5, prompt_preview="hi", n_messages=1,
-                            system_chars=0, tool_names=[]))
+    # session/start → running/ 即创建,append 实时可见,行即原始事件
+    await sink.consume(_evt("session/start", seq=0, run_id="r1", label="wiki:structure",
+                            provider="claude", model=""))
     running = tmp_path / "sessions" / "running" / "s1.jsonl"
     assert running.exists()
-    await sink.consume(_evt("block.start", seq=1, block_type="content"))
-    await sink.consume(_evt("text.delta", seq=2, text="你好"))
-    await sink.consume(_evt("block.stop", seq=3, block_type="content"))
+    await sink.consume(_evt("assistant/chunk", seq=1,
+                            chunk={"type": "text", "index": 0, "text": "你好"}))
+    await sink.consume(_evt("assistant/message", seq=2,
+                            message={"role": "assistant", "content": [{"type": "text", "text": "你好"}]},
+                            surfaceOp="append", sourceSeqs=[1]))
     lines = [json.loads(line) for line in running.read_text().splitlines()]
-    assert [ln["type"] for ln in lines] == ["session.start", "round.start", "block.start",
-                                            "block.delta", "block.end"]
+    assert [ln["type"] for ln in lines] == ["session/start", "assistant/chunk", "assistant/message"]
     # completed:终态 os.replace 原子迁出,无 .tmp 残留
-    await sink.consume(_evt("run.end", seq=4, ok=True))
+    await sink.consume(_evt("session/end", seq=3, state="completed", ok=True,
+                            duration_ms=10, text_chars=2, num_steps=1))
     assert not running.exists()
     completed = tmp_path / "sessions" / "completed" / "s1.jsonl"
     assert completed.exists()
     assert not list((tmp_path / "sessions" / "completed").glob("*.tmp"))
     final = [json.loads(line) for line in completed.read_text().splitlines()]
-    assert final[-1]["type"] == "session.end" and final[-1]["state"] == "completed"
+    assert final[-1]["type"] == "session/end" and final[-1]["data"]["state"] == "completed"
 
 
 @pytest.mark.asyncio
 async def test_file_sink_aborted_by_error(tmp_path):
     sink = FileSink(str(tmp_path))
-    await sink.consume(_evt("run.start", session="s2", prompt_chars=5, prompt_preview="hi",
-                            n_messages=1, system_chars=0, tool_names=[]))
-    await sink.consume(_evt("error", session="s2", exc_type="RuntimeError", message="agent 执行失败", stage="run"))
+    await sink.consume(_evt("session/start", session="s2", seq=0, run_id="r2",
+                            label="wiki:structure", provider="claude", model=""))
+    await sink.consume(_evt("error", session="s2", seq=1, stage="run",
+                            exc_type="RuntimeError", message="agent 执行失败"))
+    await sink.consume(_evt("session/end", session="s2", seq=2, state="aborted", ok=False,
+                            reason="RuntimeError: agent 执行失败", duration_ms=5,
+                            text_chars=0, num_steps=1))
     aborted = tmp_path / "sessions" / "aborted" / "s2.jsonl"
     assert aborted.exists()
     final = [json.loads(line) for line in aborted.read_text().splitlines()]
-    assert final[-1]["type"] == "session.end" and final[-1]["state"] == "aborted"
-    assert "RuntimeError" in final[-1]["reason"]
+    assert final[-1]["type"] == "session/end" and final[-1]["data"]["state"] == "aborted"
+    assert "RuntimeError" in final[-1]["data"]["reason"]
 
 
 # ---------------------------------------------------------------------------
@@ -139,17 +157,15 @@ async def test_file_sink_aborted_by_error(tmp_path):
 
 @pytest.mark.asyncio
 async def test_stream_adapter_normalizes_events():
+    """流事件 → 事件溯源:chunk 原始增量(含 thinking/tool_input)、tool/call 原始
+    arguments 字符串、tool/result 全量、工具结果后 message_start → step 边界。"""
     agent.configure(file=False, ws_urls=[], otel_urls=[])
     got = []
     bus = sinks.ensure_bus()
-    assert bus.enabled is False
-
-    async def recv(evt):
-        got.append(evt)
-
-    bus.add(recv)
+    bus.add(_recv(got))
     run = _Run("s1", "claude", "", label="t")
-    # 第 0 轮:正文块 + 思考块
+    run.start()
+    # 第 1 步:正文块 + 思考块
     _handle_stream_event(run, {"type": "content_block_start", "index": 0, "content_block": {"type": "text"}})
     _handle_stream_event(run, {"type": "content_block_delta", "index": 0,
                                "delta": {"type": "text_delta", "text": "hi"}})
@@ -158,7 +174,7 @@ async def test_stream_adapter_normalizes_events():
     _handle_stream_event(run, {"type": "content_block_delta", "index": 1,
                                "delta": {"type": "thinking_delta", "thinking": "深"}})
     _handle_stream_event(run, {"type": "content_block_stop", "index": 1})
-    # 工具调用:碎片 JSON 装配为终值
+    # 工具调用:碎片 JSON 增量,收尾 raw arguments 字符串(不解析)
     _handle_stream_event(run, {"type": "content_block_start", "index": 2,
                                "content_block": {"type": "tool_use", "id": "t1", "name": "graphify_query"}})
     _handle_stream_event(run, {"type": "content_block_delta", "index": 2,
@@ -166,38 +182,58 @@ async def test_stream_adapter_normalizes_events():
     _handle_stream_event(run, {"type": "content_block_delta", "index": 2,
                                "delta": {"type": "input_json_delta", "partial_json": ': "x"}'}})
     _handle_stream_event(run, {"type": "content_block_stop", "index": 2})
-    # 用户段工具结果(文本片段归属 tool.result,不入 text.delta)
+    # 用户段工具结果(文本片段归属 tool/result,不入 text chunk)
     _handle_stream_event(run, {"type": "message_start", "message": {"role": "user"}})
     _handle_stream_event(run, {"type": "content_block_start", "index": 0,
                                "content_block": {"type": "tool_result", "tool_use_id": "t1", "is_error": False}})
     _handle_stream_event(run, {"type": "content_block_delta", "index": 0,
-                               "delta": {"type": "text_delta", "text": "结果片段"}})
+                               "delta": {"type": "text_delta", "text": "结果"}})
+    _handle_stream_event(run, {"type": "content_block_delta", "index": 0,
+                               "delta": {"type": "text_delta", "text": "片段"}})
     _handle_stream_event(run, {"type": "content_block_stop", "index": 0})
-    # 下一段 assistant 消息 → round+1
+    # 下一段 assistant 消息 → step 边界(step/end + step/start)
     _handle_stream_event(run, {"type": "message_start", "message": {"role": "assistant"}})
     _handle_stream_event(run, {"type": "content_block_start", "index": 0, "content_block": {"type": "text"}})
     _handle_stream_event(run, {"type": "content_block_delta", "index": 0,
                                "delta": {"type": "text_delta", "text": "答案是"}})
     await asyncio.sleep(0.05)
 
-    assert [(g["kind"], g.get("round")) for g in got][:3] == \
-        [("block.start", 0), ("text.delta", 0), ("block.stop", 0)]
-    tool_stop = next(g for g in got if g["kind"] == "block.stop" and g.get("tool_input"))
-    assert tool_stop["tool_input"] == {"q": "x"} and tool_stop["tool_id"] == "t1"
-    tres = next(g for g in got if g["kind"] == "tool.result")
-    assert tres["tool_id"] == "t1" and tres["tool_name"] == "graphify_query"
-    assert tres["content_chars"] == 4 and tres["round"] == 0
-    assert tres["content_preview"] == "结果片段"
-    assert got[-1]["kind"] == "text.delta" and got[-1]["round"] == 1 and got[-1]["text"] == "答案是"
+    types_ = [g["type"] for g in got]
+    assert types_[:4] == ["session/start", "turn/start", "step/start", "assistant/chunk"]
+    asst = next(g for g in got if g["type"] == "assistant/chunk")
+    assert asst["data"]["chunk"]["text"] == "hi" and asst["seq"] == 3  # seq 从 0 连续
+    thinking = next(g for g in got if g["type"] == "assistant/chunk"
+                    and g["data"]["chunk"].get("type") == "thinking")
+    assert thinking["data"]["chunk"]["text"] == "深"
+    tool_c = next(g for g in got if g["type"] == "tool/call")
+    assert tool_c["data"]["arguments"] == '{"q": "x"}'  # 原始字符串,JSON 解析交给 UI
+    assert tool_c["data"]["callId"] == "t1" and tool_c["data"]["name"] == "graphify_query"
+    tres = next(g for g in got if g["type"] == "tool/result")
+    assert tres["data"]["message"]["content"][0]["content"] == "结果片段"  # 全量不截断
+    assert tres["data"]["is_error"] is False and tres["data"]["step"] == 1
+    assert tres["data"]["sourceSeqs"] == [tool_c["seq"]]
+    # 工具结果后:step/end + step/start,新正文 chunk 归属 step 2
+    last = got[-1]
+    assert last["type"] == "assistant/chunk" and last["data"]["step"] == 2
+    assert last["data"]["chunk"]["text"] == "答案是"
+    # step 事件次序:run 入口开 step1,工具结果后收尾并开 step2
+    assert [g["type"] for g in got if g["type"] in ("step/end", "step/start")] == \
+        ["step/start", "step/end", "step/start"]
 
 
-def test_assistant_message_monitors_but_never_duplicates():
-    """整块消息:未产出增量时事件化一次;已产出增量时只记元信息。"""
+@pytest.mark.asyncio
+async def test_assistant_message_monitors_but_never_duplicates():
+    """整块消息:未产出增量时事件化一次(文本 chunk + 全量消息);已产出增量时
+    只记元信息;无流事件的 tool_use 兜底补合成 tool/call。"""
     agent.configure(file=False, ws_urls=[], otel_urls=[])
+    got = []
+    bus = sinks.ensure_bus()
+    bus.add(_recv(got))
     msg = types.SimpleNamespace(
         content=[
             types.SimpleNamespace(type="text", text="hi"),
-            types.SimpleNamespace(type="thinking", text=None),
+            types.SimpleNamespace(type="thinking", thinking="想", text=None),
+            types.SimpleNamespace(type="tool_use", id="t2", name="read_file", input={"path": "a.py"}),
         ],
         stop_reason="end_turn",
         usage=types.SimpleNamespace(input_tokens=3, output_tokens=5, cache_read_input_tokens=1),
@@ -205,9 +241,19 @@ def test_assistant_message_monitors_but_never_duplicates():
     run = _Run("s1", "claude", "", label="t")
     _handle_assistant_message(run, msg, already_yielded=False)
     assert run.text_chars == 2
+    await asyncio.sleep(0.05)
+    asst = next(g for g in got if g["type"] == "assistant/message")
+    assert asst["data"]["message"]["content"][0] == {"type": "text", "text": "hi"}
+    assert asst["data"]["usage"] == {
+        "input_tokens": 3, "output_tokens": 5, "cache_read_input_tokens": 1,
+    }
+    assert asst["data"]["sourceSeqs"] == [g["seq"] for g in got if g["type"] == "assistant/chunk"]
+    assert asst["data"]["stop_reason"] == "end_turn"
+    synth = next(g for g in got if g["type"] == "tool/call")  # 兜底合成
+    assert synth["data"]["callId"] == "t2" and synth["data"]["arguments"] == '{"path": "a.py"}'
     run2 = _Run("s2", "claude", "", label="t")
-    _handle_assistant_message(run2, msg, already_yielded=True)
-    assert run2.text_chars == 0  # 兜底不重复流式增量
+    _handle_assistant_message(run2, msg, already_yielded=True)  # 已产出 → 不重复
+    assert run2.text_chars == 0
 
 
 def test_normalize_usage_maps_sdk_and_http():
@@ -319,6 +365,33 @@ async def test_cc_stream_exact_output_no_duplicates(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_cc_stream_captures_event_sequence(monkeypatch):
+    """监控开启 + 假 SDK:全事件序列(含全量 prompt user/message、partial header)可折叠。"""
+    agent.configure(file=False, ws_urls=[], otel_urls=[])
+    got = []
+    sinks.ensure_bus().add(_recv(got))
+    sdk = _fake_sdk([
+        _FakeStreamEvent({"type": "content_block_start", "index": 0, "content_block": {"type": "text"}}),
+        _FakeStreamEvent({"type": "content_block_delta", "index": 0,
+                          "delta": {"type": "text_delta", "text": "hi"}}),
+        _FakeStreamEvent({"type": "content_block_stop", "index": 0}),
+        _FakeAssistantMessage(content=[types.SimpleNamespace(type="text", text="hi")]),
+        _FakeResultMessage(result="hi", usage=types.SimpleNamespace(input_tokens=2, output_tokens=1)),
+    ])
+    monkeypatch.setitem(sys.modules, "claude_agent_sdk", sdk)
+    await agent.cc_text(_options(), "整段 prompt ⚙", session_name="x", run_id="r1")
+    await asyncio.sleep(0.05)
+    types_ = [g["type"] for g in got]
+    assert types_[0] == "session/start" and got[0]["run_id"] == "r1"
+    assert "user/message" in types_ and "request/header" in types_ and "assistant/message" in types_
+    assert types_[-2:] == ["turn/end", "session/end"] and got[-1]["data"]["state"] == "completed"
+    um = next(g for g in got if g["type"] == "user/message")
+    assert um["data"]["message"]["content"][0]["text"] == "整段 prompt ⚙"  # 全量不截断
+    rs = next(g for g in got if g["type"] == "session/end")
+    assert rs["data"]["usage"] == {"input_tokens": 2, "output_tokens": 1, "cache_read_input_tokens": None}
+
+
+@pytest.mark.asyncio
 async def test_cc_text_fallback_without_partials(monkeypatch, tmp_path):
     """无 partial 事件:AssistantMessage 整块兜底一次,输出与原漏斗一致。"""
     agent.configure(file=False, file_dir=str(tmp_path), ws_urls=[], otel_urls=[])
@@ -375,11 +448,9 @@ async def test_ws_sink_forwards_raw_events_only(monkeypatch):
 
     sink = agent.WsSink("ws://preview/ws")
     evts = [
-        _evt("run.start", seq=0, prompt_chars=5, prompt_preview="hi", n_messages=1,
-             system_chars=0, tool_names=[]),
-        _evt("block.start", seq=1, block_type="content"),
-        _evt("text.delta", seq=2, text="你好"),
-        _evt("text.delta", seq=3, text="世界"),
+        _evt("session/start", seq=0, run_id=None, label="wiki:structure", provider="claude", model=""),
+        _evt("assistant/chunk", seq=1, chunk={"type": "text", "index": 0, "text": "你好"}),
+        _evt("assistant/chunk", seq=2, chunk={"type": "text", "index": 0, "text": "世界"}),
     ]
     for e in evts:
         await sink.consume(e)
@@ -389,9 +460,10 @@ async def test_ws_sink_forwards_raw_events_only(monkeypatch):
         assert sent == [{"type": "evt", "event": e} for e in evts]
         # 无聚合产物泄漏(无 llm 行帧),delta 只携本块文本
         assert not any(f.get("line") for f in sent)
-        delta_texts = [f["event"]["text"] for f in sent if f["event"]["kind"] == "text.delta"]
+        delta_texts = [f["event"]["data"]["chunk"]["text"] for f in sent
+                       if f["event"]["type"] == "assistant/chunk"]
         assert delta_texts == ["你好", "世界"]
-        assert "你好世界" not in [f["event"].get("text", "") for f in sent]
+        assert "你好世界" not in delta_texts
         assert connects == ["ws://preview/ws"]  # 单连接,无重连抖动
     finally:
         sink._task.cancel()
@@ -416,69 +488,78 @@ def _otel_sink():
 async def test_otel_span_tree():
     sink, exporter = _otel_sink()
     for evt in [
-        _evt("run.start", seq=0, prompt_chars=6, prompt_preview="prompt", n_messages=1,
-             system_chars=10, tool_names=["graphify_query"]),
-        _evt("block.start", seq=1, block_type="content"),
-        _evt("text.delta", seq=2, text="你好"),
-        _evt("text.delta", seq=3, text="世界"),
-        _evt("block.stop", seq=4),
-        _evt("block.start", seq=5, block_type="tool_use", tool_id="t1", tool_name="graphify_query"),
-        _evt("block.stop", seq=6, block_type="tool_use", tool_id="t1", tool_input={"q": "x"}),
-        _evt("tool.result", seq=7, tool_id="t1", tool_name="graphify_query", is_error=False,
-             content_chars=4, content_preview="结果"),
-        _evt("result", seq=8, usage={"input_tokens": 3, "output_tokens": 5,
-                                     "cache_read_input_tokens": 1}, total_cost_usd=0.001,
-             duration_ms=123),
-        _evt("run.end", seq=9, ok=True, text_chars=4, duration_ms=123, num_rounds=1),
+        _evt("session/start", seq=0, run_id="r1", label="wiki:structure",
+             provider="claude", model=""),
+        _evt("step/start", seq=1, turn=1, step=1),
+        _evt("assistant/chunk", seq=2, chunk={"type": "text", "index": 0, "text": "你好"}),
+        _evt("assistant/chunk", seq=3, chunk={"type": "text", "index": 0, "text": "世界"}),
+        _evt("assistant/message", seq=4, message={"role": "assistant", "content": []},
+             usage={"input_tokens": 3, "output_tokens": 5, "cache_read_input_tokens": 1},
+             stop_reason="end_turn", surfaceOp="append"),
+        _evt("tool/call", seq=5, callId="t1", name="graphify_query", arguments='{"q": "x"}'),
+        _evt("tool/result", seq=6, callId="t1", name="graphify_query", is_error=False,
+             message={"role": "user", "content": [
+                 {"type": "tool_result", "tool_use_id": "t1", "content": "结果", "is_error": False}]},
+             surfaceOp="append", sourceSeqs=[5]),
+        _evt("step/end", seq=7, turn=1, step=1),
+        _evt("session/end", seq=8, state="completed", ok=True, duration_ms=123,
+             text_chars=4, num_steps=1),
     ]:
         await sink.consume(evt)
-    root = next(s for s in exporter.get_finished_spans() if s.name == "wiki:structure · claude")
-    content = next(s for s in exporter.get_finished_spans() if s.name == "block.content")
-    tool = next(s for s in exporter.get_finished_spans() if s.name == "block.tool_use")
-    tres = next(s for s in exporter.get_finished_spans() if s.name.startswith("tool.result"))
-    # 父子关系:块/工具结果都挂在根 span 下
-    assert content.parent.span_id == root.context.span_id
-    assert tool.parent.span_id == root.context.span_id
+    spans = exporter.get_finished_spans()
+    root = next(s for s in spans if s.name == "wiki:structure · claude")
+    step = next(s for s in spans if s.name == "step.1")
+    tool_call = next(s for s in spans if s.name == "tool.call:graphify_query")
+    tres = next(s for s in spans if s.name == "tool.result:graphify_query")
+    # 父子关系:step/工具都挂在根 span 下
+    assert step.parent.span_id == root.context.span_id
+    assert tool_call.parent.span_id == root.context.span_id
     assert tres.parent.span_id == root.context.span_id
     assert root.attributes["gen_ai.provider.name"] == "claude"
-    assert root.attributes["gh_puller.prompt_preview"] == "prompt"
-    assert root.attributes["gh_puller.tool_names"] == '["graphify_query"]'
+    assert root.attributes["gh_puller.run_id"] == "r1"
     assert root.attributes["gen_ai.usage.input_tokens"] == 3
-    assert root.attributes["gh_puller.total_cost_usd"] == 0.001
+    assert root.attributes["gh_puller.stop_reason"] == "end_turn"
     assert root.attributes["gh_puller.duration_ms"] == 123
+    assert root.attributes["gh_puller.num_steps"] == 1
     assert root.status.status_code == StatusCode.OK
-    assert content.attributes["gh_puller.text_chars"] == 4
-    assert content.attributes["gh_puller.text_preview"] == "你好世界"
-    assert tool.attributes["gh_puller.tool_input"] == '{"q": "x"}'
+    assert step.attributes["gh_puller.text_chars"] == 4
+    assert step.attributes["gh_puller.text_preview"] == "你好世界"
+    assert tool_call.attributes["gh_puller.arguments_preview"] == '{"q": "x"}'
+    assert tres.attributes["gh_puller.content_preview"] == "结果"
     assert tres.attributes["gh_puller.is_error"] is False
-    assert sink._spans == {}  # run.end 清场
+    assert sink._spans == {}  # session/end 清场
 
 
 @pytest.mark.asyncio
 async def test_otel_error_status_and_cleanup():
     sink, exporter = _otel_sink()
-    await sink.consume(_evt("run.start", seq=0, prompt_chars=5, prompt_preview="p", n_messages=1,
-                            system_chars=0, tool_names=[]))
-    await sink.consume(_evt("error", seq=1, exc_type="RuntimeError", message="agent 执行失败: boom",
-                            stage="run"))
-    await sink.consume(_evt("run.end", seq=2, ok=False, text_chars=0, duration_ms=10, num_rounds=1))
+    await sink.consume(_evt("session/start", seq=0, run_id=None, label="wiki:structure",
+                            provider="claude", model=""))
+    await sink.consume(_evt("error", seq=1, stage="run", exc_type="RuntimeError",
+                            message="agent 执行失败: boom"))
+    await sink.consume(_evt("session/end", seq=2, state="aborted", ok=False,
+                            duration_ms=10, text_chars=0, num_steps=1,
+                            reason="RuntimeError: agent 执行失败: boom"))
     root = exporter.get_finished_spans()[0]
     assert root.status.status_code == StatusCode.ERROR
     assert "RuntimeError" in root.attributes["gh_puller.error"]
     assert root.attributes["gh_puller.error_stage"] == "run"
     assert root.attributes["gh_puller.duration_ms"] == 10
+    assert sinks  # 防未用 import 误删(见下)
     assert sink._spans == {}
 
 
 @pytest.mark.asyncio
 async def test_otel_usage_attrs_skip_none():
     sink, exporter = _otel_sink()
-    await sink.consume(_evt("run.start", seq=0, prompt_chars=5, prompt_preview="p", n_messages=1,
-                            system_chars=0, tool_names=[]))
-    await sink.consume(_evt("message.assistant", seq=1,
+    await sink.consume(_evt("session/start", seq=0, run_id=None, label="wiki:structure",
+                            provider="claude", model=""))
+    await sink.consume(_evt("assistant/message", seq=1,
+                            message={"role": "assistant", "content": [{"type": "text", "text": "x"}]},
                             usage={"input_tokens": 8, "output_tokens": 2, "cache_read_input_tokens": None},
-                            stop_reason="end_turn"))
-    await sink.consume(_evt("run.end", seq=2, ok=True, text_chars=0, duration_ms=9, num_rounds=1))
+                            stop_reason="end_turn", surfaceOp="append"))
+    await sink.consume(_evt("session/end", seq=2, state="completed", ok=True,
+                            duration_ms=9, text_chars=1, num_steps=1))
     root = exporter.get_finished_spans()[0]
     assert root.attributes["gen_ai.usage.input_tokens"] == 8
     assert root.attributes["gen_ai.usage.output_tokens"] == 2
@@ -503,9 +584,9 @@ async def test_otel_failure_isolated(monkeypatch):
             raise RuntimeError("boom")
 
     sink = OtelSink("http://preview/v1/traces", tracer=_BoomTracer())
-    await sink.consume(_evt("run.start", seq=0, prompt_chars=5, prompt_preview="p", n_messages=1,
-                            system_chars=0, tool_names=[]))  # start_span 抛 → 吞掉不抛
-    await sink.consume(_evt("text.delta", seq=1, text="x"))  # 同一会话已报过 → 静默
+    await sink.consume(_evt("session/start", seq=0, run_id=None, label="wiki:structure",
+                            provider="claude", model=""))  # start_span 抛 → 吞掉不抛
+    await sink.consume(_evt("assistant/chunk", seq=1, chunk={"type": "text", "index": 0, "text": "x"}))  # 已报过 → 静默
     assert len(logged) == 1
     assert "otel sink 消费失败" in logged[0]
 

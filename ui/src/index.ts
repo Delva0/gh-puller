@@ -22,3 +22,19 @@ export type {
   CodemapPhase,
   CodemapEvent,
 } from './types/codemap';
+// 监控会话页(对话/轨迹;宿主 apps/agent-dashboard 主面板组装)
+export { default as MonitorSessionList } from './components/MonitorSessionList';
+export { default as MonitorConversation } from './components/MonitorConversation';
+export type { MonitorView } from './components/MonitorConversation';
+export { default as MonitorChatView } from './components/MonitorChatView';
+export { default as MonitorNodeSeat } from './components/MonitorNodeSeat';
+export { default as MonitorMessageItem } from './components/MonitorMessageItem';
+export { default as MonitorToolCall } from './components/MonitorToolCall';
+export { default as MonitorContextRow } from './components/MonitorContextRow';
+export { default as MonitorTurnTail } from './components/MonitorTurnTail';
+export { default as MonitorTrajectoryView } from './components/MonitorTrajectoryView';
+export { default as MonitorTrajectoryToolbar } from './components/MonitorTrajectoryToolbar';
+export { default as MonitorTrajectoryTimeline } from './components/MonitorTrajectoryTimeline';
+export { default as MonitorTrajectoryTable } from './components/MonitorTrajectoryTable';
+// 监控数据层(纯 TS 折叠/快照/时间轴/搜索;零 React)
+export * from './monitor';

@@ -2,8 +2,8 @@
 
 用户定义两种观测通道,无控制台通道:
 - 文件 sink(默认恒开):AGENT_MONITOR_DIR/sessions/{running,completed,aborted}/<session>.jsonl,
-  每行是 LLM 流 —— 事件流的增量聚合产物(thinking/content 各并 1 块/轮、工具块 0..n),
-  聚合器见 gh_puller.agent.events.LlmAggregator,纯 dict 一处实现,FS/hub 共用;
+  每行一条原始事件(事件溯源,全量无损 —— 折叠恢复规范见 gh_puller.agent.events;
+  取代 v1 的 LLM 流聚合行,旧格式不兼容,历史数据需手动清理);
 - Web/WS sink(AGENT_MONITOR_WEBUI_URL,默认 ws://localhost:8765/ws,逗号分隔多 hub):
   事件流推送给独立 hub(apps/agent-dashboard/server/,WS 端点 /ws),浏览器实时查看;
 - OTel sink(AGENT_MONITOR_PHOENIX_URL,默认 http://localhost:6006/):事件流 → span 树 →
@@ -23,18 +23,18 @@ import asyncio
 import json
 import os
 import socket
-import sys
 from pathlib import Path
 from urllib.parse import urlsplit
 
 from .. import envs
-from .events import LlmAggregator, truncate
+from ..utils import _log as _utils_log
+from .events import truncate
 
 _STATE_DIRS = ("running", "completed", "aborted")
 
 
 def _log(msg: str) -> None:
-    print(f"[agent-monitor] {msg}", file=sys.stderr, flush=True)
+    _utils_log(msg, prefix="agent-monitor")
 
 
 # ---------------------------------------------------------------------------
@@ -83,45 +83,39 @@ class EventBus:
 
 
 class FileSink:
-    """文件观测通道:每会话一个 JSONL(LLM 流行),终态经 os.replace 迁入对应状态目录。
+    """文件观测通道:每会话一个 JSONL,每行一条原始事件(事件溯源,全量无损)。
 
-    目录结构即索引(sessions/{running,aborted,completed}/),行即自描述 LLM 流,
-    Linux 查询友好:tail -f running/*.jsonl 实时看,jq 过滤块文本还原全文。
-    崩溃残留停留在 running/(即排查素材);hub 启动时按文件所在目录种子状态。
+    目录结构即索引(sessions/{running,aborted,completed}/),行即自描述事件;
+    Linux 查询友好:tail -f running/*.jsonl 实时看,jq 过滤并按折叠规范
+    (gh_puller.agent.events)还原任意时刻消息上下文。终态经 os.replace 迁入
+    对应状态目录;崩溃残留停留在 running/(即排查素材);hub 启动时按文件
+    所在目录种子状态。无 session/start 起点的事件不可分组,丢弃(同 v1 语义)。
     """
 
     def __init__(self, root: str):
         self.root = Path(root)
-        self._agg: dict[str, LlmAggregator] = {}
         self._files: dict[str, Path] = {}
         for st in _STATE_DIRS:
             (self.root / "sessions" / st).mkdir(parents=True, exist_ok=True)
 
     async def consume(self, evt: dict) -> None:
         session = evt.get("session", "")
-        if evt["kind"] == "run.start":
-            self._open(session, evt)
-        agg = self._agg.get(session)
-        if agg is None:
-            return  # 无 run.start 起点:事件不可聚合,丢弃
-        lines = agg.feed(evt)
-        if not lines:
+        if evt["type"] == "session/start":
+            self._open(session)
+        path = self._files.get(session)
+        if path is None:
             return
-        with open(self._files[session], "a", encoding="utf-8") as f:
-            for line in lines:
-                f.write(json.dumps(line, ensure_ascii=False) + "\n")
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(evt, ensure_ascii=False) + "\n")
             f.flush()
-        if lines[-1]["type"] == "session.end":
-            self._close(session, lines[-1]["state"])
+        if evt["type"] == "session/end":
+            self._close(session, (evt.get("data") or {}).get("state", "completed"))
 
-    def _open(self, session: str, evt: dict) -> None:
-        agg = LlmAggregator(session, evt.get("label", ""), evt.get("provider", ""), evt.get("model", ""))
-        self._agg[session] = agg
+    def _open(self, session: str) -> None:
         self._files[session] = self.root / "sessions" / "running" / f"{session}.jsonl"
 
     def _close(self, session: str, state: str) -> None:
         src = self._files.pop(session)
-        self._agg.pop(session)
         os.replace(src, self.root / "sessions" / state / src.name)
 
 
@@ -196,14 +190,14 @@ def _otel():
 class OtelSink:
     """事件流消费端:逐会话构建 OTel span 树并经 OTLP 导出(契约同 FileSink)。
 
-    只消费 gh_puller.agent.events 的事件 dict(无 run.start 起点则忽略),零 SDK 依赖;
-    对外的信息粒度与 FileSink 的 LLM 流一致但落在标准 OTel 上:
-    - 根 span 一次 agent 运行(run.start → run.end),按会话维护 span 树;
-    - 块级粒度:每个 content/thinking/tool_use 块一个子 span,block.stop 即 end——
-      SimpleSpanProcessor 同步导出(块级实时);OTLP 协议无 token 级增量语义,
-      text.delta/thinking.delta 只累加进当前块的属性(不逐字传输);
-    - 工具结果/usage/错误/成本挂在细粒度 span 或根 span 属性上,gen_ai.* 兼容
-      Phoenix 等后端的自动识别。
+    只消费 gh_puller.agent.events 的事件 dict(无 session/start 起点则忽略),零 SDK 依赖;
+    对外粒度落在标准 OTel 上:
+    - 根 span 一次 agent 运行(session/start → session/end),按会话维护;
+    - step/start→end 对应一次 LLM 请求,原文/思考增量只累加进 step span 属性
+      (OTLP 协议无 token 级增量语义,预览截断 300 字);
+    - tool/call / tool/result 子 span(调用参数与结果预览;is_error → ERROR);
+    - usage/停止原因/错误/上下文事件挂在根 span 属性上,gen_ai.* 兼容 Phoenix 等
+      后端的自动识别。
 
     opentelemetry 为可选依赖(惰性导入于 __init__:缺失 → ImportError,由 ensure_bus
     降级)。tracer 注入为测试用(InMemorySpanExporter);缺省懒建
@@ -224,34 +218,38 @@ class OtelSink:
             )
             tp.add_span_processor(SimpleSpanProcessor(otel_exporter(endpoint=endpoint)))
             self.tracer = tp.get_tracer("gh-puller.agent-monitor")
-        self._spans: dict[str, dict] = {}  # session → {root, stack, error, logged…}
+        self._spans: dict[str, dict] = {}  # session → {root, step, buf…}
         self._failed: set[str] = set()  # 已报过错的 session(每会话只报一次)
 
     # ---- 事件分发 ----
 
     async def consume(self, evt: dict) -> None:
         session = evt.get("session", "")
-        kind = evt.get("kind")
+        t = evt.get("type")
         try:
             state = self._spans.get(session) if session else None
-            if kind == "run.start":
-                self._on_run_start(session, evt)
+            if t == "session/start":
+                self._on_session_start(session, evt)
             elif state is None:
-                return  # 无 run.start 起点:事件不可分组,丢弃(同 FileSink)
-            elif kind == "block.start":
-                self._on_block_start(state, evt)
-            elif kind in ("text.delta", "thinking.delta"):
-                self._on_delta(state, evt, kind)
-            elif kind == "block.stop":
-                self._on_block_stop(state, evt)
-            elif kind == "tool.result":
+                return  # 无 session/start 起点:事件不可分组,丢弃(同 FileSink)
+            elif t == "session/end":
+                self._on_session_end(session, evt)
+            elif t == "step/start":
+                self._on_step_start(state, evt)
+            elif t == "step/end":
+                self._on_step_end(state, evt)
+            elif t == "assistant/chunk":
+                self._on_chunk(state, evt)
+            elif t == "assistant/message":
+                self._on_message(state, evt)
+            elif t == "tool/call":
+                self._on_tool_call(state, evt)
+            elif t == "tool/result":
                 self._on_tool_result(state, evt)
-            elif kind in ("message.assistant", "result"):
-                self._on_result_like(state, evt)
-            elif kind == "error":
+            elif t == "error":
                 self._on_error(state, evt)
-            elif kind == "run.end":
-                self._on_run_end(session, evt)
+            else:  # turn/user/request/context 信息事件:根 span 属性
+                self._on_info(state, evt)
         except Exception as exc:  # 隔离:监控失败绝不冒泡(每次会话只报一次)
             if session not in self._failed:
                 self._failed.add(session)
@@ -263,137 +261,171 @@ class OtelSink:
         ctx = self._trace.set_span_in_context(state["root"])
         return self.tracer.start_span(name, context=ctx, start_time=_ns(ts))
 
-    def _on_run_start(self, session: str, evt: dict) -> None:
+    def _on_session_start(self, session: str, evt: dict) -> None:
         stale = self._spans.pop(session, None)  # 同会话重入:旧根强制收尾
         if stale is not None:
             stale["root"].end(end_time=_ns(evt.get("ts")))
-        label = evt.get("label") or session
+        d = evt.get("data") or {}
+        label = d.get("label") or session
         root = self.tracer.start_span(
-            f"{label} · {evt.get('provider', '')}".strip(" ·"),
+            f"{label} · {d.get('provider', '')}".strip(" ·"),
             start_time=_ns(evt.get("ts")),
         )
         self._spans[session] = {
             "root": root,
-            "stack": [],
+            "step": None,
+            "step_n": 0,
+            "buf": "",
+            "thinking": "",
             "error": None,
-            "tool_names": evt.get("tool_names"),
+            "context_chars": 0,
+            "modifies": [],
         }
         _attrs(root, {
-            "gen_ai.provider.name": evt.get("provider"),
-            "gen_ai.request.model": evt.get("model"),
+            "gen_ai.provider.name": d.get("provider"),
+            "gen_ai.request.model": d.get("model"),
             "gh_puller.session": session,
             "gh_puller.label": label,
-            "gh_puller.prompt_preview": evt.get("prompt_preview"),
-            "gh_puller.prompt_chars": evt.get("prompt_chars"),
-            "gh_puller.n_messages": evt.get("n_messages"),
-            "gh_puller.system_chars": evt.get("system_chars"),
-            "gh_puller.tool_names": evt.get("tool_names"),
-            "gh_puller.meta": evt.get("meta"),
+            "gh_puller.run_id": d.get("run_id"),
+            "gh_puller.retry": d.get("retry"),
+            "gh_puller.meta": d.get("meta"),
         })
 
-    def _open_block(self, state: dict, kind: str, evt: dict, *, tool_id=None, tool_name=None) -> dict:
-        span = self._child(state, f"block.{kind}", evt.get("ts"))
-        _attrs(span, {"gh_puller.block_type": kind, "gh_puller.round": evt.get("round"),
-                      "gh_puller.tool_id": tool_id, "gh_puller.tool_name": tool_name})
-        entry = {"kind": kind, "span": span, "buf": "", "tool_id": tool_id, "tool_name": tool_name}
-        state["stack"].append(entry)
-        return entry
+    def _on_step_start(self, state: dict, evt: dict) -> None:
+        state["step_n"] += 1
+        state["buf"] = ""  # 每步独立累加:一步 = 一次 LLM 请求
+        state["thinking"] = ""
+        span = self._child(state, f"step.{state['step_n']}", evt.get("ts"))
+        _attrs(span, {"gh_puller.turn": evt["data"].get("turn"), "gh_puller.step": evt["data"].get("step")})
+        state["step"] = span
 
-    def _on_block_start(self, state: dict, evt: dict) -> None:
-        kind = evt.get("block_type")
-        if kind == "tool_use":
-            self._open_block(state, "tool_use", evt, tool_id=evt.get("tool_id"),
-                             tool_name=evt.get("tool_name"))
-        elif kind in ("content", "thinking"):
-            self._open_block(state, kind, evt)
-
-    def _on_delta(self, state: dict, evt: dict, kind: str) -> None:
-        """delta 累加进当前块:类型不匹配(兜底路径无 block.start)则自动开块。"""
-        btype = "content" if kind == "text.delta" else "thinking"
-        top = state["stack"][-1] if state["stack"] else None
-        if top is None or top["kind"] != btype:
-            top = self._open_block(state, btype, evt)
-        top["buf"] += evt.get("text") or evt.get("thinking", "") or ""
-
-    def _pop_block(self, state: dict, *, tool_id=None) -> dict | None:
-        """按 tool_id(工具块可交错)或最近非工具块弹出;无匹配 → None。"""
-        stack = state["stack"]
-        if tool_id is not None:
-            for i in range(len(stack) - 1, -1, -1):
-                if stack[i]["tool_id"] == tool_id:
-                    return stack.pop(i)
-        for i in range(len(stack) - 1, -1, -1):
-            if stack[i]["kind"] in ("content", "thinking"):
-                return stack.pop(i)
-        return None
-
-    def _on_block_stop(self, state: dict, evt: dict) -> None:
-        entry = self._pop_block(state, tool_id=evt.get("tool_id"))
-        if entry is None:
+    def _on_step_end(self, state: dict, evt: dict) -> None:
+        span = state["step"]
+        if span is None:
             return
-        span = entry["span"]
-        if entry["kind"] == "tool_use":
-            _attrs(span, {"gh_puller.tool_id": evt.get("tool_id"), "gh_puller.tool_name": evt.get("tool_name"),
-                          "gh_puller.tool_input": evt.get("tool_input")})
-        else:
-            preview_len, preview = truncate(entry["buf"], 300)
-            prefix = "gh_puller.thinking" if entry["kind"] == "thinking" else "gh_puller.text"
-            _attrs(span, {f"{prefix}_chars": preview_len, f"{prefix}_preview": preview})
+        if state["thinking"]:
+            _, prev = truncate(state["thinking"], 300)
+            _attrs(span, {"gh_puller.thinking_chars": len(state["thinking"]), "gh_puller.thinking_preview": prev})
+        if state["buf"]:
+            chars, preview = truncate(state["buf"], 300)
+            _attrs(span, {"gh_puller.text_chars": chars, "gh_puller.text_preview": preview})
         span.end(end_time=_ns(evt.get("ts")))
+        state["step"] = None
 
-    def _on_tool_result(self, state: dict, evt: dict) -> None:
-        span = self._child(state, f"tool.result:{evt.get('tool_name') or evt.get('tool_id') or ''}",
-                           evt.get("ts"))
-        _attrs(span, {
-            "gh_puller.tool_id": evt.get("tool_id"),
-            "gh_puller.tool_name": evt.get("tool_name"),
-            "gh_puller.is_error": evt.get("is_error"),
-            "gh_puller.content_chars": evt.get("content_chars"),
-            "gh_puller.content_preview": evt.get("content_preview"),
-            "gh_puller.round": evt.get("round"),
-        })
-        if evt.get("is_error"):
-            span.set_status(self._trace.Status(self._trace.StatusCode.ERROR))
-        span.end(end_time=_ns(evt.get("ts")))
+    def _on_chunk(self, state: dict, evt: dict) -> None:
+        c = evt["data"]["chunk"]
+        if c.get("type") == "text":
+            state["buf"] += c.get("text") or ""
+        elif c.get("type") == "thinking":
+            state["thinking"] += c.get("text") or ""
 
-    def _set_usage(self, root, evt: dict) -> None:
-        usage = evt.get("usage") or {}
-        _attrs(root, {
+    def _on_message(self, state: dict, evt: dict) -> None:
+        d = evt["data"]
+        usage = d.get("usage") or {}
+        _attrs(state["root"], {
             "gen_ai.usage.input_tokens": usage.get("input_tokens"),
             "gen_ai.usage.output_tokens": usage.get("output_tokens"),
             "gh_puller.cache_read_input_tokens": usage.get("cache_read_input_tokens"),
-            "gh_puller.total_cost_usd": evt.get("total_cost_usd"),
+            "gh_puller.stop_reason": d.get("stop_reason"),
         })
+        if d.get("interrupted"):
+            state["root"].set_attribute("gh_puller.interrupted", True)
 
-    def _on_result_like(self, state: dict, evt: dict) -> None:
-        self._set_usage(state["root"], evt)
-        if evt.get("stop_reason"):
-            state["root"].set_attribute("gh_puller.stop_reason", evt["stop_reason"])
-        if evt.get("duration_ms") is not None:
-            state["root"].set_attribute("gh_puller.duration_ms", evt["duration_ms"])
+    def _on_tool_call(self, state: dict, evt: dict) -> None:
+        d = evt["data"]
+        args = d.get("arguments") or ""
+        span = self._child(state, f"tool.call:{d.get('name') or d.get('callId') or ''}", evt.get("ts"))
+        _attrs(span, {
+            "gh_puller.call_id": d.get("callId"),
+            "gh_puller.tool_name": d.get("name"),
+            "gh_puller.arguments_chars": len(args),
+            "gh_puller.arguments_preview": truncate(args, 300)[1],
+            "gh_puller.step": d.get("step"),
+        })
+        span.end(end_time=_ns(evt.get("ts")))
+
+    def _on_tool_result(self, state: dict, evt: dict) -> None:
+        d = evt["data"]
+        blocks = (d.get("message") or {}).get("content") or []
+        first = blocks[0] if blocks else {}
+        tid = d.get("callId") or first.get("tool_use_id")
+        content = _tool_result_text(d.get("message") or {})
+        span = self._child(state, f"tool.result:{d.get('name') or tid or ''}", evt.get("ts"))
+        chars, preview = truncate(content, 300)
+        _attrs(span, {
+            "gh_puller.call_id": tid,
+            "gh_puller.tool_name": d.get("name"),
+            "gh_puller.is_error": d.get("is_error") or bool(first.get("is_error")),
+            "gh_puller.content_chars": chars,
+            "gh_puller.content_preview": preview,
+            "gh_puller.step": d.get("step"),
+        })
+        if d.get("is_error"):
+            span.set_status(self._trace.Status(self._trace.StatusCode.ERROR))
+        span.end(end_time=_ns(evt.get("ts")))
+
+    def _on_info(self, state: dict, evt: dict) -> None:
+        t = evt.get("type")
+        d = evt.get("data") or {}
+        if t == "request/header":
+            h = d.get("header") or {}
+            _attrs(state["root"], {
+                "gh_puller.request_reason": d.get("reason"),
+                "gh_puller.request_partial": d.get("partial"),
+                "gh_puller.system_chars": len(str(h.get("system") or "")),
+                "gh_puller.tool_count": len(h.get("tools") or []),
+            })
+        elif t == "context/inject":
+            state["context_chars"] += len(str(d.get("text") or ""))
+        elif t == "context/modify":
+            state["modifies"].append(d.get("kind"))
+        elif t == "turn/end":
+            state["root"].set_attribute("gh_puller.turn_reason", d.get("reason"))
 
     def _on_error(self, state: dict, evt: dict) -> None:
-        detail = f"{evt.get('exc_type', '')}: {evt.get('message', '')}"
+        d = evt["data"]
+        detail = f"{d.get('exc_type', '')}: {d.get('message', '')}"
         state["error"] = detail
-        _attrs(state["root"], {"gh_puller.error": detail, "gh_puller.error_stage": evt.get("stage")})
+        _attrs(state["root"], {"gh_puller.error": detail, "gh_puller.error_stage": d.get("stage")})
         state["root"].set_status(self._trace.Status(self._trace.StatusCode.ERROR, detail[:300]))
 
-    def _on_run_end(self, session: str, evt: dict) -> None:
+    def _on_session_end(self, session: str, evt: dict) -> None:
         state = self._spans.pop(session, None)
         if state is None:
             return
+        d = evt.get("data") or {}
         root = state["root"]
         _attrs(root, {
-            "gh_puller.duration_ms": evt.get("duration_ms"),
-            "gh_puller.text_chars": evt.get("text_chars"),
-            "gh_puller.num_rounds": evt.get("num_rounds"),
+            "gh_puller.duration_ms": d.get("duration_ms"),
+            "gh_puller.text_chars": d.get("text_chars"),
+            "gh_puller.num_steps": d.get("num_steps"),
+            "gh_puller.state": d.get("state"),
+            "gh_puller.context_chars": state["context_chars"],
+            "gh_puller.context_modifies": state["modifies"],
         })
-        if evt.get("ok"):
+        if d.get("usage"):
+            _attrs(root, {
+                "gh_puller.final_usage": d["usage"],
+                "gh_puller.stop_reason": d.get("stop_reason"),
+            })
+        if d.get("ok"):
             root.set_status(self._trace.Status(self._trace.StatusCode.OK))
         else:
             reason = state["error"] or "agent 执行未成功完成"
             root.set_status(self._trace.Status(self._trace.StatusCode.ERROR, reason[:300]))
         root.end(end_time=_ns(evt.get("ts")))
+
+
+def _tool_result_text(message: dict) -> str:
+    """tool/result 消息 → 结果文本(preview 用):拼接各块 content。"""
+    parts = []
+    for block in message.get("content") or []:
+        c = block.get("content")
+        if isinstance(c, list):
+            parts.extend(str(x.get("text") or "") for x in c if isinstance(x, dict))
+        elif c is not None:
+            parts.append(str(c))
+    return "".join(parts)
 
 
 # ---------------------------------------------------------------------------
