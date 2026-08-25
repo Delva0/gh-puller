@@ -33,7 +33,7 @@ const IDLE_PHASES: Record<CodemapPhase, PhaseStatus> = {
 type ChatMode = 'fast' | 'deep_research' | 'codemap';
 
 const MODES: { id: ChatMode; label: string; description: string; icon: React.ReactNode }[] = [
-  { id: 'fast', label: 'Fast', description: 'Quick and responsive answers', icon: <FaBolt size={14} /> },
+  { id: 'fast', label: 'Fast', description: 'Quick and responsive answers', icon: <FaBolt size={14} suppressHydrationWarning /> },
   { id: 'deep_research', label: 'Deep Research', description: 'More thorough investigation', icon: <FaMicroscope size={14} /> },
   { id: 'codemap', label: 'Codemap', description: 'Structured explanation grounded in code', icon: <FaBook size={14} /> },
 ];
@@ -1273,8 +1273,8 @@ const Ask: React.FC<AskProps> = ({
             className="text-xs px-2.5 py-1 rounded border border-[var(--border-color)]/40 bg-[var(--background)]/10 text-[var(--foreground)]/80 hover:bg-[var(--background)]/30 hover:text-[var(--foreground)] transition-colors flex items-center gap-1.5"
           >
             <span>{selectedProvider}/{isCustomSelectedModel ? customSelectedModel : selectedModel}</span>
-            <svg className="h-3.5 w-3.5 text-[var(--accent-primary)]/70" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" />
+            <svg className="h-3.5 w-3.5 text-[var(--accent-primary)]/70" fill="none" viewBox="0 0 24 24" stroke="currentColor" suppressHydrationWarning>
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" suppressHydrationWarning />
             </svg>
           </button>
 
@@ -1318,8 +1318,8 @@ const Ask: React.FC<AskProps> = ({
                 <div className="w-4 h-4 rounded-full border-2 border-t-transparent border-white animate-spin" />
               ) : (
                 <>
-                  <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 5l7 7-7 7M5 5l7 7-7 7" />
+                  <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" suppressHydrationWarning>
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 5l7 7-7 7M5 5l7 7-7 7" suppressHydrationWarning />
                   </svg>
                   <span>{t("ask.askButton")}</span>
                 </>
@@ -1354,7 +1354,7 @@ const Ask: React.FC<AskProps> = ({
                   >
                     {current.icon}
                     <span>{current.label}</span>
-                    <FaChevronDown size={10} />
+                    <FaChevronDown size={10} suppressHydrationWarning />
                   </button>
                   {modeMenuOpen && (
                     <>

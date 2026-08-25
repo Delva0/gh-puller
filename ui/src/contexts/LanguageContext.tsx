@@ -1,6 +1,6 @@
 'use client';
 
-import { createContext, useContext, useEffect, useMemo, useState } from 'react';
+import { createContext, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import en from './messages/en';
 import zh from './messages/zh';
@@ -42,9 +42,22 @@ export const LanguageProvider = ({ children, extraMessages }: {
     en: { ...baseDicts.en, ...extraMessages?.en },
     zh: { ...baseDicts.zh, ...extraMessages?.zh },
   }), [extraMessages]);
-  const [lang, setLangState] = useState<Lang>(detect);
+  // 初始统一 en:SSR 与客户端水合首帧渲染一致,避免水合不匹配(detect() 依赖 localStorage/浏览器语言,水合期会与 SSR 不一致)
+  // 实际语言由下方 mount effect 在水合完成后切换
+  const [lang, setLangState] = useState<Lang>('en');
+  const isFirstRender = useRef(true);
+
+  // 水合完成后按 detect() 同步初始语言(仅客户端执行)
+  useEffect(() => {
+    setLangState(detect());
+  }, []);
 
   useEffect(() => {
+    // 跳过挂载首帧:避免在 detect() 读取前把 'en' 写回 localStorage,覆盖用户保存的语言
+    if (isFirstRender.current) {
+      isFirstRender.current = false;
+      return;
+    }
     localStorage.setItem('lang', lang);
     document.documentElement.lang = lang;
   }, [lang]);

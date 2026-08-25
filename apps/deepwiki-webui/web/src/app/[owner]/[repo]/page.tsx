@@ -859,7 +859,7 @@ export default function RepoWikiPage() {
         <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-4">
           <div className="flex items-center gap-4">
             <Link href="/" className="text-[var(--accent-primary)] hover:text-[var(--highlight)] flex items-center gap-1.5 transition-colors border-b border-[var(--border-color)] hover:border-[var(--accent-primary)] pb-0.5">
-              <FaHome /> {t("repoPage.home")}
+              <FaHome suppressHydrationWarning /> {t("repoPage.home")}
             </Link>
           </div>
         </div>
@@ -1142,7 +1142,7 @@ export default function RepoWikiPage() {
               className="text-[var(--muted)] hover:text-[var(--foreground)] transition-colors bg-[var(--card-bg)]/80 rounded-full p-2"
               aria-label="Close"
             >
-              <FaTimes className="text-xl" />
+              <FaTimes className="text-xl" suppressHydrationWarning />
             </button>
           </div>
 

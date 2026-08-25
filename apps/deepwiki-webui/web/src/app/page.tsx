@@ -121,6 +121,11 @@ export default function Home() {
     setLang(selectedLanguage as Lang);
   }, [selectedLanguage, setLang]);
 
+  // 语言检测在水合后异步生效,lang 会从初始 en 切换为检测值;此时同步 selectedLanguage(用户未手动改配置时)
+  useEffect(() => {
+    setSelectedLanguage(lang);
+  }, [lang]);
+
   // Fetch authentication status on component mount
   useEffect(() => {
     const fetchAuthStatus = async () => {
@@ -368,7 +373,7 @@ export default function Home() {
           className="flex flex-col md:flex-row md:items-center md:justify-between gap-4 bg-[var(--card-bg)] rounded-lg shadow-custom border border-[var(--border-color)] p-4">
           <div className="flex items-center">
             <div className="bg-[var(--accent-primary)] p-2 rounded-lg mr-3">
-              <FaWikipediaW className="text-2xl text-white" />
+              <FaWikipediaW className="text-2xl text-white" suppressHydrationWarning />
             </div>
             <div className="mr-6">
               <h1 className="text-xl md:text-2xl font-bold text-[var(--accent-primary)]">{t('common.appName')}</h1>
@@ -463,7 +468,7 @@ export default function Home() {
                 <div className="flex flex-col sm:flex-row items-center mb-6 gap-4">
                   <div className="relative">
                     <div className="absolute -inset-1 bg-[var(--accent-primary)]/20 rounded-full blur-md"></div>
-                    <FaWikipediaW className="text-5xl text-[var(--accent-primary)] relative z-10" />
+                    <FaWikipediaW className="text-5xl text-[var(--accent-primary)] relative z-10" suppressHydrationWarning />
                   </div>
                   <div className="text-center sm:text-left">
                     <h2 className="text-2xl font-bold text-[var(--foreground)] font-serif mb-1">{t('projects.existingProjects')}</h2>
@@ -486,7 +491,7 @@ export default function Home() {
                 <div className="flex flex-col sm:flex-row items-center mb-6 gap-4">
                   <div className="relative">
                     <div className="absolute -inset-1 bg-[var(--accent-primary)]/20 rounded-full blur-md"></div>
-                    <FaWikipediaW className="text-5xl text-[var(--accent-primary)] relative z-10" />
+                    <FaWikipediaW className="text-5xl text-[var(--accent-primary)] relative z-10" suppressHydrationWarning />
                   </div>
                   <div className="text-center sm:text-left">
                     <h2 className="text-2xl font-bold text-[var(--foreground)] font-serif mb-1">{t('home.welcome')}</h2>
@@ -504,8 +509,8 @@ export default function Home() {
             className="w-full max-w-2xl mb-10 bg-[var(--accent-primary)]/5 border border-[var(--accent-primary)]/20 rounded-lg p-5">
             <h3 className="text-sm font-semibold text-[var(--accent-primary)] mb-3 flex items-center">
               <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4 mr-2" fill="none" viewBox="0 0 24 24"
-                stroke="currentColor">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
+                stroke="currentColor" suppressHydrationWarning>
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} suppressHydrationWarning
                   d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
               </svg>
               {t('home.quickStart')}
@@ -537,8 +542,8 @@ export default function Home() {
             <div className="flex flex-col sm:flex-row items-start sm:items-center gap-2 mb-4">
               <svg xmlns="http://www.w3.org/2000/svg"
                 className="h-5 w-5 text-[var(--accent-primary)] flex-shrink-0 mt-0.5 sm:mt-0" fill="none"
-                viewBox="0 0 24 24" stroke="currentColor">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
+                viewBox="0 0 24 24" stroke="currentColor" suppressHydrationWarning>
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} suppressHydrationWarning
                   d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z" />
               </svg>
               <h3 className="text-base font-semibold text-[var(--foreground)] font-serif">{t('home.advancedVisualization')}</h3>
@@ -574,15 +579,15 @@ export default function Home() {
             <div className="flex items-center space-x-5">
               <a href="https://github.com/AsyncFuncAI/deepwiki-open" target="_blank" rel="noopener noreferrer"
                 className="text-[var(--muted)] hover:text-[var(--accent-primary)] transition-colors">
-                <FaGithub className="text-xl" />
+                <FaGithub suppressHydrationWarning className="text-xl" />
               </a>
               <a href="https://buymeacoffee.com/sheing" target="_blank" rel="noopener noreferrer"
                 className="text-[var(--muted)] hover:text-[var(--accent-primary)] transition-colors">
-                <FaCoffee className="text-xl" />
+                <FaCoffee suppressHydrationWarning className="text-xl" />
               </a>
               <a href="https://x.com/sashimikun_void" target="_blank" rel="noopener noreferrer"
                 className="text-[var(--muted)] hover:text-[var(--accent-primary)] transition-colors">
-                <FaTwitter className="text-xl" />
+                <FaTwitter suppressHydrationWarning className="text-xl" />
               </a>
             </div>
             <ThemeToggle />

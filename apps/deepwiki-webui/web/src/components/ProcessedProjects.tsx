@@ -163,7 +163,7 @@ export default function ProcessedProjects({
             }`}
             title="Card View"
           >
-            <FaTh className="h-4 w-4" />
+            <FaTh className="h-4 w-4" suppressHydrationWarning />
           </button>
           <button
             onClick={() => setViewMode('list')}
@@ -174,7 +174,7 @@ export default function ProcessedProjects({
             }`}
             title="List View"
           >
-            <FaList className="h-4 w-4" />
+            <FaList className="h-4 w-4" suppressHydrationWarning />
           </button>
         </div>
       </div>
