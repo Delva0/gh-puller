@@ -14,8 +14,8 @@ import pytest
 import pytest_asyncio
 
 from gh_puller import agent
-from gh_puller.benchmark.evaluators.claude import ClaudeEvaluator
-from gh_puller.benchmark.evaluators.llm import LLMEvaluator
+from gh_puller.benchmark.evaluators import ClaudeEvaluator
+from gh_puller.benchmark.evaluators import LLMEvaluator
 
 
 @pytest_asyncio.fixture(autouse=True)
@@ -60,7 +60,7 @@ async def test_claude_judge_success(monkeypatch):
         calls.append((options.model, prompt, session_name))
         return GOOD_VERDICT
 
-    from gh_puller.benchmark.evaluators import claude as claude_mod
+    from gh_puller.benchmark import evaluators as claude_mod
 
     monkeypatch.setattr(claude_mod, "cc_result", fake_cc_result)
     judge = _MiniClaude()
@@ -71,7 +71,7 @@ async def test_claude_judge_success(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_claude_judge_degrades_on_error_and_bad_json(monkeypatch):
-    from gh_puller.benchmark.evaluators import claude as claude_mod
+    from gh_puller.benchmark import evaluators as claude_mod
 
     async def fake_cc_result(options, prompt, *, session=None, session_name=None, meta=None):
         raise RuntimeError("boom")
@@ -133,7 +133,7 @@ def _fake_httpx(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_llm_judge_success(monkeypatch):
-    from gh_puller.benchmark.evaluators import llm as llm_mod
+    from gh_puller.benchmark import evaluators as llm_mod
 
     monkeypatch.setattr(llm_mod, "LLM_JUDGE_API_KEY", "sk-test")
     posts = _fake_httpx(monkeypatch)

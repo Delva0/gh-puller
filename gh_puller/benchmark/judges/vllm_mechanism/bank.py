@@ -12,10 +12,9 @@ from pathlib import Path
 
 from claude_agent_sdk import ClaudeAgentOptions
 
-from gh_puller.benchmark.envs import JUDGE_EVALUATOR
 from gh_puller.benchmark.evaluators import ClaudeEvaluator, LLMEvaluator
-from gh_puller.benchmark.judges.parallel import ParallelJudge
-from gh_puller.benchmark.judges.vllm_mech.utils import (
+from gh_puller.benchmark.judges.base import ParallelJudge
+from gh_puller.benchmark.judges.vllm_mechanism.utils import (
     DIMENSIONS,
     MCP_SERVERS,
     SKILLS,
@@ -23,7 +22,8 @@ from gh_puller.benchmark.judges.vllm_mech.utils import (
     auto_user_prompt,
     coerce_verdict,
 )
-from gh_puller.types import Answer
+from gh_puller.benchmark.types import Answer
+from gh_puller.envs import JUDGE_EVALUATOR
 
 
 class VllmMechEvalMixin:

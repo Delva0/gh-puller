@@ -8,7 +8,7 @@ sequence judge 的一个应用特例：扩展点只有题目序列。
 import json
 from pathlib import Path
 
-from gh_puller.benchmark.judges.sequence import SequenceJudge
+from gh_puller.benchmark.judges.base import SequenceJudge
 
 
 class VllmJudge(SequenceJudge):

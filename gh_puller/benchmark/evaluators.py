@@ -1,17 +1,125 @@
-"""人类评测器:逐题人工评审(web 页面),从原 HumanSequenceJudge 迁移而来的静态评测器。
+"""评测器(自动化评测基础设施):LLM(vLLM API)/Claude Code(SDK)/Human(web 评审)。
 
-入参:question/ref/answer 均为 str(页面直接展示);输出评审表单数据
-(结构由构造参数 judge_schema 定义,web UI 按其渲染表单,提交数据即本题评判结果)。
-server 为其内部实现细节:首次 evaluate 时惰性起服并等待前端连接,后续复用,
-不对上层暴露生命周期。
+评测器是底层静态工具,只有 evaluate 接口、无生命周期,被题库(上层)随意调用;
+三种评测器(LLM/Claude/Human)结构兼容即可,无需继承(见 Evaluator)。
+入参/输出约定由各实现自定(question/ref/answer 均为 Any),统一见各类 docstring:
+- LLMEvaluator(半抽象基类):机制(HTTP 调用、解析失败重试、降级输出)由基类提供,
+  请求体(payload)与判定解析是扩展点,由应用层题库以子类挂接,
+  如 judges/vllm_mechanism/utils.py 的 auto_* 提示词与 coerce_verdict。
+  模型地址与型号可用环境变量 LLM_JUDGE_URL / LLM_JUDGE_MODEL 覆盖,或由题库构造时传参。
+- ClaudeEvaluator(半抽象基类):机制(SDK 会话、无状态逐题)由基类提供,
+  agent 配置(options)、查询文本与判定解析是扩展点,由应用层题库以子类挂接,
+  如 judges/vllm_mechanism/utils.py 的 auto_* 提示词与 MCP_SERVERS/SKILLS。
+  模型可用环境变量 CLAUDE_JUDGE_MODEL 覆盖(缺省用 SDK 默认模型),需要 ANTHROPIC_API_KEY。
+- HumanEvaluator:入参三字符串,输出评审表单数据(结构由 judge_schema 定义);
+  server 为其内部实现细节:首次 evaluate 时惰性起服并等待前端连接,后续复用,
+  不对上层暴露生命周期。
+任一失败不得抛出,降级输出 {"dimensions": {}, "overall": 0, "reason": "评测失败: ..."}。
 """
 
 import asyncio
+import json
+from typing import Any, Protocol
 
+import httpx
 import jsonschema
 import uvicorn
+from claude_agent_sdk import ClaudeAgentOptions
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
+
+from gh_puller.agent import cc_result, llm_complete
+from gh_puller.envs import CLAUDE_JUDGE_MODEL, LLM_JUDGE_API_KEY, LLM_JUDGE_MODEL, LLM_JUDGE_URL
+from gh_puller.envs import TIMEOUT as GLOBAL_TIMEOUT
+
+__all__ = ["Evaluator", "LLMEvaluator", "ClaudeEvaluator", "HumanEvaluator"]
+
+# 单题评分超时:connect 短(端点不可达时快速降级),read 取全局单题超时上限
+TIMEOUT = httpx.Timeout(connect=5.0, read=GLOBAL_TIMEOUT, write=30.0, pool=5.0)
+
+
+class Evaluator(Protocol):
+    """评测器协议。
+
+    name: 评测器标识,写入 judgment["evaluator"]。
+    evaluate: 评判单题,返回 JSON 可序列化 dict。题库负责拆字段、组装上下文,
+    把返回 dict 原样放进 judgment。
+    """
+
+    name: str
+
+    async def evaluate(self, question: Any, ref: Any, answer: Any) -> dict:
+        ...
+
+
+class LLMEvaluator:
+    """vLLM 服务上的评分模型逐题评分(半抽象基类:请求体由题库子类提供)。"""
+
+    name = "llm"
+
+    # 扩展点:解析失败重试时向 payload["messages"] 追加的提示(机制默认,题库可覆盖)
+    retry_nudge: str = "只输出 JSON,不要任何其他内容。"
+
+    def __init__(self, url: str = "", model: str = ""):
+        self.url = url or LLM_JUDGE_URL
+        self.model = model or LLM_JUDGE_MODEL
+
+    def make_payload(self, question: str, ref: str, answer: str) -> dict:
+        """chat/completions 请求体组装(OpenAI 兼容契约:须含可追加的 messages 键);题库子类必须提供。"""
+        raise NotImplementedError
+
+    def coerce(self, data) -> dict:
+        """判定规范化(维度补齐/限幅);题库子类必须提供。"""
+        raise NotImplementedError
+
+    async def evaluate(self, question: str, ref: str, answer: str) -> dict:
+        payload = self.make_payload(question, ref, answer)
+        headers = {"Authorization": f"Bearer {LLM_JUDGE_API_KEY}"} if LLM_JUDGE_API_KEY else None
+        last_err: Exception | None = None
+        for nudge in (False, True):  # 解析失败重试 1 次(第二次追加"只输出 JSON"提示)
+            if nudge:
+                payload["messages"].append({"role": "user", "content": self.retry_nudge})
+            try:
+                content = await llm_complete(
+                    url=self.url, payload=payload, api_key=LLM_JUDGE_API_KEY,
+                    timeout=TIMEOUT, headers=headers, session_name="judge:llm",
+                )
+                return self.coerce(json.loads(content))
+            except Exception as e:  # 网络/HTTP/解析失败:继续下一轮,耗尽后降级
+                last_err = e
+        return {"dimensions": {}, "overall": 0, "reason": f"评测失败: {type(last_err).__name__}: {last_err}"}
+
+
+class ClaudeEvaluator:
+    """headless Claude agent 逐题评分(半抽象基类:agent 配置由题库子类提供)。"""
+
+    name = "claude"
+
+    def __init__(self, model: str = ""):
+        self.model = model or CLAUDE_JUDGE_MODEL
+
+    def make_options(self, question: str, ref: str, answer: str) -> ClaudeAgentOptions:
+        """agent 配置组装(system_prompt/工具授权/模型等);题库子类必须提供。"""
+        raise NotImplementedError
+
+    def user_prompt(self, question: str, ref: str, answer: str) -> str:
+        """单题请求文本(query);题库子类必须提供。"""
+        raise NotImplementedError
+
+    def coerce(self, data) -> dict:
+        """判定规范化(维度补齐/限幅);题库子类必须提供。"""
+        raise NotImplementedError
+
+    async def evaluate(self, question: str, ref: str, answer: str) -> dict:
+        try:
+            result = await cc_result(
+                self.make_options(question, ref, answer), self.user_prompt(question, ref, answer),
+                session_name="judge:claude",
+            )
+            return self.coerce(json.loads(result))
+        except Exception as e:  # SDK/解析异常:降级输出,不抛出
+            return {"dimensions": {}, "overall": 0, "reason": f"评测失败: {type(e).__name__}: {e}"}
+
 
 PAGE = """<!doctype html>
 <html lang="zh">
