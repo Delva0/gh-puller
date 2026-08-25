@@ -22,7 +22,13 @@ from opentelemetry.trace import StatusCode
 
 from gh_puller import agent
 from gh_puller.agent import EventBus, FileSink, new_event, sinks
-from gh_puller.agent.adapters import _handle_assistant_message, _handle_stream_event, _normalize_usage, _Run
+from gh_puller.agent.adapters import (
+    _handle_assistant_message,
+    _handle_stream_event,
+    _normalize_usage,
+    _Run,
+    _session_id,
+)
 from gh_puller.agent.sinks import OtelSink
 
 
@@ -97,7 +103,7 @@ def test_configure_disabled_short_circuits():
 
 
 # ---------------------------------------------------------------------------
-# FileSink 布局与状态迁移(原始事件逐行)
+# FileSink 扁平布局与非流式事件流投影(原始事件逐行)
 # ---------------------------------------------------------------------------
 
 
@@ -108,29 +114,38 @@ def _evt(evt_type: str, session: str = "s1", seq: int = 0, **data) -> dict:
 
 
 @pytest.mark.asyncio
-async def test_file_sink_layout_and_finalized(tmp_path):
+async def test_file_sink_flat_layout_nonstream_projection(tmp_path):
     sink = FileSink(str(tmp_path))
-    # session/start → running/ 即创建,append 实时可见,行即原始事件
-    await sink.consume(_evt("session/start", seq=0, run_id="r1", label="wiki:structure",
+    # session/start → 扁平 sessions/ 即创建,append 实时可见,行即原始事件;
+    # 会话 id 带 ns(judge:llm/uuid):文件名只取 "/" 后段
+    await sink.consume(_evt("session/start", session="judge:llm/0460e1e9-5155-4014-9054-a39986462b20",
+                            seq=0, run_id="r1", label="wiki:structure",
                             provider="claude", model=""))
-    running = tmp_path / "sessions" / "running" / "s1.jsonl"
-    assert running.exists()
-    await sink.consume(_evt("assistant/chunk", seq=1,
-                            chunk={"type": "text", "index": 0, "text": "你好"}))
-    await sink.consume(_evt("assistant/message", seq=2,
+    flat = tmp_path / "sessions" / "0460e1e9-5155-4014-9054-a39986462b20.jsonl"
+    assert flat.exists()
+    # assistant/chunk 不落盘(非流式事件流投影):文件 seq 出现洞(0 → 2)
+    await sink.consume(_evt("assistant/chunk", session="judge:llm/0460e1e9-5155-4014-9054-a39986462b20",
+                            seq=1, chunk={"type": "text", "index": 0, "text": "你好"}))
+    await sink.consume(_evt("assistant/message", session="judge:llm/0460e1e9-5155-4014-9054-a39986462b20",
+                            seq=2,
                             message={"role": "assistant", "content": [{"type": "text", "text": "你好"}]},
                             surfaceOp="append", sourceSeqs=[1]))
-    lines = [json.loads(line) for line in running.read_text().splitlines()]
-    assert [ln["type"] for ln in lines] == ["session/start", "assistant/chunk", "assistant/message"]
-    # completed:终态 os.replace 原子迁出,无 .tmp 残留
-    await sink.consume(_evt("session/end", seq=3, state="completed", ok=True,
+    lines = [json.loads(line) for line in flat.read_text().splitlines()]
+    assert [ln["type"] for ln in lines] == ["session/start", "assistant/message"]
+    assert [ln["seq"] for ln in lines] == [0, 2]  # 洞 = 被跳过的 chunk
+    # session/end 留在文件内(不迁移、不分目录):隐式分类学,状态在事件里
+    await sink.consume(_evt("session/end", session="judge:llm/0460e1e9-5155-4014-9054-a39986462b20",
+                            seq=3, state="completed", ok=True,
                             duration_ms=10, text_chars=2, num_steps=1))
-    assert not running.exists()
-    completed = tmp_path / "sessions" / "completed" / "s1.jsonl"
-    assert completed.exists()
-    assert not list((tmp_path / "sessions" / "completed").glob("*.tmp"))
-    final = [json.loads(line) for line in completed.read_text().splitlines()]
+    assert flat.exists()
+    assert not list((tmp_path / "sessions").glob("completed"))
+    assert not list((tmp_path / "sessions").glob("running"))
+    assert not list((tmp_path / "sessions").glob("*.tmp"))
+    final = [json.loads(line) for line in flat.read_text().splitlines()]
     assert final[-1]["type"] == "session/end" and final[-1]["data"]["state"] == "completed"
+    # 无序文件:目录里只有一个扁平文件
+    assert [p.name for p in (tmp_path / "sessions").glob("*.jsonl")] == [
+        "0460e1e9-5155-4014-9054-a39986462b20.jsonl"]
 
 
 @pytest.mark.asyncio
@@ -143,11 +158,24 @@ async def test_file_sink_aborted_by_error(tmp_path):
     await sink.consume(_evt("session/end", session="s2", seq=2, state="aborted", ok=False,
                             reason="RuntimeError: agent 执行失败", duration_ms=5,
                             text_chars=0, num_steps=1))
-    aborted = tmp_path / "sessions" / "aborted" / "s2.jsonl"
+    aborted = tmp_path / "sessions" / "s2.jsonl"  # 扁平:无 state 目录
     assert aborted.exists()
     final = [json.loads(line) for line in aborted.read_text().splitlines()]
     assert final[-1]["type"] == "session/end" and final[-1]["data"]["state"] == "aborted"
     assert "RuntimeError" in final[-1]["data"]["reason"]
+
+
+@pytest.mark.asyncio
+async def test_file_sink_crash_residue_stays_flat(tmp_path):
+    """崩溃残留(无 session/end)= 扁平目录里无终态行的文件,不迁移(排查素材)。"""
+    sink = FileSink(str(tmp_path))
+    await sink.consume(_evt("session/start", session="s3", seq=0, run_id="r3",
+                            label="wiki:structure", provider="claude", model=""))
+    path = tmp_path / "sessions" / "s3.jsonl"
+    assert path.exists()
+    final = [json.loads(line) for line in path.read_text().splitlines()]
+    assert [ln["type"] for ln in final] == ["session/start"]
+    assert "session/end" not in path.read_text()
 
 
 # ---------------------------------------------------------------------------
@@ -263,6 +291,23 @@ def test_normalize_usage_maps_sdk_and_http():
     assert _normalize_usage({"prompt_tokens": 3, "completion_tokens": 4}) == \
         {"input_tokens": 3, "output_tokens": 4, "cache_read_input_tokens": None}
     assert _normalize_usage(None) is None
+
+
+# ---------------------------------------------------------------------------
+# 会话 id 归属(ns 解析序:显式 session_ns → run_id → session_name → "agent")
+# ---------------------------------------------------------------------------
+
+
+def test_session_id_ns_resolution():
+    """ns 解析序;显式 session 原样;默认 <ns>/<uuid4> 且 ns 不含 "/"。"""
+    assert _session_id("explicit", "ns", "run", "name") == "explicit"
+    sid = _session_id(None, "ns-x", "run", "name")
+    assert sid.startswith("ns-x/")
+    assert len(sid.rsplit("/", 1)[1]) == 36  # 全量 uuid4
+    assert _session_id(None, None, "run", "name").startswith("run/")
+    assert _session_id(None, None, None, "name").startswith("name/")
+    assert _session_id(None, None, None, None).startswith("agent/")  # 全兜底
+    assert _session_id(None, "deepwiki:wiki", None, None).startswith("deepwiki:wiki/")
 
 
 # ---------------------------------------------------------------------------

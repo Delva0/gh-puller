@@ -4,14 +4,16 @@ Agent 流式监控 Web/WS hub(FastAPI 端点层,独立 uv 项目)。生产端是
 的 WsSink(客户端,包内只留它);本服务承担原 `python -m gh_puller.agent serve` 的双角色:
 
 - `WS /ws` — 一连接一角色,首帧定角色:`{"type":"evt",...}` 为生产端(事件接入),
-  其余(`index`/`llm-subscribe`/`evt-subscribe`/`evt-replay`/`ping`)为查看端;
+  其余(`index`/`history`/`subscribe`/`ping`)为查看端;
 - `GET /` 与 `/viewer` — 直接出构建好的单文件 viewer(`static/agent_monitor_viewer.html`;
 
   缺件回退 `viewer 文件缺失` 文案,构建见仓库根 `pnpm -r build`)。
 
-hub 只持内存状态(事件环 1000/会话、LLM 流行 500 行/会话),写盘是 FileSink 的事;
-启动时从 `AGENT_MONITOR_DIR`(见 `gh_puller/envs.py`,默认 `~/.gh-puller/agent-monitor`)
-种子历史,重启 hub 列表仍在。
+hub 只持内存状态(每会话全量事件,seq 索引),写盘是 FileSink 的事;磁盘布局为
+扁平 `sessions/<uuid>.jsonl`(隐式分类学:会话键 = 事件内 `session/start` 的
+`session` 字段,状态 = 有无 `session/end` 行),启动时从 `AGENT_MONITOR_DIR`
+(见 `gh_puller/envs.py`,默认 `~/.gh-puller/agent-monitor`)种子历史,重启 hub
+列表仍在;`index` 时对 running 会话按文件 mtime 按需重判(自愈残留死会话)。
 
 ## 启动
 

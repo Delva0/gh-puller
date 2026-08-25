@@ -52,6 +52,24 @@ describe('RunFold(live/历史接缝)', () => {
     }
     expect(f.partial).toBe('hi世界');
   });
+
+  it('applyBatch 容忍 seq 洞(文件侧投影契约定域:chunk 被跳过后不触发 gap)', () => {
+    // 磁盘投影 seq 0,1,2,5,7(chunk 3/4/6 未落盘)→ 洞是合法结构
+    const f = new RunFold();
+    const fileside = [
+      evt('session/start', 0),
+      evt('user/message', 1, { message: { role: 'user', content: [{ type: 'text', text: 'q' }] }, surfaceOp: 'append' }),
+      evt('step/start', 2),
+      evt('assistant/message', 5, { message: { role: 'assistant', content: [{ type: 'text', text: 'aidan' }] }, surfaceOp: 'append' }),
+      evt('session/end', 7, { state: 'completed', ok: true, duration_ms: 1, text_chars: 5, num_steps: 1 }),
+    ];
+    f.applyBatch(fileside);
+    expect(f.length).toBe(8); // nextSeq = 窗口尾 seq+1,洞不使守卫开裂
+    expect(f.messages().map((m) => (m.content[0] as { text?: string }).text)).toEqual(['q', 'aidan']);
+    // live 接续:seq 8 直接按 ok 折入(不再补片);早于 nextSeq → dup
+    expect(f.ingest(evt('assistant/chunk', 8, { chunk: { type: 'text', index: 0, text: 'x' } }))).toBe('ok');
+    expect(f.ingest(evt('turn/start', 3))).toBe('dup');
+  });
 });
 
 describe('buildSnapshot(对话节点+请求序)', () => {

@@ -3,13 +3,16 @@
 覆盖(事件溯源协议 v2,破坏性升级):
 - index 会话列表(含 run_id/num_events/state);生产端 evt 广播给两个订阅查看端;
 - subscribe:evt_ready{lastSeq} → 实时 evt 推送(带 seq);换会话替换订阅 + 断连清理;
-- history:seq 升序分页(尾部/翻旧页/缺会话空页),磁盘+内存合并;
+- history:seq 升序分页(尾部/翻旧页/缺会话空页),磁盘+内存合并(扁平布局);
 - ping→pong;GET /(与 /viewer)出 viewer HTML,其它路径 404;
-- 重启种子:事件溯源 JSONL 进索引(running 保持 continuing),历史可回放(旧局限回归);
+- 重启种子(扁平 sessions/*.jsonl):隐式分类学 —— 会话键=事件内 session 字段,
+  有 session/end → completed/aborted,无 → running;按需重判(mtime 变 → 尾部找终态);
   旧 v1 聚合行/坏行文件跳过不崩。
 """
 
 import json
+import os
+import time
 from pathlib import Path
 
 import pytest
@@ -139,12 +142,16 @@ def test_history_pagination_tail_and_older(client):
 
 
 def test_history_merges_disk_and_memory(tmp_path):
-    """磁盘(经 seed)+ 内存 live 合并:同 seq 以内存为准,拼成完整 seq 序。"""
-    (tmp_path / "sessions" / "completed").mkdir(parents=True)
+    """磁盘(经 seed)+ 内存 live 合并:同 seq 以内存为准,拼成完整 seq 序。
+
+    扁平布局:会话键取事件内 session 字段(文件名只是 stem);文件 seq 可带洞
+    (洞=被跳过的 chunk),合并按键天然兼容。
+    """
+    (tmp_path / "sessions").mkdir(parents=True)
     disk = [_evt("session/start", "merge1", seq=0, run_id="r",
                  label="l", provider="claude", model="m"),
             _user_evt("merge1", 1, "disk-msg")]
-    (tmp_path / "sessions" / "completed" / "merge1.jsonl").write_text(
+    (tmp_path / "sessions" / "merge1.jsonl").write_text(
         "".join(json.dumps(e, ensure_ascii=False) + "\n" for e in disk), encoding="utf-8")
     hub = _Hub()
     hub.seed(str(tmp_path))
@@ -182,60 +189,99 @@ def test_default_static_serves_viewer(tmp_path):
 
 
 def test_disk_seed_index_and_history(tmp_path):
-    """重启种子(事件溯源格式):索引含 run_id/state,历史可回放 —— 旧局限回归。"""
-    (tmp_path / "sessions" / "completed").mkdir(parents=True)
-    (tmp_path / "sessions" / "running").mkdir()
+    """重启种子(事件溯源格式,扁平):索引含 run_id/state,历史可回放 —— 旧局限回归。
+
+    隐式分类学:文件有 session/end → completed;无 → running。会话键取事件内
+    session 字段(文件名只是 stem)。
+    """
+    (tmp_path / "sessions").mkdir(parents=True)
     a = [
-        _evt("session/start", "seed-a", seq=0, run_id=None, label="judge:llm",
+        _evt("session/start", "judge:llm/seed-a", seq=0, run_id=None, label="judge:llm",
              provider="openai", model="m"),
-        _user_evt("seed-a", 1, "问"),
-        _evt("assistant/message", "seed-a", seq=2, turn=1, step=1,
+        _user_evt("judge:llm/seed-a", 1, "问"),
+        _evt("assistant/message", "judge:llm/seed-a", seq=2, turn=1, step=1,
              message={"role": "assistant", "content": [{"type": "text", "text": "答"}]},
              surfaceOp="append"),
-        _evt("session/end", "seed-a", seq=3, state="completed", ok=True,
+        _evt("session/end", "judge:llm/seed-a", seq=3, state="completed", ok=True,
              duration_ms=5, text_chars=1, num_steps=1),
     ]
-    (tmp_path / "sessions" / "completed" / "seed-a.jsonl").write_text(
+    (tmp_path / "sessions" / "seed-a.jsonl").write_text(
         "".join(json.dumps(x, ensure_ascii=False) + "\n" for x in a), encoding="utf-8")
-    r = _evt("session/start", "seed-r", seq=0, run_id="chat:demo", label="chat:demo",
+    r = _evt("session/start", "chat:demo/seed-r", seq=0, run_id="chat:demo", label="chat:demo",
              provider="claude", model="")
-    (tmp_path / "sessions" / "running" / "seed-r.jsonl").write_text(
+    (tmp_path / "sessions" / "seed-r.jsonl").write_text(
         json.dumps(r, ensure_ascii=False) + "\n", encoding="utf-8")
 
     hub = _Hub()
     hub.seed(str(tmp_path))
     by_session = {s["session"]: s for s in hub.index()}
-    assert by_session["seed-a"]["state"] == "completed"
-    assert by_session["seed-a"]["label"] == "judge:llm"
-    assert by_session["seed-a"]["num_events"] == 4
-    assert by_session["seed-r"]["state"] == "running"
-    assert by_session["seed-r"]["run_id"] == "chat:demo"
+    assert by_session["judge:llm/seed-a"]["state"] == "completed"  # 隐式:文件含 session/end
+    assert by_session["judge:llm/seed-a"]["label"] == "judge:llm"
+    assert by_session["judge:llm/seed-a"]["num_events"] == 4
+    assert by_session["chat:demo/seed-r"]["state"] == "running"  # 无终态行
+    assert by_session["chat:demo/seed-r"]["run_id"] == "chat:demo"
 
     app = create_app(hub, static_root=tmp_path / "static")
     with TestClient(app) as c, c.websocket_connect("/ws") as v:
-        v.send_text(json.dumps({"type": "history", "session": "seed-a"}, ensure_ascii=False))
+        v.send_text(json.dumps({"type": "history", "session": "judge:llm/seed-a"}, ensure_ascii=False))
         page = json.loads(v.receive_text())
         types_ = [e["type"] for e in page["events"]]
         assert types_ == ["session/start", "user/message", "assistant/message", "session/end"]
         assert page["hasMore"] is False
 
 
+def test_seed_recheck_heals_state_on_mtime_change(tmp_path):
+    """按需重判(index 时):running 会话文件 mtime 变化 → 重读尾部找终态,翻转为完成。"""
+    (tmp_path / "sessions").mkdir(parents=True)
+    r = _evt("session/start", "seed-r", seq=0, run_id="chat:demo", label="chat:demo",
+             provider="claude", model="")
+    path = tmp_path / "sessions" / "seed-r.jsonl"
+    path.write_text(json.dumps(r, ensure_ascii=False) + "\n", encoding="utf-8")
+
+    hub = _Hub()
+    hub.seed(str(tmp_path))
+    assert hub.index()[0]["state"] == "running"
+    # 崩溃残留被外部补写终态(mtime 强制变化)
+    end = _evt("session/end", "seed-r", seq=1, state="completed", ok=True,
+               duration_ms=1, text_chars=0, num_steps=1)
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(end, ensure_ascii=False) + "\n")
+    os.utime(path, (time.time() + 2, time.time() + 2))  # mtime 前进,确保触发重判
+    assert hub.index()[0]["state"] == "completed"
+    # 幂等:mtime 不变 → 不再重读,状态保持
+    assert hub.index()[0]["state"] == "completed"
+
+
+def test_seed_recheck_no_mtime_change_keeps_state(tmp_path):
+    """按需重判:文件 mtime 未变 → 零重读,状态保持 running(stat 与读盘分离)。"""
+    (tmp_path / "sessions").mkdir(parents=True)
+    r = _evt("session/start", "seed-r", seq=0, run_id="chat:demo", label="chat:demo",
+             provider="claude", model="")
+    path = tmp_path / "sessions" / "seed-r.jsonl"
+    path.write_text(json.dumps(r, ensure_ascii=False) + "\n", encoding="utf-8")
+
+    hub = _Hub()
+    hub.seed(str(tmp_path))
+    assert hub.index()[0]["state"] == "running"
+    assert hub.index()[0]["state"] == "running"  # 第二次:同一 mtime,不重读
+
+
 def test_seed_skips_old_format_and_corrupt_lines(tmp_path):
     """旧 v1 聚合行(无 seq/type)与坏行:整文件/半行跳过不崩;剩余会话照常。"""
-    (tmp_path / "sessions" / "completed").mkdir(parents=True)
+    (tmp_path / "sessions").mkdir(parents=True)
     old_format = [
         {"type": "session.start", "session": "old-a", "label": "l", "provider": "p",
          "model": "m", "state": "running", "ts": 1},
         {"type": "session.end", "state": "completed", "ts": 2},
     ]
-    (tmp_path / "sessions" / "completed" / "old-a.jsonl").write_text(
+    (tmp_path / "sessions" / "old-a.jsonl").write_text(
         "".join(json.dumps(x, ensure_ascii=False) + "\n" for x in old_format),
         encoding="utf-8")
     good = [_evt("session/start", "seed-b", seq=0, run_id=None, label="l",
                  provider="claude", model="")]
     bad_line = _evt("assistant/chunk", "seed-b", seq=1, turn=1, step=1,
                     chunk={"type": "text", "index": 0, "text": "ok"})
-    (tmp_path / "sessions" / "completed" / "seed-b.jsonl").write_text(
+    (tmp_path / "sessions" / "seed-b.jsonl").write_text(
         json.dumps(good[0], ensure_ascii=False) + "\n{broken\n"
         + json.dumps(bad_line, ensure_ascii=False) + "\n", encoding="utf-8")
 

@@ -16,9 +16,12 @@ The following files were used as context for generating this wiki page:
 
 Every LLM call in this repository — Claude Code agent calls (`cc_stream` / `cc_text` / `cc_result`, the single streaming funnel that `deepwiki` and the claude judge previously drilled directly into the SDK) and plain OpenAI-compatible calls (`llm_complete` / `llm_stream`) — flows through the wrappers in `gh_puller/agent/`. Callers keep their exact signature and semantics (same `RuntimeError` wording, same fallback order, same text chunks); the monitor is invisible to them. In exchange, every call is observed on **three channels**: a **file sink** (on by default), the internal **Web/WS hub** (agent-dashboard; on when its endpoint is reachable), and an **OTel trace export** (Phoenix-compatible backends; on when endpoint reachable + opentelemetry importable). Sources: [gh_puller/agent/adapters.py:cc_stream/cc_text/cc_result/llm_complete/llm_stream]()
 
-The observation model is **event-sourcing**: a single lossless append-only event log per run, aligned with the deepseek-harness invariant — the LLM `messages` context is *derived* by a surface fold, not snapshotted:
+The observation model is **event-sourcing**: a single lossless append-only event log per run, aligned with the deepseek-harness invariant — the LLM `messages` context is *derived* by a surface fold, not snapshotted. The event log splits into two granularities (the old "llm流" concept is retired):
 
-- **Event log** — the raw atomic units (`session/start` → `turn/start` → `step/start` → `user/message` → `request/header` → `assistant/chunk` → `assistant/message` (`tool/call` / `tool/result`) → `step/end` → `end`), normalized by per-provider adapters into plain dicts with a per-session monotonic `seq` (from 0, contiguous) and published to a single asyncio `EventBus`; `publish` is `put_nowait` only and never blocks the caller. Source: [gh_puller/agent/events.py:TAXONOMY]()
+- **流式事件流 (agent event flow, full taxonomy)** — every atomic unit including `assistant/chunk` typing deltas; restores the *real-time* context (character granularity). Carried by the WS/OTel channels.
+- **非流式事件流** — full taxonomy *minus* `assistant/chunk`; restores the *message-granularity* context (the surface fold contract does not need chunks). **FileSink 只落此级 (日志防膨胀)**; file `seq` therefore has **holes** (hole = skipped chunk), and readers must only sort/compare `seq` — never assume density (contract: [gh_puller/agent/events.py]()).
+
+- **Event log** — the raw atomic units (`session/start` → `turn/start` → `step/start` → `user/message` → `request/header` → `assistant/chunk` → `assistant/message` (`tool/call` / `tool/result`) → `step/end` → `end`), normalized by per-provider adapters into plain dicts with a per-session monotonic `seq` (from 0, contiguous within the streaming flow) and published to a single asyncio `EventBus`; `publish` is `put_nowait` only and never blocks the caller. Source: [gh_puller/agent/events.py:TAXONOMY]()
 - **Surface fold (derived)** — `user/message` / `assistant/message` / `tool/result` full messages act as *surface nodes* (each carries `surfaceOp: append | {op:'replace',start,end}`); the fold of any log prefix yields the exact `messages` context that moment, and `request/header` (a snapshot of config/system/tools; `partial:true` for the cc path, since the SDK never exposes the rendered request) pinpoints the full request payload at every `step`. Context injection is just a non-user-source `user/message`; modifications shell as `replace`. `context/inject` / `context/modify` are *log-only* explanation records (ignorable; they never move the fold) — this contract is shared with the viewer (single implementation in [ui/src/monitor/surface.ts]()) and contract-tested in [tests/test_event_taxonomy.py](). Sources: [gh_puller/agent/events.py:SURFACE_TYPES](), [ui/src/monitor/surface.ts]()
 
 ```mermaid
@@ -43,28 +46,30 @@ graph LR
     RUN --> A[aborted]
 ```
 
-One `session` = one adapter call (one JSONL), `run_id` links the task-level family (`chat:<repo>`, `codemap:<repo>`, `<type>_<owner>_<repo>` for wiki runs) so a whole deepwiki run is groupable. `session/end` carries `state` (`completed` / `aborted`), `ok`, `duration_ms`, `num_steps`, usage and reason; the terminal state moves the session file into its final directory. Sources: [gh_puller/agent/adapters.py:_Run]()
+One `session` = one adapter call (one JSONL), id = `<ns>/<uuid4>` — `ns` (业务分类命名空间)由上层业务决定(显式 `session_ns=` → `run_id` → `session_name` → `"agent"`),so grepping `session/start` tells you the source; `run_id` links the task-level family (`chat:<repo>`, `codemap:<repo>`, `<type>_<owner>_<repo>` for wiki runs). `session/end` carries `state` (`completed` / `aborted`), `ok`, `duration_ms`, `num_steps`, usage and reason. Sources: [gh_puller/agent/adapters.py:_Run]()
 
-## 2. File Sink (default on)
+## 2. File Sink (default on, flat layout + implicit classification)
 
 ```
 ~/.gh-puller/agent-monitor/            # AGENT_MONITOR_DIR
 └── sessions/
-    ├── running/    <session>.jsonl    # created on session/start, live append+flush; tail -f works
-    ├── aborted/    <session>.jsonl    # atomic os.replace on session/end
-    └── completed/  <session>.jsonl    # atomic os.replace on session/end
+    └── <uuid>.jsonl                   # one flat file per session (uuid part of session id),
+                                       # 只含非流式事件流(taxonomy − assistant/chunk)
 ```
 
-The directory layout **is** the index. Each JSONL line is one raw event (full content — no truncation anywhere in the log; only OTel previews truncate):
+**分类学是隐式的,不在目录名里**:running = 文件无 `session/end` 行;completed/aborted = 有终态行、state 在事件 data 里;会话来源 = `session/start` 的 `session` 字段(`<ns>/<uuid4>`)。用户直接 grep 而非翻目录:
 
 ```bash
-# replay a finished run's model-visible messages (fold every line, sequential)
-jq -r 'select(.type=="assistant/chunk")|.data.chunk.text' ~/.gh-puller/agent-monitor/sessions/completed/*.jsonl
-# watch a live run
-tail -f ~/.gh-puller/agent-monitor/sessions/running/*.jsonl
+# 查终态(completed / aborted 由 data.state 区分)
+grep '"type":"session/end"' ~/.gh-puller/agent-monitor/sessions/*.jsonl
+# 查错误
+grep '"type":"error"' ~/.gh-puller/agent-monitor/sessions/*.jsonl
+# 查会话来源(业务命名空间),watch 实时
+grep '"type":"session/start"' ~/.gh-puller/agent-monitor/sessions/*.jsonl
+tail -f ~/.gh-puller/agent-monitor/sessions/*.jsonl
 ```
 
-Writes happen in the sink worker (queue drain), bounded at 5000 events drop-oldest; a slow or full disk never blocks the LLM call. A crash leaves the file in `running/` with its content intact. **v1 迁移**:旧格式(LLM 聚合行)与本格式互不兼容,首次升级请在 hub 未启动/可停止时清理旧的 `~/.gh-puller/agent-monitor/sessions/**`(hub 会把无 `seq` 的文件整件跳过并日志)。Sources: [gh_puller/agent/sinks.py:FileSink]()
+Each JSONL line is one raw non-streaming event (full content — no truncation anywhere in the log; only OTel previews truncate). `assistant/chunk` is **skipped** (log inflation), so the file `seq` has holes (hole == skipped chunk); the fold contract only compares `seq` — readers never assume density. Writes happen in the sink worker (queue drain), bounded at 5000 events drop-oldest; a slow or full disk never blocks the LLM call. A crash leaves a file **without** `session/end` (residue = running, debug material) which the hub heals on demand (mtime change → tail re-scan, see §3). **v1 迁移**:旧格式(LLM 聚合行)与本格式互不兼容,首次升级请在 hub 未启动/可停止时清理旧的 `~/.gh-puller/agent-monitor/sessions/**`(hub 会把无 `seq` 的文件整件跳过并日志)。Sources: [gh_puller/agent/sinks.py:FileSink]()
 
 ## 3. Web/WS Hub (opt-in via monitor)
 
@@ -77,7 +82,7 @@ cd apps/agent-dashboard/server && uv run uvicorn hub:app --port 8765   # AGENT_M
 AGENT_MONITOR_WEBUI_URL=ws://localhost:8765/ws uv run benchmark ...
 ```
 
-The hub seeds in-memory state from `AGENT_MONITOR_DIR/sessions/{running,completed,aborted}/*.jsonl` at startup — **the full raw event log now loads, so history replay works for disk-seeded sessions too** (the old "seeded event view is empty" limitation is gone). `GET /` (and `/viewer`) serves the built viewer `static/agent_monitor_viewer.html`; anything else 404s. The viewer no longer ships in the wheel; when missing the hub logs `viewer 未构建:请运行仓库根 pnpm build` and falls back to a plain `viewer 文件缺失` page.
+The hub seeds in-memory state from `AGENT_MONITOR_DIR/sessions/*.jsonl` (flat layout) at startup — **the full (non-streaming) event log loads, so history replay works for disk-seeded sessions too** (the old "seeded event view is empty" limitation is gone). Session key = the `session` field of each file's `session/start` (not the filename); state is implicit (has `session/end` → completed/aborted by `data.state`, else running). While serving, `index` requests re-check running sessions whose file mtime changed (heal crash residue / missed end frames). `GET /` (and `/viewer`) serves the built viewer `static/agent_monitor_viewer.html`; anything else 404s. The viewer no longer ships in the wheel; when missing the hub logs `viewer 未构建:请运行仓库根 pnpm build` and falls back to a plain `viewer 文件缺失` page.
 
 ### WS protocol (one JSON object per frame)
 

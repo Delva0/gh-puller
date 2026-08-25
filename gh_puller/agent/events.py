@@ -1,7 +1,18 @@
 """agent 调用的可观测事件模型(事件溯源式;纯 dict 实现,零 SDK 依赖)。
 
 对齐 deepseek-harness 的核心不变量:无损 append-only 事件日志,seq 每 session 从 0
-连续单调;LLM messages 上下文是 surface 节点的派生(折叠)而非快照:
+连续单调(**流式事件流内稠密**;非流式投影侧允许洞,见下);LLM messages 上下文
+是 surface 节点的派生(折叠)而非快照:
+
+事件流按粒度分为两级(取代旧"llm流"说法):
+- 流式事件流(agent 事件流)= TAXONOMY 全集(STREAM_TYPES):含 assistant/chunk
+  原始增量,可还原实时(逐字)上下文;WS/OTel 通道承载;
+- 非流式事件流 = TAXONOMY − {assistant/chunk}(NON_STREAM_TYPES):message 粒度,
+  assistant/message 已是定型全量,可还原任意时刻的消息上下文;filesink 只落此级。
+
+seq 序列是流式事件流的稠密序号;文件侧(非流式投影)按行跳过 chunk,因此
+**文件内 seq 允许洞,洞 = 被跳过的 assistant/chunk**。折叠契约只做 seq 排序
+与 seq < x 比较,不要求稠密 —— 读者(含前端)不得假定文件 seq 连续。
 - surface 事件 user/message / assistant/message / tool/result 携带全量消息与
   surfaceOp(append 或 {op:'replace', start, end});
 - request/header 快照(ignorable 日志型)给出 config/system/tools ——
@@ -48,6 +59,12 @@ TAXONOMY = frozenset(
 
 # surface 事件:消息上下文的可折叠集合(必带全量 message 与合法 surfaceOp)
 SURFACE_TYPES = frozenset({"user/message", "assistant/message", "tool/result"})
+
+# 事件流两级划分:流式事件流(agent 事件流,完整 taxonomy,可还原实时上下文)
+# 与非流式事件流(逐行跳 chunk,message 粒度,可还原任意时刻消息上下文)。
+# filesink 只落非流式事件流(NON_STREAM_TYPES);WS/OTel 通道承载完整流式事件流。
+STREAM_TYPES = TAXONOMY
+NON_STREAM_TYPES = TAXONOMY - {"assistant/chunk"}
 
 # ignorable 日志型事件:读者可安全跳过(不影响消息派生/请求重建);缺失 ignorable
 # 标记的未知类型 → 必须可解析(读者应报错,防静默丢消息)

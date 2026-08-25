@@ -58,6 +58,20 @@ def test_surface_and_log_split():
     assert {"user/message", "assistant/message", "tool/result"} == SURFACE_TYPES
 
 
+def test_stream_and_non_stream_split():
+    """流式事件流(agent 事件流)= taxonomy 全集;非流式 = − {assistant/chunk}。
+
+    文件侧只落非流式事件流:message 粒度可还原任意时刻消息上下文,
+    chunk 是打字机细节(实时上下文只在流式通道)。
+    """
+    from gh_puller.agent.events import NON_STREAM_TYPES, STREAM_TYPES
+
+    assert STREAM_TYPES == TAXONOMY
+    assert NON_STREAM_TYPES == TAXONOMY - {"assistant/chunk"}
+    assert SURFACE_TYPES <= NON_STREAM_TYPES  # 折叠依赖的 surface 全在非流式集内
+    assert "assistant/chunk" not in NON_STREAM_TYPES
+
+
 # ---------------------------------------------------------------------------
 # 信封
 # ---------------------------------------------------------------------------
@@ -180,6 +194,92 @@ def user_msg(text: str, *, source: dict | None = None, surface: str | dict = "ap
     if isinstance(surface, dict):
         data["surfaceOp"] = {"op": "replace", "start": start, "end": end}
     return data
+
+
+def _project(events: list[dict]) -> list[dict]:
+    """非流式事件流投影:逐行跳过 assistant/chunk(与 FileSink 一致)"""
+    from gh_puller.agent.events import NON_STREAM_TYPES
+
+    return [e for e in events if e["type"] in NON_STREAM_TYPES]
+
+
+def fold_lenient(events: list[dict]) -> tuple[list[int], dict[int, dict]]:
+    """宽松折叠(文件侧语义,与 ui/src/monitor/surface.ts 一致):seq 只排序比较,
+    不要求稠密 —— 洞 = 流式投影跳过的 chunk。"""
+    evs = sorted(events, key=lambda e: e["seq"])
+    nodes: list[int] = []
+    by_seq: dict[int, dict] = {}
+    for evt in evs:
+        t = evt.get("type")
+        if t not in TAXONOMY:
+            if evt.get("ignorable"):
+                continue
+            raise ValueError(f"未知必需事件 type: {t!r}")
+        by_seq[evt["seq"]] = evt
+        if t not in SURFACE_TYPES:
+            continue
+        op = evt["data"]["surfaceOp"]
+        if op == "append":
+            nodes.append(evt["seq"])
+        else:
+            start, end = op["start"], op["end"]
+            si, ei = nodes.index(start), nodes.index(end)
+            if si > ei:
+                raise ValueError(f"replace 区间倒置: {op!r}")
+            nodes[si:ei + 1] = [evt["seq"]]
+    return nodes, by_seq
+
+
+def messages_at_projected(events: list[dict], x: int) -> list[dict]:
+    """投影流上的 messages_at(等价 surface.ts 语义;洞容忍)。"""
+    nodes, by_seq = fold_lenient([e for e in events if e["seq"] < x])
+    out = []
+    for seq in nodes:
+        m = derive_message(by_seq[seq])
+        if m is not None:
+            out.append(m)
+    return out
+
+
+def test_projection_holes_preserve_fold():
+    """文件侧投影契约:chunk 全跳过后 seq 有洞,但 surface 折叠(messages)
+    与全流逐时刻一致 —— 洞只丢打字机细节,不丢消息粒度上下文。
+
+    (严格 oracle fold_events 保留"流式事件流 seq 连续"检查;投影侧用
+    宽松折叠 fold_lenient,与 surface.ts 同语义。)
+    """
+    from gh_puller.agent.events import NON_STREAM_TYPES
+
+    full = [
+        evt(0, "session/start", label="wiki:structure", provider="claude", model=""),
+        evt(1, "turn/start", turn=1),
+        evt(2, "step/start", step=1),
+        evt(3, "user/message", **user_msg("how does auth work?")),
+        evt(4, "request/header", header={"config": {}, "system": "s", "tools": []},
+            reason="initial", partial=True),
+        evt(5, "assistant/chunk", chunk={"type": "text", "index": 0, "text": "检"}),
+        evt(6, "assistant/chunk", chunk={"type": "text", "index": 0, "text": "查"}),
+        evt(7, "assistant/message",
+            message={"role": "assistant", "content": [{"type": "text", "text": "检查"}]},
+            surfaceOp="append", sourceSeqs=[5, 6]),
+        evt(8, "tool/call", callId="t1", name="q", arguments="{}"),
+        evt(9, "tool/result",
+            message={"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": "ok", "is_error": False}]},
+            surfaceOp="append", sourceSeqs=[8]),
+        evt(10, "step/end", step=1),
+    ]
+    proj = _project(full)
+    # 投影后 chunk seq 5/6 消失 → 洞;surface 序列顺序保持
+    assert [e["seq"] for e in proj] == [0, 1, 2, 3, 4, 7, 8, 9, 10]
+    assert all(e["type"] in NON_STREAM_TYPES for e in proj)
+    # 各时刻消息上下文:全流与投影逐点一致(在两者都可见的 seq 断点)
+    for x in (3, 4, 5, 7, 9, 10, 11):
+        assert messages_at(full, x) == messages_at_projected(proj, x), f"x={x}"
+    # 投影侧无 chunk 的洞是合法的;全流侧(严格 oracle)洞为错 —— 两语义并存
+    with pytest.raises(ValueError):
+        fold_events(proj)
+    fold_lenient(proj)
 
 
 def test_fold_cc_multi_request_exact_contexts():

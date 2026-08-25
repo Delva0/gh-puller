@@ -9,12 +9,16 @@ ClaudeSDKClient / httpx(无感,对外语义不变):
 - llm_complete / llm_stream:OpenAI 兼容端点(httpx);异常原样抛,重试留给调用方。
 
 事件语义(对齐 deepseek-harness 事件溯源模型,规范见 gh_puller.agent.events):
-单次运行一个 session(seq 从 0 连续);进入即 session/start → (context:* 说明事件)
-→ turn/start → step/start → user/message → request/header(cc 路径 partial=true:
-SDK 不暴露请求体,system/tools 只能取调用方 options)→ 逐次 assistant/chunk →
-assistant/message(+ 工具则 tool/call / tool/result)→ ... → step[end] → session/end。
-上下文每时每刻可恢复:折叠 surface 前缀(见 events.py 模块规范),任意请求平面
-X = 该 step 首条 assistant/chunk 的 seq。
+单次运行一个 session(流式事件流内 seq 从 0 连续);进入即 session/start →
+(context:* 说明事件)→ turn/start → step/start → user/message →
+request/header(cc 路径 partial=true:SDK 不暴露请求体,system/tools 只能取调用方
+options)→ 逐次 assistant/chunk → assistant/message(+ 工具则 tool/call /
+tool/result)→ ... → step[end] → session/end。上下文每时每刻可恢复:折叠 surface
+前缀(见 events.py 模块规范),任意请求平面 X = 该 step 首条 assistant/chunk 的 seq。
+
+会话 id 默认 <ns>/<uuid4>(ns 归上层业务定:显式 session_ns → run_id →
+session_name → "agent"),见 _session_id;文件侧只落非流式事件流
+(NON_STREAM_TYPES,逐行跳过 assistant/chunk → 文件 seq 有洞,契约见 events.py)。
 
 管线:适配器归一化 SDK/HTTP 对象 → 事件 dict → EventBus 扇出(sinks.EventBus,
 publish 仅 put_nowait 到每 sink 的 asyncio.Queue,永不阻塞调用)→ sink worker 消费。
@@ -32,6 +36,20 @@ from .sinks import ensure_bus
 # ---------------------------------------------------------------------------
 # 事件发布器(适配器共用):信封/turn/step/seq
 # ---------------------------------------------------------------------------
+
+
+def _session_id(session: str | None, session_ns: str | None, run_id: str | None,
+                session_name: str | None) -> str:
+    """会话 id:显式 session 原样;否则 <ns>/<uuid4>(ns 由上层业务决定分类命名空间)。
+
+    ns 解析序:显式 session_ns 参数 → run_id → session_name → "agent";
+    会话 id 形如 judge:llm/0460e1e9-5155-4014-9054-a39986462b20 —— grep
+    session/start 的 session 字段即知来源;文件名只取 "/" 后段(见 FileSink)。
+    """
+    if session:
+        return session
+    ns = session_ns or run_id or session_name or "agent"
+    return f"{ns}/{uuid.uuid4()}"
 
 
 class _Run:
@@ -371,6 +389,7 @@ def _llm_emit_messages(run: _Run, payload: dict) -> None:
 async def cc_stream(
     options, prompt: str, *, session: str | None = None,
     session_name: str | None = None, run_id: str | None = None,
+    session_ns: str | None = None,
     context: list[dict] | None = None, retry: dict | None = None,
     meta: dict | None = None,
 ):
@@ -385,7 +404,8 @@ async def cc_stream(
     from claude_agent_sdk import AssistantMessage, ClaudeSDKClient, ResultMessage, StreamEvent
 
     run = _Run(
-        session or uuid.uuid4().hex[:12], "claude", getattr(options, "model", None) or "",
+        _session_id(session, session_ns, run_id, session_name), "claude",
+        getattr(options, "model", None) or "",
         label=session_name, run_id=run_id, meta=meta,
     )
     run.start(context=context, retry=retry)
@@ -428,25 +448,29 @@ async def cc_stream(
 
 async def cc_text(options, prompt: str, *, session: str | None = None,
                   session_name: str | None = None, run_id: str | None = None,
+                  session_ns: str | None = None,
                   context: list[dict] | None = None, retry: dict | None = None,
                   meta: dict | None = None) -> str:
     """agent 整收应答(流式转整收,监控走与 cc_stream 同一条路径)。"""
     parts: list[str] = []
     async for chunk in cc_stream(options, prompt, session=session, session_name=session_name,
-                                 run_id=run_id, context=context, retry=retry, meta=meta):
+                                 run_id=run_id, session_ns=session_ns,
+                                 context=context, retry=retry, meta=meta):
         parts.append(chunk)
     return "".join(parts)
 
 
 async def cc_result(options, prompt: str, *, session: str | None = None,
                     session_name: str | None = None, run_id: str | None = None,
+                    session_ns: str | None = None,
                     context: list[dict] | None = None, retry: dict | None = None,
                     meta: dict | None = None) -> str:
     """非流式取最终结果(judge 用):失败或无结果 → RuntimeError(调用方降级)。"""
     from claude_agent_sdk import AssistantMessage, ClaudeSDKClient, ResultMessage, StreamEvent
 
     run = _Run(
-        session or uuid.uuid4().hex[:12], "claude", getattr(options, "model", None) or "",
+        _session_id(session, session_ns, run_id, session_name), "claude",
+        getattr(options, "model", None) or "",
         label=session_name, run_id=run_id, meta=meta,
     )
     run.start(context=context, retry=retry)
@@ -497,6 +521,7 @@ async def llm_complete(
     *, url: str, payload: dict, api_key: str | None = None,
     timeout: httpx.Timeout | None = None, headers: dict | None = None,
     session: str | None = None, session_name: str | None = None, run_id: str | None = None,
+    session_ns: str | None = None,
     context: list[dict] | None = None, retry: dict | None = None, meta: dict | None = None,
 ) -> str:
     """OpenAI 兼容非流式补全(异常原样抛,重试留给调用方)。
@@ -507,8 +532,8 @@ async def llm_complete(
     text 增量 + assistant/message + 每 tool_call 一个 tool/call(原始 arguments 字符串)。
     """
     model = payload["model"]
-    run = _Run(session or uuid.uuid4().hex[:12], "openai", model, label=session_name,
-               run_id=run_id, meta=meta)
+    run = _Run(_session_id(session, session_ns, run_id, session_name), "openai", model,
+               label=session_name, run_id=run_id, meta=meta)
     run.start(context=context, retry=retry)
     _llm_emit_messages(run, payload)
     run.event("request/header", header=_llm_header(payload), reason="initial")
@@ -557,11 +582,12 @@ async def llm_stream(
     *, url: str, payload: dict, api_key: str | None = None,
     timeout: httpx.Timeout | None = None, headers: dict | None = None,
     session: str | None = None, session_name: str | None = None, run_id: str | None = None,
+    session_ns: str | None = None,
     context: list[dict] | None = None, retry: dict | None = None, meta: dict | None = None,
 ):
     """OpenAI 兼容流式补全(SSE 逐 delta,预留接口):payload 语义同 llm_complete,附加 stream=True。"""
-    run = _Run(session or uuid.uuid4().hex[:12], "openai", payload["model"], label=session_name,
-               run_id=run_id, meta=meta)
+    run = _Run(_session_id(session, session_ns, run_id, session_name), "openai",
+               payload["model"], label=session_name, run_id=run_id, meta=meta)
     run.start(context=context, retry=retry)
     _llm_emit_messages(run, payload)
     run.event("request/header", header=_llm_header(payload), reason="initial")

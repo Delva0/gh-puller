@@ -1,9 +1,10 @@
 """监控观测通道:sink 基础设施(事件总线/文件/WS/OTel)与运行时配置。
 
 用户定义两种观测通道,无控制台通道:
-- 文件 sink(默认恒开):AGENT_MONITOR_DIR/sessions/{running,completed,aborted}/<session>.jsonl,
-  每行一条原始事件(事件溯源,全量无损 —— 折叠恢复规范见 gh_puller.agent.events;
-  取代 v1 的 LLM 流聚合行,旧格式不兼容,历史数据需手动清理);
+- 文件 sink(默认恒开):AGENT_MONITOR_DIR/sessions/<uuid>.jsonl 扁平布局,
+  每行一条非流式事件流事件(TAXONOMY − assistant/chunk,message 粒度,防日志
+  膨胀;折叠恢复规范见 gh_puller.agent.events;取代 v1 的聚合行,旧格式不兼容,
+  历史数据需手动清理);
 - Web/WS sink(AGENT_MONITOR_WEBUI_URL,默认 ws://localhost:8765/ws,逗号分隔多 hub):
   事件流推送给独立 hub(apps/agent-dashboard/server/,WS 端点 /ws),浏览器实时查看;
 - OTel sink(AGENT_MONITOR_PHOENIX_URL,默认 http://localhost:6006/):事件流 → span 树 →
@@ -21,16 +22,22 @@ put_nowait 到每 sink 的 asyncio.Queue,永不阻塞调用)→ sink worker 消�
 
 import asyncio
 import json
-import os
 import socket
 from pathlib import Path
 from urllib.parse import urlsplit
 
 from .. import envs
 from ..utils import _log as _utils_log
-from .events import truncate
+from .events import NON_STREAM_TYPES, truncate
 
-_STATE_DIRS = ("running", "completed", "aborted")
+
+def _file_stem(session: str) -> str:
+    """会话 id → 文件名 stem(uuid 段):取最后一个 "/" 后段,保证扁平布局。
+
+    session id 形如 <ns>/<uuid4>(ns 由上层业务定);显式无斜杠 session 原样
+    (测试用 "s1" 等)。本函数不改协议,仅为文件名映射。
+    """
+    return session.rsplit("/", 1)[-1]
 
 
 def _log(msg: str) -> None:
@@ -83,22 +90,30 @@ class EventBus:
 
 
 class FileSink:
-    """文件观测通道:每会话一个 JSONL,每行一条原始事件(事件溯源,全量无损)。
+    """文件观测通道:每会话一个 JSONL,只落非流式事件流(message 粒度)。
 
-    目录结构即索引(sessions/{running,aborted,completed}/),行即自描述事件;
-    Linux 查询友好:tail -f running/*.jsonl 实时看,jq 过滤并按折叠规范
-    (gh_puller.agent.events)还原任意时刻消息上下文。终态经 os.replace 迁入
-    对应状态目录;崩溃残留停留在 running/(即排查素材);hub 启动时按文件
-    所在目录种子状态。无 session/start 起点的事件不可分组,丢弃(同 v1 语义)。
+    布局扁平:sessions/<uuid>.jsonl(uuid 段 = session id 最后一个 "/" 后段),
+    一行一条事件(按 seq 排序来自适配器);assistant/chunk 直接跳过 —— 文件
+    seq 允许洞,洞 = 被跳过的流式事件(契约见 gh_puller.agent.events,前端
+    折叠只比较 seq,不要求稠密)。分类学隐式化:不再有运行/完成/中止目录,
+    状态在事件里 —— grep '"type":"session/end"' 查终态(按 data.state 分
+    完成/中止)、grep '"type":"error"' 查错误、grep 'session/start' 的 session
+    字段查会话来源(<ns>/<uuid4>,ns 由上层业务定)。Linux 查询友好:
+    tail -f sessions/*.jsonl 实时看;jq 过滤并按折叠规范
+    (gh_puller.agent.events)还原任意时刻消息上下文。session/end 留作文件
+    脏终行;崩溃残留 = 无终态行的文件(= running,排查素材),hub seed 按
+    "有无 session/end" 判态并支持按需重判(见 hub.py)。无 session/start 起点
+    的事件不可分组,丢弃(同 v1 语义)。
     """
 
     def __init__(self, root: str):
         self.root = Path(root)
-        self._files: dict[str, Path] = {}
-        for st in _STATE_DIRS:
-            (self.root / "sessions" / st).mkdir(parents=True, exist_ok=True)
+        self._files: dict[str, Path] = {}  # session → 当前文件(注册用;终态不移走)
+        (self.root / "sessions").mkdir(parents=True, exist_ok=True)
 
     async def consume(self, evt: dict) -> None:
+        if evt["type"] not in NON_STREAM_TYPES:
+            return  # 流式事件(chunk):文件只落非流式事件流,防日志膨胀
         session = evt.get("session", "")
         if evt["type"] == "session/start":
             self._open(session)
@@ -108,15 +123,9 @@ class FileSink:
         with open(path, "a", encoding="utf-8") as f:
             f.write(json.dumps(evt, ensure_ascii=False) + "\n")
             f.flush()
-        if evt["type"] == "session/end":
-            self._close(session, (evt.get("data") or {}).get("state", "completed"))
 
     def _open(self, session: str) -> None:
-        self._files[session] = self.root / "sessions" / "running" / f"{session}.jsonl"
-
-    def _close(self, session: str, state: str) -> None:
-        src = self._files.pop(session)
-        os.replace(src, self.root / "sessions" / state / src.name)
+        self._files[session] = self.root / "sessions" / f"{_file_stem(session)}.jsonl"
 
 
 class WsSink:

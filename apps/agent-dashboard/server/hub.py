@@ -6,12 +6,18 @@
 (每会话事件按 seq 索引;完备真源是 FileSink 磁盘 JSONL —— 启动种子加载后,
 历史查看不再为空),写盘是 FileSink 的事,重启 hub 列表与历史均在。
 
+磁盘布局扁平(sessions/<uuid>.jsonl,见 gh_puller.agent.sinks.FileSink):
+分类学隐式化 —— 会话键 = 文件内 session/start 的 session 字段(<ns>/<uuid4>),
+状态 = 有无 session/end(有:按 data.state 分 completed/aborted;无:running)。
+index 时对 running 会话按需重判(文件 mtime 变化才重读尾部找终态)。
+
 协议:一连接一角色,首帧定角色(evt → 生产端,其余 → 查看端);查看端帧:
 - index → {type:"index", sessions:[{session, run_id, label, provider, model, state,
   ts, last_ts, num_events}]}(last_ts 降序);
 - history {session, beforeSeq?, max?} → {type:"history", session, events, hasMore,
   nextBeforeSeq}:磁盘+内存合并的 seq 升序页(beforeSeq 缺省读尾部;nextBeforeSeq
-  为 oldest in-page,客户端以此翻旧页);
+  为 oldest in-page,客户端以此翻旧页)。文件 seq 允许洞(洞=被跳过的
+  assistant/chunk),客户端只按 seq 排序/比较,不作稠密假设;
 - subscribe {session} → {type:"evt_ready", session, lastSeq} 后实时
   {type:"evt","event":...} 推送(单订阅视图:一连接只盯一会话);
 - ping → pong。
@@ -28,11 +34,17 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response
 from gh_puller import envs
 
-_STATE_DIRS = ("running", "completed", "aborted")
-
 
 def _log(msg: str) -> None:
     print(f"[agent-monitor] {msg}", file=sys.stderr, flush=True)
+
+
+def _file_stem(session: str) -> str:
+    """会话 id → 文件名 stem(uuid 段):取最后一个 "/" 后段(与 FileSink 同映射)。
+
+    session id 形如 <ns>/<uuid4>(ns 由上层业务定);显式无斜杠 session 原样。
+    """
+    return session.rsplit("/", 1)[-1]
 
 
 class _Session:
@@ -50,6 +62,7 @@ class _Session:
         self.last_ts = self.ts
         self.events: dict[int, dict] = {}  # seq → 事件(feed 实时写入;种子时载入)
         self.subscribers: set = set()  # live evt 订阅(查看端;单视图语义)
+        self.disk_mtime: float = 0.0  # 最近一次重判时文件的 mtime(0 = 未查)
 
 
 class _Hub:
@@ -59,54 +72,110 @@ class _Hub:
         self.sessions: dict[str, _Session] = {}
         self.root: str | None = None  # AGENT_MONITOR_DIR(history 合并磁盘用)
 
-    def seed(self, root: str | None) -> None:
-        """启动种子:扫描 sessions/{running,completed,aborted}/*.jsonl 载入事件溯源格式。
+    def _file_for(self, session: str) -> Path | None:
+        """会话 → 磁盘文件路径(扁平布局);root 未设 → None。"""
+        if not self.root:
+            return None
+        return Path(self.root) / "sessions" / f"{_file_stem(session)}.jsonl"
 
-        旧(聚合 LLM 行)格式 / 坏行不可折叠 → 跳过并日志(不影响其余会话);
-        running 会话保持 running,live 续写经 feed(同 seq 覆盖,天然去重)。
+    def seed(self, root: str | None) -> None:
+        """启动种子:扫描 sessions/*.jsonl 扁平文件,载入事件溯源格式。
+
+        会话键取文件内 session/start 的 session 字段(文件名只是 stem,无状态目录);
+        状态隐式判定:文件含 session/end → 按 data.state 分 completed/aborted,
+        无 → running(崩溃残留/运行中)。旧(聚合 LLM 行)格式 / 坏行不可折叠 →
+        跳过并日志(不影响其余会话);live 续写经 feed(同 seq 覆盖,天然去重)。
         """
         if not root:
             return
         self.root = root
         base = Path(root) / "sessions"
-        for state in _STATE_DIRS:
-            for path in sorted((base / state).glob("*.jsonl")):
+        for path in sorted(base.glob("*.jsonl")):
+            try:
+                lines = path.read_text(encoding="utf-8").splitlines()
+            except Exception as exc:
+                _log(f"hub 种子跳过 {path.name}: 读取失败 {exc}")
+                continue
+            events: dict[int, dict] = {}
+            head: dict | None = None
+            end_state: str | None = None
+            for line in lines:
+                if not line.strip():
+                    continue
                 try:
-                    lines = path.read_text(encoding="utf-8").splitlines()
-                except Exception as exc:
-                    _log(f"hub 种子跳过 {path.name}: 读取失败 {exc}")
+                    evt = json.loads(line)
+                except Exception:
+                    _log(f"hub 种子跳过半行 {path.name}: 不可解析")
                     continue
-                events: dict[int, dict] = {}
-                head: dict | None = None
-                for line in lines:
-                    if not line.strip():
-                        continue
-                    try:
-                        evt = json.loads(line)
-                    except Exception:
-                        _log(f"hub 种子跳过半行 {path.name}: 不可解析")
-                        continue
-                    if head is None and evt.get("type") == "session/start":
-                        head = evt
-                    if "seq" not in evt or "type" not in evt:
-                        continue  # 旧 v1 聚合行:无 seq/type,整体不可折叠
-                    events[int(evt["seq"])] = evt
-                if head is None or not events:
-                    _log(f"hub 种子跳过 {path.name}: 非事件溯源格式")
-                    continue
-                d = head.get("data") or {}
-                sess = _Session(path.stem, head.get("label") or d.get("label"),
-                                head.get("provider") or d.get("provider"),
-                                head.get("model") or d.get("model"),
-                                run_id=head.get("run_id") or d.get("run_id"))
-                sess.state = state
-                sess.ts = head.get("ts") or sess.ts
-                sess.last_ts = max((e.get("ts") or sess.ts) for e in events.values())
-                sess.events = events
-                self.sessions[path.stem] = sess
+                if head is None and evt.get("type") == "session/start":
+                    head = evt
+                if evt.get("type") == "session/end":
+                    end_state = (evt.get("data") or {}).get("state", "completed")
+                if "seq" not in evt or "type" not in evt:
+                    continue  # 旧 v1 聚合行:无 seq/type,整体不可折叠
+                events[int(evt["seq"])] = evt
+            if head is None or not events:
+                _log(f"hub 种子跳过 {path.name}: 非事件溯源格式")
+                continue
+            d = head.get("data") or {}
+            sid = head.get("session") or path.stem  # key = 事件内 session(文件名只是 stem)
+            sess = _Session(sid, head.get("label") or d.get("label"),
+                            head.get("provider") or d.get("provider"),
+                            head.get("model") or d.get("model"),
+                            run_id=head.get("run_id") or d.get("run_id"))
+            sess.state = end_state or "running"
+            sess.ts = head.get("ts") or sess.ts
+            sess.last_ts = max((e.get("ts") or sess.ts) for e in events.values())
+            sess.events = events
+            try:
+                sess.disk_mtime = path.stat().st_mtime
+            except OSError:
+                pass
+            self.sessions[sid] = sess
+
+    def _recheck_state(self, sess: _Session) -> None:
+        """按需重判(隐式分类学):running 会话的磁盘文件 mtime 变化 → 重读尾部找终态。
+
+        session/end 必为文件最后一条合法行(适配器 finish 的 finally 兜底);
+        文件尾部 64KB 内反向扫描即可。mtime 不变 → 不动(stat 与读盘分离,
+        全量跳过的会话零读盘)。自愈场景:seed 后文件继续被写(WS 漏帧/断接),
+        或崩溃残留文件被外部补写终态。
+        """
+        if sess.state != "running":
+            return
+        path = self._file_for(sess.session)
+        if path is None or not path.exists():
+            return
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            return
+        if mtime == sess.disk_mtime:
+            return
+        sess.disk_mtime = mtime
+        try:
+            size = path.stat().st_size
+            with open(path, "rb") as f:
+                f.seek(max(0, size - 65536))
+                tail = f.read().decode("utf-8", "replace")
+        except OSError:
+            return
+        for line in reversed(tail.splitlines()):
+            if not line.strip():
+                continue
+            try:
+                evt = json.loads(line)
+            except Exception:
+                continue  # 半行/坏行:继续看更早的行
+            if evt.get("type") == "session/end":
+                sess.state = (evt.get("data") or {}).get("state", "completed")
+                sess.last_ts = max(sess.last_ts, evt.get("ts") or 0)
+            break  # 只判最后一条合法文件行
 
     def index(self) -> list[dict]:
-        """会话索引(最近更新在前):供左列表渲染。"""
+        """会话索引(最近更新在前):供左列表渲染;先对 running 会话按需重判。"""
+        for sess in self.sessions.values():
+            self._recheck_state(sess)
         return sorted(
             (
                 {"session": s.session, "run_id": s.run_id, "label": s.label,
@@ -128,27 +197,24 @@ class _Hub:
                 subs.discard(sub)
 
     def _session_events(self, sess: _Session) -> dict[int, dict]:
-        """磁盘 + 内存合并事件(seq 键;内存更新,覆盖磁盘同 seq —— live 优先)。"""
+        """磁盘 + 内存合并事件(seq 键;内存更新,覆盖磁盘同 seq —— live 优先)。
+
+        文件为扁平布局(sessions/<uuid>.jsonl);seq 允许洞(洞=被跳过的
+        assistant/chunk),按键合并天然兼容。
+        """
         merged: dict[int, dict] = {}
-        if self.root:
-            base = Path(self.root) / "sessions"
-            for cand in (
-                base / "running" / f"{sess.session}.jsonl",
-                base / "completed" / f"{sess.session}.jsonl",
-                base / "aborted" / f"{sess.session}.jsonl",
-            ):
-                if not cand.exists():
+        cand = self._file_for(sess.session)
+        if cand is not None and cand.exists():
+            for line in cand.read_text(encoding="utf-8", errors="replace").splitlines():
+                if not line.strip():
                     continue
-                for line in cand.read_text(encoding="utf-8", errors="replace").splitlines():
-                    if not line.strip():
-                        continue
-                    try:
-                        evt = json.loads(line)
-                    except Exception:
-                        continue
-                    if "seq" not in evt:
-                        continue  # 旧格式行跳过
-                    merged[int(evt["seq"])] = evt
+                try:
+                    evt = json.loads(line)
+                except Exception:
+                    continue
+                if "seq" not in evt:
+                    continue  # 旧格式行跳过
+                merged[int(evt["seq"])] = evt
         merged.update(sess.events)
         return merged
 
