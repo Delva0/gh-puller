@@ -21,6 +21,7 @@ cd apps/agent-dashboard/web && pnpm dev
 pnpm -r build
 ```
 
-浏览器打开 `http://localhost:8765/` 即查看端;生产侧 LLM 调用以
-`AGENT_MONITOR_WS_URL=ws://localhost:8765/ws` 启动即可实时上屏。
+浏览器打开 `http://localhost:8765/` 即查看端;生产侧 LLM 调用默认自动对接
+(`AGENT_MONITOR_WEBUI_URL` 默认 `ws://localhost:8765/ws` 且 hub 可达才注册;
+可逗号分隔多个 hub),实时上屏。
 各子项目的完整说明见 `server/README.md`。

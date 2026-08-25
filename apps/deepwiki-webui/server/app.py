@@ -13,6 +13,12 @@ import os
 from datetime import datetime
 from typing import Literal
 
+from dotenv import load_dotenv
+
+# 必须先于任何 gh_puller 导入:envs.py 在导入时单点快照环境变量。
+# load_dotenv() 自 cwd 向上找 .env(仓库根,整树仅此一份);override=False,不覆盖已设变量。
+load_dotenv()
+
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse

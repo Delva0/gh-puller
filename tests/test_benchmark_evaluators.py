@@ -22,7 +22,7 @@ from gh_puller.benchmark.evaluators import LLMEvaluator
 async def _monitor_cleanup():
     """评测器走真实 llm_complete/cc_result:监控需停用,避免写用户真实 monitor 目录。"""
     yield
-    agent.configure(file=False, ws_url="")
+    agent.configure(file=False, ws_urls=[], otel_urls=[])
     await asyncio.sleep(0.01)
 
 

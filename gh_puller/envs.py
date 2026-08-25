@@ -35,12 +35,15 @@ GRAPHIFY_OUT = os.environ.get("GRAPHIFY_OUT", "graphify-out")
 # ---- chat 输入上限的粗略估算(不引 tiktoken:以字符数/4 近似 token) ----
 CHAT_TOKEN_LIMIT_ESTIMATE = int(os.environ.get("DEEPWIKI_CHAT_TOKEN_LIMIT", "7500"))
 
-# ---- agent 流式监控(文件观测默认开;Web/WS 经 AGENT_MONITOR_WS_URL opt-in) ----
+# ---- agent 流式监控(文件观测默认恒开;Web/WS 经 AGENT_MONITOR_WEBUI_URL,OTel 经 AGENT_MONITOR_PHOENIX_URL) ----
+# 两 URL 均逗号分隔多地址(每地址一个 sink 实例,预留);空 → 不启用该类 sink。
+# 新 OTel 后端(如 AGENT_MONITOR_LANGFUSE_URL,默认 "")= 此处一个常量 + sinks._OTEL_BACKENDS 表一条。
 AGENT_MONITOR_DIR = os.path.expanduser(os.environ.get("AGENT_MONITOR_DIR", "~/.gh-puller/agent-monitor"))
-AGENT_MONITOR_FILE = os.environ.get("AGENT_MONITOR_FILE", "1") not in ("0", "false")
-AGENT_MONITOR_WS_URL = os.environ.get("AGENT_MONITOR_WS_URL", "")  # 空 → 不启用 ws sink
+# 默认 = 内部 agent-dashboard hub(apps/agent-dashboard,AGENT_MONITOR_PORT 联动)
+AGENT_MONITOR_WEBUI_URL = os.environ.get("AGENT_MONITOR_WEBUI_URL", "ws://localhost:8765/ws")
 AGENT_MONITOR_PORT = int(os.environ.get("AGENT_MONITOR_PORT", "8765"))
-AGENT_MONITOR_OTEL_ENDPOINT = os.environ.get("AGENT_MONITOR_OTEL_ENDPOINT", "")  # 空 → 不启用 otel sink
+# 启用条件:端点可达(ensure_bus 构建时 TCP 探活)+ opentelemetry 可导入
+AGENT_MONITOR_PHOENIX_URL = os.environ.get("AGENT_MONITOR_PHOENIX_URL", "http://localhost:6006/")
 
 # ---- benchmark 评测(单题超时/评测器选择与端点) ----
 TIMEOUT = 3600.0  # 单题超时(秒,1 小时):参赛方 ask 与评测器评分的统一上限

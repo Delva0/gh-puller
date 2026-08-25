@@ -6,10 +6,11 @@
   ResultMessage.is_error → RuntimeError("agent 执行失败: ...") —— 与 deepwiki
   原 `_agent_stream` 漏斗逐字节一致;thinking/工具增量只进监控事件流,不改变产出。
 - llm_complete / llm_stream(adapters.py):OpenAI 兼容端点(httpx);异常原样抛,重试留给调用方。
-- configure / EventBus / FileSink / WsSink(sinks.py):监控运行时重配与文件/WS 观测通道
-  (AGENT_MONITOR_DIR / AGENT_MONITOR_WS_URL;OtelSink 亦在 sinks.py,经
-  AGENT_MONITOR_OTEL_ENDPOINT 启用,opentelemetry 惰性导入,需显式
-  `from gh_puller.agent.sinks import OtelSink`,本模块不导出)。
+- configure / ensure_bus / EventBus / FileSink / WsSink(sinks.py):监控运行时重配、
+  惰性构建总线与文件/WS 观测通道(AGENT_MONITOR_DIR / AGENT_MONITOR_WEBUI_URL,
+  逗号分隔多地址,每地址一个 sink 实例;OtelSink 亦在 sinks.py,经
+  AGENT_MONITOR_PHOENIX_URL 启用 —— 端点可达 + opentelemetry 可导入才注册,
+  置空关闭;需显式 `from gh_puller.agent.sinks import OtelSink`,本模块不导出)。
 - KINDS / LLM_STREAM_TYPES / LlmAggregator / new_event / truncate(events.py):
   纯 dict 事件模型与 LLM 流聚合器,零 SDK 依赖,FS/hub 共用。
 
@@ -29,7 +30,7 @@ from .events import (
     new_event,
     truncate,
 )
-from .sinks import EventBus, FileSink, WsSink, configure
+from .sinks import EventBus, FileSink, WsSink, configure, ensure_bus
 
 __all__ = [
     "KINDS",
@@ -43,6 +44,7 @@ __all__ = [
     "FileSink",
     "WsSink",
     "configure",
+    "ensure_bus",
     "cc_stream",
     "cc_text",
     "cc_result",

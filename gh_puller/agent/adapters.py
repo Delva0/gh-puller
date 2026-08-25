@@ -20,7 +20,7 @@ import uuid
 import httpx
 
 from .events import new_event, truncate
-from .sinks import _ensure_bus
+from .sinks import ensure_bus
 
 
 # ---------------------------------------------------------------------------
@@ -48,7 +48,7 @@ class _Run:
         self._tool_result: dict | None = None
 
     def event(self, kind: str, **fields) -> None:
-        bus = _ensure_bus()
+        bus = ensure_bus()
         if not bus.enabled:  # 零 sink 短路:不构造事件(无 uuid/json 开销)
             return
         evt = new_event(

@@ -1,6 +1,6 @@
 """Agent 监控 Web/WS hub(FastAPI 端点层)。
 
-生产端是 gh_puller.agent 的 WsSink(经 AGENT_MONITOR_WS_URL 接入,主动向 /ws 推
+生产端是 gh_puller.agent 的 WsSink(经 AGENT_MONITOR_WEBUI_URL 接入,主动向 /ws 推
 {"type":"evt","event":...});浏览器查看端经同一端点订阅会话。GET / 与 /viewer
 直接出构建好的单文件 viewer(agent-monitor.html);hub 只持内存状态
 (事件环 1000/会话、LLM 流行 500 行/会话),写盘是 FileSink 的事,启动时从磁盘

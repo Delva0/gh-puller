@@ -22,9 +22,12 @@ uv run uvicorn hub:app --host 0.0.0.0 --port 8765   # 端口默认与 envs.AGENT
 ## 生产端接入
 
 任何 LLM 调用(经 `gh_puller.agent` 的 `cc_*` / `llm_*` 包装)时开启 WS 通道:
+WsSink 由 `ensure_bus` 惰性注册 —— 默认 `AGENT_MONITOR_WEBUI_URL=ws://localhost:8765/ws`,
+hub 可达(tcp 探活)即自动对接,无需显式配置。
 
 ```bash
-AGENT_MONITOR_WS_URL=ws://localhost:8765/ws uv run benchmark ...
+# 自定义/多 hub(逗号分隔,每地址一个 WsSink):
+AGENT_MONITOR_WEBUI_URL=ws://localhost:8765/ws uv run benchmark ...
 ```
 
 注意 WS 地址带 `/ws` 路径。协议帧格式测试见 `tests/test_hub.py`(`uv run pytest`)。
