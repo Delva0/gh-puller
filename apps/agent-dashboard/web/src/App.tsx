@@ -1,31 +1,46 @@
 // 监控面板布局:侧栏(搜索/筛选/run_id 分组会话列表)+ 主面板(状态芯片条 +
-// 对话/轨迹 双 Tab,组件取自 @gh-puller/ui)+ 状态栏
-import { useEffect, useMemo, useState } from 'react';
+// dsh 1:1 对话/轨迹面板(DshConversationPanel,组件取自 @gh-puller/ui))+ 状态栏
+import { useMemo, useState } from 'react';
 import {
-  MonitorChatView,
-  MonitorConversation,
+  DshConversationPanel,
   MonitorSessionList,
   MonitorStatusBar,
-  MonitorTrajectoryView,
   StateBadge,
   ThemeToggle,
   useLanguage,
   useMonitorSession,
   useMonitorSocket,
 } from '@gh-puller/ui';
-import type { MonitorView, ToolCallView } from '@gh-puller/ui';
 
 const CHIP = 'rounded-md border border-[var(--border-color)] px-2 py-0.5 font-mono text-[11px] text-[var(--muted)]';
+
+/** 从 dsh 轨迹快照汇总 tok(usage 字段以 dsh 侧形状为准则)。 */
+function usageOf(requests: ReadonlyArray<{ usage?: unknown }>): { input: number; output: number } | null {
+  let inp = 0;
+  let out = 0;
+  let seen = false;
+  for (const r of requests) {
+    const u = r.usage as { input?: number; output?: number; inputTokens?: number; outputTokens?: number } | null | undefined;
+    if (u == null) continue;
+    const i = u.input ?? u.inputTokens;
+    const o = u.output ?? u.outputTokens;
+    if (i != null) { inp += i; seen = true; }
+    if (o != null) { out += o; seen = true; }
+  }
+  return seen ? { input: inp, output: out } : null;
+}
 
 export default function App() {
   const { t, lang, setLang } = useLanguage();
   const m = useMonitorSocket();
-  const { events, chat, partial } = useMonitorSession();
+  const { events, dsh } = useMonitorSession();
 
   const [query, setQuery] = useState('');
   const [stateFilter, setStateFilter] = useState<string>('all');
-  const [view, setView] = useState<MonitorView>('chat');
-  const [autoScroll, setAutoScroll] = useState(true);
+
+  const conv = dsh?.snapshot();
+  const traj = conv?.views.get('trajectory');
+  const requests = traj?.requests ?? [];
 
   const meta = useMemo(() => m.sessions.find((s) => s.session === m.current) ?? null, [m.sessions, m.current]);
   // 终态摘要取自 session/end;运行中时长按 last_ts - ts 即时表现
@@ -35,23 +50,7 @@ export default function App() {
     }
     return null;
   }, [events]);
-  const usage = useMemo(() => {
-    // 汇总各请求 usage(会话级摘要)
-    let inp: number | null = null;
-    let out: number | null = null;
-    for (const r of chat.requests) {
-      if (r.usage?.input_tokens != null) inp = (inp ?? 0) + r.usage.input_tokens;
-      if (r.usage?.output_tokens != null) out = (out ?? 0) + r.usage.output_tokens;
-    }
-    return inp == null && out == null ? null : { input_tokens: inp, output_tokens: out };
-  }, [chat.requests]);
-  const toolsByCall = useMemo(() => {
-    const map = new Map<string, ToolCallView>();
-    for (const r of chat.requests) {
-      for (const tool of r.tools) map.set(tool.callId, tool);
-    }
-    return map;
-  }, [chat.requests]);
+  const usage = useMemo(() => usageOf(requests), [requests]);
 
   const durMs = Number(summary?.duration_ms);
   const duration = Number.isFinite(durMs) && summary && summary.duration_ms != null
@@ -115,32 +114,25 @@ export default function App() {
               {meta.provider && <span className={CHIP}>{meta.provider}/{meta.model || '—'}</span>}
               {meta.run_id && <span className={CHIP}>{meta.run_id}</span>}
               <span className={CHIP}>{t('meta.duration')} {duration}</span>
-              {chat.requests.length > 0 && (
-                <span className={CHIP}>{t('meta.steps')} {chat.requests.length}</span>
+              {requests.length > 0 && (
+                <span className={CHIP}>{t('meta.steps')} {requests.length}</span>
               )}
               {usage && (
                 <span className={CHIP}>
-                  {usage.input_tokens ?? '?'}→{usage.output_tokens ?? '?'}
-                  {usage.input_tokens != null || usage.output_tokens != null ? ' tok' : ''}
+                  {usage.input}→{usage.output} tok
                 </span>
               )}
             </>
           )}
-          <label className="ml-auto flex cursor-pointer items-center gap-1 text-xs text-[var(--muted)]">
-            <input type="checkbox" checked={autoScroll} onChange={(e) => setAutoScroll(e.target.checked)} />
-            {t('monitor.autoScroll')}
-          </label>
         </header>
 
-        <MonitorConversation view={view} onView={setView}>
+        <div className="min-h-0 flex-1">
           {m.current === null ? (
             <div className="p-6 text-xs text-[var(--muted)]">{t('view.empty')}</div>
-          ) : view === 'chat' ? (
-            <MonitorChatView nodes={chat.chatNodes} partial={partial} toolsByCall={toolsByCall} autoScroll={autoScroll} />
           ) : (
-            <MonitorTrajectoryView requests={chat.requests} nodes={chat.chatNodes} />
+            <DshConversationPanel />
           )}
-        </MonitorConversation>
+        </div>
 
         <MonitorStatusBar status={m.status} current={m.current} events={events.length} />
       </main>

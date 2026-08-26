@@ -3,14 +3,48 @@
     "target": "ES2022",
     "module": "ESNext",
     "moduleResolution": "bundler",
-    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "baseUrl": ".",
+    "paths": {
+      "@dsh/ui-slots": [
+        "../../../ui/src/vendor/dsh/ui-slots/src/index.ts"
+      ],
+      "@dsh/ui-conversation": [
+        "../../../ui/src/vendor/dsh/ui-conversation/src/client/index.ts"
+      ],
+      "@dsh/runtime": [
+        "../../../ui/src/vendor/dsh/runtime/src/client/index.ts"
+      ],
+      "@dsh/cordis": [
+        "../../../ui/src/vendor/dsh/shims/cordis.ts"
+      ],
+      "@dsh/session": [
+        "../../../ui/src/vendor/dsh/session/types.ts"
+      ],
+      "@dsh/session-projection": [
+        "../../../ui/src/vendor/dsh/session-projection.ts"
+      ]
+    },
+    "lib": [
+      "ES2022",
+      "ES2023",
+      "DOM",
+      "DOM.Iterable"
+    ],
     "jsx": "react-jsx",
     "strict": true,
     "noEmit": true,
+    "allowImportingTsExtensions": true,
     "resolveJsonModule": true,
     "skipLibCheck": true,
     "isolatedModules": true,
-    "types": ["node", "vite/client"]
+    "types": [
+      "node",
+      "vite/client"
+    ]
   },
-  "include": ["src", "vite.config.ts", "../../../ui/src"]
+  "include": [
+    "src",
+    "vite.config.ts",
+    "../../../ui/src"
+  ]
 }

@@ -8,6 +8,17 @@ import { viteSingleFile } from 'vite-plugin-singlefile';
 // (hub 经 GET / 直出;产物 html 文件名取自源 html 文件 basename,故入口命名为 agent_monitor_viewer.html)
 export default defineConfig({
   plugins: [react(), tailwindcss(), viteSingleFile()],
+  resolve: {
+    alias: {
+      // vendor 面板的模块增强统一走字符串别名(TS 不允许相对路径 declare module)
+      '@dsh/ui-slots': resolve(import.meta.dirname, '../../../ui/src/vendor/dsh/ui-slots/src/index.ts'),
+      '@dsh/ui-conversation': resolve(import.meta.dirname, '../../../ui/src/vendor/dsh/ui-conversation/src/client/index.ts'),
+      '@dsh/runtime': resolve(import.meta.dirname, '../../../ui/src/vendor/dsh/runtime/src/client/index.ts'),
+      '@dsh/cordis': resolve(import.meta.dirname, '../../../ui/src/vendor/dsh/shims/cordis.ts'),
+      '@dsh/session': resolve(import.meta.dirname, '../../../ui/src/vendor/dsh/session/types.ts'),
+      '@dsh/session-projection': resolve(import.meta.dirname, '../../../ui/src/vendor/dsh/session-projection.ts'),
+    },
+  },
   build: {
     outDir: resolve(import.meta.dirname, '../server/static'),
     emptyOutDir: true,

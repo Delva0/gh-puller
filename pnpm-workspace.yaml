@@ -11,3 +11,8 @@ allowBuilds:
   '@parcel/watcher': true
   '@swc/core': true
   sharp: true
+
+# 单版本固化:micromark-util-types 的 .d.ts 被 micromark-extension-math 增强,
+# 双版本并存会让 TokenTypeMap 增强与 Effects 类型分裂(见 vendor 面板编译)。
+overrides:
+  micromark-util-types: 2.0.2

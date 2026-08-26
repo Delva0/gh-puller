@@ -7,7 +7,9 @@
 - ping→pong;GET /(与 /viewer)出 viewer HTML,其它路径 404;
 - 重启种子(扁平 sessions/*.jsonl):隐式分类学 —— 会话键=事件内 session 字段,
   有 session/end → completed/aborted,无 → running;按需重判(mtime 变 → 尾部找终态);
-  旧 v1 聚合行/坏行文件跳过不崩。
+  旧 v1 聚合行/坏行文件跳过不崩;
+- 查看端广播 index:feed 新建会话/终态翻转时向全部查看端推 {type:'index'}
+  (每 run ≤2 帧;既有会话内事件不广播),断连端剔除不异常。
 """
 
 import json
@@ -290,3 +292,77 @@ def test_seed_skips_old_format_and_corrupt_lines(tmp_path):
     sessions = {s["session"]: s for s in hub.index()}
     assert "old-a" not in sessions  # 旧格式整文件跳过
     assert sessions["seed-b"]["num_events"] == 2  # 坏行跳过,其余载入
+
+
+def test_index_pushed_on_new_session(client):
+    """全新会话 live 到达(viewer 的场景):feed 惰性建 s2 时向查看端广播完整索引。
+
+    协议不新增帧型:复用 {type:'index'}(客户端 handleFrame 已处理);仅新建与
+    session/end 触发(每 run ≤2 帧),既有会话内事件不广播(见 spam 用例)。
+    """
+    with client.websocket_connect("/ws") as producer:
+        producer.send_text(json.dumps({"type": "evt", "event": _evt(
+            "session/start", "s1", seq=0, run_id="chat:demo", label="chat:demo")},
+            ensure_ascii=False))
+        with client.websocket_connect("/ws") as v:
+            v.send_text(json.dumps({"type": "subscribe", "session": "s1"}, ensure_ascii=False))
+            assert json.loads(v.receive_text())["type"] == "evt_ready"
+            # 全新会话首事件:viewer 被动收到 index(s2 出现,状态 running)
+            producer.send_text(json.dumps({"type": "evt", "event": _evt(
+                "session/start", "s2", seq=0, run_id="chat:demo2", label="chat:demo2")},
+                ensure_ascii=False))
+            frames = _until(v, "index")
+            by_s = {s["session"]: s for s in frames[-1]["sessions"]}
+            assert set(by_s) == {"s1", "s2"}
+            assert by_s["s2"]["state"] == "running"
+            assert by_s["s2"]["run_id"] == "chat:demo2"
+
+
+def test_index_pushed_on_session_end(client):
+    """终态翻转:session/end 到达 → 查看端收 live evt 后收广播 index,状态转 completed。"""
+    with client.websocket_connect("/ws") as producer:
+        producer.send_text(json.dumps({"type": "evt", "event": _evt(
+            "session/start", "s1", seq=0, run_id="chat:demo", label="chat:demo")},
+            ensure_ascii=False))
+        with client.websocket_connect("/ws") as v:
+            v.send_text(json.dumps({"type": "subscribe", "session": "s1"}, ensure_ascii=False))
+            assert json.loads(v.receive_text())["type"] == "evt_ready"
+            producer.send_text(json.dumps({"type": "evt", "event": _evt(
+                "session/end", "s1", seq=1, state="completed", ok=True,
+                duration_ms=10, text_chars=1, num_steps=1)}, ensure_ascii=False))
+            frames = _until(v, "index")
+            assert frames[0]["type"] == "evt"  # 订阅端先收 live 帧
+            state = {s["session"]: s["state"] for s in frames[-1]["sessions"]}
+            assert state["s1"] == "completed"
+
+
+def test_broadcast_skips_disconnected():
+    """断开的查看端:被 finally 剔除,feed 广播不残留不异常;新会话照常入库。"""
+    h = _Hub()
+    app = create_app(h)
+    with TestClient(app) as c:
+        with c.websocket_connect("/ws") as v:
+            v.send_text(json.dumps({"type": "ping"}, ensure_ascii=False))
+            assert json.loads(v.receive_text())["type"] == "pong"
+        assert h.viewers == set()  # 断连清理无残留
+        with c.websocket_connect("/ws") as producer:
+            producer.send_text(json.dumps({"type": "evt", "event": _evt(
+                "session/start", "s3", seq=0, label="l3")}, ensure_ascii=False))
+        assert {s["session"] for s in h.index()} == {"s3"}
+
+
+def test_no_index_spam_on_same_session_events(client):
+    """既有会话内事件只发 live evt,不广播 index:以 ping/pong 探针验证无残留帧。"""
+    with client.websocket_connect("/ws") as producer:
+        producer.send_text(json.dumps({"type": "evt", "event": _evt(
+            "session/start", "s1", seq=0, run_id="chat:demo", label="chat:demo")},
+            ensure_ascii=False))
+        with client.websocket_connect("/ws") as v:
+            v.send_text(json.dumps({"type": "subscribe", "session": "s1"}, ensure_ascii=False))
+            assert json.loads(v.receive_text())["type"] == "evt_ready"
+            producer.send_text(json.dumps({"type": "evt", "event": _user_evt("s1", 1, "hi")},
+                                          ensure_ascii=False))
+            live = json.loads(v.receive_text())
+            assert live["type"] == "evt" and live["event"]["seq"] == 1
+            v.send_text(json.dumps({"type": "ping"}, ensure_ascii=False))
+            assert json.loads(v.receive_text())["type"] == "pong"  # 若 index 被误广播,会先于 pong 出现

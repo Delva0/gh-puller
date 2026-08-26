@@ -71,6 +71,7 @@ class _Hub:
 
     def __init__(self):
         self.sessions: dict[str, _Session] = {}
+        self.viewers: set = set()  # 所有查看端连接(新会话/终态时广播 index;不同于 per-session subscribers)
         self.root: str | None = None  # AGENT_MONITOR_DIR(history 合并磁盘用)
 
     def _file_for(self, session: str) -> Path | None:
@@ -199,6 +200,11 @@ class _Hub:
                 _log(f"hub 订阅端断连,移除订阅: {type(exc).__name__}: {exc}")
                 subs.discard(sub)
 
+    async def _broadcast_index(self) -> None:
+        """推送完整会话索引到所有查看端(新会话/终态变更时;协议不新增帧型)。"""
+        await self._push(self.viewers, json.dumps(
+            {"type": "index", "sessions": self.index()}, ensure_ascii=False))
+
     def _session_events(self, sess: _Session) -> dict[int, dict]:
         """磁盘 + 内存合并事件(seq 键;内存更新,覆盖磁盘同 seq —— live 优先)。
 
@@ -235,6 +241,7 @@ class _Hub:
         sid = evt.get("session") or ""
         if not sid:
             return
+        created = self.sessions.get(sid) is None
         sess = self.sessions.get(sid)
         if sess is None:
             d = evt.get("data") or {}
@@ -258,6 +265,9 @@ class _Hub:
         elif evt.get("type") == "session/end":
             sess.state = (evt.get("data") or {}).get("state", "completed")
         await self._push(sess.subscribers, json.dumps({"type": "evt", "event": evt}, ensure_ascii=False))
+        # 新会话 / 终态翻转:让所有查看端(含未订阅侧栏)无需刷新即更新列表;每次 run 至多 2 帧
+        if created or evt.get("type") == "session/end":
+            await self._broadcast_index()
 
 
 def _viewer_html(static_root: Path) -> bytes:
@@ -326,6 +336,7 @@ async def _viewer_loop(ws: WebSocket, hub: _Hub, first: dict) -> None:
     except WebSocketDisconnect:
         pass
     finally:
+        hub.viewers.discard(ws)
         for sess in hub.sessions.values():
             sess.subscribers.discard(ws)
 
@@ -354,6 +365,7 @@ def create_app(hub: _Hub | None = None, *, static_root: Path | None = None) -> F
         if first.get("type") == "evt":
             await _producer_loop(ws, h, first)
         else:  # index/history/subscribe/ping:一律按查看端处理
+            h.viewers.add(ws)  # 广播 index 的受众(离开时 _viewer_loop finally 剔除)
             await _viewer_loop(ws, h, first)
 
     return app

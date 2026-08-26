@@ -10,12 +10,5 @@ export {
   newSurface,
 } from './surface';
 export { RunFold } from './fold';
-export { buildSnapshot } from './snapshot';
-export { TrajectorySearchIndex } from './search-index';
-export { contextForm, contextProvenance } from './provenance';
-export { deriveTrajectoryLayout } from './layout';
-export type { LayoutCell, LayoutGroup } from './layout';
-export { deriveTrajectoryTimeline, formatTimelineOffset, trajectoryTimelineFocusIndexes } from './timeline';
-export type { TimelineMode, TimelineModel, TimelinePoint } from './timeline';
 export { mergeEvents, sortedEvents } from './ws';
 export type { HubFrame, SessionMeta, ViewerFrame } from './ws';

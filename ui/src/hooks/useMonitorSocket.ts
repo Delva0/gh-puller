@@ -30,15 +30,31 @@ export function useMonitorSocket() {
     }
   }, []);
 
+  const sessionsRef = useRef<SessionMeta[]>([]);
+
   const requestHistory = useCallback((beforeSeq?: number) => {
     send({ type: 'history', session: currentRef.current, beforeSeq, max: 200 });
   }, [send]);
+
+  const loadOlderRegistered = useRef(false);
 
   const select = useCallback((session: string) => {
     currentRef.current = session;
     pendingRef.current = [];
     loadingRef.current = true;
-    sessionStore.reset(); // 清空旧会话折叠与快照
+    // 清空旧会话折叠与快照(事实来自会话列表行)
+    const row = sessionsRef.current.find((s) => s.session === session);
+    sessionStore.reset({
+      sessionId: session,
+      label: row?.label ?? session,
+      runId: row?.run_id ?? null,
+      provider: row?.provider ?? '',
+      model: row?.model ?? '',
+      generator: row?.generator ?? '',
+      state: (row?.state === 'completed' || row?.state === 'aborted')
+        ? row.state
+        : 'running',
+    });
     setCurrent(session);
     send({ type: 'subscribe', session });
     // 尾页请求在 subscribe 应答(evt_ready)后发出:先登记订阅,再拉历史,无缝衔接
@@ -49,6 +65,7 @@ export function useMonitorSocket() {
 
     const handleFrame = (frame: HubFrame) => {
       if (frame.type === 'index') {
+        sessionsRef.current = frame.sessions;
         setSessions(frame.sessions);
       } else if (frame.type === 'evt_ready') {
         sessionStore.ready(frame.lastSeq);
@@ -58,6 +75,16 @@ export function useMonitorSocket() {
         pendingRef.current = [];
         loadingRef.current = false;
         sessionStore.applyBatch(events);
+        sessionStore.getBridge().setHasMore(frame.hasMore);
+        if (!loadOlderRegistered.current) {
+          loadOlderRegistered.current = true;
+          sessionStore.getBridge().setLoadOlder(async () => {
+            // 旧页翻页:以最新尾部空白为止,返回是否有变化(简化:翻到哪算哪)
+            const before = sessionStore.snapshot().lastSeq;
+            requestHistory(before ?? undefined);
+            return true;
+          });
+        }
         // 余量预告:漏页继续翻(单页 200 上限,超长会话翻旧)
         if (frame.hasMore && frame.nextBeforeSeq !== null) {
           requestHistory(frame.nextBeforeSeq);
@@ -77,6 +104,7 @@ export function useMonitorSocket() {
 
     const connect = () => {
       if (disposed) return;
+      loadOlderRegistered.current = false;
       setStatus('connecting');
       const ws = new WebSocket(monitorWsUrl());
       wsRef.current = ws;
