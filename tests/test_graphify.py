@@ -49,7 +49,10 @@ def test_extract_missing_path_raises(tmp_path):
         extract(tmp_path / "nope")
 
 
-def test_extract_no_cluster(corpus):
+def test_extract_no_cluster(tmp_path):
+    """no_cluster 全量路径。必须用独立语料:模块级 corpus 已被 graph_json fixture
+    建图,温跑会落入"无变化早退"(skipped)分支而不是全量 raw 写。"""
+    corpus = _tiny_corpus(tmp_path / "repo")
     r = extract(corpus, code_only=True, no_cluster=True)
     assert r["error"] is None
     assert r["analysis_json"] is None
@@ -180,3 +183,175 @@ def test_extract_default_cache_layout_unchanged(tmp_path):
     assert r["error"] is None
     assert (corpus / "graphify-out" / "cache").is_dir()
     assert Path(r["graph_json"]).parent == corpus / "graphify-out"
+
+
+# ---------------------------------------------------------------------------
+# 增量语义（与 CLI 同式：graph.json 存在且非 force 即走 detect_incremental +
+# build_merge / merge_raw_extraction + save_manifest）
+# ---------------------------------------------------------------------------
+
+
+def test_extract_warm_incremental_no_change(tmp_path):
+    """温跑未变:incremental=True,图内容一致,manifest 已生成。"""
+    corpus = _tiny_corpus(tmp_path / "repo")
+    r1 = extract(corpus, code_only=True)
+    assert r1["error"] is None and r1["incremental"] is False
+    gout = Path(r1["graph_json"]).parent
+    assert (gout / "manifest.json").exists()
+    r2 = extract(corpus, code_only=True)
+    assert r2["error"] is None
+    assert r2["incremental"] is True and r2["skipped"] is False
+    assert r2["nodes"] == r1["nodes"] and r2["edges"] == r1["edges"]
+    assert (gout / "manifest.json").exists()
+
+
+def test_extract_warm_incremental_changed_file(tmp_path):
+    """改文件:该文件的旧节点按 tier 替换,无重复。"""
+    corpus = _tiny_corpus(tmp_path / "repo")
+    r1 = extract(corpus, code_only=True)
+    assert r1["error"] is None
+    (corpus / "app.py").write_text(
+        "import util\n\ndef main():\n    return util.hello('x')\n\n\n# extra\ndef extra():\n    return 1\n",
+        encoding="utf-8",
+    )
+    r2 = extract(corpus, code_only=True)
+    assert r2["error"] is None and r2["incremental"] is True
+    raw = json.loads(Path(r2["graph_json"]).read_text(encoding="utf-8"))
+    ids = [n["id"] for n in raw["nodes"]]
+    assert len(ids) == len(set(ids))  # 无重复节点
+    assert r2["files"]["code"] == 1  # 只重提取了改动的 app.py
+    assert r2["files_unchanged"] == 1  # util.py 未变
+
+
+def test_extract_warm_deleted_file_pruned(tmp_path):
+    """删文件:节点按 deleted+stale 双通道剪除。"""
+    corpus = _tiny_corpus(tmp_path / "repo")
+    r1 = extract(corpus, code_only=True)
+    assert r1["error"] is None
+    n1 = r1["nodes"]
+    (corpus / "app.py").unlink()
+    r2 = extract(corpus, code_only=True)
+    assert r2["error"] is None and r2["incremental"] is True
+    raw = json.loads(Path(r2["graph_json"]).read_text(encoding="utf-8"))
+    sfs = {n.get("source_file") or "" for n in raw["nodes"]}
+    assert not any(s.endswith("app.py") for s in sfs)
+    assert len(raw["nodes"]) < n1
+
+
+def test_extract_no_cluster_warm_no_change(tmp_path):
+    """no_cluster 温跑未变:早退 skipped=True,graph.json 未被重写。"""
+    corpus = _tiny_corpus(tmp_path / "repo")
+    r1 = extract(corpus, code_only=True, no_cluster=True)
+    assert r1["error"] is None
+    gp = Path(r1["graph_json"])
+    mtime = gp.stat().st_mtime
+    r2 = extract(corpus, code_only=True, no_cluster=True)
+    assert r2["error"] is None and r2["skipped"] is True
+    assert r2["nodes"] == r1["nodes"]
+    assert gp.stat().st_mtime == mtime  # 未重写
+
+
+def test_extract_manifest_missing_warm_run_succeeds(tmp_path):
+    """#1925:manifest.json 缺失不关闭增量——旧图作为基线,节点保留、不空图。"""
+    corpus = _tiny_corpus(tmp_path / "repo")
+    r1 = extract(corpus, code_only=True)
+    assert r1["error"] is None
+    gout = Path(r1["graph_json"]).parent
+    (gout / "manifest.json").unlink()
+    r2 = extract(corpus, code_only=True)
+    assert r2["error"] is None and r2["incremental"] is True
+    raw = json.loads(Path(r2["graph_json"]).read_text(encoding="utf-8"))
+    assert len(raw["nodes"]) == r1["nodes"]
+
+
+def test_extract_force_full_rescan(tmp_path):
+    """force:关闭增量门并跳过语义缓存读（同 CLI --force / GRAPHIFY_FORCE）。"""
+    corpus = _tiny_corpus(tmp_path / "repo")
+    r1 = extract(corpus, code_only=True)
+    assert r1["error"] is None
+    r2 = extract(corpus, code_only=True, force=True)
+    assert r2["error"] is None and r2["incremental"] is False
+    assert r2["files"]["code"] == 2  # 全量重分类
+
+
+def test_extract_force_env_override(tmp_path, monkeypatch):
+    monkeypatch.setenv("GRAPHIFY_FORCE", "1")
+    corpus = _tiny_corpus(tmp_path / "repo")
+    r1 = extract(corpus, code_only=True)
+    assert r1["error"] is None
+    r2 = extract(corpus, code_only=True)
+    assert r2["error"] is None and r2["incremental"] is False  # env 强制全量
+
+
+def test_extract_no_dedup_maps_build_merge_valueerror(tmp_path, monkeypatch):
+    """build_merge 的 #479 ValueError（仅 --no-dedup 时 arm）映射为 error dict，
+    旧图不被写（镜像 cli.py:3977-3983）。必须 patch 本模块的 build_merge 别名。
+    """
+    corpus = _tiny_corpus(tmp_path / "repo")
+    r1 = extract(corpus, code_only=True)
+    assert r1["error"] is None
+    gp = Path(r1["graph_json"])
+    before = gp.read_text(encoding="utf-8")
+
+    import gh_puller.graphify as gfx
+
+    def _boom(*a, **kw):
+        raise ValueError(
+            "graphify: build_merge would drop 1 node(s) from sources that were "
+            "neither re-extracted nor pruned this run (#479)"
+        )
+
+    monkeypatch.setattr(gfx, "build_merge", _boom)
+    r2 = extract(corpus, code_only=True, no_dedup=True)
+    assert r2["error"] is not None and "#479" in r2["error"]
+    assert gp.read_text(encoding="utf-8") == before  # 旧图完好
+
+
+def test_extract_no_dedup_passes_dedup_false(monkeypatch, tmp_path):
+    """--no-dedup 透传 build(dedup=False)。spy 必须 patch 本模块的 build 别名
+    （import 绑定早于 monkeypatch，patch graphify.build.build 无效）。"""
+    corpus = _tiny_corpus(tmp_path / "repo")
+    import gh_puller.graphify as gfx
+
+    calls = {}
+    real = gfx.build
+
+    def spy(*a, **kw):
+        calls["kw"] = kw
+        return real(*a, **kw)
+
+    monkeypatch.setattr(gfx, "build", spy)
+    r = extract(corpus, code_only=True, no_dedup=True)
+    assert r["error"] is None and calls["kw"]["dedup"] is False
+
+
+def test_extract_allow_partial_ast_failure(monkeypatch, tmp_path):
+    """#2445:整段 AST 丢失默认致命(错误态、不写图);allow_partial 才降级续跑。"""
+    corpus = _tiny_corpus(tmp_path / "repo")
+    import gh_puller.graphify as gfx
+
+    def _boom(*a, **kw):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(gfx, "_ast_extract", _boom)
+    r = extract(corpus, code_only=True)
+    assert r["error"] is not None
+    assert not (corpus / "graphify-out" / "graph.json").exists()
+    # allow_partial 下 AST 空 → 纯代码语料 0 节点 → 空图错误（与 CLI exit 1 等价）
+    r2 = extract(corpus, code_only=True, allow_partial=True)
+    assert r2["error"] is not None and "empty" in r2["error"]
+
+
+def test_extract_build_config_persistence(tmp_path):
+    """#1971:--exclude 持久化到 .graphify_build.json,warm 无 flag 运行继承排除。"""
+    corpus = _tiny_corpus(tmp_path / "repo")
+    r = extract(corpus, code_only=True, extra_excludes=["util.py"])
+    assert r["error"] is None
+    cfg = corpus / "graphify-out" / ".graphify_build.json"
+    assert cfg.exists()
+    assert json.loads(cfg.read_text(encoding="utf-8"))["excludes"] == ["util.py"]
+    r2 = extract(corpus, code_only=True)  # 不传 → 继承 ["util.py"]
+    assert r2["error"] is None
+    raw = json.loads(Path(r2["graph_json"]).read_text(encoding="utf-8"))
+    assert not any((n.get("source_file") or "").endswith("util.py")
+                   for n in raw["nodes"])
