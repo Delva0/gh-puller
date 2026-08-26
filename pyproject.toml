@@ -67,3 +67,9 @@ dev = [
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
 ]
+
+# 根 pytest 只跑 tests/:apps/* 是独立 uv 项目(各自 pyproject+venv,按 AGENTS.md
+# 约定单独跑);裸 `uv run pytest` 会连带收集 apps/archive/playground 的 tests,
+# 触发 pytest_plugins 非顶层等 collection 错误。
+[tool.pytest.ini_options]
+testpaths = ["tests"]

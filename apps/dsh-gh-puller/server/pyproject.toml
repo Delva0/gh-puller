@@ -15,6 +15,10 @@ gh-graphify-worker = "gh_puller_dsh.worker:main"
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
+# gh-puller → openai-codex 在默认镜像不存在,须显式 pypi.org 索引(同根/webui,见 codex 适配事实)
+[[tool.uv.index]]
+url = "https://pypi.org/simple"
+
 [tool.uv.sources]
 gh-puller = { path = "../../..", editable = true }
 graphifyy = { path = "../../../../graphify", editable = true }
