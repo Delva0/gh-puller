@@ -36,7 +36,6 @@ from gh_puller.deepwiki import (
     RepoNotIndexedError,
     RepoPrepareRequest,
     RepoRequestBase,
-    TargetInput,
     WikiCacheData,
     WikiExportRequest,
     WikiTask,
@@ -69,55 +68,69 @@ from gh_puller.utils import (
 # 语言与模型契约(仅 HTTP 层展示用;_LANGUAGE_NAMES 为引擎侧映射)
 _LANG_CONFIG = {"supported_languages": dict(_LANGUAGE_NAMES), "default": "en"}
 
-# 模型/target 契约:唯一真源是 agent.adapters.GENERATORS/PROVIDERS 注册表
-# (generator/provider/model 三正交;openai-compatible 只是 openai+自定义 base_url
-# 的一种部署形态,不单列 provider)。/models/config 为 deepwiki-open 旧契约的
-# 注册表投影(provider id 已按新语义呈现);/generators/config 为新统一契约。
+# target 契约:唯一真源 = agent.GENERATORS(极简 id → 生成器类实例映射;类型信息在
+# 各生成器类属性)。generator → generator_config(dict,按 generator 包装):file 类
+# (cc/dsh/codex)= {"config_path"};object 类(llm)= {"provider","model","base_url","api_key"}。
+# /models/config 为 deepwiki-open 旧契约的投影(标注 deprecated);/generators/config
+# 为当前契约(前端唯一真源)。
 from gh_puller.agent import GENERATORS as AGENT_GENERATORS
-from gh_puller.agent import PROVIDERS as AGENT_PROVIDERS
 
 
 def _models_config() -> ModelConfig:
-    """旧 /models/config 契约(注册表投影):providers = anthropic/deepseek/openai。
+    """旧 /models/config 契约(object-only 投影,标注 deprecated):file 类的
+    provider 由所选配置文件决定(请求无此轴),故只出 object 类(openai)入口。
 
-    defaultProvider = 默认 generator(envs.DEEPWIKI_GENERATOR)的默认 provider。
+    defaultProvider = 默认 generator 的"provider"展示值(cc 无此轴 → 空串)。
     """
-    default_provider = AGENT_GENERATORS[envs.DEEPWIKI_GENERATOR].default_provider
     return ModelConfig(
         providers=[
             Provider(
-                id=spec.id,
-                name=spec.name,
-                supportsCustomModel=spec.supports_custom_model,
-                models=[Model(id=mid, name=mid) for mid in spec.models],
+                id=gen.provider,
+                name=gen.provider.title(),
+                supportsCustomModel=getattr(gen, "supports_custom_model", False),
+                models=[Model(id=mid, name=mid) for mid in getattr(gen, "models", ())],
             )
-            for spec in AGENT_PROVIDERS.values()
+            for gen in AGENT_GENERATORS.values()
+            if gen.config_kind == "object"
         ],
-        defaultProvider=default_provider,
+        defaultProvider=getattr(AGENT_GENERATORS[envs.DEEPWIKI_GENERATOR], "provider", ""),
     )
 
 
 def _generators_config() -> dict:
-    """GET /generators/config:注册表直出(前端唯一真源)。"""
+    """GET /generators/config:生成器类属性直出(前端唯一真源)。
+
+    configKind = "file"(generator_config 只填 config_path;占位取 configPathEnv/
+    configDefault)或 "object"(providers 列表 + provider/model 字段)。
+    """
+    default_gen = AGENT_GENERATORS[envs.DEEPWIKI_GENERATOR]
+    if default_gen.config_kind == "file":
+        default_config: dict = {"config_path": default_gen.config_default or ""}
+    else:
+        default_config = {"provider": default_gen.provider, "model": ""}
     return {
         "generators": [
-            {"id": spec.id, "name": spec.name, "defaultProvider": spec.default_provider,
-             "providers": list(spec.providers), "capability": spec.capability,
-             "defaultModelEnv": spec.default_model_env}
-            for spec in AGENT_GENERATORS.values()
+            {"id": gen.id, "name": gen.name, "configKind": gen.config_kind,
+             "capability": gen.capability,
+             "defaultProvider": gen.provider if gen.config_kind == "object" else "",
+             "providers": [gen.provider] if gen.config_kind == "object" else [],
+             "defaultModelEnv": getattr(gen, "model_env", None),
+             "configPathEnv": getattr(gen, "config_path_env", None),
+             "configDefault": getattr(gen, "config_default", None)}
+            for gen in AGENT_GENERATORS.values()
         ],
         "providers": [
-            {"id": spec.id, "name": spec.name, "apiKeyEnv": spec.api_key_env,
-             "baseUrlEnv": spec.base_url_env, "baseUrlDefault": spec.base_url_default,
-             "models": list(spec.models), "supportsCustomModel": spec.supports_custom_model}
-            for spec in AGENT_PROVIDERS.values()
+            {"id": gen.provider, "name": gen.provider.title(),
+             "apiKeyEnv": getattr(gen, "api_key_env", None),
+             "baseUrlEnv": getattr(gen, "base_url_env", None),
+             "baseUrlDefault": getattr(gen, "base_url_default", None),
+             "models": list(getattr(gen, "models", ())),
+             "supportsCustomModel": getattr(gen, "supports_custom_model", False)}
+            for gen in AGENT_GENERATORS.values() if gen.config_kind == "object"
         ],
         "defaultGenerator": envs.DEEPWIKI_GENERATOR,
-        "defaultTarget": {
-            "generator": envs.DEEPWIKI_GENERATOR,
-            "provider": AGENT_GENERATORS[envs.DEEPWIKI_GENERATOR].default_provider,
-            "model": "",
-        },
+        "defaultTarget": {"generator": envs.DEEPWIKI_GENERATOR,
+                          "generator_config": default_config},
     }
 
 
@@ -365,10 +378,16 @@ async def get_local_repo_structure(path: str | None = Query(None, description="P
         return JSONResponse(status_code=500, content={"error": f"Error processing local repository: {e}"})
 
 
-def _target_digest_query(generator: str, provider: str, model: str) -> str:
-    """公开 target(generator/provider/model 查询参数)→ 缓存摘要(与引擎侧同规则)。"""
-    return _request_digest(TargetInput(generator=generator or "", provider=provider or None,
-                                       model=model or None))
+def _target_digest_query(generator: str, config_path: str, provider: str, model: str) -> str:
+    """target 查询参数(generator + file:config_path / object:provider|model)→ 缓存摘要。"""
+    gc: dict = {}
+    if config_path:
+        gc["config_path"] = config_path
+    if provider:
+        gc["provider"] = provider
+    if model:
+        gc["model"] = model
+    return _request_digest({"generator": generator or "", "generator_config": gc})
 
 
 @app.get("/api/wiki_cache", response_model=WikiCacheData | None)
@@ -378,13 +397,14 @@ async def read_wiki(
     repo_type: str = Query(..., description="Repository type (e.g. github, gitlab)"),
     language: str = Query(..., description="Language of the wiki content"),
     generator: str = Query("", description="Generator id (cc/dsh/codex/llm) — public target"),
-    provider: str = Query("", description="Provider id — public target"),
-    model: str = Query("", description="Model id — public target"),
+    config_path: str = Query("", description="Config file path (file kind) — public target"),
+    provider: str = Query("", description="Provider id (object kind) — public target"),
+    model: str = Query("", description="Model id (object kind) — public target"),
 ):
     if language not in _LANG_CONFIG["supported_languages"]:
         language = _LANG_CONFIG["default"]
     return await read_wiki_cache(owner, repo, repo_type, language,
-                                 digest=_target_digest_query(generator, provider, model))
+                                 digest=_target_digest_query(generator, config_path, provider, model))
 
 
 @app.delete("/api/wiki_cache")
@@ -395,8 +415,10 @@ async def delete_wiki(
     language: str = Query(..., description="Language of the wiki content"),
     authorization_code: str | None = Query(None, description="Authorization code"),
     generator: str = Query("", description="Generator id (cc/dsh/codex/llm) — public target"),
-    provider: str = Query("", description="Provider id — public target"),
-    model: str = Query("", description="Model id — public target"),
+    config_path: str = Query("", description="Config file path (file kind) — public target"),
+    provider: str = Query("", description="Provider id (object kind) — public target"),
+    model: str = Query("", description="Model id (object kind) — public target"),
+    digest: str = Query("", description="公开 target 摘要(列尾 digest8;缺省=摘要缺省/旧格式)"),
 ):
     if language not in _LANG_CONFIG["supported_languages"]:
         raise HTTPException(status_code=400, detail="Language is not supported")
@@ -404,9 +426,14 @@ async def delete_wiki(
         if not authorization_code or authorization_code != envs.WIKI_AUTH_CODE:
             raise HTTPException(status_code=401, detail="Authorization code is invalid")
     try:
+        target_digest = (
+            digest
+            or (_target_digest_query(generator, config_path, provider, model)
+                if (generator or config_path or provider or model) else "")
+        )
         deleted = await delete_wiki_cache(
             owner, repo, repo_type, language,
-            digest=_target_digest_query(generator, provider, model),
+            digest=target_digest,
         )
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"Failed to delete wiki cache: {e}")
@@ -425,8 +452,15 @@ async def get_processed_projects():
 
 @app.post("/wiki/tasks", response_model=WikiTaskSubmitResult)
 async def submit_wiki_task(request: WikiTaskRequest):
-    """提交任务(get-or-create):created / joined / from_cache 三态(同原)。"""
-    return await registry.submit(WikiTask.from_wiki_request(request))
+    """提交任务(get-or-create):created / joined / from_cache 三态(同原)。
+
+    target 校验(dict 键集白名单/非法组合/配置文件不存在)在 resolve_target
+    运行前即抛 ValueError → 400(带具体消息,不是 500)。
+    """
+    try:
+        return await registry.submit(WikiTask.from_wiki_request(request))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @app.get("/wiki/tasks", response_model=list[WikiTaskSummary])

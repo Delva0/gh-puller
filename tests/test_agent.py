@@ -23,11 +23,11 @@ from opentelemetry.trace import StatusCode
 
 from gh_puller import agent
 from gh_puller.agent import EventBus, FileSink, new_event, sinks
-from gh_puller.agent.adapters import (
+from gh_puller.agent.generators import (
     _handle_assistant_message,
     _handle_stream_event,
     _normalize_usage,
-    _Run,
+    EventRecorder,
     _session_id,
 )
 from gh_puller.agent.sinks import OtelSink
@@ -97,10 +97,10 @@ async def test_bus_drop_oldest_when_full():
 def test_configure_disabled_short_circuits():
     """file/ws 全关:bus 无 sink,事件不构造(无 uuid/json 开销)、目录不建。"""
     agent.configure(file=False, ws_urls=[], otel_urls=[])
-    run = _Run("s1", "anthropic", "", label="t")
+    run = EventRecorder("s1", "anthropic", "", label="t")
     run.event("session/start", run_id=None, label="t", provider="anthropic", model="")
     bus = sinks._bus
-    assert bus is not None and bus.enabled is False
+    assert bus is None  # 新语义:无任何通道时不建总线(事件零开销短路)
 
 
 # ---------------------------------------------------------------------------
@@ -192,7 +192,7 @@ async def test_stream_adapter_normalizes_events():
     got = []
     bus = sinks.ensure_bus()
     bus.add(_recv(got))
-    run = _Run("s1", "anthropic", "", label="t")
+    run = EventRecorder("s1", "anthropic", "", label="t")
     run.start()
     # 第 1 步:正文块 + 思考块
     _handle_stream_event(run, {"type": "content_block_start", "index": 0, "content_block": {"type": "text"}})
@@ -267,7 +267,7 @@ async def test_assistant_message_monitors_but_never_duplicates():
         stop_reason="end_turn",
         usage=types.SimpleNamespace(input_tokens=3, output_tokens=5, cache_read_input_tokens=1),
     )
-    run = _Run("s1", "anthropic", "", label="t")
+    run = EventRecorder("s1", "anthropic", "", label="t")
     _handle_assistant_message(run, msg, already_yielded=False)
     assert run.text_chars == 2
     await asyncio.sleep(0.05)
@@ -280,7 +280,7 @@ async def test_assistant_message_monitors_but_never_duplicates():
     assert asst["data"]["stop_reason"] == "end_turn"
     synth = next(g for g in got if g["type"] == "tool/call")  # 兜底合成
     assert synth["data"]["callId"] == "t2" and synth["data"]["arguments"] == '{"path": "a.py"}'
-    run2 = _Run("s2", "anthropic", "", label="t")
+    run2 = EventRecorder("s2", "anthropic", "", label="t")
     _handle_assistant_message(run2, msg, already_yielded=True)  # 已产出 → 不重复
     assert run2.text_chars == 0
 
@@ -456,7 +456,7 @@ async def test_cc_stream_error_semantics(monkeypatch, tmp_path):
     agent.configure(file=False, file_dir=str(tmp_path), ws_urls=[], otel_urls=[])
     sdk = _fake_sdk([_FakeResultMessage(result="", is_error=True, errors=["boom"])])
     monkeypatch.setitem(sys.modules, "claude_agent_sdk", sdk)
-    with pytest.raises(RuntimeError, match="agent 执行失败"):
+    with pytest.raises(agent.RequestFailedError, match="boom"):
         async for _ in agent.cc_stream(_options(), "p", session_name="x"):
             pass
     assert not (tmp_path / "sessions").exists()
@@ -842,14 +842,14 @@ async def test_dsh_stream_non_completed_reason_raises(monkeypatch):
                   data={"turn": 1, "reason": {"kind": "max-tokens"}}),
     ]
     _fake_dsh(monkeypatch, notes, finish_reason="max-tokens", final_response="部分", session_id=sid)
-    with pytest.raises(RuntimeError, match="agent 执行失败: max-tokens"):
+    with pytest.raises(agent.RequestFailedError, match="max-tokens"):
         async for _ in agent.dsh_stream(_dsh_options(), "q", session=f"deepwiki:wiki/{sid}"):
             pass
     await asyncio.sleep(0.05)
     assert [g["type"] for g in got].count("turn/end") == 1  # dsh 已转发 → 不合成(epilogue=False)
     end = got[-1]
     assert end["type"] == "session/end" and end["data"]["state"] == "aborted"
-    assert end["data"]["reason"] == "agent 执行失败: max-tokens"  # str(exc) 无前缀(cc 同规)
+    assert end["data"]["reason"] == "max-tokens"  # 监控事件记原始 detail(文案组合层包装)
     assert any(g["type"] == "error" and g["data"]["stage"] == "run" for g in got)
 
 
@@ -890,7 +890,7 @@ async def test_dsh_result_empty_final_response_raises(monkeypatch):
         _dsh_note("turn/end", seq=4, session_id=sid, data={"turn": 1, "reason": {"kind": "completed"}}),
     ]
     _fake_dsh(monkeypatch, notes, finish_reason="completed", final_response="", session_id=sid)
-    with pytest.raises(RuntimeError, match="agent 未产出最终结果"):
+    with pytest.raises(agent.RequestFailedError, match="未产出最终结果"):
         await agent.dsh_result(_dsh_options(), "q", session=f"deepwiki:wiki/{sid}")
 
 
@@ -927,14 +927,14 @@ async def test_run_epilogue_and_prologue_preserve_cc_defaults():
     agent.configure(file=False, ws_urls=[], otel_urls=[])
     got = []
     sinks.ensure_bus().add(_recv(got))
-    run = _Run("s1", "anthropic", "", label="t")
+    run = EventRecorder("s1", "anthropic", "", label="t")
     run.start()
     run.finish(True)
     await asyncio.sleep(0.05)
     assert [g["type"] for g in got] == ["session/start", "turn/start", "step/start",
                                         "step/end", "turn/end", "session/end"]
     got.clear()
-    run2 = _Run("s2", "deepseek", "", label="t")
+    run2 = EventRecorder("s2", "deepseek", "", label="t")
     run2.start(prologue=False)
     run2.finish(True, epilogue=False)
     await asyncio.sleep(0.05)
@@ -1580,7 +1580,7 @@ async def test_codex_stream_command_execution_failed_is_error(monkeypatch, tmp_p
         _codex_nt("turn/completed", turn=_codex_it(id="t1", status="failed",
                                                    error=_codex_it(message="boom"))),
     ], user_home=_codex_user_home(tmp_path))
-    with pytest.raises(RuntimeError, match="agent 执行失败: boom"):
+    with pytest.raises(agent.RequestFailedError, match="boom"):
         async for _ in agent.codex_stream(_codex_options(codex_home=str(tmp_path)), "q"):
             pass
     await asyncio.sleep(0.05)
@@ -1603,14 +1603,14 @@ async def test_codex_stream_failed_turn_raises(monkeypatch, tmp_path):
         _codex_nt("turn/completed", turn=_codex_it(id="t1", status="failed",
                                                    error=_codex_it(message="boom"))),
     ], user_home=_codex_user_home(tmp_path))
-    with pytest.raises(RuntimeError, match="agent 执行失败: boom"):
+    with pytest.raises(agent.RequestFailedError, match="boom"):
         async for _ in agent.codex_stream(_codex_options(codex_home=str(tmp_path)), "q"):
             pass
     await asyncio.sleep(0.05)
     err = next(g for g in got if g["type"] == "error")
-    assert err["data"]["stage"] == "run" and err["data"]["exc_type"] == "RuntimeError"
+    assert err["data"]["stage"] == "run" and err["data"]["exc_type"] == "RequestFailedError"
     assert got[-1]["type"] == "session/end" and got[-1]["data"]["state"] == "aborted"
-    assert got[-1]["data"]["reason"] == "agent 执行失败: boom"
+    assert got[-1]["data"]["reason"] == "boom"
 
 
 @pytest.mark.asyncio
@@ -1620,7 +1620,7 @@ async def test_codex_stream_missing_completed_raises(monkeypatch, tmp_path):
     _fake_codex(monkeypatch, [
         _codex_nt("turn/started", turn=_codex_it(id="t1")),
     ], user_home=_codex_user_home(tmp_path))
-    with pytest.raises(RuntimeError, match="turn 未收到完成事件"):
+    with pytest.raises(agent.RequestFailedError, match="turn 未收到完成事件"):
         await agent.codex_text(_codex_options(codex_home=str(tmp_path)), "q", session_name="x")
 
 
@@ -1670,7 +1670,7 @@ async def test_codex_stream_config_isolation_and_auth(monkeypatch, tmp_path):
     assert _FakeThread.calls[0] == ("prompt", {"cwd": "/repo", "effort": "high"})  # turn 级同样透传
     # 隔离 home:config.toml 仅 graphify;token → 先断 auth 符号链接再 login
     # (防 login_api_key 穿透写穿用户真实 ~/.codex/auth.json —— 凭证进本隔离 home)
-    assert (tmp_path / "codex-home" / "config.toml").read_text().startswith("[mcp_servers.graphify]")
+    assert (tmp_path / "codex-home" / "config.toml").read_text() == ""  # 工具桌默认不注入
     assert not (tmp_path / "codex-home" / "auth.json").exists()
 
 
@@ -1700,7 +1700,7 @@ async def test_codex_result_empty_final_response_raises(monkeypatch, tmp_path):
         _codex_nt("turn/started", turn=_codex_it(id="t1")),
         _codex_nt("turn/completed", turn=_codex_it(id="t1", status="completed", error=None)),
     ], user_home=_codex_user_home(tmp_path))
-    with pytest.raises(RuntimeError, match="agent 未产出最终结果"):
+    with pytest.raises(agent.RequestFailedError, match="未产出最终结果"):
         await agent.codex_result(_codex_options(codex_home=str(tmp_path)), "q", session_name="x")
 
 
@@ -1709,14 +1709,16 @@ def test_codex_home_setup_config_toml_and_auth(tmp_path, monkeypatch):
     本地凭证(cc 的 CLI 自持凭证同形:重新登录即跟随,无副本陈旧)且幂等。"""
     from pathlib import Path
 
-    from gh_puller.agent.adapters import _codex_home_setup
+    from gh_puller.agent.generators import _codex_home_setup
 
     user_home = tmp_path / "home"
     (user_home / ".codex").mkdir(parents=True)
     (user_home / ".codex" / "auth.json").write_text('{"tok": "u"}', encoding="utf-8")
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: Path(user_home)))
     home = tmp_path / "codex-home"
-    _codex_home_setup(str(home), graphify_command="python3")
+    _codex_home_setup(str(home), mcp_servers=[{"id": "graphify", "command": "python3",
+                                                "args": ["-m", "graphify.serve"],
+                                                "env_vars": ["GRAPHIFY_OUT"]}])
     cfg = (home / "config.toml").read_text(encoding="utf-8")
     assert cfg.startswith("[mcp_servers.graphify]")
     assert 'command = "python3"' in cfg
@@ -1729,6 +1731,8 @@ def test_codex_home_setup_config_toml_and_auth(tmp_path, monkeypatch):
     assert auth.resolve() == (user_home / ".codex" / "auth.json")
     # 幂等:内容不变不重写(config.toml mtime 不变;auth 仍为同一条链接)
     before = (home / "config.toml").stat().st_mtime_ns
-    _codex_home_setup(str(home), graphify_command="python3")
+    _codex_home_setup(str(home), mcp_servers=[{"id": "graphify", "command": "python3",
+                                                "args": ["-m", "graphify.serve"],
+                                                "env_vars": ["GRAPHIFY_OUT"]}])
     assert (home / "config.toml").stat().st_mtime_ns == before
     assert auth.is_symlink() and auth.resolve() == (user_home / ".codex" / "auth.json")

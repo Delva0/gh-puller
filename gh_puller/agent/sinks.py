@@ -28,7 +28,7 @@ from urllib.parse import urlsplit
 
 from .. import envs
 from ..utils import _log as _utils_log
-from .events import NON_STREAM_TYPES, truncate
+from .events import EventBus, NON_STREAM_TYPES, set_active_bus, truncate
 
 
 def _file_stem(session: str) -> str:
@@ -47,46 +47,6 @@ def _log(msg: str) -> None:
 # ---------------------------------------------------------------------------
 # EventBus(进程内单例;publish 非阻塞)
 # ---------------------------------------------------------------------------
-
-
-class EventBus:
-    """进程内异步事件总线:publish 只 put_nowait 到每 sink 队列,慢 sink 只拖 sink,不拖调用。"""
-
-    def __init__(self):
-        self._sinks: list[asyncio.Queue[dict]] = []
-        self._tasks: list[asyncio.Task] = []
-
-    @property
-    def enabled(self) -> bool:
-        return bool(self._sinks)
-
-    def add(self, consume) -> None:
-        """注册 sink 消费协程:async def consume(evt: dict) -> None。"""
-        q: asyncio.Queue[dict] = asyncio.Queue(maxsize=5000)
-        self._sinks.append(q)
-        self._tasks.append(asyncio.create_task(self._drain(consume, q)))
-
-    async def _drain(self, consume, q) -> None:
-        while True:
-            evt = await q.get()
-            try:
-                await consume(evt)
-            except Exception as exc:  # sink 失败只报 stderr,绝不冒泡到调用方
-                _log(f"sink 消费失败: {type(exc).__name__}: {exc}")
-
-    def publish(self, evt: dict) -> None:
-        if not self._sinks:
-            return
-        for q in self._sinks:
-            try:
-                q.put_nowait(evt)
-            except asyncio.QueueFull:
-                q.get_nowait()  # 有界队列:丢最旧,新事件优先
-                q.put_nowait(evt)
-
-    def shutdown(self) -> None:
-        for task in self._tasks:
-            task.cancel()
 
 
 class FileSink:
@@ -526,6 +486,7 @@ def configure(*, file=None, file_dir=None, ws_urls=None, otel_urls=None) -> None
     if _bus is not None:
         _bus.shutdown()
         _bus = None
+    set_active_bus(None)
 
 
 def ensure_bus() -> EventBus:
@@ -556,4 +517,5 @@ def ensure_bus() -> EventBus:
                 continue
             _log(f"otel sink 已启用: {traces_url}")
         _bus = b
+        set_active_bus(b)
     return _bus

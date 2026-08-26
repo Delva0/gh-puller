@@ -5,7 +5,7 @@ import { useRouter } from 'next/navigation';
 import Link from 'next/link';
 import { FaWikipediaW, FaGithub, FaCoffee, FaTwitter } from 'react-icons/fa';
 import {
-  ConfigurationModal, ThemeToggle, publicTargetOf, loadCreds, saveCreds,
+  ConfigurationModal, ThemeToggle, strippedTarget, loadCreds, saveCreds,
   type TargetConfig,
 } from '@gh-puller/ui';
 import Mermaid from '@gh-puller/ui/components/Mermaid';
@@ -67,6 +67,7 @@ export default function Home() {
           const creds = loadCreds(repoUrl);
           setTarget({
             generator: config.generator || '',
+            config_path: config.config_path || '',
             provider: config.provider || '',
             model: config.model || '',
             api_key: creds.api_key,
@@ -295,7 +296,7 @@ export default function Home() {
         const configToSave = {
           selectedLanguage,
           isComprehensiveView,
-          ...publicTargetOf(target),
+          ...strippedTarget(target),
           selectedPlatform,
           excludedDirs,
           excludedFiles,
@@ -336,10 +337,12 @@ export default function Home() {
     } else {
       params.append('repo_url', encodeURIComponent(repositoryInput));
     }
-    // Add public target params(凭证不进 URL,经 sessionStorage 由会话内页面读取)
+    // Add public target params(凭证不进 URL,经 sessionStorage 由会话内页面读取;
+    // file 类 = config_path;object 类 = provider/model —— 空参由服务端 env 缺省解析)
     params.append('generator', target.generator);
-    params.append('provider', target.provider);
-    params.append('model', target.model);
+    params.append('config_path', target.config_path || '');
+    params.append('provider', target.provider || '');
+    params.append('model', target.model || '');
     // Add file filters configuration
     if (excludedDirs) {
       params.append('excluded_dirs', excludedDirs);

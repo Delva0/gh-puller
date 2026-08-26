@@ -12,18 +12,18 @@
 
 ## Roadmap
 
-- [x] **deepwiki + graphify**：deepwiki + graphify 查询统一聚合，构建 agent 可观测设施
-- [ ] **commit 级增量**：跨仓 graphify 增量建图，query 优化
-- [ ] **PR/Issue 联动**：知识库与 PR/Issue 打通
+- [x] **deepwiki + graphify**：deepwiki + graphify 验证基础应用pipeline，构建 agent 可观测设施
+- [ ] **commit 持久化图 + 跨仓**：跨仓 graphify 增量建图
+- [ ] **PR/Issue 联动**: 基于commit图打通 github PR/Issue
+- [ ] **agents 接入 + query 优化**: skill+cli、mcp、dsh插件，面向agent的query工具优化
 
 ## 快速上手
 
 ```bash
-# 依赖安装（仓库根，单一 pnpm lockfile）
 pnpm install
 ```
 
-**问答服务（deepwiki-webui）**
+**问答服务**
 
 ```bash
 # 终端 1：后端（默认 :8001）
@@ -32,17 +32,15 @@ cd apps/deepwiki-webui/server && uv run uvicorn app:app --port 8001
 cd apps/deepwiki-webui/web && pnpm dev
 ```
 
-浏览器打开 `http://localhost:3000`。
-
-**评测（benchmark）**
+**评测（可选）**
 
 ```bash
-# 先启动一个实现协议 v1 的参赛方服务（唯一路由 POST /ask，如 :8001），然后：
+# 先启动一个实现协议 v1 的待测服务（唯一路由 POST /ask，如 :8001），然后：
 uv run benchmark gh_puller/benchmark/judges/vllm_mechanism/bank.py --url http://localhost:8001
 # 产物：outputs/<时间戳>/result.json
 ```
 
-**agent 监控（agent-dashboard，可选）**
+**agent 可观测（可选）**
 
 ```bash
 cd apps/agent-dashboard/server && uv run uvicorn hub:app --port 8765

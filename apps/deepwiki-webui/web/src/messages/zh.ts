@@ -52,6 +52,7 @@ export default {
   "repoPage.errorTitle": "错误",
   "repoPage.errorMessageDefault": "请检查您的仓库是否存在且为公开仓库。有效格式为\"owner/repo\", \"https://github.com/owner/repo\", \"https://gitlab.com/owner/repo\", \"https://bitbucket.org/owner/repo\", 或本地文件夹路径，如\"C:\\\\path\\\\to\\\\folder\"或\"/path/to/folder\"。",
   "repoPage.embeddingErrorDefault": "这个错误与用于分析您的仓库的文件嵌入系统有关。请检查您的嵌入模型配置、API 密钥，并重试。如果问题持续存在，请考虑在模型设置中切换到不同的嵌入提供者。",
+  "repoPage.agentCredErrorDefault": "生成代理未登录或服务端缺少凭证:请确认仓库根目录 .env 已配置 ANTHROPIC_API_KEY 与 ANTHROPIC_BASE_URL(cd apps/deepwiki-webui/server && uv run uvicorn app:app --port 8001 重新启动),或在配置弹窗中填写 API Key。",
   "repoPage.backToHome": "返回首页",
   "repoPage.exportWiki": "导出Wiki",
   "repoPage.exportAsMarkdown": "导出为Markdown",

@@ -194,13 +194,13 @@ def _make_request(owner: str, repo: str) -> WikiTaskRequest:
     )
 
 
-def _digest_of(target: "deepwiki.TargetInput | None") -> str:
+def _digest_of(target: "dict | None") -> str:
     """request target → 稳定摘要(测试与实现共用一个函数)。"""
     return deepwiki._request_digest(target)
 
 
-def _default_target() -> "deepwiki.TargetInput":
-    return deepwiki.TargetInput()
+def _default_target() -> dict:
+    return {}
 
 
 @pytest.mark.asyncio
@@ -242,13 +242,13 @@ async def test_agent_text_through_target_dispatcher(monkeypatch):
     monkeypatch.setattr(deepwiki, "generate_stream", fake_generate_stream)
     ctx = [{"type": "context/inject", "data": {"text": "n"}}]
     out = await deepwiki._agent_text(
-        deepwiki.TargetInput(generator="cc"), "sys", "query",
+        {"generator": "cc"}, "sys", "query",
         label="wiki:structure", run_id="r1", context=ctx,
     )
     assert out == "ab"
     target, options, session_name, prompt, run_id, ctx_got = calls[0]
     assert (session_name, prompt, run_id, ctx_got) == ("wiki:structure", "query", "r1", ctx)
-    assert target.generator == "cc"
+    assert target["generator"] == "cc"
     assert options.system_prompt == "sys"  # cc 选项:仅装配,model/凭证由绑定层
     assert options.model is None  # model 由绑定层注入(ClaudeAgentOptions 恒有该字段)
 
@@ -270,7 +270,7 @@ async def test_agent_text_through_dsh_stream(monkeypatch):
     monkeypatch.setattr(deepwiki, "generate_stream", fake_generate_stream)
     ctx = [{"type": "context/inject", "data": {"text": "n"}}]
     out = await deepwiki._agent_text(
-        deepwiki.TargetInput(), "sys", "query", label="wiki:structure", run_id="r1", context=ctx
+        {}, "sys", "query", label="wiki:structure", run_id="r1", context=ctx
     )
     assert out == "ab"
     options, session_name, prompt, run_id, ctx_got = calls[0]
@@ -285,27 +285,31 @@ async def test_agent_text_through_dsh_stream(monkeypatch):
 
 def test_dsh_options_config(monkeypatch, tmp_path):
     """_dsh_options 仅做工具/隔离装配:cwd 固定仓库根,runtime_cwd 越过 checkout(.env 加载点);
-    model/api_key/base_url 不在装配层(统一经 target 绑定)。"""
+    model/api_key/base_url 不在装配层(file 类配置随组合文件)。"""
     repo = Repo(str(tmp_path), "local")
-    opts = deepwiki._dsh_options("sys", repo)
+    opts = deepwiki._dsh_options({}, "sys", repo)
     assert opts.cwd == str(tmp_path)
-    assert not hasattr(opts, "model")  # model 交给 target 绑定(显式 > env > SDK 缺省)
+    assert not hasattr(opts, "model")  # model 随组合配置(file 类不在请求面)
     assert not hasattr(opts, "api_key") and not hasattr(opts, "base_url")
     assert opts.session_root.endswith("dsh-sessions")
     assert "dsh-runtime" in opts.runtime_cwd  # 与任务 checkout 隔离(见 envs.DSH_RUNTIME_CWD)
     assert not hasattr(opts, "cordis")  # 默认不传 → 适配器缺省隔离组合
-    opts2 = deepwiki._dsh_options("sys", None)
+    opts2 = deepwiki._dsh_options({}, "sys", None)
     assert not hasattr(opts2, "cwd")  # repo 空:不固定 cwd(走进程缺省)
-    # 显式覆写:envs.DEEPWIKI_DSH_CORDIS 提供即传递(全责在上层组合)
-    monkeypatch.setattr(deepwiki.envs, "DEEPWIKI_DSH_CORDIS", "/custom/cordis.yml")
-    assert deepwiki._dsh_options("sys", None).cordis == "/custom/cordis.yml"
+    # file 类契约:config_path(经 resolve 解析;env DEEPWIKI_DSH_CORDIS 为 env 缺省)即 cordis
+    cordis = tmp_path / "cordis.yml"
+    cordis.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(deepwiki.envs, "DEEPWIKI_DSH_CORDIS", str(cordis))
+    _, resolved = deepwiki._resolve_target({"generator": "dsh"})
+    assert deepwiki._dsh_options(resolved, "sys", None).cordis == str(cordis)
 
 
 def test_dsh_cordis_isolation_and_graphify():
-    """内置组合 = 完全隔离(逐项关断本地/用户级配置)+ 显式装载 graphify MCP。
+    """内置组合 = 完全隔离(逐项关断本地/用户级配置);图工具桌由调用方注入。
 
     与 cc 的 setting_sources=[] 同语义:workspaceContext(本地 AGENTS.md 链)/
-    skills(用户/项目/捆绑技能)关断;graphify 仅经单服务器 mcp-client 行显式装载。
+    skills(用户/项目/捆绑技能)关断;默认组合(无 mcp_servers)不含任何工具服务器,
+    mcp 段仅在 deepwiki 装配层经 _graphify_mcp 显式注入(适配层零工具名)。
     """
     from gh_puller.agent import dsh_cordis_path
 
@@ -315,9 +319,11 @@ def test_dsh_cordis_isolation_and_graphify():
     assert "includeRuntimeContext: false" in text
     assert "toolBash: false" in text and "toolJobs: false" in text
     assert "goals: false" in text
-    assert "- id: mcp-graphify" in text
-    assert "serverName: graphify" in text
-    assert "-m" in text and "graphify.serve" in text
+    assert "mcp-graphify" not in text  # 默认组合无图工具(引擎工具桌经装配注入)
+    with_mcp = Path(dsh_cordis_path(deepwiki._graphify_mcp("dsh"))).read_text(encoding="utf-8")
+    assert "- id: mcp-graphify" in with_mcp
+    assert "serverName: graphify" in with_mcp
+    assert "graphify.serve" in with_mcp
 
 
 def test_wiki_pipeline_dsh_uses_agent(monkeypatch):
@@ -337,9 +343,14 @@ def test_agent_note_tool_name_by_generator():
 
 
 def test_agent_options_cc_setting_sources_isolated():
-    """cc 完全隔离本地 claude 配置(setting_sources=[]):用户级 MCP/skills/hooks 不掺入 agent。"""
-    opts = deepwiki._agent_options("sys", None)
+    """cc 完全隔离本地 claude 配置(setting_sources=[]):用户级 MCP/skills/hooks 不掺入 agent;
+    显式 config_path → settings 纯透传(路径直传 SDK,不读文件)。"""
+    opts = deepwiki._agent_options({}, "sys", None)
     assert opts.setting_sources == []
+    assert getattr(opts, "settings", None) is None
+    opts2 = deepwiki._agent_options({"config_path": "/tmp/dw-test-settings.json"}, "sys", None)
+    assert opts2.setting_sources == []
+    assert opts2.settings == "/tmp/dw-test-settings.json"  # 纯透传(无任何文件读取)
 
 
 @pytest.mark.asyncio
@@ -414,7 +425,10 @@ async def test_registry_resume_restores_task(monkeypatch):
     提交明文凭证入请求、落盘状态剥离(仅公开 target),续跑时合并当前提交凭证。"""
     structure = _make_structure(["p1", "p2", "p3"])
     state = WikiTaskState(
-        request=_make_request("resume-io", "demo"),
+        request=_make_request("resume-io", "demo").model_copy(
+            update={"target": {"generator": "llm", "generator_config": {
+                    "provider": "openai", "model": "m1"}}}
+        ),
         status=TaskStatus.GENERATING,
         wiki_structure=structure,
         generated_pages={"p1": _make_page("p1"), "p2": _make_page("p2")},
@@ -433,7 +447,9 @@ async def test_registry_resume_restores_task(monkeypatch):
     key = f"local_resume-io_demo@{digest}"
     fresh = _make_request("resume-io", "demo")
     fresh.comprehensive = False  # 与首次不一致:落盘快照应胜出
-    fresh.target = deepwiki.TargetInput(api_key="sk-live-1", base_url="https://custom/v1")
+    fresh.target = {"generator": "llm", "generator_config": {
+        "provider": "openai", "model": "m1",  # 公开部分与落盘快照同轨(digest 匹配)
+        "api_key": "sk-live-1", "base_url": "https://custom/v1"}}
     try:
         res = await deepwiki.registry.submit(WikiTask.from_wiki_request(fresh))
         assert res.created is True
@@ -445,9 +461,10 @@ async def test_registry_resume_restores_task(monkeypatch):
         assert task.pages_done == 2
         assert task.submitted_at == 9876543210
         assert task.request.comprehensive is True
-        # 续跑合并凭证:公开三元组取自落盘快照,凭证来自当前提交
-        assert task.request.target.api_key == "sk-live-1"
-        assert task.request.target.base_url == "https://custom/v1"
+        # 续跑合并凭证:公开部分取自落盘快照,凭证来自当前提交(object 类)
+        assert task.request.target["generator_config"]["api_key"] == "sk-live-1"
+        assert task.request.target["generator_config"]["base_url"] == "https://custom/v1"
+        assert task.request.target["generator_config"]["provider"] == "openai"
         await task.task
         assert task.status == TaskStatus.COMPLETED
     finally:
@@ -469,7 +486,7 @@ async def test_resume_isolated_by_target(monkeypatch):
         submitted_at=424242,
     )
     assert await write_wiki_task_state(state) is True
-    digest_cc = deepwiki._request_digest(deepwiki.TargetInput())  # 空 target → env 缺省 cc
+    digest_cc = deepwiki._request_digest({})  # 空 target → env 缺省 cc
 
     async def fake_generate(task):
         task.status = TaskStatus.COMPLETED
@@ -492,7 +509,7 @@ async def test_resume_isolated_by_target(monkeypatch):
         res = await deepwiki.registry.submit(
             WikiTask.from_wiki_request(
                 _make_request("gen-switch", "demo").model_copy(
-                    update={"target": deepwiki.TargetInput(generator="llm")}
+                    update={"target": {"generator": "llm"}}
                 )
             )
         )
@@ -500,7 +517,7 @@ async def test_resume_isolated_by_target(monkeypatch):
         assert res.resumed is False
         assert os.path.exists(_wiki_state_path("gen-switch", "demo", "local", "en", digest=digest_cc))
         key_llm = "local_gen-switch_demo@" + deepwiki._request_digest(
-            deepwiki.TargetInput(generator="llm"))
+            {"generator": "llm"})
         # 任务键 = repo 键 + target 摘要(与 cc 槽位隔离)
         task = deepwiki.registry.get(key_llm)
         assert task.key != key_cc
@@ -509,26 +526,30 @@ async def test_resume_isolated_by_target(monkeypatch):
     finally:
         await deepwiki.registry.remove(key_cc)
         await deepwiki.registry.remove("local_gen-switch_demo@" + deepwiki._request_digest(
-            deepwiki.TargetInput(generator="llm")))
+            {"generator": "llm"}))
         await delete_wiki_task_state("gen-switch", "demo", "local", "en", digest=digest_cc)
         await asyncio.sleep(0.25)  # 让 TTL 移除计时器自然结束,避免挂起的任务告警
 
 
 @pytest.mark.asyncio
-async def test_cache_hit_respects_target(monkeypatch):
-    """成品缓存按公开 target 摘要校验:同轨(generator/provider/model)才命中;
-    换 generator(同 repo)即另一份缓存,不否定旧成品、全新重新生成。"""
+async def test_cache_hit_respects_target(monkeypatch, tmp_path):
+    """成品缓存按公开 target 身份校验:同轨(generator + file:config_path / object:provider|model)
+    才命中;换 generator(同 repo)即另一份缓存,不否定旧成品、全新重新生成。"""
+    cfg = tmp_path / "settings.json"
+    cfg.write_text("{}", encoding="utf-8")
+    cc_target = {"generator": "cc", "generator_config": {"config_path": str(cfg)}}
     cache = WikiCacheData(
         wiki_structure=_make_structure(["p1"]),
         generated_pages={"p1": _make_page("p1")},
         generator="cc",
-        provider="anthropic",
-        model="",
+        config_path=str(cfg),
+        provider=None,
+        model=None,
         repo=RepoInfo(
             owner="gen-cache", repo="demo", type="local", repoUrl="/tmp/gh-puller-test-repo"
         ),
     )
-    digest_cc = deepwiki._request_digest(deepwiki.TargetInput())
+    digest_cc = deepwiki._request_digest(cc_target)
     assert await save_wiki_cache("gen-cache", "demo", "local", "en", cache, digest=digest_cc) is True
 
     calls = []
@@ -541,9 +562,11 @@ async def test_cache_hit_respects_target(monkeypatch):
     monkeypatch.setattr(deepwiki, "_WIKI_TASK_TTL_SECONDS", 0.2)
     key_cc = f"local_gen-cache_demo@{digest_cc}"
     try:
-        # 同轨(default cc):缓存命中,不运行
+        # 同轨(同 config_path):缓存命中,不运行
         res_ok = await deepwiki.registry.submit(
-            WikiTask.from_wiki_request(_make_request("gen-cache", "demo"))
+            WikiTask.from_wiki_request(
+                _make_request("gen-cache", "demo").model_copy(update={"target": cc_target})
+            )
         )
         assert res_ok.from_cache is True
         assert res_ok.status == TaskStatus.COMPLETED
@@ -553,7 +576,7 @@ async def test_cache_hit_respects_target(monkeypatch):
         res = await deepwiki.registry.submit(
             WikiTask.from_wiki_request(
                 _make_request("gen-cache", "demo").model_copy(
-                    update={"target": deepwiki.TargetInput(generator="llm")}
+                    update={"target": {"generator": "llm"}}
                 )
             )
         )
@@ -562,7 +585,7 @@ async def test_cache_hit_respects_target(monkeypatch):
         # llm 任务走自己摘要的注册表槽位(cc 键无新任务)
         assert deepwiki.registry.get(key_cc) is None
         task_llm = deepwiki.registry.get("local_gen-cache_demo@" + deepwiki._request_digest(
-            deepwiki.TargetInput(generator="llm")))
+            {"generator": "llm"}))
         assert task_llm is not None
         await task_llm.task
         assert task_llm.status == TaskStatus.COMPLETED
@@ -570,7 +593,7 @@ async def test_cache_hit_respects_target(monkeypatch):
     finally:
         await deepwiki.registry.remove(key_cc)
         await deepwiki.registry.remove("local_gen-cache_demo@" + deepwiki._request_digest(
-            deepwiki.TargetInput(generator="llm")))
+            {"generator": "llm"}))
         await delete_wiki_cache("gen-cache", "demo", "local", "en", digest=digest_cc)
         await asyncio.sleep(0.25)  # 让 TTL 移除计时器自然结束,避免挂起的任务告警
 
@@ -610,15 +633,16 @@ def test_agent_options_cc_delivery(tmp_path):
     model/凭证不在装配层(经 target 绑定)。"""
     repo = Repo(str(tmp_path), "local")
     opts = deepwiki._agent_options(
-        "", repo, agent_output_dir=str(tmp_path / "out"), agent_write_mode=True
+        {}, "", repo, agent_output_dir=str(tmp_path / "out"), agent_write_mode=True
     )
     assert opts.cwd == str(tmp_path)
     assert opts.add_dirs == [str(tmp_path / "out")]
     assert opts.permission_mode == "acceptEdits"
-    assert opts.model is None  # model 由 target 绑定层注入
+    assert opts.model is None  # model 随配置文件(file 类不在装配层注入)
+    assert getattr(opts, "settings", None) is None
     for t in ("Read", "Grep", "Glob", "Write", "graphify_query"):
         assert t in opts.allowed_tools, t
-    opts2 = deepwiki._agent_options("", repo)
+    opts2 = deepwiki._agent_options({}, "", repo)
     assert opts2.cwd == str(tmp_path)
     assert opts2.add_dirs == []
     assert opts2.permission_mode is None
@@ -872,7 +896,10 @@ async def test_generate_repo_wiki_cc_assemble_and_resume(tmp_path, monkeypatch):
     data = json.loads(cache_path.read_text(encoding="utf-8"))
     assert set(data["generated_pages"]) == {"p1", "p2", "p3"}
     assert data["generator"] == "cc"  # 成品缓存只记公开 target,无凭证字段
-    assert data["provider"] == "anthropic"
+    assert data.get("provider") is None and data.get("model") == ""  # file 类不落 provider/model
+    from gh_puller import envs as _envs
+
+    assert data["config_path"] == _envs.DEEPWIKI_CC_CONFIG  # 身份 = config_path(非凭证)
     assert "api_key" not in json.dumps(data) and "base_url" not in json.dumps(data)
     for pid in ("p1", "p2", "p3"):
         assert f"{pid}-REAL" in data["generated_pages"][pid]["content"]
@@ -1407,12 +1434,12 @@ async def test_agent_text_through_codex_stream(monkeypatch):
     monkeypatch.setattr(deepwiki, "generate_stream", fake_generate_stream)
     ctx = [{"type": "context/inject", "data": {"text": "n"}}]
     out = await deepwiki._agent_text(
-        deepwiki.TargetInput(), "sys", "query", label="wiki:structure", run_id="r1", context=ctx
+        {}, "sys", "query", label="wiki:structure", run_id="r1", context=ctx
     )
     assert out == "ab"
     target, options, session_name, prompt, run_id, ctx_got = calls[0]
     assert (session_name, prompt, run_id, ctx_got) == ("wiki:structure", "query", "r1", ctx)
-    assert target.generator == "codex"  # _agent_stream 已解析(env 缺省),透传 resolved target
+    assert target == {}  # 分派在 generate_stream 内按 env 缺省解析(此处原样透传)
     # 组装面:system_prompt → 适配器 base_instructions;高自由度缺省(full_access/auto_review);
     # 凭证/home/model 不在装配层(经 target 绑定)
     assert options.system_prompt == "sys"
@@ -1422,13 +1449,13 @@ async def test_agent_text_through_codex_stream(monkeypatch):
 
 
 def test_codex_options_config(tmp_path):
-    """_codex_options 与 cc/dsh 同构:model 只认 target 绑定(envs 层无 CODEX_* 常量;
-    凭证/home 零配置在适配器层);cwd 固定仓库根;图目录经 env.GRAPHIFY_OUT 绝对路径注入。"""
+    """_codex_options 与 cc/dsh 同构:file 类配置随 config_path(纯透传,不读文件);
+    cwd 固定仓库根;图目录经 env.GRAPHIFY_OUT 绝对路径注入。"""
     repo = Repo(str(tmp_path), "local")
-    opts = deepwiki._codex_options("sys", repo)
+    opts = deepwiki._codex_options({}, "sys", repo)
     assert not hasattr(opts, "model") and opts.cwd == str(tmp_path)
     assert opts.env == {"GRAPHIFY_OUT": str(deepwiki._graph_dir(repo))}
-    opts2 = deepwiki._codex_options("sys", None)
+    opts2 = deepwiki._codex_options({}, "sys", None)
     assert not hasattr(opts2, "cwd") and not hasattr(opts2, "env")  # repo 空:不固定 cwd/图
     assert not hasattr(opts2, "model")  # 缺省交给 SDK 缺省模型
     # 学 cc 凭证面:envs 无 CODEX_* 常量(防误引入"看起来必须配置"的 env 骨架)
@@ -1439,9 +1466,11 @@ def test_codex_options_config(tmp_path):
 def test_codex_home_isolation_and_graphify(tmp_path):
     """codex 隔离 home:config.toml 仅 graphify 单服务器 + env_vars 白名单,无用户配置面
     (与 cc setting_sources=[] / dsh 内置 cordis 同语义)。"""
-    from gh_puller.agent.adapters import _codex_home_setup
+    from gh_puller.agent.generators import _codex_home_setup
 
-    home = _codex_home_setup(str(tmp_path / "home"), graphify_command="python3", auth_src=False)
+    from gh_puller.agent import dsh_cordis_path  # noqa 引用仅保持模块级存在(下方用 engine 注入)
+    home = _codex_home_setup(str(tmp_path / "graph"), auth_src=False,
+                             mcp_servers=deepwiki._graphify_mcp("codex"))
     text = Path(home, "config.toml").read_text(encoding="utf-8")
     assert text.startswith("[mcp_servers.graphify]")
     assert "graphify.serve" in text and "env_vars = [\"GRAPHIFY_OUT\"]" in text

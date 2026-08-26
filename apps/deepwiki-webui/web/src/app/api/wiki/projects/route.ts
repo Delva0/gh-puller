@@ -16,6 +16,8 @@ interface DeleteProjectCachePayload {
   repo: string;
   repo_type: string;
   language: string;
+  /** 公开 target 摘要(列尾 digest8;缺省=旧格式无摘要缓存) */
+  digest?: string;
 }
 
 /** Type guard to validate DeleteProjectCachePayload at runtime */
@@ -26,7 +28,8 @@ function isDeleteProjectCachePayload(obj: unknown): obj is DeleteProjectCachePay
     'owner' in obj && typeof (obj as Record<string, unknown>).owner === 'string' && ((obj as Record<string, unknown>).owner as string).trim() !== '' &&
     'repo' in obj && typeof (obj as Record<string, unknown>).repo === 'string' && ((obj as Record<string, unknown>).repo as string).trim() !== '' &&
     'repo_type' in obj && typeof (obj as Record<string, unknown>).repo_type === 'string' && ((obj as Record<string, unknown>).repo_type as string).trim() !== '' &&
-    'language' in obj && typeof (obj as Record<string, unknown>).language === 'string' && ((obj as Record<string, unknown>).language as string).trim() !== ''
+    'language' in obj && typeof (obj as Record<string, unknown>).language === 'string' && ((obj as Record<string, unknown>).language as string).trim() !== '' &&
+    ((obj as Record<string, unknown>).digest === undefined || typeof (obj as Record<string, unknown>).digest === 'string')
   );
 }
 
@@ -81,8 +84,9 @@ export async function DELETE(request: Request) {
         { status: 400 }
       );
     }
-    const { owner, repo, repo_type, language } = body;
+    const { owner, repo, repo_type, language, digest = '' } = body;
     const params = new URLSearchParams({ owner, repo, repo_type, language });
+    if (digest) params.set('digest', digest);
     const response = await fetch(`${CACHE_API_ENDPOINT}?${params}`, {
       method: 'DELETE',
       headers: { 'Content-Type': 'application/json' },

@@ -10,6 +10,7 @@ interface ProcessedProject {
   submittedAt: number;
   language: string;
   status?: string;
+  digest?: string;
 }
 
 export function useProcessedProjects() {

@@ -55,6 +55,7 @@ export default {
   "repoPage.errorTitle": "Error",
   "repoPage.errorMessageDefault": "Please check that your repository exists and is public. Valid formats are \"owner/repo\", \"https://github.com/owner/repo\", \"https://gitlab.com/owner/repo\", \"https://bitbucket.org/owner/repo\", or local folder paths like \"C:\\\\path\\\\to\\\\folder\" or \"/path/to/folder\".",
   "repoPage.embeddingErrorDefault": "This error is related to the document embedding system used for analyzing your repository. Please verify your embedding model configuration, API keys, and try again. If the issue persists, consider switching to a different embedding provider in the model settings.",
+  "repoPage.agentCredErrorDefault": "The generation agent is not logged in or the server lacks credentials: make sure ANTHROPIC_API_KEY and ANTHROPIC_BASE_URL are set in the repository-root .env (restart with `uv run uvicorn app:app --port 8001` from apps/deepwiki-webui/server), or enter the API Key in the configuration modal.",
   "repoPage.backToHome": "Back to Home",
   "repoPage.exportWiki": "Export Wiki",
   "repoPage.exportAsMarkdown": "Export as Markdown",

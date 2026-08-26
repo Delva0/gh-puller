@@ -2,7 +2,7 @@
 
 import React, {useState, useRef, useEffect} from 'react';
 import { FaChevronLeft, FaChevronRight, FaBolt, FaMicroscope, FaBook, FaChevronDown, FaCheck } from 'react-icons/fa';
-import { Markdown, ModelSelectionModal, useLanguage, type TargetConfig } from '@gh-puller/ui';
+import { Markdown, ModelSelectionModal, useLanguage, buildTargetRequest, type TargetConfig } from '@gh-puller/ui';
 import CodeMap from '@gh-puller/ui/components/CodeMap';
 import type { CodeTarget, PhaseStatus } from '@gh-puller/ui';
 import RepoInfo from '@/types/repoinfo';
@@ -374,7 +374,7 @@ const Ask: React.FC<AskProps> = ({
           content: msg.content,
           mode: msg.mode ?? 'normal',
         })),
-        target: targetRef.current,
+        target: await buildTargetRequest(targetRef.current),
         language: language,
         research_iteration: newIteration
       };
@@ -668,7 +668,7 @@ const Ask: React.FC<AskProps> = ({
   };
 
   // Generate a codemap over the WebSocket NDJSON stream.
-  const handleCodemapAsk = () => {
+  const handleCodemapAsk = async () => {
     const askedQuestion = question;
     setIsLoading(true);
     setQuestion('');
@@ -685,7 +685,7 @@ const Ask: React.FC<AskProps> = ({
       repo_url: getRepoUrl(repoInfo),
       question: askedQuestion,
       type: repoInfo.type,
-      target: targetRef.current,
+      target: await buildTargetRequest(targetRef.current),
       language,
     };
     if (repoInfo?.token) request.token = repoInfo.token;
@@ -781,7 +781,7 @@ const Ask: React.FC<AskProps> = ({
           content: msg.content,
           mode: msg.mode ?? 'normal'
         })),
-        target: targetRef.current,
+        target: await buildTargetRequest(targetRef.current),
         language: language,
         research_iteration: deepResearch ? 1 : undefined
       };
@@ -1211,7 +1211,12 @@ const Ask: React.FC<AskProps> = ({
             onClick={() => setIsModelSelectionModalOpen(true)}
             className="text-xs px-2.5 py-1 rounded border border-[var(--border-color)]/40 bg-[var(--background)]/10 text-[var(--foreground)]/80 hover:bg-[var(--background)]/30 hover:text-[var(--foreground)] transition-colors flex items-center gap-1.5"
           >
-            <span>{localTarget.generator ? `${localTarget.generator}·` : ''}{localTarget.provider}/{localTarget.model || '—'}</span>
+            <span>
+              {localTarget.generator ? `${localTarget.generator}·` : ''}
+              {localTarget.config_path
+                ? (localTarget.config_path.split('/').pop() || localTarget.config_path)
+                : `${localTarget.provider}/${localTarget.model || '—'}`}
+            </span>
             <svg className="h-3.5 w-3.5 text-[var(--accent-primary)]/70" fill="none" viewBox="0 0 24 24" stroke="currentColor" suppressHydrationWarning>
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" suppressHydrationWarning />
             </svg>

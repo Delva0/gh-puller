@@ -1,6 +1,8 @@
 """agent 调用统一入口 + 流式监控(事件模型/适配器/观测通道按关注点拆分)。
 
-其他模块不再直接调用 ClaudeSDKClient / httpx,一律经本包函数(无感,对外语义不变):
+其他模块不再直接调用 ClaudeSDKClient / httpx,一律经本包函数(无感,对外语义不变)。
+架构:events.py(事件模型) ⊂ sinks.py(观测通道) ⊂ run.py(单次运行事件发布器) ⊂
+generators.py(BaseGenerator 基类 + ClaudeCode/OpenAI/Dsh/Codex 四个生成器 + 解析/统一分派):
 - cc_stream / cc_text / cc_result(adapters.py):Claude Code(SDK)调用。文本增量
   StreamEvent `text_delta` 优先、AssistantMessage 兜底(仅在未产出任何增量时)、
   ResultMessage.is_error → RuntimeError("agent 执行失败: ...") —— 与 deepwiki
@@ -26,27 +28,25 @@ put_nowait 到每 sink 的 asyncio.Queue,永不阻塞调用)→ sink worker 消�
 须自行经 loop.call_soon_threadsafe 转发。
 """
 
-from .adapters import (
-                       GENERATORS,
-                       PROVIDERS,
-                       ResolvedTarget,
-                       cc_result,
-                       cc_stream,
-                       cc_text,
-                       codex_result,
-                       codex_stream,
-                       codex_text,
-                       dsh_cordis_path,
-                       dsh_result,
-                       dsh_stream,
-                       dsh_text,
-                       generate_result,
-                       generate_stream,
-                       generate_text,
-                       llm_complete,
-                       llm_stream,
-                       public_target,
-                       resolve_target,
+from .generators import (
+    GENERATORS,
+    RequestFailedError,
+    cc_result,
+    cc_stream,
+    cc_text,
+    codex_result,
+    codex_stream,
+    codex_text,
+    dsh_cordis_path,
+    dsh_result,
+    dsh_stream,
+    dsh_text,
+    generate_result,
+    generate_stream,
+    generate_text,
+    llm_complete,
+    llm_stream,
+    resolve_generator,
 )
 from .events import LOG_TYPES, SURFACE_TYPES, TAXONOMY, new_event, truncate, type_of
 from .sinks import EventBus, FileSink, WsSink, configure, ensure_bus
@@ -64,10 +64,8 @@ __all__ = [
     "configure",
     "ensure_bus",
     "GENERATORS",
-    "PROVIDERS",
-    "ResolvedTarget",
-    "resolve_target",
-    "public_target",
+    "resolve_generator",
+    "RequestFailedError",
     "generate_stream",
     "generate_text",
     "generate_result",

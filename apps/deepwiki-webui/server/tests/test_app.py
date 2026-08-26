@@ -54,19 +54,30 @@ def test_lang_config():
 
 
 def test_models_config():
-    """旧契约 = 注册表投影:providers 现为 anthropic/deepseek/openai(id 语义对齐新概念)。"""
+    """旧契约 = object 类投影(deprecated):file 类 provider 随配置文件,不设请求轴。"""
     cfg = _client().get("/models/config").json()
-    assert cfg["defaultProvider"] == "anthropic"  # 默认 generator(cc)的默认 provider
-    assert [p["id"] for p in cfg["providers"]] == ["anthropic", "deepseek", "openai"]
+    assert cfg["defaultProvider"] == ""  # 默认 generator(cc)为 file 类,无 provider 轴
+    assert [p["id"] for p in cfg["providers"]] == ["openai"]  # 仅 object 类入口
     assert all(p["supportsCustomModel"] for p in cfg["providers"])
 
 
 def test_generators_config():
-    """统一 target 配置:注册表直出(generators/providers/default target);凭证不出现。"""
+    """统一 target 配置:注册表直出(generators/providers/default target);凭证不出现。
+
+    generator → generator_config 契约:configKind 分 file(cc/dsh/codex,configDefault/
+    configPathEnv)/object(llm,providers 列表);defaultTarget.generator_config 按默认
+    generator 的 kind 给出(cc = config_path)。
+    """
     cfg = _client().get("/generators/config").json()
     assert [g["id"] for g in cfg["generators"]] == ["cc", "dsh", "codex", "llm"]
     by_id = {g["id"]: g for g in cfg["generators"]}
-    assert by_id["cc"]["defaultProvider"] == "anthropic"
+    assert by_id["cc"]["configKind"] == "file"
+    assert by_id["dsh"]["configKind"] == "file"
+    assert by_id["codex"]["configKind"] == "file"
+    assert by_id["llm"]["configKind"] == "object"
+    assert by_id["cc"]["configDefault"] is not None  # ~/.claude/settings.json
+    assert by_id["cc"]["configPathEnv"] == "DEEPWIKI_CC_CONFIG"
+    assert by_id["cc"]["providers"] == []  # file 类不再暴露 provider 选择
     assert by_id["llm"]["providers"] == ["openai"]
     assert by_id["codex"]["capability"] == "responses"
     prov = {p["id"]: p for p in cfg["providers"]}
@@ -74,6 +85,8 @@ def test_generators_config():
     assert prov["openai"]["baseUrlDefault"] == "https://api.openai.com/v1"
     assert cfg["defaultGenerator"] == "cc"
     assert cfg["defaultTarget"]["generator"] == "cc"
+    # file 类默认 generator → generator_config = {"config_path": ...}
+    assert "config_path" in cfg["defaultTarget"]["generator_config"]
     blob = json.dumps(cfg)
     assert "api_key" not in blob and "base_url" not in blob and "KEY" not in blob[:200]
 

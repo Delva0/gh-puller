@@ -18,6 +18,8 @@ interface ProcessedProject {
   // Present for the merged tasks list: 'completed' for cached wikis, otherwise
   // a queued/in-progress task (pending | indexing | determining_structure | generating).
   status?: string;
+  /** 公开 target 摘要(列尾 digest8;删除时精确命中缓存文件) */
+  digest?: string;
 }
 
 interface ProcessedProjectsProps {
@@ -105,6 +107,7 @@ export default function ProcessedProjects({
           repo: project.repo,
           repo_type: project.repo_type,
           language: project.language,
+          digest: project.digest ?? '',
         }),
       });
       if (!response.ok) {

@@ -29,7 +29,7 @@ import pytest_asyncio
 from claude_agent_sdk import ClaudeAgentOptions  # 真 SDK,与 mock 测试相反
 
 from gh_puller import agent
-from gh_puller.agent.adapters import cc_stream, codex_stream, dsh_stream, llm_stream
+from gh_puller.agent.generators import cc_stream, codex_stream, dsh_stream, llm_stream
 
 MODEL = os.environ.get("GH_PULLER_MODEL", "deepseek-v4-flash")
 MODEL_CODEX = "gpt-5.6-sol"  # 常量直写:codex 无环境变量(同 cc 路线),models_cache 现存模型

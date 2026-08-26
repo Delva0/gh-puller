@@ -4,7 +4,8 @@
 import Ask from '@/components/Ask';
 import {
   ModelSelectionModal, WikiTreeView, Markdown, ThemeToggle, useLanguage,
-  type CodeTarget, type TargetConfig, publicTargetOf, loadCreds, saveCreds,
+  type CodeTarget, type TargetConfig, strippedTarget, loadCreds, saveCreds,
+  buildTargetRequest,
 } from '@gh-puller/ui';
 import CodeViewer from '@gh-puller/ui/components/CodeViewer';
 import Mermaid from '@gh-puller/ui/components/Mermaid';
@@ -113,6 +114,7 @@ export default function RepoWikiPage() {
   const localPath = searchParams.get('local_path') ? decodeURIComponent(searchParams.get('local_path')!) : undefined;
   const repoUrl = searchParams.get('repo_url') ? decodeURIComponent(searchParams.get('repo_url')!) : undefined;
   const generatorParam = searchParams.get('generator');
+  const configPathParam = searchParams.get('config_path');
   const providerParam = searchParams.get('provider');
   const modelParam = searchParams.get('model');
   const language = searchParams.get('language') ?? 'en';
@@ -173,6 +175,7 @@ export default function RepoWikiPage() {
   const repoCredsKey = `${repoType}_${owner}_${repo}`;
   const [targetConfig, setTargetConfig] = useState<TargetConfig>(() => ({
     generator: generatorParam || '',
+    config_path: configPathParam || '',
     provider: providerParam || '',
     model: modelParam || '',
     ...loadCreds(repoCredsKey),
@@ -288,6 +291,7 @@ export default function RepoWikiPage() {
         language: language,
         comprehensive: isComprehensiveView.toString(),
         generator: targetConfig.generator || '',
+        config_path: targetConfig.config_path || '',
         provider: targetConfig.provider || '',
         model: targetConfig.model || '',
       });
@@ -308,6 +312,7 @@ export default function RepoWikiPage() {
       setTargetConfig(prev => ({
         ...prev,
         generator: cachedData.generator || prev.generator,
+        config_path: cachedData.config_path || prev.config_path,
         provider: cachedData.provider || prev.provider,
         model: cachedData.model || prev.model,
       }));
@@ -497,7 +502,7 @@ export default function RepoWikiPage() {
         repo: effectiveRepoInfo.repo,
         comprehensive: isComprehensiveView,
         token: currentToken || undefined,
-        target: targetConfig,
+        target: await buildTargetRequest(targetConfig),
         language,
         excluded_dirs: modelExcludedDirs || undefined,
         excluded_files: modelExcludedFiles || undefined,
@@ -670,6 +675,7 @@ export default function RepoWikiPage() {
         repo_type: effectiveRepoInfo.type,
         language: language,
         generator: targetConfig.generator || '',
+        config_path: targetConfig.config_path || '',
         provider: targetConfig.provider || '',
         model: targetConfig.model || '',
         comprehensive: isComprehensiveView.toString(),
@@ -804,7 +810,7 @@ export default function RepoWikiPage() {
               comprehensive: isComprehensiveView,
               wiki_structure: structureToCache,
               generated_pages: generatedPages,
-              ...publicTargetOf(targetConfig),
+              ...strippedTarget(targetConfig),
             };
             const response = await fetch(`/api/wiki_cache`, {
               method: 'POST',
@@ -941,6 +947,8 @@ export default function RepoWikiPage() {
             <p className="text-[var(--muted)] text-xs">
               {embeddingError ? (
                 t("repoPage.embeddingErrorDefault")
+              ) : /Not logged in/i.test(error || "") ? (
+                t("repoPage.agentCredErrorDefault")
               ) : (
                 t("repoPage.errorMessageDefault")
               )}

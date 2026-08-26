@@ -36,8 +36,11 @@ cd apps/deepwiki-webui/web && pnpm dev
 | `NEXT_PUBLIC_API_PORT` | `8001` | 浏览器直连后端 HTTP/WS 的端口（与后端 `PORT` 联动） |
 | `NEXT_PUBLIC_WS_BASE_URL` | 按 host + `NEXT_PUBLIC_API_PORT` 推导 | 浏览器直连后端 WebSocket 的地址（省略时按当前页 host 推导） |
 
-后端（全部收敛在 `gh_puller/envs.py`）：`ANTHROPIC_API_KEY`（或已登录的 Claude Code CLI，agent 必需）、
-`CLAUDE_AGENT_MODEL`（空 = SDK 缺省模型）、`DEEPWIKI_ROOT`（产物根目录，默认 `~/.adalflow`：
+后端（全部收敛在 `gh_puller/envs.py`）：cc（file 类）配置随本地 Claude settings JSON —— 缺省
+`~/.claude/settings.json`（`DEEPWIKI_CC_CONFIG` 可覆写；模型/凭证/服务端点全在该文件内，服务端原样
+透传给 agent SDK）；进程环境 `.env` 的 `ANTHROPIC_API_KEY`/`ANTHROPIC_BASE_URL` 对 cc 子进程同样
+生效（环境继承兜底）；llm（object 类）用 `OPENAI_API_KEY`/`OPENAI_BASE_URL`/`LLM_MODEL`。
+`DEEPWIKI_ROOT`（产物根目录，默认 `~/.adalflow`：
 `repos/` 克隆目录与 `wikicache/` 缓存都在其下；目录须可写，必要时 `sudo chown -R delva ~/.adalflow`）、
 `PORT`（默认 8001）、
 `DEEPWIKI_AUTH_MODE` / `DEEPWIKI_AUTH_CODE`（wiki 删除授权）、`DEEPWIKI_MAX_CONCURRENT_WIKI_TASKS` 等调度参数。

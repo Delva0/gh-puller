@@ -27,13 +27,18 @@ seq 序列是流式事件流的稠密序号;文件侧(非流式投影)按行跳�
             tool/result→data.message; 其余→None
 
 本模块只认普通 dict,严禁 import claude_agent_sdk / httpx —— 测试只喂假 dict。
-seq/run_id 等会话属性由适配器(_Run, adapters.py)附加;new_event 只造 id/ts/type/data
+seq/run_id 等会话属性由调用方(EventRecorder,见下)附加;new_event 只造 id/ts/type/data
 信封(seq 不在此分配,防止双写)。
+
+事件域全集 = 本文件(模型 TAXONOMY/new_event + 单次调用记录器 EventRecorder +
+进程内总线 EventBus):纯 stdlib,零 SDK/envs 依赖;sinks.py 是观测通道层。
 """
 
+import asyncio
 import json
 import time
 import uuid
+
 
 # 事件全量 taxonomy(点号→斜杠命名,与 dsh type 风格对齐)
 TAXONOMY = frozenset(
@@ -112,3 +117,243 @@ def truncate(text: str | None, n: int) -> tuple[int, str]:
     if len(text) <= n:
         return (len(text), text)
     return (len(text), text[:n] + "…")
+
+
+# ---------------------------------------------------------------------------
+# 运行事件发布器(单次调用的 EventRecorder)+ 进程内总线(EventBus):
+# 纯 stdlib(事件域全集),依旧零 SDK/envs 依赖。
+# ---------------------------------------------------------------------------
+
+def _session_id(session: str | None, session_ns: str | None, run_id: str | None,
+                session_name: str | None) -> str:
+    """会话 id:显式 session 原样;否则 <ns>/<uuid4>(ns 由上层业务决定分类命名空间)。
+
+    ns 解析序:显式 session_ns 参数 → run_id → session_name → "agent";
+    会话 id 形如 judge:llm/0460e1e9-5155-4014-9054-a39986462b20 —— grep
+    session/start 的 session 字段即知来源;文件名只取 "/" 后段(见 FileSink)。
+    """
+    if session:
+        return session
+    ns = session_ns or run_id or session_name or "agent"
+    return f"{ns}/{uuid.uuid4()}"
+
+
+def _norm_token(u, keys: tuple[str, ...]):
+    """从 SDK 对象/字典取值(映射 prompt/completion_tokens 命名)的通用取值器。"""
+    for k in keys:
+        v = getattr(u, k, None)
+        if v is None and isinstance(u, dict):
+            v = u.get(k)
+        if v is not None:
+            return v
+    return None
+
+
+def _normalize_usage(u) -> dict | None:
+    """SDK/HTTP usage → 统一结构 {input_tokens, output_tokens, cache_read_input_tokens}。"""
+    if not u:
+        return None
+    return {
+        "input_tokens": _norm_token(u, ("input_tokens", "prompt_tokens", "inputTokens")),
+        "output_tokens": _norm_token(u, ("output_tokens", "completion_tokens", "outputTokens")),
+        "cache_read_input_tokens": _norm_token(u, ("cache_read_input_tokens", "cacheReadTokens")),
+    }
+
+
+_active_bus: "EventBus | None" = None  # 由 sinks.configure/ensure_bus 单向设置(events 层零反向依赖)
+
+
+def set_active_bus(bus: "EventBus | None") -> None:
+    """设置当前总线(由观测通道层 enclose)0;None = 无通道(事件发布零开销短路)。"""
+    global _active_bus
+    _active_bus = bus
+
+
+class EventRecorder:
+    """单次运行的事件发布器:维护会话信封/turn/step/seq 计数,归一化后广播事件。"""
+
+    def __init__(self, session: str, provider: str, model: str, *, generator: str = "",
+                 label: str | None = None,
+                 run_id: str | None = None, meta=None):
+        self.session = session
+        self.label = label or session
+        self.provider = provider
+        self.generator = generator
+        self.model = model
+        self.run_id = run_id
+        self.meta = meta
+        self.seq = 0
+        self.turn = 1  # 每 run 一个 dsh-style turn:单一用户消息 → 最终回答
+        self.step = 1  # 一次 LLM 请求 = 一个 step;工具结果后的新请求 +1
+        self.text_chars = 0
+        self.t0 = time.monotonic()  # run 起点(与 start() 方法分名)
+        self.tool_names: dict[str, str] = {}  # tool_use_id → 工具名(tool/result 归一化用)
+        self._tool_pending = False  # 本轮工具结果已发 → 下个 assistant 消息段开新 step
+        self._active_tool_use: dict[int, str] = {}  # 块 index → tool_use_id
+        self._tool_use_pieces: dict[int, list[str]] = {}  # 块 index → input_json_delta 碎片
+        self._tool_result: dict | None = None
+        self._chunk_seqs: list[int] = []  # 本 step 的 assistant/chunk seq(消息 sourceSeqs)
+        self._call_seqs: dict[str, int] = {}  # callId → tool/call 的 seq
+        self._step_open = False
+        self._ended = False
+        self._reason: str | None = None  # error 事件后供 session/end.reason 使用
+        self.result_usage: dict | None = None
+        self.result_stop_reason: str | None = None
+        self.result_cost_usd: float | None = None
+
+    def event(self, evt_type: str, **data) -> dict | None:
+        """造信封并发布;返回事件(seq 已分配);无 sink 时返回 None(零开销短路)。"""
+        bus = _active_bus
+        if bus is None or not bus.enabled:
+            return None  # 无通道:零开销短路(publish 语义不变)
+        evt = new_event(evt_type, **data)
+        evt["session"] = self.session
+        evt["run_id"] = self.run_id
+        evt["label"] = self.label
+        evt["generator"] = self.generator
+        evt["provider"] = self.provider
+        evt["model"] = self.model
+        evt["seq"] = self.seq
+        self.seq += 1
+        bus.publish(evt)
+        return evt
+
+    def start(self, *, context: list[dict] | None = None, retry: dict | None = None,
+              prologue: bool = True) -> None:
+        """运行进入:session/start(带 retry 元数据)→ context 说明事件 → turn/start → step/start。
+
+        prologue=False(dsh 投影路径专用):turn/step 生命周期由 dsh 原生事件自带,
+        不合成 turn/start + step/start,且 _step_open 保持 False(dsh 路径不调 step_boundary)。
+        """
+        self.event("session/start", run_id=self.run_id, label=self.label, generator=self.generator,
+                   provider=self.provider, model=self.model, retry=retry, meta=self.meta)
+        for ctx in context or []:
+            self.event(ctx["type"], **ctx["data"])  # 日志型说明事件:重放于 turn 之前
+        if prologue:
+            self.event("turn/start", turn=self.turn)
+            self.event("step/start", turn=self.turn, step=self.step)
+            self._step_open = True
+
+    def step_boundary(self) -> None:
+        """上一步完成、新一步开始(工具结果后新一轮 LLM 请求);本 step 增量清空。"""
+        if self._stepping():
+            self.event("step/end", turn=self.turn, step=self.step)
+        self.step += 1
+        self._chunk_seqs = []
+        self._step_open = True
+        self.event("step/start", turn=self.turn, step=self.step)
+
+    def user_message(self, message: dict, *, source: dict | None = None,
+                     surface_op: str | dict = "append") -> None:
+        """user/message surface 事件(source 缺省 human 用户)。"""
+        if source is None:
+            source = {"kind": "user"}
+        self.event("user/message", turn=self.turn, step=self.step, message=message,
+                   source=source, surfaceOp=surface_op)
+
+    def chunk(self, chunk: dict) -> None:
+        """assistant/chunk 原始增量;seq 记入本 step 的 sourceSeqs。"""
+        evt = self.event("assistant/chunk", turn=self.turn, step=self.step, chunk=chunk)
+        if evt is not None:
+            self._chunk_seqs.append(evt["seq"])
+
+    def text(self, text: str, *, index: int = 0) -> None:
+        self.text_chars += len(text)
+        self.chunk({"type": "text", "index": index, "text": text})
+
+    def tool_call(self, call_id: str, name: str | None, arguments: str) -> None:
+        evt = self.event("tool/call", turn=self.turn, step=self.step, callId=call_id,
+                         name=name, arguments=arguments)
+        if evt is not None:
+            self._call_seqs[call_id] = evt["seq"]
+
+    def tool_result(self, message: dict, *, call_id: str, name: str | None,
+                    is_error: bool, src_seq: int | None = None) -> None:
+        data = {"turn": self.turn, "step": self.step, "message": message, "is_error": is_error,
+                "surfaceOp": "append", "callId": call_id}
+        if name:
+            data["name"] = name
+        if src_seq is not None:
+            data["sourceSeqs"] = [src_seq]
+        self.event("tool/result", **data)
+
+    def result_meta(self, msg) -> None:
+        """ResultMessage → session/end 汇总字段(usage/stop_reason/cost)。"""
+        self.result_usage = _normalize_usage(getattr(msg, "usage", None))
+        self.result_stop_reason = getattr(msg, "stop_reason", None)
+        self.result_cost_usd = getattr(msg, "total_cost_usd", None)
+
+    def finish(self, ok: bool, *, epilogue: bool = True) -> None:
+        """finally 兜底:step/end → turn/end → session/end(幂等)。
+
+        epilogue=False(dsh 投影路径专用):turn/step 终局事件已由 dsh 原生事件转发,
+        只收尾 session/end(状态汇总字段组装不变)。
+        """
+        if self._ended:
+            return
+        self._ended = True
+        state = "completed" if ok else "aborted"
+        data = {"state": state, "ok": ok,
+                "duration_ms": int((time.monotonic() - self.t0) * 1000),
+                "text_chars": self.text_chars, "num_steps": self.step}
+        for k, v in (("usage", self.result_usage), ("stop_reason", self.result_stop_reason),
+                     ("total_cost_usd", self.result_cost_usd)):
+            if v is not None:
+                data[k] = v
+        if not ok and self._reason:
+            data["reason"] = self._reason
+        if epilogue:
+            if self._step_open:
+                self.event("step/end", turn=self.turn, step=self.step)
+                self._step_open = False
+            self.event("turn/end", turn=self.turn, reason="completed" if ok else "error")
+        self.event("session/end", **data)
+
+    def error(self, exc: Exception, stage: str) -> None:
+        """error 事件(全量 message,不截断);session/end.reason 取首 2000 字符。"""
+        self.event("error", stage=stage, exc_type=type(exc).__name__, message=str(exc))
+        self._reason = str(exc)[:2000]
+
+    def _stepping(self) -> bool:
+        return self._step_open
+
+
+# EventBus(进程内单例;publish 非阻塞,失败只记 stderr)
+class EventBus:
+    """进程内异步事件总线:publish 只 put_nowait 到每 sink 队列,慢 sink 只拖 sink,不拖调用。"""
+
+    def __init__(self):
+        self._sinks: list[asyncio.Queue[dict]] = []
+        self._tasks: list[asyncio.Task] = []
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self._sinks)
+
+    def add(self, consume) -> None:
+        """注册 sink 消费协程:async def consume(evt: dict) -> None。"""
+        q: asyncio.Queue[dict] = asyncio.Queue(maxsize=5000)
+        self._sinks.append(q)
+        self._tasks.append(asyncio.create_task(self._drain(consume, q)))
+
+    async def _drain(self, consume, q) -> None:
+        while True:
+            evt = await q.get()
+            try:
+                await consume(evt)
+            except Exception as exc:  # sink 失败只报 stderr,绝不冒泡到调用方
+                _log(f"sink 消费失败: {type(exc).__name__}: {exc}")
+
+    def publish(self, evt: dict) -> None:
+        if not self._sinks:
+            return
+        for q in self._sinks:
+            try:
+                q.put_nowait(evt)
+            except asyncio.QueueFull:
+                q.get_nowait()  # 有界队列:丢最旧,新事件优先
+                q.put_nowait(evt)
+
+    def shutdown(self) -> None:
+        for task in self._tasks:
+            task.cancel()
