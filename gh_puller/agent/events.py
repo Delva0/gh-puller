@@ -4,7 +4,7 @@
 连续单调(**流式事件流内稠密**;非流式投影侧允许洞,见下);LLM messages 上下文
 是 surface 节点的派生(折叠)而非快照:
 
-事件流按粒度分为两级(取代旧"llm流"说法):
+事件流按粒度分为两级:
 - 流式事件流(agent 事件流)= TAXONOMY 全集(STREAM_TYPES):含 assistant/chunk
   原始增量,可还原实时(逐字)上下文;WS/OTel 通道承载;
 - 非流式事件流 = TAXONOMY − {assistant/chunk}(NON_STREAM_TYPES):message 粒度,

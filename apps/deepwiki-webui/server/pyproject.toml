@@ -6,7 +6,6 @@ requires-python = ">=3.13"
 dependencies = [
     "claude-agent-sdk>=0.2.142",
     "fastapi>=0.139.0",
-    "graphifyy[chinese,leiden,openai,svg]",
     "gh-puller",
     "python-dotenv>=1.2.3",
     "uvicorn[standard]>=0.51.0",
