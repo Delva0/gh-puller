@@ -9,6 +9,9 @@
 - dsh_stream / dsh_text / dsh_result(adapters.py):DeepSeek Harness(SDK)调用。
   dsh 原生事件 1:1 投影为监控事件流;非 completed 的 finish_reason →
   RuntimeError("agent 执行失败: ...")(与 cc is_error 语义对齐)。
+- codex_stream / codex_text / codex_result(adapters.py):OpenAI Codex(SDK)调用。
+  codex 通知流合成 TAXONOMY(无 seq 编号 → cc 式合成);turn 非 completed →
+  RuntimeError("agent 执行失败: ...")(与 cc is_error 语义对齐)。
 - configure / ensure_bus / EventBus / FileSink / WsSink(sinks.py):监控运行时重配、
   惰性构建总线与文件/WS 观测通道(AGENT_MONITOR_DIR / AGENT_MONITOR_WEBUI_URL,
   逗号分隔多地址,每地址一个 sink 实例;OtelSink 亦在 sinks.py,经
@@ -27,6 +30,9 @@ from .adapters import (
                        cc_result,
                        cc_stream,
                        cc_text,
+                       codex_result,
+                       codex_stream,
+                       codex_text,
                        dsh_cordis_path,
                        dsh_result,
                        dsh_stream,
@@ -56,6 +62,9 @@ __all__ = [
     "dsh_text",
     "dsh_result",
     "dsh_cordis_path",
+    "codex_stream",
+    "codex_text",
+    "codex_result",
     "llm_complete",
     "llm_stream",
 ]

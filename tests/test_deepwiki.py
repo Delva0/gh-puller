@@ -1328,3 +1328,77 @@ async def test_chat_and_codemap_dispatch_by_generator(monkeypatch):
     assert [c async for c in deepwiki.chat_stream(chat_req)] == ["l"]
     assert [ev async for ev in deepwiki.generate_codemap(codemap_req)] == ["l"]
     assert calls == ["cc", "cc-codemap", "llm", "llm-codemap"]
+
+
+# ---------------------------------------------------------------------------
+# codex 后端分派/选项(镜像 dsh 测试;假 codex_stream,零 SDK/网络/token)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_agent_text_through_codex_stream(monkeypatch):
+    """codex 后端镜像 cc/dsh 的迁移冒烟:归一化为 agent.codex_stream
+    (label/run_id/context 透传);options 由 _codex_options 组装(隔离 home + 图 MCP)。"""
+    monkeypatch.setattr(deepwiki.envs, "DEEPWIKI_GENERATOR", "codex")
+    calls = []
+
+    async def fake_codex_stream(options, prompt, *, session=None, session_name=None, run_id=None,
+                                context=None, retry=None, meta=None):
+        calls.append((options, session_name, prompt, run_id, context))
+        yield "a"
+        yield "b"
+
+    monkeypatch.setattr(deepwiki, "codex_stream", fake_codex_stream)
+    ctx = [{"type": "context/inject", "data": {"text": "n"}}]
+    out = await deepwiki._agent_text("sys", "query", label="wiki:structure", run_id="r1", context=ctx)
+    assert out == "ab"
+    options, session_name, prompt, run_id, ctx_got = calls[0]
+    assert (session_name, prompt, run_id, ctx_got) == ("wiki:structure", "query", "r1", ctx)
+    # 组装面:system_prompt → 适配器 base_instructions;高自由度缺省(full_access/auto_review);
+    # 凭证/home 零配置(学 cc:适配器符号链接引用本地凭证,envs 层无 CODEX_* 常量)
+    assert options.system_prompt == "sys"
+    assert options.sandbox == "full_access" and options.approval_mode == "auto_review"
+    assert not hasattr(options, "codex_home") and not hasattr(options, "token")
+
+
+def test_codex_options_config(tmp_path):
+    """_codex_options 与 cc/dsh 同构:model 只认调用方参数(envs 层无 CODEX_* 常量;
+    凭证/home 零配置在适配器层);cwd 固定仓库根;图目录经 env.GRAPHIFY_OUT 绝对路径注入。"""
+    repo = Repo(str(tmp_path), "local")
+    opts = deepwiki._codex_options("sys", repo, model="m")
+    assert opts.model == "m" and opts.cwd == str(tmp_path)
+    assert opts.env == {"GRAPHIFY_OUT": str(deepwiki._graph_dir(repo))}
+    opts2 = deepwiki._codex_options("sys", None, model=None)
+    assert not hasattr(opts2, "cwd") and not hasattr(opts2, "env")  # repo 空:不固定 cwd/图
+    assert not hasattr(opts2, "model")  # 缺省交给 SDK 缺省模型
+    # 学 cc 凭证面:envs 无 CODEX_* 常量(防误引入"看起来必须配置"的 env 骨架)
+    assert not hasattr(deepwiki.envs, "CODEX_HOME")
+    assert not hasattr(deepwiki.envs, "CODEX_MODEL")
+    assert not hasattr(deepwiki.envs, "CODEX_API_KEY")
+
+
+def test_codex_home_isolation_and_graphify(tmp_path):
+    """codex 隔离 home:config.toml 仅 graphify 单服务器 + env_vars 白名单,无用户配置面
+    (与 cc setting_sources=[] / dsh 内置 cordis 同语义)。"""
+    from gh_puller.agent.adapters import _codex_home_setup
+
+    home = _codex_home_setup(str(tmp_path / "home"), graphify_command="python3", auth_src=False)
+    text = Path(home, "config.toml").read_text(encoding="utf-8")
+    assert text.startswith("[mcp_servers.graphify]")
+    assert "graphify.serve" in text and "env_vars = [\"GRAPHIFY_OUT\"]" in text
+    assert text.count("[mcp_servers.") == 1  # 无第三方服务器/无设置节(隔离边界)
+    assert not (Path(home) / "auth.json").exists()  # auth_src=False:纯隔离无凭证态
+
+
+def test_wiki_pipeline_codex_uses_agent(monkeypatch):
+    """分派:codex 与 cc/dsh 同为 agent 路(AgentWikiPipeline);llm 路不受扰。"""
+    monkeypatch.setattr(deepwiki.envs, "DEEPWIKI_GENERATOR", "codex")
+    assert isinstance(deepwiki._wiki_pipeline(), deepwiki.AgentWikiPipeline)
+    assert isinstance(deepwiki._service_pipeline(), deepwiki.AgentWikiPipeline)
+
+
+def test_agent_note_codex_uses_mcp_graphify(monkeypatch):
+    """图工具指引按后端切换:codex 与 dsh 同款 mcp__graphify__query_graph(隔离 config.toml 装载)。"""
+    monkeypatch.setattr(deepwiki.envs, "DEEPWIKI_GENERATOR", "codex")
+    assert "mcp__graphify__query_graph" in deepwiki._agent_note()
+    assert "graphify_query" not in deepwiki._agent_note()

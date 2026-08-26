@@ -12,6 +12,7 @@ import asyncio
 import json
 import sys
 import types
+from enum import StrEnum
 
 import pytest
 import pytest_asyncio
@@ -1280,3 +1281,454 @@ async def test_configure_none_reseeds_env_constant(monkeypatch):
     agent.configure(file=False, ws_urls=None, otel_urls=[])
     assert sinks.ensure_bus().enabled is True
     assert ws_urls == ["ws://env/ws"]
+
+
+# ---------------------------------------------------------------------------
+# codex 适配器(OpenAI Codex SDK):假模块注入(AsyncCodex/CodexConfig/Sandbox)零 SDK/网络/token
+# ---------------------------------------------------------------------------
+
+
+class _CodexJsonRpcError(Exception):
+    pass
+
+
+class _FakeCodexSandbox(StrEnum):
+    read_only = "read-only"
+    workspace_write = "workspace-write"
+    full_access = "full-access"
+
+
+class _FakeCodexApprovalMode(StrEnum):
+    deny_all = "deny_all"
+    auto_review = "auto_review"
+
+
+class _FakeNotify:
+    """形似 codex Notification 的假通知(method/payload;payload 用 SimpleNamespace)。"""
+
+    def __init__(self, method, payload):
+        self.method = method
+        self.payload = types.SimpleNamespace(**payload)
+
+
+class _FakeCodexConfig:
+    """形似 CodexConfig 的假 dataclass:记录构造 kwargs。"""
+
+    instances: list = []
+
+    def __init__(self, **kwargs):
+        self.__dict__.update(kwargs)
+        type(self).instances.append(self)
+
+
+class _FakeTurnHandle:
+    """形似 AsyncTurnHandle:stream() 重放注入通知后自然结束(异步生成器)。"""
+
+    notifs: list = []
+
+    def __init__(self, thread_id, turn_id):
+        self.thread_id = thread_id
+        self.id = turn_id
+
+    async def stream(self):
+        for n in type(self).notifs:
+            yield n
+
+
+class _FakeThread:
+    """形似 AsyncThread:记录 turn(input, kwargs),返回假 handle。"""
+
+    calls: list = []
+
+    def __init__(self, thread_id):
+        self.id = thread_id
+
+    async def turn(self, input, **kwargs):
+        type(self).calls.append((input, kwargs))
+        return _FakeTurnHandle(self.id, "t1")
+
+
+class _FakeCodex:
+    """形似 AsyncCodex:拦截 config/login_api_key/thread_start,退出计数(防子进程泄漏)。"""
+
+    instances: list = []
+    closed = 0
+    thread_raise: Exception | None = None
+
+    def __init__(self, config=None):
+        self.config = config
+        self.logged_keys: list[str] = []
+        self.thread_start_kwargs = None
+        type(self).instances.append(self)
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        type(self).closed += 1
+        return False
+
+    async def login_api_key(self, api_key):
+        self.logged_keys.append(api_key)
+
+    async def thread_start(self, **kwargs):
+        if type(self).thread_raise is not None:
+            raise type(self).thread_raise
+        self.thread_start_kwargs = kwargs
+        return _FakeThread("thr_1")
+
+
+def _fake_codex(monkeypatch, notifs, *, thread_raise=None, user_home):
+    """注入假 openai_codex(errors 一并)并复位全部静态;Path.home 指到假 HOME。
+
+    user_home 是假"用户主目录"(含 ~/.codex/auth.json 等):auth 引导复制从此取,
+    防读到机器真实 ~/.codex/{auth.json,config.toml} 且防向真实 ~/.gh-puller 写。
+    """
+    import pathlib
+
+    mod = types.ModuleType("openai_codex")
+    mod.AsyncCodex = _FakeCodex
+    mod.CodexConfig = _FakeCodexConfig
+    mod.Sandbox = _FakeCodexSandbox
+    mod.ApprovalMode = _FakeCodexApprovalMode
+    mod.JsonRpcError = _CodexJsonRpcError
+    monkeypatch.setitem(sys.modules, "openai_codex", mod)
+    _FakeTurnHandle.notifs = list(notifs)
+    _FakeThread.calls = []
+    _FakeCodex.instances = []
+    _FakeCodex.closed = 0
+    _FakeCodex.thread_raise = thread_raise
+    _FakeCodexConfig.instances = []
+    monkeypatch.setattr(pathlib.Path, "home",
+                        classmethod(lambda cls: pathlib.Path(user_home)))
+
+
+def _codex_nt(method, **payload):
+    """codex 通知构造(payload 蛇形属性,与 pydantic populate_by_name 属性面一致)。"""
+    return _FakeNotify(method, payload)
+
+
+def _codex_it(**fields):
+    """codex item 构造(ThreadItem 实际项,蛇形字段)。"""
+    return types.SimpleNamespace(**fields)
+
+
+def _codex_options(**kw):
+    return types.SimpleNamespace(model="m1", system_prompt="sys", **kw)
+
+
+def _codex_user_home(tmp_path, *, with_auth=False):
+    """假用户主目录(with_auth → 放置 ~/.codex/auth.json 供引导复制)。"""
+    home = tmp_path / "home"
+    if with_auth:
+        (home / ".codex").mkdir(parents=True, exist_ok=True)
+        (home / ".codex" / "auth.json").write_text('{"tok": "u"}', encoding="utf-8")
+    return str(home)
+
+
+@pytest.mark.asyncio
+async def test_codex_stream_text_deltas_deduped(monkeypatch, tmp_path):
+    """文本增量优先、assistant/message 全量 + phase;delta 与 completed 恰一次(不双发)。"""
+    agent.configure(file=False, ws_urls=[], otel_urls=[])
+    got = []
+    sinks.ensure_bus().add(_recv(got))
+    _fake_codex(monkeypatch, [
+        _codex_nt("turn/started", turn=_codex_it(id="t1")),
+        _codex_nt("item/started", item=_codex_it(type="agentMessage", id="m1")),
+        _codex_nt("item/agentMessage/delta", delta="hi", item_id="m1"),
+        _codex_nt("item/agentMessage/delta", delta="好", item_id="m1"),
+        _codex_nt("item/completed",
+                  item=_codex_it(type="agentMessage", id="m1", text="hi好", phase="final_answer")),
+        _codex_nt("turn/completed", turn=_codex_it(id="t1", status="completed", error=None)),
+    ], user_home=_codex_user_home(tmp_path))
+    chunks = [c async for c in agent.codex_stream(_codex_options(codex_home=str(tmp_path)),
+                                                  "prompt", session_name="x")]
+    assert "".join(chunks) == "hi好"
+    await asyncio.sleep(0.05)
+    asst = next(g for g in got if g["type"] == "assistant/message")
+    assert asst["data"]["message"]["content"] == [
+        {"type": "text", "text": "hi好", "phase": "final_answer"}]
+    assert asst["data"]["sourceSeqs"] == \
+        [g["seq"] for g in got if g["type"] == "assistant/chunk"]  # 增量 seq 引用
+    assert len([g for g in got if g["type"] == "assistant/chunk"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_codex_stream_event_sequence(monkeypatch, tmp_path):
+    """全 TAXONOMY 事件序列:session/turn/step 合成,partial header,终局 completed。"""
+    agent.configure(file=False, ws_urls=[], otel_urls=[])
+    got = []
+    sinks.ensure_bus().add(_recv(got))
+    _fake_codex(monkeypatch, [
+        _codex_nt("turn/started", turn=_codex_it(id="t1")),
+        _codex_nt("item/started", item=_codex_it(type="agentMessage", id="m1")),
+        _codex_nt("item/agentMessage/delta", delta="a", item_id="m1"),
+        _codex_nt("item/completed",
+                  item=_codex_it(type="agentMessage", id="m1", text="a", phase=None)),
+        _codex_nt("thread/tokenUsage/updated",
+                  token_usage=_codex_it(total=_codex_it(input_tokens=2, output_tokens=1,
+                                                        cache_read_input_tokens=None),
+                                        last=None)),
+        _codex_nt("turn/completed", turn=_codex_it(id="t1", status="completed", error=None)),
+    ], user_home=_codex_user_home(tmp_path))
+    await agent.codex_text(_codex_options(codex_home=str(tmp_path)), "整段 prompt ⚙",
+                           session_name="x", run_id="r1")
+    await asyncio.sleep(0.05)
+    types_ = [g["type"] for g in got]
+    assert types_[:4] == ["session/start", "turn/start", "step/start", "user/message"]
+    assert got[0]["provider"] == "codex" and got[0]["run_id"] == "r1"
+    assert [g["seq"] for g in got] == list(range(len(got)))  # 合成流 seq 稠密
+    hdr = next(g for g in got if g["type"] == "request/header")
+    assert hdr["data"]["partial"] is True  # SDK 不暴露请求体(cc 同语义)
+    assert hdr["data"]["header"]["config"]["provider"] == "codex"
+    um = next(g for g in got if g["type"] == "user/message")
+    assert um["data"]["message"]["content"][0]["text"] == "整段 prompt ⚙"
+    assert types_[-2:] == ["turn/end", "session/end"] and got[-1]["data"]["state"] == "completed"
+    assert got[-1]["data"]["usage"] == {"input_tokens": 2, "output_tokens": 1,
+                                        "cache_read_input_tokens": None}
+
+
+@pytest.mark.asyncio
+async def test_codex_stream_thinking_and_plan_chunks(monkeypatch, tmp_path):
+    """reasoning 增量 → thinking chunk(不产出文本);reasoning/plan completed 无重复双投。"""
+    agent.configure(file=False, ws_urls=[], otel_urls=[])
+    got = []
+    sinks.ensure_bus().add(_recv(got))
+    _fake_codex(monkeypatch, [
+        _codex_nt("turn/started", turn=_codex_it(id="t1")),
+        _codex_nt("item/started", item=_codex_it(type="reasoning", id="r1")),
+        _codex_nt("item/reasoning/textDelta", delta="深", item_id="r1", content_index=0),
+        _codex_nt("item/completed", item=_codex_it(type="reasoning", id="r1",
+                                                   content=["深"], summary=["…"])),
+        _codex_nt("item/started", item=_codex_it(type="plan", id="p1")),
+        _codex_nt("item/completed", item=_codex_it(type="plan", id="p1", text="计划")),
+        _codex_nt("item/started", item=_codex_it(type="agentMessage", id="m1")),
+        _codex_nt("item/agentMessage/delta", delta="回答", item_id="m1"),
+        _codex_nt("item/completed",
+                  item=_codex_it(type="agentMessage", id="m1", text="回答", phase=None)),
+        _codex_nt("turn/completed", turn=_codex_it(id="t1", status="completed", error=None)),
+    ], user_home=_codex_user_home(tmp_path))
+    assert await agent.codex_text(_codex_options(codex_home=str(tmp_path)), "q",
+                                  session_name="x") == "回答"
+    await asyncio.sleep(0.05)
+    kinds = [g["data"]["chunk"].get("type") for g in got
+             if g["type"] == "assistant/chunk"]
+    assert kinds == ["thinking", "plan", "text"]  # reasoning completed 未重复;plan 恰一次
+    assert kinds.count("plan") == 1
+
+
+@pytest.mark.asyncio
+async def test_codex_stream_tool_round_single_step_boundary(monkeypatch, tmp_path):
+    """并行两个 mcp 工具:各 1 组 tool/call|result;随后下一 LLM item 恰开一次 step 边界。"""
+    agent.configure(file=False, ws_urls=[], otel_urls=[])
+    got = []
+    sinks.ensure_bus().add(_recv(got))
+    _fake_codex(monkeypatch, [
+        _codex_nt("turn/started", turn=_codex_it(id="t1")),
+        _codex_nt("item/started", item=_codex_it(type="reasoning", id="r1")),
+        _codex_nt("item/reasoning/textDelta", delta="想", item_id="r1", content_index=0),
+        _codex_nt("item/completed", item=_codex_it(type="reasoning", id="r1", content=["想"])),
+        _codex_nt("item/completed",
+                  item=_codex_it(type="mcpToolCall", id="c1", server="graphify",
+                                 tool="query_graph", arguments={"q": "x"}, status="completed",
+                                 result=_codex_it(content=[_codex_it(type="text", text="结果1")],
+                                                  structured_content=None),
+                                 error=None)),
+        _codex_nt("item/completed",
+                  item=_codex_it(type="mcpToolCall", id="c2", server="graphify",
+                                 tool="query_graph", arguments='{"q": "y"}', status="completed",
+                                 result=_codex_it(content=[_codex_it(type="text", text="结果2")],
+                                                  structured_content=None),
+                                 error=None)),
+        _codex_nt("item/started", item=_codex_it(type="agentMessage", id="m2")),
+        _codex_nt("item/agentMessage/delta", delta="final", item_id="m2"),
+        _codex_nt("item/completed",
+                  item=_codex_it(type="agentMessage", id="m2", text="final", phase=None)),
+        _codex_nt("turn/completed", turn=_codex_it(id="t1", status="completed", error=None)),
+    ], user_home=_codex_user_home(tmp_path))
+    assert await agent.codex_text(_codex_options(codex_home=str(tmp_path)), "q",
+                                  session_name="x") == "final"
+    await asyncio.sleep(0.05)
+    calls = [g for g in got if g["type"] == "tool/call"]
+    assert len(calls) == 2
+    assert [c["data"]["name"] for c in calls] == ["mcp__graphify__query_graph"] * 2
+    assert calls[0]["data"]["arguments"] == '{"q": "x"}'  # dict → json.dumps
+    assert calls[1]["data"]["arguments"] == '{"q": "y"}'  # str 原样
+    results = [g for g in got if g["type"] == "tool/result"]
+    assert len(results) == 2
+    assert [r["data"]["is_error"] for r in results] == [False, False]
+    assert results[0]["data"]["message"]["content"][0]["content"] == "结果1"
+    assert results[0]["data"]["sourceSeqs"] == [calls[0]["seq"]]
+    # 工具结果后:恰一组 step/end + step/start(tool_round_open 聚合并行工具,单次翻转);
+    # 末位 step/end = epilogue 收尾第二步(与 cc 同规)
+    boundaries = [g["type"] for g in got if g["type"] in ("step/end", "step/start")]
+    assert boundaries == ["step/start", "step/end", "step/start", "step/end"]
+
+
+@pytest.mark.asyncio
+async def test_codex_stream_command_execution_failed_is_error(monkeypatch, tmp_path):
+    """commandExecution:归 shell 工具;exit_code≠0 → tool/result is_error + 文本聚合。"""
+    agent.configure(file=False, ws_urls=[], otel_urls=[])
+    got = []
+    sinks.ensure_bus().add(_recv(got))
+    _fake_codex(monkeypatch, [
+        _codex_nt("turn/started", turn=_codex_it(id="t1")),
+        _codex_nt("item/completed",
+                  item=_codex_it(type="commandExecution", id="sh1", command="false",
+                                 cwd="/repo", exit_code=1, aggregated_output="boom! 1",
+                                 status="failed")),
+        _codex_nt("turn/completed", turn=_codex_it(id="t1", status="failed",
+                                                   error=_codex_it(message="boom"))),
+    ], user_home=_codex_user_home(tmp_path))
+    with pytest.raises(RuntimeError, match="agent 执行失败: boom"):
+        async for _ in agent.codex_stream(_codex_options(codex_home=str(tmp_path)), "q"):
+            pass
+    await asyncio.sleep(0.05)
+    call = next(g for g in got if g["type"] == "tool/call")
+    assert call["data"]["name"] == "shell"
+    assert json.loads(call["data"]["arguments"]) == {"command": "false", "cwd": "/repo"}
+    result = next(g for g in got if g["type"] == "tool/result")
+    assert result["data"]["is_error"] is True
+    assert result["data"]["message"]["content"][0]["content"] == "boom! 1"
+
+
+@pytest.mark.asyncio
+async def test_codex_stream_failed_turn_raises(monkeypatch, tmp_path):
+    """turn status=failed → RuntimeError("agent 执行失败: ..."),error stage=run,abort 终局。"""
+    agent.configure(file=False, ws_urls=[], otel_urls=[])
+    got = []
+    sinks.ensure_bus().add(_recv(got))
+    _fake_codex(monkeypatch, [
+        _codex_nt("turn/started", turn=_codex_it(id="t1")),
+        _codex_nt("turn/completed", turn=_codex_it(id="t1", status="failed",
+                                                   error=_codex_it(message="boom"))),
+    ], user_home=_codex_user_home(tmp_path))
+    with pytest.raises(RuntimeError, match="agent 执行失败: boom"):
+        async for _ in agent.codex_stream(_codex_options(codex_home=str(tmp_path)), "q"):
+            pass
+    await asyncio.sleep(0.05)
+    err = next(g for g in got if g["type"] == "error")
+    assert err["data"]["stage"] == "run" and err["data"]["exc_type"] == "RuntimeError"
+    assert got[-1]["type"] == "session/end" and got[-1]["data"]["state"] == "aborted"
+    assert got[-1]["data"]["reason"] == "agent 执行失败: boom"
+
+
+@pytest.mark.asyncio
+async def test_codex_stream_missing_completed_raises(monkeypatch, tmp_path):
+    """流自然终止而未见 turn/completed → RuntimeError(传输中断兜底)。"""
+    agent.configure(file=False, ws_urls=[], otel_urls=[])
+    _fake_codex(monkeypatch, [
+        _codex_nt("turn/started", turn=_codex_it(id="t1")),
+    ], user_home=_codex_user_home(tmp_path))
+    with pytest.raises(RuntimeError, match="turn 未收到完成事件"):
+        await agent.codex_text(_codex_options(codex_home=str(tmp_path)), "q", session_name="x")
+
+
+@pytest.mark.asyncio
+async def test_codex_stream_sdk_error_stage_parse(monkeypatch, tmp_path):
+    """SDK JSON-RPC 协议错误:原样重抛、error 事件 stage=parse。"""
+    agent.configure(file=False, ws_urls=[], otel_urls=[])
+    got = []
+    sinks.ensure_bus().add(_recv(got))
+    _fake_codex(monkeypatch, [], thread_raise=_CodexJsonRpcError("boom"),
+                user_home=_codex_user_home(tmp_path))
+    with pytest.raises(_CodexJsonRpcError, match="boom"):
+        await agent.codex_text(_codex_options(codex_home=str(tmp_path)), "q", session_name="x")
+    await asyncio.sleep(0.05)
+    err = next(g for g in got if g["type"] == "error")
+    assert err["data"]["stage"] == "parse" and err["data"]["exc_type"] == "_CodexJsonRpcError"
+    assert got[-1]["type"] == "session/end" and got[-1]["data"]["state"] == "aborted"
+
+
+@pytest.mark.asyncio
+async def test_codex_stream_config_isolation_and_auth(monkeypatch, tmp_path):
+    """config 装配:CODEX_HOME 进 env(cwd/codex_bin/overrides/launch 透传)、token →
+    login_api_key、sandbox/approval 字符串 → SDK 枚举、系统提示 → base_instructions。"""
+    agent.configure(file=False, ws_urls=[], otel_urls=[])
+    _fake_codex(monkeypatch, [
+        _codex_nt("turn/started", turn=_codex_it(id="t1")),
+        _codex_nt("turn/completed", turn=_codex_it(id="t1", status="completed", error=None)),
+    ], user_home=_codex_user_home(tmp_path, with_auth=True))
+    options = types.SimpleNamespace(
+        model="m1", system_prompt="sys", codex_home=str(tmp_path / "codex-home"),
+        token="sk-x", sandbox="full_access", approval_mode="auto_review",
+        cwd="/repo", codex_bin="/bin/codex", config_overrides=("k=v",),
+        launch_args_override=("l", "a"), env={"GRAPHIFY_OUT": "/g"}, effort="high",
+        base_instructions="SYSTEM",
+    )
+    await agent.codex_text(options, "prompt", session_name="x")
+    cfg = _FakeCodexConfig.instances[0]
+    assert cfg.cwd == "/repo" and cfg.codex_bin == "/bin/codex"
+    assert cfg.config_overrides == ("k=v",) and cfg.launch_args_override == ("l", "a")
+    assert cfg.env == {"GRAPHIFY_OUT": "/g", "CODEX_HOME": str(tmp_path / "codex-home")}
+    codex = _FakeCodex.instances[0]
+    assert codex.logged_keys == ["sk-x"]  # token → login_api_key
+    assert codex.thread_start_kwargs["sandbox"] == _FakeCodexSandbox.full_access
+    assert codex.thread_start_kwargs["approval_mode"] == _FakeCodexApprovalMode.auto_review
+    assert codex.thread_start_kwargs["base_instructions"] == "SYSTEM"  # 显式优先于 system_prompt
+    assert codex.thread_start_kwargs["cwd"] == "/repo"  # thread cwd(工作区根)
+    assert _FakeThread.calls[0] == ("prompt", {"cwd": "/repo", "effort": "high"})  # turn 级同样透传
+    # 隔离 home:config.toml 仅 graphify;token → 先断 auth 符号链接再 login
+    # (防 login_api_key 穿透写穿用户真实 ~/.codex/auth.json —— 凭证进本隔离 home)
+    assert (tmp_path / "codex-home" / "config.toml").read_text().startswith("[mcp_servers.graphify]")
+    assert not (tmp_path / "codex-home" / "auth.json").exists()
+
+
+@pytest.mark.asyncio
+async def test_codex_stream_consumer_close_closes_codex(monkeypatch, tmp_path):
+    """消费者提前退场:async with 语义回收 AsyncCodex(__aexit__ 计数);终局 aborted。"""
+    agent.configure(file=False, ws_urls=[], otel_urls=[])
+    _fake_codex(monkeypatch, [
+        _codex_nt("turn/started", turn=_codex_it(id="t1")),
+        _codex_nt("item/started", item=_codex_it(type="agentMessage", id="m1")),
+        _codex_nt("item/agentMessage/delta", delta="x", item_id="m1"),
+        _codex_nt("item/completed",
+                  item=_codex_it(type="agentMessage", id="m1", text="x", phase=None)),
+    ], user_home=_codex_user_home(tmp_path))
+    gen = agent.codex_stream(_codex_options(codex_home=str(tmp_path)), "q", session_name="x")
+    first = await gen.__anext__()
+    assert first == "x"
+    await gen.aclose()
+    assert _FakeCodex.closed == 1  # AsyncCodex.__aexit__ 已执行(app-server 回收)
+
+
+@pytest.mark.asyncio
+async def test_codex_result_empty_final_response_raises(monkeypatch, tmp_path):
+    """completed 但无产出文本 → codex_result RuntimeError(与 cc_result 同文案)。"""
+    agent.configure(file=False, ws_urls=[], otel_urls=[])
+    _fake_codex(monkeypatch, [
+        _codex_nt("turn/started", turn=_codex_it(id="t1")),
+        _codex_nt("turn/completed", turn=_codex_it(id="t1", status="completed", error=None)),
+    ], user_home=_codex_user_home(tmp_path))
+    with pytest.raises(RuntimeError, match="agent 未产出最终结果"):
+        await agent.codex_result(_codex_options(codex_home=str(tmp_path)), "q", session_name="x")
+
+
+def test_codex_home_setup_config_toml_and_auth(tmp_path, monkeypatch):
+    """隔离 home:config.toml 仅 graphify 单服务器(无用户配置面);auth 符号链接引用
+    本地凭证(cc 的 CLI 自持凭证同形:重新登录即跟随,无副本陈旧)且幂等。"""
+    from pathlib import Path
+
+    from gh_puller.agent.adapters import _codex_home_setup
+
+    user_home = tmp_path / "home"
+    (user_home / ".codex").mkdir(parents=True)
+    (user_home / ".codex" / "auth.json").write_text('{"tok": "u"}', encoding="utf-8")
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: Path(user_home)))
+    home = tmp_path / "codex-home"
+    _codex_home_setup(str(home), graphify_command="python3")
+    cfg = (home / "config.toml").read_text(encoding="utf-8")
+    assert cfg.startswith("[mcp_servers.graphify]")
+    assert 'command = "python3"' in cfg
+    assert 'args = ["-m", "graphify.serve"]' in cfg
+    assert 'env_vars = ["GRAPHIFY_OUT"]' in cfg
+    assert "required = true" in cfg
+    assert cfg.count("[mcp_servers.") == 1  # 无用户配置面(不含第三方服务器/设置)
+    auth = home / "auth.json"
+    assert auth.is_symlink()  # 实时引用用户凭证,非复制
+    assert auth.resolve() == (user_home / ".codex" / "auth.json")
+    # 幂等:内容不变不重写(config.toml mtime 不变;auth 仍为同一条链接)
+    before = (home / "config.toml").stat().st_mtime_ns
+    _codex_home_setup(str(home), graphify_command="python3")
+    assert (home / "config.toml").stat().st_mtime_ns == before
+    assert auth.is_symlink() and auth.resolve() == (user_home / ".codex" / "auth.json")

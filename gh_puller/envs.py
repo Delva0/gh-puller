@@ -23,6 +23,11 @@ DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")  # 显式走 options.a
 DEEPSEEK_BASE_URL = os.environ.get("DEEPSEEK_BASE_URL", "")  # 端点覆写(本地 proxy/mock),空走官方
 DEEPWIKI_DSH_CORDIS = os.environ.get("DEEPWIKI_DSH_CORDIS", "")  # 自定义组合文件;空 → 内置最小组合
 
+# codex(OpenAI Codex SDK)无 env 骨架 —— 学 cc 的凭证面:零配置复用本地登录凭证
+# (~/.codex/auth.json 符号链接,见 adapters._codex_home_setup),隔离只管设置面
+# (config.toml/sessions);codex_home/model/token 都是适配器 options API 参数
+# (调用方按需传,经 _codex_options 骨架或在 chat/wik 业务层构造)。
+
 # ---- 产物根目录:repos/ 克隆目录、graphify-out/ 索引、wikicache/ 缓存 ----
 DEEPWIKI_ROOT = os.path.expanduser(os.environ.get("DEEPWIKI_ROOT", "~/.gh-puller/deepwiki"))
 
@@ -70,7 +75,7 @@ LLM_JUDGE_MODEL = os.environ.get("LLM_JUDGE_MODEL", "Qwen2.5-7B-Instruct")
 LLM_JUDGE_API_KEY = os.environ.get("LLM_JUDGE_API_KEY", "")  # 端点认证密钥,留空不发 Authorization
 
 # ---- wiki 生成器开关与纯 LLM 端点(缺省回退 LLM_JUDGE_* 现值) ----
-# "cc"=Claude Code agent;"dsh"=DeepSeek Harness agent;"llm"=纯 LLM 单次补全
+# "cc"=Claude Code agent;"dsh"=DeepSeek Harness agent;"codex"=OpenAI Codex agent;"llm"=纯 LLM 单次补全
 DEEPWIKI_GENERATOR = os.environ.get("DEEPWIKI_GENERATOR", "cc")
 DEEPWIKI_LLM_URL = os.environ.get("DEEPWIKI_LLM_URL", LLM_JUDGE_URL)
 DEEPWIKI_LLM_MODEL = os.environ.get("DEEPWIKI_LLM_MODEL", LLM_JUDGE_MODEL)

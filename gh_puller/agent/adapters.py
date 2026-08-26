@@ -10,6 +10,10 @@ ClaudeSDKClient / httpx(无感,对外语义不变):
 - dsh_stream / dsh_text / dsh_result:DeepSeek Harness(SDK)调用。dsh 原生 session
   事件 1:1 投影为监控事件流(事件模型同源,events.py);finish_reason 非 completed
   → RuntimeError("agent 执行失败: ...")(与 cc is_error 语义对齐)。
+- codex_stream / codex_text / codex_result:OpenAI Codex(SDK)调用。codex 通知流
+  (item/agentMessage/delta 文本增量、item/completed 整块兜底)合成 TAXONOMY ——
+  与 cc 同为"唯一权威"合成路线(codex 通知无 seq/生命周期编号,见 _CodexSynth);
+  turn 非 completed → RuntimeError("agent 执行失败: ...")。
 
 事件语义(对齐 deepseek-harness 事件溯源模型,规范见 gh_puller.agent.events):
 单次运行一个 session(流式事件流内 seq 从 0 连续);进入即 session/start →
@@ -37,37 +41,20 @@ BaseAdapter)(provider 类属性;stream 必写,text/result 用缺省或覆盖);SD
 未知 type 抛 ValueError → 只发 TAXONOMY);若新 SDK 自带 seq/turn/step 生命周期
 (如 dsh)→ 参照 _DshProj 做投影对齐,严禁把对方 seq 当 gh seq;尾部注册进 ADAPTERS
 并加导出。
-
-为什么区分"合成"与"投影"(dsh 事件同源却比 cc 多一套 _DshProj):
-关键不在词汇是否一致,而在"权威(authority)"的数量 ——
-- cc 是唯一权威 → 合成器。Claude SDK 给出的是原料流(增量 StreamEvent、聚合
-  AssistantMessage/ResultMessage),不携带 session/turn/step 编号、无生命周期事件、
-  无 sourceSeqs。适配器只维护一套自己造的编号(seq 自己数、turn/step 自开合、
-  tool/call|result 自合成、sourceSeqs 引用自己的 _chunk_seqs),正确性靠自洽,
-  去重是布尔判断(already_yielded、tid in _call_seqs)。
-- dsh 是第二权威 → 对齐器。词汇虽与 TAXONOMY 同源,但 dsh 已把会话语义做掉一半,
-  且用的是 dsh 自己的编号:seq 按 log.length 对全部会话事件计数(含被跳过的插件
-  事件),turn/step 生命周期由 dsh 发,同一 tool-call 既有原料(block-end 完整
-  arguments)又有成品(显式 tool/call),sourceEventSeqs 引用 dsh 编号空间,
-  字段命名(camelCase usage、tool-result/toolCallId/isError 卡片)也不同。适配器
-  不能发明、只能对账:seq_map 重映射 + 生命周期让渡(prologue=False /
-  epilogue=not saw_turn_end)+ synth 双表达去重 + 字段改名 —— 即 _DshProj。
-- 一句话:"同源"省掉发明词汇,换来持续对齐两套编号、两套生命周期与双表达去重;
-  翻译只有一种权威,对齐要同时伺候两种。cc 的合成状态也真实存在,只是小而散
-  (_Run 的 6 个字段),所以"cc 更少"其实是它没有第二权威要伺候。
-  (曾评估"跟则跟"(恒等 seq + 纯整形 + TAXONOMY 扩容 + 驱动降级到 HarnessClient
-  订阅级 —— 不走 SDK Session.run,因收据门闸会吞流头部),因 extensions 不在主题、
-  维持本项目事件风格,维持投影;方案内容见历次调研,如需重开另行设计。)
 """
 
 import asyncio
 import contextlib
 import hashlib
 import json
+import os
+import shutil
+import sys
 import tempfile
 import time
 import uuid
 from pathlib import Path
+from typing import Any
 
 import httpx
 
@@ -860,6 +847,20 @@ class _DshProj:
     step/start 归零 —— 块 index 每 step 从 0 重新计数);
     saw_user_message / saw_turn_end:兜底与终局判定;last_finish_kind:最近 finish
     chunk 的 reason(assistant/message 与 session/end 的 stop_reason 来源)。
+
+    为什么区分"合成"与"投影"(dsh 事件同源却比 cc 多一套 _DshProj):
+    - cc 是唯一权威 → 合成器。Claude SDK 给出的是原料流(增量 StreamEvent、聚合
+    AssistantMessage/ResultMessage),不携带 session/turn/step 编号、无生命周期事件、
+    无 sourceSeqs。适配器只维护一套自己造的编号(seq 自己数、turn/step 自开合、
+    tool/call|result 自合成、sourceSeqs 引用自己的 _chunk_seqs),正确性靠自洽,
+    去重是布尔判断(already_yielded、tid in _call_seqs)。
+    - dsh 是第二权威 → 对齐器。词汇虽与 TAXONOMY 同源,但 dsh 已把会话语义做掉一半,
+    且用的是 dsh 自己的编号:seq 按 log.length 对全部会话事件计数(含被跳过的插件
+    事件),turn/step 生命周期由 dsh 发,同一 tool-call 既有原料(block-end 完整
+    arguments)又有成品(显式 tool/call),sourceEventSeqs 引用 dsh 编号空间,
+    字段命名(camelCase usage、tool-result/toolCallId/isError 卡片)也不同。适配器
+    不能发明、只能对账:seq_map 重映射 + 生命周期让渡(prologue=False /
+    epilogue=not saw_turn_end)+ synth 双表达去重 + 字段改名 —— 即 _DshProj。
     """
 
     def __init__(self, run: _Run, prompt: str, session_id: str):
@@ -1185,12 +1186,447 @@ class DshAdapter(BaseAdapter):
 
 
 # ---------------------------------------------------------------------------
+# Codex(OpenAI Codex SDK)包装:codex_stream / codex_text / codex_result
+# ---------------------------------------------------------------------------
+
+
+def _codex_val(x):
+    """枚举成员 → 值(pydantic/codex 枚举 .value;普通值原样)—— 状态比较统一走值。"""
+    return getattr(x, "value", x)
+
+
+def _codex_lookup(v, enum_cls, label):
+    """options 的 Sandbox/ApprovalMode(名字/值/枚举成员)→ SDK 枚举;None → None。
+
+    调用方(deepwiki)常传字符串("full_access" / "auto_review");高级用户可传 SDK 枚举。
+    名字与值双匹配 —— 防 str 子类枚举当 str 用后按名匹配失真。
+    """
+    if v is None:
+        return None
+    if isinstance(v, enum_cls):
+        return v
+    raw = _codex_val(v)
+    for member in enum_cls:
+        if raw in (member.name, member.value):
+            return member
+    raise ValueError(f"codex {label} 取值非法(可选 {[m.name for m in enum_cls]}): {v!r}")
+
+
+def _codex_config_fields(options) -> dict:
+    """鸭子类型 codex options → CodexConfig 构造 kwargs(None 跳过 → 走 SDK 缺省)。
+
+    与 _dsh_options_fields 同法:调用方自组装 options(仿 cc 的 ClaudeAgentOptions 透传);
+    env 由调用流合并 CODEX_HOME 后整传入 —— SDK 从不自设 CODEX_HOME,隔离点见
+    codex_home_path / _codex_home_setup。
+    """
+    names = ("cwd", "codex_bin", "config_overrides", "launch_args_override", "env")
+    return {k: v for k, v in ((k, getattr(options, k, None)) for k in names) if v is not None}
+
+
+def _codex_thread_fields(options) -> dict:
+    """codex options → AsyncCodex.thread_start 透传 kwargs(sandbox/approval_mode 由
+    stream 内经 _codex_lookup 转换后塞入,此处只保留其余自由字段)。
+
+    system_prompt 缺省映射 base_instructions(与 cc 的 system_prompt 同位语义)。
+    """
+    names = ("base_instructions", "developer_instructions", "personality", "ephemeral",
+             "model", "model_provider", "service_tier", "config", "cwd",
+             "session_start_source", "thread_source")
+    fields = {k: v for k, v in ((k, getattr(options, k, None)) for k in names) if v is not None}
+    if getattr(options, "system_prompt", None) and "base_instructions" not in fields:
+        fields["base_instructions"] = options.system_prompt
+    return fields
+
+
+def _codex_turn_fields(options) -> dict:
+    """codex options → AsyncThread.turn 透传 kwargs。"""
+    names = ("cwd", "effort", "output_schema", "personality", "service_tier", "summary")
+    return {k: v for k, v in ((k, getattr(options, k, None)) for k in names) if v is not None}
+
+
+def _codex_header(options) -> dict:
+    """codex options → request/header 的 header 快照(partial=True:SDK 不暴露请求体)。
+
+    tools 缺省 = 隔离 config.toml 装载的 graphify 工具(见 _codex_home_setup),与
+    _agent_note 的 mcp__graphify__query_graph 呼应(deepwiki 侧注入指引文本);
+    仅监控用,无 schema。
+    """
+    system = getattr(options, "system_prompt", None) or ""
+    names = list(getattr(options, "tools", None) or ["mcp__graphify__query_graph"])
+    return {"config": {"provider": "codex", "model": getattr(options, "model", None) or ""},
+            "system": system or None, "tools": [{"name": n} for n in names] or None}
+
+
+def _codex_args_json(arguments) -> str:
+    """codex 工具 arguments(Any:dict/str/None)→ tool/call 的原始 JSON 字符串。
+
+    与 cc 的 raw 字符串契约一致:dict → json.dumps,str 原样(可能本身是 JSON 文本),
+    None/空 → ""(UI 端解析失败原样展示)。
+    """
+    if arguments is None:
+        return ""
+    if isinstance(arguments, str):
+        return arguments
+    return json.dumps(arguments)
+
+
+def _codex_tool_name(server: str, tool: str) -> str:
+    """codex MCP 工具名归一:mcp__{server}__{tool}(server 缺省时裸 tool)。"""
+    return f"mcp__{server}__{tool}" if server else tool
+
+
+def _codex_stage(exc: Exception, protocol_errors: tuple) -> str:
+    """codex 异常 stage:JSON-RPC 协议层(JsonRpcError 家族)归 parse,其余沿 _stage_of。
+
+    protocol_errors = 方法内 lazy import 的错误类元组(测试经假模块注入);turn failed
+    的 RuntimeError("agent 执行失败: ...")不是协议错误 → run(正确语义)。
+    """
+    if isinstance(exc, protocol_errors):
+        return "parse"
+    return _stage_of(exc)
+
+
+def codex_home_path() -> str:
+    """codex 隔离 home 路径(缺省 ~/.gh-puller/codex-home;显式经 options.codex_home)。
+
+    与 dsh_cordis_path 同位语义:app-server 只读本目录(CODEX_HOME 下 config.toml /
+    auth.json / sessions),不读用户 ~/.codex —— 目录即隔离边界;目录稳定(会话持久,
+    thread_resume 可用),区别于 dsh_cordis 的 temp+内容哈希(文件名固定 config.toml,
+    无法按内容换名,见 _codex_home_setup 的内容比对改写)。
+    """
+    return str(Path.home() / ".gh-puller" / "codex-home")
+
+
+_CODEX_GRAPHIFY_COMMAND: str | None = None  # 一次解析(sys.executable 随 venv 定,不随调用变)
+
+
+def _codex_graphify_command() -> str:
+    """graphify MCP 启动解释器:GRAPHIFY_MCP_PYTHON 显式优先,否则 sys.executable。
+
+    sys.executable 保证 graphifyy 可导入(同一 venv);命令写进 config.toml,
+    值变化时 _codex_home_setup 内容比对自然重写。
+    """
+    global _CODEX_GRAPHIFY_COMMAND
+    if _CODEX_GRAPHIFY_COMMAND is None:
+        _CODEX_GRAPHIFY_COMMAND = os.environ.get("GRAPHIFY_MCP_PYTHON") or sys.executable
+    return _CODEX_GRAPHIFY_COMMAND
+
+
+def _codex_config_toml_content(*, command: str) -> str:
+    """隔离 config.toml 内容:仅 graphify 一行 mcp 服务器(组合即隔离边界,镜像 dsh 的
+    _DSH_CORDIS_YAML —— 无用户 model_provider/keys/mcp/hook/高级设置)。
+
+    env_vars = ["GRAPHIFY_OUT"] 白名单:值不内联(config.toml 静态 —— 多仓库并发无文件
+    竞态),每 run 经 CodexConfig.env 注入 app-server 进程环境,再由 rmcp stdio 启动器
+    (create_env_for_mcp_server)按白名单取走(MCP 子进程 env_clear 后仅带该白名单)。
+    """
+    command = json.dumps(command)  # TOML 基本字符串(JSON 转义兼容)
+    return (
+        "[mcp_servers.graphify]\n"
+        f"command = {command}\n"
+        'args = ["-m", "graphify.serve"]\n'
+        'env_vars = ["GRAPHIFY_OUT"]\n'
+        "startup_timeout_sec = 30\n"
+        "required = true\n"
+    )
+
+
+def _codex_home_setup(home, *, graphify_command: str | None = None,
+                      auth_src: str | Path | None = None) -> str:
+    """确保 codex 隔离 home 就绪:config.toml(graphify 单服务器,内容不变不重写)+ auth 引导。
+
+    auth 引导(cc 同形:凭证通道不隔离,隔离只管设置面 —— 见 cc setting_sources=[]):
+    home/auth.json 缺失且 auth_src(缺省 ~/.codex/auth.json)存在 → **符号链接**——
+    与 cc 的 CLI 自持凭证一样实时引用(重新登录/revoke 即跟随,无副本陈旧);旧副本
+    (非符号链接)存在时替换为链接。符号链接不可用(windows/文件系统限制)时回落复制。
+    auth_src 传 False 可关闭引导(纯隔离无凭证态);显式 token 走 login_api_key 时
+    app-server 自写 home/auth.json(先删符号链接再真写,不冲突)。
+    """
+    home = Path(home)
+    home.mkdir(parents=True, exist_ok=True)
+    cfg = _codex_config_toml_content(command=graphify_command or _codex_graphify_command())
+    cfg_path = home / "config.toml"
+    if not cfg_path.exists() or cfg_path.read_text(encoding="utf-8") != cfg:
+        cfg_path.write_text(cfg, encoding="utf-8")
+    auth = home / "auth.json"
+    if auth_src is not False and not auth.is_symlink():
+        src = Path(auth_src) if auth_src else Path.home() / ".codex" / "auth.json"
+        if src.exists():
+            if auth.exists() or auth.is_symlink():
+                auth.unlink()  # 旧副本(含悬空链接)→ 替换为链接或复制
+            try:
+                auth.symlink_to(src)
+            except OSError:  # windows/不支持符号链接 → 复制兜底(陈旧风险可忽略:覆写即重置)
+                shutil.copyfile(src, auth)
+    return str(home)
+
+
+class _CodexSynth:
+    """codex 通知 → gh 事件流的合成状态(单次 codex_stream 调用一个实例)。
+
+    为什么是合成而非投影(对比 _DshProj):codex 通知不携带 seq/turn/step 编号、无
+    生命周期事件、无 sourceEventSeqs —— 流顺序是唯一权威(与 cc 同构);合成器只维护
+    自洽编号(run.seq 自己数、turn/step 自开合、tool/call|result 自合成),去重是
+    字典/布尔判断,没有第二套编号要伺候。
+    """
+
+    def __init__(self, run: _Run, prompt: str):
+        self.run = run
+        self.prompt = prompt
+        self.turn_id: str | None = None  # turn/started 的 turn.id(记录用;路由已由 SDK 按 turn 过滤)
+        self.agent_pieces: dict[str, list[str]] = {}  # itemId → agentMessage 增量碎片(去重/消息组装)
+        self.reasoning_seen: set[str] = set()  # 已流式化 thinking 的 reasoning itemId(completed 兜底去重)
+        self.tool_round_open = False  # 本轮已发 tool/result → 下次 LLM item 开一次 step 边界(聚合并行工具)
+        self.plan_items: set[str] = set()  # 已发 plan 文本的 itemId(防 delta/completed 双投)
+        self.saw_turn_completed = False
+
+
+def _codex_item(item) -> Any:
+    """ThreadItem(RootModel)→ 实际 item(RootModel 不代理属性访问;普通对象原样)。"""
+    return getattr(item, "root", item)
+
+
+def _codex_item_type(item) -> str:
+    return getattr(_codex_item(item), "type", None) or ""
+
+
+def _codex_tool_result(item, itype: str) -> dict:
+    """工具类 completed item → tool/call|result 归一数据块(name/content/is_error/arguments)。
+
+    工具项只在 item/completed 合成(完整 arguments/结果一处齐;item/started 的
+    arguments 可能不完整 —— v1 舍弃提前位,未来可提前到 started 只发 tool/call)。
+    """
+    if itype == "mcpToolCall":
+        name = _codex_tool_name(getattr(item, "server", None) or "",
+                                getattr(item, "tool", None) or "")
+        content_parts = []
+        result = getattr(item, "result", None)
+        if result is not None:
+            for part in getattr(result, "content", None) or []:
+                inner = _codex_item(part)
+                if getattr(inner, "text", None):
+                    content_parts.append(inner.text)
+            structured = getattr(result, "structured_content", None)
+            if structured is not None:
+                content_parts.append(json.dumps(structured))
+        is_error = (getattr(item, "error", None) is not None
+                    or _codex_val(getattr(item, "status", None)) == "failed")
+        arguments = _codex_args_json(getattr(item, "arguments", None))
+    elif itype == "dynamicToolCall":
+        name = getattr(item, "tool", None) or ""
+        content_parts = [
+            getattr(_codex_item(ci), "text", None) or ""
+            for ci in (getattr(item, "content_items", None) or [])
+            if _codex_item_type(ci) == "inputText"
+        ]
+        is_error = (getattr(item, "success", None) is False
+                    or _codex_val(getattr(item, "status", None)) == "failed")
+        arguments = _codex_args_json(getattr(item, "arguments", None))
+    else:  # commandExecution
+        name = "shell"
+        content_parts = [getattr(item, "aggregated_output", None) or ""]
+        command = getattr(item, "command", None) or ""
+        cwd = getattr(item, "cwd", None) or ""
+        is_error = (getattr(item, "exit_code", None) not in (None, 0)
+                    or _codex_val(getattr(item, "status", None)) == "failed")
+        # 字段为 LegacyAppPathString(pydantic 路径类型,str 子类)→ 归一为纯 str 再 JSON
+        arguments = json.dumps({k: str(v) for k, v in (("command", command), ("cwd", cwd)) if v})
+    return {"name": name, "content": "\n".join(p for p in content_parts if p),
+            "is_error": is_error, "arguments": arguments}
+
+
+def _codex_item_completed(run: _Run, st: _CodexSynth, payload) -> list[str]:
+    """item/completed → surface/工具事件合成(纯 dict 构造,测试可喂假 Notification)。"""
+    item = _codex_item(payload.item)
+    itype = _codex_item_type(item)
+    item_id = getattr(item, "id", None) or ""
+    if itype == "agentMessage":
+        pieces = st.agent_pieces.get(item_id) or []
+        text = "".join(pieces) or (getattr(item, "text", None) or "")
+        if not pieces and text:
+            run.text(text)  # 兜底:无增量事件(流缺 chunk)→ 整块一次(cc AssistantMessage 兜底对齐)
+        message = {"role": "assistant", "content": [{"type": "text", "text": text}]}
+        phase = getattr(item, "phase", None)
+        if phase is not None:
+            message["content"][0]["phase"] = _codex_val(phase)
+        run.event("assistant/message", turn=run.turn, step=run.step, message=message,
+                  surfaceOp="append", sourceSeqs=list(run._chunk_seqs))
+        return [text] if not pieces and text else []
+    if itype in ("dynamicToolCall", "mcpToolCall", "commandExecution"):
+        st.tool_round_open = True
+        info = _codex_tool_result(item, itype)
+        call_id = item_id
+        run.tool_call(call_id, info["name"], info["arguments"])
+        run.tool_result(
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": call_id,
+                                          "content": info["content"], "is_error": info["is_error"]}]},
+            call_id=call_id, name=info["name"], is_error=info["is_error"],
+            src_seq=run._call_seqs.get(call_id),
+        )
+        return []
+    if itype == "reasoning":
+        # thinking 已逐条流式化(见 reasoning/textDelta);仅无 delta 的项整块兜底一次
+        content = getattr(item, "content", None) or []
+        if content and item_id not in st.reasoning_seen:
+            run.chunk({"type": "thinking", "index": 0, "text": "\n".join(content)})
+        return []
+    if itype == "plan":
+        text = getattr(item, "text", None) or ""
+        if text and item_id not in st.plan_items:
+            st.plan_items.add(item_id)
+            run.chunk({"type": "plan", "index": 0, "text": text})
+        return []
+    return []  # userMessage 已由 run.user_message 合成;fileChange/webSearch/子代理等 v1 静默跳过
+
+
+def _handle_codex_notification(run: _Run, st: _CodexSynth, notif) -> list[str]:
+    """codex 通知 → gh TAXONOMY 事件合成(纯鸭子读取,测试可喂假 Notification)。
+
+    返回本事件产生的文本增量(供 codex_stream yield);codex 无 seq,顺序即通知流顺序;
+    turn/step 生命周期由 run.start / step_boundary 合成(prologue 同 cc),codex 的
+    turn/started|completed 只贡献 stop_reason / 失败判定。
+    """
+    method = getattr(notif, "method", "")
+    payload = getattr(notif, "payload", None)
+    if method == "turn/started":
+        turn = getattr(payload, "turn", None)
+        st.turn_id = getattr(turn, "id", None)
+        return []
+    if method == "turn/completed":
+        st.saw_turn_completed = True
+        turn = getattr(payload, "turn", None) or {}
+        kind = _codex_val(getattr(turn, "status", None))
+        run.result_stop_reason = kind if isinstance(kind, str) else None
+        if kind != "completed":
+            error = getattr(turn, "error", None) or {}
+            detail = getattr(error, "message", None) or kind
+            raise RuntimeError(f"agent 执行失败: {detail}")
+        return []
+    if method == "item/started":
+        item = _codex_item(getattr(payload, "item", None))
+        itype = _codex_item_type(item)
+        if itype == "agentMessage":
+            st.agent_pieces.setdefault(getattr(item, "id", None) or "", [])
+        if itype in ("agentMessage", "reasoning", "plan") and st.tool_round_open:
+            st.tool_round_open = False
+            run.step_boundary()  # 工具结果后新一轮 LLM 请求 → 新 step(单次翻转,聚合并行工具)
+        return []
+    if method == "item/agentMessage/delta":
+        text = getattr(payload, "delta", None) or ""
+        if not text:
+            return []
+        st.agent_pieces.setdefault(getattr(payload, "item_id", None) or "", []).append(text)
+        run.text(text)
+        return [text]
+    if method in ("item/reasoning/textDelta", "item/reasoning/summaryTextDelta"):
+        delta = getattr(payload, "delta", None) or ""
+        if delta:
+            st.reasoning_seen.add(getattr(payload, "item_id", None) or "")
+            index = getattr(payload, "content_index", None)
+            run.chunk({"type": "thinking", "index": index if index is not None else 0,
+                       "text": delta})
+        return []
+    if method == "item/completed":
+        return _codex_item_completed(run, st, payload)
+    if method == "thread/tokenUsage/updated":
+        usage = getattr(payload, "token_usage", None) or {}
+        breakdown = getattr(usage, "total", None) or getattr(usage, "last", None)
+        if breakdown is not None:
+            run.result_usage = _normalize_usage(breakdown)  # 末条为准 → session/end(同 dsh)
+        return []
+    return []  # plan/delta、outputDelta、progress 等:增量已由项目侧逐条投影或属日志型,v1 不进流
+
+
+class CodexAdapter(BaseAdapter):
+    """codex:SDK 原料通知流 → 本地合成(唯一权威,无投影层;why 见 _CodexSynth docstring)。"""
+
+    provider = "codex"
+
+    async def stream(self, options, prompt: str, *, session: str | None = None,
+                     session_name: str | None = None, run_id: str | None = None,
+                     session_ns: str | None = None,
+                     context: list[dict] | None = None, retry: dict | None = None,
+                     meta: dict | None = None):
+        """Codex(OpenAI Codex SDK)流式应答(监控 + 执行)。
+
+        对外产出:与 cc_stream 同契约 —— 文本增量(item/agentMessage/delta 优先、
+        item/completed 整块兜底),turn 非 completed → RuntimeError("agent 执行失败: ...");
+        thinking/plan/工具增量只进事件流,不改变产出。codex 通知 1:1 合成 TAXONOMY
+        (无 seq 编号 → 本地合成,见 _CodexSynth);session/turn/step 生命周期由本层合成。
+
+        options = 调用方组装的鸭子类型配置(仿 dsh 的 options 透传,字段见
+        _codex_field_* 白名单):codex_home/sandbox(full_access 缺省态在 deepwiki 侧
+        定)/approval_mode/model/system_prompt → base_instructions/token/env/cwd/
+        codex_bin/config_overrides/launch_args_override/effort/output_schema 等;
+        **codex_home 缺省回退内置隔离目录**(codex_home_path:config.toml 仅 graphify +
+        auth 引导复制,隔离语义同 dsh_cordis_path),显式提供则全权交上层。
+
+        凭证(cc 同形:环境隔离不隔离凭证通道 —— 隔离只管 config.toml/sessions 设置面,
+        凭证明细见 _codex_home_setup):零配置缺省符号链接引用真实 ~/.codex/auth.json
+        (如 cc 复用 claude CLI 本地登录);显式 options.token → login_api_key 写本隔离
+        home(断链后落盘,不碰用户真实凭证文件);两者皆无且无本地凭证则认证失败由 SDK 报错。
+        """
+        from openai_codex import ApprovalMode, AsyncCodex, CodexConfig, JsonRpcError, Sandbox
+
+        run = self._run(model=getattr(options, "model", None) or "",
+                        session=session, session_ns=session_ns, run_id=run_id,
+                        session_name=session_name, meta=meta)
+        run.start(context=context, retry=retry)
+        run.user_message({"role": "user", "content": [{"type": "text", "text": prompt}]})
+        run.event("request/header", header=_codex_header(options), reason="initial", partial=True)
+        st = _CodexSynth(run, prompt)
+        home = getattr(options, "codex_home", None) or codex_home_path()
+        home = _codex_home_setup(home, graphify_command=getattr(options, "graphify_command", None))
+
+        fields = _codex_config_fields(options)
+        env = dict(getattr(options, "env", None) or {})
+        env["CODEX_HOME"] = home  # SDK 从不设 CODEX_HOME;隔离凭它生效(见 codex_home_path)
+        fields["env"] = env
+        config = CodexConfig(**fields)
+
+        thread_fields = _codex_thread_fields(options)
+        if (sandbox := getattr(options, "sandbox", None)) is not None:
+            thread_fields["sandbox"] = _codex_lookup(sandbox, Sandbox, "Sandbox")
+        if (approval := getattr(options, "approval_mode", None)) is not None:
+            thread_fields["approval_mode"] = _codex_lookup(approval, ApprovalMode, "approval_mode")
+        token = getattr(options, "token", None) or ""
+        timeout = getattr(options, "timeout_seconds", None)
+
+        guard = self._guard(run, error_stage=lambda exc: _codex_stage(exc, (JsonRpcError,)))
+        async with guard, AsyncCodex(config=config) as codex:
+            if token:
+                # 显式 token → 登录凭证属本隔离 home:先断符号链接防穿透写坏用户 ~/.codex/auth.json
+                auth = Path(home) / "auth.json"
+                if auth.is_symlink():
+                    auth.unlink()
+                await codex.login_api_key(token)
+            thread = await codex.thread_start(**thread_fields)
+            handle = await thread.turn(prompt, **_codex_turn_fields(options))
+
+            async def _consume():
+                async for notif in handle.stream():
+                    for delta in _handle_codex_notification(run, st, notif):
+                        yield delta
+                if not st.saw_turn_completed:
+                    raise RuntimeError("agent 执行失败: turn 未收到完成事件")
+
+            if timeout is not None:
+                async with asyncio.timeout(timeout):  # 兜底 review/approval 等待挂流
+                    async for chunk in _consume():
+                        yield chunk
+            else:
+                async for chunk in _consume():
+                    yield chunk
+
+
+# ---------------------------------------------------------------------------
 # 模块级绑定:公开名与签名逐参数等于历史自由函数(调用方按名导入不受影响)
 # ---------------------------------------------------------------------------
 
 _claude = ClaudeCodeAdapter()
 _openai = OpenAIAdapter()
 _dsh = DshAdapter()
+_codex = CodexAdapter()
 
 cc_stream = _claude.stream
 cc_text = _claude.text
@@ -1203,5 +1639,9 @@ dsh_stream = _dsh.stream
 dsh_text = _dsh.text
 dsh_result = _dsh.result
 
+codex_stream = _codex.stream
+codex_text = _codex.text
+codex_result = _codex.result
+
 # 扩展发现口(元数据,非运行时强制分派:deepwiki/evaluators 仍按名导入)
-ADAPTERS: dict[str, BaseAdapter] = {a.provider: a for a in (_claude, _openai, _dsh)}
+ADAPTERS: dict[str, BaseAdapter] = {a.provider: a for a in (_claude, _openai, _dsh, _codex)}

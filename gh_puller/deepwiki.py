@@ -46,7 +46,7 @@ from claude_agent_sdk import ClaudeAgentOptions, create_sdk_mcp_server, tool
 from pydantic import BaseModel, ConfigDict, Field, computed_field, field_validator
 
 from . import envs, graphify
-from .agent import cc_stream, dsh_stream, llm_complete, llm_stream
+from .agent import cc_stream, codex_stream, dsh_stream, llm_complete, llm_stream
 from .utils import (
     Repo,
     RepoType,
@@ -845,6 +845,43 @@ def _dsh_options(
     return SimpleNamespace(**kwargs)
 
 
+def _codex_options(
+    system_prompt: str,
+    repo: Repo | None,
+    model: str | None = None,
+    *,
+    agent_output_dir: str | None = None,
+    agent_write_mode: bool = False,
+) -> SimpleNamespace:
+    """组装 codex 选项(鸭子类型,适配器按 attr 取;与 cc/dsh 的 options 构建同构):
+
+    - 隔离缺省全在适配器层(codex_stream 的 _codex_home_setup:config.toml 仅装载
+      graphify MCP + 符号链接引用本地凭证,见 adapters.codex_home_path)—— 本层不经
+      envs 覆写(学 cc 凭证面零配置:显式 home/token 是适配器 options API 参数,
+      调用方按需自组 options);
+    - system_prompt 经 options.system_prompt → 适配器 thread_start.base_instructions
+      (cc 的 system_prompt 同位);
+    - model 取请求参数(cc 的调用方参数同位:envs 层不设 CODEX_MODEL,
+      claude 的 CLAUDE_AGENT_MODEL 是它自己的先例,codex 无对应常量);
+    - cwd 固定仓库根(与 cc 同:防 agent 串到 gh-puller 工作区);
+    - sandbox 缺省 full_access(镜像 dsh 组合 danger-full-access 的高自由度;
+      可经 options.sandbox 覆写 read_only/workspace_write);
+    - repo 非空时经 env.GRAPHIFY_OUT 注入图目录(绝对路径 —— 隔离 config.toml 的
+      env_vars 白名单透传给 graphify MCP 子进程,定位与 cwd/并发无关)。
+    """
+    kwargs: dict[str, Any] = {
+        "system_prompt": system_prompt,
+        "sandbox": "full_access",  # 高自由度缺省(镜像 dsh danger-full-access;可覆写)
+        "approval_mode": "auto_review",
+    }
+    if model:
+        kwargs["model"] = model
+    if repo is not None:
+        kwargs["cwd"] = os.path.abspath(repo.save_path)
+        kwargs["env"] = {"GRAPHIFY_OUT": str(_graph_dir(repo))}
+    return SimpleNamespace(**kwargs)
+
+
 async def _agent_stream(
     system_prompt: str, prompt: str, repo: Repo | None = None, model: str | None = None,
     label: str | None = None, *, run_id: str | None = None,
@@ -861,6 +898,12 @@ async def _agent_stream(
                                       context=context, retry=retry):
             yield chunk
         return
+    if envs.DEEPWIKI_GENERATOR == "codex":
+        options = _codex_options(system_prompt, repo, model)
+        async for chunk in codex_stream(options, prompt, session_name=label, run_id=run_id,
+                                        context=context, retry=retry):
+            yield chunk
+        return
     options = _agent_options(system_prompt, repo, model)
     async for chunk in cc_stream(options, prompt, session_name=label, run_id=run_id,
                                  context=context, retry=retry):
@@ -870,11 +913,11 @@ async def _agent_stream(
 def _agent_note() -> str:
     """注入到 user 消息的指引段(供 agent 知道用图工具获取带行号的代码上下文)。
 
-    dsh 后端的图工具名不同(组合经内置 mcp-client 装载 graphify,对 agent 为
-    mcp__graphify__query_graph;cc 为 graphify_query)—— 指引按后端切换,防
-    agent 找错工具名而放弃图语境。
+    dsh/codex 后端的图工具名不同(dsh 经组合内置 mcp-client、codex 经隔离
+    config.toml 装载 graphify,对 agent 均为 mcp__graphify__query_graph;cc 为
+    graphify_query)—— 指引按后端切换,防 agent 找错工具名而放弃图语境。
     """
-    if envs.DEEPWIKI_GENERATOR == "dsh":
+    if envs.DEEPWIKI_GENERATOR in ("dsh", "codex"):
         return (
             "<note>You may use the mcp__graphify__query_graph tool to inspect this "
             "repository's code graph whenever you need code context or exact file/line "
@@ -917,6 +960,13 @@ async def _agent_write_file(
         )
         runner = dsh_stream(options, prompt, session_name=label, run_id=run_id,
                             context=context, retry=retry)
+    elif envs.DEEPWIKI_GENERATOR == "codex":
+        options = _codex_options(
+            system_prompt, repo, model,
+            agent_output_dir=str(out_path.parent), agent_write_mode=True,
+        )
+        runner = codex_stream(options, prompt, session_name=label, run_id=run_id,
+                              context=context, retry=retry)
     else:
         options = _agent_options(
             system_prompt, repo, model,
@@ -2526,12 +2576,12 @@ def _wiki_pipeline() -> WikiPipeline:
     agent 类后段(cc/dsh)共用 AgentWikiPipeline —— 内部 _agent_stream/_agent_write_file
     按开关分派到 cc_stream/dsh_stream,管线逻辑(结构/页面/缓存)后端无关。
     """
-    return AgentWikiPipeline() if envs.DEEPWIKI_GENERATOR in ("cc", "dsh") else LlmWikiPipeline()
+    return AgentWikiPipeline() if envs.DEEPWIKI_GENERATOR in ("cc", "dsh", "codex") else LlmWikiPipeline()
 
 
 def _service_pipeline() -> WikiPipeline:
     """chat/codemap 服务分派:与 wiki 同开关(envs.DEEPWIKI_GENERATOR),调用时读 envs(测试 monkeypatch 生效)。"""
-    return AgentWikiPipeline() if envs.DEEPWIKI_GENERATOR in ("cc", "dsh") else LlmWikiPipeline()
+    return AgentWikiPipeline() if envs.DEEPWIKI_GENERATOR in ("cc", "dsh", "codex") else LlmWikiPipeline()
 
 
 
