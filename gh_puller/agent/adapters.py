@@ -1,6 +1,6 @@
 """LLM 调用适配器:SDK/HTTP 对象 → 事件溯源事件 dict 的归一化与调用包装。
 
-外部只经本层函数调用(经 gh_puller.agent __init__ 再导出),不再直接触碰
+外部只经本层模块级函数调用(经 gh_puller.agent __init__ 再导出),不再直接触碰
 ClaudeSDKClient / httpx(无感,对外语义不变):
 - cc_stream / cc_text / cc_result:Claude Code(SDK)调用。文本增量 StreamEvent
   `text_delta` 优先、AssistantMessage 兜底(仅在未产出任何增量时)、
@@ -25,6 +25,39 @@ session_name → "agent"),见 _session_id;文件侧只落非流式事件流
 
 管线:适配器归一化 SDK/HTTP 对象 → 事件 dict → EventBus 扇出(sinks.EventBus,
 publish 仅 put_nowait 到每 sink 的 asyncio.Queue,永不阻塞调用)→ sink worker 消费。
+
+架构(单文件分层):
+公共层(模块级 helper,为语义单测入口):_Run / _session_id / _normalize_usage /
+_header/消息归一化等 → 共享基类 BaseAdapter(_run 装配、_guard 事件守卫、
+text/result 缺省实现)→ 每路一个子类只写差异驱动循环(ClaudeCodeAdapter /
+OpenAIAdapter / DshAdapter)→ 底部单例绑定(cc_stream = _claude.stream 等,签名
+逐参数等于现状)+ ADAPTERS 元数据注册表。扩展第 N 种 agent:新建 XhAdapter(
+BaseAdapter)(provider 类属性;stream 必写,text/result 用缺省或覆盖);SDK 库在
+方法体内 lazy import(供测试 sys.modules 注入);事件只经 run.* 发(new_event 对
+未知 type 抛 ValueError → 只发 TAXONOMY);若新 SDK 自带 seq/turn/step 生命周期
+(如 dsh)→ 参照 _DshProj 做投影对齐,严禁把对方 seq 当 gh seq;尾部注册进 ADAPTERS
+并加导出。
+
+为什么区分"合成"与"投影"(dsh 事件同源却比 cc 多一套 _DshProj):
+关键不在词汇是否一致,而在"权威(authority)"的数量 ——
+- cc 是唯一权威 → 合成器。Claude SDK 给出的是原料流(增量 StreamEvent、聚合
+  AssistantMessage/ResultMessage),不携带 session/turn/step 编号、无生命周期事件、
+  无 sourceSeqs。适配器只维护一套自己造的编号(seq 自己数、turn/step 自开合、
+  tool/call|result 自合成、sourceSeqs 引用自己的 _chunk_seqs),正确性靠自洽,
+  去重是布尔判断(already_yielded、tid in _call_seqs)。
+- dsh 是第二权威 → 对齐器。词汇虽与 TAXONOMY 同源,但 dsh 已把会话语义做掉一半,
+  且用的是 dsh 自己的编号:seq 按 log.length 对全部会话事件计数(含被跳过的插件
+  事件),turn/step 生命周期由 dsh 发,同一 tool-call 既有原料(block-end 完整
+  arguments)又有成品(显式 tool/call),sourceEventSeqs 引用 dsh 编号空间,
+  字段命名(camelCase usage、tool-result/toolCallId/isError 卡片)也不同。适配器
+  不能发明、只能对账:seq_map 重映射 + 生命周期让渡(prologue=False /
+  epilogue=not saw_turn_end)+ synth 双表达去重 + 字段改名 —— 即 _DshProj。
+- 一句话:"同源"省掉发明词汇,换来持续对齐两套编号、两套生命周期与双表达去重;
+  翻译只有一种权威,对齐要同时伺候两种。cc 的合成状态也真实存在,只是小而散
+  (_Run 的 6 个字段),所以"cc 更少"其实是它没有第二权威要伺候。
+  (曾评估"跟则跟"(恒等 seq + 纯整形 + TAXONOMY 扩容 + 驱动降级到 HarnessClient
+  订阅级 —— 不走 SDK Session.run,因收据门闸会吞流头部),因 extensions 不在主题、
+  维持本项目事件风格,维持投影;方案内容见历次调研,如需重开另行设计。)
 """
 
 import asyncio
@@ -523,40 +556,128 @@ def _llm_emit_messages(run: _Run, payload: dict) -> None:
                       surfaceOp="append")
 
 
+def _llm_headers(headers: dict | None, api_key: str | None) -> dict:
+    hdrs = {"Content-Type": "application/json"}
+    if headers:
+        hdrs.update(headers)
+    if api_key:
+        hdrs.setdefault("Authorization", f"Bearer {api_key}")
+    return hdrs
+
+
+# ---------------------------------------------------------------------------
+# 共享基类:run 装配 / 事件守卫 / text、result 缺省实现
+# ---------------------------------------------------------------------------
+
+
+class BaseAdapter:
+    """三路共享骨架:cc = 单一权威合成;dsh = 双权威投影(对齐器);llm = 直连 HTTP。
+
+    子类只要写差异驱动循环(stream / complete);text、result 的整收缺省已含。
+    公共 kwarg(会话/run 元数据)逐参数与历史模块级函数一致 —— 底部以单例绑定
+    回模块级公开名(cc_stream = _claude.stream 等),签名不变。
+    """
+
+    provider = ""  # 事件封套 provider 字段值(claude|openai|dsh|...)
+
+    def _run(self, *, model: str, session: str | None = None, session_ns: str | None = None,
+             run_id: str | None = None, session_name: str | None = None,
+             meta: dict | None = None) -> _Run:
+        """公共 kwarg → _Run(session id 规则/信封 provider 取类属性;不含 context/retry)。"""
+        return _Run(_session_id(session, session_ns, run_id, session_name), self.provider,
+                    model, label=session_name, run_id=run_id, meta=meta)
+
+    @contextlib.asynccontextmanager
+    async def _guard(self, run: _Run, *, error_stage=None, epilogue=True):
+        """统一收尾:正常 → finish(ok=True);异常 → error(stage)+ raise + finish(False)。
+
+        error_stage:设 lambda 指定 error 事件 stage(None 等价 cc 的硬编码 "run");
+        epilogue:bool 或 callable(dsh 传 lambda: not proj.saw_turn_end,调用期求值)。
+        只捕获 Exception(消费者提前关闭的 GeneratorExit、CancelledError 为
+        BaseException,不落 error 事件,靠 finally 兜底 finish(False) —— 与历史
+        try/except/finally 语义一致);run.finish 本身幂等。
+        """
+        ok = False
+        try:
+            yield
+            ok = True
+        except Exception as exc:
+            run.error(exc, error_stage(exc) if error_stage else "run")
+            raise
+        finally:
+            run.finish(ok, epilogue=epilogue() if callable(epilogue) else epilogue)
+
+    async def stream(self, options, prompt: str, *, session: str | None = None,
+                     session_name: str | None = None, run_id: str | None = None,
+                     session_ns: str | None = None,
+                     context: list[dict] | None = None, retry: dict | None = None,
+                     meta: dict | None = None):
+        """流式应答(子类必写):文本增量 async generator;监控事件经 run 信封发布。"""
+        raise NotImplementedError
+
+    async def text(self, options, prompt: str, *, session: str | None = None,
+                   session_name: str | None = None, run_id: str | None = None,
+                   session_ns: str | None = None,
+                   context: list[dict] | None = None, retry: dict | None = None,
+                   meta: dict | None = None) -> str:
+        """整收应答缺省:收集流式文本(cc_text / dsh_text 共用)。"""
+        parts: list[str] = []
+        async for chunk in self.stream(options, prompt, session=session, session_name=session_name,
+                                       run_id=run_id, session_ns=session_ns,
+                                       context=context, retry=retry, meta=meta):
+            parts.append(chunk)
+        return "".join(parts)
+
+    async def result(self, options, prompt: str, *, session: str | None = None,
+                     session_name: str | None = None, run_id: str | None = None,
+                     session_ns: str | None = None,
+                     context: list[dict] | None = None, retry: dict | None = None,
+                     meta: dict | None = None) -> str:
+        """非流式最终结果缺省:整收 + 空结果 → RuntimeError(dsh_result 语义)。
+
+        不适用于需要专用最终结果通道的 SDK(如 cc 的 ResultMessage.result,见子类覆盖)。
+        """
+        text = await self.text(options, prompt, session=session, session_name=session_name,
+                               run_id=run_id, session_ns=session_ns,
+                               context=context, retry=retry, meta=meta)
+        if not text:
+            raise RuntimeError("agent 未产出最终结果")
+        return text
+
+
 # ---------------------------------------------------------------------------
 # Claude Code(SDK)包装:cc_stream / cc_text / cc_result
 # ---------------------------------------------------------------------------
 
 
-async def cc_stream(
-    options, prompt: str, *, session: str | None = None,
-    session_name: str | None = None, run_id: str | None = None,
-    session_ns: str | None = None,
-    context: list[dict] | None = None, retry: dict | None = None,
-    meta: dict | None = None,
-):
-    """Claude Code 流式应答(监控 + 执行)。
+class ClaudeCodeAdapter(BaseAdapter):
+    """cc:SDK 原料流 → 本地合成(唯一权威,无投影层;why 见模块 docstring)。"""
 
-    对外产出:文本增量(StreamEvent text_delta 优先,AssistantMessage 兜底,
-    ResultMessage.is_error → RuntimeError("agent 执行失败: ..."))—— 与 deepwiki
-    原漏斗语义一致;thinking/工具增量仅进事件流。options 整体透传(调用方自组装,
-    如 deepwiki 的进程内 MCP 闭包)。context = 上下文说明事件列表
-    (context/inject|modify,{type,data} 形),重放于 session/start 之后。
-    """
-    from claude_agent_sdk import AssistantMessage, ClaudeSDKClient, ResultMessage, StreamEvent
+    provider = "claude"
 
-    run = _Run(
-        _session_id(session, session_ns, run_id, session_name), "claude",
-        getattr(options, "model", None) or "",
-        label=session_name, run_id=run_id, meta=meta,
-    )
-    run.start(context=context, retry=retry)
-    run.user_message({"role": "user", "content": [{"type": "text", "text": prompt}]})
-    run.event("request/header", header=_options_header(options), reason="initial", partial=True)
-    yielded = False
-    ok = False
-    try:
-        async with ClaudeSDKClient(options=options) as client:
+    async def stream(self, options, prompt: str, *, session: str | None = None,
+                     session_name: str | None = None, run_id: str | None = None,
+                     session_ns: str | None = None,
+                     context: list[dict] | None = None, retry: dict | None = None,
+                     meta: dict | None = None):
+        """Claude Code 流式应答(监控 + 执行)。
+
+        对外产出:文本增量(StreamEvent text_delta 优先,AssistantMessage 兜底,
+        ResultMessage.is_error → RuntimeError("agent 执行失败: ..."))—— 与 deepwiki
+        原漏斗语义一致;thinking/工具增量仅进事件流。options 整体透传(调用方自组装,
+        如 deepwiki 的进程内 MCP 闭包)。context = 上下文说明事件列表
+        (context/inject|modify,{type,data} 形),重放于 session/start 之后。
+        """
+        from claude_agent_sdk import AssistantMessage, ClaudeSDKClient, ResultMessage, StreamEvent
+
+        run = self._run(model=getattr(options, "model", None) or "",
+                        session=session, session_ns=session_ns, run_id=run_id,
+                        session_name=session_name, meta=meta)
+        run.start(context=context, retry=retry)
+        run.user_message({"role": "user", "content": [{"type": "text", "text": prompt}]})
+        run.event("request/header", header=_options_header(options), reason="initial", partial=True)
+        yielded = False
+        async with self._guard(run), ClaudeSDKClient(options=options) as client:
             await client.query(prompt)
             async for msg in client.receive_response():
                 if isinstance(msg, StreamEvent):
@@ -580,47 +701,26 @@ async def cc_stream(
                         detail = (msg.errors or [])[-1] if msg.errors else msg.result
                         raise RuntimeError(f"agent 执行失败: {detail or msg.subtype}")
                     run.result_meta(msg)
-            ok = True
-    except Exception as exc:
-        run.error(exc, "run")  # error 事件 + session/end.reason 一并落
-        raise
-    finally:
-        run.finish(ok)
 
+    async def result(self, options, prompt: str, *, session: str | None = None,
+                     session_name: str | None = None, run_id: str | None = None,
+                     session_ns: str | None = None,
+                     context: list[dict] | None = None, retry: dict | None = None,
+                     meta: dict | None = None) -> str:
+        """非流式取最终结果(judge 用):失败或无结果 → RuntimeError(调用方降级)。
 
-async def cc_text(options, prompt: str, *, session: str | None = None,
-                  session_name: str | None = None, run_id: str | None = None,
-                  session_ns: str | None = None,
-                  context: list[dict] | None = None, retry: dict | None = None,
-                  meta: dict | None = None) -> str:
-    """agent 整收应答(流式转整收,监控走与 cc_stream 同一条路径)。"""
-    parts: list[str] = []
-    async for chunk in cc_stream(options, prompt, session=session, session_name=session_name,
-                                 run_id=run_id, session_ns=session_ns,
-                                 context=context, retry=retry, meta=meta):
-        parts.append(chunk)
-    return "".join(parts)
+        覆盖基类缺省:返回 ResultMessage.result 本身(非流式文本拼装),保留
+        "agent 未产出最终结果" 语义。
+        """
+        from claude_agent_sdk import AssistantMessage, ClaudeSDKClient, ResultMessage, StreamEvent
 
-
-async def cc_result(options, prompt: str, *, session: str | None = None,
-                    session_name: str | None = None, run_id: str | None = None,
-                    session_ns: str | None = None,
-                    context: list[dict] | None = None, retry: dict | None = None,
-                    meta: dict | None = None) -> str:
-    """非流式取最终结果(judge 用):失败或无结果 → RuntimeError(调用方降级)。"""
-    from claude_agent_sdk import AssistantMessage, ClaudeSDKClient, ResultMessage, StreamEvent
-
-    run = _Run(
-        _session_id(session, session_ns, run_id, session_name), "claude",
-        getattr(options, "model", None) or "",
-        label=session_name, run_id=run_id, meta=meta,
-    )
-    run.start(context=context, retry=retry)
-    run.user_message({"role": "user", "content": [{"type": "text", "text": prompt}]})
-    run.event("request/header", header=_options_header(options), reason="initial", partial=True)
-    ok = False
-    try:
-        async with ClaudeSDKClient(options=options) as client:
+        run = self._run(model=getattr(options, "model", None) or "",
+                        session=session, session_ns=session_ns, run_id=run_id,
+                        session_name=session_name, meta=meta)
+        run.start(context=context, retry=retry)
+        run.user_message({"role": "user", "content": [{"type": "text", "text": prompt}]})
+        run.event("request/header", header=_options_header(options), reason="initial", partial=True)
+        async with self._guard(run), ClaudeSDKClient(options=options) as client:
             await client.query(prompt)
             async for msg in client.receive_response():
                 if isinstance(msg, StreamEvent):
@@ -635,14 +735,8 @@ async def cc_result(options, prompt: str, *, session: str | None = None,
                     result = msg.result
                     if not result:
                         raise RuntimeError("agent 未产出最终结果")
-                    ok = True
                     return result
             raise RuntimeError("agent 未产出最终结果")
-    except Exception as exc:
-        run.error(exc, "run")
-        raise
-    finally:
-        run.finish(ok)
 
 
 # ---------------------------------------------------------------------------
@@ -650,125 +744,108 @@ async def cc_result(options, prompt: str, *, session: str | None = None,
 # ---------------------------------------------------------------------------
 
 
-def _llm_headers(headers: dict | None, api_key: str | None) -> dict:
-    hdrs = {"Content-Type": "application/json"}
-    if headers:
-        hdrs.update(headers)
-    if api_key:
-        hdrs.setdefault("Authorization", f"Bearer {api_key}")
-    return hdrs
+class OpenAIAdapter(BaseAdapter):
+    """OpenAI 兼容(httpx 直连):无 agent 形态,入口为 complete(非流式)/ stream(SSE)。"""
 
+    provider = "openai"
 
-async def llm_complete(
-    *, url: str, payload: dict, api_key: str | None = None,
-    timeout: httpx.Timeout | None = None, headers: dict | None = None,
-    session: str | None = None, session_name: str | None = None, run_id: str | None = None,
-    session_ns: str | None = None,
-    context: list[dict] | None = None, retry: dict | None = None, meta: dict | None = None,
-) -> str:
-    """OpenAI 兼容非流式补全(异常原样抛,重试留给调用方)。
+    async def complete(
+        self, *, url: str, payload: dict, api_key: str | None = None,
+        timeout: httpx.Timeout | None = None, headers: dict | None = None,
+        session: str | None = None, session_name: str | None = None,
+        run_id: str | None = None, session_ns: str | None = None,
+        context: list[dict] | None = None, retry: dict | None = None,
+        meta: dict | None = None,
+    ) -> str:
+        """OpenAI 兼容非流式补全(异常原样抛,重试留给调用方)。
 
-    payload 为 chat/completions 请求体(须含 model/messages;其余键原样透传,
-    如 response_format/temperature/max_tokens —— 兼容题库扩展点),HTTP body 与直连一致。
-    事件:payload 全量消息 → surface(可折叠恢复该请求输入);响应当次
-    text 增量 + assistant/message + 每 tool_call 一个 tool/call(原始 arguments 字符串)。
-    """
-    model = payload["model"]
-    run = _Run(_session_id(session, session_ns, run_id, session_name), "openai", model,
-               label=session_name, run_id=run_id, meta=meta)
-    run.start(context=context, retry=retry)
-    _llm_emit_messages(run, payload)
-    run.event("request/header", header=_llm_header(payload), reason="initial")
-    run.event("request/context", provider="openai", model=model)
-    ok = False
-    try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            resp = await client.post(f"{url}/chat/completions", json=payload, headers=_llm_headers(headers, api_key))
-        resp.raise_for_status()
-        data = resp.json()
-        msg = data["choices"][0]["message"] or {}
-        content = msg.get("content") or ""
-        usage = data.get("usage") or {}
-        if content:
-            run.text(content)
-        blocks = [{"type": "text", "text": content}] if content else []
-        for tc in msg.get("tool_calls") or []:
-            fn = tc.get("function") or {}
-            args = fn.get("arguments") or ""
-            try:
-                parsed = json.loads(args) if args else None
-            except json.JSONDecodeError:
-                parsed = args
-            blocks.append({"type": "tool_use", "id": tc.get("id"),
-                           "name": fn.get("name") or "", "input": parsed})
-            run.tool_call(tc.get("id") or "", fn.get("name"), args)
-        norm_usage = _normalize_usage(usage)
-        run.event(
-            "assistant/message", turn=run.turn, step=run.step,
-            message={"role": "assistant", "content": blocks},
-            usage=norm_usage, stop_reason=msg.get("stop_reason"),
-            surfaceOp="append", sourceSeqs=list(run._chunk_seqs),
-        )
-        run.result_usage = norm_usage
-        run.result_stop_reason = msg.get("stop_reason")
-        ok = True
-        return content
-    except Exception as exc:
-        run.error(exc, _stage_of(exc))
-        raise
-    finally:
-        run.finish(ok)
+        payload 为 chat/completions 请求体(须含 model/messages;其余键原样透传,
+        如 response_format/temperature/max_tokens —— 兼容题库扩展点),HTTP body 与直连一致。
+        事件:payload 全量消息 → surface(可折叠恢复该请求输入);响应当次
+        text 增量 + assistant/message + 每 tool_call 一个 tool/call(原始 arguments 字符串)。
+        """
+        model = payload["model"]
+        run = self._run(model=model, session=session, session_ns=session_ns, run_id=run_id,
+                        session_name=session_name, meta=meta)
+        run.start(context=context, retry=retry)
+        _llm_emit_messages(run, payload)
+        run.event("request/header", header=_llm_header(payload), reason="initial")
+        run.event("request/context", provider="openai", model=model)
+        async with self._guard(run, error_stage=_stage_of), httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.post(f"{url}/chat/completions", json=payload,
+                                     headers=_llm_headers(headers, api_key))
+            resp.raise_for_status()
+            data = resp.json()
+            msg = data["choices"][0]["message"] or {}
+            content = msg.get("content") or ""
+            usage = data.get("usage") or {}
+            if content:
+                run.text(content)
+            blocks = [{"type": "text", "text": content}] if content else []
+            for tc in msg.get("tool_calls") or []:
+                fn = tc.get("function") or {}
+                args = fn.get("arguments") or ""
+                try:
+                    parsed = json.loads(args) if args else None
+                except json.JSONDecodeError:
+                    parsed = args
+                blocks.append({"type": "tool_use", "id": tc.get("id"),
+                               "name": fn.get("name") or "", "input": parsed})
+                run.tool_call(tc.get("id") or "", fn.get("name"), args)
+            norm_usage = _normalize_usage(usage)
+            run.event(
+                "assistant/message", turn=run.turn, step=run.step,
+                message={"role": "assistant", "content": blocks},
+                usage=norm_usage, stop_reason=msg.get("stop_reason"),
+                surfaceOp="append", sourceSeqs=list(run._chunk_seqs),
+            )
+            run.result_usage = norm_usage
+            run.result_stop_reason = msg.get("stop_reason")
+            return content
 
-
-async def llm_stream(
-    *, url: str, payload: dict, api_key: str | None = None,
-    timeout: httpx.Timeout | None = None, headers: dict | None = None,
-    session: str | None = None, session_name: str | None = None, run_id: str | None = None,
-    session_ns: str | None = None,
-    context: list[dict] | None = None, retry: dict | None = None, meta: dict | None = None,
-):
-    """OpenAI 兼容流式补全(SSE 逐 delta,预留接口):payload 语义同 llm_complete,附加 stream=True。"""
-    run = _Run(_session_id(session, session_ns, run_id, session_name), "openai",
-               payload["model"], label=session_name, run_id=run_id, meta=meta)
-    run.start(context=context, retry=retry)
-    _llm_emit_messages(run, payload)
-    run.event("request/header", header=_llm_header(payload), reason="initial")
-    run.event("request/context", provider="openai", model=payload["model"])
-    ok = False
-    full = ""
-    try:
+    async def stream(
+        self, *, url: str, payload: dict, api_key: str | None = None,
+        timeout: httpx.Timeout | None = None, headers: dict | None = None,
+        session: str | None = None, session_name: str | None = None,
+        run_id: str | None = None, session_ns: str | None = None,
+        context: list[dict] | None = None, retry: dict | None = None,
+        meta: dict | None = None,
+    ):
+        """OpenAI 兼容流式补全(SSE 逐 delta):payload 语义同 complete,附加 stream=True。"""
+        run = self._run(model=payload["model"], session=session, session_ns=session_ns,
+                        run_id=run_id, session_name=session_name, meta=meta)
+        run.start(context=context, retry=retry)
+        _llm_emit_messages(run, payload)
+        run.event("request/header", header=_llm_header(payload), reason="initial")
+        run.event("request/context", provider="openai", model=payload["model"])
+        full = ""
         body: dict = {**payload, "stream": True}
-        async with httpx.AsyncClient(timeout=timeout) as client, client.stream(
-            "POST", f"{url}/chat/completions", json=body, headers=_llm_headers(headers, api_key)
-        ) as resp:
-                resp.raise_for_status()
-                async for line in resp.aiter_lines():
-                    if not line.startswith("data:"):
-                        continue
-                    payload = line[len("data:"):].strip()
-                    if not payload or payload == "[DONE]":
-                        break
-                    choices = json.loads(payload).get("choices") or []
-                    text = (choices[0].get("delta") or {}).get("content") or ""
-                    if text:
-                        full += text
-                        run.text(text)
-                        yield text
+        async with (self._guard(run, error_stage=_stage_of),
+                    httpx.AsyncClient(timeout=timeout) as client,
+                    client.stream("POST", f"{url}/chat/completions", json=body,
+                                  headers=_llm_headers(headers, api_key)) as resp):
+            resp.raise_for_status()
+            async for line in resp.aiter_lines():
+                if not line.startswith("data:"):
+                    continue
+                payload = line[len("data:"):].strip()
+                if not payload or payload == "[DONE]":
+                    break
+                choices = json.loads(payload).get("choices") or []
+                text = (choices[0].get("delta") or {}).get("content") or ""
+                if text:
+                    full += text
+                    run.text(text)
+                    yield text
         run.event(
             "assistant/message", turn=run.turn, step=run.step,
             message={"role": "assistant", "content": [{"type": "text", "text": full}]},
             surfaceOp="append", sourceSeqs=list(run._chunk_seqs),
         )
-        ok = True
-    except Exception as exc:
-        run.error(exc, _stage_of(exc))
-        raise
-    finally:
-        run.finish(ok)
 
 
 # ---------------------------------------------------------------------------
-# DeepSeek Harness(SDK)包装:dsh_stream / dsh_text / dsh_result
+# DeepSeek Harness(SDK)投影全家(模块级:纯 dict 构造,测试可喂假 Notification)
 # ---------------------------------------------------------------------------
 
 
@@ -1027,108 +1104,104 @@ def _dsh_worker(fields: dict, prompt: str, session_id: str, pump):
         return harness.run(prompt, session_id=session_id, on_notification=pump)
 
 
-async def dsh_stream(
-    options, prompt: str, *, session: str | None = None,
-    session_name: str | None = None, run_id: str | None = None,
-    session_ns: str | None = None,
-    context: list[dict] | None = None, retry: dict | None = None,
-    meta: dict | None = None,
-):
-    """dsh(DeepSeek Harness SDK)流式应答(监控 + 执行)。
-
-    对外产出:与 cc_stream 同契约 —— 文本增量(assistant/chunk 的 text-delta),
-    非 completed 的 finish_reason → RuntimeError("agent 执行失败: ...");
-    thinking/工具增量只进事件流,不改变产出。dsh 原生事件 1:1 投影为监控
-    事件流(turn/step/stop_reason 均取自主干事件,见 _project_dsh_event);
-    session/start|end 由本层合成(dsh 仅有 session/end-seed)。
-
-    options = 调用方组装的鸭子类型配置(仿 cc 的 options 透传):provider(缺省
-    "deepseek-official" 经 SDK 侧域)、model、cwd、session_root、cordis、env、
-    max_tokens、base_url、api_key 等,None 跳过(见 _dsh_options_fields);其中
-    **cordis 缺省回退内置隔离组合**(dsh_cordis_path,上层未提供即默认隔离;
-    显式提供则全权交上层)。
-
-    SDK run() 为同步阻塞:经 asyncio.to_thread 执行,on_notification 回调在线程
-    侧经 call_soon_threadsafe 泵入队列,本生成器逐条消费 —— 保持 asyncio 接口
-    形态不变。阻塞性:单次运行一 turn to_idle,无逐 prompt 取消(见 dsh 协议)。
-    """
-    from deepseek_harness import errors as _dsh_errors
-
-    run = _Run(
-        _session_id(session, session_ns, run_id, session_name), "dsh",
-        getattr(options, "model", None) or "",
-        label=session_name, run_id=run_id, meta=meta,
-    )
-    proj = _DshProj(run, prompt, _dsh_session_id(run.session))
-    fields = _dsh_options_fields(options)
-    fields.setdefault("cordis", dsh_cordis_path())  # 上层未提供 → 缺省隔离组合(见 dsh_cordis_path)
-    queue: asyncio.Queue = asyncio.Queue()  # 无界:1:1 于运行时事件流,永不阻塞发布侧
-    loop = asyncio.get_running_loop()
-
-    def pump(notif) -> None:  # 运行时线程回调:跨线程入队(loop 已关闭竞态静默丢)
-        with contextlib.suppress(RuntimeError):
-            loop.call_soon_threadsafe(queue.put_nowait, ("notif", notif))
+# ---------------------------------------------------------------------------
+# DeepSeek Harness(SDK)包装:dsh_stream / dsh_text / dsh_result
+# ---------------------------------------------------------------------------
 
 
+class DshAdapter(BaseAdapter):
+    """dsh:事件词汇同源但 dsh 是第二权威 → _DshProj 投影对齐(why 见模块 docstring)。"""
 
-    async def _worker() -> None:
-        try:
-            result = await asyncio.to_thread(_dsh_worker, fields, prompt, proj.session_id, pump)
-            loop.call_soon_threadsafe(queue.put_nowait, ("done", result))
-        except Exception as exc:  # noqa: BLE001 —— 异常经队列送消费侧统一 error/finish
-            loop.call_soon_threadsafe(queue.put_nowait, ("exc", exc))
+    provider = "dsh"
 
-    ok = False
-    try:
-        run.start(context=context, retry=retry, prologue=False)  # dsh 自带 turn/step 生命周期
-        task = asyncio.create_task(_worker())
-        try:
-            while True:
-                kind, item = await queue.get()
-                if kind == "notif":
-                    for delta in _project_dsh_event(run, proj, item):
-                        yield delta
-                elif kind == "exc":
-                    raise item
-                else:  # ("done", RunResult):run() 返回前所有通知已交付,无竞态
-                    if item.finish_reason != "completed":
-                        raise RuntimeError(f"agent 执行失败: {item.finish_reason}")
-                    ok = True
-                    break
-        finally:
-            if not task.done():
-                task.cancel()  # 消费者提前退场:executor 线程继续自然跑完(见 _dsh_worker)
-    except Exception as exc:
-        run.error(exc, _dsh_stage(exc, (_dsh_errors.SdkProtocolError, _dsh_errors.JsonRpcError)))
-        raise
-    finally:
-        run.finish(ok, epilogue=not proj.saw_turn_end)
-
-
-async def dsh_text(options, prompt: str, *, session: str | None = None,
-                   session_name: str | None = None, run_id: str | None = None,
-                   session_ns: str | None = None,
-                   context: list[dict] | None = None, retry: dict | None = None,
-                   meta: dict | None = None) -> str:
-    """dsh agent 整收应答(流式转整收,监控走与 dsh_stream 同一条路径)。"""
-    parts: list[str] = []
-    async for chunk in dsh_stream(options, prompt, session=session, session_name=session_name,
-                                  run_id=run_id, session_ns=session_ns,
-                                  context=context, retry=retry, meta=meta):
-        parts.append(chunk)
-    return "".join(parts)
-
-
-async def dsh_result(options, prompt: str, *, session: str | None = None,
+    async def stream(self, options, prompt: str, *, session: str | None = None,
                      session_name: str | None = None, run_id: str | None = None,
                      session_ns: str | None = None,
                      context: list[dict] | None = None, retry: dict | None = None,
-                     meta: dict | None = None) -> str:
-    """dsh 非流式最终结果:失败(非 completed,兼 runtime 异常)或无结果 → RuntimeError
-    (与 cc_result 语义一致:dsh_stream 已对非 completed 抛错,此处仅补空结果检查)。"""
-    text = await dsh_text(options, prompt, session=session, session_name=session_name,
-                          run_id=run_id, session_ns=session_ns,
-                          context=context, retry=retry, meta=meta)
-    if not text:
-        raise RuntimeError("agent 未产出最终结果")
-    return text
+                     meta: dict | None = None):
+        """dsh(DeepSeek Harness SDK)流式应答(监控 + 执行)。
+
+        对外产出:与 cc_stream 同契约 —— 文本增量(assistant/chunk 的 text-delta),
+        非 completed 的 finish_reason → RuntimeError("agent 执行失败: ...");
+        thinking/工具增量只进事件流,不改变产出。dsh 原生事件 1:1 投影为监控
+        事件流(turn/step/stop_reason 均取自主干事件,见 _project_dsh_event);
+        session/start|end 由本层合成(dsh 仅有 session/end-seed)。
+
+        options = 调用方组装的鸭子类型配置(仿 cc 的 options 透传):provider(缺省
+        "deepseek-official" 经 SDK 侧域)、model、cwd、session_root、cordis、env、
+        max_tokens、base_url、api_key 等,None 跳过(见 _dsh_options_fields);其中
+        **cordis 缺省回退内置隔离组合**(dsh_cordis_path,上层未提供即默认隔离;
+        显式提供则全权交上层)。
+
+        SDK run() 为同步阻塞:经 asyncio.to_thread 执行,on_notification 回调在线程
+        侧经 call_soon_threadsafe 泵入队列,本生成器逐条消费 —— 保持 asyncio 接口
+        形态不变。阻塞性:单次运行一 turn to_idle,无逐 prompt 取消(见 dsh 协议)。
+        """
+        from deepseek_harness import errors as _dsh_errors
+
+        run = self._run(model=getattr(options, "model", None) or "",
+                        session=session, session_ns=session_ns, run_id=run_id,
+                        session_name=session_name, meta=meta)
+        proj = _DshProj(run, prompt, _dsh_session_id(run.session))
+        fields = _dsh_options_fields(options)
+        fields.setdefault("cordis", dsh_cordis_path())  # 上层未提供 → 缺省隔离组合(见 dsh_cordis_path)
+        queue: asyncio.Queue = asyncio.Queue()  # 无界:1:1 于运行时事件流,永不阻塞发布侧
+        loop = asyncio.get_running_loop()
+
+        def pump(notif) -> None:  # 运行时线程回调:跨线程入队(loop 已关闭竞态静默丢)
+            with contextlib.suppress(RuntimeError):
+                loop.call_soon_threadsafe(queue.put_nowait, ("notif", notif))
+
+        async def _worker() -> None:
+            try:
+                result = await asyncio.to_thread(_dsh_worker, fields, prompt, proj.session_id, pump)
+                loop.call_soon_threadsafe(queue.put_nowait, ("done", result))
+            except Exception as exc:  # noqa: BLE001 —— 异常经队列送消费侧统一 error/finish
+                loop.call_soon_threadsafe(queue.put_nowait, ("exc", exc))
+
+        run.start(context=context, retry=retry, prologue=False)  # dsh 自带 turn/step 生命周期
+        async with self._guard(
+            run,
+            error_stage=lambda exc: _dsh_stage(exc, (_dsh_errors.SdkProtocolError,
+                                                     _dsh_errors.JsonRpcError)),
+            epilogue=lambda: not proj.saw_turn_end,
+        ):
+            task = asyncio.create_task(_worker())
+            try:
+                while True:
+                    kind, item = await queue.get()
+                    if kind == "notif":
+                        for delta in _project_dsh_event(run, proj, item):
+                            yield delta
+                    elif kind == "exc":
+                        raise item
+                    else:  # ("done", RunResult):run() 返回前所有通知已交付,无竞态
+                        if item.finish_reason != "completed":
+                            raise RuntimeError(f"agent 执行失败: {item.finish_reason}")
+                        break
+            finally:
+                if not task.done():
+                    task.cancel()  # 消费者提前退场:executor 线程继续自然跑完(见 _dsh_worker)
+
+
+# ---------------------------------------------------------------------------
+# 模块级绑定:公开名与签名逐参数等于历史自由函数(调用方按名导入不受影响)
+# ---------------------------------------------------------------------------
+
+_claude = ClaudeCodeAdapter()
+_openai = OpenAIAdapter()
+_dsh = DshAdapter()
+
+cc_stream = _claude.stream
+cc_text = _claude.text
+cc_result = _claude.result
+
+llm_complete = _openai.complete
+llm_stream = _openai.stream
+
+dsh_stream = _dsh.stream
+dsh_text = _dsh.text
+dsh_result = _dsh.result
+
+# 扩展发现口(元数据,非运行时强制分派:deepwiki/evaluators 仍按名导入)
+ADAPTERS: dict[str, BaseAdapter] = {a.provider: a for a in (_claude, _openai, _dsh)}
