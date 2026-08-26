@@ -31,6 +31,7 @@ export interface EventEnvelope {
   session: string;
   run_id?: string | null;
   label?: string;
+  generator?: string;
   provider?: string;
   model?: string;
   type: string;
@@ -105,6 +106,7 @@ export interface ContextModifyData {
 export interface SessionStartData {
   run_id?: string | null;
   label?: string;
+  generator?: string;
   provider?: string;
   model?: string;
   retry?: { attempt: number; prev_error?: string; prev_run?: string };

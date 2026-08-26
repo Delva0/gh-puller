@@ -57,8 +57,10 @@ export default function MonitorSessionList({ sessions, current, onSelect, query,
             }`}
           >
             <span className="flex-1 truncate font-mono">{s.label}</span>
-            {s.provider && (
-              <span className="font-mono text-[10px] text-[var(--muted)]">{s.provider}/{s.model || '—'}</span>
+            {(s.generator || s.provider) && (
+              <span className="font-mono text-[10px] text-[var(--muted)]">
+                {s.generator ? `${s.generator}·` : ''}{s.provider || '—'}/{s.model || '—'}
+              </span>
             )}
             <StateBadge state={s.state} label={t(`session.state.${s.state}`)} />
             <span className="font-mono text-[10px] text-[var(--muted)]">{fmt(s.last_ts)}</span>

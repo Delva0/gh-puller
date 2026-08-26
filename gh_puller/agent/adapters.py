@@ -35,16 +35,18 @@ publish 仅 put_nowait 到每 sink 的 asyncio.Queue,永不阻塞调用)→ sink
 _header/消息归一化等 → 共享基类 BaseAdapter(_run 装配、_guard 事件守卫、
 text/result 缺省实现)→ 每路一个子类只写差异驱动循环(ClaudeCodeAdapter /
 OpenAIAdapter / DshAdapter)→ 底部单例绑定(cc_stream = _claude.stream 等,签名
-逐参数等于现状)+ ADAPTERS 元数据注册表。扩展第 N 种 agent:新建 XhAdapter(
-BaseAdapter)(provider 类属性;stream 必写,text/result 用缺省或覆盖);SDK 库在
+逐参数等于现状)+ GENERATORS/PROVIDERS 注册表。扩展第 N 种 provider/generator:
+新建 XhAdapter(BaseAdapter)(generator/provider_id 类属性;stream 必写,
+text/result 用缺省或覆盖);SDK 库在
 方法体内 lazy import(供测试 sys.modules 注入);事件只经 run.* 发(new_event 对
 未知 type 抛 ValueError → 只发 TAXONOMY);若新 SDK 自带 seq/turn/step 生命周期
-(如 dsh)→ 参照 _DshProj 做投影对齐,严禁把对方 seq 当 gh seq;尾部注册进 ADAPTERS
+(如 dsh)→ 参照 _DshProj 做投影对齐,严禁把对方 seq 当 gh seq;尾部注册进 GENERATORS
 并加导出。
 """
 
 import asyncio
 import contextlib
+import dataclasses
 import hashlib
 import json
 import os
@@ -52,9 +54,10 @@ import shutil
 import sys
 import tempfile
 import time
+import types
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 import httpx
 
@@ -83,11 +86,13 @@ def _session_id(session: str | None, session_ns: str | None, run_id: str | None,
 class _Run:
     """单次运行的事件发布器:维护会话信封/turn/step/seq 计数,归一化后广播事件。"""
 
-    def __init__(self, session: str, provider: str, model: str, *, label: str | None = None,
+    def __init__(self, session: str, provider: str, model: str, *, generator: str = "",
+                 label: str | None = None,
                  run_id: str | None = None, meta=None):
         self.session = session
         self.label = label or session
         self.provider = provider
+        self.generator = generator
         self.model = model
         self.run_id = run_id
         self.meta = meta
@@ -119,6 +124,7 @@ class _Run:
         evt["session"] = self.session
         evt["run_id"] = self.run_id
         evt["label"] = self.label
+        evt["generator"] = self.generator
         evt["provider"] = self.provider
         evt["model"] = self.model
         evt["seq"] = self.seq
@@ -133,8 +139,8 @@ class _Run:
         prologue=False(dsh 投影路径专用):turn/step 生命周期由 dsh 原生事件自带,
         不合成 turn/start + step/start,且 _step_open 保持 False(dsh 路径不调 step_boundary)。
         """
-        self.event("session/start", run_id=self.run_id, label=self.label, provider=self.provider,
-                   model=self.model, retry=retry, meta=self.meta)
+        self.event("session/start", run_id=self.run_id, label=self.label, generator=self.generator,
+                   provider=self.provider, model=self.model, retry=retry, meta=self.meta)
         for ctx in context or []:
             self.event(ctx["type"], **ctx["data"])  # 日志型说明事件:重放于 turn 之前
         if prologue:
@@ -503,7 +509,7 @@ def _options_header(options) -> dict:
     system = getattr(options, "system_prompt", None) or ""
     names = list(getattr(options, "allowed_tools", None) or [])
     names.extend(f"mcp__{name}__" for name in (getattr(options, "mcp_servers", None) or {}))
-    return {"config": {"provider": "claude", "model": getattr(options, "model", None) or ""},
+    return {"config": {"provider": "anthropic", "model": getattr(options, "model", None) or ""},
             "system": system or None, "tools": [{"name": n} for n in names] or None}
 
 
@@ -558,21 +564,29 @@ def _llm_headers(headers: dict | None, api_key: str | None) -> dict:
 
 
 class BaseAdapter:
-    """三路共享骨架:cc = 单一权威合成;dsh = 双权威投影(对齐器);llm = 直连 HTTP。
+    """四路共享骨架:cc = 单一权威合成;dsh = 双权威投影(对齐器);llm = 直连 HTTP。
 
     子类只要写差异驱动循环(stream / complete);text、result 的整收缺省已含。
     公共 kwarg(会话/run 元数据)逐参数与历史模块级函数一致 —— 底部以单例绑定
     回模块级公开名(cc_stream = _claude.stream 等),签名不变。
+
+    generator = 本项目生成管线 id(cc|dsh|codex|llm);provider_id = 该路对应的
+    provider 连接语义(anthropic|deepseek|openai)—— 与 duck options 里的
+    SDK 侧字段(如 dsh provider="deepseek-official")是两回事。
     """
 
-    provider = ""  # 事件封套 provider 字段值(claude|openai|dsh|...)
+    generator = ""  # 生成管线 id(cc|dsh|codex|llm)
+    provider_id = ""  # 事件封套 provider 字段值(anthropic|deepseek|openai)
 
     def _run(self, *, model: str, session: str | None = None, session_ns: str | None = None,
              run_id: str | None = None, session_name: str | None = None,
-             meta: dict | None = None) -> _Run:
-        """公共 kwarg → _Run(session id 规则/信封 provider 取类属性;不含 context/retry)。"""
-        return _Run(_session_id(session, session_ns, run_id, session_name), self.provider,
-                    model, label=session_name, run_id=run_id, meta=meta)
+             meta: dict | None = None,
+             provider: str | None = None, generator: str | None = None) -> _Run:
+        """公共 kwarg → _Run(session id 规则/信封 provider+generator 取类属性;不含 context/retry)。"""
+        return _Run(_session_id(session, session_ns, run_id, session_name),
+                    provider or self.provider_id,
+                    model, generator=generator or self.generator,
+                    label=session_name, run_id=run_id, meta=meta)
 
     @contextlib.asynccontextmanager
     async def _guard(self, run: _Run, *, error_stage=None, epilogue=True):
@@ -640,7 +654,8 @@ class BaseAdapter:
 class ClaudeCodeAdapter(BaseAdapter):
     """cc:SDK 原料流 → 本地合成(唯一权威,无投影层;why 见模块 docstring)。"""
 
-    provider = "claude"
+    generator = "cc"
+    provider_id = "anthropic"
 
     async def stream(self, options, prompt: str, *, session: str | None = None,
                      session_name: str | None = None, run_id: str | None = None,
@@ -734,7 +749,8 @@ class ClaudeCodeAdapter(BaseAdapter):
 class OpenAIAdapter(BaseAdapter):
     """OpenAI 兼容(httpx 直连):无 agent 形态,入口为 complete(非流式)/ stream(SSE)。"""
 
-    provider = "openai"
+    generator = "llm"
+    provider_id = "openai"
 
     async def complete(
         self, *, url: str, payload: dict, api_key: str | None = None,
@@ -1113,7 +1129,8 @@ def _dsh_worker(fields: dict, prompt: str, session_id: str, pump):
 class DshAdapter(BaseAdapter):
     """dsh:事件词汇同源但 dsh 是第二权威 → _DshProj 投影对齐(why 见模块 docstring)。"""
 
-    provider = "dsh"
+    generator = "dsh"
+    provider_id = "deepseek"
 
     async def stream(self, options, prompt: str, *, session: str | None = None,
                      session_name: str | None = None, run_id: str | None = None,
@@ -1253,7 +1270,7 @@ def _codex_header(options) -> dict:
     """
     system = getattr(options, "system_prompt", None) or ""
     names = list(getattr(options, "tools", None) or ["mcp__graphify__query_graph"])
-    return {"config": {"provider": "codex", "model": getattr(options, "model", None) or ""},
+    return {"config": {"provider": "openai", "model": getattr(options, "model", None) or ""},
             "system": system or None, "tools": [{"name": n} for n in names] or None}
 
 
@@ -1540,7 +1557,8 @@ def _handle_codex_notification(run: _Run, st: _CodexSynth, notif) -> list[str]:
 class CodexAdapter(BaseAdapter):
     """codex:SDK 原料通知流 → 本地合成(唯一权威,无投影层;why 见 _CodexSynth docstring)。"""
 
-    provider = "codex"
+    generator = "codex"
+    provider_id = "openai"
 
     async def stream(self, options, prompt: str, *, session: str | None = None,
                      session_name: str | None = None, run_id: str | None = None,
@@ -1643,5 +1661,346 @@ codex_stream = _codex.stream
 codex_text = _codex.text
 codex_result = _codex.result
 
-# 扩展发现口(元数据,非运行时强制分派:deepwiki/evaluators 仍按名导入)
-ADAPTERS: dict[str, BaseAdapter] = {a.provider: a for a in (_claude, _openai, _dsh, _codex)}
+
+# ---------------------------------------------------------------------------
+# Generator / Provider / Model 注册表与统一 target 分派
+# ---------------------------------------------------------------------------
+# 三个正交概念(全项目统一语义):
+# - generator:本项目定义的生成管线(cc / dsh / codex / llm),描述执行能力
+#   (adapter/支持 providers/所需 provider API 能力/默认模型环境变量);
+# - provider:模型服务提供方及其连接配置(anthropic / deepseek / openai),描述
+#   连接能力(API key 环境变量、base URL 环境变量与缺省、模型目录、是否允许自定义);
+# - model:provider 下的模型标识。
+# openai-compatible 不作为独立 provider:它只是 openai provider 使用自定义
+# base_url 时的一种部署形态(llm generator 即如此接入兼容端点)。
+#
+# 统一请求结构(HTTP 层 target 字段):{"generator","provider","model",
+# "api_key","base_url"};解析优先级:显式 target > provider/generator 环境变量
+# > SDK 原生登录或默认值(resolve_target)。非法组合或 provider 不具备 generator
+# 所需能力 → ValueError(运行前即抛)。
+# 业务代码统一经 generate_stream / generate_text / generate_result 调用;
+# cc_stream / dsh_stream / codex_stream / llm_stream 等保留为底层兼容入口。
+
+
+@dataclasses.dataclass(frozen=True)
+class ProviderSpec:
+    """provider:连接能力(API key / base URL / 模型目录)。"""
+
+    id: str
+    name: str
+    api_key_env: str | None = None
+    base_url_env: str | None = None
+    base_url_default: str | None = None
+    models: tuple[str, ...] = ()
+    supports_custom_model: bool = False
+    capabilities: tuple[str, ...] = ()  # 该 provider 具备的 API 协议面
+
+
+@dataclasses.dataclass(frozen=True)
+class GeneratorSpec:
+    """generator:执行能力(adapter/支持 providers/所需能力/默认模型环境变量)。"""
+
+    id: str
+    name: str
+    adapter: BaseAdapter
+    providers: tuple[str, ...] = ()
+    default_provider: str = ""
+    capability: str = ""  # 该 generator 对 provider 的协议要求(见 PROVIDERS.capabilities)
+    default_model_env: str | None = None  # 环境变量名(None → 无生成器级默认模型)
+    models: tuple[str, ...] = ()  # 该路常见模型(展示用;兼容目录缺省取 provider)
+
+
+@dataclasses.dataclass(frozen=True)
+class ResolvedTarget:
+    """resolve_target 的产物:字段均已按优先级解析、组合已校验。
+
+    model == "" 表示未解析出模型(落回 SDK/端点缺省);public() = 持久化用的
+    公开三元组(generator, provider, model)—— 凭证(api_key/base_url)永不随
+    公开摘要持久化。
+    """
+
+    generator: str
+    provider: str
+    model: str = ""
+    api_key: str | None = None
+    base_url: str | None = None
+
+    def public(self) -> tuple[str, str, str]:
+        return (self.generator, self.provider, self.model)
+
+
+PROVIDERS: dict[str, ProviderSpec] = {
+    "anthropic": ProviderSpec(
+        id="anthropic",
+        name="Anthropic",
+        api_key_env="ANTHROPIC_API_KEY",
+        base_url_env="ANTHROPIC_BASE_URL",
+        models=("claude-haiku-4-5-20251001", "claude-sonnet-5", "claude-opus-5"),
+        supports_custom_model=True,
+        capabilities=("anthropic-agent-api",),
+    ),
+    "deepseek": ProviderSpec(
+        id="deepseek",
+        name="DeepSeek",
+        api_key_env="DEEPSEEK_API_KEY",
+        base_url_env="DEEPSEEK_BASE_URL",
+        models=("deepseek-v4-flash", "deepseek-chat", "deepseek-reasoner"),
+        supports_custom_model=True,
+        capabilities=("deepseek-route",),
+    ),
+    "openai": ProviderSpec(
+        id="openai",
+        name="OpenAI",
+        api_key_env="OPENAI_API_KEY",
+        base_url_env="OPENAI_BASE_URL",
+        base_url_default="https://api.openai.com/v1",
+        models=("gpt-5.6-luna", "gpt-5.3-codex", "gpt-5.1-codex"),
+        supports_custom_model=True,
+        capabilities=("responses", "chat-completions"),
+    ),
+}
+
+GENERATORS: dict[str, GeneratorSpec] = {
+    "cc": GeneratorSpec(
+        id="cc", name="Claude Code", adapter=_claude,
+        providers=("anthropic",), default_provider="anthropic",
+        capability="anthropic-agent-api", default_model_env="CC_MODEL",
+    ),
+    "dsh": GeneratorSpec(
+        id="dsh", name="DeepSeek Harness", adapter=_dsh,
+        providers=("deepseek",), default_provider="deepseek",
+        capability="deepseek-route", default_model_env="DSH_MODEL",
+    ),
+    "codex": GeneratorSpec(
+        id="codex", name="Codex", adapter=_codex,
+        providers=("openai",), default_provider="openai",
+        capability="responses", default_model_env="CODEX_MODEL",
+    ),
+    "llm": GeneratorSpec(
+        id="llm", name="LLM", adapter=_openai,
+        providers=("openai",), default_provider="openai",
+        capability="chat-completions", default_model_env="LLM_MODEL",
+    ),
+}
+
+# DeepWiki 默认 generator/provider(envs 常量动态反射:测试 monkeypatch envs 生效)
+_DEEPWIKI_GENERATOR_ENV = "DEEPWIKI_GENERATOR"
+_DEEPWIKI_PROVIDER_ENV = "DEEPWIKI_PROVIDER"
+
+
+def _env_value(name: str) -> str:
+    """envs.py 快照常量读取(调用时动态解析;测试 monkeypatch 生效)。"""
+    from gh_puller import envs
+
+    return getattr(envs, name, "") or ""
+
+
+def public_target(target: Mapping | ResolvedTarget | None) -> tuple[str, str, str]:
+    """公开三元组(generator, provider, model):缓存/任务状态/URL 的稳定摘要来源。"""
+    t = resolve_target(dict(target) if isinstance(target, Mapping) else target)
+    return t.public()
+
+
+def resolve_target(target: str | Mapping | ResolvedTarget | None) -> ResolvedTarget:
+    """统一解析:显式 target > provider/generator 环境变量 > SDK 原生缺省。
+
+    target:None/空 → 全环境缺省;str → generator id;Mapping(dict/pydantic
+    model_dump)→ 统一请求结构字段;ResolvedTarget → 原样。校验非法组合与
+    provider 能力(运行前即抛 ValueError)。
+    """
+    if isinstance(target, ResolvedTarget):
+        return target
+    if isinstance(target, str):
+        raw: dict[str, Any] = {"generator": target}
+    elif isinstance(target, Mapping):
+        raw = dict(target)
+    elif target is not None and hasattr(target, "model_dump"):  # pydantic 模型(duck)
+        raw = dict(target.model_dump())
+    else:
+        raw = {}
+    generator: str = (raw.get("generator") if raw.get("generator") else None) \
+        or _env_value(_DEEPWIKI_GENERATOR_ENV) \
+        or "cc"
+    spec = GENERATORS.get(generator)
+    if spec is None:
+        raise ValueError(f"未知 generator: {generator!r}(可选 {sorted(GENERATORS)})")
+
+    provider: str = (raw.get("provider") if raw.get("provider") else None) \
+        or _env_value(_DEEPWIKI_PROVIDER_ENV) \
+        or spec.default_provider
+    if provider not in spec.providers:
+        raise ValueError(
+            f"非法组合: generator={generator!r} 不支持 provider={provider!r}"
+            f"(可选 {list(spec.providers)})"
+        )
+    pspec = PROVIDERS.get(provider)
+    if pspec is None:
+        raise ValueError(f"未知 provider: {provider!r}(可选 {sorted(PROVIDERS)})")
+    if spec.capability not in pspec.capabilities:
+        raise ValueError(
+            f"provider={provider!r} 不具备 generator={generator!r} 所需 API 能力"
+            f"({spec.capability!r};该 provider 具备 {list(pspec.capabilities)})"
+        )
+
+    model: str = (raw.get("model") if raw.get("model") else None) \
+        or (_env_value(spec.default_model_env) if spec.default_model_env else "") \
+        or ""
+    api_key: str | None = (raw.get("api_key") if raw.get("api_key") else None) \
+        or (_env_value(pspec.api_key_env) if pspec.api_key_env else "") \
+        or None
+    base_url: str | None = (raw.get("base_url") if raw.get("base_url") else None) \
+        or (_env_value(pspec.base_url_env) if pspec.base_url_env else "") \
+        or pspec.base_url_default
+    return ResolvedTarget(generator=generator, provider=provider, model=model,
+                          api_key=api_key, base_url=base_url)
+
+
+def _copy_options(options, **fields):
+    """浅复制 options(dataclass 或 SimpleNamespace/普通对象)并覆盖字段。
+
+    cc 的 ClaudeAgentOptions 是 dataclass(env/model 为字段);测试与 dsh/codex
+    的鸭子 options 是 SimpleNamespace —— 两者统一经副本覆盖,绝不原地改
+    (并发 target 不串凭证)。
+    """
+    if dataclasses.is_dataclass(options):
+        return dataclasses.replace(options, **fields)
+    copy = types.SimpleNamespace(**{k: v for k, v in vars(options).items()})
+    for k, v in fields.items():
+        setattr(copy, k, v)
+    return copy
+
+
+def _bind_cc_options(options, t: ResolvedTarget):
+    """cc + anthropic:resolved key/base URL 注入 ClaudeAgentOptions.env(其余留 SDK 缺省)。"""
+    env = dict(getattr(options, "env", None) or {})
+    if t.api_key:
+        env.setdefault("ANTHROPIC_API_KEY", t.api_key)
+    if t.base_url:
+        env.setdefault("ANTHROPIC_BASE_URL", t.base_url)
+    fields: dict[str, Any] = {}
+    if env:
+        fields["env"] = env
+    if t.model:
+        fields["model"] = t.model
+    return _copy_options(options, **fields) if fields else options
+
+
+def _bind_dsh_options(options, t: ResolvedTarget):
+    """dsh + deepseek:原生 provider/model/api_key/base_url 参数(空由 SDK 读进程环境)。"""
+    fields: dict[str, Any] = {}
+    if t.model:
+        fields["model"] = t.model
+    if t.api_key:
+        fields["api_key"] = t.api_key
+    if t.base_url:
+        fields["base_url"] = t.base_url
+    return _copy_options(options, **fields) if fields else options
+
+
+def _bind_codex_options(options, t: ResolvedTarget):
+    """codex + openai:model_provider=openai;token 走登录;base_url 经 config override 注入。"""
+    fields: dict[str, Any] = {"model_provider": "openai"}
+    if t.model:
+        fields["model"] = t.model
+    if t.api_key:
+        fields["token"] = t.api_key  # 显式 token → 本隔离 home 登录(_codex_home_setup)
+    if t.base_url:
+        overrides = dict(getattr(options, "config_overrides", None) or {})
+        mp = dict(overrides.get("model_providers") or {})
+        mp["openai"] = {**dict(mp.get("openai") or {}), "base_url": t.base_url}
+        overrides["model_providers"] = mp
+        fields["config_overrides"] = overrides
+    return _copy_options(options, **fields)
+
+
+def _bind_llm_payload(payload: dict, t: ResolvedTarget) -> dict:
+    """llm + openai:model 来自 target;base_url/api_key 由 dispatcher 传入(本函数不动)。"""
+    return {**payload, "model": t.model}
+
+
+def _llm_url(t: ResolvedTarget) -> str:
+    return t.base_url or (PROVIDERS.get(t.provider).base_url_default or "")
+
+
+# generator id → options/payload 绑定(agent 类;llm 在 dispatcher 内专路)
+_BINDERS: dict[str, Any] = {
+    "cc": _bind_cc_options,
+    "dsh": _bind_dsh_options,
+    "codex": _bind_codex_options,
+}
+
+
+async def generate_stream(
+    prompt: str, *,
+    target: str | Mapping | ResolvedTarget | None = None,
+    options: Any = None,
+    session: str | None = None, session_name: str | None = None, run_id: str | None = None,
+    session_ns: str | None = None,
+    context: list[dict] | None = None, retry: dict | None = None,
+    meta: dict | None = None,
+):
+    """统一流式分派(业务入口):按 target.generator 选路并绑定凭证;契约同各专用 stream。
+
+    options:cc/dsh/codex → 适配器鸭子选项(工具装配等);llm → chat/completions
+    请求体 dict(messages 等键;model 由 target 注入)。prompt:agent 类生成器
+    的用户消息;llm 以 options 的 messages 为准。
+    """
+    t = resolve_target(target)
+    spec = GENERATORS[t.generator]
+    if spec.id == "llm":
+        payload = _bind_llm_payload(dict(options or {"messages": []}), t)
+        async for chunk in llm_stream(url=_llm_url(t), payload=payload, api_key=t.api_key,
+                                      session=session, session_name=session_name, run_id=run_id,
+                                      session_ns=session_ns, context=context, retry=retry,
+                                      meta=meta):
+            yield chunk
+        return
+    bound = _BINDERS[spec.id](options, t)
+    async for chunk in spec.adapter.stream(
+        bound, prompt, session=session, session_name=session_name, run_id=run_id,
+        session_ns=session_ns, context=context, retry=retry, meta=meta,
+    ):
+        yield chunk
+
+
+async def generate_text(
+    prompt: str, *,
+    target: str | Mapping | ResolvedTarget | None = None,
+    options: Any = None,
+    session: str | None = None, session_name: str | None = None, run_id: str | None = None,
+    session_ns: str | None = None,
+    context: list[dict] | None = None, retry: dict | None = None,
+    meta: dict | None = None,
+) -> str:
+    """统一整收(流式文本拼装);语义同 BaseAdapter.text 缺省。"""
+    parts: list[str] = []
+    async for chunk in generate_stream(
+        prompt, target=target, options=options, session=session, session_name=session_name,
+        run_id=run_id, session_ns=session_ns, context=context, retry=retry, meta=meta,
+    ):
+        parts.append(chunk)
+    return "".join(parts)
+
+
+async def generate_result(
+    prompt: str, *,
+    target: str | Mapping | ResolvedTarget | None = None,
+    options: Any = None,
+    session: str | None = None, session_name: str | None = None, run_id: str | None = None,
+    session_ns: str | None = None,
+    context: list[dict] | None = None, retry: dict | None = None,
+    meta: dict | None = None,
+) -> str:
+    """统一非流式最终结果(llm 走非流式 complete;agent 走专用 result 通道)。"""
+    t = resolve_target(target)
+    spec = GENERATORS[t.generator]
+    if spec.id == "llm":
+        payload = _bind_llm_payload(dict(options or {"messages": []}), t)
+        return await llm_complete(url=_llm_url(t), payload=payload, api_key=t.api_key,
+                                  session=session, session_name=session_name, run_id=run_id,
+                                  session_ns=session_ns, context=context, retry=retry, meta=meta)
+    bound = _BINDERS[spec.id](options, t)
+    return await spec.adapter.result(
+        bound, prompt, session=session, session_name=session_name, run_id=run_id,
+        session_ns=session_ns, context=context, retry=retry, meta=meta,
+    )

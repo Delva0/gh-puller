@@ -4,7 +4,7 @@
 import Ask from '@/components/Ask';
 import {
   ModelSelectionModal, WikiTreeView, Markdown, ThemeToggle, useLanguage,
-  type CodeTarget,
+  type CodeTarget, type TargetConfig, publicTargetOf, loadCreds, saveCreds,
 } from '@gh-puller/ui';
 import CodeViewer from '@gh-puller/ui/components/CodeViewer';
 import Mermaid from '@gh-puller/ui/components/Mermaid';
@@ -112,10 +112,9 @@ export default function RepoWikiPage() {
   const token = searchParams.get('token');
   const localPath = searchParams.get('local_path') ? decodeURIComponent(searchParams.get('local_path')!) : undefined;
   const repoUrl = searchParams.get('repo_url') ? decodeURIComponent(searchParams.get('repo_url')!) : undefined;
+  const generatorParam = searchParams.get('generator');
   const providerParam = searchParams.get('provider');
   const modelParam = searchParams.get('model');
-  const isCustomModelParam = searchParams.get('is_custom_model') === 'true';
-  const customModelParam = searchParams.get('custom_model');
   const language = searchParams.get('language') ?? 'en';
   const repoHost = (() => {
     if (!repoUrl) return '';
@@ -170,11 +169,19 @@ export default function RepoWikiPage() {
   // unmount / refresh and avoid leaking connections.
   const taskUnsubRef = useRef<null | (() => void)>(null);
 
-  // Model selection state variables
-  const [selectedProviderState, setSelectedProviderState] = useState(providerParam);
-  const [selectedModelState, setSelectedModelState] = useState(modelParam);
-  const [isCustomSelectedModelState, setIsCustomSelectedModelState] = useState(isCustomModelParam);
-  const [customSelectedModelState, setCustomSelectedModelState] = useState(customModelParam);
+  // Target state(公开三元组 + 请求态凭证;凭证仅存当前标签页 sessionStorage)
+  const repoCredsKey = `${repoType}_${owner}_${repo}`;
+  const [targetConfig, setTargetConfig] = useState<TargetConfig>(() => ({
+    generator: generatorParam || '',
+    provider: providerParam || '',
+    model: modelParam || '',
+    ...loadCreds(repoCredsKey),
+  }));
+  // 凭证仅存当前标签页 sessionStorage(URL/localStorage 只保留公开三元组)
+  useEffect(() => {
+    saveCreds(repoCredsKey, { api_key: targetConfig.api_key, base_url: targetConfig.base_url });
+  }, [targetConfig.api_key, targetConfig.base_url, repoCredsKey]);
+
   const [showModelOptions, setShowModelOptions] = useState(false); // Controls whether to show model options
   const excludedDirs = searchParams.get('excluded_dirs');
   const excludedFiles = searchParams.get('excluded_files');
@@ -280,6 +287,9 @@ export default function RepoWikiPage() {
         repo_type: effectiveRepoInfo.type,
         language: language,
         comprehensive: isComprehensiveView.toString(),
+        generator: targetConfig.generator || '',
+        provider: targetConfig.provider || '',
+        model: targetConfig.model || '',
       });
       const response = await fetch(`/api/wiki_cache?${params.toString()}`);
 
@@ -295,12 +305,12 @@ export default function RepoWikiPage() {
       }
 
       console.log('Using server-cached wiki data');
-      if (cachedData.model) {
-        setSelectedModelState(cachedData.model);
-      }
-      if (cachedData.provider) {
-        setSelectedProviderState(cachedData.provider);
-      }
+      setTargetConfig(prev => ({
+        ...prev,
+        generator: cachedData.generator || prev.generator,
+        provider: cachedData.provider || prev.provider,
+        model: cachedData.model || prev.model,
+      }));
 
       // Update repoInfo
       if (cachedData.repo) {
@@ -480,7 +490,6 @@ export default function RepoWikiPage() {
     };
 
     try {
-      const model = isCustomSelectedModelState ? customSelectedModelState : selectedModelState;
       const result = await submitWikiTask({
         repo_url: getRepoUrl(effectiveRepoInfo),
         type: effectiveRepoInfo.type,
@@ -488,8 +497,7 @@ export default function RepoWikiPage() {
         repo: effectiveRepoInfo.repo,
         comprehensive: isComprehensiveView,
         token: currentToken || undefined,
-        provider: selectedProviderState || undefined,
-        model: model || undefined,
+        target: targetConfig,
         language,
         excluded_dirs: modelExcludedDirs || undefined,
         excluded_files: modelExcludedFiles || undefined,
@@ -552,10 +560,7 @@ export default function RepoWikiPage() {
   }, [
     effectiveRepoInfo,
     currentToken,
-    selectedProviderState,
-    selectedModelState,
-    isCustomSelectedModelState,
-    customSelectedModelState,
+    targetConfig,
     lang,
     isComprehensiveView,
     modelExcludedDirs,
@@ -664,10 +669,9 @@ export default function RepoWikiPage() {
         repo: effectiveRepoInfo.repo,
         repo_type: effectiveRepoInfo.type,
         language: language,
-        provider: selectedProviderState || '',
-        model: selectedModelState || '',
-        is_custom_model: isCustomSelectedModelState.toString(),
-        custom_model: customSelectedModelState || '',
+        generator: targetConfig.generator || '',
+        provider: targetConfig.provider || '',
+        model: targetConfig.model || '',
         comprehensive: isComprehensiveView.toString(),
         authorization_code: authCode,
       });
@@ -744,7 +748,7 @@ export default function RepoWikiPage() {
     // The server cache was just cleared, so submit a fresh generation task
     // directly. startGeneration() resets all wiki/progress/error state itself.
     await startGeneration();
-  }, [effectiveRepoInfo, language, lang, selectedProviderState, selectedModelState, isCustomSelectedModelState, customSelectedModelState, modelExcludedDirs, modelExcludedFiles, isComprehensiveView, authCode, authRequired, startGeneration]);
+  }, [effectiveRepoInfo, language, lang, targetConfig, modelExcludedDirs, modelExcludedFiles, isComprehensiveView, authCode, authRequired, startGeneration]);
 
   // Start wiki generation when component mounts
   useEffect(() => {
@@ -800,8 +804,7 @@ export default function RepoWikiPage() {
               comprehensive: isComprehensiveView,
               wiki_structure: structureToCache,
               generated_pages: generatedPages,
-              provider: selectedProviderState,
-              model: selectedModelState
+              ...publicTargetOf(targetConfig),
             };
             const response = await fetch(`/api/wiki_cache`, {
               method: 'POST',
@@ -1153,10 +1156,7 @@ export default function RepoWikiPage() {
             <div className={`overflow-y-auto p-4 min-h-0 ${codeViewerOpen ? 'w-3/5' : 'w-full'}`}>
               <Ask
                 repoInfo={effectiveRepoInfo}
-                provider={selectedProviderState ?? ''}
-                model={selectedModelState ?? ''}
-                isCustomModel={isCustomSelectedModelState}
-                customModel={customSelectedModelState ?? ''}
+                target={targetConfig}
                 language={language}
                 onRef={(ref) => (askComponentRef.current = ref)}
                 onOpenCodeViewer={openCodeViewer}
@@ -1193,14 +1193,8 @@ export default function RepoWikiPage() {
       <ModelSelectionModal
         isOpen={isModelSelectionModalOpen}
         onClose={() => setIsModelSelectionModalOpen(false)}
-        provider={selectedProviderState ?? ''}
-        setProvider={setSelectedProviderState}
-        model={selectedModelState ?? ''}
-        setModel={setSelectedModelState}
-        isCustomModel={isCustomSelectedModelState}
-        setIsCustomModel={setIsCustomSelectedModelState}
-        customModel={customSelectedModelState ?? ''}
-        setCustomModel={setCustomSelectedModelState}
+        target={targetConfig}
+        setTarget={setTargetConfig}
         isComprehensiveView={isComprehensiveView}
         setIsComprehensiveView={setIsComprehensiveView}
         showFileFilters={true}

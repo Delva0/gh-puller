@@ -45,8 +45,7 @@ export interface ChatCompletionRequest {
   messages: ChatMessage[];
   token?: string;
   type?: string;
-  provider?: string;
-  model?: string;
+  target?: import('@gh-puller/ui').TargetConfig;
   language?: string;
   research_iteration?: number;
   excluded_dirs?: string;
@@ -133,8 +132,7 @@ export interface CodemapRequest {
   question: string;
   token?: string;
   type?: string;
-  provider?: string;
-  model?: string;
+  target?: import('@gh-puller/ui').TargetConfig;
   language?: string;
   excluded_dirs?: string;
   excluded_files?: string;

@@ -8,25 +8,34 @@ benchmark 评测相关 key 见文末分节)。
 
 import os
 
-# ---- Claude agent(SDK) ----
+# ---- provider 连接配置(全项目统一语义:provider = 模型服务提供方) ----
+# 各 provider 的模型目录/默认 base URL 见 agent.adapters.PROVIDERS;凭证解析优先级
+# 显式 target > 本组环境变量 > SDK 原生登录/默认值(见 adapters.resolve_target)。
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
-CLAUDE_AGENT_MODEL = os.environ.get("CLAUDE_AGENT_MODEL", "")  # 空 → SDK 缺省模型
+ANTHROPIC_BASE_URL = os.environ.get("ANTHROPIC_BASE_URL", "")  # 空 → SDK 原生端点
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL", "")  # 空 → ~/adapters 缺省(官方端点)
+DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")  # 显式走 options.api_key;空由 SDK 读进程环境
+DEEPSEEK_BASE_URL = os.environ.get("DEEPSEEK_BASE_URL", "")  # 端点覆写(本地 proxy/mock),空走官方
 
-# ---- dsh(DeepSeek Harness)agent:SDK 凭证缝读 DEEPSEEK_API_KEY(与 ANTHROPIC 同法) ----
-DSH_MODEL = os.environ.get("DSH_MODEL", "")  # 空 → dsh 组合缺省(deepseek-v4-flash)
+# ---- generator 默认模型(空 → SDK/端点缺省,与 provider 模型目录无关) ----
+CC_MODEL = os.environ.get("CC_MODEL", "")  # cc + anthropic
+DSH_MODEL = os.environ.get("DSH_MODEL", "")  # dsh + deepseek(空 → dsh 组合缺省 deepseek-v4-flash)
+CODEX_MODEL = os.environ.get("CODEX_MODEL", "")  # codex + openai
+LLM_MODEL = os.environ.get("LLM_MODEL", "")  # llm + openai(httpx 直连缺省模型;路由在 base_url 后拼 /chat/completions)
+
+# ---- dsh 运行隔离(非凭证) ----
 DSH_SESSION_ROOT = os.path.expanduser(os.environ.get("DSH_SESSION_ROOT", "~/.gh-puller/dsh-sessions"))
 # runtime 进程 cwd(也是它读取 .env 的加载点):必须远离任务 checkout —— 仓库自带
 # .env(可含 DEEPSEEK_*/其它字面键)会注入子进程(隔离链上唯一真实泄漏口,runtime_cwd
 # 缺省 = 任务仓库 cwd)。cc 路径无此面(SDK 不做 cwd .env 加载)。
 DSH_RUNTIME_CWD = os.path.expanduser(os.environ.get("DSH_RUNTIME_CWD", "~/.gh-puller/dsh-runtime"))
-DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")  # 显式走 options.api_key;空由 SDK 读进程环境
-DEEPSEEK_BASE_URL = os.environ.get("DEEPSEEK_BASE_URL", "")  # 端点覆写(本地 proxy/mock),空走官方
 DEEPWIKI_DSH_CORDIS = os.environ.get("DEEPWIKI_DSH_CORDIS", "")  # 自定义组合文件;空 → 内置最小组合
 
 # codex(OpenAI Codex SDK)无 env 骨架 —— 学 cc 的凭证面:零配置复用本地登录凭证
 # (~/.codex/auth.json 符号链接,见 adapters._codex_home_setup),隔离只管设置面
 # (config.toml/sessions);codex_home/model/token 都是适配器 options API 参数
-# (调用方按需传,经 _codex_options 骨架或在 chat/wik 业务层构造)。
+# (调用方按需传,经 target 绑定的 token/config_overrides 或在 chat/wiki 业务层构造)。
 
 # ---- 产物根目录:repos/ 克隆目录、graphify-out/ 索引、wikicache/ 缓存 ----
 DEEPWIKI_ROOT = os.path.expanduser(os.environ.get("DEEPWIKI_ROOT", "~/.gh-puller/deepwiki"))
@@ -74,12 +83,10 @@ LLM_JUDGE_URL = os.environ.get("LLM_JUDGE_URL", "http://localhost:8000/v1")
 LLM_JUDGE_MODEL = os.environ.get("LLM_JUDGE_MODEL", "Qwen2.5-7B-Instruct")
 LLM_JUDGE_API_KEY = os.environ.get("LLM_JUDGE_API_KEY", "")  # 端点认证密钥,留空不发 Authorization
 
-# ---- wiki 生成器开关与纯 LLM 端点(缺省回退 LLM_JUDGE_* 现值) ----
+# ---- DeepWiki 默认 target(generator/provider;模型/凭证接 target 或各自的 *_MODEL/API_KEY) ----
 # "cc"=Claude Code agent;"dsh"=DeepSeek Harness agent;"codex"=OpenAI Codex agent;"llm"=纯 LLM 单次补全
 DEEPWIKI_GENERATOR = os.environ.get("DEEPWIKI_GENERATOR", "cc")
-DEEPWIKI_LLM_URL = os.environ.get("DEEPWIKI_LLM_URL", LLM_JUDGE_URL)
-DEEPWIKI_LLM_MODEL = os.environ.get("DEEPWIKI_LLM_MODEL", LLM_JUDGE_MODEL)
-DEEPWIKI_LLM_API_KEY = os.environ.get("DEEPWIKI_LLM_API_KEY", LLM_JUDGE_API_KEY)
+DEEPWIKI_PROVIDER = os.environ.get("DEEPWIKI_PROVIDER", "")  # 空 → 各 generator 默认 provider
 
 # Claude 评测器:评分模型(缺省用 SDK 默认模型),需要 ANTHROPIC_API_KEY
 CLAUDE_JUDGE_MODEL = os.environ.get("CLAUDE_JUDGE_MODEL", "")

@@ -27,6 +27,9 @@ put_nowait 到每 sink 的 asyncio.Queue,永不阻塞调用)→ sink worker 消�
 """
 
 from .adapters import (
+                       GENERATORS,
+                       PROVIDERS,
+                       ResolvedTarget,
                        cc_result,
                        cc_stream,
                        cc_text,
@@ -37,8 +40,13 @@ from .adapters import (
                        dsh_result,
                        dsh_stream,
                        dsh_text,
+                       generate_result,
+                       generate_stream,
+                       generate_text,
                        llm_complete,
                        llm_stream,
+                       public_target,
+                       resolve_target,
 )
 from .events import LOG_TYPES, SURFACE_TYPES, TAXONOMY, new_event, truncate, type_of
 from .sinks import EventBus, FileSink, WsSink, configure, ensure_bus
@@ -55,6 +63,14 @@ __all__ = [
     "WsSink",
     "configure",
     "ensure_bus",
+    "GENERATORS",
+    "PROVIDERS",
+    "ResolvedTarget",
+    "resolve_target",
+    "public_target",
+    "generate_stream",
+    "generate_text",
+    "generate_result",
     "cc_stream",
     "cc_text",
     "cc_result",

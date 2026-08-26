@@ -92,7 +92,7 @@ async def _read_single_session(tmp_path) -> list[dict]:
     return [json.loads(line) for line in files[0].read_text(encoding="utf-8").splitlines()]
 
 
-def _assert_flow(events: list[dict], provider: str, model: str) -> None:
+def _assert_flow(events: list[dict], provider: str, model: str, generator: str = "") -> None:
     """断言 FileSink 落盘的会话流符合契约(非流式投影,终态 completed)。
 
     文本产物契约双路取强:折叠 assistant/message 带文本块(非流式后端 +
@@ -103,6 +103,8 @@ def _assert_flow(events: list[dict], provider: str, model: str) -> None:
     assert events[0]["type"] == "session/start", events[0]
     assert events[0]["provider"] == provider, events[0]
     assert events[0]["model"] == model, events[0]
+    if generator:
+        assert events[0]["generator"] == generator, events[0]
     types = [e["type"] for e in events]
     assert "assistant/chunk" not in types, "文件只落非流式事件流(chunk 应被投影剔除)"
     user = next(e for e in events if e["type"] == "user/message")
@@ -131,7 +133,7 @@ async def test_cc_stream_real(tmp_path):
     parts = await _collect(cc_stream(options, "你好", session_name="real:cc", run_id="r-cc"))
     print("cc 回复:", "".join(parts))  # pytest -s 查看真机回显
     assert "".join(parts) != "", "cc 后端应有文本增量"
-    _assert_flow(await _read_single_session(tmp_path), "claude", MODEL)
+    _assert_flow(await _read_single_session(tmp_path), "anthropic", MODEL, generator="cc")
 
 
 @pytest.mark.asyncio
@@ -157,7 +159,7 @@ async def test_llm_stream_real(tmp_path):
     ))
     assert "".join(parts) != "", "llm 后端应有文本增量"
     print("llm 回复:", "".join(parts))  # pytest -s 查看真机回显
-    _assert_flow(await _read_single_session(tmp_path), "openai", MODEL)
+    _assert_flow(await _read_single_session(tmp_path), "openai", MODEL, generator="llm")
 
 
 @pytest.mark.skip(
@@ -186,7 +188,7 @@ async def test_dsh_stream_real(tmp_path):
     parts = await _collect(dsh_stream(options, "你好", session_name="real:dsh", run_id="r-dsh"))
     print("dsh 回复:", "".join(parts))  # pytest -s 查看真机回显
     assert "".join(parts) != "", "dsh 后端应有文本增量"
-    _assert_flow(await _read_single_session(tmp_path), "dsh", MODEL)
+    _assert_flow(await _read_single_session(tmp_path), "deepseek", MODEL, generator="dsh")
 
 
 @pytest.mark.asyncio
@@ -204,4 +206,4 @@ async def test_codex_stream_real(tmp_path):
     parts = await _collect(codex_stream(options, "你好", session_name="real:codex", run_id="r-codex"))
     print("codex 回复:", "".join(parts))  # pytest -s 查看真机回显
     assert "".join(parts) != "", "codex 后端应有文本增量"
-    _assert_flow(await _read_single_session(tmp_path), "codex", MODEL_CODEX)
+    _assert_flow(await _read_single_session(tmp_path), "openai", MODEL_CODEX, generator="codex")

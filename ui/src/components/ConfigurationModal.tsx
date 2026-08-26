@@ -2,8 +2,9 @@
 
 import React, { useState } from 'react';
 import { useLanguage } from '../contexts/LanguageContext';
-import UserSelector from './UserSelector';
+import TargetSelector from './TargetSelector';
 import TokenInput from './TokenInput';
+import type { TargetConfig } from './target';
 
 // UI 语言域收窄为 en/zh(仅此两语种有语言包;多语言由后端生成 wiki 时按 selectedLanguage 定)
 const SUPPORTED_LANGUAGES: Record<string, string> = { en: 'English', zh: 'Mandarin Chinese (中文)' };
@@ -23,15 +24,9 @@ interface ConfigurationModalProps {
   isComprehensiveView: boolean;
   setIsComprehensiveView: (value: boolean) => void;
 
-  // Model selection
-  provider: string;
-  setProvider: (value: string) => void;
-  model: string;
-  setModel: (value: string) => void;
-  isCustomModel: boolean;
-  setIsCustomModel: (value: boolean) => void;
-  customModel: string;
-  setCustomModel: (value: string) => void;
+  // Target (generator/provider/model + 请求态凭证)
+  target: TargetConfig;
+  setTarget: (value: TargetConfig) => void;
 
   // Platform selection
   selectedPlatform: 'github' | 'gitlab' | 'bitbucket';
@@ -70,14 +65,8 @@ export default function ConfigurationModal({
   setSelectedLanguage,
   isComprehensiveView,
   setIsComprehensiveView,
-  provider,
-  setProvider,
-  model,
-  setModel,
-  isCustomModel,
-  setIsCustomModel,
-  customModel,
-  setCustomModel,
+  target,
+  setTarget,
   selectedPlatform,
   setSelectedPlatform,
   accessToken,
@@ -209,17 +198,11 @@ export default function ConfigurationModal({
               </div>
             </div>
 
-            {/* Model Selector */}
+            {/* Target Selector */}
             <div className="mb-4">
-              <UserSelector
-                provider={provider}
-                setProvider={setProvider}
-                model={model}
-                setModel={setModel}
-                isCustomModel={isCustomModel}
-                setIsCustomModel={setIsCustomModel}
-                customModel={customModel}
-                setCustomModel={setCustomModel}
+              <TargetSelector
+                value={target}
+                onChange={setTarget}
                 showFileFilters={true}
                 excludedDirs={excludedDirs}
                 setExcludedDirs={setExcludedDirs}

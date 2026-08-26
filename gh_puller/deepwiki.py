@@ -19,8 +19,9 @@
 - repo 克隆用 git CLI(subprocess,不引 gitpython);远程 URL 的 token 注入沿用原后端三 host 方案。
 - token 上限粗略估算(字符数/4,不引 tiktoken)。
 - 语言仅 en/zh(与前端裁剪的 messages/{en,zh}.json 同步)。
-- 模型:cc 路 claude 单一 provider(CLAUDE_AGENT_MODEL 或 SDK 缺省);
-  llm 路 OpenAI 兼容端点(envs.DEEPWIKI_LLM_URL/MODEL/API_KEY,缺省回退 LLM_JUDGE_*)。
+- 模型:统一 generator/provider/model 三概念(agent.adapters.GENERATORS/PROVIDERS;
+  resolve_target 显式 target > 环境变量 > SDK 缺省);本条四路组合
+  cc+anthropic / dsh+deepseek / codex+openai / llm+openai。
 - 文件过滤为内嵌精简规则(与原 repo.json 全量规则有差异)。
 - 聊天记忆由单次 agent 会话内承,无持久会话库。
 
@@ -32,6 +33,8 @@ HTTP 端点层(FastAPI app/SSE/WS)已迁至 apps/deepwiki-webui/server/app.py。
 """
 
 import asyncio
+import contextlib
+import hashlib
 import json
 import os
 import re
@@ -46,7 +49,7 @@ from claude_agent_sdk import ClaudeAgentOptions, create_sdk_mcp_server, tool
 from pydantic import BaseModel, ConfigDict, Field, computed_field, field_validator
 
 from . import envs, graphify
-from .agent import cc_stream, codex_stream, dsh_stream, llm_complete, llm_stream
+from .agent import generate_result, generate_stream, resolve_target
 from .utils import (
     Repo,
     RepoType,
@@ -430,12 +433,54 @@ Return your analysis in the following XML format:
 # Pydantic 契约模型(与 deepwiki-open api/schemas 同形)
 # ---------------------------------------------------------------------------
 
+
+class TargetInput(BaseModel):
+    """统一 target(请求契约):generator/provider/model 三正交 + 请求态凭证。
+
+    - generator:生成管线(cc/dsh/codex/llm);provider:模型服务提供方
+      (anthropic/deepseek/openai);model:provider 下模型标识。
+    - api_key/base_url 仅存在于请求内存态(绝不落任务状态/成品缓存/URL/
+      事件/错误文本);落盘与摘要只持久化公开三元组(public/public_model)。
+    - 解析回退(显式 target > 环境变量 > SDK 缺省)与组合校验(非法组合/
+      能力不匹配运行前即抛)在 agent.adapters.resolve_target。
+    """
+
+    generator: str = Field("", description="生成管线 id(cc/dsh/codex/llm)")
+    provider: str | None = Field(None, description="provider id(anthropic/deepseek/openai)")
+    model: str | None = Field(None, description="provider 下的模型标识")
+    api_key: str | None = Field(None, description="API key(仅请求态,永不落盘/入事件)")
+    base_url: str | None = Field(None, description="服务端点(仅请求态,永不落盘/入事件)")
+
+    def public_model(self) -> "TargetInput":
+        """公开 target:清空凭证(持久化/摘要用)。"""
+        return TargetInput(generator=self.generator or "", provider=self.provider, model=self.model)
+
+    def merge_creds(self, other: "TargetInput") -> "TargetInput":
+        """公开三元组保持自身;凭证(api_key/base_url)取 other(当前提交;缺省则保留自身)。
+
+        续跑语义:重启续跑时把用户重新提交请求中的凭证合并到已保存状态。
+        """
+        return TargetInput(
+            generator=self.generator,
+            provider=self.provider,
+            model=self.model,
+            api_key=other.api_key or self.api_key,
+            base_url=other.base_url or self.base_url,
+        )
+
+    def resolved(self) -> "Any":
+        """解析 + 组合校验(返回 agent.ResolvedTarget;非法组合运行前即抛)。"""
+        return resolve_target(self)
+
+
 class RepoRequestBase(BaseModel):
     repo_url: str = Field(..., description="URL or local path of the repository")
     type: RepoType = Field("github", description="Repository type")
     token: str | None = Field(None, description="PAT for private repositories")
-    provider: str = Field("claude", description="Model provider")
-    model: str | None = Field(None, description="Model name for the provider")
+    target: TargetInput = Field(
+        default_factory=TargetInput,
+        description="统一 generator/provider/model 与请求态凭证(api_key/base_url 不落盘)",
+    )
     language: str = Field("en", description="Language for content generation")
     excluded_dirs: list[str] = Field(
         default_factory=list,
@@ -452,13 +497,6 @@ class RepoRequestBase(BaseModel):
     included_files: list[str] = Field(
         default_factory=list,
         description="List or newline-separated string of file patterns to include exclusively",
-    )
-    generator: str | None = Field(
-        default=None,
-        description=(
-            "生成模式快照(cc/llm);由 _persist_state 落盘时以 envs.DEEPWIKI_GENERATOR 盖戳,"
-            "续跑时据此校验,防止跨模式混用产物"
-        ),
     )
 
     @field_validator(
@@ -774,25 +812,21 @@ def _graphify_server(repo: Repo):
 def _agent_options(
     system_prompt: str,
     repo: Repo | None,
-    model: str | None = None,
     *,
     agent_output_dir: str | None = None,
     agent_write_mode: bool = False,
 ) -> ClaudeAgentOptions:
-    """组装 agent 选项;repo 非空时挂 graphify 工具并把 cwd 固定到仓库根
-    (SDK 缺省 = 进程 cwd,曾导致 agent 串到 gh-puller 并把 docs 写入其中);
-    model 优先级:envs.CLAUDE_AGENT_MODEL > 请求 model > SDK 缺省。
-    默认模式开放 Read/Grep/Glob(chat/codemap 的 agent 自读代码,无落盘);
-    agent_write_mode(cc 交付件落盘,wiki 结构/页面)在此基础上追加 Write 并提供
-    agent_cache 写目录(add_dirs)与 acceptEdits,成品经 Write 落盘。"""
+    """组装 cc 选项(仅工具/隔离装配;model 与凭证统一经 target 绑定,见
+    generate_stream 的 _bind_cc_options):repo 非空时挂 graphify 工具并把
+    cwd 固定到仓库根(SDK 缺省 = 进程 cwd,曾导致 agent 串到 gh-puller 并把
+    docs 写入其中)。默认模式开放 Read/Grep/Glob(chat/codemap 的 agent 自读代码,
+    无落盘);agent_write_mode(cc 交付件落盘,wiki 结构/页面)在此基础上追加
+    Write 并提供 agent_cache 写目录(add_dirs)与 acceptEdits,成品经 Write 落盘。"""
     kwargs: dict[str, Any] = {
         "system_prompt": system_prompt,
         "include_partial_messages": True,
         "setting_sources": [],  # 完全隔离本地 claude 配置(用户级 MCP/skills/hooks 不掺入 agent)
     }
-    model_name = envs.CLAUDE_AGENT_MODEL or model or ""
-    if model_name:
-        kwargs["model"] = model_name
     if repo is not None:
         kwargs["cwd"] = os.path.abspath(repo.save_path)
         kwargs["mcp_servers"] = {"graphify": _graphify_server(repo)}
@@ -809,7 +843,6 @@ def _agent_options(
 def _dsh_options(
     system_prompt: str,
     repo: Repo | None,
-    model: str | None = None,
     *,
     agent_output_dir: str | None = None,
     agent_write_mode: bool = False,
@@ -821,34 +854,26 @@ def _dsh_options(
       见 _agent_note)—— 本层仅经 envs.DEEPWIKI_DSH_CORDIS 提供显式覆写
       (上层给配置 = 全责,隔离与否由该配置保证);
     - system_prompt 经 env.DSH_SYSTEM_PROMPT 注入组合 persona(cc 同构);
-    - model 优先级 envs.DSH_MODEL > 请求 model > 组合缺省(deepseek-v4-flash);
-    - cwd 固定仓库根(与 cc 同:防 agent 串到 gh-puller 工作区);
-    - 密钥/端点显式走 options.api_key/base_url(空则由 SDK 读进程环境)。
+    - model/api_key/base_url 统一经 target 绑定(见 generate_stream 的
+      _bind_dsh_options;空则由 SDK 读进程环境);
+    - cwd 固定仓库根(与 cc 同:防 agent 串到 gh-puller 工作区)。
     """
     kwargs: dict[str, Any] = {
-        "provider": "deepseek-official",
+        "provider": "deepseek-official",  # dsh SDK 原生 provider 路由名(gh provider id 是 deepseek)
         "session_root": envs.DSH_SESSION_ROOT,
         "runtime_cwd": envs.DSH_RUNTIME_CWD,  # .env 加载点越过任务 checkout(见 envs)
         "env": {"DSH_SYSTEM_PROMPT": system_prompt},
     }
     if envs.DEEPWIKI_DSH_CORDIS:
         kwargs["cordis"] = envs.DEEPWIKI_DSH_CORDIS
-    model_name = envs.DSH_MODEL or model or ""
-    if model_name:
-        kwargs["model"] = model_name
     if repo is not None:
         kwargs["cwd"] = os.path.abspath(repo.save_path)
-    if envs.DEEPSEEK_API_KEY:
-        kwargs["api_key"] = envs.DEEPSEEK_API_KEY
-    if envs.DEEPSEEK_BASE_URL:
-        kwargs["base_url"] = envs.DEEPSEEK_BASE_URL
     return SimpleNamespace(**kwargs)
 
 
 def _codex_options(
     system_prompt: str,
     repo: Repo | None,
-    model: str | None = None,
     *,
     agent_output_dir: str | None = None,
     agent_write_mode: bool = False,
@@ -861,8 +886,8 @@ def _codex_options(
       调用方按需自组 options);
     - system_prompt 经 options.system_prompt → 适配器 thread_start.base_instructions
       (cc 的 system_prompt 同位);
-    - model 取请求参数(cc 的调用方参数同位:envs 层不设 CODEX_MODEL,
-      claude 的 CLAUDE_AGENT_MODEL 是它自己的先例,codex 无对应常量);
+    - model/token/base_url 统一经 target 绑定(见 generate_stream 的
+      _bind_codex_options:model_provider=openai 由绑定层设);
     - cwd 固定仓库根(与 cc 同:防 agent 串到 gh-puller 工作区);
     - sandbox 缺省 full_access(镜像 dsh 组合 danger-full-access 的高自由度;
       可经 options.sandbox 覆写 read_only/workspace_write);
@@ -874,8 +899,6 @@ def _codex_options(
         "sandbox": "full_access",  # 高自由度缺省(镜像 dsh danger-full-access;可覆写)
         "approval_mode": "auto_review",
     }
-    if model:
-        kwargs["model"] = model
     if repo is not None:
         kwargs["cwd"] = os.path.abspath(repo.save_path)
         kwargs["env"] = {"GRAPHIFY_OUT": str(_graph_dir(repo))}
@@ -883,41 +906,54 @@ def _codex_options(
 
 
 async def _agent_stream(
-    system_prompt: str, prompt: str, repo: Repo | None = None, model: str | None = None,
+    target: "TargetInput | dict | None", system_prompt: str, prompt: str,
+    repo: Repo | None = None,
     label: str | None = None, *, run_id: str | None = None,
     context: list[dict] | None = None, retry: dict | None = None,
+    agent_output_dir: str | None = None, agent_write_mode: bool = False,
 ):
-    """agent 流式应答:转发文本增量,语义与旧漏斗逐字节一致(见 agent.cc_stream);
-    envs.DEEPWIKI_GENERATOR == "dsh" 时走 dsh_stream(工具 = dsh 组合原生工具 +
-    graphify MCP,与 cc 工具桌面同构,装载见 _dsh_options);label 作为监控会话名
-    (chat:/codemap:/wiki: 前缀区分用途);run_id 关联任务级会话组;
-    context = 上下文注入/修改说明事件;retry = 重试元数据(见 events.py)。"""
-    if envs.DEEPWIKI_GENERATOR == "dsh":
-        options = _dsh_options(system_prompt, repo, model)
-        async for chunk in dsh_stream(options, prompt, session_name=label, run_id=run_id,
-                                      context=context, retry=retry):
-            yield chunk
-        return
-    if envs.DEEPWIKI_GENERATOR == "codex":
-        options = _codex_options(system_prompt, repo, model)
-        async for chunk in codex_stream(options, prompt, session_name=label, run_id=run_id,
-                                        context=context, retry=retry):
-            yield chunk
-        return
-    options = _agent_options(system_prompt, repo, model)
-    async for chunk in cc_stream(options, prompt, session_name=label, run_id=run_id,
-                                 context=context, retry=retry):
+    """agent 流式应答:统一经 generate_stream 分派(按 target.generator 选
+    cc/dsh/codex 适配器,工具/隔离面经 _target_options 装配,model/凭证由
+    dispatcher 绑定);label 作为监控会话名(chat:/codemap:/wiki: 前缀区分用途);
+    run_id 关联任务级会话组;context = 上下文注入/修改说明事件;
+    retry = 重试元数据(见 events.py)。"""
+    t = resolve_target(target)
+    options = _target_options(t.generator, system_prompt, repo, agent_output_dir=agent_output_dir,
+                              agent_write_mode=agent_write_mode)
+    async for chunk in generate_stream(prompt, target=t, options=options,
+                                       session_name=label, run_id=run_id,
+                                       context=context, retry=retry):
         yield chunk
 
 
-def _agent_note() -> str:
+def _target_options(
+    generator: str, system_prompt: str, repo: Repo | None, *,
+    agent_output_dir: str | None = None, agent_write_mode: bool = False,
+):
+    """按 generator 装配适配器选项(仅工具/隔离面;model/凭证由 dispatcher 绑定)。
+
+    三条 agent 路的工具桌面与运行隔离各有差异(cc:进程内 MCP;dsh:隔离组合
+    内置 mcp-client;codex:隔离 config.toml),各自 options 构建函数承接;
+    llm 路无此层(直接以 payload messages 走 dispatcher)。
+    """
+    if generator == "dsh":
+        return _dsh_options(system_prompt, repo, agent_output_dir=agent_output_dir,
+                            agent_write_mode=agent_write_mode)
+    if generator == "codex":
+        return _codex_options(system_prompt, repo, agent_output_dir=agent_output_dir,
+                              agent_write_mode=agent_write_mode)
+    return _agent_options(system_prompt, repo, agent_output_dir=agent_output_dir,
+                          agent_write_mode=agent_write_mode)
+
+
+def _agent_note(generator: str) -> str:
     """注入到 user 消息的指引段(供 agent 知道用图工具获取带行号的代码上下文)。
 
     dsh/codex 后端的图工具名不同(dsh 经组合内置 mcp-client、codex 经隔离
     config.toml 装载 graphify,对 agent 均为 mcp__graphify__query_graph;cc 为
     graphify_query)—— 指引按后端切换,防 agent 找错工具名而放弃图语境。
     """
-    if envs.DEEPWIKI_GENERATOR in ("dsh", "codex"):
+    if generator in ("dsh", "codex"):
         return (
             "<note>You may use the mcp__graphify__query_graph tool to inspect this "
             "repository's code graph whenever you need code context or exact file/line "
@@ -932,49 +968,34 @@ def _agent_note() -> str:
 
 
 async def _agent_text(
-    system_prompt: str, prompt: str, repo: Repo | None = None, model: str | None = None,
+    target: "TargetInput | dict | None", system_prompt: str, prompt: str,
+    repo: Repo | None = None,
     label: str | None = None, *, run_id: str | None = None,
     context: list[dict] | None = None, retry: dict | None = None,
 ) -> str:
     """agent 整收应答(用于 wiki 结构/页面、codemap 两阶段)。"""
     parts: list[str] = []
-    async for chunk in _agent_stream(system_prompt, prompt, repo, model, label,
+    async for chunk in _agent_stream(target, system_prompt, prompt, repo, label,
                                      run_id=run_id, context=context, retry=retry):
         parts.append(chunk)
     return "".join(parts)
 
 
 async def _agent_write_file(
-    system_prompt: str, prompt: str, repo: Repo, model: str | None, out_path: Path,
+    target: "TargetInput | dict | None", system_prompt: str, prompt: str, repo: Repo,
+    out_path: Path,
     label: str | None = None, *, run_id: str | None = None,
     context: list[dict] | None = None, retry: dict | None = None,
 ) -> str:
-    """cc 交付件统一落盘口:提示词只给路径,agent 用自身工具读码并把成品写入 out_path;
+    """agent 交付件统一落盘口:提示词只给路径,agent 用自身工具读码并把成品写入 out_path;
     产生以文件为准(流式文本仅作监控/错误检测),未产出文件即任务失败。"""
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)  # add_dirs 指向目录须先存在(agent Write 可直接落)
-    if envs.DEEPWIKI_GENERATOR == "dsh":
-        options = _dsh_options(
-            system_prompt, repo, model,
-            agent_output_dir=str(out_path.parent), agent_write_mode=True,
-        )
-        runner = dsh_stream(options, prompt, session_name=label, run_id=run_id,
-                            context=context, retry=retry)
-    elif envs.DEEPWIKI_GENERATOR == "codex":
-        options = _codex_options(
-            system_prompt, repo, model,
-            agent_output_dir=str(out_path.parent), agent_write_mode=True,
-        )
-        runner = codex_stream(options, prompt, session_name=label, run_id=run_id,
-                              context=context, retry=retry)
-    else:
-        options = _agent_options(
-            system_prompt, repo, model,
-            agent_output_dir=str(out_path.parent), agent_write_mode=True,
-        )
-        runner = cc_stream(options, prompt, session_name=label, run_id=run_id,
-                           context=context, retry=retry)
-    async for _ in runner:
+    options = _target_options(resolve_target(target).generator, system_prompt, repo,
+                              agent_output_dir=str(out_path.parent), agent_write_mode=True)
+    async for _ in generate_stream(prompt, target=target, options=options,
+                                   session_name=label, run_id=run_id,
+                                   context=context, retry=retry):
         pass
     text = await asyncio.to_thread(out_path.read_text, encoding="utf-8")
     if not text.strip():
@@ -1260,19 +1281,48 @@ def parse_wiki_structure(text: str, comprehensive: bool) -> WikiStructureModel:
 # ---------------------------------------------------------------------------
 
 
-def _wiki_cache_path(owner: str, repo: str, repo_type: str, language: str) -> str:
-    filename = f"{_WIKI_PREFIX}{repo_type}_{owner}_{repo}_{language}.json"
+def _target_digest(public: tuple[str, str, str]) -> str:
+    """公开 target(generator,provider,model)的稳定摘要(8 hex)。
+
+    任务 id / 续跑状态 / 成品缓存路径共用:同一仓库与语言下不同 target 的
+    结果可以并发并存(生成模式/提供方/模型各自隔离)。
+    """
+    return hashlib.sha1("|".join(public).encode()).hexdigest()[:8]
+
+
+def _request_digest(target: Any = None) -> str:
+    """请求 target → 摘要(空 target 走 env 缺省解析,与运行期一致)。"""
+    return _target_digest(resolve_target(target).public())
+
+
+def _cache_identity(cache: "WikiCacheData") -> tuple[str, str, str]:
+    """缓存内记录的 target 三元组(旧缓存字段缺省 → 空串)。"""
+    return (cache.generator or "", cache.provider or "", cache.model or "")
+
+
+def _cache_target_matches(cache: "WikiCacheData", public: tuple[str, str, str]) -> bool:
+    """成品缓存与公开 target 是否同轨(摘要隔离后的二次校验,防手改文件名)。"""
+    return _cache_identity(cache) == public
+
+
+def _wiki_cache_path(
+    owner: str, repo: str, repo_type: str, language: str, digest: str = ""
+) -> str:
+    suffix = f"_{digest}" if digest else ""
+    filename = f"{_WIKI_PREFIX}{repo_type}_{owner}_{repo}_{language}{suffix}.json"
     return os.path.join(_WIKI_CACHE_DIR, filename)
 
 
-def wiki_cache_exists(owner: str, repo: str, repo_type: str, language: str) -> bool:
-    return os.path.exists(_wiki_cache_path(owner, repo, repo_type, language))
+def wiki_cache_exists(owner: str, repo: str, repo_type: str, language: str, digest: str = "") -> bool:
+    return os.path.exists(_wiki_cache_path(owner, repo, repo_type, language, digest))
 
 
-async def read_wiki_cache(owner: str, repo: str, repo_type: str, language: str) -> WikiCacheData | None:
-    if not wiki_cache_exists(owner, repo, repo_type, language):
+async def read_wiki_cache(
+    owner: str, repo: str, repo_type: str, language: str, digest: str = ""
+) -> WikiCacheData | None:
+    if not wiki_cache_exists(owner, repo, repo_type, language, digest):
         return None
-    path = _wiki_cache_path(owner, repo, repo_type, language)
+    path = _wiki_cache_path(owner, repo, repo_type, language, digest)
     try:
         text = await asyncio.to_thread(lambda: Path(path).read_text(encoding="utf-8"))
         return WikiCacheData.model_validate_json(text)
@@ -1282,9 +1332,10 @@ async def read_wiki_cache(owner: str, repo: str, repo_type: str, language: str) 
 
 
 async def save_wiki_cache(
-    owner: str, repo: str, repo_type: str, language: str, wiki_cache: WikiCacheData
+    owner: str, repo: str, repo_type: str, language: str,
+    wiki_cache: WikiCacheData, digest: str = "",
 ) -> bool:
-    path = _wiki_cache_path(owner, repo, repo_type, language)
+    path = _wiki_cache_path(owner, repo, repo_type, language, digest)
     try:
         await asyncio.to_thread(
             lambda: Path(path).write_text(wiki_cache.model_dump_json(), encoding="utf-8")
@@ -1295,28 +1346,40 @@ async def save_wiki_cache(
         return False
 
 
-async def delete_wiki_cache(owner: str, repo: str, repo_type: str, language: str) -> bool:
-    path = _wiki_cache_path(owner, repo, repo_type, language)
-    state_path = _wiki_state_path(owner, repo, repo_type, language)
+async def delete_wiki_cache(
+    owner: str, repo: str, repo_type: str, language: str, digest: str = ""
+) -> bool:
+    path = _wiki_cache_path(owner, repo, repo_type, language, digest)
     deleted = False
     if os.path.exists(path):
         os.remove(path)
         deleted = True
-    if os.path.exists(state_path):  # 删除缓存同时清续跑状态,避免裸 state 无清理途径
-        os.remove(state_path)
-        deleted = True
+    # 删除缓存同时清续跑状态(本 target + 旧格式无摘要文件),避免裸 state 无清理途径
+    for state_path in (_wiki_state_path(owner, repo, repo_type, language, digest),
+                       _wiki_state_path(owner, repo, repo_type, language)):
+        if os.path.exists(state_path):
+            os.remove(state_path)
+            deleted = True
     return deleted
 
 
-def _wiki_state_path(owner: str, repo: str, repo_type: str, language: str) -> str:
-    filename = f"{_WIKI_STATE_PREFIX}{repo_type}_{owner}_{repo}_{language}.json"
+def _wiki_state_path(
+    owner: str, repo: str, repo_type: str, language: str, digest: str = ""
+) -> str:
+    suffix = f"_{digest}" if digest else ""
+    filename = f"{_WIKI_STATE_PREFIX}{repo_type}_{owner}_{repo}_{language}{suffix}.json"
     return os.path.join(_WIKI_CACHE_DIR, filename)
 
 
 async def write_wiki_task_state(state: WikiTaskState) -> bool:
-    """原子写生成状态(先写 .tmp 再 os.replace,崩溃不产生半截文件)。"""
+    """原子写生成状态(先写 .tmp 再 os.replace,崩溃不产生半截文件)。
+
+    路径带公开 target 摘要(与成品缓存同规则):不同 target 的续跑状态并存。
+    状态内 request.target 恒为 public_model(凭证已剥离)。
+    """
     path = _wiki_state_path(
-        state.request.owner, state.request.repo, state.request.type, state.request.language
+        state.request.owner, state.request.repo, state.request.type, state.request.language,
+        digest=_target_digest(resolve_target(state.request.target).public()),
     )
     tmp = f"{path}.tmp"
     try:
@@ -1327,18 +1390,16 @@ async def write_wiki_task_state(state: WikiTaskState) -> bool:
         return True
     except OSError as e:
         _log(f"写生成状态失败: {path} - {e}")
-        try:
+        with contextlib.suppress(OSError):
             os.remove(tmp)
-        except OSError:
-            pass
         return False
 
 
 async def read_wiki_task_state(
-    owner: str, repo: str, repo_type: str, language: str
+    owner: str, repo: str, repo_type: str, language: str, digest: str = ""
 ) -> WikiTaskState | None:
     """读取生成状态;无文件或解析失败 → None(自动降级为全新生成)。"""
-    path = _wiki_state_path(owner, repo, repo_type, language)
+    path = _wiki_state_path(owner, repo, repo_type, language, digest)
     if not os.path.exists(path):
         return None
     try:
@@ -1349,8 +1410,10 @@ async def read_wiki_task_state(
         return None
 
 
-async def delete_wiki_task_state(owner: str, repo: str, repo_type: str, language: str) -> bool:
-    path = _wiki_state_path(owner, repo, repo_type, language)
+async def delete_wiki_task_state(
+    owner: str, repo: str, repo_type: str, language: str, digest: str = ""
+) -> bool:
+    path = _wiki_state_path(owner, repo, repo_type, language, digest)
     if not os.path.exists(path):
         return False
     os.remove(path)
@@ -1358,11 +1421,16 @@ async def delete_wiki_task_state(owner: str, repo: str, repo_type: str, language
 
 
 async def _persist_state(task: "WikiTask") -> None:
-    """把任务当前进度落盘(结构/已完成页/状态);并发写由模块锁串行。"""
-    # 写盘即盖戳生成模式:续跑(load_resume)据此校验,跨模式切换后丢弃旧快照
-    task.request.generator = envs.DEEPWIKI_GENERATOR
+    """把任务当前进度落盘(结构/已完成页/状态);并发写由模块锁串行。
+
+    落盘即剥离凭证:request.target 存 public_model(只含 generator/provider/model),
+    续跑合并用户重新提交的凭证(见 load_resume)。
+    """
+    request = task.request.model_copy(
+        update={"target": task.request.target.public_model()}
+    )
     state = WikiTaskState(
-        request=task.request,
+        request=request,
         status=task.status,
         wiki_structure=task.wiki_structure,
         generated_pages=dict(task.generated_pages),  # 浅拷贝快照:WikiPage 只整替换、不原地改
@@ -1385,16 +1453,17 @@ async def list_wiki_cache() -> list[WikiTaskSummary]:
         file_path = os.path.join(_WIKI_CACHE_DIR, filename)
         try:
             stats = await asyncio.to_thread(os.stat, file_path)
-            repo_type, owner, *repo, language = (
-                os.path.splitext(filename)[0].removeprefix(_WIKI_PREFIX).split("_")
-            )
+            parts = os.path.splitext(filename)[0].removeprefix(_WIKI_PREFIX).split("_")
+            # 列尾 _<digest8> 为公开 target 摘要(同一仓库多 target 并存);缺省无摘要(旧缓存兼容)
+            has_digest = len(parts) > 1 and len(parts[-1]) == 8 and re.fullmatch(r"[0-9a-f]+", parts[-1])
+            language_idx = -2 if has_digest else -1
             entries.append(
                 WikiTaskSummary(
                     id=filename,
-                    owner=owner,
-                    repo="_".join(repo),
-                    repo_type=repo_type,
-                    language=language,
+                    owner=parts[1],
+                    repo="_".join(parts[2:language_idx]),
+                    repo_type=parts[0],
+                    language=parts[language_idx],
                     submitted_at=int(stats.st_mtime * 1000),
                     status=TaskStatus.COMPLETED,
                 )
@@ -1505,8 +1574,8 @@ def _resolve_chat_continuation(last: ChatMessage, messages: list[ChatMessage]) -
 
 
 async def chat_stream(request: ChatCompletionRequest):
-    """一次 chat 请求的流式应答(纯文本 chunk 序列,前后端协议同原 research_chat);按 generator 双路。"""
-    async for chunk in _service_pipeline().chat_stream(request):
+    """一次 chat 请求的流式应答(纯文本 chunk 序列,前后端协议同原 research_chat);按 target.generator 分派双路。"""
+    async for chunk in _service_pipeline(request.target).chat_stream(request):
         yield chunk
 
 
@@ -1516,8 +1585,8 @@ async def chat_stream(request: ChatCompletionRequest):
 # ---------------------------------------------------------------------------
 
 async def generate_codemap(request: CodeMapRequest):
-    """两阶段 codemap 生成(骨架 → 指南/图),NDJSON 事件流;阶段失败语义与原相同;按 generator 双路。"""
-    async for ev in _service_pipeline().generate_codemap(request):
+    """两阶段 codemap 生成(骨架 → 指南/图),NDJSON 事件流;阶段失败语义与原相同;按 target.generator 分派双路。"""
+    async for ev in _service_pipeline(request.target).generate_codemap(request):
         yield ev
 
 
@@ -1554,12 +1623,14 @@ class WikiTask(Task):
 
     @property
     def key(self) -> str:
-        return self.repo_key
+        """注册表去重键 = repo 键 + 公开 target 稳定摘要:同一仓库/语言下
+        不同 target 的任务可并发并存(隔离生成产物与续跑状态)。"""
+        return f"{self.repo_key}@{_request_digest(self.request.target)}"
 
     def to_status(self) -> WikiTaskStatus:
         r = self.request
         return WikiTaskStatus(
-            id=self.repo_key,
+            id=self.key,
             owner=r.owner,
             repo=r.repo,
             repo_type=r.type,
@@ -1576,7 +1647,7 @@ class WikiTask(Task):
     def to_summary(self) -> WikiTaskSummary:
         r = self.request
         return WikiTaskSummary(
-            id=self.repo_key,
+            id=self.key,
             owner=r.owner,
             repo=r.repo,
             repo_type=r.type,
@@ -1598,38 +1669,41 @@ class WikiTaskRegistry(TaskRegistry):
 
     async def is_cached(self, task: WikiTask) -> bool:
         r = task.request
-        if not wiki_cache_exists(owner=r.owner, repo=r.repo, repo_type=r.type, language=r.language):
-            return False
-        cache = await read_wiki_cache(r.owner, r.repo, r.type, r.language)
+        public = resolve_target(r.target).public()
+        cache = await read_wiki_cache(
+            r.owner, r.repo, r.type, r.language, digest=_target_digest(public)
+        )
         if cache is None:
             return False
-        if cache.generator != envs.DEEPWIKI_GENERATOR:
-            _log(
-                f"成品缓存生成模式不匹配({cache.generator!r} vs {envs.DEEPWIKI_GENERATOR!r}),"
-                f"忽略并重新生成: {r.owner}/{r.repo}"
-            )
-            return False
-        return True
+        # 生成模式快照与缓存内记录对齐(旧缓存无 generator/provider → 判不匹配,重新生成)
+        if _cache_target_matches(cache, public):
+            return True
+        _log(
+            f"成品缓存 target 不匹配({_cache_identity(cache)!r} vs {public!r}),"
+            f"忽略并重新生成: {r.owner}/{r.repo}"
+        )
+        return False
 
     async def on_cache_hit(self, task: WikiTask) -> None:
         r = task.request
-        await delete_wiki_task_state(r.owner, r.repo, r.type, r.language)
+        await delete_wiki_task_state(
+            r.owner, r.repo, r.type, r.language, digest=_request_digest(r.target)
+        )
 
     async def load_resume(self, task: WikiTask) -> WikiTask | None:
         r = task.request
-        state = await read_wiki_task_state(r.owner, r.repo, r.type, r.language)
+        state = await read_wiki_task_state(
+            r.owner, r.repo, r.type, r.language, digest=_request_digest(r.target)
+        )
         if state is None:
             return None
-        # 快照含首次输入(含 generator):生成模式不同则丢弃旧进度并清状态,避免跨模式混用产物
-        if state.request.generator != envs.DEEPWIKI_GENERATOR:
-            _log(
-                f"续跑状态生成模式不匹配({state.request.generator!r} vs {envs.DEEPWIKI_GENERATOR!r}),"
-                f"丢弃旧快照: {r.owner}/{r.repo}"
-            )
-            await delete_wiki_task_state(r.owner, r.repo, r.type, r.language)
-            return None
+        # 状态文件按 target 摘要隔离(同仓库不同 target 并存);凭证从当前提交合并
+        # (落盘状态只存公开三元组,见 _persist_state)
+        merged = state.request.model_copy(
+            update={"target": state.request.target.public_model().merge_creds(r.target)}
+        )
         return WikiTask(
-            request=state.request,
+            request=merged,
             status=(
                 TaskStatus.GENERATING
                 if state.wiki_structure is not None
@@ -1655,8 +1729,8 @@ registry = WikiTaskRegistry(
 
 # ---------------------------------------------------------------------------
 # 双路包装类:llm 路与 agent(cc/dsh)路对外 API 的统一入口。
-# 分派:wiki 生成(结构/页面)按 envs.DEEPWIKI_GENERATOR 经 _wiki_pipeline() 选择;
-#       chat / codemap 同开关经 _service_pipeline()(均读 envs,不区分恒 agent)。
+# 分派:wiki 生成(结构/页面)按 target.generator 经 _wiki_pipeline() 选择;
+#       chat / codemap 同开关经 _service_pipeline()(target 缺省走 env 默认)。
 # 边界:语义属于单路生成协议的 helper(提示词组装/历史转写/检索上下文注入/
 # agent 交付件路径/llm 一次问答生成链)收进对应 pipeline 类为 self._xxx();
 # 共用构建件与低层支撑(共享提示词段、XML 解析/引用后处理、图索引、任务状态机、
@@ -1724,8 +1798,9 @@ IMPORTANT:You MUST respond in {language_name} language.
 </guidelines>"""
 
     def _proj_key(self, r: Any) -> str:
-        """项目键 {type}_{owner}_{repo}(如 local_local_deepwiki-open,与 _wiki_cache_path 命名对齐)。"""
-        return _sanitize_path_seg(f"{r.type}_{r.owner}_{r.repo}")
+        """项目键 {type}_{owner}_{repo}_{digest}:digest = 公开 target 稳定摘要
+        (同一仓库/语言下不同 target 的交付文件并存,与成品缓存同规则)。"""
+        return _sanitize_path_seg(f"{r.type}_{r.owner}_{r.repo}_{_request_digest(r.target)}")
 
     def _agent_cache_dir(self, r: Any) -> Path:
         return Path(_WIKI_CACHE_DIR) / _AGENT_CACHE_DIRNAME / self._proj_key(r)
@@ -1788,10 +1863,10 @@ IMPORTANT:You MUST respond in {language_name} language.
             prompt = self._build_structure_prompt(
                 r.owner, r.repo, "\n".join(file_tree), readme_path,
                 os.path.abspath(repo.save_path), r.comprehensive, r.language,
-                str(struct_path),
+                str(struct_path), generator=resolve_target(r.target).generator,
             )
             content = await _agent_write_file(
-                "", prompt, repo, r.model, struct_path, label="wiki:structure",
+                r.target, "", prompt, repo, struct_path, label="wiki:structure",
                 run_id=task.repo_key,
             )
         return parse_wiki_structure(content, comprehensive=r.comprehensive)
@@ -1800,6 +1875,7 @@ IMPORTANT:You MUST respond in {language_name} language.
     def _build_structure_prompt(
         owner: str, repo_name: str, file_tree: str, readme_path: str | None,
         repo_root: str, comprehensive: bool, language: str, out_path: str,
+        generator: str = "cc",
     ) -> str:
         """cc(agent)结构提示词(现代 agent 风格):输入只给路径(文件树+README 路径),不内联内容;
         成品 XML 由 agent 用 Write 工具直接落盘 out_path,而不是作为 result 文本返回。"""
@@ -1851,7 +1927,7 @@ IMPORTANT:
 2. Each page should focus on a specific aspect of the codebase (e.g., architecture, key features, setup)
 3. The relevant_files should be actual files from the repository that would be used to generate that page
 4. Do not inline file contents into this prompt — use your tools to read the files.
-{_agent_note()}"""
+{_agent_note(generator)}"""
 
     @staticmethod
     def _build_page_prompt(title: str, file_paths: list[str], out_path: str, language: str) -> str:
@@ -1875,9 +1951,12 @@ IMPORTANT:
         out_path = self._agent_cache_page_path(r, page.id)
         if out_path.exists():
             return await asyncio.to_thread(out_path.read_text, encoding="utf-8")
-        prompt = _agent_note() + self._build_page_prompt(page.title, list(page.filePaths), str(out_path), r.language)
+        generator = resolve_target(r.target).generator
+        prompt = _agent_note(generator) + self._build_page_prompt(
+            page.title, list(page.filePaths), str(out_path), r.language
+        )
         return await _agent_write_file(
-            "", prompt, repo, r.model, out_path, label=f"wiki:page:{page.id}",
+            r.target, "", prompt, repo, out_path, label=f"wiki:page:{page.id}",
             run_id=task.repo_key,
         )
 
@@ -1930,15 +2009,16 @@ IMPORTANT:
 
         # 对话历史自然转写(无 <turn> 伪标签);输入过大时省略历史。
         # 裁剪/注记作为监控上下文说明事件(context/modify|inject)伴跑,不改变折叠结果
+        generator = resolve_target(request.target).generator
         history, context = self._render_natural_history(request.messages)
         context.append({"type": "context/inject",
                         "data": {"target": "user-message", "phase": "prompt-assembly",
-                                 "provenance": "deepwiki:note", "text": _agent_note()}})
+                                 "provenance": "deepwiki:note", "text": _agent_note(generator)}})
 
-        prompt = history + _agent_note() + f"<query>\n{last.content}\n</query>\n\nAssistant: "
+        prompt = history + _agent_note(generator) + f"<query>\n{last.content}\n</query>\n\nAssistant: "
         try:
             async for chunk in _agent_stream(
-                system, prompt, repo=repo, model=request.model, label=f"chat:{repo.name}",
+                request.target, system, prompt, repo=repo, label=f"chat:{repo.name}",
                 run_id=f"chat:{repo.name}", context=context,
             ):
                 yield chunk
@@ -1973,8 +2053,8 @@ IMPORTANT:
             for attempt in range(1, attempts + 1):
                 try:
                     raw = await _agent_text(
-                        _CODEMAP_SKELETON_PROMPT.format(**fmt), prompt, repo=repo,
-                        model=request.model, label="codemap:skeleton",
+                        request.target, _CODEMAP_SKELETON_PROMPT.format(**fmt), prompt, repo=repo,
+                        label="codemap:skeleton",
                         run_id=f"codemap:{repo.name}",
                         retry={"attempt": attempt, "prev_error": str(last_error)} if last_error else None,
                     )
@@ -2004,8 +2084,8 @@ IMPORTANT:
         final = skeleton
         try:
             raw = await _agent_text(
-                _CODEMAP_ENRICH_PROMPT.format(**fmt), enrich_prompt, repo=repo,
-                model=request.model, label="codemap:enrich", run_id=f"codemap:{repo.name}",
+                request.target, _CODEMAP_ENRICH_PROMPT.format(**fmt), enrich_prompt, repo=repo,
+                label="codemap:enrich", run_id=f"codemap:{repo.name}",
             )
             final = CodeMap.model_validate(_extract_json(raw))
             yield _phase("diagrams", "done")
@@ -2261,44 +2341,40 @@ IMPORTANT:You MUST respond in {language_name} language.
             "maximum context length", "token limit", "too many tokens",
         ))
 
-    async def _llm_stream_user(self, prompt: str, *, session_name: str, run_id: str,
+    async def _llm_stream_user(self, prompt: str, *, target, session_name: str, run_id: str,
                                context: list[dict] | None = None):
-        """llm 路统一流式补全口(OpenAI 兼容端点;单条 user 消息,同原版 streamer;
-        envs 调用时解析,测试 monkeypatch 生效)。"""
-        async for chunk in llm_stream(
-            url=envs.DEEPWIKI_LLM_URL,
-            payload={"model": envs.DEEPWIKI_LLM_MODEL,
-                     "messages": [{"role": "user", "content": prompt}]},
-            api_key=envs.DEEPWIKI_LLM_API_KEY or None,
+        """llm 路统一流式补全口(经 generate_stream 分派:model/url/api_key 由 target
+        绑定,显式 target > env > provider 缺省;单条 user 消息,同原版 streamer)。"""
+        async for chunk in generate_stream(
+            "", target=target,
+            options={"messages": [{"role": "user", "content": prompt}]},
             session_name=session_name, run_id=run_id, context=context,
         ):
             yield chunk
 
-    async def _llm_complete_user(self, prompt: str, *, session_name: str, run_id: str,
+    async def _llm_complete_user(self, prompt: str, *, target, session_name: str, run_id: str,
                                  context: list[dict] | None = None) -> str:
-        """llm 路统一整收补全口(OpenAI 兼容端点;单条 user 消息;envs 调用时解析)。"""
-        return await llm_complete(
-            url=envs.DEEPWIKI_LLM_URL,
-            payload={"model": envs.DEEPWIKI_LLM_MODEL,
-                     "messages": [{"role": "user", "content": prompt}]},
-            api_key=envs.DEEPWIKI_LLM_API_KEY or None,
+        """llm 路统一整收补全口(经 generate_result 分派;单条 user 消息)。"""
+        return await generate_result(
+            "", target=target,
+            options={"messages": [{"role": "user", "content": prompt}]},
             session_name=session_name, run_id=run_id, context=context,
         )
 
     async def _llm_research_chat(
-        self, system: str, query: str, *, repo: Repo, session_name: str, run_id: str,
+        self, system: str, query: str, *, target, repo: Repo, session_name: str, run_id: str,
         conversation_history: str = "",
     ):
         """原版 research_chat 等价(LLM 路流式):见 _llm_research_stream 所述语义;
         失败语义与原版一致(错误文本进流,不抛出)。"""
         async for chunk in self._llm_research_stream(
-            system, query, repo=repo, session_name=session_name, run_id=run_id,
+            system, query, target=target, repo=repo, session_name=session_name, run_id=run_id,
             conversation_history=conversation_history,
         ):
             yield chunk
 
     async def _llm_research_stream(
-        self, system: str, query: str, *, repo: Repo, session_name: str, run_id: str,
+        self, system: str, query: str, *, target, repo: Repo, session_name: str, run_id: str,
         conversation_history: str = "",
     ):
         """原版 research_chat 语义(LLM 路逐段对齐):
@@ -2342,7 +2418,7 @@ IMPORTANT:You MUST respond in {language_name} language.
         )
         try:
             async for chunk in self._llm_stream_user(
-                prompt, session_name=session_name, run_id=run_id, context=context,
+                prompt, target=target, session_name=session_name, run_id=run_id, context=context,
             ):
                 yield chunk
         except Exception as e:
@@ -2350,7 +2426,8 @@ IMPORTANT:You MUST respond in {language_name} language.
                 _log("token 超限,简化为无检索上下文重试")
                 try:
                     async for chunk in self._llm_stream_user(
-                        simplified, session_name=session_name, run_id=run_id, context=context,
+                        simplified, target=target, session_name=session_name, run_id=run_id,
+                        context=context,
                     ):
                         yield chunk
                 except Exception as e2:  # noqa: BLE001 - 简化重试失败 → 致歉文本(原版同式)
@@ -2375,7 +2452,7 @@ IMPORTANT:You MUST respond in {language_name} language.
         system = _SIMPLE_CHAT_SYSTEM_PROMPT.format(**_format_request_fmt(r))
         parts: list[str] = []
         async for chunk in self._llm_research_chat(
-            system, prompt, repo=repo,
+            system, prompt, target=r.target, repo=repo,
             session_name="wiki:structure", run_id=task.repo_key,
         ):
             parts.append(chunk)
@@ -2424,7 +2501,7 @@ IMPORTANT FORMATTING INSTRUCTIONS:
 IMPORTANT:
 1. Create {page_count} pages that would make a {kind} wiki for this repository
 2. Each page should focus on a specific aspect of the codebase (e.g., architecture, key features, setup)
-3. The relevant_files should be actual files from the repository that would be used to generate that page
+3. The relevant_files should be actual files from the repository used to generate that page
 4. Return ONLY valid XML with the structure specified above, with no markdown code block delimiters"""
 
     async def generate_page(
@@ -2438,7 +2515,7 @@ IMPORTANT:
         system = _SIMPLE_CHAT_SYSTEM_PROMPT.format(**_format_request_fmt(r))
         parts: list[str] = []
         async for chunk in self._llm_research_chat(
-            system, prompt, repo=repo,
+            system, prompt, target=r.target, repo=repo,
             session_name=f"wiki:page:{page.id}", run_id=task.repo_key,
         ):
             parts.append(chunk)
@@ -2472,7 +2549,7 @@ IMPORTANT:
 
         history = self._build_turn_history(request.messages)
         async for chunk in self._llm_research_chat(
-            system, last.content, repo=repo,
+            system, last.content, target=request.target, repo=repo,
             session_name=f"chat:{repo.name}", run_id=f"chat:{repo.name}",
             conversation_history=history,
         ):
@@ -2524,7 +2601,8 @@ IMPORTANT:
             last_error: Exception | None = None
             for attempt in range(1, attempts + 1):
                 raw = await self._llm_complete_user(
-                    prompt, session_name=session_name, run_id=f"codemap:{repo.name}",
+                    prompt, target=request.target,
+                    session_name=session_name, run_id=f"codemap:{repo.name}",
                     context=context,
                 )
                 try:
@@ -2570,18 +2648,21 @@ IMPORTANT:
         yield _event(type="done")
 
 
-def _wiki_pipeline() -> WikiPipeline:
-    """按 envs.DEEPWIKI_GENERATOR 选路;调用时读 envs(测试 monkeypatch 生效)。
+def _wiki_pipeline(target: "TargetInput | dict | None" = None) -> WikiPipeline:
+    """按解析后的 target.generator 选路;调用时解析(测试 monkeypatch envs 生效)。
 
-    agent 类后段(cc/dsh)共用 AgentWikiPipeline —— 内部 _agent_stream/_agent_write_file
-    按开关分派到 cc_stream/dsh_stream,管线逻辑(结构/页面/缓存)后端无关。
+    agent 类后段(cc/dsh/codex)共用 AgentWikiPipeline —— 内部 _agent_stream/
+    _agent_write_file 经 target 分派到 dispatcher,管线逻辑(结构/页面/缓存)后端无关;
+    llm 走 LlmWikiPipeline(原式单次补全)。
     """
-    return AgentWikiPipeline() if envs.DEEPWIKI_GENERATOR in ("cc", "dsh", "codex") else LlmWikiPipeline()
+    gen = resolve_target(target).generator
+    return AgentWikiPipeline() if gen in ("cc", "dsh", "codex") else LlmWikiPipeline()
 
 
-def _service_pipeline() -> WikiPipeline:
-    """chat/codemap 服务分派:与 wiki 同开关(envs.DEEPWIKI_GENERATOR),调用时读 envs(测试 monkeypatch 生效)。"""
-    return AgentWikiPipeline() if envs.DEEPWIKI_GENERATOR in ("cc", "dsh", "codex") else LlmWikiPipeline()
+def _service_pipeline(target: "TargetInput | dict | None" = None) -> WikiPipeline:
+    """chat/codemap 服务分派:与 wiki 同开关(按 target.generator),调用时解析(测试 monkeypatch envs 生效)。"""
+    gen = resolve_target(target).generator
+    return AgentWikiPipeline() if gen in ("cc", "dsh", "codex") else LlmWikiPipeline()
 
 
 
@@ -2595,7 +2676,7 @@ async def generate_repo_wiki(task: WikiTask) -> None:
     r = task.request
     try:
         await _persist_state(task)  # 入口即落盘:中断于索引/结构阶段的也能续跑
-        pipeline = _wiki_pipeline()
+        pipeline = _wiki_pipeline(r.target)
         repo = Repo(r.repo_url, r.type, access_token=r.token)
         # 索引:只建一次(v1 无增量;已存在即跳过)
         if not _index_ready(repo):
@@ -2619,7 +2700,9 @@ async def generate_repo_wiki(task: WikiTask) -> None:
 
         if not await _save(task, pages):
             raise RuntimeError("写 wiki 缓存失败")  # 不删状态:再提交仅重试写缓存
-        await delete_wiki_task_state(r.owner, r.repo, r.type, r.language)
+        await delete_wiki_task_state(
+            r.owner, r.repo, r.type, r.language, digest=_request_digest(r.target)
+        )
         task.status = TaskStatus.COMPLETED
         _log(f"wiki 任务完成: {task.repo_key}")
     except asyncio.CancelledError:  # Ctrl+C/停机:尽力持久化一次后重新抛出
@@ -2633,7 +2716,7 @@ async def generate_repo_wiki(task: WikiTask) -> None:
 
 
 async def _determine_structure(task: WikiTask) -> WikiStructureModel:
-    """确定 wiki 结构(按 DEEPWIKI_GENERATOR 分派 cc/llm);失败上抛使任务 FAILED。"""
+    """确定 wiki 结构(按 target.generator 分派 cc/dsh/codex/llm);失败上抛使任务 FAILED。"""
     r = task.request
     repo = Repo(r.repo_url, r.type, access_token=r.token)
     if not repo.is_local and not repo.downloaded:
@@ -2648,7 +2731,7 @@ async def _determine_structure(task: WikiTask) -> WikiStructureModel:
         r.excluded_files,
         r.excluded_dirs,
     )
-    return await _wiki_pipeline().determine_structure(task, repo, file_tree, readme)
+    return await _wiki_pipeline(task.request.target).determine_structure(task, repo, file_tree, readme)
 
 
 async def _generate_page(task: WikiTask, page: WikiPage) -> WikiPage:
@@ -2657,7 +2740,7 @@ async def _generate_page(task: WikiTask, page: WikiPage) -> WikiPage:
     repo = Repo(r.repo_url, r.type, access_token=r.token)
     ctx = RepoUrlContext(type=r.type, repo_url=r.repo_url, default_branch=task.default_branch)
     file_links = "\n".join(f"- [{p}]({generate_file_url(p, ctx)})" for p in page.filePaths)
-    content = await _wiki_pipeline().generate_page(task, repo, page, file_links)
+    content = await _wiki_pipeline(task.request.target).generate_page(task, repo, page, file_links)
     content = _strip_markdown_fences(content)
     content = post_process_wiki_content(content, list(page.filePaths), ctx)
     return page.model_copy(update={"content": content})
@@ -2673,7 +2756,7 @@ async def _generate_page_with_retry(task: WikiTask, page: WikiPage) -> WikiPage:
             _log(f"页面 {page.id} 生成失败(尝试 {attempt + 1}/{_WIKI_PAGE_RETRIES + 1}): {e}")
     # 重试耗尽:回退错误占位页,保证整个 wiki 仍能完成
     content = f"Error generating content: {last_error}"
-    _wiki_pipeline().write_error_page(task, page, content)
+    _wiki_pipeline(task.request.target).write_error_page(task, page, content)
     return page.model_copy(update={"content": content})
 
 
@@ -2694,10 +2777,8 @@ async def _generate_pages(task: WikiTask, structure: WikiStructureModel) -> dict
             try:
                 task.generated_pages[page.id] = await _generate_page_with_retry(task, page)
             finally:
-                try:
+                with contextlib.suppress(ValueError):
                     task.current_page_ids.remove(page.id)
-                except ValueError:
-                    pass
                 task.pages_done += 1
             await _persist_state(task)  # 每页完成即落盘(锁内串行写)
 
@@ -2707,15 +2788,19 @@ async def _generate_pages(task: WikiTask, structure: WikiStructureModel) -> dict
 
 async def _save(task: WikiTask, pages: dict[str, WikiPage]) -> bool:
     assert task.wiki_structure is not None
+    public = resolve_target(task.request.target).public()
     return await save_wiki_cache(
         owner=task.request.owner,
         repo=task.request.repo,
         repo_type=task.request.type,
         language=task.request.language,
+        digest=_target_digest(public),
         wiki_cache=WikiCacheData(
             wiki_structure=task.wiki_structure,
             generated_pages=pages,
-            generator=envs.DEEPWIKI_GENERATOR,  # 成品缓存记模式,cache 命中时校验
+            generator=public[0],  # 成品缓存记公开 target,cache 命中时校验(见 is_cached)
+            provider=public[1],
+            model=public[2],
             repo=RepoInfo(
                 owner=task.request.owner,
                 repo=task.request.repo,
@@ -2723,8 +2808,6 @@ async def _save(task: WikiTask, pages: dict[str, WikiPage]) -> bool:
                 token=None,  # 缓存文件不落 token
                 repoUrl=task.request.repo_url,
             ),
-            provider=task.request.provider,
-            model=task.request.model,
         ),
     )
 

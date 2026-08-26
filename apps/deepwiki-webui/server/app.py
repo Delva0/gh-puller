@@ -36,6 +36,7 @@ from gh_puller.deepwiki import (
     RepoNotIndexedError,
     RepoPrepareRequest,
     RepoRequestBase,
+    TargetInput,
     WikiCacheData,
     WikiExportRequest,
     WikiTask,
@@ -46,6 +47,7 @@ from gh_puller.deepwiki import (
     _index_ready,
     _log,
     _require_indexed,
+    _request_digest,
     _run_extract,
     chat_stream,
     delete_wiki_cache,
@@ -67,26 +69,56 @@ from gh_puller.utils import (
 # 语言与模型契约(仅 HTTP 层展示用;_LANGUAGE_NAMES 为引擎侧映射)
 _LANG_CONFIG = {"supported_languages": dict(_LANGUAGE_NAMES), "default": "en"}
 
-# 模型配置:仅 claude 单一 provider(与 tools 缺省模型同为 SDK 缺省)
-_CLAUDE_MODELS = [
-    ("claude-haiku-4-5-20251001", "Claude Haiku 4.5"),
-    ("claude-sonnet-5", "Claude Sonnet 5"),
-    ("claude-opus-5", "Claude Opus 5"),
-]
+# 模型/target 契约:唯一真源是 agent.adapters.GENERATORS/PROVIDERS 注册表
+# (generator/provider/model 三正交;openai-compatible 只是 openai+自定义 base_url
+# 的一种部署形态,不单列 provider)。/models/config 为 deepwiki-open 旧契约的
+# 注册表投影(provider id 已按新语义呈现);/generators/config 为新统一契约。
+from gh_puller.agent import GENERATORS as AGENT_GENERATORS
+from gh_puller.agent import PROVIDERS as AGENT_PROVIDERS
 
 
 def _models_config() -> ModelConfig:
+    """旧 /models/config 契约(注册表投影):providers = anthropic/deepseek/openai。
+
+    defaultProvider = 默认 generator(envs.DEEPWIKI_GENERATOR)的默认 provider。
+    """
+    default_provider = AGENT_GENERATORS[envs.DEEPWIKI_GENERATOR].default_provider
     return ModelConfig(
         providers=[
             Provider(
-                id="claude",
-                name="Claude",
-                supportsCustomModel=False,
-                models=[Model(id=mid, name=name) for mid, name in _CLAUDE_MODELS],
+                id=spec.id,
+                name=spec.name,
+                supportsCustomModel=spec.supports_custom_model,
+                models=[Model(id=mid, name=mid) for mid in spec.models],
             )
+            for spec in AGENT_PROVIDERS.values()
         ],
-        defaultProvider="claude",
+        defaultProvider=default_provider,
     )
+
+
+def _generators_config() -> dict:
+    """GET /generators/config:注册表直出(前端唯一真源)。"""
+    return {
+        "generators": [
+            {"id": spec.id, "name": spec.name, "defaultProvider": spec.default_provider,
+             "providers": list(spec.providers), "capability": spec.capability,
+             "defaultModelEnv": spec.default_model_env}
+            for spec in AGENT_GENERATORS.values()
+        ],
+        "providers": [
+            {"id": spec.id, "name": spec.name, "apiKeyEnv": spec.api_key_env,
+             "baseUrlEnv": spec.base_url_env, "baseUrlDefault": spec.base_url_default,
+             "models": list(spec.models), "supportsCustomModel": spec.supports_custom_model}
+            for spec in AGENT_PROVIDERS.values()
+        ],
+        "defaultGenerator": envs.DEEPWIKI_GENERATOR,
+        "defaultTarget": {
+            "generator": envs.DEEPWIKI_GENERATOR,
+            "provider": AGENT_GENERATORS[envs.DEEPWIKI_GENERATOR].default_provider,
+            "model": "",
+        },
+    }
 
 
 app = FastAPI(title="Streaming API", description="DeepWiki 兼容后端 (gh-puller)", version="0.1.0")
@@ -119,6 +151,12 @@ async def lang_config():
 @app.get("/models/config", response_model=ModelConfig)
 async def get_model_config():
     return _models_config()
+
+
+@app.get("/generators/config")
+async def get_generators_config():
+    """统一 target 契约配置(注册表直出):前端 Generator→Provider→Model 选择器唯一真源。"""
+    return _generators_config()
 
 
 @app.get("/auth/status")
@@ -327,16 +365,26 @@ async def get_local_repo_structure(path: str | None = Query(None, description="P
         return JSONResponse(status_code=500, content={"error": f"Error processing local repository: {e}"})
 
 
+def _target_digest_query(generator: str, provider: str, model: str) -> str:
+    """公开 target(generator/provider/model 查询参数)→ 缓存摘要(与引擎侧同规则)。"""
+    return _request_digest(TargetInput(generator=generator or "", provider=provider or None,
+                                       model=model or None))
+
+
 @app.get("/api/wiki_cache", response_model=WikiCacheData | None)
 async def read_wiki(
     owner: str = Query(..., description="Repository owner"),
     repo: str = Query(..., description="Repository name"),
     repo_type: str = Query(..., description="Repository type (e.g. github, gitlab)"),
     language: str = Query(..., description="Language of the wiki content"),
+    generator: str = Query("", description="Generator id (cc/dsh/codex/llm) — public target"),
+    provider: str = Query("", description="Provider id — public target"),
+    model: str = Query("", description="Model id — public target"),
 ):
     if language not in _LANG_CONFIG["supported_languages"]:
         language = _LANG_CONFIG["default"]
-    return await read_wiki_cache(owner, repo, repo_type, language)
+    return await read_wiki_cache(owner, repo, repo_type, language,
+                                 digest=_target_digest_query(generator, provider, model))
 
 
 @app.delete("/api/wiki_cache")
@@ -346,6 +394,9 @@ async def delete_wiki(
     repo_type: str = Query(..., description="Repository type (e.g. github, gitlab)"),
     language: str = Query(..., description="Language of the wiki content"),
     authorization_code: str | None = Query(None, description="Authorization code"),
+    generator: str = Query("", description="Generator id (cc/dsh/codex/llm) — public target"),
+    provider: str = Query("", description="Provider id — public target"),
+    model: str = Query("", description="Model id — public target"),
 ):
     if language not in _LANG_CONFIG["supported_languages"]:
         raise HTTPException(status_code=400, detail="Language is not supported")
@@ -353,7 +404,10 @@ async def delete_wiki(
         if not authorization_code or authorization_code != envs.WIKI_AUTH_CODE:
             raise HTTPException(status_code=401, detail="Authorization code is invalid")
     try:
-        deleted = await delete_wiki_cache(owner, repo, repo_type, language)
+        deleted = await delete_wiki_cache(
+            owner, repo, repo_type, language,
+            digest=_target_digest_query(generator, provider, model),
+        )
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"Failed to delete wiki cache: {e}")
     if deleted:

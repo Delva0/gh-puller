@@ -3,11 +3,12 @@
 export { default as Markdown } from './components/Markdown';
 export { default as ThemeToggle } from './components/ThemeToggle';
 export { default as StateBadge } from './components/StateBadge';
-export { default as UserSelector } from './components/UserSelector';
+export { default as TargetSelector } from './components/TargetSelector';
 export { default as TokenInput } from './components/TokenInput';
 export { default as ConfigurationModal } from './components/ConfigurationModal';
 export { default as WikiTypeSelector } from './components/WikiTypeSelector';
 export { default as ModelSelectionModal } from './components/ModelSelectionModal';
+export * from './components/target';
 export type { CodeTarget } from './components/CodeViewer';
 export type { PhaseStatus } from './components/CodeMap';
 export { default as WikiTreeView } from './components/WikiTreeView';

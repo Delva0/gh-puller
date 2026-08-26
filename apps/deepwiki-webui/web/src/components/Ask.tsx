@@ -2,7 +2,7 @@
 
 import React, {useState, useRef, useEffect} from 'react';
 import { FaChevronLeft, FaChevronRight, FaBolt, FaMicroscope, FaBook, FaChevronDown, FaCheck } from 'react-icons/fa';
-import { Markdown, ModelSelectionModal, useLanguage } from '@gh-puller/ui';
+import { Markdown, ModelSelectionModal, useLanguage, type TargetConfig } from '@gh-puller/ui';
 import CodeMap from '@gh-puller/ui/components/CodeMap';
 import type { CodeTarget, PhaseStatus } from '@gh-puller/ui';
 import RepoInfo from '@/types/repoinfo';
@@ -37,18 +37,6 @@ const MODES: { id: ChatMode; label: string; description: string; icon: React.Rea
   { id: 'deep_research', label: 'Deep Research', description: 'More thorough investigation', icon: <FaMicroscope size={14} /> },
   { id: 'codemap', label: 'Codemap', description: 'Structured explanation grounded in code', icon: <FaBook size={14} /> },
 ];
-
-interface Model {
-  id: string;
-  name: string;
-}
-
-interface Provider {
-  id: string;
-  name: string;
-  models: Model[];
-  supportsCustomModel?: boolean;
-}
 
 interface Message {
   role: 'user' | 'assistant' | 'system';
@@ -91,10 +79,8 @@ type ConversationTurn = ChatTurn | CodemapTurn;
 
 interface AskProps {
   repoInfo: RepoInfo;
-  provider?: string;
-  model?: string;
-  isCustomModel?: boolean;
-  customModel?: string;
+  /** 统一 target(公开三元组 + 请求态凭证);随请求体嵌套下发,不再用扁平 provider/model */
+  target?: TargetConfig;
   language?: string;
   onRef?: (ref: { clearConversation: () => void }) => void;
   // Notifies the parent to open the right-side code viewer (rendered at the
@@ -107,10 +93,7 @@ interface AskProps {
 
 const Ask: React.FC<AskProps> = ({
   repoInfo,
-  provider = '',
-  model = '',
-  isCustomModel = false,
-  customModel = '',
+  target = { generator: '', provider: '', model: '' },
   language = 'en',
   onRef,
   onOpenCodeViewer,
@@ -131,11 +114,8 @@ const Ask: React.FC<AskProps> = ({
   const [codemapPhaseStatus, setCodemapPhaseStatus] =
     useState<Record<CodemapPhase, PhaseStatus>>(IDLE_PHASES);
 
-  // Model selection state
-  const [selectedProvider, setSelectedProvider] = useState(provider);
-  const [selectedModel, setSelectedModel] = useState(model);
-  const [isCustomSelectedModel, setIsCustomSelectedModel] = useState(isCustomModel);
-  const [customSelectedModel, setCustomSelectedModel] = useState(customModel);
+  // Target(generator/provider/model + 请求态凭证)选择状态
+  const [localTarget, setLocalTarget] = useState<TargetConfig>(target);
   const [isModelSelectionModalOpen, setIsModelSelectionModalOpen] = useState(false);
   const [isComprehensiveView, setIsComprehensiveView] = useState(true);
 
@@ -155,8 +135,7 @@ const Ask: React.FC<AskProps> = ({
   const inputRef = useRef<HTMLInputElement>(null);
   const responseRef = useRef<HTMLDivElement>(null);
   const conversationEndRef = useRef<HTMLDivElement>(null);
-  const providerRef = useRef(provider);
-  const modelRef = useRef(model);
+  const targetRef = useRef<TargetConfig>(target);
 
   // Focus input on component mount
   useEffect(() => {
@@ -190,45 +169,8 @@ const Ask: React.FC<AskProps> = ({
   }, []);
 
   useEffect(() => {
-    providerRef.current = provider;
-    modelRef.current = model;
-  }, [provider, model]);
-
-  useEffect(() => {
-    const fetchModel = async () => {
-      try {
-        setIsLoading(true);
-
-        const response = await fetch('/api/models/config');
-        if (!response.ok) {
-          throw new Error(`Error fetching model configurations: ${response.status}`);
-        }
-
-        const data = await response.json();
-
-        // use latest provider/model ref to check
-        if(providerRef.current == '' || modelRef.current== '') {
-          setSelectedProvider(data.defaultProvider);
-
-          // Find the default provider and set its default model
-          const selectedProvider = data.providers.find((p:Provider) => p.id === data.defaultProvider);
-          if (selectedProvider && selectedProvider.models.length > 0) {
-            setSelectedModel(selectedProvider.models[0].id);
-          }
-        } else {
-          setSelectedProvider(providerRef.current);
-          setSelectedModel(modelRef.current);
-        }
-      } catch (err) {
-        console.error('Failed to fetch model configurations:', err);
-      } finally {
-        setIsLoading(false);
-      }
-    };
-    if(provider == '' || model == '') {
-      fetchModel()
-    }
-  }, [provider, model]);
+    targetRef.current = localTarget;
+  }, [localTarget]);
 
   const clearConversation = () => {
     setQuestion('');
@@ -432,8 +374,7 @@ const Ask: React.FC<AskProps> = ({
           content: msg.content,
           mode: msg.mode ?? 'normal',
         })),
-        provider: selectedProvider,
-        model: isCustomSelectedModel ? customSelectedModel : selectedModel,
+        target: targetRef.current,
         language: language,
         research_iteration: newIteration
       };
@@ -744,8 +685,7 @@ const Ask: React.FC<AskProps> = ({
       repo_url: getRepoUrl(repoInfo),
       question: askedQuestion,
       type: repoInfo.type,
-      provider: selectedProvider,
-      model: isCustomSelectedModel ? customSelectedModel : selectedModel,
+      target: targetRef.current,
       language,
     };
     if (repoInfo?.token) request.token = repoInfo.token;
@@ -841,8 +781,7 @@ const Ask: React.FC<AskProps> = ({
           content: msg.content,
           mode: msg.mode ?? 'normal'
         })),
-        provider: selectedProvider,
-        model: isCustomSelectedModel ? customSelectedModel : selectedModel,
+        target: targetRef.current,
         language: language,
         research_iteration: deepResearch ? 1 : undefined
       };
@@ -1272,7 +1211,7 @@ const Ask: React.FC<AskProps> = ({
             onClick={() => setIsModelSelectionModalOpen(true)}
             className="text-xs px-2.5 py-1 rounded border border-[var(--border-color)]/40 bg-[var(--background)]/10 text-[var(--foreground)]/80 hover:bg-[var(--background)]/30 hover:text-[var(--foreground)] transition-colors flex items-center gap-1.5"
           >
-            <span>{selectedProvider}/{isCustomSelectedModel ? customSelectedModel : selectedModel}</span>
+            <span>{localTarget.generator ? `${localTarget.generator}·` : ''}{localTarget.provider}/{localTarget.model || '—'}</span>
             <svg className="h-3.5 w-3.5 text-[var(--accent-primary)]/70" fill="none" viewBox="0 0 24 24" stroke="currentColor" suppressHydrationWarning>
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" suppressHydrationWarning />
             </svg>
@@ -1400,19 +1339,13 @@ const Ask: React.FC<AskProps> = ({
       <ModelSelectionModal
         isOpen={isModelSelectionModalOpen}
         onClose={() => setIsModelSelectionModalOpen(false)}
-        provider={selectedProvider}
-        setProvider={setSelectedProvider}
-        model={selectedModel}
-        setModel={setSelectedModel}
-        isCustomModel={isCustomSelectedModel}
-        setIsCustomModel={setIsCustomSelectedModel}
-        customModel={customSelectedModel}
-        setCustomModel={setCustomSelectedModel}
+        target={targetRef.current}
+        setTarget={setLocalTarget}
         isComprehensiveView={isComprehensiveView}
         setIsComprehensiveView={setIsComprehensiveView}
         showFileFilters={false}
         onApply={() => {
-          console.log('Model selection applied:', selectedProvider, selectedModel);
+          console.log('Target applied:', targetRef.current.generator, targetRef.current.model);
         }}
         showWikiType={false}
         authRequired={false}

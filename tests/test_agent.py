@@ -97,8 +97,8 @@ async def test_bus_drop_oldest_when_full():
 def test_configure_disabled_short_circuits():
     """file/ws 全关:bus 无 sink,事件不构造(无 uuid/json 开销)、目录不建。"""
     agent.configure(file=False, ws_urls=[], otel_urls=[])
-    run = _Run("s1", "claude", "", label="t")
-    run.event("session/start", run_id=None, label="t", provider="claude", model="")
+    run = _Run("s1", "anthropic", "", label="t")
+    run.event("session/start", run_id=None, label="t", provider="anthropic", model="")
     bus = sinks._bus
     assert bus is not None and bus.enabled is False
 
@@ -111,7 +111,7 @@ def test_configure_disabled_short_circuits():
 def _evt(evt_type: str, session: str = "s1", seq: int = 0, **data) -> dict:
     """测试用具:built 信封事件(seq 显式,data 经 new_event 校验)。"""
     return {**new_event(evt_type, **data), "session": session, "label": "wiki:structure",
-            "provider": "claude", "model": "", "run_id": None, "seq": seq}
+            "provider": "anthropic", "model": "", "run_id": None, "seq": seq}
 
 
 @pytest.mark.asyncio
@@ -121,7 +121,7 @@ async def test_file_sink_flat_layout_nonstream_projection(tmp_path):
     # 会话 id 带 ns(judge:llm/uuid):文件名只取 "/" 后段
     await sink.consume(_evt("session/start", session="judge:llm/0460e1e9-5155-4014-9054-a39986462b20",
                             seq=0, run_id="r1", label="wiki:structure",
-                            provider="claude", model=""))
+                            provider="anthropic", model=""))
     flat = tmp_path / "sessions" / "0460e1e9-5155-4014-9054-a39986462b20.jsonl"
     assert flat.exists()
     # assistant/chunk 不落盘(非流式事件流投影):文件 seq 出现洞(0 → 2)
@@ -153,7 +153,7 @@ async def test_file_sink_flat_layout_nonstream_projection(tmp_path):
 async def test_file_sink_aborted_by_error(tmp_path):
     sink = FileSink(str(tmp_path))
     await sink.consume(_evt("session/start", session="s2", seq=0, run_id="r2",
-                            label="wiki:structure", provider="claude", model=""))
+                            label="wiki:structure", provider="anthropic", model=""))
     await sink.consume(_evt("error", session="s2", seq=1, stage="run",
                             exc_type="RuntimeError", message="agent 执行失败"))
     await sink.consume(_evt("session/end", session="s2", seq=2, state="aborted", ok=False,
@@ -171,7 +171,7 @@ async def test_file_sink_crash_residue_stays_flat(tmp_path):
     """崩溃残留(无 session/end)= 扁平目录里无终态行的文件,不迁移(排查素材)。"""
     sink = FileSink(str(tmp_path))
     await sink.consume(_evt("session/start", session="s3", seq=0, run_id="r3",
-                            label="wiki:structure", provider="claude", model=""))
+                            label="wiki:structure", provider="anthropic", model=""))
     path = tmp_path / "sessions" / "s3.jsonl"
     assert path.exists()
     final = [json.loads(line) for line in path.read_text().splitlines()]
@@ -192,7 +192,7 @@ async def test_stream_adapter_normalizes_events():
     got = []
     bus = sinks.ensure_bus()
     bus.add(_recv(got))
-    run = _Run("s1", "claude", "", label="t")
+    run = _Run("s1", "anthropic", "", label="t")
     run.start()
     # 第 1 步:正文块 + 思考块
     _handle_stream_event(run, {"type": "content_block_start", "index": 0, "content_block": {"type": "text"}})
@@ -267,7 +267,7 @@ async def test_assistant_message_monitors_but_never_duplicates():
         stop_reason="end_turn",
         usage=types.SimpleNamespace(input_tokens=3, output_tokens=5, cache_read_input_tokens=1),
     )
-    run = _Run("s1", "claude", "", label="t")
+    run = _Run("s1", "anthropic", "", label="t")
     _handle_assistant_message(run, msg, already_yielded=False)
     assert run.text_chars == 2
     await asyncio.sleep(0.05)
@@ -280,7 +280,7 @@ async def test_assistant_message_monitors_but_never_duplicates():
     assert asst["data"]["stop_reason"] == "end_turn"
     synth = next(g for g in got if g["type"] == "tool/call")  # 兜底合成
     assert synth["data"]["callId"] == "t2" and synth["data"]["arguments"] == '{"path": "a.py"}'
-    run2 = _Run("s2", "claude", "", label="t")
+    run2 = _Run("s2", "anthropic", "", label="t")
     _handle_assistant_message(run2, msg, already_yielded=True)  # 已产出 → 不重复
     assert run2.text_chars == 0
 
@@ -641,7 +641,7 @@ async def test_dsh_stream_yields_and_projects_taxonomy(monkeypatch):
     assert "".join(chunks) == "hi好!"
     await asyncio.sleep(0.05)
     types_ = [g["type"] for g in got]
-    assert types_[0] == "session/start" and got[0]["provider"] == "dsh"
+    assert types_[0] == "session/start" and got[0]["provider"] == "deepseek"
     assert types_[:4] == ["session/start", "turn/start", "step/start", "user/message"]
     assert [g["seq"] for g in got] == list(range(len(got)))  # 投影流 seq 稠密
     # user/message 重塑:扁平化 → gh 嵌套 message + source
@@ -927,14 +927,14 @@ async def test_run_epilogue_and_prologue_preserve_cc_defaults():
     agent.configure(file=False, ws_urls=[], otel_urls=[])
     got = []
     sinks.ensure_bus().add(_recv(got))
-    run = _Run("s1", "claude", "", label="t")
+    run = _Run("s1", "anthropic", "", label="t")
     run.start()
     run.finish(True)
     await asyncio.sleep(0.05)
     assert [g["type"] for g in got] == ["session/start", "turn/start", "step/start",
                                         "step/end", "turn/end", "session/end"]
     got.clear()
-    run2 = _Run("s2", "dsh", "", label="t")
+    run2 = _Run("s2", "deepseek", "", label="t")
     run2.start(prologue=False)
     run2.finish(True, epilogue=False)
     await asyncio.sleep(0.05)
@@ -1008,7 +1008,7 @@ async def test_ws_sink_forwards_raw_events_only(monkeypatch):
 
     sink = agent.WsSink("ws://preview/ws")
     evts = [
-        _evt("session/start", seq=0, run_id=None, label="wiki:structure", provider="claude", model=""),
+        _evt("session/start", seq=0, run_id=None, label="wiki:structure", provider="anthropic", model=""),
         _evt("assistant/chunk", seq=1, chunk={"type": "text", "index": 0, "text": "你好"}),
         _evt("assistant/chunk", seq=2, chunk={"type": "text", "index": 0, "text": "世界"}),
     ]
@@ -1049,7 +1049,7 @@ async def test_otel_span_tree():
     sink, exporter = _otel_sink()
     for evt in [
         _evt("session/start", seq=0, run_id="r1", label="wiki:structure",
-             provider="claude", model=""),
+             provider="anthropic", model=""),
         _evt("step/start", seq=1, turn=1, step=1),
         _evt("assistant/chunk", seq=2, chunk={"type": "text", "index": 0, "text": "你好"}),
         _evt("assistant/chunk", seq=3, chunk={"type": "text", "index": 0, "text": "世界"}),
@@ -1067,7 +1067,7 @@ async def test_otel_span_tree():
     ]:
         await sink.consume(evt)
     spans = exporter.get_finished_spans()
-    root = next(s for s in spans if s.name == "wiki:structure · claude")
+    root = next(s for s in spans if s.name == "wiki:structure · anthropic")
     step = next(s for s in spans if s.name == "step.1")
     tool_call = next(s for s in spans if s.name == "tool.call:graphify_query")
     tres = next(s for s in spans if s.name == "tool.result:graphify_query")
@@ -1075,7 +1075,7 @@ async def test_otel_span_tree():
     assert step.parent.span_id == root.context.span_id
     assert tool_call.parent.span_id == root.context.span_id
     assert tres.parent.span_id == root.context.span_id
-    assert root.attributes["gen_ai.provider.name"] == "claude"
+    assert root.attributes["gen_ai.provider.name"] == "anthropic"
     assert root.attributes["gh_puller.run_id"] == "r1"
     assert root.attributes["gen_ai.usage.input_tokens"] == 3
     assert root.attributes["gh_puller.stop_reason"] == "end_turn"
@@ -1094,7 +1094,7 @@ async def test_otel_span_tree():
 async def test_otel_error_status_and_cleanup():
     sink, exporter = _otel_sink()
     await sink.consume(_evt("session/start", seq=0, run_id=None, label="wiki:structure",
-                            provider="claude", model=""))
+                            provider="anthropic", model=""))
     await sink.consume(_evt("error", seq=1, stage="run", exc_type="RuntimeError",
                             message="agent 执行失败: boom"))
     await sink.consume(_evt("session/end", seq=2, state="aborted", ok=False,
@@ -1113,7 +1113,7 @@ async def test_otel_error_status_and_cleanup():
 async def test_otel_usage_attrs_skip_none():
     sink, exporter = _otel_sink()
     await sink.consume(_evt("session/start", seq=0, run_id=None, label="wiki:structure",
-                            provider="claude", model=""))
+                            provider="anthropic", model=""))
     await sink.consume(_evt("assistant/message", seq=1,
                             message={"role": "assistant", "content": [{"type": "text", "text": "x"}]},
                             usage={"input_tokens": 8, "output_tokens": 2, "cache_read_input_tokens": None},
@@ -1145,7 +1145,7 @@ async def test_otel_failure_isolated(monkeypatch):
 
     sink = OtelSink("http://preview/v1/traces", tracer=_BoomTracer())
     await sink.consume(_evt("session/start", seq=0, run_id=None, label="wiki:structure",
-                            provider="claude", model=""))  # start_span 抛 → 吞掉不抛
+                            provider="anthropic", model=""))  # start_span 抛 → 吞掉不抛
     await sink.consume(_evt("assistant/chunk", seq=1, chunk={"type": "text", "index": 0, "text": "x"}))  # 已报过 → 静默
     assert len(logged) == 1
     assert "otel sink 消费失败" in logged[0]
@@ -1476,11 +1476,11 @@ async def test_codex_stream_event_sequence(monkeypatch, tmp_path):
     await asyncio.sleep(0.05)
     types_ = [g["type"] for g in got]
     assert types_[:4] == ["session/start", "turn/start", "step/start", "user/message"]
-    assert got[0]["provider"] == "codex" and got[0]["run_id"] == "r1"
+    assert got[0]["provider"] == "openai" and got[0]["run_id"] == "r1"
     assert [g["seq"] for g in got] == list(range(len(got)))  # 合成流 seq 稠密
     hdr = next(g for g in got if g["type"] == "request/header")
     assert hdr["data"]["partial"] is True  # SDK 不暴露请求体(cc 同语义)
-    assert hdr["data"]["header"]["config"]["provider"] == "codex"
+    assert hdr["data"]["header"]["config"]["provider"] == "openai"
     um = next(g for g in got if g["type"] == "user/message")
     assert um["data"]["message"]["content"][0]["text"] == "整段 prompt ⚙"
     assert types_[-2:] == ["turn/end", "session/end"] and got[-1]["data"]["state"] == "completed"

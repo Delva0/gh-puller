@@ -295,6 +295,7 @@ class OtelSink:
             "gen_ai.request.model": d.get("model"),
             "gh_puller.session": session,
             "gh_puller.label": label,
+            "gh_puller.generator": d.get("generator") or "",
             "gh_puller.run_id": d.get("run_id"),
             "gh_puller.retry": d.get("retry"),
             "gh_puller.meta": d.get("meta"),

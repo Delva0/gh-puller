@@ -51,10 +51,11 @@ class _Session:
     """hub 内存中的单会话状态:seq 索引事件(完备真源在磁盘 JSONL)。"""
 
     def __init__(self, session: str, label: str = "", provider: str = "", model: str = "",
-                 run_id: str | None = None):
+                 run_id: str | None = None, generator: str = ""):
         self.session = session
         self.label = label or session
         self.provider = provider
+        self.generator = generator
         self.model = model
         self.run_id = run_id
         self.state = "running"
@@ -122,7 +123,8 @@ class _Hub:
             sess = _Session(sid, head.get("label") or d.get("label"),
                             head.get("provider") or d.get("provider"),
                             head.get("model") or d.get("model"),
-                            run_id=head.get("run_id") or d.get("run_id"))
+                            run_id=head.get("run_id") or d.get("run_id"),
+                            generator=head.get("generator") or d.get("generator") or "")
             sess.state = end_state or "running"
             sess.ts = head.get("ts") or sess.ts
             sess.last_ts = max((e.get("ts") or sess.ts) for e in events.values())
@@ -179,8 +181,9 @@ class _Hub:
         return sorted(
             (
                 {"session": s.session, "run_id": s.run_id, "label": s.label,
-                 "provider": s.provider, "model": s.model, "state": s.state,
-                 "ts": s.ts, "last_ts": s.last_ts, "num_events": len(s.events)}
+                 "generator": s.generator, "provider": s.provider, "model": s.model,
+                 "state": s.state, "ts": s.ts, "last_ts": s.last_ts,
+                 "num_events": len(s.events)}
                 for s in self.sessions.values()
             ),
             key=lambda x: x["last_ts"],
@@ -238,7 +241,8 @@ class _Hub:
             sess = _Session(sid, evt.get("label") or d.get("label"),
                             evt.get("provider") or d.get("provider"),
                             evt.get("model") or d.get("model"),
-                            run_id=evt.get("run_id") or d.get("run_id") or None)
+                            run_id=evt.get("run_id") or d.get("run_id") or None,
+                            generator=evt.get("generator") or d.get("generator") or "")
             self.sessions[sid] = sess
         seq = evt.get("seq")
         if seq is not None:
@@ -248,6 +252,7 @@ class _Hub:
             d = evt.get("data") or {}
             sess.label = evt.get("label") or d.get("label") or sess.label
             sess.provider = evt.get("provider") or d.get("provider") or sess.provider
+            sess.generator = evt.get("generator") or d.get("generator") or sess.generator
             sess.model = evt.get("model") or d.get("model") or sess.model
             sess.run_id = evt.get("run_id") or d.get("run_id") or sess.run_id
         elif evt.get("type") == "session/end":

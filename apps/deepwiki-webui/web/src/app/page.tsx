@@ -4,7 +4,10 @@ import React, { useState, useEffect } from 'react';
 import { useRouter } from 'next/navigation';
 import Link from 'next/link';
 import { FaWikipediaW, FaGithub, FaCoffee, FaTwitter } from 'react-icons/fa';
-import { ConfigurationModal, ThemeToggle } from '@gh-puller/ui';
+import {
+  ConfigurationModal, ThemeToggle, publicTargetOf, loadCreds, saveCreds,
+  type TargetConfig,
+} from '@gh-puller/ui';
 import Mermaid from '@gh-puller/ui/components/Mermaid';
 import ProcessedProjects from '@/components/ProcessedProjects';
 import { extractUrlPath, extractUrlDomain } from '@/utils/urlDecoder';
@@ -60,10 +63,15 @@ export default function Home() {
         if (config) {
           setSelectedLanguage(config.selectedLanguage || lang);
           setIsComprehensiveView(config.isComprehensiveView === undefined ? true : config.isComprehensiveView);
-          setProvider(config.provider || '');
-          setModel(config.model || '');
-          setIsCustomModel(config.isCustomModel || false);
-          setCustomModel(config.customModel || '');
+          // 公开 target 仅存 generator/provider/model;凭证从当前标签页 sessionStorage 合并
+          const creds = loadCreds(repoUrl);
+          setTarget({
+            generator: config.generator || '',
+            provider: config.provider || '',
+            model: config.model || '',
+            api_key: creds.api_key,
+            base_url: creds.base_url,
+          });
           setSelectedPlatform(config.selectedPlatform || 'github');
           setExcludedDirs(config.excludedDirs || '');
           setExcludedFiles(config.excludedFiles || '');
@@ -92,11 +100,8 @@ export default function Home() {
     }
   }, []);
 
-  // Provider-based model selection state
-  const [provider, setProvider] = useState<string>('');
-  const [model, setModel] = useState<string>('');
-  const [isCustomModel, setIsCustomModel] = useState<boolean>(false);
-  const [customModel, setCustomModel] = useState<string>('');
+  // Target(generator/provider/model)选择状态;配置模态里编辑,凭证仅存会话
+  const [target, setTarget] = useState<TargetConfig>({ generator: '', provider: '', model: '' });
 
   // Wiki type state - default to comprehensive view
   const [isComprehensiveView, setIsComprehensiveView] = useState<boolean>(true);
@@ -286,13 +291,11 @@ export default function Home() {
       const currentRepoUrl = repositoryInput.trim();
       if (currentRepoUrl) {
         const existingConfigs = JSON.parse(localStorage.getItem(REPO_CONFIG_CACHE_KEY) || '{}');
+        // localStorage 只持久化公开三元组;凭证单独存当前标签页 sessionStorage
         const configToSave = {
           selectedLanguage,
           isComprehensiveView,
-          provider,
-          model,
-          isCustomModel,
-          customModel,
+          ...publicTargetOf(target),
           selectedPlatform,
           excludedDirs,
           excludedFiles,
@@ -301,6 +304,7 @@ export default function Home() {
         };
         existingConfigs[currentRepoUrl] = configToSave;
         localStorage.setItem(REPO_CONFIG_CACHE_KEY, JSON.stringify(existingConfigs));
+        saveCreds(currentRepoUrl, { api_key: target.api_key, base_url: target.base_url });
       }
     } catch (error) {
       console.error('Error saving config to localStorage:', error);
@@ -332,12 +336,10 @@ export default function Home() {
     } else {
       params.append('repo_url', encodeURIComponent(repositoryInput));
     }
-    // Add model parameters
-    params.append('provider', provider);
-    params.append('model', model);
-    if (isCustomModel && customModel) {
-      params.append('custom_model', customModel);
-    }
+    // Add public target params(凭证不进 URL,经 sessionStorage 由会话内页面读取)
+    params.append('generator', target.generator);
+    params.append('provider', target.provider);
+    params.append('model', target.model);
     // Add file filters configuration
     if (excludedDirs) {
       params.append('excluded_dirs', excludedDirs);
@@ -425,14 +427,8 @@ export default function Home() {
             setSelectedLanguage={setSelectedLanguage}
             isComprehensiveView={isComprehensiveView}
             setIsComprehensiveView={setIsComprehensiveView}
-            provider={provider}
-            setProvider={setProvider}
-            model={model}
-            setModel={setModel}
-            isCustomModel={isCustomModel}
-            setIsCustomModel={setIsCustomModel}
-            customModel={customModel}
-            setCustomModel={setCustomModel}
+            target={target}
+            setTarget={setTarget}
             selectedPlatform={selectedPlatform}
             setSelectedPlatform={setSelectedPlatform}
             accessToken={accessToken}

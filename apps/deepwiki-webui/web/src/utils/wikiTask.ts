@@ -23,8 +23,8 @@ export interface WikiTaskSubmitRequest {
   repo: string;
   comprehensive?: boolean;
   token?: string;
-  provider?: string;
-  model?: string;
+  /** 统一 target(generator/provider/model + 请求态凭证);嵌套下发,不再用扁平 provider/model */
+  target?: import('@gh-puller/ui').TargetConfig;
   language?: string;
   excluded_dirs?: string;
   excluded_files?: string;

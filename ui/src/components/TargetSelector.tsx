@@ -2,38 +2,22 @@
 
 import React, { useState, useEffect } from 'react';
 import { useLanguage } from '../contexts/LanguageContext';
+import {
+  DEFAULT_LOAD_GENERATORS_CONFIG,
+  publicTargetOf,
+  type GeneratorsConfig,
+  type GeneratorConfigItem,
+  type ProviderConfigItem,
+  type TargetConfig,
+} from './target';
 
-// Define the interfaces for our model configuration
-interface Model {
-  id: string;
-  name: string;
-}
+interface TargetSelectorProps {
+  /** 注册表配置加载器(可注入;缺省 GET /api/generators/config) */
+  loadConfig?: () => Promise<GeneratorsConfig>;
+  value: TargetConfig;
+  onChange: (value: TargetConfig) => void;
 
-interface Provider {
-  id: string;
-  name: string;
-  models: Model[];
-  supportsCustomModel?: boolean;
-}
-
-interface ModelConfig {
-  providers: Provider[];
-  defaultProvider: string;
-}
-
-interface ModelSelectorProps {
-  /** 模型配置加载器(可注入;缺省 GET /api/models/config,provider/model 默认值在其内初始化) */
-  loadModelConfig?: () => Promise<ModelConfig>;
-  provider: string;
-  setProvider: (value: string) => void;
-  model: string;
-  setModel: (value: string) => void;
-  isCustomModel: boolean;
-  setIsCustomModel: (value: boolean) => void;
-  customModel: string;
-  setCustomModel: (value: string) => void;
-
-  // File filter configuration
+  // File filter configuration(原 UserSelector 继承的过滤面,结构不变)
   showFileFilters?: boolean;
   excludedDirs?: string;
   setExcludedDirs?: (value: string) => void;
@@ -45,27 +29,15 @@ interface ModelSelectorProps {
   setIncludedFiles?: (value: string) => void;
 }
 
-/** 缺省加载器:GET /api/models/config(deepwiki 后端契约);消费方可经 loadModelConfig 覆盖 */
-const DEFAULT_LOAD_MODEL_CONFIG = async (): Promise<ModelConfig> => {
-  const response = await fetch('/api/models/config');
-  if (!response.ok) {
-    throw new Error(`Error fetching model configurations: ${response.status}`);
-  }
-  return response.json();
-};
-
-export default function UserSelector({
-  loadModelConfig = DEFAULT_LOAD_MODEL_CONFIG,
-  provider,
-  setProvider,
-  model,
-  setModel,
-  isCustomModel,
-  setIsCustomModel,
-  customModel,
-  setCustomModel,
-
-  // File filter configuration
+/**
+ * Generator → Provider → Model → API Key / Base URL 的 target selector。
+ * 消费方只管 TargetConfig(公开三元组 + 请求态凭证);切换 generator 后按注册表
+ * 过滤 provider 并重置不兼容模型;凭证输入不落 URL/localStorage(会话层由调用方存)。
+ */
+export default function TargetSelector({
+  loadConfig = DEFAULT_LOAD_GENERATORS_CONFIG,
+  value,
+  onChange,
   showFileFilters = false,
   excludedDirs = '',
   setExcludedDirs,
@@ -74,70 +46,69 @@ export default function UserSelector({
   includedDirs = '',
   setIncludedDirs,
   includedFiles = '',
-  setIncludedFiles
-}: ModelSelectorProps) {
-  // State to manage the visibility of the filters modal and filter section
+  setIncludedFiles,
+}: TargetSelectorProps) {
   const [isFilterSectionOpen, setIsFilterSectionOpen] = useState(false);
-  // State to manage filter mode: 'exclude' or 'include'
   const [filterMode, setFilterMode] = useState<'exclude' | 'include'>('exclude');
   const { t } = useLanguage();
 
-  // State for model configurations from backend
-  const [modelConfig, setModelConfig] = useState<ModelConfig | null>(null);
+  const [config, setConfig] = useState<GeneratorsConfig | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-
-  // State for viewing default values
   const [showDefaultDirs, setShowDefaultDirs] = useState(false);
   const [showDefaultFiles, setShowDefaultFiles] = useState(false);
 
-  // Fetch model configurations from the backend
+  const update = (patch: Partial<TargetConfig>) => onChange({ ...value, ...patch });
+
+  // 侧边态:provider 已选但当前 generator 不支持 → 重置为该 generator 默认
+  const selectedGenerator = config?.generators.find((g) => g.id === value.generator);
+  const selectedProvider = config?.providers.find((p) => p.id === value.provider);
+
   useEffect(() => {
-    const fetchModelConfig = async () => {
+    const fetchConfig = async () => {
       try {
         setIsLoading(true);
         setError(null);
-
-        const data = await loadModelConfig();
-        setModelConfig(data);
-
-        // Initialize provider and model with defaults from API if not already set
-        if (!provider && data.defaultProvider) {
-          setProvider(data.defaultProvider);
-
-          // Find the default provider and set its default model
-          const selectedProvider = data.providers.find((p: Provider) => p.id === data.defaultProvider);
-          if (selectedProvider && selectedProvider.models.length > 0) {
-            setModel(selectedProvider.models[0].id);
-          }
+        const data = await loadConfig();
+        setConfig(data);
+        if (!value.generator) {
+          onChange({
+            generator: data.defaultGenerator,
+            provider: data.defaultTarget.provider,
+            model: data.defaultTarget.model,
+          });
         }
       } catch (err) {
-        console.error('Failed to fetch model configurations:', err);
-        setError('Failed to load model configurations. Using default options.');
+        console.error('Failed to fetch generators config:', err);
+        setError('Failed to load generator configurations. Using defaults.');
       } finally {
         setIsLoading(false);
       }
     };
+    fetchConfig();
+    // loadConfig 未入 deps:缺省为模块级常量(稳定引用);消费方注入时须同样传稳定引用
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [value.generator, onChange]);
 
-    fetchModelConfig();
-    // loadModelConfig 未入 deps:缺省为模块级常量(稳定引用);消费方注入时须同样传稳定引用
-  }, [provider, setModel, setProvider]);
+  const handleGeneratorChange = (newGenerator: string) => {
+    const gen = config?.generators.find((g: GeneratorConfigItem) => g.id === newGenerator);
+    const prov = config?.providers.find((p: ProviderConfigItem) => p.id === gen?.defaultProvider);
+    onChange({
+      generator: newGenerator,
+      provider: gen?.defaultProvider || '',
+      model: prov?.models[0] || '',
+      api_key: value.api_key,
+      base_url: value.base_url,
+    });
+  };
 
-  // Handler for changing provider
   const handleProviderChange = (newProvider: string) => {
-    setProvider(newProvider);
-    setTimeout(() => {
-      // Reset custom model state when changing providers
-      setIsCustomModel(false);
-
-      // Set default model for the selected provider
-      if (modelConfig) {
-        const selectedProvider = modelConfig.providers.find((p: Provider) => p.id === newProvider);
-        if (selectedProvider && selectedProvider.models.length > 0) {
-          setModel(selectedProvider.models[0].id);
-        }
-      }
-    }, 10);
+    const prov = config?.providers.find((p: ProviderConfigItem) => p.id === newProvider);
+    onChange({
+      ...value,
+      provider: newProvider,
+      model: prov?.models[0] || '',
+    });
   };
 
   // Default excluded directories from config.py
@@ -220,10 +191,10 @@ tsconfig.json
 webpack.config.js
 babel.config.js
 rollup.config.js
-jest.config.js
+vitest.config.js
 karma.conf.js
-vite.config.js
-next.config.js
+jest.config.js
+tsconfig.spec.json
 *.min.js
 *.min.css
 *.bundle.js
@@ -251,7 +222,6 @@ next.config.js
 *.svg
 *.webp
 *.mp3
-*.mp4
 *.wav
 *.avi
 *.mov
@@ -267,11 +237,10 @@ next.config.js
 *.docx
 *.pptx`;
 
-  // Display loading state
   if (isLoading) {
     return (
       <div className="flex flex-col gap-2">
-        <div className="text-sm text-[var(--muted)]">Loading model configurations...</div>
+        <div className="text-sm text-[var(--muted)]">Loading generator configurations...</div>
       </div>
     );
   }
@@ -283,6 +252,29 @@ next.config.js
           <div className="text-sm text-red-500 mb-2">{error}</div>
         )}
 
+        {/* Generator Selection */}
+        <div>
+          <label htmlFor="generator-dropdown" className="block text-xs font-medium text-[var(--foreground)] mb-1.5">
+            {t("form.generator")}
+          </label>
+          <select
+            id="generator-dropdown"
+            value={value.generator}
+            onChange={(e) => handleGeneratorChange(e.target.value)}
+            className="input-japanese block w-full px-2.5 py-1.5 text-sm rounded-md bg-transparent text-[var(--foreground)] focus:outline-none focus:border-[var(--accent-primary)]"
+          >
+            <option value="" disabled>{t("form.selectGenerator")}</option>
+            {config?.generators.map((g) => (
+              <option key={g.id} value={g.id}>{g.name}</option>
+            ))}
+          </select>
+          {selectedGenerator && (
+            <p className="text-[10px] text-[var(--muted)] mt-1">
+              {t("form.generatorCapability")}: {selectedGenerator.capability}
+            </p>
+          )}
+        </div>
+
         {/* Provider Selection */}
         <div>
           <label htmlFor="provider-dropdown" className="block text-xs font-medium text-[var(--foreground)] mb-1.5">
@@ -290,95 +282,71 @@ next.config.js
           </label>
           <select
             id="provider-dropdown"
-            value={provider}
+            value={value.provider}
             onChange={(e) => handleProviderChange(e.target.value)}
-            className="input-japanese block w-full px-2.5 py-1.5 text-sm rounded-md bg-transparent text-[var(--foreground)] focus:outline-none focus:border-[var(--accent-primary)]"
+            disabled={!selectedGenerator}
+            className="input-japanese block w-full px-2.5 py-1.5 text-sm rounded-md bg-transparent text-[var(--foreground)] focus:outline-none focus:border-[var(--accent-primary)] disabled:opacity-50"
           >
             <option value="" disabled>{t("form.selectProvider")}</option>
-            {modelConfig?.providers.map((providerOption) => (
-              <option key={providerOption.id} value={providerOption.id}>
-                {t("form.provider" + providerOption.id.charAt(0).toUpperCase() + providerOption.id.slice(1)) || providerOption.name}
-              </option>
-            ))}
+            {(selectedGenerator?.providers || []).map((pid) => {
+              const p = config?.providers.find((x) => x.id === pid);
+              return <option key={pid} value={pid}>{p?.name || pid}</option>;
+            })}
           </select>
         </div>
 
-        {/* Model Selection - consistent height regardless of type */}
+        {/* Model Selection */}
         <div>
-          <label htmlFor={isCustomModel ? "custom-model-input" : "model-dropdown"} className="block text-xs font-medium text-[var(--foreground)] mb-1.5">
+          <label htmlFor="model-dropdown" className="block text-xs font-medium text-[var(--foreground)] mb-1.5">
             {t("form.modelSelection")}
           </label>
-
-          {isCustomModel ? (
-            <input
-              id="custom-model-input"
-              type="text"
-              value={customModel}
-              onChange={(e) => {
-                setCustomModel(e.target.value);
-                setModel(e.target.value);
-              }}
-              placeholder={t("form.customModelPlaceholder")}
-              className="input-japanese block w-full px-2.5 py-1.5 text-sm rounded-md bg-transparent text-[var(--foreground)] focus:outline-none focus:border-[var(--accent-primary)]"
-            />
-          ) : (
-            <select
-              id="model-dropdown"
-              value={model}
-              onChange={(e) => setModel(e.target.value)}
-              className="input-japanese block w-full px-2.5 py-1.5 text-sm rounded-md bg-transparent text-[var(--foreground)] focus:outline-none focus:border-[var(--accent-primary)]"
-              disabled={!provider || isLoading || !modelConfig?.providers.find(p => p.id === provider)?.models?.length}
-            >
-              {modelConfig?.providers.find((p: Provider) => p.id === provider)?.models.map((modelOption) => (
-                <option key={modelOption.id} value={modelOption.id}>
-                  {modelOption.name}
-                </option>
-              )) || <option value="">{t("form.selectModel")}</option>}
-            </select>
+          <input
+            id="model-dropdown"
+            type="text"
+            value={value.model}
+            onChange={(e) => update({ model: e.target.value })}
+            placeholder={t("form.customModelPlaceholder")}
+            className="input-japanese block w-full px-2.5 py-1.5 text-sm rounded-md bg-transparent text-[var(--foreground)] focus:outline-none focus:border-[var(--accent-primary)]"
+            list="target-model-options"
+          />
+          <datalist id="target-model-options">
+            {(selectedProvider?.models || []).map((m) => (
+              <option key={m} value={m} />
+            ))}
+          </datalist>
+          {!selectedProvider?.supportsCustomModel && (
+            <p className="text-[10px] text-[var(--muted)] mt-1">{t("form.modelCatalogLocked")}</p>
           )}
         </div>
 
-        {/* Custom model toggle - only when provider supports it */}
-        {modelConfig?.providers.find((p: Provider) => p.id === provider)?.supportsCustomModel && (
-          <div className="mb-2">
-            <div className="flex items-center pb-1">
-              <div
-                className="relative flex items-center cursor-pointer"
-                onClick={() => {
-                  const newValue = !isCustomModel;
-                  setIsCustomModel(newValue);
-                  if (newValue) {
-                    setCustomModel(model);
-                  }
-                }}
-              >
-                <input
-                  id="use-custom-model"
-                  type="checkbox"
-                  checked={isCustomModel}
-                  onChange={() => {}}
-                  className="sr-only"
-                />
-                <div className={`w-10 h-5 rounded-full transition-colors ${isCustomModel ? 'bg-[var(--accent-primary)]' : 'bg-[var(--muted)]/30'}`}></div>
-                <div className={`absolute left-0.5 top-0.5 w-4 h-4 rounded-full bg-white transition-transform transform ${isCustomModel ? 'translate-x-5' : ''}`}></div>
-              </div>
-              <label
-                htmlFor="use-custom-model"
-                className="ml-2 text-sm font-medium text-[var(--muted)] cursor-pointer"
-                onClick={(e) => {
-                  e.preventDefault();
-                  const newValue = !isCustomModel;
-                  setIsCustomModel(newValue);
-                  if (newValue) {
-                    setCustomModel(model);
-                  }
-                }}
-              >
-                {t("form.useCustomModel")}
-              </label>
-            </div>
-          </div>
-        )}
+        {/* API Key / Base URL(请求态,仅本次会话) */}
+        <div>
+          <label htmlFor="api-key-input" className="block text-xs font-medium text-[var(--foreground)] mb-1.5">
+            {t("form.apiKey")}
+          </label>
+          <input
+            id="api-key-input"
+            type="password"
+            autoComplete="off"
+            value={value.api_key || ''}
+            onChange={(e) => update({ api_key: e.target.value || undefined })}
+            placeholder={selectedProvider?.apiKeyEnv || t("form.apiKeyPlaceholder")}
+            className="input-japanese block w-full px-2.5 py-1.5 text-sm rounded-md bg-transparent text-[var(--foreground)] focus:outline-none focus:border-[var(--accent-primary)]"
+          />
+          {selectedProvider?.baseUrlEnv && (
+            <input
+              id="base-url-input"
+              type="text"
+              value={value.base_url || ''}
+              onChange={(e) => update({ base_url: e.target.value || undefined })}
+              placeholder={`${selectedProvider.baseUrlEnv}${selectedProvider.baseUrlDefault ? ` (${selectedProvider.baseUrlDefault})` : ''}`}
+              className="input-japanese block w-full px-2.5 py-1.5 mt-2 text-sm rounded-md bg-transparent text-[var(--foreground)] focus:outline-none focus:border-[var(--accent-primary)]"
+            />
+          )}
+          <p className="text-[10px] text-[var(--muted)] mt-1">
+            {t("form.targetCredsNote")}
+          </p>
+        </div>
 
         {showFileFilters && (
           <div className="mt-4">
@@ -527,3 +495,6 @@ next.config.js
     </div>
   );
 }
+
+// 兼容旧出口名(UserSelector → TargetSelector;消费方已迁移,不再新增用法)
+export { publicTargetOf };

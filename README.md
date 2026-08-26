@@ -1,6 +1,6 @@
 # gh-puller
 
-将 GitHub 开源仓库（含 PR/Issue）构建为知识库并搭载 agent，对外暴露 REST 接口，回答任何与代码库相关的问题。
+将 GitHub 开源仓库（源码库+PR/Issue）构建为知识库，对外暴露 REST 接口，回答任何与github仓库相关的问题。
 
 ## 功能
 
@@ -10,13 +10,11 @@
 - **benchmark 评测框架**：`gh_puller/benchmark/` 按 REST 协议 v1 单点评测——一个题库 + 一个参赛方 endpoint，题库（`JUDGE`）自治
 - **共享 UI**：`ui/` 基础组件包 `@gh-puller/ui`，apps 经 `workspace:*` 直引源码
 
-## 哲学
+## Roadmap
 
-- **协议契约代码化**：`benchmark/protocol.py` + `types.py` 是 ask 请求/响应的唯一权威定义，调用方与服务方共用；未知字段不拒绝，协议前向兼容
-- **管线零认知**：pipeline 只认识 ask 接口签名、题库导出的 `JUDGE`、judgment 原样存档——题目形态、评判逻辑全由出题人自拟，pipeline 只存档、不解释
-- **双方独立发展**：参赛方（服务方）与评测框架互不见面，仅通过 REST 协议互操作
-- **不建 RAG，建图**：索引是代码本体的 AST 建图，检索交给 agent 按需查工具，而非 chunk-embed 相似度检索
-- **事件溯源**：监控日志无损 append-only；LLM 消息上下文是 surface 节点的派生，不是快照
+- [x] **deepwiki + graphify**：deepwiki + graphify 查询统一聚合，构建 agent 可观测设施
+- [ ] **commit 级增量**：跨仓 graphify 增量建图，query 优化
+- [ ] **PR/Issue 联动**：知识库与 PR/Issue 打通
 
 ## 快速上手
 
@@ -50,5 +48,3 @@ uv run benchmark gh_puller/benchmark/judges/vllm_mechanism/bank.py --url http://
 cd apps/agent-dashboard/server && uv run uvicorn hub:app --port 8765
 # 浏览器 :8765；LLM 调用默认自动对接（AGENT_MONITOR_WEBUI_URL 默认 ws://localhost:8765/ws）
 ```
-
-更多文档：`gh_puller/benchmark/README.md`（协议契约 + 出题人约定）、`docs/agent-monitor.md`（流式监控）。

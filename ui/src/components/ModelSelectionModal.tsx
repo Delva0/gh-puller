@@ -2,21 +2,16 @@
 
 import React, {useEffect, useState} from 'react';
 import {useLanguage} from '../contexts/LanguageContext';
-import UserSelector from './UserSelector';
+import TargetSelector from './TargetSelector';
 import WikiTypeSelector from './WikiTypeSelector';
 import TokenInput from './TokenInput';
+import type { TargetConfig } from './target';
 
 interface ModelSelectionModalProps {
   isOpen: boolean;
   onClose: () => void;
-  provider: string;
-  setProvider: (value: string) => void;
-  model: string;
-  setModel: (value: string) => void;
-  isCustomModel: boolean;
-  setIsCustomModel: (value: boolean) => void;
-  customModel: string;
-  setCustomModel: (value: string) => void;
+  target: TargetConfig;
+  setTarget: (value: TargetConfig) => void;
   onApply: (token?: string) => void;
 
   // Wiki type options
@@ -48,14 +43,8 @@ interface ModelSelectionModalProps {
 export default function ModelSelectionModal({
   isOpen,
   onClose,
-  provider,
-  setProvider,
-  model,
-  setModel,
-  isCustomModel,
-  setIsCustomModel,
-  customModel,
-  setCustomModel,
+  target,
+  setTarget,
   onApply,
   isComprehensiveView,
   setIsComprehensiveView,
@@ -79,11 +68,8 @@ export default function ModelSelectionModal({
   const { t } = useLanguage();
 
   // Local state for form values (to only apply changes when the user clicks "Submit")
-  const [localProvider, setLocalProvider] = useState(provider);
-  const [localModel, setLocalModel] = useState(model);
-  const [localIsCustomModel, setLocalIsCustomModel] = useState(isCustomModel);
-  const [localCustomModel, setLocalCustomModel] = useState(customModel);
-  const [localIsComprehensiveView, setLocalIsComprehensiveView] = useState(isComprehensiveView);
+  const [localTarget, setLocalTarget] = useState<TargetConfig>(target);
+  const [localIsComprehensiveView, setIsComprehensiveViewLocal] = useState(isComprehensiveView);
   const [localExcludedDirs, setLocalExcludedDirs] = useState(excludedDirs);
   const [localExcludedFiles, setLocalExcludedFiles] = useState(excludedFiles);
   const [localIncludedDirs, setLocalIncludedDirs] = useState(includedDirs);
@@ -97,11 +83,8 @@ export default function ModelSelectionModal({
   // Reset local state when modal is opened
   useEffect(() => {
     if (isOpen) {
-      setLocalProvider(provider);
-      setLocalModel(model);
-      setLocalIsCustomModel(isCustomModel);
-      setLocalCustomModel(customModel);
-      setLocalIsComprehensiveView(isComprehensiveView);
+      setLocalTarget(target);
+      setIsComprehensiveViewLocal(isComprehensiveView);
       setLocalExcludedDirs(excludedDirs);
       setLocalExcludedFiles(excludedFiles);
       setLocalIncludedDirs(includedDirs);
@@ -110,14 +93,11 @@ export default function ModelSelectionModal({
       setLocalAccessToken('');
       setShowTokenSection(showTokenInput);
     }
-  }, [isOpen, provider, model, isCustomModel, customModel, isComprehensiveView, excludedDirs, excludedFiles, includedDirs, includedFiles, repositoryType, showTokenInput]);
+  }, [isOpen, target, isComprehensiveView, excludedDirs, excludedFiles, includedDirs, includedFiles, repositoryType, showTokenInput]);
 
   // Handler for applying changes
   const handleApply = () => {
-    setProvider(localProvider);
-    setModel(localModel);
-    setIsCustomModel(localIsCustomModel);
-    setCustomModel(localCustomModel);
+    setTarget(localTarget);
     setIsComprehensiveView(localIsComprehensiveView);
     if (setExcludedDirs) setExcludedDirs(localExcludedDirs);
     if (setExcludedFiles) setExcludedFiles(localExcludedFiles);
@@ -161,23 +141,17 @@ export default function ModelSelectionModal({
             {
               showWikiType && <WikiTypeSelector
                     isComprehensiveView={localIsComprehensiveView}
-                    setIsComprehensiveView={setLocalIsComprehensiveView}
+                    setIsComprehensiveView={setIsComprehensiveViewLocal}
                 />
             }
 
             {/* Divider */}
             <div className="my-4 border-t border-[var(--border-color)]/30"></div>
 
-            {/* Model Selector */}
-            <UserSelector
-              provider={localProvider}
-              setProvider={setLocalProvider}
-              model={localModel}
-              setModel={setLocalModel}
-              isCustomModel={localIsCustomModel}
-              setIsCustomModel={setLocalIsCustomModel}
-              customModel={localCustomModel}
-              setCustomModel={setLocalCustomModel}
+            {/* Target Selector */}
+            <TargetSelector
+              value={localTarget}
+              onChange={setLocalTarget}
               showFileFilters={showFileFilters}
               excludedDirs={localExcludedDirs}
               setExcludedDirs={showFileFilters ? (value: string) => setLocalExcludedDirs(value) : undefined}
