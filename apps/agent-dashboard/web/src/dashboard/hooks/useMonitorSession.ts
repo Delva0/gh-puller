@@ -4,8 +4,8 @@
 // history 页/live evt → RunFold(seq 守卫 + 间隙可补片)+ dsh 推导桥(vendor 面板数据面)。
 // 旧读接口(events/chat/partial)保留兼容;面板改吃 dsh(桥)快照。
 import { useSyncExternalStore } from 'react';
-import { RunFold } from '../monitor';
-import type { EventEnvelope } from '../monitor';
+import { RunFold } from '../monitor-data';
+import type { EventEnvelope } from '../monitor-data';
 import {
   createDshSession,
   type DshSessionStore,

@@ -3,7 +3,7 @@
  * ConversationSnapshot/HostObservable 面。被 useMonitorSession(既有连接层)
  * 与 install/DshPanels 共用。
  */
-import type { EventEnvelope } from '../../../monitor/types'
+import type { EventEnvelope } from '../../../monitor-data/types'
 import type { ConversationSnapshot } from '@dsh/runtime'
 import {
   ConversationNodeAssembler,

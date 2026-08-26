@@ -1,22 +1,30 @@
-// Generator / Provider / Model 统一 target 契约(前端侧)。
+// Generator → generator_config 统一 target 契约(前端侧)。
 //
-// 语义与 gh_puller.agent.adapters 注册表一一对应:
-// - generator:生成管线(cc/dsh/codex/llm),决定 API surface/编排/工具生命周期;
-// - provider:模型服务提供方(anthropic/deepseek/openai),决定连接(API key/base URL);
-// - model:provider 下的模型标识。openai-compatible 只是 openai + 自定义 base_url 的形态。
+// 语义与 gh_puller.agent.adapters 注册表一一对应,generator 决定生成器配置形态
+// (configKind):
+// - "file"(cc/dsh/codex):生成器配置 = 各 CLI 原生配置文件的本地路径(config_path)。
+//   模型/凭证/服务端点全在文件内 —— 服务端原样透传给 agent SDK(cc: --settings;
+//   codex: CODEX_HOME.config.toml;dsh: cordis),前端不解释文件内容;
+// - "object"(llm):provider / model / base_url / api_key 字段。openai-compatible
+//   只是 openai + 自定义 base_url 的部署形态,不单列 provider。
 //
-// 持久化规则(跨页面一律只走公开三元组):
-// - URL/localStorage:仅 generator/provider/model(publicTargetOf);
-// - api_key/base_url:仅当前标签页 sessionStorage(见 saveCreds/loadCreds),绝不进
-//   URL/localStorage/请求日志。
+// 持久化与提交规则(与后端 _strip_creds 落盘形态一致):
+// - URL/localStorage:公开部分(strippedTarget)—— file 类 = generator + config_path
+//   (路径非凭证);object 类 = generator + provider/model;
+// - api_key/base_url 仅当前标签页 sessionStorage(见 saveCreds/loadCreds),绝不进
+//   URL/localStorage/请求日志;file 类的生成器配置不携带凭证字段(422 语义)。
+// 组装为请求体的统一入口:asyncTargetRequest(按注册表 configKind 收窄字段)。
 
 export interface GeneratorConfigItem {
   id: string;
   name: string;
-  defaultProvider: string;
-  providers: string[];
+  configKind: 'file' | 'object';
   capability: string;
-  defaultModelEnv: string | null;
+  defaultProvider: string; // object 类有效(file 类仅旧投影展示)
+  providers: string[]; // object 类选择列表(file 类为空)
+  defaultModelEnv: string | null; // object 类
+  configPathEnv: string | null; // file 类(占位提示:环境变量名)
+  configDefault: string | null; // file 类(默认路径提示)
 }
 
 export interface ProviderConfigItem {
@@ -33,21 +41,30 @@ export interface GeneratorsConfig {
   generators: GeneratorConfigItem[];
   providers: ProviderConfigItem[];
   defaultGenerator: string;
-  defaultTarget: { generator: string; provider: string; model: string };
+  defaultTarget: {
+    generator: string;
+    generator_config: { config_path?: string; provider?: string; model?: string };
+  };
 }
 
-/** 浏览器端 target 选择:公开三元组 + 请求态凭证(凭证仅存 sessionStorage)。 */
+/** 浏览器端 target 选择:公开部分按 kind 分字段;api_key/base_url 仅 object 类请求态。 */
 export interface TargetConfig {
   generator: string;
-  provider: string;
-  model: string;
-  api_key?: string;
-  base_url?: string;
+  config_path?: string; // file 类
+  provider?: string; // object 类
+  model?: string; // object 类
+  api_key?: string; // object 类凭证(仅 sessionStorage,见 saveCreds/loadCreds)
+  base_url?: string; // object 类凭证(同上)
 }
 
-/** 发布/持久化安全副本:清空凭证。 */
-export function publicTargetOf(t: TargetConfig): TargetConfig {
-  return { generator: t.generator, provider: t.provider, model: t.model };
+/** 落盘/判等安全副本:剥凭证(api_key/base_url);file 类保留 config_path(非凭证)。 */
+export function strippedTarget(t: TargetConfig): TargetConfig {
+  return {
+    generator: t.generator,
+    config_path: t.config_path,
+    provider: t.provider,
+    model: t.model,
+  };
 }
 
 export const DEFAULT_LOAD_GENERATORS_CONFIG = async (): Promise<GeneratorsConfig> => {
@@ -57,6 +74,54 @@ export const DEFAULT_LOAD_GENERATORS_CONFIG = async (): Promise<GeneratorsConfig
   }
   return response.json();
 };
+
+// ---- 请求体组装(注册表 configKind 收窄;注册表一次性缓存) ----
+
+/** 请求体中 target 的嵌套形态(与后端 TargetInput 同形)。 */
+export interface TargetRequest {
+  generator: string;
+  generator_config: {
+    config_path?: string;
+    provider?: string;
+    model?: string;
+    base_url?: string;
+    api_key?: string;
+  };
+}
+
+let configCache: GeneratorsConfig | null = null;
+
+async function loadConfigOnce(): Promise<GeneratorsConfig> {
+  if (configCache === null) {
+    configCache = await DEFAULT_LOAD_GENERATORS_CONFIG().catch((err) => {
+      configCache = null; // 网络瞬断允许重试
+      throw err;
+    });
+  }
+  return configCache;
+}
+
+/**
+ * target(平面选择态)→ 请求体 target(按 generator 的 configKind 收窄字段)。
+ *
+ * file 类:仅 config_path(默认取注册表 configDefault;空 → 服务端 env/缺省解析),
+ * 丢弃任何凭证/模型字段 —— 与后端 422 语义一致;object 类:provider/model/凭证。
+ */
+export async function buildTargetRequest(t: TargetConfig): Promise<TargetRequest> {
+  const cfg = await loadConfigOnce();
+  const generator = t.generator || cfg.defaultGenerator;
+  const gen = cfg.generators.find((g) => g.id === generator);
+  const gc: TargetRequest['generator_config'] = {};
+  if (gen?.configKind === 'file') {
+    gc.config_path = t.config_path || gen.configDefault || '';
+  } else {
+    if (t.provider) gc.provider = t.provider;
+    if (t.model) gc.model = t.model;
+    if (t.base_url) gc.base_url = t.base_url;
+    if (t.api_key) gc.api_key = t.api_key;
+  }
+  return { generator, generator_config: gc };
+}
 
 // ---- 凭证:仅 sessionStorage(每标签页),按仓库键隔离 ----
 
@@ -94,17 +159,23 @@ export function clearCreds(repoUrl: string): void {
   }
 }
 
-/** 依据注册表把 target 内尽量补齐(空 generator → defaultGenerator;空 provider → 该 generator 默认)。 */
+/** 依据注册表把 target 内尽量补齐(空 generator → defaultGenerator;给各 kind 的缺省位填默认值)。 */
 export function normalizeWithRegistry(
   t: TargetConfig,
   cfg: GeneratorsConfig,
 ): TargetConfig {
   const generator = t.generator || cfg.defaultGenerator;
   const gen = cfg.generators.find((g) => g.id === generator);
+  let config_path = t.config_path;
+  if (gen?.configKind === 'file' && !config_path) config_path = gen.configDefault || '';
   let provider = t.provider;
-  if (!provider && gen) provider = gen.defaultProvider;
+  if (gen?.configKind === 'object' && !provider && gen.defaultProvider) {
+    provider = gen.defaultProvider;
+  }
   const prov = cfg.providers.find((p) => p.id === provider);
   let model = t.model;
-  if (!model && prov && prov.models.length > 0) model = prov.models[0];
-  return { generator, provider: provider || '', model, api_key: t.api_key, base_url: t.base_url };
+  if (gen?.configKind === 'object' && !model && prov && prov.models.length > 0) {
+    model = prov.models[0];
+  }
+  return { generator, config_path, provider, model, api_key: t.api_key, base_url: t.base_url };
 }

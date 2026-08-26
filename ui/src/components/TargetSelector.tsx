@@ -4,7 +4,7 @@ import React, { useState, useEffect } from 'react';
 import { useLanguage } from '../contexts/LanguageContext';
 import {
   DEFAULT_LOAD_GENERATORS_CONFIG,
-  publicTargetOf,
+  strippedTarget,
   type GeneratorsConfig,
   type GeneratorConfigItem,
   type ProviderConfigItem,
@@ -30,9 +30,12 @@ interface TargetSelectorProps {
 }
 
 /**
- * Generator → Provider → Model → API Key / Base URL 的 target selector。
- * 消费方只管 TargetConfig(公开三元组 + 请求态凭证);切换 generator 后按注册表
- * 过滤 provider 并重置不兼容模型;凭证输入不落 URL/localStorage(会话层由调用方存)。
+ * Generator → 生成器配置的 target selector(按注册表 configKind 渲染):
+ * - file 类(cc/dsh/codex):config_path 输入(各 CLI 原生配置文件;模型/凭证/端点随文件);
+ * - object 类(llm):Provider → Model → API Key / Base URL。
+ * 消费方只管 TargetConfig(公开部分 + object 类请求态凭证);切换 generator 后按
+ * 注册表补齐对应 kind 的缺省并清空他类字段;凭证输入不落 URL/localStorage
+ * (会话层由调用方存);file 类不携带凭证字段(后端 422 语义)。
  */
 export default function TargetSelector({
   loadConfig = DEFAULT_LOAD_GENERATORS_CONFIG,
@@ -72,11 +75,16 @@ export default function TargetSelector({
         const data = await loadConfig();
         setConfig(data);
         if (!value.generator) {
-          onChange({
-            generator: data.defaultGenerator,
-            provider: data.defaultTarget.provider,
-            model: data.defaultTarget.model,
-          });
+          const dt = data.defaultTarget;
+          const gc = dt.generator_config || {};
+          const kind = data.generators.find((g) => g.id === dt.generator)?.configKind;
+          onChange(kind === 'file'
+            ? { generator: dt.generator, config_path: gc.config_path || '' }
+            : {
+                generator: dt.generator,
+                provider: gc.provider || '',
+                model: gc.model || '',
+              });
         }
       } catch (err) {
         console.error('Failed to fetch generators config:', err);
@@ -92,6 +100,11 @@ export default function TargetSelector({
 
   const handleGeneratorChange = (newGenerator: string) => {
     const gen = config?.generators.find((g: GeneratorConfigItem) => g.id === newGenerator);
+    if (gen?.configKind === 'file') {
+      // file 类:全新对象(仅 config_path;不携 object 类字段/凭证 —— 后端 422 语义)
+      onChange({ generator: newGenerator, config_path: gen.configDefault || '' });
+      return;
+    }
     const prov = config?.providers.find((p: ProviderConfigItem) => p.id === gen?.defaultProvider);
     onChange({
       generator: newGenerator,
@@ -275,78 +288,107 @@ tsconfig.spec.json
           )}
         </div>
 
-        {/* Provider Selection */}
-        <div>
-          <label htmlFor="provider-dropdown" className="block text-xs font-medium text-[var(--foreground)] mb-1.5">
-            {t("form.modelProvider")}
-          </label>
-          <select
-            id="provider-dropdown"
-            value={value.provider}
-            onChange={(e) => handleProviderChange(e.target.value)}
-            disabled={!selectedGenerator}
-            className="input-japanese block w-full px-2.5 py-1.5 text-sm rounded-md bg-transparent text-[var(--foreground)] focus:outline-none focus:border-[var(--accent-primary)] disabled:opacity-50"
-          >
-            <option value="" disabled>{t("form.selectProvider")}</option>
-            {(selectedGenerator?.providers || []).map((pid) => {
-              const p = config?.providers.find((x) => x.id === pid);
-              return <option key={pid} value={pid}>{p?.name || pid}</option>;
-            })}
-          </select>
-        </div>
-
-        {/* Model Selection */}
-        <div>
-          <label htmlFor="model-dropdown" className="block text-xs font-medium text-[var(--foreground)] mb-1.5">
-            {t("form.modelSelection")}
-          </label>
-          <input
-            id="model-dropdown"
-            type="text"
-            value={value.model}
-            onChange={(e) => update({ model: e.target.value })}
-            placeholder={t("form.customModelPlaceholder")}
-            className="input-japanese block w-full px-2.5 py-1.5 text-sm rounded-md bg-transparent text-[var(--foreground)] focus:outline-none focus:border-[var(--accent-primary)]"
-            list="target-model-options"
-          />
-          <datalist id="target-model-options">
-            {(selectedProvider?.models || []).map((m) => (
-              <option key={m} value={m} />
-            ))}
-          </datalist>
-          {!selectedProvider?.supportsCustomModel && (
-            <p className="text-[10px] text-[var(--muted)] mt-1">{t("form.modelCatalogLocked")}</p>
-          )}
-        </div>
-
-        {/* API Key / Base URL(请求态,仅本次会话) */}
-        <div>
-          <label htmlFor="api-key-input" className="block text-xs font-medium text-[var(--foreground)] mb-1.5">
-            {t("form.apiKey")}
-          </label>
-          <input
-            id="api-key-input"
-            type="password"
-            autoComplete="off"
-            value={value.api_key || ''}
-            onChange={(e) => update({ api_key: e.target.value || undefined })}
-            placeholder={selectedProvider?.apiKeyEnv || t("form.apiKeyPlaceholder")}
-            className="input-japanese block w-full px-2.5 py-1.5 text-sm rounded-md bg-transparent text-[var(--foreground)] focus:outline-none focus:border-[var(--accent-primary)]"
-          />
-          {selectedProvider?.baseUrlEnv && (
+        {/* file 类:生成器配置 = 各 CLI 原生配置文件路径(模型/凭证/端点随文件,服务端纯透传) */}
+        {selectedGenerator?.configKind === 'file' && (
+          <div>
+            <label htmlFor="config-path-input" className="block text-xs font-medium text-[var(--foreground)] mb-1.5">
+              {t("form.configFilePath")}
+            </label>
             <input
-              id="base-url-input"
+              id="config-path-input"
               type="text"
-              value={value.base_url || ''}
-              onChange={(e) => update({ base_url: e.target.value || undefined })}
-              placeholder={`${selectedProvider.baseUrlEnv}${selectedProvider.baseUrlDefault ? ` (${selectedProvider.baseUrlDefault})` : ''}`}
-              className="input-japanese block w-full px-2.5 py-1.5 mt-2 text-sm rounded-md bg-transparent text-[var(--foreground)] focus:outline-none focus:border-[var(--accent-primary)]"
+              value={value.config_path || ''}
+              onChange={(e) => update({ config_path: e.target.value })}
+              placeholder={selectedGenerator.configDefault || selectedGenerator.configPathEnv || t("form.configFilePathPlaceholder")}
+              className="input-japanese block w-full px-2.5 py-1.5 text-sm rounded-md bg-transparent text-[var(--foreground)] focus:outline-none focus:border-[var(--accent-primary)]"
             />
-          )}
-          <p className="text-[10px] text-[var(--muted)] mt-1">
-            {t("form.targetCredsNote")}
-          </p>
-        </div>
+            <p className="text-[10px] text-[var(--muted)] mt-1">
+              {t("form.configPathNote")}
+            </p>
+            {selectedGenerator.configDefault && (
+              <p className="text-[10px] text-[var(--muted)] mt-1">
+                {t("form.configPathDefault")}: {selectedGenerator.configDefault}
+              </p>
+            )}
+          </div>
+        )}
+
+        {selectedGenerator?.configKind === 'object' && (
+          <>
+            {/* Provider Selection */}
+            <div>
+              <label htmlFor="provider-dropdown" className="block text-xs font-medium text-[var(--foreground)] mb-1.5">
+                {t("form.modelProvider")}
+              </label>
+              <select
+                id="provider-dropdown"
+                value={value.provider}
+                onChange={(e) => handleProviderChange(e.target.value)}
+                disabled={!selectedGenerator}
+                className="input-japanese block w-full px-2.5 py-1.5 text-sm rounded-md bg-transparent text-[var(--foreground)] focus:outline-none focus:border-[var(--accent-primary)] disabled:opacity-50"
+              >
+                <option value="" disabled>{t("form.selectProvider")}</option>
+                {(selectedGenerator?.providers || []).map((pid) => {
+                  const p = config?.providers.find((x) => x.id === pid);
+                  return <option key={pid} value={pid}>{p?.name || pid}</option>;
+                })}
+              </select>
+            </div>
+
+            {/* Model Selection */}
+            <div>
+              <label htmlFor="model-dropdown" className="block text-xs font-medium text-[var(--foreground)] mb-1.5">
+                {t("form.modelSelection")}
+              </label>
+              <input
+                id="model-dropdown"
+                type="text"
+                value={value.model}
+                onChange={(e) => update({ model: e.target.value })}
+                placeholder={t("form.customModelPlaceholder")}
+                className="input-japanese block w-full px-2.5 py-1.5 text-sm rounded-md bg-transparent text-[var(--foreground)] focus:outline-none focus:border-[var(--accent-primary)]"
+                list="target-model-options"
+              />
+              <datalist id="target-model-options">
+                {(selectedProvider?.models || []).map((m) => (
+                  <option key={m} value={m} />
+                ))}
+              </datalist>
+              {!selectedProvider?.supportsCustomModel && (
+                <p className="text-[10px] text-[var(--muted)] mt-1">{t("form.modelCatalogLocked")}</p>
+              )}
+            </div>
+
+            {/* API Key / Base URL(请求态,仅本次会话) */}
+            <div>
+              <label htmlFor="api-key-input" className="block text-xs font-medium text-[var(--foreground)] mb-1.5">
+                {t("form.apiKey")}
+              </label>
+              <input
+                id="api-key-input"
+                type="password"
+                autoComplete="off"
+                value={value.api_key || ''}
+                onChange={(e) => update({ api_key: e.target.value || undefined })}
+                placeholder={selectedProvider?.apiKeyEnv || t("form.apiKeyPlaceholder")}
+                className="input-japanese block w-full px-2.5 py-1.5 text-sm rounded-md bg-transparent text-[var(--foreground)] focus:outline-none focus:border-[var(--accent-primary)]"
+              />
+              {selectedProvider?.baseUrlEnv && (
+                <input
+                  id="base-url-input"
+                  type="text"
+                  value={value.base_url || ''}
+                  onChange={(e) => update({ base_url: e.target.value || undefined })}
+                  placeholder={`${selectedProvider.baseUrlEnv}${selectedProvider.baseUrlDefault ? ` (${selectedProvider.baseUrlDefault})` : ''}`}
+                  className="input-japanese block w-full px-2.5 py-1.5 mt-2 text-sm rounded-md bg-transparent text-[var(--foreground)] focus:outline-none focus:border-[var(--accent-primary)]"
+                />
+              )}
+              <p className="text-[10px] text-[var(--muted)] mt-1">
+                {t("form.targetCredsNote")}
+              </p>
+            </div>
+          </>
+        )}
 
         {showFileFilters && (
           <div className="mt-4">
@@ -497,4 +539,4 @@ tsconfig.spec.json
 }
 
 // 兼容旧出口名(UserSelector → TargetSelector;消费方已迁移,不再新增用法)
-export { publicTargetOf };
+export { strippedTarget };

@@ -6,13 +6,37 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
   },
   "dependencies": {
     "@gh-puller/ui": "workspace:*",
     "next-themes": "^0.4.6",
     "react": "^19.0.0",
-    "react-dom": "^19.0.0"
+    "react-dom": "^19.0.0",
+    "@shikijs/langs": "^4.3.1",
+    "@tanstack/react-virtual": "^3.14.9",
+    "@types/mdast": "^4.0.4",
+    "anser": "^2.3.5",
+    "clsx": "^2.0.0",
+    "diff": "^9.0.0",
+    "immer": "^10.1.1",
+    "katex": "^0.16.47",
+    "mdast-util-from-markdown": "^2.0.3",
+    "mdast-util-gfm": "^3.1.0",
+    "mdast-util-math": "^3.0.0",
+    "micromark-core-commonmark": "^2.0.3",
+    "micromark-extension-gfm": "^3.0.0",
+    "micromark-extension-math": "^3.1.0",
+    "micromark-factory-space": "^2.0.1",
+    "micromark-util-character": "^2.1.1",
+    "micromark-util-classify-character": "^2.0.1",
+    "micromark-util-sanitize-uri": "^2.0.1",
+    "micromark-util-symbol": "^2.0.1",
+    "micromark-util-types": "^2.0.2",
+    "shiki": "^4.3.1",
+    "use-sync-external-store": "1.2.0",
+    "zustand": "~4.4.7"
   },
   "devDependencies": {
     "@tailwindcss/typography": "^0.5.10",
@@ -24,6 +48,8 @@
     "tailwindcss": "^4",
     "typescript": "^5.9.2",
     "vite": "^7",
-    "vite-plugin-singlefile": "^2.3.0"
+    "vite-plugin-singlefile": "^2.3.0",
+    "vitest": "^3.2.4",
+    "jsdom": "^26.1.0"
   }
 }

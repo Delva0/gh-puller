@@ -6,8 +6,8 @@
 // 注:依赖 window.location(monitorWsUrl),仅限浏览器宿主使用(勿在 SSR 端导入)。
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { monitorWsUrl } from '../utils/monitorWs';
-import { mergeEvents } from '../monitor';
-import type { EventEnvelope, HubFrame, SessionMeta } from '../monitor';
+import { mergeEvents } from '../monitor-data';
+import type { EventEnvelope, HubFrame, SessionMeta } from '../monitor-data';
 import { sessionStore } from './useMonitorSession';
 
 export type ConnStatus = 'connecting' | 'connected' | 'closed';

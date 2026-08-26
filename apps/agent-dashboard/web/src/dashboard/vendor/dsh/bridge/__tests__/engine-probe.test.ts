@@ -8,7 +8,7 @@ import {
 } from '../../runtime/src/client';
 import { registerConversationNodes } from '../../ui-conversation/src/client/conversation-nodes/register';
 import { GhToDshEvents } from '../dsh-events';
-import type { EventEnvelope } from '../../../../monitor/types';
+import type { EventEnvelope } from '../../../../monitor-data/types';
 
 function evt(type: string, seq: number, data: Record<string, unknown>): EventEnvelope {
   return { id: `e${seq}`, seq, ts: 1700000000.5, session: 'ns/u1', type, data };

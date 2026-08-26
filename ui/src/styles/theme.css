@@ -176,3 +176,16 @@ html[data-theme='dark'] .paper-texture {
   background: transparent;
   border: none;
 }
+
+/* ThemeToggle 日/月图标:可见性由 [data-theme] 决定,组件内类名保持静态
+   (SSR 时 next-themes theme 为 undefined、客户端首渲染却是 localStorage 值,
+   任何依赖 theme 的 className 都会水合不一致)。切换时由 transition 过渡。 */
+.theme-toggle-moon {
+  opacity: 0;
+}
+html[data-theme='dark'] .theme-toggle-sun {
+  opacity: 0;
+}
+html[data-theme='dark'] .theme-toggle-moon {
+  opacity: 1;
+}

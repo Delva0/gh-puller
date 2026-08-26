@@ -3,9 +3,9 @@
 // 监控侧栏会话列表:搜索/状态筛选 + run_id 分组头(任务级会话组,组头带条数)
 
 import { useMemo } from 'react';
-import StateBadge from './StateBadge';
-import { useLanguage } from '../contexts/LanguageContext';
-import type { SessionMeta } from '../monitor';
+import { StateBadge } from '@gh-puller/ui';
+import { useLanguage } from '@gh-puller/ui';
+import type { SessionMeta } from '../monitor-data';
 
 interface Props {
   sessions: SessionMeta[];

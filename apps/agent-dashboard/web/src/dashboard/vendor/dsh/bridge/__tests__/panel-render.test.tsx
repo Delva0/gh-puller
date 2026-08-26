@@ -6,8 +6,7 @@ import { act } from 'react';
 import { it, expect, beforeAll, afterAll } from 'vitest';
 import { sessionStore } from '../../../../hooks/useMonitorSession';
 import DshConversationPanel from '../DshPanels';
-import { LanguageProvider } from '../../../../contexts/LanguageContext';
-import type { EventEnvelope } from '../../../../monitor/types';
+import type { EventEnvelope } from '../../../../monitor-data/types';
 
 function evt(type: string, seq: number, data: Record<string, unknown>): EventEnvelope {
   return { id: `e${seq}`, seq, ts: 1700000000.5, session: 'smoke/u1', type, data };
@@ -41,7 +40,7 @@ it('渲染出 dsh 对话面板(root 壳 + 会话体 + 消息内容)', async () =
   root = createRoot(container);
   await act(async () => {
     try {
-      root.render(<LanguageProvider><DshConversationPanel /></LanguageProvider>);
+      root.render(<DshConversationPanel />);
     } catch (e) {
       threw = e;
     }

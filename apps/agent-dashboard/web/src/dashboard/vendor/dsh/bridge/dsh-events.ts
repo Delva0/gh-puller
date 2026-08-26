@@ -14,7 +14,7 @@
  * - surface 事件携带 gh 的 `surfaceOp` 与 dsh `SurfaceOp` 同形('append' |
  *   {op:'replace',start,end})→ 直传;gh 的时间戳为秒,dsh 为毫秒 → ×1000。
  */
-import type { EventEnvelope, Message as GhMessage } from '../../../monitor/types'
+import type { EventEnvelope, Message as GhMessage } from '../../../monitor-data/types'
 import type { SessionEvent } from '../session/types.ts'
 import type { UserMessage, AssistantMessage, ToolResultMessage } from '../llm/message.ts'
 import type { ContentBlock, TokenUsage } from '../llm/types.ts'

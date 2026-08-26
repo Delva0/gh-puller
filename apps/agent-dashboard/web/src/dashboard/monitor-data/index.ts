@@ -1,4 +1,4 @@
-// monitor 数据层出口(纯 TS,零 React;折叠/快照/时间轴/搜索/帧协议)
+// dashboard 监控数据层出口(纯 TS,零 React;事件守卫/折叠/表面折叠/帧协议)
 export * from './types';
 export {
   SURFACE_TYPES,

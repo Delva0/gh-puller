@@ -1,16 +1,14 @@
 // 监控面板布局:侧栏(搜索/筛选/run_id 分组会话列表)+ 主面板(状态芯片条 +
 // dsh 1:1 对话/轨迹面板(DshConversationPanel,组件取自 @gh-puller/ui))+ 状态栏
 import { useMemo, useState } from 'react';
+import { StateBadge, ThemeToggle, useLanguage } from '@gh-puller/ui';
 import {
   DshConversationPanel,
   MonitorSessionList,
   MonitorStatusBar,
-  StateBadge,
-  ThemeToggle,
-  useLanguage,
   useMonitorSession,
   useMonitorSocket,
-} from '@gh-puller/ui';
+} from './dashboard';
 
 const CHIP = 'rounded-md border border-[var(--border-color)] px-2 py-0.5 font-mono text-[11px] text-[var(--muted)]';
 
@@ -130,7 +128,7 @@ export default function App() {
           {m.current === null ? (
             <div className="p-6 text-xs text-[var(--muted)]">{t('view.empty')}</div>
           ) : (
-            <DshConversationPanel />
+            <DshConversationPanel locale={lang} />
           )}
         </div>
 

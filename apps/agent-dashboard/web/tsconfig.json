@@ -6,22 +6,22 @@
     "baseUrl": ".",
     "paths": {
       "@dsh/ui-slots": [
-        "../../../ui/src/vendor/dsh/ui-slots/src/index.ts"
+        "./src/dashboard/vendor/dsh/ui-slots/src/index.ts"
       ],
       "@dsh/ui-conversation": [
-        "../../../ui/src/vendor/dsh/ui-conversation/src/client/index.ts"
+        "./src/dashboard/vendor/dsh/ui-conversation/src/client/index.ts"
       ],
       "@dsh/runtime": [
-        "../../../ui/src/vendor/dsh/runtime/src/client/index.ts"
+        "./src/dashboard/vendor/dsh/runtime/src/client/index.ts"
       ],
       "@dsh/cordis": [
-        "../../../ui/src/vendor/dsh/shims/cordis.ts"
+        "./src/dashboard/vendor/dsh/shims/cordis.ts"
       ],
       "@dsh/session": [
-        "../../../ui/src/vendor/dsh/session/types.ts"
+        "./src/dashboard/vendor/dsh/session/types.ts"
       ],
       "@dsh/session-projection": [
-        "../../../ui/src/vendor/dsh/session-projection.ts"
+        "./src/dashboard/vendor/dsh/session-projection.ts"
       ]
     },
     "lib": [

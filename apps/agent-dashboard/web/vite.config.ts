@@ -11,12 +11,12 @@ export default defineConfig({
   resolve: {
     alias: {
       // vendor 面板的模块增强统一走字符串别名(TS 不允许相对路径 declare module)
-      '@dsh/ui-slots': resolve(import.meta.dirname, '../../../ui/src/vendor/dsh/ui-slots/src/index.ts'),
-      '@dsh/ui-conversation': resolve(import.meta.dirname, '../../../ui/src/vendor/dsh/ui-conversation/src/client/index.ts'),
-      '@dsh/runtime': resolve(import.meta.dirname, '../../../ui/src/vendor/dsh/runtime/src/client/index.ts'),
-      '@dsh/cordis': resolve(import.meta.dirname, '../../../ui/src/vendor/dsh/shims/cordis.ts'),
-      '@dsh/session': resolve(import.meta.dirname, '../../../ui/src/vendor/dsh/session/types.ts'),
-      '@dsh/session-projection': resolve(import.meta.dirname, '../../../ui/src/vendor/dsh/session-projection.ts'),
+      '@dsh/ui-slots': resolve(import.meta.dirname, './src/dashboard/vendor/dsh/ui-slots/src/index.ts'),
+      '@dsh/ui-conversation': resolve(import.meta.dirname, './src/dashboard/vendor/dsh/ui-conversation/src/client/index.ts'),
+      '@dsh/runtime': resolve(import.meta.dirname, './src/dashboard/vendor/dsh/runtime/src/client/index.ts'),
+      '@dsh/cordis': resolve(import.meta.dirname, './src/dashboard/vendor/dsh/shims/cordis.ts'),
+      '@dsh/session': resolve(import.meta.dirname, './src/dashboard/vendor/dsh/session/types.ts'),
+      '@dsh/session-projection': resolve(import.meta.dirname, './src/dashboard/vendor/dsh/session-projection.ts'),
     },
   },
   build: {

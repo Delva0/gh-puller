@@ -1,7 +1,7 @@
 'use client';
 
 // 底部状态栏:连接状态 + 当前会话 + 行/事件计数(监控宿主主面板组装用)
-import { useLanguage } from '../contexts/LanguageContext';
+import { useLanguage } from '@gh-puller/ui';
 import type { ConnStatus } from '../hooks/useMonitorSocket';
 
 interface Props {
