@@ -824,11 +824,11 @@ class OpenAIAdapter(BaseAdapter):
                     full += text
                     run.text(text)
                     yield text
-        run.event(
-            "assistant/message", turn=run.turn, step=run.step,
-            message={"role": "assistant", "content": [{"type": "text", "text": full}]},
-            surfaceOp="append", sourceSeqs=list(run._chunk_seqs),
-        )
+            run.event(
+                "assistant/message", turn=run.turn, step=run.step,
+                message={"role": "assistant", "content": [{"type": "text", "text": full}]},
+                surfaceOp="append", sourceSeqs=list(run._chunk_seqs),
+            )
 
 
 # ---------------------------------------------------------------------------
