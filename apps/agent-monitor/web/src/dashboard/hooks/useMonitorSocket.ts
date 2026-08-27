@@ -32,6 +32,11 @@ export function useMonitorSocket() {
 
   const sessionsRef = useRef<SessionMeta[]>([]);
 
+  /** 删除会话(本端或经侧栏 ··· 菜单触发):hub 广播 index 回响推进。 */
+  const remove = useCallback((session: string) => {
+    send({ type: 'delete', session });
+  }, [send]);
+
   const requestHistory = useCallback((beforeSeq?: number) => {
     send({ type: 'history', session: currentRef.current, beforeSeq, max: 200 });
   }, [send]);
@@ -67,6 +72,13 @@ export function useMonitorSocket() {
       if (frame.type === 'index') {
         sessionsRef.current = frame.sessions;
         setSessions(frame.sessions);
+        // 当前项被删(本端或别的查看端触发)→ 复原视图(与 select 的空态同路径)
+        if (currentRef.current !== null
+            && !frame.sessions.some((s) => s.session === currentRef.current)) {
+          currentRef.current = null;
+          setCurrent(null);
+          sessionStore.reset(null);
+        }
       } else if (frame.type === 'evt_ready') {
         sessionStore.ready(frame.lastSeq);
         requestHistory();
@@ -139,5 +151,5 @@ export function useMonitorSocket() {
     // 只跑一次:send/select 经 ref 取当前 ws,闭包稳定
   }, [send, select, requestHistory]);
 
-  return { status, sessions, current, select };
+  return { status, sessions, current, select, remove };
 }

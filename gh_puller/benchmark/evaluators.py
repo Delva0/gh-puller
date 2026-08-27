@@ -28,7 +28,7 @@ from claude_agent_sdk import ClaudeAgentOptions
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
-from gh_puller.agent import cc_result, llm_complete
+from gh_puller.agent import ClaudeCode, OpenAI
 from gh_puller.envs import CLAUDE_JUDGE_MODEL, LLM_JUDGE_API_KEY, LLM_JUDGE_MODEL, LLM_JUDGE_URL
 from gh_puller.envs import TIMEOUT as GLOBAL_TIMEOUT
 
@@ -80,10 +80,9 @@ class LLMEvaluator:
             if nudge:
                 payload["messages"].append({"role": "user", "content": self.retry_nudge})
             try:
-                content = await llm_complete(
-                    url=self.url, payload=payload, api_key=LLM_JUDGE_API_KEY,
-                    timeout=TIMEOUT, headers=headers, session_name="judge:llm",
-                )
+                content = await OpenAI(
+                    {"model": self.model, "base_url": self.url, "api_key": LLM_JUDGE_API_KEY},
+                ).result(payload, timeout=TIMEOUT, headers=headers, session_name="judge:llm")
                 return self.coerce(json.loads(content))
             except Exception as e:  # 网络/HTTP/解析失败:继续下一轮,耗尽后降级
                 last_err = e
@@ -112,9 +111,10 @@ class ClaudeEvaluator:
 
     async def evaluate(self, question: str, ref: str, answer: str) -> dict:
         try:
-            result = await cc_result(
-                self.make_options(question, ref, answer), self.user_prompt(question, ref, answer),
-                session_name="judge:claude",
+            options = self.make_options(question, ref, answer)
+            config = vars(options) if hasattr(options, "__dict__") else dict(options)
+            result = await ClaudeCode(config).result(
+                self.user_prompt(question, ref, answer), session_name="judge:claude",
             )
             return self.coerce(json.loads(result))
         except Exception as e:  # SDK/解析异常:降级输出,不抛出

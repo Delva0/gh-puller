@@ -99,6 +99,7 @@ export default function App() {
             query={query}
             stateFilter={stateFilter}
             onSelect={m.select}
+            onDelete={m.remove}
           />
         </div>
       </aside>

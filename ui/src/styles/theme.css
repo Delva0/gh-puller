@@ -6,7 +6,7 @@
  * Tailwind 处理链,否则 @theme inline / @custom-variant 不生效):
  *   - apps/deepwiki-webui/web/src/app/globals.css
  *     @import "../../../../../ui/src/styles/theme.css"; (App 目录 → 仓库根,5 层)
- *   - apps/agent-dashboard/web/src/styles.css
+ *   - apps/agent-monitor/web/src/styles.css
  *     @import "../../../../ui/src/styles/theme.css"; (src 目录 → 仓库根,4 层)
  * 宿主 css 中不要重复定义本文件出现的令牌/变体/风格类。
  * (注意:html,body,#root 高度骨架与 body{margin:0} 属宿主私有,不入本文件。)
@@ -162,7 +162,7 @@ html[data-theme='dark'] .paper-texture {
   -webkit-line-clamp: 3;
 }
 
-/* 运行中状态点的呼吸闪烁(StateBadge 用;原 agent-dashboard styles.css,统一收口于此) */
+/* 运行中状态点的呼吸闪烁(StateBadge 用;原 agent-monitor styles.css,统一收口于此) */
 .dot-blink {
   animation: dot-blink 1.2s ease-in-out infinite;
 }

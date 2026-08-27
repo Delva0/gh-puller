@@ -1,5 +1,5 @@
 /**
- * DshConversationPanel:对话+轨迹两面板的宿主出口(agent-dashboard 专用)。
+ * DshConversationPanel:对话+轨迹两面板的宿主出口(agent-monitor 专用)。
  *
  * 外壳角色 = dsh ConversationRoot 的去 hero/composer 版:根条目('root')组件
  * 持有滚动容器(scrollBody 复用 dsh ConversationRoot.module.css),经 standardKit

@@ -27,4 +27,4 @@ outputs/
 node_modules/
 .next/
 *.tsbuildinfo
-apps/agent-dashboard/server/static/
+apps/agent-monitor/server/static/

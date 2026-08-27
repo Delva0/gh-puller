@@ -1,5 +1,5 @@
 // @gh-puller/ui 出口(本项目共享 UI 组件:Markdown/ThemeToggle/StateBadge/语言上下文/监控 WS 工具等)
-// 从 apps/deepwiki-webui/web 提炼,现由 deepwiki-webui 与 agent-dashboard 共同消费(直接消费 TS 源码,无构建)
+// 从 apps/deepwiki-webui/web 提炼,现由 deepwiki-webui 与 agent-monitor 共同消费(直接消费 TS 源码,无构建)
 export { default as Markdown } from './components/Markdown';
 export { default as ThemeToggle } from './components/ThemeToggle';
 export { default as StateBadge } from './components/StateBadge';
@@ -22,5 +22,5 @@ export type {
   CodemapPhase,
   CodemapEvent,
 } from './types/codemap';
-// 监控会话页(对话/轨迹;宿主 apps/agent-dashboard 主面板组装)
+// 监控会话页(对话/轨迹;宿主 apps/agent-monitor 主面板组装)
 // 监控数据层(纯 TS 折叠/快照/时间轴/搜索;零 React)

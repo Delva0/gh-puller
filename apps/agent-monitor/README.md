@@ -1,4 +1,4 @@
-# agent-dashboard
+# agent-monitor
 
 Agent 流式监控仪表盘(完整应用,`web/` + `server/` 两个子项目):
 
@@ -12,10 +12,10 @@ Agent 流式监控仪表盘(完整应用,`web/` + `server/` 两个子项目):
 pnpm install
 
 # 终端 1:hub(默认端口 8765,与 envs.AGENT_MONITOR_PORT 一致)
-cd apps/agent-dashboard/server && uv run uvicorn hub:app --port 8765
+uv --directory apps/agent-monitor/server run uvicorn hub:app --port 8765
 
 # 终端 2(可选,开发热更):web
-cd apps/agent-dashboard/web && pnpm dev
+pnpm --dir apps/agent-monitor/web dev
 
 # 构建 viewer(单文件产物落入 server/static/)
 pnpm -r build

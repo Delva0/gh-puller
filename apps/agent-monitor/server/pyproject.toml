@@ -1,5 +1,5 @@
 [project]
-name = "gh-puller-agent-dashboard"
+name = "gh-puller-agent-monitor"
 version = "0.1.0"
 description = "Agent 监控 Web/WS hub(FastAPI 端点层);事件模型与配置复用 gh_puller"
 requires-python = ">=3.13"
@@ -12,6 +12,9 @@ dependencies = [
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
+
+[[tool.uv.index]]
+url = "https://pypi.org/simple"
 
 [tool.uv.sources]
 gh-puller = { path = "../../..", editable = true }

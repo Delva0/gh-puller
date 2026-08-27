@@ -11,6 +11,7 @@ import asyncio
 import json
 import os
 from datetime import datetime
+from pathlib import Path
 from typing import Literal
 
 from dotenv import load_dotenv
@@ -72,12 +73,32 @@ from tasks import WikiTask, WikiTaskSubmitResult, registry  # noqa: E402
 # 语言与模型契约(仅 HTTP 层展示用;_LANGUAGE_NAMES 为引擎侧映射)
 _LANG_CONFIG = {"supported_languages": dict(_LANGUAGE_NAMES), "default": "en"}
 
-# target 契约:唯一真源 = agent.GENERATORS(极简 id → 生成器类实例映射;类型信息在
-# 各生成器类属性)。generator → generator_config(dict,按 generator 包装):file 类
-# (cc/dsh/codex)= {"config_path"};object 类(llm)= {"provider","model","base_url","api_key"}。
+# target 契约:唯一真源 = agent.GENERATORS(极简 id → 生成器类映射;生成器类零 config
+# 元数据 —— configKind 经引擎 utils.config_kind 判别,展示/缺省元数据由本层自持(同
+# _LANGUAGE_NAMES 的「仅 HTTP 层展示用」哲学;值沿旧生成器类属性契约,见 test_app.py)。
+# generator → generator_config(dict,按 generator 包装):file 类(cc/dsh/codex)
+# = {"config_path"};object 类(llm)= {"provider","model","base_url","api_key"}。
 # /models/config 为 deepwiki-open 旧契约的投影(标注 deprecated);/generators/config
 # 为当前契约(前端唯一真源)。
 from gh_puller.agent import GENERATORS as AGENT_GENERATORS
+from gh_puller.deepwiki.utils import config_kind, resolve_generator
+
+# /generators/config 前端元数据表(键 = GENERATORS id;file 类无 provider 键,object 类
+# 无 configPath 键 —— 键集互斥即类别;configDefault = 配置路径 UI 占位/缺省展示)。
+_GENERATOR_META: dict[str, dict] = {
+    "cc": {"name": "Claude Code", "capability": "anthropic-agent-api",
+           "configPathEnv": "DEEPWIKI_CC_CONFIG",
+           "configDefault": str(Path.home() / ".claude" / "settings.json")},
+    "dsh": {"name": "DeepSeek Harness", "capability": "deepseek-route",
+            "configPathEnv": "DEEPWIKI_DSH_CORDIS", "configDefault": None},
+    "codex": {"name": "Codex", "capability": "responses",
+              "configPathEnv": "DEEPWIKI_CODEX_CONFIG", "configDefault": None},
+    "llm": {"name": "LLM", "capability": "chat-completions", "provider": "openai",
+            "modelEnv": "LLM_MODEL", "apiKeyEnv": "OPENAI_API_KEY",
+            "baseUrlEnv": "OPENAI_BASE_URL", "baseUrlDefault": "https://api.openai.com/v1",
+            "models": ("gpt-5.6-luna", "gpt-5.3-codex", "gpt-5.1-codex"),
+            "supportsCustomModel": True},
+}
 
 
 def _models_config() -> ModelConfig:
@@ -86,55 +107,61 @@ def _models_config() -> ModelConfig:
 
     defaultProvider = 默认 generator 的"provider"展示值(cc 无此轴 → 空串)。
     """
+    providers = []
+    for gid in AGENT_GENERATORS:
+        meta = _GENERATOR_META[gid]
+        if "provider" not in meta:  # file 类:provider 随所选配置文件,不设请求轴
+            continue
+        providers.append(Provider(
+            id=meta["provider"], name=meta["provider"].title(),
+            supportsCustomModel=meta["supportsCustomModel"],
+            models=[Model(id=mid, name=mid) for mid in meta["models"]],
+        ))
     return ModelConfig(
-        providers=[
-            Provider(
-                id=gen.provider,
-                name=gen.provider.title(),
-                supportsCustomModel=getattr(gen, "supports_custom_model", False),
-                models=[Model(id=mid, name=mid) for mid in getattr(gen, "models", ())],
-            )
-            for gen in AGENT_GENERATORS.values()
-            if gen.config_kind == "object"
-        ],
-        defaultProvider=getattr(AGENT_GENERATORS[envs.DEEPWIKI_GENERATOR], "provider", ""),
+        providers=providers,
+        defaultProvider=_GENERATOR_META[envs.DEEPWIKI_GENERATOR].get("provider", ""),
     )
 
 
 def _generators_config() -> dict:
-    """GET /generators/config:生成器类属性直出(前端唯一真源)。
+    """GET /generators/config:注册表直出(前端唯一真源)。
 
     configKind = "file"(generator_config 只填 config_path;占位取 configPathEnv/
     configDefault)或 "object"(providers 列表 + provider/model 字段)。
     """
-    default_gen = AGENT_GENERATORS[envs.DEEPWIKI_GENERATOR]
-    if default_gen.config_kind == "file":
-        default_config: dict = {"config_path": default_gen.config_default or ""}
+    default_gid, default_gc = resolve_generator()  # 空选型 → env 缺省(与运行期解析一致)
+    if config_kind(default_gid) == "file":
+        default_config: dict = {"config_path": default_gc.get("config_path", "")}
     else:
-        default_config = {"provider": default_gen.provider, "model": ""}
+        default_config = {"provider": _GENERATOR_META[default_gid].get("provider", ""),
+                          "model": ""}
+    generators, providers = [], []
+    for gid in AGENT_GENERATORS:
+        meta = _GENERATOR_META[gid]
+        kind = config_kind(gid)
+        generators.append({
+            "id": gid, "name": meta["name"], "configKind": kind,
+            "capability": meta["capability"],
+            "defaultProvider": meta.get("provider", "") if kind == "object" else "",
+            "providers": [meta["provider"]] if kind == "object" else [],
+            "defaultModelEnv": meta.get("modelEnv"),
+            "configPathEnv": meta.get("configPathEnv"),
+            "configDefault": meta.get("configDefault"),
+        })
+        if "provider" in meta:  # object 类入口(providers 注册表)
+            providers.append({
+                "id": meta["provider"], "name": meta["provider"].title(),
+                "apiKeyEnv": meta.get("apiKeyEnv"),
+                "baseUrlEnv": meta.get("baseUrlEnv"),
+                "baseUrlDefault": meta.get("baseUrlDefault"),
+                "models": list(meta.get("models", ())),
+                "supportsCustomModel": meta.get("supportsCustomModel", False),
+            })
     return {
-        "generators": [
-            {"id": gen.id, "name": gen.name, "configKind": gen.config_kind,
-             "capability": gen.capability,
-             "defaultProvider": gen.provider if gen.config_kind == "object" else "",
-             "providers": [gen.provider] if gen.config_kind == "object" else [],
-             "defaultModelEnv": getattr(gen, "model_env", None),
-             "configPathEnv": getattr(gen, "config_path_env", None),
-             "configDefault": getattr(gen, "config_default", None)}
-            for gen in AGENT_GENERATORS.values()
-        ],
-        "providers": [
-            {"id": gen.provider, "name": gen.provider.title(),
-             "apiKeyEnv": getattr(gen, "api_key_env", None),
-             "baseUrlEnv": getattr(gen, "base_url_env", None),
-             "baseUrlDefault": getattr(gen, "base_url_default", None),
-             "models": list(getattr(gen, "models", ())),
-             "supportsCustomModel": getattr(gen, "supports_custom_model", False)}
-            for gen in AGENT_GENERATORS.values() if gen.config_kind == "object"
-        ],
-        "defaultGenerator": envs.DEEPWIKI_GENERATOR,
-        "defaultTarget": {"generator": envs.DEEPWIKI_GENERATOR,
-                          "generator_config": default_config},
+        "generators": generators,
+        "providers": providers,
+        "defaultGenerator": default_gid,
+        "defaultTarget": {"generator": default_gid, "generator_config": default_config},
     }
 
 

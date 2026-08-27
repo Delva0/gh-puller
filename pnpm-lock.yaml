@@ -11,7 +11,7 @@ importers:
 
   .: {}
 
-  apps/agent-dashboard/web:
+  apps/agent-monitor/web:
     dependencies:
       '@gh-puller/ui':
         specifier: workspace:*

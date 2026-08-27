@@ -21,6 +21,7 @@ export type ViewerFrame =
   | { type: 'index' }
   | { type: 'history'; session: string; beforeSeq?: number; max?: number }
   | { type: 'subscribe'; session: string }
+  | { type: 'delete'; session: string }
   | { type: 'ping' };
 
 // hub(→ 查看端)
