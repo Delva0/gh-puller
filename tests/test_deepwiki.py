@@ -26,7 +26,8 @@ from gh_puller.deepwiki import (
     write_resume_state,
 )
 from gh_puller.deepwiki import utils as deepwiki_utils
-from gh_puller.deepwiki.cache import _generator_digest, _graph_dir, _resume_state_path
+from gh_puller.deepwiki.utils import generator_digest, graph_dir
+from gh_puller.deepwiki.wiki import resume_state_path
 from gh_puller.deepwiki.codemap import _locate_snippet
 from gh_puller.deepwiki.utils import _graphify_mcp, adapter, agent_note
 from gh_puller.deepwiki.wiki import (
@@ -192,7 +193,7 @@ def _make_request(owner: str, repo: str) -> dict:
 
 def _digest_of(choice: "dict | None") -> str:
     """选型 dict → 稳定摘要(测试与实现共用一个函数)。"""
-    return _generator_digest((choice or {}).get("generator"), (choice or {}).get("generator_config"))
+    return generator_digest((choice or {}).get("generator"), (choice or {}).get("generator_config"))
 
 
 def _repo_of(req: dict) -> Repo:
@@ -238,9 +239,9 @@ async def test_wiki_task_state_roundtrip_atomic():
         "submitted_at": 1234567890,
         "error": None,
     }
-    digest = _generator_digest(request["target"])
+    digest = generator_digest(request["target"])
     assert await write_resume_state("state-io", "demo", "local", "en", state, digest=digest) is True
-    path = _resume_state_path("state-io", "demo", "local", "en", digest=digest)
+    path = resume_state_path("state-io", "demo", "local", "en", digest=digest)
     assert os.path.exists(path)
     assert not os.path.exists(f"{path}.tmp")
     loaded = await read_resume_state("state-io", "demo", "local", "en", digest=digest)
@@ -459,10 +460,10 @@ NODE d [src=src/c.py community=c1]
 
 def test_subgraph_hits_parse():
     """解析 NODE(src/loc)/EDGE(at=) 标注:容忍截断前缀行,空 loc 或无 loc 跳过。"""
-    hits = deepwiki.utils.subgraph_hits(_SUBGRAPH_ANSWER)
+    hits = deepwiki.chat.subgraph_hits(_SUBGRAPH_ANSWER)
     assert hits == {"src/a.py": [5, 12, 40]}
     assert "src/b.py" not in hits and "src/c.py" not in hits
-    assert deepwiki.utils.subgraph_hits("no matches here\n") == {}
+    assert deepwiki.chat.subgraph_hits("no matches here\n") == {}
 
 
 @pytest.mark.asyncio
@@ -473,13 +474,13 @@ async def test_subgraph_src_blocks_windows_merge(tmp_path, monkeypatch):
         "\n".join(f"line {i}" for i in range(1, 101)), encoding="utf-8"
     )
     monkeypatch.setattr(deepwiki.envs, "CHAT_TOKEN_LIMIT_ESTIMATE", 20000)
-    blocks, degraded = deepwiki.utils.subgraph_src_blocks(
+    blocks, degraded = deepwiki.chat.subgraph_src_blocks(
         str(tmp_path), {"src/a.py": [5, 9]}, radius=8
     )
     assert not degraded and len(blocks) == 1
     assert blocks[0]["start_line"] == 1 and blocks[0]["end_line"] == 17
     assert blocks[0]["text"] == "\n".join(f"line {i}" for i in range(1, 18))
-    blocks, degraded = deepwiki.utils.subgraph_src_blocks(
+    blocks, degraded = deepwiki.chat.subgraph_src_blocks(
         str(tmp_path), {"src/a.py": [5, 45]}, radius=8
     )
     assert not degraded and len(blocks) == 2
@@ -492,17 +493,17 @@ def test_subgraph_src_blocks_per_file_cap_and_budget(tmp_path):
     d = tmp_path / "src"
     d.mkdir()
     (d / "a.py").write_text("\n".join(f"line {i}" for i in range(1, 51)), encoding="utf-8")
-    blocks, degraded = deepwiki.utils.subgraph_src_blocks(
+    blocks, degraded = deepwiki.chat.subgraph_src_blocks(
         str(tmp_path), {"src/a.py": [25]}, radius=8, per_file_cap=30,
     )
     assert not degraded and len(blocks) == 1
     assert len(blocks[0]["text"]) == 30
     assert blocks[0]["end_line"] == blocks[0]["start_line"] + blocks[0]["text"].count("\n")
-    blocks, degraded = deepwiki.utils.subgraph_src_blocks(
+    blocks, degraded = deepwiki.chat.subgraph_src_blocks(
         str(tmp_path), {"src/a.py": [25]}, radius=8, budget_chars=5,
     )
     assert (blocks, degraded) == ([], True)
-    blocks, degraded = deepwiki.utils.subgraph_src_blocks(str(tmp_path), {"nope.py": [1]})
+    blocks, degraded = deepwiki.chat.subgraph_src_blocks(str(tmp_path), {"nope.py": [1]})
     assert (blocks, degraded) == ([], False)
 
 
@@ -514,13 +515,13 @@ def test_format_subgraph_context():
         {"path": "src/a.py", "text": "y = 2", "start_line": 10, "end_line": 20},
         {"path": "src/b.py", "text": "z = 3", "start_line": 5, "end_line": 9},
     ]
-    text = deepwiki.utils.format_subgraph_context(blocks)
+    text = deepwiki.chat.format_subgraph_context(blocks)
     assert text.startswith("\n\n----------## File Path: src/a.py\n\n")  # 原版联结式
     assert text.count("## File Path:") == 2
     assert "[lines 1-1]\nx = 1" in text and "[lines 10-20]\ny = 2" in text
     assert "## File Path: src/b.py\n\n[lines 5-9]\nz = 3" in text
-    assert deepwiki.utils.format_subgraph_context([]) == ""
-    assert deepwiki.utils.format_subgraph_context([{"path": "a.py", "text": "t", "start_line": 1, "end_line": 1}]) \
+    assert deepwiki.chat.format_subgraph_context([]) == ""
+    assert deepwiki.chat.format_subgraph_context([{"path": "a.py", "text": "t", "start_line": 1, "end_line": 1}]) \
         .startswith("\n\n----------## File Path: a.py")
 
 
@@ -678,9 +679,9 @@ async def test_llm_codemap_events_sequence(monkeypatch, tmp_path):
     (repo_dir / "src").mkdir(parents=True)
     (repo_dir / "src" / "a.py").write_text("def f():\n    return 42\n", encoding="utf-8")
     fake_repo = Repo(str(repo_dir), "local")
-    graph_dir = _graph_dir(fake_repo)
-    graph_dir.mkdir(parents=True, exist_ok=True)
-    (graph_dir / "graph.json").write_text("{}", encoding="utf-8")
+    gd = graph_dir(fake_repo)
+    gd.mkdir(parents=True, exist_ok=True)
+    (gd / "graph.json").write_text("{}", encoding="utf-8")
 
     calls = []
 
@@ -768,9 +769,9 @@ async def test_llm_codemap_skeleton_retry_and_enrich_degrade(monkeypatch, tmp_pa
     (repo_dir / "src").mkdir(parents=True)
     (repo_dir / "src" / "a.py").write_text("def f():\n    return 42\n", encoding="utf-8")
     fake_repo = Repo(str(repo_dir), "local")
-    graph_dir = _graph_dir(fake_repo)
-    graph_dir.mkdir(parents=True, exist_ok=True)
-    (graph_dir / "graph.json").write_text("{}", encoding="utf-8")
+    gd = graph_dir(fake_repo)
+    gd.mkdir(parents=True, exist_ok=True)
+    (gd / "graph.json").write_text("{}", encoding="utf-8")
 
     skeleton = {"title": "How to f", "summary": "s",
                 "sections": [{"id": "1", "title": "S", "guide": "", "diagram": "",
@@ -977,7 +978,7 @@ def test_codex_options_config(monkeypatch, tmp_path):
     monkeypatch.setattr(_FakeGenerator, "generator", "codex")
     cfg = adapter(**_gen_kwargs({"generator": "codex"}), system_prompt="sys", repo=repo).config
     assert "model" not in cfg and cfg["cwd"] == str(tmp_path)
-    assert cfg["env"] == {"GRAPHIFY_OUT": str(_graph_dir(repo))}
+    assert cfg["env"] == {"GRAPHIFY_OUT": str(graph_dir(repo))}
     assert cfg["mcp_servers"] == _graphify_mcp("codex")  # 零配置缺省隔离 config.toml 带图工具
     assert cfg["sandbox"] == "full_access" and cfg["approval_mode"] == "auto_review"
     cfg2 = adapter(**_gen_kwargs({"generator": "codex"}), system_prompt="sys").config
