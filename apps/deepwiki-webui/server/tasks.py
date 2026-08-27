@@ -48,7 +48,7 @@ from gh_puller.deepwiki.cache import (
     _index_ready,
     _wiki_cache_dir,
 )
-from gh_puller.deepwiki.pipeline import _wiki_pipeline
+from gh_puller.deepwiki.wiki import _wiki_pipeline
 from gh_puller.deepwiki.utils import _log, _merge_creds, _resolve_generator, _strip_creds
 from gh_puller.utils import (
     Repo,

@@ -16,6 +16,7 @@ from pathlib import Path
 import pytest
 
 from gh_puller import deepwiki
+from gh_puller.agent import GENERATORS, RequestFailedError
 from gh_puller.deepwiki import (
     WikiPage,
     WikiStructureModel,
@@ -24,15 +25,12 @@ from gh_puller.deepwiki import (
     read_resume_state,
     write_resume_state,
 )
-from gh_puller.agent import GENERATORS, RequestFailedError
 from gh_puller.deepwiki import utils as deepwiki_utils
 from gh_puller.deepwiki.cache import _generator_digest, _graph_dir, _resume_state_path
-from gh_puller.deepwiki.pipeline import (
+from gh_puller.deepwiki.codemap import _locate_snippet
+from gh_puller.deepwiki.utils import _adapter, _agent_note, _graphify_mcp
+from gh_puller.deepwiki.wiki import (
     RepoUrlContext,
-    _adapter,
-    _agent_note,
-    _graphify_mcp,
-    _locate_snippet,
     _wiki_pipeline,
     parse_wiki_structure,
     post_process_wiki_content,
@@ -202,18 +200,18 @@ def _repo_of(req: dict) -> Repo:
     return Repo(req["repo_url"], req["type"], access_token=req.get("token"))
 
 
-async def _chat(pipeline_cls, req: dict) -> list[str]:
-    """散装参数测试辅助:调用 chat_stream(请求为 dict)。"""
-    return [c async for c in pipeline_cls.chat_stream(
+async def _chat(req: dict) -> list[str]:
+    """散装参数测试辅助:调用模块级 chat_stream(请求为 dict;agent/llm 分派随 target)。"""
+    return [c async for c in deepwiki.chat_stream(
         choice=req["target"], repo=_repo_of(req), messages=req["messages"],
         language=req.get("language", "en"),
         research_iteration=req.get("research_iteration", 1),
     )]
 
 
-async def _codemap(pipeline_cls, req: dict) -> list[dict]:
-    """散装参数测试辅助:调用 generate_codemap 并解析 NDJSON 事件(请求为 dict)。"""
-    return [json.loads(ev) async for ev in pipeline_cls.generate_codemap(
+async def _codemap(req: dict) -> list[dict]:
+    """散装参数测试辅助:调用模块级 generate_codemap 并解析 NDJSON 事件(请求为 dict)。"""
+    return [json.loads(ev) async for ev in deepwiki.generate_codemap(
         choice=req["target"], repo=_repo_of(req), question=req["question"],
         language=req.get("language", "en"),
     )]
@@ -369,7 +367,7 @@ async def test_chat_stream_context_events(monkeypatch):
                      {"role": "assistant", "content": "a1"},
                      {"role": "user", "content": "q2"}],
     }
-    got = await _chat(deepwiki.AgentWikiPipeline(), request)
+    got = await _chat(request)
     assert "".join(got) == "hi"
     assert captured["run_id"] == captured["session"]  # 会话组名与监控名同一来源(chat:<repo>)
     assert captured["run_id"].startswith("chat:")
@@ -553,7 +551,7 @@ async def test_llm_chat_stream_prompt_and_context(monkeypatch, tmp_path):
                      {"role": "assistant", "content": "a1"},
                      {"role": "user", "content": "how does src/a.py work?"}],
     }
-    got = await _chat(deepwiki.LlmWikiPipeline(), request)
+    got = await _chat(request)
     assert "".join(got) == "HELLO"
     assert captured["session"] == f"chat:{Repo(str(tmp_path), 'local').name}"
     assert captured["choice"] == request["target"]  # llm 路:model/url/api_key 由选型注入(经 _adapter)
@@ -595,11 +593,11 @@ async def test_llm_chat_continuation_and_iteration_templates(monkeypatch, tmp_pa
                      {"role": "user", "content": "Continue the research",
                       "mode": "deep_research"}],
     }
-    _ = await _chat(deepwiki.LlmWikiPipeline(), request)
+    _ = await _chat(request)
     assert captured["query"] == "what is this repo about?"
     assert "iteration 3" in captured["prompt"]
     request_final = {**request, "research_iteration": 5}
-    _ = await _chat(deepwiki.LlmWikiPipeline(), request_final)
+    _ = await _chat(request_final)
     assert "## Final Conclusion" in captured["prompt"]
 
 
@@ -625,7 +623,7 @@ async def test_llm_chat_error_fallbacks(monkeypatch, tmp_path):
         "target": {"generator": "llm"}, "token": None,
         "messages": [{"role": "user", "content": "hi"}],
     }
-    got = await _chat(deepwiki.LlmWikiPipeline(), request)
+    got = await _chat(request)
     assert "".join(got) == "ok"  # 图无命中也一样回答
     assert "Answering without retrieval augmentation." in captured["prompt"]
     # 图谱查询失败 → 同样降级 note(不引入任何错误文本)
@@ -633,7 +631,7 @@ async def test_llm_chat_error_fallbacks(monkeypatch, tmp_path):
         raise RuntimeError("graph is gone")
 
     monkeypatch.setattr(deepwiki.graphify, "query", boom)
-    got = await _chat(deepwiki.LlmWikiPipeline(), request)
+    got = await _chat(request)
     assert "".join(got) == "ok"
     assert "Answering without retrieval augmentation." in captured["prompt"]
     # 非 token 错误 → "Error with openai API: ..." 原版式文本进流
@@ -642,7 +640,7 @@ async def test_llm_chat_error_fallbacks(monkeypatch, tmp_path):
         yield  # 保持 async generator
 
     monkeypatch.setattr(deepwiki_utils, "llm_stream", err_stream)
-    got = await _chat(deepwiki.LlmWikiPipeline(), request)
+    got = await _chat(request)
     assert "Error with openai API: llm down" in "".join(got)
     # token 超限 → 简化提示词重试一次
     calls = []
@@ -654,7 +652,7 @@ async def test_llm_chat_error_fallbacks(monkeypatch, tmp_path):
         yield "SIMPLIFIED"
 
     monkeypatch.setattr(deepwiki_utils, "llm_stream", token_stream)
-    got = await _chat(deepwiki.LlmWikiPipeline(), request)
+    got = await _chat(request)
     assert "".join(got) == "SIMPLIFIED"
     assert len(calls) == 2
     assert "due to input size constraints" in calls[1]
@@ -664,7 +662,7 @@ async def test_llm_chat_error_fallbacks(monkeypatch, tmp_path):
         yield
 
     monkeypatch.setattr(deepwiki_utils, "llm_stream", token_stream2)
-    got = await _chat(deepwiki.LlmWikiPipeline(), request)
+    got = await _chat(request)
     assert "I apologize, but your request is too large for me to process" in "".join(got)
 
 
@@ -710,7 +708,7 @@ async def test_llm_codemap_events_sequence(monkeypatch, tmp_path):
         "repo_url": str(repo_dir), "type": "local", "language": "en",
         "target": {"generator": "llm"}, "token": None, "question": "how to call f?",
     }
-    events = await _codemap(deepwiki.LlmWikiPipeline(), request)
+    events = await _codemap(request)
     assert [e["type"] for e in events] == ["phase", "phase", "phase", "phase",
                                            "phase", "phase", "codemap", "done"]
     assert events[0] == {"type": "phase", "phase": "analyzing", "status": "start"}
@@ -752,7 +750,7 @@ async def test_llm_codemap_not_indexed_and_retry_and_degraded(monkeypatch, tmp_p
         "repo_url": str(repo_dir), "type": "local", "language": "en",
         "target": {"generator": "llm"}, "token": None, "question": "q",
     }
-    events = await _codemap(deepwiki.LlmWikiPipeline(), request)
+    events = await _codemap(request)
     assert events[1] == {"type": "phase", "phase": "analyzing", "status": "done",
                          "chunk_count": 0}
     assert events[2]["type"] == "error" and events[2]["stage"] == "analyzing"
@@ -791,7 +789,7 @@ async def test_llm_codemap_skeleton_retry_and_enrich_degrade(monkeypatch, tmp_pa
         "repo_url": str(repo_dir), "type": "local", "language": "en",
         "target": {"generator": "llm"}, "token": None, "question": "how to call f?",
     }
-    events = await _codemap(deepwiki.LlmWikiPipeline(), request)
+    events = await _codemap(request)
     assert events[4] == {"type": "phase", "phase": "diagrams", "status": "start"}
     assert events[5]["status"] == "done" and events[5]["degraded"] is True
     assert events[6]["type"] == "codemap" and events[6]["data"]["sections"][0]["guide"] == ""
@@ -802,7 +800,7 @@ async def test_llm_codemap_skeleton_retry_and_enrich_degrade(monkeypatch, tmp_pa
         return "not json"
 
     monkeypatch.setattr(deepwiki_utils, "llm_complete", garbage)
-    events = await _codemap(deepwiki.LlmWikiPipeline(), request)
+    events = await _codemap(request)
     assert events[3]["type"] == "error" and events[3]["stage"] == "initial_codemap"
     assert events[3]["message"].startswith("Model did not return valid JSON")
     assert [e["type"] for e in events].count("codemap") == 0
@@ -832,7 +830,7 @@ async def test_agent_chat_natural_history(monkeypatch):
                      {"role": "assistant", "content": "a1"},
                      {"role": "user", "content": "q2"}],
     }
-    got = await _chat(deepwiki.AgentWikiPipeline(), request)
+    got = await _chat(request)
     assert "".join(got) == "hi"
     assert captured["session"] == captured["run_id"]
     p = captured["prompt"]
@@ -862,7 +860,7 @@ async def test_agent_chat_deep_one_shot(monkeypatch):
                      {"role": "user", "content": "Continue the research",
                       "mode": "deep_research"}],
     }
-    _ = await _chat(deepwiki.AgentWikiPipeline(), request)
+    _ = await _chat(request)
     assert "single-run Deep Research" in captured["system"]
     assert "## Final Conclusion" in captured["system"]
     assert "first iteration of a multi-turn" not in captured["system"]
@@ -874,26 +872,26 @@ async def test_chat_and_codemap_dispatch_by_generator(monkeypatch):
     """chat/codemap 顶层分派:与 wiki 同开关(DEEPWIKI_GENERATOR)。"""
     calls = []
 
-    async def fake_cc_chat(self, **kwargs):
+    async def fake_cc_chat(**kwargs):
         calls.append("cc")
         yield "c"
 
-    async def fake_llm_chat(self, **kwargs):
+    async def fake_llm_chat(**kwargs):
         calls.append("llm")
         yield "l"
 
-    async def fake_cc_codemap(self, **kwargs):
+    async def fake_cc_codemap(**kwargs):
         calls.append("cc-codemap")
         yield "c"
 
-    async def fake_llm_codemap(self, **kwargs):
+    async def fake_llm_codemap(**kwargs):
         calls.append("llm-codemap")
         yield "l"
 
-    monkeypatch.setattr(deepwiki.AgentWikiPipeline, "chat_stream", fake_cc_chat)
-    monkeypatch.setattr(deepwiki.LlmWikiPipeline, "chat_stream", fake_llm_chat)
-    monkeypatch.setattr(deepwiki.AgentWikiPipeline, "generate_codemap", fake_cc_codemap)
-    monkeypatch.setattr(deepwiki.LlmWikiPipeline, "generate_codemap", fake_llm_codemap)
+    monkeypatch.setattr(deepwiki.chat, "_agent_chat", fake_cc_chat)
+    monkeypatch.setattr(deepwiki.chat, "_llm_chat", fake_llm_chat)
+    monkeypatch.setattr(deepwiki.codemap, "_agent_codemap", fake_cc_codemap)
+    monkeypatch.setattr(deepwiki.codemap, "_llm_codemap", fake_llm_codemap)
     chat_req = {
         "repo_url": "/tmp/x", "type": "local", "language": "en",
         "target": {}, "token": None,
@@ -962,7 +960,7 @@ async def test_agent_chat_wraps_request_failure_in_degrade(monkeypatch):
         "target": {}, "token": None,
         "messages": [{"role": "user", "content": "hi"}],
     }
-    got = "".join(await _chat(deepwiki.AgentWikiPipeline(), request))
+    got = "".join(await _chat(request))
     # 客户端可见降级串逐字节(wire 契约):半角逗号/冒号
     assert "(抱歉,本次请求处理失败: agent 执行失败: sdk exploded)" in got
 

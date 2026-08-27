@@ -18,14 +18,18 @@ generator_config};解析/校验唯一知识源在 deepwiki.utils._resolve_genera
 任务状态机/调度/进度投影在其 server/tasks.py。续跑落盘(deepwiki_resume_*)语义见 ./cache.py。
 
 子模块结构(本文件只做公共白名单 re-export,不含任何实现):
-- utils      generator 选型/判等/凭证规则簇 + 域内日志(_log)+ repo 键
 - models     引擎契约 dataclass 族(零 pydantic)+ dict→model 构造器
 - cache      产物布局(graphify 图/wiki 成品缓存/续跑状态) + 导出 + 判等摘要族
-- pipeline   生成协议层(双路包装类 + 四路装配 + 模型产出解析/引用渲染 +
-             索引保障服务 + chat/codemap 服务入口;离核心概念近的 helper 收编本层)
+- utils      generator 选型/判等/凭证规则簇 + 域内日志(_log)+ repo 键 +
+             跨功能通用(四路装配 _adapter/llm 传输/检索簇/lm-m 路补全协议/
+             提示词共性常量/索引保障服务)
+- wiki        wiki 主线:双路包装类(WikiPipeline/AgentWikiPipeline/LlmWikiPipeline
+              + _wiki_pipeline 分派)+ 结构 XML 解析 + 引用渲染 + wiki 提示词
+- chat        chat 主线:chat_stream 入口 + 双路实现 + 历史转写 + 深研究模板
+- codemap     codemap 主线:generate_codemap 入口 + 双路实现 + 提示词 + 引用接地
 
 私有成员(下划线名)不经此门面 —— 直接从对应子模块导入;
-monkeypatch 同理打在属主子模块上(如 deepwiki.pipeline.llm_stream、
+monkeypatch 同理打在属主子模块上(如 deepwiki.utils.llm_stream、
 AgentWikiPipeline._deliver 或 agent 适配器单例方法)。
 """
 
@@ -43,6 +47,8 @@ from .cache import (
     wiki_cache_exists,
     write_resume_state,
 )
+from .chat import chat_stream
+from .codemap import generate_codemap
 from .models import (
     CodeMap,
     CodeMapCitation,
@@ -55,15 +61,12 @@ from .models import (
     codemap_of,
     wiki_structure_of,
 )
-from .pipeline import (
+from .utils import ensure_index, repo_key_of
+from .wiki import (
     AgentWikiPipeline,
     LlmWikiPipeline,
     WikiPipeline,
-    chat_stream,
-    ensure_index,
-    generate_codemap,
 )
-from .utils import repo_key_of
 
 __all__ = [
     # models(契约 dataclass 族)
@@ -80,7 +83,7 @@ __all__ = [
     "wiki_structure_of",
     # 仓库键(utils)
     "repo_key_of",
-    # 索引保障服务(pipeline;/repo/prepare 与 wiki 任务主流程共用)
+    # 索引保障服务(utils;/repo/prepare 与 wiki 任务主流程共用)
     "ensure_index",
     # 缓存 / 续跑状态 / 导出(cache)
     "save_generated_wiki",
@@ -94,7 +97,7 @@ __all__ = [
     "write_resume_state",
     "read_resume_state",
     "delete_resume_state",
-    # 服务入口(pipeline)
+    # 服务入口(chat/codemap/wiki)
     "chat_stream",
     "generate_codemap",
     "WikiPipeline",

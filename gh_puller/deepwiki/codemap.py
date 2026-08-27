@@ -5,14 +5,21 @@
 _agent_codemap;llm → _llm_codemap,分派规则与 wiki._wiki_pipeline 同);本主线
 专用 helper:骨架/富化提示词(带 JSON 输出格式与引用接地规则)、codemap 引用
 接地(_ground_citations/_locate_snippet —— snippet 为权威,LLM 给的行号不可靠)。
-跨功能通用 helper(四路装配/检索簇/提示词共性)在 utils。
+跨功能通用 helper(四路装配/检索簇/提示词共性常量)在 utils,经本模块属性
+调用(utils.xxx 调用时取 —— monkeypatch 活性)。
 """
 
 from __future__ import annotations
 
+import dataclasses
+import json
 import os
 
-from .models import CodeMap
+from ..utils import Repo, _event, _extract_json, _phase
+from . import utils
+from .cache import _index_ready
+from .models import CodeMap, codemap_of
+from .utils import _log
 
 # codemap 生成 - 阶段 1:分析代码并产出 codemap 骨架(带 JSON 输出格式与引用接地规则)
 _CODEMAP_SKELETON_PROMPT = """<role>
@@ -131,3 +138,188 @@ def _ground_citations(codemap: CodeMap, repo_dir: str) -> None:
             loc = _locate_snippet(text, cit.snippet)
             if loc:
                 cit.start_line, cit.end_line = loc
+
+
+# ---------------------------------------------------------------------------
+# 双路实现(agent 路两阶段整收;llm 路原版 prompt_builder + 整收重试)
+# ---------------------------------------------------------------------------
+
+
+def _codemap_note() -> str:
+    """codemap 指引(仅 cc/agent 路用):先查图谱再构造,引用行号取自 Source 标记。"""
+    return (
+        "<note>Before answering, use the graphify_query tool to inspect the repository "
+        "code graph (its result carries `Source: <file path> L<line>` markers). "
+        "When filling citation.file_path / start_line / end_line, use those paths and line "
+        "numbers, and make the 'snippet' a verbatim substring of the code shown in the result.</note>\n\n"
+    )
+
+
+async def _agent_codemap(
+    *, choice: dict | None, repo: Repo, question: str, language: str = "en",
+):
+    """两阶段 codemap 生成(骨架 → 指南/图),NDJSON 事件流;阶段失败语义与原相同。"""
+    yield _phase("analyzing", "start")
+    if not _index_ready(repo):
+        yield _phase("analyzing", "done", chunk_count=0)
+        yield _event(type="error", stage="analyzing", message=f"仓库尚未索引,请先 /repo/prepare: {repo.name}")
+        return
+    yield _phase("analyzing", "done", chunk_count=0)
+
+    fmt = utils._prompt_fmt(repo, language=language)
+
+    async def _run_json(prompt: str, attempts: int = 3) -> dict:
+        """整收 + 解析 JSON,失败重试(每轮新 agent);system 恒用骨架提示词。"""
+        last_error: Exception | None = None
+        for attempt in range(1, attempts + 1):
+            try:
+                adapter = utils._adapter(
+                    choice, system_prompt=_CODEMAP_SKELETON_PROMPT.format(**fmt), repo=repo
+                )
+                raw = await adapter.result(
+                    prompt, session_name="codemap:skeleton",
+                    run_id=f"codemap:{repo.name}",
+                    retry={"attempt": attempt, "prev_error": str(last_error)} if last_error else None,
+                )
+                return _extract_json(raw)
+            except Exception as e:  # noqa: BLE001 - 重试预算兜底(RequestFailedError 先转文案)
+                last_error = utils._failure(e)
+                _log(f"codemap JSON 解析尝试 {attempt}/{attempts} 失败: {last_error}")
+        raise ValueError(f"Model did not return valid JSON after {attempts} attempts: {last_error}")
+
+    # 阶段 1:骨架
+    yield _phase("initial_codemap", "start")
+    skeleton_prompt = _codemap_note() + f"<query>\n{question}\n</query>\n\nAssistant: "
+    try:
+        skeleton = codemap_of(await _run_json(skeleton_prompt))
+    except Exception as e:  # noqa: BLE001
+        _log(f"codemap 骨架失败: {e}")
+        yield _event(type="error", stage="initial_codemap", message=str(e))
+        return
+    yield _phase("initial_codemap", "done", section_count=len(skeleton.sections))
+
+    # 阶段 2:指南/图;i/骨架失败不致命 — 退化为骨架
+    yield _phase("diagrams", "start")
+    enrich_query = (
+        f"{question}\n\n<SKELETON>\n{json.dumps(dataclasses.asdict(skeleton))}\n</SKELETON>"
+    )
+    enrich_prompt = _codemap_note() + f"<query>\n{enrich_query}\n</query>\n\nAssistant: "
+    final = skeleton
+    try:
+        adapter = utils._adapter(
+            choice, system_prompt=_CODEMAP_ENRICH_PROMPT.format(**fmt), repo=repo
+        )
+        raw = await adapter.result(
+            enrich_prompt, session_name="codemap:enrich",
+            run_id=f"codemap:{repo.name}",
+        )
+        final = codemap_of(_extract_json(raw))
+        yield _phase("diagrams", "done")
+    except Exception as e:  # noqa: BLE001
+        err = utils._failure(e)  # RequestFailedError 先转「agent 执行失败」再降级(同原包装时序)
+        _log(f"codemap 指南/图失败,使用骨架: {err}")
+        yield _phase("diagrams", "done", degraded=True)
+
+    _ground_citations(final, repo.save_path)
+    yield _event(type="codemap", data=dataclasses.asdict(final))
+    yield _event(type="done")
+
+
+async def _llm_codemap(
+    *, choice: dict | None, repo: Repo, question: str, language: str = "en",
+):
+    """llm 路 codemap(原版等价):analyzing 阶段完成检索(chunk_count=窗口数);
+    双提示词经 prompt_builder(与 chat 同构);JSON 解析失败重试——骨架 3 次、
+    富化 2 次(传输错误直接上抛);富化失败 degraded;引用接地两路共用。"""
+    # ---- 阶段 1a:analyzing(原版 RAG 检索;此处 = 图谱子图→真实代码窗) ----
+    yield _phase("analyzing", "start")
+    if not _index_ready(repo):
+        yield _phase("analyzing", "done", chunk_count=0)
+        yield _event(type="error", stage="analyzing", message=f"仓库尚未索引,请先 /repo/prepare: {repo.name}")
+        return
+    ctx = await utils._graphify_context(repo, question)
+    yield _phase("analyzing", "done", chunk_count=len(ctx["blocks"]))
+
+    fmt = utils._prompt_fmt(repo, language=language)
+    context: list[dict] = []
+    for b in ctx["blocks"]:
+        context.append({"type": "context/modify",
+                        "data": {"target": "codemap", "phase": "prompt-assembly",
+                                 "provenance": f"deepwiki:graph:{b['path']}", "text": b["text"]}})
+    if ctx["degraded"]:
+        context.append({"type": "context/modify",
+                        "data": {"target": "codemap", "kind": "degrade",
+                                 "cause": "token-limit", "detail": "检索上下文超限"}})
+    if ctx["error"]:
+        context.append({"type": "context/modify",
+                        "data": {"target": "codemap", "kind": "degrade",
+                                 "cause": "graph-error",
+                                 "detail": f"代码图谱不可用: {ctx['error']}"}})
+    context_text = utils._format_subgraph_context(ctx["blocks"])
+
+    async def _run_llm_json(prompt: str, attempts: int, session_name: str) -> dict:
+        """整收 + 解析 JSON;仅解析失败重试(原版 _generate_json 语义:
+        传输异常直接上抛,由阶段 try 处理)。"""
+        last_error: Exception | None = None
+        for attempt in range(1, attempts + 1):
+            raw = await utils.llm_complete(
+                prompt, choice=choice,
+                session_name=session_name, run_id=f"codemap:{repo.name}",
+                context=context,
+            )
+            try:
+                return _extract_json(raw)
+            except Exception as e:  # noqa: BLE001
+                last_error = e
+                _log(f"codemap JSON 解析尝试 {attempt}/{attempts} 失败: {e}")
+        raise ValueError(f"Model did not return valid JSON after {attempts} attempts: {last_error}")
+
+    # ---- 阶段 1b:骨架 ----------------------------------------------------
+    yield _phase("initial_codemap", "start")
+    skeleton_prompt = utils._build_service_prompt(
+        _CODEMAP_SKELETON_PROMPT.format(**fmt), question, context=context_text
+    )
+    try:
+        skeleton = codemap_of(await _run_llm_json(skeleton_prompt, 3, "codemap:skeleton"))
+    except Exception as e:  # noqa: BLE001
+        _log(f"codemap 骨架失败: {e}")
+        yield _event(type="error", stage="initial_codemap", message=str(e))
+        return
+    yield _phase("initial_codemap", "done", section_count=len(skeleton.sections))
+
+    # ---- 阶段 2:指南/图;失败不致命 — 退化为骨架 -------------------------
+    yield _phase("diagrams", "start")
+    enrich_query = (
+        f"{question}\n\n<SKELETON>\n{json.dumps(dataclasses.asdict(skeleton))}\n</SKELETON>"
+    )
+    enrich_prompt = utils._build_service_prompt(
+        _CODEMAP_ENRICH_PROMPT.format(**fmt), enrich_query, context=context_text
+    )
+    final = skeleton
+    try:
+        final = codemap_of(
+            await _run_llm_json(enrich_prompt, 2, "codemap:enrich")
+        )
+        yield _phase("diagrams", "done")
+    except Exception as e:  # noqa: BLE001
+        _log(f"codemap 指南/图失败,使用骨架: {e}")
+        yield _phase("diagrams", "done", degraded=True)
+
+    _ground_citations(final, repo.save_path)
+    yield _event(type="codemap", data=dataclasses.asdict(final))
+    yield _event(type="done")
+
+
+# ---------------------------------------------------------------------------
+# 服务入口(端点层从 app.py 直呼;分派规则与 wiki._wiki_pipeline 同)
+# ---------------------------------------------------------------------------
+
+
+async def generate_codemap(
+    *, choice: dict | None, repo: Repo, question: str, language: str = "en",
+):
+    """两阶段 codemap 生成(骨架 → 指南/图),NDJSON 事件流;阶段失败语义与原相同;按 choice.generator 分派双路。"""
+    gen = utils._resolve_generator(choice)[0]
+    impl = _agent_codemap if gen in ("cc", "dsh", "codex") else _llm_codemap
+    async for ev in impl(choice=choice, repo=repo, question=question, language=language):
+        yield ev

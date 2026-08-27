@@ -9,8 +9,8 @@
 patch 约定:tasks 自身模块全局(tasks.generate_repo_wiki / tasks._WIKI_TASK_TTL_SECONDS /
 tasks._generate_page_with_retry / tasks._WIKI_PAGE_CONCURRENCY)与 tasks.registry.* 直指
 server;引擎 patch 位点为其属主子模块(AgentWikiPipeline._deliver 类方法 /
-deepwiki.pipeline.llm_stream(llm 路直呼)、deepwiki.graphify.query、管线类方法、
-deepwiki.envs.DEEPWIKI_GENERATOR)—— 引擎模块内调用时经裸名动态解析。
+deepwiki.utils.llm_stream(llm 路直呼)、deepwiki.graphify.query、管线类方法、
+deepwiki.envs.DEEPWIKI_GENERATOR)—— 引擎模块内调用时经模块对象属性动态解析。
 """
 
 import asyncio
