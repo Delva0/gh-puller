@@ -29,7 +29,6 @@ from .. import envs  # 模块对象绑定:属性一律调用时取(patch/强刷�
 from ..agent import RequestFailedError
 from ..utils import Repo, TaskStatus, _find_readme_path, _sanitize_path_seg, _strip_markdown_fences
 from . import (
-    chat,  # llm 路协议(原版 research_chat;wiki llm 路 structure/page 复用)
     utils,  # 模块对象绑定:跨功能 helper 属性调用(monkeypatch 位点活性)
 )
 from .utils import language_name, log
@@ -1114,7 +1113,7 @@ class LlmWikiPipeline(WikiPipeline):
         )
         system = utils._SIMPLE_CHAT_SYSTEM_PROMPT.format(**utils.prompt_fmt(repo, language=language))
         parts: list[str] = []
-        async for chunk in chat.llm_research_chat(
+        async for chunk in utils.llm_research_chat(
             system, prompt, generator=generator, generator_config=generator_config, repo=repo,
             session_name="wiki:structure", run_id=run_id,
         ):
@@ -1179,7 +1178,7 @@ IMPORTANT:
         prompt = _build_page_prompt(page.title, file_links, language)
         system = utils._SIMPLE_CHAT_SYSTEM_PROMPT.format(**utils.prompt_fmt(repo, language=language))
         parts: list[str] = []
-        async for chunk in chat.llm_research_chat(
+        async for chunk in utils.llm_research_chat(
             system, prompt, generator=generator, generator_config=generator_config, repo=repo,
             session_name=f"wiki:page:{page.id}", run_id=run_id,
         ):

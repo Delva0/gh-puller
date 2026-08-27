@@ -21,6 +21,7 @@ resolve_generator 唯一知识源)。envs/graphify 保持模块对象绑定 + �
 import asyncio
 import hashlib
 import os
+import re
 import sys
 from functools import partial
 from pathlib import Path
@@ -30,7 +31,7 @@ from claude_agent_sdk import create_sdk_mcp_server, tool
 
 from .. import envs, graphify  # 模块对象绑定:属性一律调用时取(patch/强刷活性)
 from ..agent import GENERATORS, RequestFailedError
-from ..utils import Repo
+from ..utils import Repo, _estimate_tokens
 from ..utils import _log as _utils_log
 
 # 进度日志走 stderr(同 graphify.py 约定);prefix 固定 [deepwiki]
@@ -411,6 +412,215 @@ def failure(exc: Exception) -> Exception:
     if isinstance(exc, RequestFailedError):
         return RuntimeError(f"agent 执行失败: {exc.detail}")
     return exc
+
+
+# ---------------------------------------------------------------------------
+# llm 路补全协议(原 chat.py 收编;chat/wiki 的 llm 路单次补全复用)+ 检索工具簇
+# (graphify 子图 → 真实代码行窗;llm 路专用,失败即 raise,不许"带病继续")
+# ---------------------------------------------------------------------------
+
+
+def build_service_prompt(
+    system_prompt: str, query: str, *, conversation_history: str = "", context: str = "",
+    simplify: bool = False,
+) -> str:
+    """原版 api/chat/_prompts.py prompt_builder 逐字移植(单条 user 消息)。
+
+    结构:/no_think + 系统提示词 → <conversation_history> → 检索上下文
+    (<START_OF_CONTEXT> 包裹;为空注"无检索增强"note)或简化 note(输入超限时)
+    → <query>…</query> + Assistant:。"""
+    prompt = f"/no_think {system_prompt}\n\n"
+    if conversation_history:
+        prompt += f"<conversation_history>\n{conversation_history}</conversation_history>\n\n"
+    if not simplify:
+        if context.strip():
+            prompt += f"<START_OF_CONTEXT>\n{context}\n<END_OF_CONTEXT>\n\n"
+        else:
+            prompt += "<note>Answering without retrieval augmentation.</note>\n\n"
+    else:
+        prompt += "<note>Answering without retrieval augmentation due to input size constraints.</note>\n\n"
+    return prompt + f"<query>\n{query}\n</query>\n\nAssistant: "
+
+
+def _is_token_limit_error(exc: Exception) -> bool:
+    """原版 api/chat/__init__.py is_token_limit_error 的判断子串(大小写不敏感)。"""
+    error_message = str(exc).lower()
+    return any(k in error_message for k in (
+        "maximum context length", "token limit", "too many tokens",
+    ))
+
+
+async def llm_research_chat(
+    system: str, query: str, *, generator: str | None, generator_config: dict | None,
+    repo: Repo, session_name: str, run_id: str,
+    conversation_history: str = "",
+):
+    """原版 research_chat 语义(流式整口):
+
+    - 最后一问估算超 CHAT_TOKEN_LIMIT_ESTIMATE(原 MAX_INPUT_TOKENS=7500)→ 跳过检索;
+    - 检索上下文 = 图谱子图→真实代码窗(原 RAG 的适配点),经 prompt_builder 同式
+      拼装(<START_OF_CONTEXT> 包裹;为空注"无检索增强"note);图谱失败/超预算
+      直接 raise(检索失败不继续);
+    - stream_and_fallback:token 超限 → 简化提示词重试(去掉检索上下文)→ 致歉;
+      其余异常 → "Error with openai API: {e}" 文本进流。
+    """
+    context_text = ""
+    if _estimate_tokens(query) > envs.CHAT_TOKEN_LIMIT_ESTIMATE:
+        log(f"输入过大(估算 {_estimate_tokens(query)} tokens),跳过检索上下文(原版 MAX_INPUT_TOKENS 语义)")
+    else:
+        ctx = await graphify_context(repo, query)  # 图谱失败/超预算 → raise
+        context_text = format_subgraph_context(ctx["blocks"])
+
+    prompt = build_service_prompt(
+        system, query, conversation_history=conversation_history, context=context_text
+    )
+    simplified = build_service_prompt(
+        system, query, conversation_history=conversation_history, simplify=True
+    )
+    try:
+        async for chunk in llm_stream(
+            prompt, generator=generator, generator_config=generator_config,
+            session_name=session_name, run_id=run_id,
+        ):
+            yield chunk
+    except Exception as e:
+        if _is_token_limit_error(e):
+            log("token 超限,简化为无检索上下文重试")
+            try:
+                async for chunk in llm_stream(
+                    simplified, generator=generator, generator_config=generator_config,
+                    session_name=session_name, run_id=run_id,
+                ):
+                    yield chunk
+            except Exception as e2:  # noqa: BLE001 - 简化重试失败 → 致歉文本(原版同式)
+                log(f"简化重试失败: {e2}")
+                yield (
+                    "\nI apologize, but your request is too large for me to process. "
+                    "Please try a shorter query or break it into smaller parts."
+                )
+        else:
+            log(f"chat llm 错误: {e}")
+            yield f"\nError with openai API: {e}"
+
+
+# 纯 LLM 路径单文件内联截断(字符)
+_FILE_INLINE_CAP = 8000
+
+
+def subgraph_hits(answer: str) -> dict[str, list[int]]:
+    """解析 graphify.query 的 answer 标注 → {file: [行号...]}。
+
+    NODE 行形如 `NODE <label> [src=<file> loc=L<line> community=<cid>]`,
+    EDGE 行以 ` at=<file>:L<line>` 结尾;容忍 [i] TRUNCATED / over-budget
+    前缀行与 ... (truncated 尾行;非匹配行忽略,loc 缺失/为空的文件跳过)。
+    """
+    hits: dict[str, list[int]] = {}
+    for raw in answer.splitlines():
+        m = re.match(r"^NODE\s+.+?\s+\[([^\]]*)\]$", raw)
+        if m:
+            src = re.search(r"\bsrc=(\S+)\b", m.group(1))
+            loc = re.search(r"\bloc=(L?\d+)\b", m.group(1))
+            if src and loc:
+                hits.setdefault(src.group(1), []).append(int(loc.group(1).lstrip("L")))
+            continue
+        m = re.search(r"\bat=([^:\s]+):(L\d+)$", raw)
+        if m:
+            hits.setdefault(m.group(1), []).append(int(m.group(2)[1:]))
+    return {p: sorted(set(lines)) for p, lines in hits.items()}
+
+
+def subgraph_src_blocks(
+    save_path: str,
+    hits: dict[str, list[int]],
+    *,
+    radius: int = 12,
+    per_file_cap: int = _FILE_INLINE_CAP,
+    budget_chars: int | None = None,
+) -> tuple[list[dict[str, Any]], bool]:
+    """命中行窗提取:{file: [行号]} → [{path,text,start_line,end_line}...], (blocks, degraded)。
+
+    每文件:命中行 ±radius 展开、相邻窗(间距 ≤ 2*radius)合并、夹到文件行界;
+    单文件累计字符封顶 per_file_cap(溢出窗截断,后续窗丢弃);
+    全量累计超 budget_chars(缺省 CHAT_TOKEN_LIMIT_ESTIMATE*4)即整组降级
+    (返回 ([], True));调用方(graphify_context)据此 raise。
+    OSError/解码失败的文件跳过(其余文件正常)。
+    """
+    budget = budget_chars if budget_chars is not None else envs.CHAT_TOKEN_LIMIT_ESTIMATE * 4
+    blocks: list[dict[str, Any]] = []
+    total = 0
+    for path in sorted(hits):
+        try:
+            full_text = Path(save_path, path).read_text(encoding="utf-8")
+        except OSError:
+            continue
+        lines = full_text.splitlines()
+        n_lines = len(lines)
+        # 命中行 → 合并后的窗区间
+        windows: list[tuple[int, int]] = []
+        for line in sorted(set(hits[path])):
+            start = max(1, line - radius)
+            end = min(n_lines, line + radius)
+            if windows and start <= windows[-1][1] + 1:
+                windows[-1] = (windows[-1][0], max(windows[-1][1], end))
+            else:
+                windows.append((start, end))
+        file_chars = 0
+        for start, end in windows:
+            seg_text = "\n".join(lines[start - 1:end])
+            if not seg_text.strip():
+                continue
+            remain = per_file_cap - file_chars
+            if len(seg_text) > remain:
+                if remain <= 0:
+                    break
+                seg_text = seg_text[:remain]
+                end = start + seg_text.count("\n")
+            file_chars += len(seg_text)
+            if total + len(seg_text) > budget:  # 先按单文件截断,再整体预算判断
+                return [], True
+            blocks.append({"path": path, "text": seg_text, "start_line": start, "end_line": end})
+            total += len(seg_text)
+    return blocks, False
+
+
+def format_subgraph_context(blocks: list[dict[str, Any]]) -> str:
+    """代码窗 → 原版 _format_context 同式文本(chat/codemap 共用)。
+
+    按文件分组:每组 `## File Path: {path}` 头 + 每窗 `[lines A-B]\n<code>`
+    (窗间空行);文件段以原版同式(`"\n\n" + "-"*10 + "\n\n".join(parts)`)
+    联结。空输入 → ""(上层 prompt_builder 会注入"无检索增强"note)。"""
+    if not blocks:
+        return ""  # 原版由调用方兜底(无文档时不调用);空输入保持 "" 供 prompt_builder 注 note
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for b in blocks:
+        groups.setdefault(b["path"], []).append(b)
+    context_parts: list[str] = []
+    for path, blks in groups.items():
+        chunk_texts = [f"[lines {b['start_line']}-{b['end_line']}]\n{b['text']}" for b in blks]
+        context_parts.append(f"## File Path: {path}\n\n" + "\n\n".join(chunk_texts))
+    return "\n\n" + ("-" * 10) + "\n\n".join(context_parts)
+
+
+async def graphify_context(repo: Repo, question: str) -> dict[str, Any]:
+    """graphify.query + 子图 → 真实代码行窗。
+
+    检索是正确作答的前提:图谱查询失败与超预算降级均直接 raise(不再以
+    "无检索增强"降级继续)。
+    """
+    try:
+        result = await asyncio.to_thread(
+            graphify.query, question, graph_path=str(graph_path(repo))
+        )
+        answer = result.get("answer") or ""
+    except Exception as exc:
+        raise RuntimeError(f"代码图谱不可用: {type(exc).__name__}: {exc}") from exc
+    hits = subgraph_hits(answer)
+    if not hits:
+        return {"hits": {}, "blocks": []}
+    blocks, degraded = subgraph_src_blocks(repo.save_path, hits)
+    if degraded:
+        raise RuntimeError("检索上下文超出预算")
+    return {"hits": hits, "blocks": blocks}
 
 
 # ---------------------------------------------------------------------------

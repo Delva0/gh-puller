@@ -460,10 +460,10 @@ NODE d [src=src/c.py community=c1]
 
 def test_subgraph_hits_parse():
     """解析 NODE(src/loc)/EDGE(at=) 标注:容忍截断前缀行,空 loc 或无 loc 跳过。"""
-    hits = deepwiki.chat.subgraph_hits(_SUBGRAPH_ANSWER)
+    hits = deepwiki.utils.subgraph_hits(_SUBGRAPH_ANSWER)
     assert hits == {"src/a.py": [5, 12, 40]}
     assert "src/b.py" not in hits and "src/c.py" not in hits
-    assert deepwiki.chat.subgraph_hits("no matches here\n") == {}
+    assert deepwiki.utils.subgraph_hits("no matches here\n") == {}
 
 
 @pytest.mark.asyncio
@@ -474,13 +474,13 @@ async def test_subgraph_src_blocks_windows_merge(tmp_path, monkeypatch):
         "\n".join(f"line {i}" for i in range(1, 101)), encoding="utf-8"
     )
     monkeypatch.setattr(deepwiki.envs, "CHAT_TOKEN_LIMIT_ESTIMATE", 20000)
-    blocks, degraded = deepwiki.chat.subgraph_src_blocks(
+    blocks, degraded = deepwiki.utils.subgraph_src_blocks(
         str(tmp_path), {"src/a.py": [5, 9]}, radius=8
     )
     assert not degraded and len(blocks) == 1
     assert blocks[0]["start_line"] == 1 and blocks[0]["end_line"] == 17
     assert blocks[0]["text"] == "\n".join(f"line {i}" for i in range(1, 18))
-    blocks, degraded = deepwiki.chat.subgraph_src_blocks(
+    blocks, degraded = deepwiki.utils.subgraph_src_blocks(
         str(tmp_path), {"src/a.py": [5, 45]}, radius=8
     )
     assert not degraded and len(blocks) == 2
@@ -493,17 +493,17 @@ def test_subgraph_src_blocks_per_file_cap_and_budget(tmp_path):
     d = tmp_path / "src"
     d.mkdir()
     (d / "a.py").write_text("\n".join(f"line {i}" for i in range(1, 51)), encoding="utf-8")
-    blocks, degraded = deepwiki.chat.subgraph_src_blocks(
+    blocks, degraded = deepwiki.utils.subgraph_src_blocks(
         str(tmp_path), {"src/a.py": [25]}, radius=8, per_file_cap=30,
     )
     assert not degraded and len(blocks) == 1
     assert len(blocks[0]["text"]) == 30
     assert blocks[0]["end_line"] == blocks[0]["start_line"] + blocks[0]["text"].count("\n")
-    blocks, degraded = deepwiki.chat.subgraph_src_blocks(
+    blocks, degraded = deepwiki.utils.subgraph_src_blocks(
         str(tmp_path), {"src/a.py": [25]}, radius=8, budget_chars=5,
     )
     assert (blocks, degraded) == ([], True)
-    blocks, degraded = deepwiki.chat.subgraph_src_blocks(str(tmp_path), {"nope.py": [1]})
+    blocks, degraded = deepwiki.utils.subgraph_src_blocks(str(tmp_path), {"nope.py": [1]})
     assert (blocks, degraded) == ([], False)
 
 
@@ -515,13 +515,13 @@ def test_format_subgraph_context():
         {"path": "src/a.py", "text": "y = 2", "start_line": 10, "end_line": 20},
         {"path": "src/b.py", "text": "z = 3", "start_line": 5, "end_line": 9},
     ]
-    text = deepwiki.chat.format_subgraph_context(blocks)
+    text = deepwiki.utils.format_subgraph_context(blocks)
     assert text.startswith("\n\n----------## File Path: src/a.py\n\n")  # 原版联结式
     assert text.count("## File Path:") == 2
     assert "[lines 1-1]\nx = 1" in text and "[lines 10-20]\ny = 2" in text
     assert "## File Path: src/b.py\n\n[lines 5-9]\nz = 3" in text
-    assert deepwiki.chat.format_subgraph_context([]) == ""
-    assert deepwiki.chat.format_subgraph_context([{"path": "a.py", "text": "t", "start_line": 1, "end_line": 1}]) \
+    assert deepwiki.utils.format_subgraph_context([]) == ""
+    assert deepwiki.utils.format_subgraph_context([{"path": "a.py", "text": "t", "start_line": 1, "end_line": 1}]) \
         .startswith("\n\n----------## File Path: a.py")
 
 

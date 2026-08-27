@@ -21,13 +21,13 @@ gh_puller.agent.configs.py)。
 子模块结构(本文件只做公共白名单 re-export,不含任何实现):
 - cache      产物布局(graphify 图/wiki 成品缓存/续跑状态) + 导出 + 判等摘要族
 - utils      generator 选型/判等/凭证规则簇 + 域内日志(log)+ repo 键 +
-             跨功能通用(四路装配 adapter/llm 传输/图产物路径与索引/判等摘要族/
-             提示词共性常量/索引保障服务;契约 dataclass 已消除全并入功能主线)
+             跨功能通用(四路装配 adapter/llm 传输/llm 路补全协议 + 检索工具簇/
+             图产物路径与索引/判等摘要族/提示词共性常量/索引保障服务;
+             契约 dataclass 已消除全并入功能主线)
 - wiki        wiki 主线:契约 dataclass 族 + 成品缓存/续跑状态/导出 IO +
              双路包装类(AgentWikiPipeline/LlmWikiPipeline + _wiki_pipeline
              分派)+ 结构 XML 解析 + 引用渲染 + wiki 提示词
-- chat        chat 主线:chat_stream 入口 + 双路实现 + llm 路单次补全协议
-             (research_chat 语义 + 检索工具簇)+ 历史转写 + 深研究模板
+- chat        chat 主线:chat_stream 入口 + 双路实现 + 历史转写 + 深研究模板
 - codemap     codemap 主线:契约 dataclass 族 + generate_codemap 入口 + 双路实现 +
              提示词 + 引用接地
 

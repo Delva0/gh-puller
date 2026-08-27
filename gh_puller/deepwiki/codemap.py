@@ -18,8 +18,7 @@ from dataclasses import dataclass, field
 
 from ..utils import Repo, _event, _extract_json, _phase
 from . import (
-    chat,  # llm 路协议(检索/富化提示词组装;llm 路专用)
-    utils,
+    utils,  # 模块对象绑定:跨功能 helper 属性调用(monkeypatch 位点活性)
 )
 from .utils import log
 
@@ -301,7 +300,7 @@ async def _llm_codemap(
     *, generator: str | None = None, generator_config: dict | None = None, repo: Repo, question: str, language: str = "en",
 ):
     """llm 路 codemap(原版等价):analyzing 阶段完成检索(chunk_count=窗口数);
-    双提示词经 prompt_builder(与 chat 同构);JSON 解析失败重试——骨架 3 次、
+    双提示词经 build_service_prompt(utils 收编;与 chat 同构);JSON 解析失败重试——骨架 3 次、
     富化 2 次(传输错误直接上抛);富化失败 degraded;引用接地两路共用。"""
     # ---- 阶段 1a:analyzing(原版 RAG 检索;此处 = 图谱子图→真实代码窗) ----
     yield _phase("analyzing", "start")
@@ -309,11 +308,11 @@ async def _llm_codemap(
         yield _phase("analyzing", "done", chunk_count=0)
         yield _event(type="error", stage="analyzing", message=f"仓库尚未索引,请先 /repo/prepare: {repo.name}")
         return
-    ctx = await chat.graphify_context(repo, question)  # 图谱失败/超预算 → raise
+    ctx = await utils.graphify_context(repo, question)  # 图谱失败/超预算 → raise
     yield _phase("analyzing", "done", chunk_count=len(ctx["blocks"]))
 
     fmt = utils.prompt_fmt(repo, language=language)
-    context_text = chat.format_subgraph_context(ctx["blocks"])
+    context_text = utils.format_subgraph_context(ctx["blocks"])
 
     async def _run_llm_json(prompt: str, attempts: int, session_name: str) -> dict:
         """整收 + 解析 JSON;仅解析失败重试(原版 _generate_json 语义:
@@ -333,7 +332,7 @@ async def _llm_codemap(
 
     # ---- 阶段 1b:骨架 ----------------------------------------------------
     yield _phase("initial_codemap", "start")
-    skeleton_prompt = chat.build_service_prompt(
+    skeleton_prompt = utils.build_service_prompt(
         _CODEMAP_SKELETON_PROMPT.format(**fmt), question, context=context_text
     )
     try:
@@ -349,7 +348,7 @@ async def _llm_codemap(
     enrich_query = (
         f"{question}\n\n<SKELETON>\n{json.dumps(dataclasses.asdict(skeleton))}\n</SKELETON>"
     )
-    enrich_prompt = chat.build_service_prompt(
+    enrich_prompt = utils.build_service_prompt(
         _CODEMAP_ENRICH_PROMPT.format(**fmt), enrich_query, context=context_text
     )
     final = skeleton
