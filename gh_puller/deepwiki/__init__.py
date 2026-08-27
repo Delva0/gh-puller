@@ -18,15 +18,16 @@ generator_config};解析/校验唯一知识源在 deepwiki.utils._resolve_genera
 任务状态机/调度/进度投影在其 server/tasks.py。续跑落盘(deepwiki_resume_*)语义见 ./cache.py。
 
 子模块结构(本文件只做公共白名单 re-export,不含任何实现):
-- models     引擎契约 dataclass 族(零 pydantic)+ dict→model 构造器
 - cache      产物布局(graphify 图/wiki 成品缓存/续跑状态) + 导出 + 判等摘要族
-- utils      generator 选型/判等/凭证规则簇 + 域内日志(_log)+ repo 键 +
-             跨功能通用(四路装配 _adapter/llm 传输/检索簇/lm-m 路补全协议/
-             提示词共性常量/索引保障服务)
-- wiki        wiki 主线:双路包装类(WikiPipeline/AgentWikiPipeline/LlmWikiPipeline
-              + _wiki_pipeline 分派)+ 结构 XML 解析 + 引用渲染 + wiki 提示词
+- utils      generator 选型/判等/凭证规则簇 + 域内日志(log)+ repo 键 +
+             跨功能通用(四路装配 adapter/llm 传输/检索簇/llm 路补全协议/
+             提示词共性常量/索引保障服务;契约 dataclass 已消除全并入功能主线)
+- wiki        wiki 主线:契约 dataclass 族 + 双路包装类(AgentWikiPipeline/
+              LlmWikiPipeline + _wiki_pipeline 分派)+ 结构 XML 解析 + 引用渲染 +
+             wiki 提示词
 - chat        chat 主线:chat_stream 入口 + 双路实现 + 历史转写 + 深研究模板
-- codemap     codemap 主线:generate_codemap 入口 + 双路实现 + 提示词 + 引用接地
+- codemap     codemap 主线:契约 dataclass 族 + generate_codemap 入口 + 双路实现 +
+             提示词 + 引用接地
 
 私有成员(下划线名)不经此门面 —— 直接从对应子模块导入;
 monkeypatch 同理打在属主子模块上(如 deepwiki.utils.llm_stream、
@@ -48,29 +49,27 @@ from .cache import (
     write_resume_state,
 )
 from .chat import chat_stream
-from .codemap import generate_codemap
-from .models import (
+from .codemap import (
     CodeMap,
     CodeMapCitation,
     CodeMapSection,
     CodeMapStep,
-    RepoInfo,
-    WikiPage,
-    WikiSection,
-    WikiStructureModel,
     codemap_of,
-    wiki_structure_of,
+    generate_codemap,
 )
 from .utils import ensure_index, repo_key_of
 from .wiki import (
     AgentWikiPipeline,
     LlmWikiPipeline,
+    WikiPage,
     WikiPipeline,
+    WikiSection,
+    WikiStructureModel,
+    wiki_structure_of,
 )
 
 __all__ = [
-    # models(契约 dataclass 族)
-    "RepoInfo",
+    # 契约 dataclass 族(wiki / codemap)
     "WikiPage",
     "WikiSection",
     "WikiStructureModel",

@@ -35,7 +35,13 @@ from gh_puller.deepwiki import (
     read_wiki_cache,
 )
 from gh_puller.deepwiki.cache import _generator_digest, _index_ready
-from gh_puller.deepwiki.utils import _LANGUAGE_NAMES, _log
+from gh_puller.deepwiki.utils import _log
+
+# 语言契约(引擎层移出:仅 HTTP 层展示用;提示词语言名在 utils.language_name)
+_LANGUAGE_NAMES: dict[str, str] = {
+    "en": "English",
+    "zh": "Mandarin Chinese (中文)",
+}
 from gh_puller.utils import (
     Repo,
     TaskStatus,

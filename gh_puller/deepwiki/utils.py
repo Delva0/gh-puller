@@ -117,11 +117,6 @@ def repo_key_of(repo_type: str, owner: str, repo: str) -> str:
 # 提示词共性常量(跨功能:wiki(llm 路 system)/chat/codemap 共用)
 # ---------------------------------------------------------------------------
 
-_LANGUAGE_NAMES: dict[str, str] = {
-    "en": "English",
-    "zh": "Mandarin Chinese (中文)",
-}
-
 _LANGUAGE_NAMES_RAW = {
     "en": "English",
     "ja": "Japanese (日本語)",

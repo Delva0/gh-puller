@@ -14,12 +14,82 @@ from __future__ import annotations
 import dataclasses
 import json
 import os
+from dataclasses import dataclass, field
 
 from ..utils import Repo, _event, _extract_json, _phase
 from . import utils
 from .cache import _index_ready
-from .models import CodeMap, codemap_of
 from .utils import _log
+
+# ---------------------------------------------------------------------------
+# 引擎契约 dataclass 族(codemap 主线;零 pydantic,字段名即序化键):
+# wire/落盘 camelCase;wire 契约(出网校验)在 apps/deepwiki-webui/server/schemas.py。
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class CodeMapCitation:
+    file_path: str  # Repository-relative path of the source file
+    start_line: int | None = None  # 1-based line range start
+    end_line: int | None = None  # 1-based line range end
+    snippet: str = ""  # Verbatim excerpt copied from the source (used to locate the range)
+
+
+@dataclass
+class CodeMapStep:
+    id: str  # Human-facing id such as '1a', '1b', '2a'
+    label: str  # Short title of the step
+    code: str = ""  # Example code snippet illustrating the step
+    citation: CodeMapCitation | None = None  # Where this step's code comes from
+
+
+@dataclass
+class CodeMapSection:
+    id: str  # Section id such as '1', '2'
+    title: str  # Section title
+    guide: str = ""  # Prose guide for the section (filled in phase 2)
+    diagram: str = ""  # Mermaid diagram source (filled in phase 2)
+    steps: list[CodeMapStep] = field(default_factory=list)
+
+
+@dataclass
+class CodeMap:
+    title: str  # Overall codemap title
+    summary: str = ""  # Introductory summary
+    sections: list[CodeMapSection] = field(default_factory=list)
+
+
+def codemap_of(d: dict) -> CodeMap:
+    """dict → CodeMap(递归构造;缺失字段按缺省兜底);坏结构 → ValueError(调用方按失败处理)。
+
+    兜底默认值与旧 pydantic 契约逐字相同(summary/guide/diagram/code = "",steps = [],
+    citation = None),保证 codemap 退化路径与 NDJSON 事件形态不漂移。
+    """
+    try:
+        return CodeMap(
+            title=d["title"],
+            summary=d.get("summary", ""),
+            sections=[
+                CodeMapSection(
+                    id=s["id"],
+                    title=s["title"],
+                    guide=s.get("guide", ""),
+                    diagram=s.get("diagram", ""),
+                    steps=[
+                        CodeMapStep(
+                            id=t["id"],
+                            label=t["label"],
+                            code=t.get("code", ""),
+                            citation=CodeMapCitation(**t["citation"]) if t.get("citation") else None,
+                        )
+                        for t in s.get("steps", [])
+                    ],
+                )
+                for s in d.get("sections", [])
+            ],
+        )
+    except (KeyError, TypeError, AttributeError) as e:
+        raise ValueError(f"无效 codemap 数据: {e}") from e
 
 # codemap 生成 - 阶段 1:分析代码并产出 codemap 骨架(带 JSON 输出格式与引用接地规则)
 _CODEMAP_SKELETON_PROMPT = """<role>

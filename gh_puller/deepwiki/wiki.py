@@ -18,6 +18,7 @@ import dataclasses
 import os
 import re
 import xml.etree.ElementTree as ET
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -25,8 +26,65 @@ from ..agent import RequestFailedError
 from ..utils import Repo, _find_readme_path, _sanitize_path_seg, _strip_markdown_fences
 from . import utils  # 模块对象绑定:跨功能 helper 属性调用(monkeypatch 位点活性)
 from .cache import _AGENT_CACHE_DIRNAME, _generator_digest, _wiki_cache_dir
-from .models import WikiPage, WikiSection, WikiStructureModel
 from .utils import _language_name, _log
+
+# ---------------------------------------------------------------------------
+# 引擎契约 dataclass 族(wiki 主线;零 pydantic,字段名即序化键):
+# wire/落盘 camelCase(filePaths/rootSections);wire 契约(出网校验)在
+# apps/deepwiki-webui/server/schemas.py。
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class WikiPage:
+    id: str
+    title: str
+    content: str
+    filePaths: list[str]  # 字段名即序化键(wire/落盘 camelCase)
+    importance: str  # 'high' | 'medium' | 'low'
+    relatedPages: list[str]
+
+
+@dataclass
+class WikiSection:
+    id: str
+    title: str
+    pages: list[str]
+    subsections: list[str] | None = None
+
+
+@dataclass
+class WikiStructureModel:
+    id: str
+    title: str
+    description: str
+    pages: list[WikiPage]
+    sections: list[WikiSection] | None = None
+    rootSections: list[str] | None = None  # 字段名即序化键
+
+
+def wiki_structure_of(d: dict | None) -> WikiStructureModel | None:
+    """dict → WikiStructureModel(嵌套 WikiPage/Section);缺失键按旧契约缺省兜底;None → None。"""
+    if d is None:
+        return None
+    return WikiStructureModel(
+        id=d["id"],
+        title=d["title"],
+        description=d.get("description", ""),
+        pages=[WikiPage(**p) for p in d.get("pages", [])],
+        sections=[
+            WikiSection(
+                id=s["id"],
+                title=s["title"],
+                pages=s.get("pages", []),
+                subsections=s.get("subsections"),
+            )
+            for s in d.get("sections") or []
+        ],
+        rootSections=d.get("rootSections"),
+    )
+
+
 
 # ---------------------------------------------------------------------------
 # wiki 提示词(原文移植自 deepwiki-open api/services/wiki/prompts.py)

@@ -7,8 +7,9 @@
   判等摘要族 `_generator_digest`/_generator_digest_of/_cache_identity/
   _cache_generator_matches(任务 id、缓存路径共用同一判等身份)。
 - 数据形态为纯 dict(成品缓存/续跑状态 passthrough;注解一律 dict,不用
-  抽象 Mapping);嵌套结构用引擎 dataclass(.models 的 WikiStructureModel/WikiPage);
-  generator 选型规则(.utils 判等/凭证簇)、日志(.utils._log)均子模块直连,无包内回取。
+  抽象 Mapping);嵌套结构用引擎 dataclass(.wiki 的 WikiStructureModel/WikiPage,
+  TYPE_CHECKING 注解免运行时环);
+  generator 选型规则(.utils 判等/凭证簇)、日志(..utils._log)均子模块直连,无包内回取。
 - 路径常量驻本模块(cache 域):`_WIKI_PREFIX`/`_RESUME_STATE_PREFIX` 静态;
   `wikicache` 根经 `_wiki_cache_dir()` **调用时**解析 envs.DEEPWIKI_ROOT —— 测试
   pop+delattr 强刷后跟随新根。注:wikicache 因此比 `..utils._CLONE_ROOT`(导入期
@@ -29,12 +30,14 @@ import os
 import re
 from datetime import datetime
 from pathlib import Path
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from .. import envs
 from ..utils import Repo, TaskStatus, _log
-from .models import WikiPage, WikiStructureModel
 from .utils import _config_kind, _generator_identity, _resolve_generator
+
+if TYPE_CHECKING:  # 仅注解:wiki.py 反向依赖本模块,避免运行时导入环
+    from .wiki import WikiPage, WikiStructureModel
 
 # 缓存目录布局常量(on-disk 契约);根目录动态解析见 _wiki_cache_dir()
 _WIKI_PREFIX = "deepwiki_cache_"
