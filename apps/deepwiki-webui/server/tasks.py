@@ -41,15 +41,17 @@ from gh_puller.deepwiki import (
     save_generated_wiki,
     write_resume_state,
 )
-from gh_puller.deepwiki.cache import (
-    _cache_generator_matches,
-    _cache_identity,
-    _generator_digest,
-    _index_ready,
-    _wiki_cache_dir,
+from gh_puller.deepwiki.utils import (
+    cache_generator_matches,
+    cache_identity,
+    generator_digest,
+    index_ready,
+    log,
+    merge_creds,
+    resolve_generator,
+    strip_creds,
 )
-from gh_puller.deepwiki.wiki import _wiki_pipeline
-from gh_puller.deepwiki.utils import log, merge_creds, resolve_generator, strip_creds
+from gh_puller.deepwiki.wiki import _wiki_pipeline, wiki_cache_dir
 from gh_puller.utils import (
     Repo,
     TaskStatus,
@@ -73,7 +75,7 @@ _WIKI_TASK_TTL_SECONDS = envs.WIKI_TASK_TTL_SECONDS
 # 状态写锁:并发页生成器的落盘写串行化(asyncio 3.10+ 的 Lock 不再绑定 loop,模块级安全)
 _state_write_lock = asyncio.Lock()
 # 引擎导入零副作用(不再建目录),缓存目录创建由本模块(App 进程)负责
-os.makedirs(_wiki_cache_dir(), exist_ok=True)
+os.makedirs(wiki_cache_dir(), exist_ok=True)
 
 
 # ---------------------------------------------------------------------------
@@ -122,7 +124,7 @@ class WikiTask(BaseModel):
     def key(self) -> str:
         """注册表去重键 = repo 键 + target 判等摘要:同一仓库/语言下
         不同 target 的任务可并发并存(隔离生成产物与续跑状态)。"""
-        return f"{self.repo_key}@{_generator_digest(self.request['target'].get('generator'), self.request['target'].get('generator_config'))}"
+        return f"{self.repo_key}@{generator_digest(self.request['target'].get('generator'), self.request['target'].get('generator_config'))}"
 
     def to_status(self) -> dict:
         r = self.request
@@ -276,15 +278,15 @@ class WikiTaskRegistry(TaskRegistry):
     async def is_cached(self, task: WikiTask) -> bool:
         r = task.request
         cache = await read_wiki_cache(
-            r["owner"], r["repo"], r["type"], r["language"], digest=_generator_digest(r["target"].get("generator"), r["target"].get("generator_config"))
+            r["owner"], r["repo"], r["type"], r["language"], digest=generator_digest(r["target"].get("generator"), r["target"].get("generator_config"))
         )
         if cache is None:
             return False
         # 判等身份与缓存内记录对齐(旧缓存字段缺失/旧契约 → 判不匹配,重新生成)
-        if _cache_generator_matches(cache, r["target"].get("generator"), r["target"].get("generator_config")):
+        if cache_generator_matches(cache, r["target"].get("generator"), r["target"].get("generator_config")):
             return True
         log(
-            f"成品缓存 target 不匹配({_cache_identity(cache)!r} vs "
+            f"成品缓存 target 不匹配({cache_identity(cache)!r} vs "
             f"{resolve_generator(r['target'])!r}),忽略并重新生成: {r['owner']}/{r['repo']}"
         )
         return False
@@ -292,13 +294,13 @@ class WikiTaskRegistry(TaskRegistry):
     async def on_cache_hit(self, task: WikiTask) -> None:
         r = task.request
         await delete_resume_state(
-            r["owner"], r["repo"], r["type"], r["language"], digest=_generator_digest(r["target"].get("generator"), r["target"].get("generator_config"))
+            r["owner"], r["repo"], r["type"], r["language"], digest=generator_digest(r["target"].get("generator"), r["target"].get("generator_config"))
         )
 
     async def load_resume(self, task: WikiTask) -> WikiTask | None:
         r = task.request
         state = await read_resume_state(
-            r["owner"], r["repo"], r["type"], r["language"], digest=_generator_digest(r["target"].get("generator"), r["target"].get("generator_config"))
+            r["owner"], r["repo"], r["type"], r["language"], digest=generator_digest(r["target"].get("generator"), r["target"].get("generator_config"))
         )
         if state is None:
             return None
@@ -359,7 +361,7 @@ async def _persist_state(task: WikiTask) -> None:
     async with _state_write_lock:
         await write_resume_state(
             req["owner"], req["repo"], req["type"], req["language"], state,
-            digest=_generator_digest(req["target"].get("generator"), req["target"].get("generator_config")),
+            digest=generator_digest(req["target"].get("generator"), req["target"].get("generator_config")),
         )
 
 
@@ -405,7 +407,7 @@ async def generate_repo_wiki(task: WikiTask) -> None:
         pipeline = _wiki_pipeline(r["target"].get("generator"), r["target"].get("generator_config"))  # 唯一分派:全流程共用一个实例
         repo = Repo(r["repo_url"], r["type"], access_token=r.get("token"))
         # 索引:只建一次(v1 无增量;已存在即跳过)
-        if not _index_ready(repo):
+        if not index_ready(repo):
             task.status = TaskStatus.INDEXING
             log(f"索引中: {task.repo_key}")
             extra_excludes = (
@@ -441,7 +443,7 @@ async def generate_repo_wiki(task: WikiTask) -> None:
         ):
             raise RuntimeError("写 wiki 缓存失败")  # 不删状态:再提交仅重试写缓存
         await delete_resume_state(
-            r["owner"], r["repo"], r["type"], r["language"], digest=_generator_digest(r["target"].get("generator"), r["target"].get("generator_config"))
+            r["owner"], r["repo"], r["type"], r["language"], digest=generator_digest(r["target"].get("generator"), r["target"].get("generator_config"))
         )
         task.status = TaskStatus.COMPLETED
         log(f"wiki 任务完成: {task.repo_key}")

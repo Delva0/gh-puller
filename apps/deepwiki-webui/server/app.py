@@ -34,8 +34,7 @@ from gh_puller.deepwiki import (
     list_wiki_cache,
     read_wiki_cache,
 )
-from gh_puller.deepwiki.cache import _generator_digest, _index_ready
-from gh_puller.deepwiki.utils import log
+from gh_puller.deepwiki.utils import generator_digest, index_ready, log
 
 # 语言契约(引擎层移出:仅 HTTP 层展示用;提示词语言名在 utils.language_name)
 _LANGUAGE_NAMES: dict[str, str] = {
@@ -197,7 +196,7 @@ _HEARTBEAT_INTERVAL_SEC = 10  # 前端代理/undici bodyTimeout(300s)以内保�
 async def prepare_repo_index(request: RepoPrepareRequest):
     async def event_stream():
         repo = Repo(request.repo_url, request.type, access_token=request.token)
-        if _index_ready(repo):
+        if index_ready(repo):
             yield "event: ready\ndata: already indexed\n\n"
             yield "event: done\ndata: ok\n\n"
             return
@@ -240,7 +239,7 @@ async def repo_index_status(
     type: str = Query("github", description="Repository type"),
 ):
     """廉价就绪探针(前端轮询 /repo/index/status,不占用 prepare 流)。"""
-    return {"ready": _index_ready(Repo(repo_url, type))}
+    return {"ready": index_ready(Repo(repo_url, type))}
 
 
 class RepoNotIndexedError(ValueError):
@@ -250,7 +249,7 @@ class RepoNotIndexedError(ValueError):
 def _require_indexed(repo: Repo) -> None:
     """chat 前置校验:仓库必须已建图,失败在进生成器前即抛
     (WS 发错误文本、HTTP 映射 425,见两处调用点)。"""
-    if not _index_ready(repo):
+    if not index_ready(repo):
         raise RepoNotIndexedError(
             f"仓库尚未索引: {repo.name}。请先通过 /repo/prepare 建立代码图谱。"
         )
@@ -428,7 +427,7 @@ def _query_choice_digest(generator: str, config_path: str, provider: str, model:
         gc["provider"] = provider
     if model:
         gc["model"] = model
-    return _generator_digest(generator or "", gc)
+    return generator_digest(generator or "", gc)
 
 
 @app.get("/api/wiki_cache")

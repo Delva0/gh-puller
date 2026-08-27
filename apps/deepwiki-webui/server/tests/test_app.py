@@ -15,7 +15,7 @@ import time
 os.environ.setdefault("DEEPWIKI_ROOT", tempfile.mkdtemp(prefix="deepwiki-app-test-"))
 
 from fastapi.testclient import TestClient
-from gh_puller.deepwiki.cache import _graph_path
+from gh_puller.deepwiki.utils import graph_path
 from gh_puller.utils import Repo, TaskStatus
 
 import tasks
@@ -203,7 +203,7 @@ def test_prepare_local_repo(tmp_path):
     assert "event: done" in r.text
     assert "data: ok" in r.text
     # 图产物在 DEEPWIKI_ROOT/graphify/<repo_key>/graph.json,源目录零残留
-    assert _graph_path(Repo(raw, "local")).exists()
+    assert graph_path(Repo(raw, "local")).exists()
     assert not os.path.exists(os.path.join(raw, "graphify-out"))
     # 索引后就绪探针翻转
     assert _client().get(

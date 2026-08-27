@@ -19,8 +19,8 @@ resolve_generator 唯一知识源)。envs/graphify 保持模块对象绑定 + �
 """
 
 import asyncio
+import hashlib
 import os
-import re
 import sys
 from functools import partial
 from pathlib import Path
@@ -30,7 +30,7 @@ from claude_agent_sdk import create_sdk_mcp_server, tool
 
 from .. import envs, graphify  # 模块对象绑定:属性一律调用时取(patch/强刷活性)
 from ..agent import GENERATORS, RequestFailedError
-from ..utils import Repo, _estimate_tokens
+from ..utils import Repo
 from ..utils import _log as _utils_log
 
 # 进度日志走 stderr(同 graphify.py 约定);prefix 固定 [deepwiki]
@@ -114,6 +114,62 @@ def merge_creds(base: dict, other: dict | None) -> dict:
 def repo_key_of(repo_type: str, owner: str, repo: str) -> str:
     """repo 键(type_owner_repo;与任务注册键/交付件目录前缀同式)。"""
     return f"{repo_type}_{owner}_{repo}"
+
+
+# ---------------------------------------------------------------------------
+# 图产物路径/索引就绪 + 判等摘要族(原 cache.py;图路径属公用基建,cache 消除后
+# 归本模块。ready = graph.json 存在;digest 是选型判等身份的 8-hex 摘要,
+# 任务 id / 续跑状态 / 成品缓存路径共用同一判等)
+# ---------------------------------------------------------------------------
+
+
+def graph_dir(repo: Repo) -> Path:
+    """单仓库图产物根(extract 的 out_dir):graphify/{type}_{name},无日期层,路径稳定以支持已缓存即跳过。"""
+    return Path(envs.DEEPWIKI_ROOT) / "graphify" / f"{repo.repo_type}_{repo.name}"
+
+
+def graph_path(repo: Repo) -> Path:
+    """graph.json 规范路径(extract 的 out_dir 即最终目录,无 graphify-out 层)。"""
+    return graph_dir(repo) / "graph.json"
+
+
+def index_ready(repo: Repo) -> bool:
+    """索引完成信号 = graph.json 已存在(复用 graphify._load_graph 的存在性语义)。"""
+    return graph_path(repo).exists()
+
+
+def generator_digest(generator: str | None = None, generator_config: dict | None = None,
+                     get_env=None) -> str:
+    """generator 选型判等身份(不含凭证)的稳定摘要(8 hex)。
+
+    身份 = generator + 配置摘要:file 类 = config_path(路径是身份;内容随文件,
+    不读取);object 类 = provider|model。任务 id / 续跑状态 / 成品缓存路径共用:
+    同一仓库与语言下不同选型的结果可以并发并存且互不串用。
+    """
+    generator_id, resolved = resolve_generator(generator, generator_config, get_env)
+    return _generator_digest_of(generator_id, resolved)
+
+
+def _generator_digest_of(generator_id: str, resolved: dict) -> str:
+    return hashlib.sha1(
+        f"{generator_id}|{generator_identity(generator_id, resolved)}".encode()
+    ).hexdigest()[:8]
+
+
+def cache_identity(cache: dict) -> tuple[str, str]:
+    """缓存内记录的公开身份(file 类:generator+config_path;object 类:generator+provider|model)。"""
+    generator = cache.get("generator") or ""
+    config_path = cache.get("config_path") or ""
+    if generator and config_path:
+        return (generator, config_path)
+    return (generator, f"{cache.get('provider') or ''}|{cache.get('model') or ''}")
+
+
+def cache_generator_matches(cache: dict, generator: str | None = None,
+                            generator_config: dict | None = None) -> bool:
+    """成品缓存与公开选型是否同轨(摘要隔离后的二次校验,防手改文件名)。"""
+    generator_id, resolved = resolve_generator(generator, generator_config)
+    return cache_identity(cache) == (generator_id, generator_identity(generator_id, resolved))
 
 
 # ---------------------------------------------------------------------------
@@ -234,9 +290,7 @@ def _graphify_mcp(backend: str) -> list[dict]:
 def _graphify_server(repo: Repo):
     """进程内 MCP server:把 graphify.query 封装为 graphify_query 工具(闭包绑定图路径)。"""
 
-    from .cache import _graph_path  # lazy:cache 反向依赖本模块(see circular import)
-
-    graph_path = _graph_path(repo)
+    gp = graph_path(repo)
 
     @tool(
         "graphify_query",
@@ -248,7 +302,7 @@ def _graphify_server(repo: Repo):
     async def graphify_query(args: dict) -> dict:
         try:
             question = (args.get("question") or "").strip()
-            result = graphify.query(question, graph_path=graph_path)
+            result = graphify.query(question, graph_path=gp)
             text = result.get("answer") or ""
         except Exception as exc:
             text = f"Graph query failed: {type(exc).__name__}: {exc}"
@@ -281,8 +335,6 @@ def adapter(generator: str | None = None, *, generator_config: dict | None = Non
 
     一个实例 = 一次对话(重试/每阶段刷新构造;构造期即装配 SDK 对象)。
     """
-    from .cache import _graph_dir  # lazy:cache 反向依赖本模块(see circular import)
-
     gid, resolved = resolve_generator(generator, generator_config)
     if gid == "llm":
         return GENERATORS["llm"](resolved)
@@ -308,7 +360,7 @@ def adapter(generator: str | None = None, *, generator_config: dict | None = Non
             options["config_path"] = resolved["config_path"]
         if repo is not None:
             options["cwd"] = os.path.abspath(repo.save_path)
-            options["env"] = {"GRAPHIFY_OUT": str(_graph_dir(repo))}
+            options["env"] = {"GRAPHIFY_OUT": str(graph_dir(repo))}
             options["mcp_servers"] = _graphify_mcp("codex")  # 零配置缺省隔离 config.toml 带图工具
     else:  # cc
         options = {
@@ -362,224 +414,6 @@ def failure(exc: Exception) -> Exception:
 
 
 # ---------------------------------------------------------------------------
-# Llm 路检索工具簇(graphify 子图 → 真实代码行窗;chat/codemap/wiki(llm 路)共用。
-# 检索失败 → raise:管道不作无检索降级,不许"带病继续")
-# ---------------------------------------------------------------------------
-
-
-# 纯 LLM 路径单文件内联截断(字符)
-_FILE_INLINE_CAP = 8000
-
-
-def subgraph_hits(answer: str) -> dict[str, list[int]]:
-    """解析 graphify.query 的 answer 标注 → {file: [行号...]}。
-
-    NODE 行形如 `NODE <label> [src=<file> loc=L<line> community=<cid>]`,
-    EDGE 行以 ` at=<file>:L<line>` 结尾;容忍 [i] TRUNCATED / over-budget
-    前缀行与 ... (truncated 尾行;非匹配行忽略,loc 缺失/为空的文件跳过)。
-    """
-    hits: dict[str, list[int]] = {}
-    for raw in answer.splitlines():
-        m = re.match(r"^NODE\s+.+?\s+\[([^\]]*)\]$", raw)
-        if m:
-            src = re.search(r"\bsrc=(\S+)\b", m.group(1))
-            loc = re.search(r"\bloc=(L?\d+)\b", m.group(1))
-            if src and loc:
-                hits.setdefault(src.group(1), []).append(int(loc.group(1).lstrip("L")))
-            continue
-        m = re.search(r"\bat=([^:\s]+):(L\d+)$", raw)
-        if m:
-            hits.setdefault(m.group(1), []).append(int(m.group(2)[1:]))
-    return {p: sorted(set(lines)) for p, lines in hits.items()}
-
-
-def subgraph_src_blocks(
-    save_path: str,
-    hits: dict[str, list[int]],
-    *,
-    radius: int = 12,
-    per_file_cap: int = _FILE_INLINE_CAP,
-    budget_chars: int | None = None,
-) -> tuple[list[dict[str, Any]], bool]:
-    """命中行窗提取:{file: [行号]} → [{path,text,start_line,end_line}...], (blocks, degraded)。
-
-    每文件:命中行 ±radius 展开、相邻窗(间距 ≤ 2*radius)合并、夹到文件行界;
-    单文件累计字符封顶 per_file_cap(溢出窗截断,后续窗丢弃);
-    全量累计超 budget_chars(缺省 CHAT_TOKEN_LIMIT_ESTIMATE*4)即整组降级
-    (返回 ([], True));调用方(graphify_context)据此 raise。
-    OSError/解码失败的文件跳过(其余文件正常)。
-    """
-    budget = budget_chars if budget_chars is not None else envs.CHAT_TOKEN_LIMIT_ESTIMATE * 4
-    blocks: list[dict[str, Any]] = []
-    total = 0
-    for path in sorted(hits):
-        try:
-            full_text = Path(save_path, path).read_text(encoding="utf-8")
-        except OSError:
-            continue
-        lines = full_text.splitlines()
-        n_lines = len(lines)
-        # 命中行 → 合并后的窗区间
-        windows: list[tuple[int, int]] = []
-        for line in sorted(set(hits[path])):
-            start = max(1, line - radius)
-            end = min(n_lines, line + radius)
-            if windows and start <= windows[-1][1] + 1:
-                windows[-1] = (windows[-1][0], max(windows[-1][1], end))
-            else:
-                windows.append((start, end))
-        file_chars = 0
-        for start, end in windows:
-            seg_text = "\n".join(lines[start - 1:end])
-            if not seg_text.strip():
-                continue
-            remain = per_file_cap - file_chars
-            if len(seg_text) > remain:
-                if remain <= 0:
-                    break
-                seg_text = seg_text[:remain]
-                end = start + seg_text.count("\n")
-            file_chars += len(seg_text)
-            if total + len(seg_text) > budget:  # 先按单文件截断,再整体预算判断
-                return [], True
-            blocks.append({"path": path, "text": seg_text, "start_line": start, "end_line": end})
-            total += len(seg_text)
-    return blocks, False
-
-
-def format_subgraph_context(blocks: list[dict[str, Any]]) -> str:
-    """代码窗 → 原版 _format_context 同式文本(chat/codemap 共用)。
-
-    按文件分组:每组 `## File Path: {path}` 头 + 每窗 `[lines A-B]\n<code>`
-    (窗间空行);文件段以原版同式(`"\n\n" + "-"*10 + "\n\n".join(parts)`)
-    联结。空输入 → ""(上层 prompt_builder 会注入"无检索增强"note)。"""
-    if not blocks:
-        return ""  # 原版由调用方兜底(无文档时不调用);空输入保持 "" 供 prompt_builder 注 note
-    groups: dict[str, list[dict[str, Any]]] = {}
-    for b in blocks:
-        groups.setdefault(b["path"], []).append(b)
-    context_parts: list[str] = []
-    for path, blks in groups.items():
-        chunk_texts = [f"[lines {b['start_line']}-{b['end_line']}]\n{b['text']}" for b in blks]
-        context_parts.append(f"## File Path: {path}\n\n" + "\n\n".join(chunk_texts))
-    return "\n\n" + ("-" * 10) + "\n\n".join(context_parts)
-
-
-async def graphify_context(repo: Repo, question: str) -> dict[str, Any]:
-    """graphify.query + 子图 → 真实代码行窗。
-
-    检索是正确作答的前提:图谱查询失败与超预算降级均直接 raise(不再以
-    "无检索增强"降级继续)。
-    """
-    from .cache import _graph_path  # lazy:cache 反向依赖本模块(see circular import)
-
-    try:
-        result = await asyncio.to_thread(
-            graphify.query, question, graph_path=str(_graph_path(repo))
-        )
-        answer = result.get("answer") or ""
-    except Exception as exc:
-        raise RuntimeError(f"代码图谱不可用: {type(exc).__name__}: {exc}") from exc
-    hits = subgraph_hits(answer)
-    if not hits:
-        return {"hits": {}, "blocks": []}
-    blocks, degraded = subgraph_src_blocks(repo.save_path, hits)
-    if degraded:
-        raise RuntimeError("检索上下文超出预算")
-    return {"hits": hits, "blocks": blocks}
-
-
-# ---------------------------------------------------------------------------
-# llm 路补全协议(research_chat 等价:检索上下文注入 + token 超限简化重试;
-# wiki(llm 路 structure/page)/chat 共用;context 事件已全部清除 —— 引擎不向
-# agent 传输层传 context,失败即 raise/流错误文本,不做"假日志"事件)
-# ---------------------------------------------------------------------------
-
-
-def build_service_prompt(
-    system_prompt: str, query: str, *, conversation_history: str = "", context: str = "",
-    simplify: bool = False,
-) -> str:
-    """原版 api/chat/_prompts.py prompt_builder 逐字移植(单条 user 消息)。
-
-    结构:/no_think + 系统提示词 → <conversation_history> → 检索上下文
-    (<START_OF_CONTEXT> 包裹;为空注"无检索增强"note)或简化 note(输入超限时)
-    → <query>…</query> + Assistant:。"""
-    prompt = f"/no_think {system_prompt}\n\n"
-    if conversation_history:
-        prompt += f"<conversation_history>\n{conversation_history}</conversation_history>\n\n"
-    if not simplify:
-        if context.strip():
-            prompt += f"<START_OF_CONTEXT>\n{context}\n<END_OF_CONTEXT>\n\n"
-        else:
-            prompt += "<note>Answering without retrieval augmentation.</note>\n\n"
-    else:
-        prompt += "<note>Answering without retrieval augmentation due to input size constraints.</note>\n\n"
-    return prompt + f"<query>\n{query}\n</query>\n\nAssistant: "
-
-
-def _is_token_limit_error(exc: Exception) -> bool:
-    """原版 api/chat/__init__.py is_token_limit_error 的判断子串(大小写不敏感)。"""
-    error_message = str(exc).lower()
-    return any(k in error_message for k in (
-        "maximum context length", "token limit", "too many tokens",
-    ))
-
-
-async def llm_research_chat(
-    system: str, query: str, *, generator: str | None, generator_config: dict | None,
-    repo: Repo, session_name: str, run_id: str,
-    conversation_history: str = "",
-):
-    """原版 research_chat 语义(流式整口;已合并原 _llm_research_chat/_stream):
-
-    - 最后一问估算超 CHAT_TOKEN_LIMIT_ESTIMATE(原 MAX_INPUT_TOKENS=7500)→ 跳过检索;
-    - 检索上下文 = 图谱子图→真实代码窗(原 RAG 的适配点),经 prompt_builder 同式
-      拼装(<START_OF_CONTEXT> 包裹;为空注"无检索增强"note);图谱失败/超预算
-      直接 raise(检索失败不继续);
-    - stream_and_fallback:token 超限 → 简化提示词重试(去掉检索上下文)→ 致歉;
-      其余异常 → "Error with openai API: {e}" 文本进流。
-    """
-    context_text = ""
-    if _estimate_tokens(query) > envs.CHAT_TOKEN_LIMIT_ESTIMATE:
-        log(f"输入过大(估算 {_estimate_tokens(query)} tokens),跳过检索上下文(原版 MAX_INPUT_TOKENS 语义)")
-    else:
-        ctx = await graphify_context(repo, query)  # 图谱失败/超预算 → raise
-        context_text = format_subgraph_context(ctx["blocks"])
-
-    prompt = build_service_prompt(
-        system, query, conversation_history=conversation_history, context=context_text
-    )
-    simplified = build_service_prompt(
-        system, query, conversation_history=conversation_history, simplify=True
-    )
-    try:
-        async for chunk in llm_stream(
-            prompt, generator=generator, generator_config=generator_config,
-            session_name=session_name, run_id=run_id,
-        ):
-            yield chunk
-    except Exception as e:
-        if _is_token_limit_error(e):
-            log("token 超限,简化为无检索上下文重试")
-            try:
-                async for chunk in llm_stream(
-                    simplified, generator=generator, generator_config=generator_config,
-                    session_name=session_name, run_id=run_id,
-                ):
-                    yield chunk
-            except Exception as e2:  # noqa: BLE001 - 简化重试失败 → 致歉文本(原版同式)
-                log(f"简化重试失败: {e2}")
-                yield (
-                    "\nI apologize, but your request is too large for me to process. "
-                    "Please try a shorter query or break it into smaller parts."
-                )
-        else:
-            log(f"chat llm 错误: {e}")
-            yield f"\nError with openai API: {e}"
-
-
-# ---------------------------------------------------------------------------
 # 索引保障服务(clone + 建图;/repo/prepare 与 wiki 任务主流程共用。
 # 未索引前置校验属端点守卫,在 apps/deepwiki-webui/server/app.py)
 # ---------------------------------------------------------------------------
@@ -587,13 +421,11 @@ async def llm_research_chat(
 
 async def _run_extract(repo: Repo, *, extra_excludes: list[str] | None = None) -> dict:
     """graphify.extract 建图(code_only 纯本地 AST,无 key 可跑);失败返回错误态 dict,不抛。"""
-    from .cache import _graph_dir  # lazy:cache 反向依赖本模块(see circular import)
-
     return await asyncio.to_thread(
         graphify.extract,
         path=repo.save_path,
         code_only=True,
-        out_dir=_graph_dir(repo),
+        out_dir=graph_dir(repo),
         extra_excludes=extra_excludes,
     )
 
@@ -605,11 +437,9 @@ async def ensure_index(repo: Repo, *, extra_excludes: list[str] | None = None) -
     (防文件树静默退化为空);建图失败(extract 错误态)→ RuntimeError 上抛,
     由调用方决定上报/置任务 FAILED。
     """
-    from .cache import _index_ready  # lazy:cache 反向依赖本模块(see circular import)
-
     if not repo.downloaded and not repo.is_local:
         await asyncio.to_thread(repo.download)
-    if not _index_ready(repo):
+    if not index_ready(repo):
         result = await _run_extract(repo, extra_excludes=extra_excludes)
         if result.get("error"):
             raise RuntimeError(result["error"])

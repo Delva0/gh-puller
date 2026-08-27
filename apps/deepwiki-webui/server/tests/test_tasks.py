@@ -30,12 +30,8 @@ from gh_puller.deepwiki import (
     write_resume_state,
 )
 from gh_puller.deepwiki import utils as deepwiki_utils
-from gh_puller.deepwiki.cache import (
-    _generator_digest,
-    _graph_dir,
-    _resume_state_path,
-    _wiki_cache_dir,
-)
+from gh_puller.deepwiki.utils import generator_digest, graph_dir
+from gh_puller.deepwiki.wiki import resume_state_path, wiki_cache_dir
 from gh_puller.utils import Repo, TaskStatus
 
 import tasks
@@ -73,7 +69,7 @@ def _make_request(owner: str, repo: str) -> dict:
 
 def _digest_of(choice: "dict | None") -> str:
     """选型 dict → 稳定摘要(测试与实现共用一个函数)。"""
-    return _generator_digest((choice or {}).get("generator"), (choice or {}).get("generator_config"))
+    return generator_digest((choice or {}).get("generator"), (choice or {}).get("generator_config"))
 
 
 def _proj(request) -> str:
@@ -155,7 +151,7 @@ async def test_registry_resume_restores_task(monkeypatch):
         "submitted_at": 9876543210,
         "error": None,
     }
-    digest = _generator_digest(state["request"]["target"].get("generator"), state["request"]["target"].get("generator_config"))
+    digest = generator_digest(state["request"]["target"].get("generator"), state["request"]["target"].get("generator_config"))
     assert await write_resume_state("resume-io", "demo", "local", "en", state, digest=digest) is True
 
     async def fake_generate(task):
@@ -207,7 +203,7 @@ async def test_resume_isolated_by_target(monkeypatch):
         "submitted_at": 424242,
         "error": None,
     }
-    digest_cc = _generator_digest(None, None)  # 空 target → env 缺省 cc
+    digest_cc = generator_digest(None, None)  # 空 target → env 缺省 cc
     assert await write_resume_state("gen-switch", "demo", "local", "en", state, digest=digest_cc) is True
 
     async def fake_generate(task):
@@ -235,8 +231,8 @@ async def test_resume_isolated_by_target(monkeypatch):
         )
         assert res.created is True
         assert res.resumed is False
-        assert os.path.exists(_resume_state_path("gen-switch", "demo", "local", "en", digest=digest_cc))
-        key_llm = "local_gen-switch_demo@" + _generator_digest(
+        assert os.path.exists(resume_state_path("gen-switch", "demo", "local", "en", digest=digest_cc))
+        key_llm = "local_gen-switch_demo@" + generator_digest(
             "llm", None)
         # 任务键 = repo 键 + target 摘要(与 cc 槽位隔离)
         task = tasks.registry.get(key_llm)
@@ -245,7 +241,7 @@ async def test_resume_isolated_by_target(monkeypatch):
         assert task.status == TaskStatus.COMPLETED
     finally:
         await tasks.registry.remove(key_cc)
-        await tasks.registry.remove("local_gen-switch_demo@" + _generator_digest(
+        await tasks.registry.remove("local_gen-switch_demo@" + generator_digest(
             "llm", None))
         await delete_resume_state("gen-switch", "demo", "local", "en", digest=digest_cc)
         await asyncio.sleep(0.25)  # 让 TTL 移除计时器自然结束,避免挂起的任务告警
@@ -271,7 +267,7 @@ async def test_cache_hit_respects_target(monkeypatch, tmp_path):
         "provider": None,
         "model": None,
     }
-    digest_cc = _generator_digest((cc_target or {}).get("generator"), (cc_target or {}).get("generator_config"))
+    digest_cc = generator_digest((cc_target or {}).get("generator"), (cc_target or {}).get("generator_config"))
     assert await save_wiki_cache("gen-cache", "demo", "local", "en", cache, digest=digest_cc) is True
 
     calls = []
@@ -305,7 +301,7 @@ async def test_cache_hit_respects_target(monkeypatch, tmp_path):
         assert res.created is True
         # llm 任务走自己摘要的注册表槽位(cc 键无新任务)
         assert tasks.registry.get(key_cc) is None
-        task_llm = tasks.registry.get("local_gen-cache_demo@" + _generator_digest(
+        task_llm = tasks.registry.get("local_gen-cache_demo@" + generator_digest(
             "llm", None))
         assert task_llm is not None
         await task_llm.task
@@ -313,7 +309,7 @@ async def test_cache_hit_respects_target(monkeypatch, tmp_path):
         assert calls == [task_llm.key]
     finally:
         await tasks.registry.remove(key_cc)
-        await tasks.registry.remove("local_gen-cache_demo@" + _generator_digest(
+        await tasks.registry.remove("local_gen-cache_demo@" + generator_digest(
             "llm", None))
         await delete_wiki_cache("gen-cache", "demo", "local", "en", digest=digest_cc)
         await asyncio.sleep(0.25)  # 让 TTL 移除计时器自然结束,避免挂起的任务告警
@@ -567,9 +563,9 @@ async def test_generate_repo_wiki_cc_assemble_and_resume(tmp_path, monkeypatch):
     }
     # 预置假索引(与 _graph_dir 命名对齐)
     fake_repo = Repo(str(repo_dir), "local")
-    graph_dir = _graph_dir(fake_repo)
-    graph_dir.mkdir(parents=True, exist_ok=True)
-    (graph_dir / "graph.json").write_text("{}", encoding="utf-8")
+    gd = graph_dir(fake_repo)
+    gd.mkdir(parents=True, exist_ok=True)
+    (gd / "graph.json").write_text("{}", encoding="utf-8")
     # 预置结构 + 全部页面交付文件
     pipeline = deepwiki.AgentWikiPipeline()
     struct_path = pipeline._agent_cache_structure_path(_proj(request), request["target"].get("generator"), request["target"].get("generator_config"))
@@ -588,8 +584,8 @@ async def test_generate_repo_wiki_cc_assemble_and_resume(tmp_path, monkeypatch):
     task = tasks.WikiTask(request=request)
     await tasks.generate_repo_wiki(task)
     assert task.status == TaskStatus.COMPLETED
-    digest = _generator_digest(request["target"].get("generator"), request["target"].get("generator_config"))
-    cache_path = Path(_wiki_cache_dir()) / f"deepwiki_cache_local_local_demo_en_{digest}.json"
+    digest = generator_digest(request["target"].get("generator"), request["target"].get("generator_config"))
+    cache_path = Path(wiki_cache_dir()) / f"deepwiki_cache_local_local_demo_en_{digest}.json"
     assert cache_path.exists()
     data = json.loads(cache_path.read_text(encoding="utf-8"))
     assert set(data["generated_pages"]) == {"p1", "p2", "p3"}
@@ -601,7 +597,7 @@ async def test_generate_repo_wiki_cc_assemble_and_resume(tmp_path, monkeypatch):
     assert "api_key" not in json.dumps(data) and "base_url" not in json.dumps(data)
     for pid in ("p1", "p2", "p3"):
         assert f"{pid}-REAL" in data["generated_pages"][pid]["content"]
-    assert not Path(_resume_state_path("local", "demo", "local", "en", digest=digest)).exists()
+    assert not Path(resume_state_path("local", "demo", "local", "en", digest=digest)).exists()
     assert task.pages_done == 3
 
 
