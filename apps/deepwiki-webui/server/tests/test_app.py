@@ -9,14 +9,16 @@
 import json
 import os
 import tempfile
+import time
 
 # envs 在模块导入时单点读取 —— 必须在 import gh_puller.deepwiki 前把产物根指向临时目录
 os.environ.setdefault("DEEPWIKI_ROOT", tempfile.mkdtemp(prefix="deepwiki-app-test-"))
 
 from fastapi.testclient import TestClient
-from gh_puller.deepwiki import _graph_path
-from gh_puller.utils import Repo
+from gh_puller.deepwiki.cache import _graph_path
+from gh_puller.utils import Repo, TaskStatus
 
+import tasks
 from app import app as server_app
 
 
@@ -117,6 +119,44 @@ def test_wiki_cache_empty():
     assert c.get("/api/processed_projects").json() == []
     assert c.get("/wiki/tasks").json() == []
     assert c.get("/wiki/tasks/nope").status_code == 404
+
+
+def test_wiki_task_submit_and_get_contract(tmp_path, monkeypatch):
+    """POST /wiki/tasks 契约(server registry):created 提交 → 后台调度 → GET 轮询至 completed。"""
+    async def fake_generate(task):
+        task.status = TaskStatus.COMPLETED
+
+    monkeypatch.setattr(tasks, "generate_repo_wiki", fake_generate)
+    monkeypatch.setattr(tasks, "_WIKI_TASK_TTL_SECONDS", 0.2)
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    r = _client().post(
+        "/wiki/tasks",
+        json={"repo_url": str(repo_dir), "type": "local",
+              "owner": "smoke-1", "repo": "demo", "language": "en"},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["created"] is True and body["joined"] is False
+    got = None
+    for _ in range(40):
+        got = _client().get(f"/wiki/tasks/{body['task_id']}")
+        if got.status_code == 200 and got.json().get("status") == "completed":
+            break
+        time.sleep(0.05)
+    assert got is not None and got.status_code == 200
+    assert got.json()["status"] == "completed"
+    assert "pages_total" in got.json()
+    time.sleep(0.3)  # 让 TTL 移除计时器自然收尾,不留终端任务
+
+
+def test_wiki_task_submit_invalid_target_400():
+    r = _client().post(
+        "/wiki/tasks",
+        json={"repo_url": "/x", "type": "local", "owner": "smoke-2", "repo": "demo",
+              "language": "en", "target": {"generator": "nope"}},
+    )
+    assert r.status_code == 400
 
 
 def test_local_repo_structure_errors():

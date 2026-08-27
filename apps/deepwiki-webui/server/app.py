@@ -25,38 +25,18 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from fastapi.websockets import WebSocketState
 from gh_puller import envs
 from gh_puller.deepwiki import (
-    _LANGUAGE_NAMES,
-    AuthorizationConfig,
-    ChatCompletionRequest,
-    CodeMapRequest,
-    Model,
-    ModelConfig,
-    ProcessedProjectEntry,
-    Provider,
-    RepoNotIndexedError,
-    RepoPrepareRequest,
-    RepoRequestBase,
-    WikiCacheData,
-    WikiExportRequest,
-    WikiTask,
-    WikiTaskRequest,
-    WikiTaskStatus,
-    WikiTaskSubmitResult,
-    WikiTaskSummary,
-    _index_ready,
-    _log,
-    _require_indexed,
-    _request_digest,
-    _run_extract,
     chat_stream,
     delete_wiki_cache,
+    ensure_index,
     export_wiki,
     generate_codemap,
     list_processed_projects,
     list_wiki_cache,
     read_wiki_cache,
-    registry,
 )
+from gh_puller.deepwiki.cache import _generator_digest, _index_ready
+from gh_puller.deepwiki.pipeline import _LANGUAGE_NAMES
+from gh_puller.deepwiki.utils import _log
 from gh_puller.utils import (
     Repo,
     TaskStatus,
@@ -64,6 +44,26 @@ from gh_puller.utils import (
     read_repo_file,
     read_repo_file_tree,
 )
+
+# HTTP 边界请求/响应模型(wire 契约唯一验证面;引擎零 pydantic)
+from schemas import (
+    AuthorizationConfig,
+    ChatCompletionRequest,
+    CodeMapRequest,
+    Model,
+    ModelConfig,
+    ProcessedProjectEntry,
+    Provider,
+    RepoPrepareRequest,
+    RepoRequestBase,
+    WikiExportRequest,
+    WikiTaskRequest,
+    WikiTaskStatus,
+    WikiTaskSummary,
+)
+
+# 任务 runtime 包装(注册表/任务模型/提交响应):server 侧专属(引擎零任务调度状态)
+from tasks import WikiTask, WikiTaskSubmitResult, registry  # noqa: E402
 
 # 语言与模型契约(仅 HTTP 层展示用;_LANGUAGE_NAMES 为引擎侧映射)
 _LANG_CONFIG = {"supported_languages": dict(_LANGUAGE_NAMES), "default": "en"}
@@ -223,14 +223,10 @@ async def prepare_repo_index(request: RepoPrepareRequest):
 
 
 async def _prepare_index(request: RepoRequestBase) -> dict:
-    """克隆(如需) + graphify.extract 建图;失败抛异常供 SSE 上报。"""
+    """索引保障(克隆 + 建图,与 wiki 任务流共用 ensure_index);失败抛异常供 SSE 上报。"""
     repo = Repo(request.repo_url, request.type, access_token=request.token)
-    if not repo.downloaded and not repo.is_local:
-        await asyncio.to_thread(repo.download)
-    result = await _run_extract(repo, request)
-    if result.get("error"):
-        raise RuntimeError(result["error"])
-    return result
+    await ensure_index(repo, extra_excludes=_extra_excludes(request))
+    return {}
 
 
 @app.get("/repo/index/status")
@@ -242,6 +238,19 @@ async def repo_index_status(
     return {"ready": _index_ready(Repo(repo_url, type))}
 
 
+class RepoNotIndexedError(ValueError):
+    """chat/codemap 到达时仓库尚未建图(未索引前置校验属端点守卫;建图服务在引擎)。"""
+
+
+def _require_indexed(repo: Repo) -> None:
+    """chat 前置校验:仓库必须已建图,失败在进生成器前即抛
+    (WS 发错误文本、HTTP 映射 425,见两处调用点)。"""
+    if not _index_ready(repo):
+        raise RepoNotIndexedError(
+            f"仓库尚未索引: {repo.name}。请先通过 /repo/prepare 建立代码图谱。"
+        )
+
+
 # -- chat --------------------------------------------------------------------------------------
 
 
@@ -251,17 +260,29 @@ def _send_if_connect(websocket: WebSocket, msg: str) -> None:
 
 
 # 经调研:query 失败时 chat 的 WebSocket 端点会向客户端多发送一条错误文本;原后端也是直接发文本 chunk
+def _extra_excludes(request: RepoRequestBase) -> list[str] | None:
+    """请求的排除目录/文件 → graphify extra_excludes(散装参数形态的边界拼装)。"""
+    if request.excluded_dirs or request.excluded_files:
+        return [*request.excluded_dirs, *request.excluded_files]
+    return None
+
+
 @app.websocket("/ws/chat")
 async def handle_websocket_chat(websocket: WebSocket):
     await websocket.accept()
     try:
         request = ChatCompletionRequest(**await websocket.receive_json())
+        repo = Repo(request.repo_url, request.type, access_token=request.token)
         try:
-            _require_indexed(request)
+            _require_indexed(repo)
         except RepoNotIndexedError as e:
             await websocket.send_text(str(e))
             return
-        async for chunk in chat_stream(request):
+        async for chunk in chat_stream(
+            choice=request.target, repo=repo,
+            messages=[m.model_dump() for m in request.messages],
+            language=request.language, research_iteration=request.research_iteration,
+        ):
             if websocket.application_state != WebSocketState.CONNECTED:
                 break
             await websocket.send_text(chunk)
@@ -282,12 +303,17 @@ async def chat_completions_stream(request: ChatCompletionRequest):
         raise HTTPException(status_code=400, detail="No messages provided")
     if request.messages[-1].role != "user":
         raise HTTPException(status_code=400, detail="Last message must be from the user")
+    repo = Repo(request.repo_url, request.type, access_token=request.token)
     try:
-        _require_indexed(request)
+        _require_indexed(repo)
     except RepoNotIndexedError as e:
         raise HTTPException(status_code=425, detail=str(e))
     try:
-        stream = chat_stream(request)
+        stream = chat_stream(
+            choice=request.target, repo=repo,
+            messages=[m.model_dump() for m in request.messages],
+            language=request.language, research_iteration=request.research_iteration,
+        )
     except ValueError as e:
         raise HTTPException(status_code=500, detail=f"Error preparing retriever: {str(e)}")
     except Exception as e:  # noqa: BLE001
@@ -302,7 +328,10 @@ async def handle_websocket_codemap(websocket: WebSocket):
     await websocket.accept()
     try:
         request = CodeMapRequest(**await websocket.receive_json())
-        async for event in generate_codemap(request):
+        repo = Repo(request.repo_url, request.type, access_token=request.token)
+        async for event in generate_codemap(
+            choice=request.target, repo=repo, question=request.question, language=request.language,
+        ):
             if websocket.application_state != WebSocketState.CONNECTED:
                 break
             await websocket.send_text(event)
@@ -320,7 +349,11 @@ async def handle_websocket_codemap(websocket: WebSocket):
 @app.post("/codemap/stream")
 async def codemap_stream(request: CodeMapRequest):
     try:
-        return StreamingResponse(generate_codemap(request), media_type="application/x-ndjson")
+        repo = Repo(request.repo_url, request.type, access_token=request.token)
+        stream = generate_codemap(
+            choice=request.target, repo=repo, question=request.question, language=request.language,
+        )
+        return StreamingResponse(stream, media_type="application/x-ndjson")
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -349,7 +382,10 @@ async def post_export_wiki(request: WikiExportRequest):
     repo_parts = request.repo_url.rstrip("/").split("/")
     repo_name = repo_parts[-1] if repo_parts else "wiki"
     timestamp = datetime.now()
-    content = export_wiki(request.repo_url, pages=request.pages, format=request.format, timestamp=timestamp)
+    content = export_wiki(
+        request.repo_url, pages=[p.model_dump() for p in request.pages],
+        format=request.format, timestamp=timestamp,
+    )
     filename = f"{repo_name}_wiki_{timestamp.strftime('%Y%m%d_%H%M%S')}"
     if request.format == "markdown":
         filename += ".md"
@@ -378,8 +414,8 @@ async def get_local_repo_structure(path: str | None = Query(None, description="P
         return JSONResponse(status_code=500, content={"error": f"Error processing local repository: {e}"})
 
 
-def _target_digest_query(generator: str, config_path: str, provider: str, model: str) -> str:
-    """target 查询参数(generator + file:config_path / object:provider|model)→ 缓存摘要。"""
+def _query_choice_digest(generator: str, config_path: str, provider: str, model: str) -> str:
+    """查询参数(generator + file:config_path / object:provider|model)→ 选型摘要。"""
     gc: dict = {}
     if config_path:
         gc["config_path"] = config_path
@@ -387,10 +423,10 @@ def _target_digest_query(generator: str, config_path: str, provider: str, model:
         gc["provider"] = provider
     if model:
         gc["model"] = model
-    return _request_digest({"generator": generator or "", "generator_config": gc})
+    return _generator_digest({"generator": generator or "", "generator_config": gc})
 
 
-@app.get("/api/wiki_cache", response_model=WikiCacheData | None)
+@app.get("/api/wiki_cache")
 async def read_wiki(
     owner: str = Query(..., description="Repository owner"),
     repo: str = Query(..., description="Repository name"),
@@ -404,7 +440,7 @@ async def read_wiki(
     if language not in _LANG_CONFIG["supported_languages"]:
         language = _LANG_CONFIG["default"]
     return await read_wiki_cache(owner, repo, repo_type, language,
-                                 digest=_target_digest_query(generator, config_path, provider, model))
+                                 digest=_query_choice_digest(generator, config_path, provider, model))
 
 
 @app.delete("/api/wiki_cache")
@@ -428,7 +464,7 @@ async def delete_wiki(
     try:
         target_digest = (
             digest
-            or (_target_digest_query(generator, config_path, provider, model)
+            or (_query_choice_digest(generator, config_path, provider, model)
                 if (generator or config_path or provider or model) else "")
         )
         deleted = await delete_wiki_cache(
@@ -458,7 +494,7 @@ async def submit_wiki_task(request: WikiTaskRequest):
     运行前即抛 ValueError → 400(带具体消息,不是 500)。
     """
     try:
-        return await registry.submit(WikiTask.from_wiki_request(request))
+        return await registry.submit(WikiTask.from_wiki_request(request.model_dump()))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -496,7 +532,7 @@ async def stream_wiki_task(task_id: str):
             if task is None:
                 yield 'event: error\ndata: {"error": "task no longer available"}\n\n'
                 return
-            payload = task.to_status().model_dump_json()
+            payload = json.dumps(task.to_status())
             if task.status == TaskStatus.COMPLETED:
                 yield f"event: done\ndata: {payload}\n\n"
                 return

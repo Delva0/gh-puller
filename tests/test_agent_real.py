@@ -21,15 +21,12 @@ import asyncio
 import json
 import os
 from pathlib import Path
-from types import SimpleNamespace
 
 import httpx
 import pytest
 import pytest_asyncio
-from claude_agent_sdk import ClaudeAgentOptions  # 真 SDK,与 mock 测试相反
 
 from gh_puller import agent
-from gh_puller.agent.generators import cc_stream, codex_stream, dsh_stream, llm_stream
 
 MODEL = os.environ.get("GH_PULLER_MODEL", "deepseek-v4-flash")
 MODEL_CODEX = "gpt-5.6-sol"  # 常量直写:codex 无环境变量(同 cc 路线),models_cache 现存模型
@@ -123,14 +120,14 @@ def _assert_flow(events: list[dict], provider: str, model: str, generator: str =
 async def test_cc_stream_real(tmp_path):
     """cc 真机:spawn 本地 claude CLI,凭证走本地配置(不传 setting_sources/api_key/base_url)。"""
     agent.configure(file_dir=str(tmp_path), ws_urls=[], otel_urls=[])
-    options = ClaudeAgentOptions(
-        model=MODEL,
-        cwd=str(tmp_path),
-        allowed_tools=[],  # "你好" 无工具需求,关工具省流量
-        max_turns=1,
-        include_partial_messages=True,  # 让 StreamEvent 路径真实产 chunk
-    )
-    parts = await _collect(cc_stream(options, "你好", session_name="real:cc", run_id="r-cc"))
+    config = {
+        "model": MODEL,
+        "cwd": str(tmp_path),
+        "allowed_tools": [],  # "你好" 无工具需求,关工具省流量
+        "max_turns": 1,
+        "include_partial_messages": True,  # 让 StreamEvent 路径真实产 chunk
+    }
+    parts = await _collect(agent.ClaudeCode(config).stream("你好", session_name="real:cc", run_id="r-cc"))
     print("cc 回复:", "".join(parts))  # pytest -s 查看真机回显
     assert "".join(parts) != "", "cc 后端应有文本增量"
     _assert_flow(await _read_single_session(tmp_path), "anthropic", MODEL, generator="cc")
@@ -150,10 +147,11 @@ async def test_llm_stream_real(tmp_path):
         pytest.skip("DEEPSEEK_API_KEY 缺失(env 与 ~/.dsh/.credentials.yaml 均无)")
 
     agent.configure(file_dir=str(tmp_path), ws_urls=[], otel_urls=[])
-    payload = {"model": MODEL, "messages": [{"role": "user", "content": "你好"}],
+    config = {"model": MODEL, "base_url": DEEPSEEK_API_URL, "api_key": key}
+    payload = {"messages": [{"role": "user", "content": "你好"}],
                "max_tokens": 256, "temperature": 0}
-    parts = await _collect(llm_stream(
-        url=DEEPSEEK_API_URL, payload=payload, api_key=key,
+    parts = await _collect(agent.OpenAI(config).stream(
+        payload,
         timeout=httpx.Timeout(connect=10.0, read=180.0, write=10.0, pool=10.0),
         session_name="real:llm", run_id="r-llm",
     ))
@@ -178,14 +176,14 @@ async def test_dsh_stream_real(tmp_path):
     sessions = tmp_path / "dsh-sessions"
     sessions.mkdir()
     agent.configure(file_dir=str(tmp_path), ws_urls=[], otel_urls=[])
-    options = SimpleNamespace(
-        provider="deepseek-official",  # SDK 缺省域(deepseek_harness.api.py)
-        model=MODEL,
-        cwd=str(work),
-        session_root=str(sessions),  # 隔离,dsh 会话不落真实 ~/.gh-puller
-        max_tokens=1024,
-    )
-    parts = await _collect(dsh_stream(options, "你好", session_name="real:dsh", run_id="r-dsh"))
+    config = {
+        "provider": "deepseek-official",  # SDK 缺省域(deepseek_harness.api.py)
+        "model": MODEL,
+        "cwd": str(work),
+        "session_root": str(sessions),  # 隔离,dsh 会话不落真实 ~/.gh-puller
+        "max_tokens": 1024,
+    }
+    parts = await _collect(agent.Dsh(config).stream("你好", session_name="real:dsh", run_id="r-dsh"))
     print("dsh 回复:", "".join(parts))  # pytest -s 查看真机回显
     assert "".join(parts) != "", "dsh 后端应有文本增量"
     _assert_flow(await _read_single_session(tmp_path), "deepseek", MODEL, generator="dsh")
@@ -195,15 +193,15 @@ async def test_dsh_stream_real(tmp_path):
 async def test_codex_stream_real(tmp_path):
     """codex 真机:openai_codex SDK;隔离 home 符号链接引用真实 ~/.codex/auth.json(同 cc 路线)。"""
     agent.configure(file_dir=str(tmp_path), ws_urls=[], otel_urls=[])
-    options = SimpleNamespace(
-        codex_home=str(tmp_path / "codex-home"),  # 必须隔离;_codex_home_setup 建符号链接
-        sandbox="full_access",  # 生产缺省(deepwiki._codex_options 同值)
-        approval_mode="auto_review",  # 生产缺省同值
-        model=MODEL_CODEX,
-        cwd=str(tmp_path),
-        timeout_seconds=300,  # 兜底防止 approval 挂流
-    )
-    parts = await _collect(codex_stream(options, "你好", session_name="real:codex", run_id="r-codex"))
+    config = {
+        "codex_home": str(tmp_path / "codex-home"),  # 必须隔离;_codex_home_setup 建符号链接
+        "sandbox": "full_access",  # 生产缺省(deepwiki._codex_options 同值)
+        "approval_mode": "auto_review",  # 生产缺省同值
+        "model": MODEL_CODEX,
+        "cwd": str(tmp_path),
+        "timeout_seconds": 300,  # 兜底防止 approval 挂流
+    }
+    parts = await _collect(agent.Codex(config).stream("你好", session_name="real:codex", run_id="r-codex"))
     print("codex 回复:", "".join(parts))  # pytest -s 查看真机回显
     assert "".join(parts) != "", "codex 后端应有文本增量"
     _assert_flow(await _read_single_session(tmp_path), "openai", MODEL_CODEX, generator="codex")

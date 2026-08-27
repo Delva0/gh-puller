@@ -6,31 +6,26 @@
   带路径穿越防护的仓库内文件读取。
 - 纯工具:stderr 日志、路径段安全化、token 粗估算、markdown fence 剥离、
   NDJSON 事件序列化、LLM JSON 修复/提取。
-- 通用任务层:TaskStatus / Task / TaskSubmitResult / TaskRegistry——
-  状态机、按 key 去重并入、缓存胜、落盘续跑、并发信号量、TTL 迟移除;
-  具体业务(缓存检查、状态恢复、实际执行)由子类钩子注入。
+- 通用状态枚举:TaskStatus(唯一共享枚举;状态机/注册表 TTL 等任务调度
+  已迁至 apps/deepwiki-webui/server/tasks.py —— 全仓唯一消费者,不留底层抽象)。
 
 约定:
-- 本模块导入无副作用(不建目录、不建 asyncio 锁/信号量;锁/信号量在 TaskRegistry
-  __init__ 时创建,deepwiki 等持有者负责其业务目录与写锁)。
+- 本模块导入无副作用(不建目录、不建 asyncio 锁/信号量;调度机在 app 侧实例化
+  时创建,由其持有者负责业务目录与写锁)。
 - _CLONE_ROOT 在导入时对 envs 快照(envs 为导入时单点快照,见 envs.py),
   同一进程内与 deepwiki 的 DEEPWIKI_ROOT 快照保持一致。
 - 进度日志走 stderr(同 graphify.py 约定)。
 """
 
-import asyncio
 import json
 import os
 import re
 import subprocess
 import sys
-import time
 from enum import Enum
 from pathlib import Path
 from typing import Literal
 from urllib.parse import quote, urlparse, urlunparse
-
-from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from . import envs
 
@@ -363,7 +358,7 @@ def _extract_json(text: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# 通用任务状态机(状态/注册表/缓存胜/续跑;业务特化经子类钩子注入)
+# 任务状态枚举(唯一共享枚举:模型契约/缓存列表/端点;调度机在 server/tasks.py)
 # ---------------------------------------------------------------------------
 
 
@@ -377,118 +372,6 @@ class TaskStatus(str, Enum):
 
     def is_terminal(self) -> bool:
         return self in (TaskStatus.COMPLETED, TaskStatus.FAILED)
-
-
-class Task(BaseModel):
-    """通用任务内存态基类:状态/错误/提交时间/运行时 asyncio.Task 均在基类;
-    注册键 key(及可选的展示模型)由子类实现。"""
-
-    model_config = ConfigDict(arbitrary_types_allowed=True)  # 允许 asyncio.Task 字段
-
-    status: TaskStatus = TaskStatus.PENDING
-    error: str | None = None
-    submitted_at: int = Field(default_factory=lambda: int(time.time() * 1000))
-    task: asyncio.Task | None = Field(default=None, repr=False)
-
-    @property
-    def key(self) -> str:
-        raise NotImplementedError("TaskRegistry 以 key 为注册键,子类必须实现")
-
-
-class TaskSubmitResult(BaseModel):
-    task_id: str
-    status: TaskStatus | str
-    created: bool = False
-    joined: bool = False
-    from_cache: bool = False
-    resumed: bool = False  # 从落盘状态续跑(同仓库再提交命中生成状态)
-
-    @field_validator("status", mode="before")
-    @classmethod
-    def _status_validate(cls, value):
-        if isinstance(value, str):
-            return TaskStatus(value.lower())
-        return value
-
-
-class TaskRegistry:
-    """通用异步任务注册表:按 key 去重并入(join)/缓存胜/落盘续跑/并发信号量/TTL 迟移除。
-
-    提交语义的业务差异全部经由子类钩子注入(见各钩子默认实现);
-    基类默认:无缓存、无续跑、run 须子类实现。
-    """
-
-    def __init__(self, max_concurrent: int = 1, ttl_seconds: float = 300):
-        self._tasks: dict[str, Task] = {}
-        self._ttl = ttl_seconds
-        self._lock = asyncio.Lock()
-        self._semaphore = asyncio.Semaphore(max(1, max_concurrent))
-
-    def get(self, id: str) -> Task | None:
-        return self._tasks.get(id)
-
-    def active(self) -> list[Task]:
-        return [t for t in self._tasks.values() if not t.status.is_terminal()]
-
-    async def remove(self, id: str) -> Task | None:
-        async with self._lock:
-            return self._tasks.pop(id, None)
-
-    async def submit(self, task: Task) -> TaskSubmitResult:
-        key = task.key
-        async with self._lock:
-            exist_task = self.get(key)
-            if exist_task and not exist_task.status.is_terminal():
-                return TaskSubmitResult(task_id=key, status=exist_task.status, joined=True)
-            if await self.is_cached(task):
-                # 缓存胜:清理陈旧落盘状态(成功写缓存后删状态前崩溃的残留)
-                await self.on_cache_hit(task)
-                return TaskSubmitResult(task_id=key, status=TaskStatus.COMPLETED, from_cache=True)
-            resumed = await self.load_resume(task)
-            if resumed is not None:
-                task = resumed
-            task.task = asyncio.create_task(self._run(task))
-            self._tasks[key] = task
-            return TaskSubmitResult(
-                task_id=key, status=task.status, created=True, resumed=resumed is not None
-            )
-
-    async def _run(self, task: Task) -> None:
-        async with self._semaphore:
-            await self.run(task)
-        self._schedule_remove(task)
-
-    def _schedule_remove(self, task: Task) -> None:
-        async def remove() -> None:
-            await asyncio.sleep(self._ttl_seconds())
-            if self.get(task.key) is task and task.status.is_terminal():
-                await self.remove(task.key)
-
-        asyncio.create_task(remove())
-
-    # ------------------------------------------------------------------
-    # 子类钩子协议
-    # ------------------------------------------------------------------
-
-    async def run(self, task: Task) -> None:
-        """执行任务本体(子类必须实现;调用时解析,支持模块全局 monkeypatch)。"""
-        raise NotImplementedError
-
-    async def is_cached(self, task: Task) -> bool:
-        """磁盘上是否有完整成品缓存(命中则快速返回,不再执行)。"""
-        return False
-
-    async def on_cache_hit(self, task: Task) -> None:
-        """缓存命中时的清理动作(默认无;wiki 用于清除陈旧续跑状态)。"""
-        return None
-
-    async def load_resume(self, task: Task) -> Task | None:
-        """从落盘状态恢复并返回重建的任务(默认无续跑)。"""
-        return None
-
-    def _ttl_seconds(self) -> float:
-        """TTL call-time 解析(默认构造参数;子类可读模块全局以支持测试 monkeypatch)。"""
-        return self._ttl
 
 
 # ---------------------------------------------------------------------------

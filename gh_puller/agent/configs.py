@@ -180,7 +180,7 @@ def claude_options(config: dict):
     """
     from claude_agent_sdk import ClaudeAgentOptions  # lazy:测试可喂假模块
 
-    sdk_options = dict(config)
+    sdk_options = {k: v for k, v in config.items() if k != "config_path"}  # 概念键不得透传
     if config.get("config_path"):  # 统一概念键 → SDK settings(--settings 装载)
         sdk_options["settings"] = config["config_path"]
     return ClaudeAgentOptions(**sdk_options)

@@ -5,7 +5,7 @@ dsh(DeepSeek Harness)插件:在 dsh 会话内注册两个**原生工具**——`
 边行 `at=<file>:L<n>`),全程本地执行、无 LLM、无 API key。
 
 **为什么是原生工具而不是 MCP**:dsh 自带 `@deepseek-ai/dsh-mcp-client`,需要 MCP 时直接加载即可、
-无须插件;做成本插件即原生工具注册——工具裸名(无 `mcp__` 前缀,与 `gh_puller/deepwiki.py`
+无须插件;做成本插件即原生工具注册——工具裸名(无 `mcp__` 前缀,与 `gh_puller/deepwiki/`
 agent 会话中的 `graphify_query` 同名)、宿主进程内注册直通。Python 侧仍需要一个进程
 (graphify 是 Python 库),以**普通跨进程通信**(NDJSON stdio 常驻 worker)对接,不上 MCP。
 
@@ -23,7 +23,7 @@ agent 会话中的 `graphify_query` 同名)、宿主进程内注册直通。Pyth
 ## 前置
 
 - dsh(本地源码 rc.8 或更新),`uv`。
-- gh-puller 仓库,且 Python 侧项目就绪:`cd apps/dsh-gh-puller/server && uv sync`。
+- gh-puller 仓库,且 Python 侧项目就绪:`uv --directory apps/dsh-gh-puller/server sync`。
 - (可选)期望 `DEEPWIKI_ROOT` 指向自定义目录时,先设好环境变量再启 dsh(wrapper 子进程继承之)。
 
 ## 启用
@@ -59,7 +59,6 @@ dsh web --patch /abs/path/gh-puller/apps/dsh-gh-puller/cordis.patch.yml
 ## 构建/自检(开发)
 
 ```bash
-cd apps/dsh-gh-puller
-pnpm install && pnpm exec tsc && pnpm vitest run     # 插件包;
-cd server && uv sync && uv run pytest                # Python worker(全离线)
+pnpm --dir apps/dsh-gh-puller install && pnpm --dir apps/dsh-gh-puller exec tsc && pnpm --dir apps/dsh-gh-puller vitest run     # 插件包;
+uv --directory apps/dsh-gh-puller/server sync && uv --directory apps/dsh-gh-puller/server run pytest                # Python worker(全离线)
 ```

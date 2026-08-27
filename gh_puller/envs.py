@@ -9,8 +9,9 @@ benchmark 评测相关 key 见文末分节)。
 import os
 
 # ---- provider 连接配置(全项目统一语义:provider = 模型服务提供方) ----
-# 各 provider 的模型目录/默认 base URL 见 agent.generators(generator 类属性);凭证解析优先级
-# 显式 target > 本组环境变量 > SDK 原生登录/默认值(见 agent.resolve_generator)。
+# 各 provider 的模型路由/默认 base URL 见 gh_puller.agent.configs.py 契约
+# (OpenAIConfig/DshConfig 概念键);凭证解析优先级 显式 target > 本组环境变量 >
+# SDK 原生登录/默认值(解析在 deepwiki.utils._resolve_generator)。
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 ANTHROPIC_BASE_URL = os.environ.get("ANTHROPIC_BASE_URL", "")  # 空 → SDK 原生端点
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
@@ -66,7 +67,7 @@ CHAT_TOKEN_LIMIT_ESTIMATE = int(os.environ.get("DEEPWIKI_CHAT_TOKEN_LIMIT", "750
 # 两 URL 均逗号分隔多地址(每地址一个 sink 实例,预留);空 → 不启用该类 sink。
 # 新 OTel 后端(如 AGENT_MONITOR_LANGFUSE_URL,默认 "")= 此处一个常量 + sinks._OTEL_BACKENDS 表一条。
 AGENT_MONITOR_DIR = os.path.expanduser(os.environ.get("AGENT_MONITOR_DIR", "~/.gh-puller/agent-monitor"))
-# 默认 = 内部 agent-dashboard hub(apps/agent-dashboard,AGENT_MONITOR_PORT 联动)
+# 默认 = 内部 agent-monitor hub(apps/agent-monitor,AGENT_MONITOR_PORT 联动)
 AGENT_MONITOR_WEBUI_URL = os.environ.get("AGENT_MONITOR_WEBUI_URL", "ws://localhost:8765/ws")
 AGENT_MONITOR_PORT = int(os.environ.get("AGENT_MONITOR_PORT", "8765"))
 # 启用条件:端点可达(ensure_bus 构建时 TCP 探活)+ opentelemetry 可导入

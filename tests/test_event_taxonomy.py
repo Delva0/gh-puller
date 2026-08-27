@@ -108,7 +108,7 @@ def test_new_event_replace_op_and_ignorable():
         source={"kind": "context", "label": "注记"}, surfaceOp={"op": "replace", "start": 3, "end": 3},
     )
     assert e["data"]["surfaceOp"] == {"op": "replace", "start": 3, "end": 3}
-    log = new_event("request/header", header={"config": {"provider": "openai", "model": "m"}}, reason="initial")
+    log = new_event("config/init", header={"config": {"provider": "openai", "model": "m"}}, reason="initial")
     assert log.get("ignorable") is True  # 日志型事件带 ignorable 标记
     assert "ignorable" not in new_event(
         "session/start", label="l", provider="openai", model="m")  # 必需事件无标记
@@ -255,7 +255,7 @@ def test_projection_holes_preserve_fold():
         evt(1, "turn/start", turn=1),
         evt(2, "step/start", step=1),
         evt(3, "user/message", **user_msg("how does auth work?")),
-        evt(4, "request/header", header={"config": {}, "system": "s", "tools": []},
+        evt(4, "config/init", header={"config": {}, "system": "s", "tools": []},
             reason="initial", partial=True),
         evt(5, "assistant/chunk", chunk={"type": "text", "index": 0, "text": "检"}),
         evt(6, "assistant/chunk", chunk={"type": "text", "index": 0, "text": "查"}),
@@ -289,7 +289,7 @@ def test_fold_cc_multi_request_exact_contexts():
         evt(1, "turn/start", turn=1),
         evt(2, "step/start", step=1),
         evt(3, "user/message", **user_msg("how does auth work?")),
-        evt(4, "request/header", header={"config": {"provider": "claude", "model": ""},
+        evt(4, "config/init", header={"config": {"provider": "claude", "model": ""},
                                          "system": "s", "tools": []}, reason="initial", partial=True),
         evt(5, "assistant/chunk", chunk={"type": "thinking", "index": 0, "text": "分"}),
         evt(6, "assistant/chunk", chunk={"type": "thinking", "index": 0, "text": "析"}),
@@ -352,7 +352,7 @@ def test_fold_replace_op_after_context_modify():
         evt(3, "user/message", **user_msg("旧问题")),
         evt(4, "context/modify", target="chat-history", kind="trim", cause="token-limit",
             detail="省略对话历史", removed={"n_turns": 1, "est_tokens": 100}),
-        evt(5, "request/header", header={"config": {"provider": "claude", "model": ""}}, reason="initial"),
+        evt(5, "config/init", header={"config": {"provider": "claude", "model": ""}}, reason="initial"),
         evt(6, "user/message", **user_msg("新问题", surface={"op": "replace", "start": 3, "end": 3},
                                           start=3, end=3)),
     ]

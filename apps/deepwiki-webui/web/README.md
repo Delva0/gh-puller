@@ -1,7 +1,7 @@
 # gh-puller WebUI 前端
 
 DeepWiki 兼容前端（Next.js 15 + React 19 + Tailwind v4，前端契约与 MIT 协议 deepwiki-open 一致）。
-配合后端使用：HTTP 端点层是仓库 `apps/deepwiki-webui/server/app.py`（独立 uv 项目，FastAPI），引擎/任务层在 `gh_puller/deepwiki.py`。
+配合后端使用：HTTP 端点层是仓库 `apps/deepwiki-webui/server/app.py`（独立 uv 项目，FastAPI），引擎/任务层在 `gh_puller/deepwiki/`。
 Claude Code agent 生成仓库 wiki / 跑 codemap / 回答代码问题，
 代码图谱检索由 `gh_puller/graphify.py` 提供（经 `graphify_query` 工具注入 agent）。
 
@@ -16,11 +16,10 @@ Claude Code agent 生成仓库 wiki / 跑 codemap / 回答代码问题，
 pnpm install
 
 # 终端 1：启动后端（端口默认 8001，env 单点读取见 gh_puller/envs.py）
-cd apps/deepwiki-webui/server
-uv run uvicorn app:app --port 8001
+uv --directory apps/deepwiki-webui/server run uvicorn app:app --port 8001
 
 # 终端 2：启动前端（端口默认 3000）
-cd apps/deepwiki-webui/web && pnpm dev
+pnpm --dir apps/deepwiki-webui/web dev
 ```
 
 浏览器打开 `http://localhost:3000`，首页输入仓库 URL（远程 HTTP(S) GitHub/GitLab/Bitbucket 或有
@@ -57,11 +56,11 @@ cd apps/deepwiki-webui/web && pnpm dev
 
 | 路径 | 说明 |
 |---|---|
-| `apps/deepwiki-webui/server/app.py` / `pyproject.toml` / `tests/` | 后端 Python 项目根（FastAPI 端点层；`cd apps/deepwiki-webui/server && uv run uvicorn app:app` 启动） |
+| `apps/deepwiki-webui/server/app.py` / `pyproject.toml` / `tests/` | 后端 Python 项目根（FastAPI 端点层；`uv --directory apps/deepwiki-webui/server run uvicorn app:app` 启动） |
 | `src/app` | 页面与 API 路由（`[owner]/[repo]` 会话页、`wiki/projects` 项目列表） |
 | `src/components` | UI 组件（Ask / WikiView / CodeMap 等，WebUI 核心） |
 | `src/utils/` | `websocketClient.ts`（WS 直连）、`wikiTask.ts`（任务轮询封装） |
 | `src/messages/` | 语言包（扁平化 en/zh 字典，经共享包 `@gh-puller/ui` 的 `extraMessages` 注入） |
 
 共享基础组件（Markdown/ThemeToggle/LanguageProvider 等）来自共享包 `@gh-puller/ui`（源码在 `ui/src/`，workspace 成员）。
-构建产物（`next build` 输出 `.next/`）；构建全工作区用 `pnpm -r build`（含 agent-dashboard）。
+构建产物（`next build` 输出 `.next/`）；构建全工作区用 `pnpm -r build`（含 agent-monitor）。
