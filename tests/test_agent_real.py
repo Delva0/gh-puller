@@ -41,9 +41,9 @@ pytestmark = pytest.mark.skipif(
 
 @pytest_asyncio.fixture(autouse=True)
 async def _monitor_cleanup():
-    """每测后复元监控配置:关文件 sink + ws/otel,防写真实 ~/.gh-puller/agent-monitor。"""
+    """每测后复元监控配置:撤 ws/otel;文件落盘默认重定向(conftest tmp),防真实 ~/.gh-puller。"""
     yield
-    agent.configure(file=False, ws_urls=[], otel_urls=[])
+    agent.configure(ws_urls=[], otel_urls=[])
     await asyncio.sleep(0.01)
 
 

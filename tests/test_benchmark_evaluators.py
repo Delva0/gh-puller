@@ -1,12 +1,13 @@
 """benchmark evaluator 迁移后的本地测试(零网络 / 零 token)。
 
 两个评测器本体是半抽象基类,这里用最小子类挂接扩展点,并把后端调用
-(cc_result / httpx)全部置换为假实现:
-- claude judge:成功路径(cc_result → coerce)与降级路径(RuntimeError / JSON 解析失败);
+(ClaudeCode.result / httpx)全部置换为假实现:
+- claude judge:成功路径(result → coerce)与降级路径(RuntimeError / JSON 解析失败);
 - llm judge:HTTP 成功、nudge 重试(第二次追加提示)、耗尽降级;并断言请求体逐字节直连一致。
 """
 
 import asyncio
+import json
 import types
 
 import httpx
@@ -20,9 +21,9 @@ from gh_puller.benchmark.evaluators import LLMEvaluator
 
 @pytest_asyncio.fixture(autouse=True)
 async def _monitor_cleanup():
-    """评测器走真实 llm_complete/cc_result:监控需停用,避免写用户真实 monitor 目录。"""
+    """评测器走真实 OpenAI.result/ClaudeCode.result:撤 ws/otel;文件落盘默认重定向(conftest tmp)。"""
     yield
-    agent.configure(file=False, ws_urls=[], otel_urls=[])
+    agent.configure(ws_urls=[], otel_urls=[])
     await asyncio.sleep(0.01)
 
 
@@ -56,13 +57,11 @@ GOOD_VERDICT = '{"dimensions": {"code_essence": 8}, "overall": 7, "reason": "ok"
 async def test_claude_judge_success(monkeypatch):
     calls = []
 
-    async def fake_cc_result(options, prompt, *, session=None, session_name=None, meta=None):
-        calls.append((options.model, prompt, session_name))
+    async def fake_result(self, prompt, *, session_name=None, meta=None, **kw):
+        calls.append((self.config.get("model"), prompt, session_name))
         return GOOD_VERDICT
 
-    from gh_puller.benchmark import evaluators as claude_mod
-
-    monkeypatch.setattr(claude_mod, "cc_result", fake_cc_result)
+    monkeypatch.setattr(agent.ClaudeCode, "result", fake_result)
     judge = _MiniClaude()
     r = await judge.evaluate("q", "ref", "ans")
     assert r["overall"] == 7
@@ -71,20 +70,18 @@ async def test_claude_judge_success(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_claude_judge_degrades_on_error_and_bad_json(monkeypatch):
-    from gh_puller.benchmark import evaluators as claude_mod
-
-    async def fake_cc_result(options, prompt, *, session=None, session_name=None, meta=None):
+    async def fake_result(self, prompt, *, session_name=None, meta=None, **kw):
         raise RuntimeError("boom")
 
-    monkeypatch.setattr(claude_mod, "cc_result", fake_cc_result)
+    monkeypatch.setattr(agent.ClaudeCode, "result", fake_result)
     judge = _MiniClaude()
     r = await judge.evaluate("q", "ref", "ans")
     assert r == {"dimensions": {}, "overall": 0, "reason": "评测失败: RuntimeError: boom"}
 
-    async def fake_cc_result_json(options, prompt, **kw):
+    async def fake_result_json(self, prompt, **kw):
         return "not a json"
 
-    monkeypatch.setattr(claude_mod, "cc_result", fake_cc_result_json)
+    monkeypatch.setattr(agent.ClaudeCode, "result", fake_result_json)
     r2 = await judge.evaluate("q", "ref", "ans")
     assert r2["overall"] == 0 and "评测失败" in r2["reason"]
 
@@ -105,6 +102,22 @@ class _FakeResponse:
         return self._data
 
 
+class _FakeSSERes:
+    """形似流式响应:把预设响应整体包成一条 SSE delta(llm result 内部走流式端点)。"""
+
+    def __init__(self, resp):
+        self._resp = resp
+
+    def raise_for_status(self):
+        pass
+
+    async def aiter_lines(self):
+        # 预设响应是完整形式(message.content)→ 包成一条 delta(适配器只读 delta.content)
+        content = self._resp.json()["choices"][0]["message"]["content"]
+        yield "data: " + json.dumps({"choices": [{"delta": {"content": content}}]})
+        yield "data: [DONE]"
+
+
 class _FakeHttpClient:
     """形似 httpx.AsyncClient 的假客户端:捕获请求体,按 index 返回预设响应。"""
 
@@ -120,9 +133,22 @@ class _FakeHttpClient:
     async def __aexit__(self, *exc):
         return False
 
-    async def post(self, url, json, headers):
+    async def post(self, url, json, headers, timeout=None):
         _FakeHttpClient.posts.append((url, json, headers))
         return _FakeHttpClient.responses.pop(0)
+
+    def stream(self, method, url, json, headers, timeout=None):  # 同步(与 httpx 同形:返回 async CM)
+        type(self).posts.append((url, json, headers))
+        resp = type(self).responses.pop(0)
+
+        class _CM:
+            async def __aenter__(self):
+                return _FakeSSERes(resp)
+
+            async def __aexit__(self, *exc):
+                return False
+
+        return _CM()
 
 
 def _fake_httpx(monkeypatch):
@@ -143,7 +169,8 @@ async def test_llm_judge_success(monkeypatch):
     assert r["overall"] == 7
     url, body, headers = posts[0]
     assert url == "http://j/chat/completions"
-    assert body == {"model": "m", "messages": [{"role": "user", "content": "q"}]}  # body 与 payload 逐字节一致
+    # body 与 payload 逐字节一致(+result 内部流式抽取注入 stream=True)
+    assert body == {"model": "m", "messages": [{"role": "user", "content": "q"}], "stream": True}
     assert headers["Authorization"].startswith("Bearer")
 
 

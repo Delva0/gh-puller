@@ -410,3 +410,35 @@ def test_fold_replace_unknown_shadow_raises():
                                                start=5, end=5))]
     with pytest.raises(ValueError, match="不存在的节点"):
         fold_events(events)
+
+
+def test_fold_ignores_session_heartbeat():
+    """session/heartbeat(TAXONOMY 内非 surface,ignorable)掺杂流:折叠节点与消息派生
+    与无心跳流完全一致(心跳不折面、不派生、不改变消息上下文)。"""
+    base = [evt(0, "session/start", run_id="r", label="l", generator="cc"),
+            evt(1, "user/message", turn=1, step=1,
+                message={"role": "user", "content": [{"type": "text", "text": "hi"}]},
+                source={"kind": "user"}, surfaceOp="append"),
+            evt(2, "assistant/chunk", turn=1, step=1,
+                chunk={"type": "content", "index": 0, "text": "a"}),
+            evt(3, "assistant/message", turn=1, step=1,
+                message={"role": "assistant", "content": [{"type": "text", "text": "a"}]},
+                surfaceOp="append", sourceSeqs=[2]),
+            evt(4, "session/end", state="completed", ok=True, duration_ms=1,
+                text_chars=1, num_steps=1)]
+    # 心跳夹在流中(占位 seq,保持稠密):与基准同节点、同消息
+    with_hb = [evt(0, "session/start", run_id="r", label="l", generator="cc"),
+               evt(1, "session/heartbeat"),
+               evt(2, "user/message", turn=1, step=1,
+                   message={"role": "user", "content": [{"type": "text", "text": "hi"}]},
+                   source={"kind": "user"}, surfaceOp="append"),
+               evt(3, "assistant/chunk", turn=1, step=1,
+                   chunk={"type": "content", "index": 0, "text": "a"}),
+               evt(4, "assistant/message", turn=1, step=1,
+                   message={"role": "assistant", "content": [{"type": "text", "text": "a"}]},
+                   surfaceOp="append", sourceSeqs=[3]),
+               evt(5, "session/end", state="completed", ok=True, duration_ms=1,
+                   text_chars=1, num_steps=1)]
+    assert fold_events(with_hb)[0] == [2, 4]  # 心跳不进面:节点恰为 user/assistant message
+    assert messages_at(with_hb, 10**9) == messages_at(base, 10**9)  # 消息上下文一致
+    assert new_event("session/heartbeat")["ignorable"] is True  # LOG_TYPES 契约

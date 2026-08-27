@@ -3,18 +3,18 @@
 
 The following files were used as context for generating this wiki page:
 
-- [gh_puller/agent/adapters.py](gh_puller/agent/adapters.py)
+- [gh_puller/agent/generators.py](gh_puller/agent/generators.py)
 - [gh_puller/agent/events.py](gh_puller/agent/events.py)
 - [gh_puller/agent/sinks.py](gh_puller/agent/sinks.py)
 - [gh_puller/envs.py](gh_puller/envs.py)
-- [apps/agent-dashboard/web/src/](apps/agent-dashboard/web/src/)
+- [apps/agent-monitor/web/src/](apps/agent-monitor/web/src/)
 - [ui/src/](ui/src/)
-- [apps/agent-dashboard/server/tests/test_hub.py](apps/agent-dashboard/server/tests/test_hub.py)
+- [apps/agent-monitor/server/tests/test_hub.py](apps/agent-monitor/server/tests/test_hub.py)
 </details>
 
 # Agent Streaming Monitor: Event-Sourced Log + Web/WS Hub
 
-Every LLM call in this repository — Claude Code agent calls (`cc_stream` / `cc_text` / `cc_result`, the single streaming funnel that `deepwiki` and the claude judge previously drilled directly into the SDK) and plain OpenAI-compatible calls (`llm_complete` / `llm_stream`) — flows through the wrappers in `gh_puller/agent/`. Callers keep their exact signature and semantics (same `RuntimeError` wording, same fallback order, same text chunks); the monitor is invisible to them. In exchange, every call is observed on **three channels**: a **file sink** (on by default), the internal **Web/WS hub** (agent-dashboard; on when its endpoint is reachable), and an **OTel trace export** (Phoenix-compatible backends; on when endpoint reachable + opentelemetry importable). Sources: [gh_puller/agent/adapters.py:cc_stream/cc_text/cc_result/llm_complete/llm_stream]()
+Every LLM call in this repository — Claude Code agent calls (`cc_stream` / `cc_text` / `cc_result`, the single streaming funnel that `deepwiki` and the claude judge previously drilled directly into the SDK) and plain OpenAI-compatible calls (`llm_complete` / `llm_stream`) — flows through the wrappers in `gh_puller/agent/`. Callers keep their exact signature and semantics (same `RuntimeError` wording, same fallback order, same text chunks); the monitor is invisible to them. In exchange, every call is observed on **three channels**: a **file sink** (on by default), the internal **Web/WS hub** (agent-monitor; on when its endpoint is reachable), and an **OTel trace export** (Phoenix-compatible backends; on when endpoint reachable + opentelemetry importable). Sources: [gh_puller/agent/generators.py:cc_stream/cc_result/llm_stream]()
 
 The observation model is **event-sourcing**: a single lossless append-only event log per run, aligned with the deepseek-harness invariant — the LLM `messages` context is *derived* by a surface fold, not snapshotted. The event log splits into two granularities:
 
@@ -46,7 +46,7 @@ graph LR
     RUN --> A[aborted]
 ```
 
-One `session` = one adapter call (one JSONL), id = `<ns>/<uuid4>` — `ns` (业务分类命名空间)由上层业务决定(显式 `session_ns=` → `run_id` → `session_name` → `"agent"`),so grepping `session/start` tells you the source; `run_id` links the task-level family (`chat:<repo>`, `codemap:<repo>`, `<type>_<owner>_<repo>` for wiki runs). `session/end` carries `state` (`completed` / `aborted`), `ok`, `duration_ms`, `num_steps`, usage and reason. Sources: [gh_puller/agent/adapters.py:_Run]()
+One `session` = one adapter call (one JSONL), id = `<ns>/<uuid4>` — `ns` (业务分类命名空间)由上层业务决定(显式 `session_ns=` → `run_id` → `session_name` → `"agent"`),so grepping `session/start` tells you the source; `run_id` links the task-level family (`chat:<repo>`, `codemap:<repo>`, `<type>_<owner>_<repo>` for wiki runs). `session/end` carries `state` (`completed` / `aborted`), `ok`, `duration_ms`, `num_steps`, usage and reason. While running, the producer emits `session/heartbeat` **silence fillers**: only when ≥ `AGENT_MONITOR_HEARTBEAT_SECS` pass with no event that lands on disk (non-chunk; `assistant/chunk` typing deltas are streaming-only, they don't count) — it keeps the JSONL mtime moving so the hub can tell "alive but quiet" from "process dead" (lease, §2/§3). The event is `ignorable` and never folds. Sources: [gh_puller/agent/events.py:EventRecorder]()
 
 ## 2. File Sink (default on, flat layout + implicit classification)
 
@@ -57,7 +57,7 @@ One `session` = one adapter call (one JSONL), id = `<ns>/<uuid4>` — `ns` (业�
                                        # 只含非流式事件流(taxonomy − assistant/chunk)
 ```
 
-**分类学是隐式的,不在目录名里**:running = 文件无 `session/end` 行;completed/aborted = 有终态行、state 在事件 data 里;会话来源 = `session/start` 的 `session` 字段(`<ns>/<uuid4>`)。用户直接 grep 而非翻目录:
+**分类学是隐式的,不在目录名里**:completed/aborted = 有终态行、state 在事件 data 里;running = 无终态行且文件 mtime 新鲜;无终态行但文件 mtime 静止超租约(AGENT_MONITOR_LEASE_SECS,见 §3)= 孤儿,监控侧派生为 aborted(纯内存判,不写盘);会话来源 = `session/start` 的 `session` 字段(`<ns>/<uuid4>`)。用户直接 grep 而非翻目录:
 
 ```bash
 # 查终态(completed / aborted 由 data.state 区分)
@@ -69,20 +69,20 @@ grep '"type":"session/start"' ~/.gh-puller/agent-monitor/sessions/*.jsonl
 tail -f ~/.gh-puller/agent-monitor/sessions/*.jsonl
 ```
 
-Each JSONL line is one raw non-streaming event (full content — no truncation anywhere in the log; only OTel previews truncate). `assistant/chunk` is **skipped** (log inflation), so the file `seq` has holes (hole == skipped chunk); the fold contract only compares `seq` — readers never assume density. Writes happen in the sink worker (queue drain), bounded at 5000 events drop-oldest; a slow or full disk never blocks the LLM call. A crash leaves a file **without** `session/end` (residue = running, debug material) which the hub heals on demand (mtime change → tail re-scan, see §3). **v1 迁移**:旧格式(LLM 聚合行)与本格式互不兼容,首次升级请在 hub 未启动/可停止时清理旧的 `~/.gh-puller/agent-monitor/sessions/**`(hub 会把无 `seq` 的文件整件跳过并日志)。Sources: [gh_puller/agent/sinks.py:FileSink]()
+Each JSONL line is one raw non-streaming event (full content — no truncation anywhere in the log; only OTel previews truncate). `assistant/chunk` is **skipped** (log inflation), so the file `seq` has holes (hole == skipped chunk); the fold contract only compares `seq` — readers never assume density. Writes happen in the sink worker (queue drain), bounded at 5000 events drop-oldest; a slow or full disk never blocks the LLM call. A crash leaves a file **without** `session/end` (residue; hub 按"无终态行 + mtime 静止超租约"派生为 aborted,见 §3 —— 运行期静默补发的 `session/heartbeat` 行同样落盘,活会话的 mtime 不会停,读者以租约区分"活但静默"与"进程已死";残留文件即排查素材)。 **v1 迁移**:旧格式(LLM 聚合行)与本格式互不兼容,首次升级请在 hub 未启动/可停止时清理旧的 `~/.gh-puller/agent-monitor/sessions/**`(hub 会把无 `seq` 的文件整件跳过并日志)。Sources: [gh_puller/agent/sinks.py:FileSink]()
 
 ## 3. Web/WS Hub (opt-in via monitor)
 
 ### Run
 
 ```bash
-cd apps/agent-dashboard/server && uv run uvicorn hub:app --port 8765   # AGENT_MONITOR_PORT default 8765
+uv --directory apps/agent-monitor/server run uvicorn hub:app --port 8765   # AGENT_MONITOR_PORT default 8765
 # in another terminal, run any LLM work (ws sink auto-enables when hub reachable;
 # override the default target with AGENT_MONITOR_WEBUI_URL, comma-separated for multiple hubs):
 AGENT_MONITOR_WEBUI_URL=ws://localhost:8765/ws uv run benchmark ...
 ```
 
-The hub seeds in-memory state from `AGENT_MONITOR_DIR/sessions/*.jsonl` (flat layout) at startup — **the full (non-streaming) event log loads, so history replay works for disk-seeded sessions too** (the old "seeded event view is empty" limitation is gone). Session key = the `session` field of each file's `session/start` (not the filename); state is implicit (has `session/end` → completed/aborted by `data.state`, else running). While serving, `index` requests re-check running sessions whose file mtime changed (heal crash residue / missed end frames). `GET /` (and `/viewer`) serves the built viewer `static/agent_monitor_viewer.html`; anything else 404s. The viewer no longer ships in the wheel; when missing the hub logs `viewer 未构建:请运行仓库根 pnpm build` and falls back to a plain `viewer 文件缺失` page.
+The hub seeds in-memory state from `AGENT_MONITOR_DIR/sessions/*.jsonl` (flat layout) at startup — **the full (non-streaming) event log loads, so history replay works for disk-seeded sessions too** (the old "seeded event view is empty" limitation is gone). Session key = the `session` field of each file's `session/start` (not the filename); state is implicit (has `session/end` → completed/aborted by `data.state`, else running). While serving, `index` requests re-check running sessions whose file mtime changed (heal crash residue / missed end frames). A continuous **lease scanner** (lifespan task, tick ≈ lease/4) flips a running session to `aborted` when its file has no `session/end` **and** its mtime has been still longer than `AGENT_MONITOR_LEASE_SECS` (orphan derivation only: in-memory, no synthetic rows written; if the file moves again the session self-heals to `running`), and broadcasts the new `index` exactly once per flip. `GET /` (and `/viewer`) serves the built viewer `static/agent_monitor_viewer.html`; anything else 404s. The viewer no longer ships in the wheel; when missing the hub logs `viewer 未构建:请运行仓库根 pnpm build` and falls back to a plain `viewer 文件缺失` page.
 
 ### WS protocol (one JSON object per frame)
 
@@ -94,18 +94,18 @@ The hub seeds in-memory state from `AGENT_MONITOR_DIR/sessions/*.jsonl` (flat la
 | viewer → hub | `{"type":"subscribe","session":id}` | `{"type":"evt_ready","session":id,"lastSeq":n}` then live `{"type":"evt","event":{...}}` frames; single-subscription view (new subscribe replaces the old session) |
 | anyone → hub | `{"type":"ping"}` | `{"type":"pong"}` |
 
-One connection is one role, decided by its first frame: `evt` → producer loop, anything else → viewer loop. The client maintains a `RunFold` (seq-guarded): live frames at `seq == next` fold in; `seq > next` → request `history({beforeSeq: next})` and re-fold after a merge; `seq < next` dedups. Reconnect refetches the tail and re-subscribes. Sources: [apps/agent-dashboard/server/hub.py]()
+One connection is one role, decided by its first frame: `evt` → producer loop, anything else → viewer loop. The client maintains a `RunFold` (seq-guarded): live frames at `seq == next` fold in; `seq > next` → request `history({beforeSeq: next})` and re-fold after a merge; `seq < next` dedups. Reconnect refetches the tail and re-subscribes. Sources: [apps/agent-monitor/server/hub.py]()
 
-### Viewer page (`apps/agent-dashboard/server/static/agent_monitor_viewer.html`)
+### Viewer page (`apps/agent-monitor/server/static/agent_monitor_viewer.html`)
 
-React app built from the `apps/agent-dashboard/web` project into a single inline HTML (repo-root pnpm workspace):
+React app built from the `apps/agent-monitor/web` project into a single inline HTML (repo-root pnpm workspace):
 
 ```bash
 pnpm install && pnpm -r build   # → server/static/agent_monitor_viewer.html
 ```
 
 - `ui` — shared component package (`@gh-puller/ui`, own package.json at `ui/`, workspace member, source in `ui/src/`): the existing `Markdown`/`ThemeToggle`/`StateBadge`/`LanguageProvider` plus a new **monitor data layer** (`ui/src/monitor/*`: surface fold, per-session `RunFold`, snapshot builder, trajectory layout/timeline/search, context provenance, hub frame types — pure TS, unit-tested with vitest) and the **conversation/trajectory components** (`MonitorSessionList`, `MonitorConversation` tabs 对话/轨迹, `MonitorChatView` nodes, `MonitorTrajectoryView` with 4-mode timeline + range selection + search + collapse-all). Components are theme-agnostic (CSS-variable tokens), bilingual.
-- `apps/agent-dashboard/web` — the shell: sidebar (search/state filter/run_id-grouped session list) + main panel (stats chips + 对话/轨迹 tabs via `MonitorConversation`) + status bar; `useMonitorSocket` handles hub protocol v2 (subscribe/history stitch), `useMonitorSession` is a `useSyncExternalStore`-based store over `RunFold`.
+- `apps/agent-monitor/web` — the shell: sidebar (search/state filter/run_id-grouped session list) + main panel (stats chips + 对话/轨迹 tabs via `MonitorConversation`) + status bar; `useMonitorSocket` handles hub protocol v2 (subscribe/history stitch), `useMonitorSession` is a `useSyncExternalStore`-based store over `RunFold`.
 
 ## 4. OTel / Phoenix (auto-enabled when reachable)
 
@@ -119,20 +119,22 @@ docker run --rm -p 6006:6006 -i ghcr.io/axiomhq/phoenix:latest  # 或 Axiom Phoe
 
 ## 5. Configuration
 
-Runtime override via `agent.configure(file=..., file_dir=..., ws_urls=..., otel_urls=...)`; `ws_urls`/`otel_urls` 接受 URL 列表或逗号分隔字符串,`None` → 重读 env 常量;defaults come from env at import time ([gh_puller/envs.py:38-46](gh_puller/envs.py:38-46)). `ensure_bus()` 为惰性构建总线的公开入口(每 URL 一个 sink 实例):
+Runtime override via `agent.configure(file_dir=..., ws_urls=..., otel_urls=...)`(file sink **恒开**,无开关;`file_dir` 为测试/嵌入的隔离/重定向手段);`ws_urls`/`otel_urls` 接受 URL 列表或逗号分隔字符串,`None` → 重读 env 常量;defaults come from env at import time ([gh_puller/envs.py:38-46](gh_puller/envs.py:38-46)). `ensure_bus()` 为惰性构建总线的公开入口(每 URL 一个 sink 实例):
 
 | Variable | Default | Meaning |
 |---|---|---|
 | `AGENT_MONITOR_DIR` | `~/.gh-puller/agent-monitor` | file sink root (mirrors the `~/.gh-puller/deepwiki` convention) |
 | `AGENT_MONITOR_WEBUI_URL` | `ws://localhost:8765/ws` | ws sink targets, comma-separated (one WsSink each); empty → ws sink off |
 | `AGENT_MONITOR_PORT` | `8765` | hub listen port |
+| `AGENT_MONITOR_HEARTBEAT_SECS` | `30` | producer heartbeat interval: silence (no non-chunk event) ≥ this gets one `session/heartbeat` filler row (activity periods get none) |
+| `AGENT_MONITOR_LEASE_SECS` | `150` | hub orphan lease: no `session/end` + file mtime still > this → session derived `aborted`; keep ≥ 3–5× HEARTBEAT (0 heartbeat = pure event-mtime semantics) |
 | `AGENT_MONITOR_PHOENIX_URL` | `http://localhost:6006/` | OTLP backend base URL (auto appends `/v1/traces` when path empty); empty → off; only registered when reachable + opentelemetry importable |
 
-File sink is **always on** (`AGENT_MONITOR_FILE` has been removed); runtime `configure(file=False)` can disable it for tests/embedding.
+File sink is **always on** — the `AGENT_MONITOR_FILE` env and the runtime `configure(file=...)` switch have both been removed (convention code-enforced); tests/embedding isolate only via the `configure(file_dir=...)` redirect.
 
 ## 6. Loopback tests
 
 - `tests/test_event_taxonomy.py` — taxonomy/envelope, plus the **fold-spec oracle**: fake contiguous event sequences → `messages_at(seq)` equals the expected contexts for every prefix (append & replace), empty-content skips, seq-gap and unknown-required-type errors.
-- `tests/test_agent.py` — bus fanout/drop-oldest, `_Run` start/step/finish ordering, adapters (chunk/tool.call/tool.result full-content mapping, raw arguments strings, step boundaries), FileSink raw-event lines + state move, WsSink envelope passthrough, OtelSink span tree (InMemorySpanExporter), failure isolation, config/URL gating.
-- `apps/agent-dashboard/server/tests/test_hub.py` — hub protocol v2 via FastAPI `TestClient` (zero network egress): index + two-viewer live broadcast, subscribe/`evt_ready(lastSeq)`, history pagination (tail/older/missing session), disk+memory merge, **disk-seeded session history replay (regression: old limitation)**, old-format/corrupt-line skip, `GET /` vs 404, ping/pong.
+- `tests/test_agent.py` — bus fanout/drop-oldest, `_Run` start/step/finish ordering, adapters (chunk/tool.call/tool.result full-content mapping, raw arguments strings, step boundaries), FileSink raw-event lines + state move, WsSink envelope passthrough, OtelSink span tree (InMemorySpanExporter), failure isolation, config/URL gating, heartbeat silence-fill (quiet gap / busy absence / aborted run cancels the task).
+- `apps/agent-monitor/server/tests/test_hub.py` — hub protocol v2 via FastAPI `TestClient` (zero network egress): index + two-viewer live broadcast, subscribe/`evt_ready(lastSeq)`, history pagination (tail/older/missing session), disk+memory merge, **disk-seeded session history replay (regression: old limitation)**, old-format/corrupt-line skip, `GET /` vs 404, ping/pong, lease orphan flip / fresh-keep / self-heal / broadcast-once, session/heartbeat feed tolerance.
 - `ui/src/monitor/__tests__/` — vitest: surface fold contract, RunFold gap/repair, snapshot builder, timeline modes + range selection, layout grouping, search index, provenance.

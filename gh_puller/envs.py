@@ -70,6 +70,10 @@ AGENT_MONITOR_DIR = os.path.expanduser(os.environ.get("AGENT_MONITOR_DIR", "~/.g
 # 默认 = 内部 agent-monitor hub(apps/agent-monitor,AGENT_MONITOR_PORT 联动)
 AGENT_MONITOR_WEBUI_URL = os.environ.get("AGENT_MONITOR_WEBUI_URL", "ws://localhost:8765/ws")
 AGENT_MONITOR_PORT = int(os.environ.get("AGENT_MONITOR_PORT", "8765"))
+# 会话心跳:静默超时(无落盘事件)的补发间隔;hub 租约按"文件 mtime 静止 > LEASE"判孤儿。
+# LEASE 需 ≥ 3~5×HEARTBEAT(否则活动会话会被误判;HEARTBEAT=0 可退化为纯事件 mtime 语义)。
+AGENT_MONITOR_HEARTBEAT_SECS = int(os.environ.get("AGENT_MONITOR_HEARTBEAT_SECS", "30"))
+AGENT_MONITOR_LEASE_SECS = int(os.environ.get("AGENT_MONITOR_LEASE_SECS", "150"))
 # 启用条件:端点可达(ensure_bus 构建时 TCP 探活)+ opentelemetry 可导入
 AGENT_MONITOR_PHOENIX_URL = os.environ.get("AGENT_MONITOR_PHOENIX_URL", "http://localhost:6006/")
 # OTel 导出 service.name(缺省 gh-puller;OtelSink 构建读用)

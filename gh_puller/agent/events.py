@@ -18,7 +18,10 @@ seq 序列是流式事件流的稠密序号;文件侧(非流式投影)按行跳�
 - config/init(ignorable 日志型)= **构造期初始配置快照**,在 session/start 之前打印
   (对应 self._client 的初始配置;api_key/token/base_url 等凭证与端点面剥离,不入流);
 - context/modify 是上下文修改的解释事件(日志型,不折动),折叠正确性与它无关 ——
-  丢弃也只是少了解释,不会误解消息历史。
+  丢弃也只是少了解释,不会误解消息历史;
+- session/heartbeat(ignorable 日志型)= 运行期静默补发:进程仍活但连续超过
+  AGENT_MONITOR_HEARTBEAT_SECS 无落盘事件时,每条间隔补发一条 —— 让文件 mtime 保持
+  前进,监测端(agent-monitor hub)借"无终态行且 mtime 静止超租约"判定会话已死。
 
 折叠恢复规范(与 ui/src/monitor/surface.ts 同份语义,本模块不落 Python 实现,
 契约测试见 tests/test_event_taxonomy.py):
@@ -47,6 +50,7 @@ TAXONOMY = frozenset(
     {
         "session/start",
         "session/end",
+        "session/heartbeat",  # 静默补发(见 docstring):非流式落盘,进 NON_STREAM_TYPES
         "turn/start",
         "turn/end",
         "step/start",
@@ -73,7 +77,7 @@ NON_STREAM_TYPES = TAXONOMY - {"assistant/chunk"}
 
 # ignorable 日志型事件:读者可安全跳过(不影响消息派生/请求重建);缺失 ignorable
 # 标记的未知类型 → 必须可解析(读者应报错,防静默丢消息)
-LOG_TYPES = frozenset({"config/init", "context/modify"})
+LOG_TYPES = frozenset({"config/init", "context/modify", "session/heartbeat"})
 
 
 def type_of(evt: dict) -> str:
@@ -184,6 +188,7 @@ class EventRecorder:
         self.step = 1  # 一次 LLM 请求 = 一个 step;工具结果后的新请求 +1
         self.text_chars = 0
         self.t0 = time.monotonic()  # run 起点(与 start() 方法分名)
+        self.last_file_ts = time.time()  # 最后一条落盘(非 chunk)事件 ts;心跳静默判定锚点
         self.tool_names: dict[str, str] = {}  # tool_use_id → 工具名(tool/result 归一化用)
         self._tool_pending = False  # 本轮工具结果已发 → 下个 assistant 消息段开新 step
         self._active_tool_use: dict[int, str] = {}  # 块 index → tool_use_id
@@ -213,6 +218,8 @@ class EventRecorder:
         evt["session"] = self.session  # 身份仅 session;元数据快照见 session/start
         evt["seq"] = self.seq
         self.seq += 1
+        if evt_type != "assistant/chunk":
+            self.last_file_ts = evt["ts"]  # 非流式事件 = 文件动静(chunk 不进盘,不参与静默判定)
         bus.publish(evt)
         return evt
 

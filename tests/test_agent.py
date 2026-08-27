@@ -21,7 +21,7 @@ from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from opentelemetry.trace import StatusCode
 
-from gh_puller import agent
+from gh_puller import agent, envs
 from gh_puller.agent import EventBus, FileSink, new_event, sinks
 from gh_puller.agent.generators import (
     _handle_assistant_message,
@@ -36,7 +36,7 @@ from gh_puller.agent.sinks import OtelSink
 @pytest_asyncio.fixture(autouse=True)
 async def _monitor_cleanup():
     yield
-    agent.configure(file=False, ws_urls=[], otel_urls=[])  # 停用并取消 sink worker 任务
+    agent.configure(ws_urls=[], otel_urls=[])  # 停用并取消 sink worker 任务
     await asyncio.sleep(0.01)  # 轮转一拍,让被取消的 worker 退场
 
 
@@ -95,12 +95,13 @@ async def test_bus_drop_oldest_when_full():
 
 
 def test_configure_disabled_short_circuits():
-    """file/ws 全关:bus 无 sink,事件不构造(无 uuid/json 开销)、目录不建。"""
-    agent.configure(file=False, ws_urls=[], otel_urls=[])
+    """ws/otel 全关后:bus 惰性重建 —— 未 ensure_bus 前事件零开销短路
+    (无 uuid/json 开销)、sessions 目录不建(文件 sink 恒在,总线未建不启动)。"""
+    agent.configure(ws_urls=[], otel_urls=[])
     run = EventRecorder("s1", label="t")
     run.event("session/start", run_id=None, label="t", model="")
     bus = sinks._bus
-    assert bus is None  # 新语义:无任何通道时不建总线(事件零开销短路)
+    assert bus is None  # 新语义:配置即关旧总线,未 ensure_bus 则无总线(事件零开销短路)
 
 
 # ---------------------------------------------------------------------------
@@ -188,7 +189,7 @@ async def test_file_sink_crash_residue_stays_flat(tmp_path):
 async def test_stream_adapter_normalizes_events():
     """流事件 → 事件溯源:chunk 原始增量(含 thinking/tool_input)、tool/call 原始
     arguments 字符串、tool/result 全量、工具结果后 message_start → step 边界。"""
-    agent.configure(file=False, ws_urls=[], otel_urls=[])
+    agent.configure(ws_urls=[], otel_urls=[])
     got = []
     bus = sinks.ensure_bus()
     bus.add(_recv(got))
@@ -254,7 +255,7 @@ async def test_stream_adapter_normalizes_events():
 async def test_assistant_message_monitors_but_never_duplicates():
     """整块消息:未产出增量时事件化一次(文本 chunk + 全量消息);已产出增量时
     只记元信息;无流事件的 tool_use 兜底补合成 tool/call。"""
-    agent.configure(file=False, ws_urls=[], otel_urls=[])
+    agent.configure(ws_urls=[], otel_urls=[])
     got = []
     bus = sinks.ensure_bus()
     bus.add(_recv(got))
@@ -429,7 +430,7 @@ async def _fold(chunks):
 async def test_cc_stream_exact_output_no_duplicates(monkeypatch, tmp_path):
     """禁用监控 + 假 SDK:产出逐字节一致(content 增量优先,AssistantMessage 不重复兜底),
     monitor 目录不建(零副作用)。"""
-    agent.configure(file=False, file_dir=str(tmp_path), ws_urls=[], otel_urls=[])
+    agent.configure(file_dir=str(tmp_path), ws_urls=[], otel_urls=[])
     sdk = _fake_sdk([
         _FakeStreamEvent({"type": "content_block_start", "index": 0, "content_block": {"type": "text"}}),
         _FakeStreamEvent({"type": "content_block_delta", "index": 0,
@@ -448,7 +449,7 @@ async def test_cc_stream_exact_output_no_duplicates(monkeypatch, tmp_path):
 @pytest.mark.asyncio
 async def test_cc_stream_captures_event_sequence(monkeypatch):
     """监控开启 + 假 SDK:全事件序列(含全量 prompt user/message、partial header)可折叠。"""
-    agent.configure(file=False, ws_urls=[], otel_urls=[])
+    agent.configure(ws_urls=[], otel_urls=[])
     got = []
     sinks.ensure_bus().add(_recv(got))
     sdk = _fake_sdk([
@@ -477,7 +478,7 @@ async def test_cc_stream_partial_markers_rebuild_and_boundary(monkeypatch):
     """partial 模式(真机 CLI 形状):AssistantMessage=空内容标记 → 缓冲重建全量;
     工具结果经 UserMessage(tool_result 块)合成 tool/result + 置 _tool_pending
     → 下条 assistant 消息(message_start)开 step 边界(修复前两者皆无)。"""
-    agent.configure(file=False, ws_urls=[], otel_urls=[])
+    agent.configure(ws_urls=[], otel_urls=[])
     got = []
     sinks.ensure_bus().add(_recv(got))
     sdk = _fake_sdk([
@@ -530,7 +531,7 @@ async def test_cc_stream_partial_markers_rebuild_and_boundary(monkeypatch):
 @pytest.mark.asyncio
 async def test_cc_text_fallback_without_partials(monkeypatch, tmp_path):
     """无 partial 事件:AssistantMessage 整块兜底一次,输出与原漏斗一致。"""
-    agent.configure(file=False, file_dir=str(tmp_path), ws_urls=[], otel_urls=[])
+    agent.configure(file_dir=str(tmp_path), ws_urls=[], otel_urls=[])
     sdk = _fake_sdk([
         _FakeAssistantMessage(content=[types.SimpleNamespace(type="text", text="hi好world")]),
         _FakeResultMessage(result="hi好world"),
@@ -543,7 +544,7 @@ async def test_cc_text_fallback_without_partials(monkeypatch, tmp_path):
 @pytest.mark.asyncio
 async def test_cc_stream_error_semantics(monkeypatch, tmp_path):
     """is_error 的 ResultMessage → RuntimeError"agent 执行失败: ..."(与旧漏斗同一文案)。"""
-    agent.configure(file=False, file_dir=str(tmp_path), ws_urls=[], otel_urls=[])
+    agent.configure(file_dir=str(tmp_path), ws_urls=[], otel_urls=[])
     sdk = _fake_sdk([_FakeResultMessage(result="", is_error=True, errors=["boom"])])
     monkeypatch.setitem(sys.modules, "claude_agent_sdk", sdk)
     with pytest.raises(agent.RequestFailedError, match="boom"):
@@ -652,7 +653,7 @@ def _fake_dsh(monkeypatch, notifs, *, finish_reason="completed", final_response=
 @pytest.mark.asyncio
 async def test_dsh_stream_yields_and_projects_taxonomy(monkeypatch):
     """dsh 流 → 文本增量逐字节一致 + 全事件投影(seq 稠密/usage 归一化/step 追踪)。"""
-    agent.configure(file=False, ws_urls=[], otel_urls=[])
+    agent.configure(ws_urls=[], otel_urls=[])
     got = []
     sinks.ensure_bus().add(_recv(got))
     sid = "0460e1e9-5155-4014-9054-a39986462b20"
@@ -770,7 +771,7 @@ async def test_dsh_stream_yields_and_projects_taxonomy(monkeypatch):
 @pytest.mark.asyncio
 async def test_dsh_stream_source_seqs_mapped(monkeypatch):
     """跳过的插件事件使 dsh seq 稀疏:sourceSeqs 映射为 gh seq 而非裸 dsh seq。"""
-    agent.configure(file=False, ws_urls=[], otel_urls=[])
+    agent.configure(ws_urls=[], otel_urls=[])
     got = []
     sinks.ensure_bus().add(_recv(got))
     sid = "sparse"
@@ -807,7 +808,7 @@ async def test_dsh_stream_source_seqs_mapped(monkeypatch):
 @pytest.mark.asyncio
 async def test_dsh_stream_skips_non_taxonomy_events(monkeypatch):
     """插件/生命周期事件不投影不报错;异 sessionId 的子代理通知丢弃。"""
-    agent.configure(file=False, ws_urls=[], otel_urls=[])
+    agent.configure(ws_urls=[], otel_urls=[])
     got = []
     sinks.ensure_bus().add(_recv(got))
     sid = "skips"
@@ -844,7 +845,7 @@ async def test_dsh_stream_skips_non_taxonomy_events(monkeypatch):
 @pytest.mark.asyncio
 async def test_dsh_stream_tool_result_reshaped(monkeypatch):
     """tool/result:卡片改名(文本块拼接全量)、data.error 透传、name 来自块端工具名。"""
-    agent.configure(file=False, ws_urls=[], otel_urls=[])
+    agent.configure(ws_urls=[], otel_urls=[])
     got = []
     sinks.ensure_bus().add(_recv(got))
     sid = "toolr"
@@ -884,7 +885,7 @@ async def test_dsh_stream_tool_result_reshaped(monkeypatch):
 @pytest.mark.asyncio
 async def test_dsh_stream_reasoning_delta_is_thinking_chunk(monkeypatch):
     """reasoning-delta:不产出文本,只发 thinking chunk(与 cc 漏斗一致)。"""
-    agent.configure(file=False, ws_urls=[], otel_urls=[])
+    agent.configure(ws_urls=[], otel_urls=[])
     got = []
     sinks.ensure_bus().add(_recv(got))
     sid = "think"
@@ -915,7 +916,7 @@ async def test_dsh_stream_reasoning_delta_is_thinking_chunk(monkeypatch):
 @pytest.mark.asyncio
 async def test_dsh_stream_non_completed_reason_raises(monkeypatch):
     """finish_reason 非 completed → RuntimeError(cc 同文案);turn/end 恰一条(不双发)。"""
-    agent.configure(file=False, ws_urls=[], otel_urls=[])
+    agent.configure(ws_urls=[], otel_urls=[])
     got = []
     sinks.ensure_bus().add(_recv(got))
     sid = "maxt"
@@ -946,7 +947,7 @@ async def test_dsh_stream_non_completed_reason_raises(monkeypatch):
 @pytest.mark.asyncio
 async def test_dsh_stream_sdk_protocol_error_stage_parse(monkeypatch):
     """SDK 协议错误:原样重抛、error 事件 stage=parse;无 dsh turn/end → 合成终局。"""
-    agent.configure(file=False, ws_urls=[], otel_urls=[])
+    agent.configure(ws_urls=[], otel_urls=[])
     got = []
     sinks.ensure_bus().add(_recv(got))
     sid = "proto"
@@ -968,7 +969,7 @@ async def test_dsh_stream_sdk_protocol_error_stage_parse(monkeypatch):
 @pytest.mark.asyncio
 async def test_dsh_result_empty_final_response_raises(monkeypatch):
     """completed 但无最终文本 → dsh_result RuntimeError(cc_result 同文案)。"""
-    agent.configure(file=False, ws_urls=[], otel_urls=[])
+    agent.configure(ws_urls=[], otel_urls=[])
     sid = "empty"
     notes = [
         _dsh_note("turn/start", seq=0, session_id=sid, data={"turn": 1}),
@@ -987,7 +988,7 @@ async def test_dsh_result_empty_final_response_raises(monkeypatch):
 @pytest.mark.asyncio
 async def test_dsh_harness_fields_and_session_id(monkeypatch):
     """options → DeepSeekHarness kwargs(None 跳过 → SDK 缺省);gh session → dsh id 取尾段。"""
-    agent.configure(file=False, ws_urls=[], otel_urls=[])
+    agent.configure(ws_urls=[], otel_urls=[])
     sid = "0460e1e9-5155-4014-9054-a39986462b20"
     notes = [
         _dsh_note("turn/start", seq=0, session_id=sid, data={"turn": 1}),
@@ -1014,7 +1015,7 @@ async def test_dsh_harness_fields_and_session_id(monkeypatch):
 @pytest.mark.asyncio
 async def test_run_epilogue_and_prologue_preserve_cc_defaults():
     """回归:start/finish 缺省行为(合成 turn/step 生命周期)零变化;双 False 只留封套端点。"""
-    agent.configure(file=False, ws_urls=[], otel_urls=[])
+    agent.configure(ws_urls=[], otel_urls=[])
     got = []
     sinks.ensure_bus().add(_recv(got))
     run = EventRecorder("s1", label="t")
@@ -1041,7 +1042,7 @@ def test_normalize_usage_accepts_camel_case():
 @pytest.mark.asyncio
 async def test_dsh_stream_user_message_fallback(monkeypatch):
     """流缺 user/message:首个 assistant 事件前合成 prompt 消息(可折叠、不预发重复)。"""
-    agent.configure(file=False, ws_urls=[], otel_urls=[])
+    agent.configure(ws_urls=[], otel_urls=[])
     got = []
     sinks.ensure_bus().add(_recv(got))
     sid = "nouser"
@@ -1217,10 +1218,14 @@ async def test_otel_usage_attrs_skip_none():
     assert root.attributes["gh_puller.stop_reason"] == "end_turn"
 
 
-def test_otel_off_by_default():
-    """otel_urls / ws_urls 空:与 file 全关一致,bus 无 sink(零构造开销)。"""
-    agent.configure(file=False, ws_urls=[], otel_urls=[])
-    assert sinks.ensure_bus().enabled is False
+@pytest.mark.asyncio
+async def test_otel_off_by_default():
+    """otel_urls / ws_urls 空:总线恒挂文件 sink(恒开约定)→ enabled;默认无 ws/otel。"""
+    agent.configure(ws_urls=[], otel_urls=[])
+    bus = sinks.ensure_bus()
+    assert bus.enabled is True  # 文件 sink 恒在
+    assert len(bus._sinks) == 1  # 仅文件 sink(ws/otel 空,无额外注册)
+    bus.shutdown()
 
 
 @pytest.mark.asyncio
@@ -1295,19 +1300,21 @@ async def test_ensure_bus_multi_ws_sinks(monkeypatch):
     patch = _rec_sink(urls)
     patch(monkeypatch, "WsSink")
     monkeypatch.setattr("gh_puller.agent.sinks._url_reachable", lambda url: True)
-    agent.configure(file=False, ws_urls="ws://a/ws, ws://b/ws", otel_urls=[])
+    agent.configure(ws_urls="ws://a/ws, ws://b/ws", otel_urls=[])
     assert sinks.ensure_bus().enabled is True
     assert urls == ["ws://a/ws", "ws://b/ws"]
 
 
 @pytest.mark.asyncio
 async def test_ensure_bus_skips_unreachable_otel(monkeypatch):
-    """端点不可达:不注册该 OTel 实例(仅一条日志);与空列表同效(bus 空)。"""
+    """端点不可达:不注册该 OTel 实例(仅一条日志);总线只剩恒在的文件 sink。"""
     logged = []
     monkeypatch.setattr("gh_puller.agent.sinks._url_reachable", lambda url: False)
     monkeypatch.setattr("gh_puller.agent.sinks._log", logged.append)
-    agent.configure(file=False, ws_urls=[], otel_urls="http://localhost:6006/")
-    assert sinks.ensure_bus().enabled is False
+    agent.configure(ws_urls=[], otel_urls="http://localhost:6006/")
+    bus = sinks.ensure_bus()
+    assert bus.enabled is True  # 文件 sink 恒在(系统约定)
+    assert len(bus._sinks) == 1  # 仅文件 sink:不可达 OTel 未注册
     assert any("端口不可达" in m for m in logged)
 
 
@@ -1322,8 +1329,10 @@ async def test_ensure_bus_otel_missing_dependency(monkeypatch):
     monkeypatch.setattr("gh_puller.agent.sinks._url_reachable", lambda url: True)
     monkeypatch.setattr("gh_puller.agent.sinks.OtelSink", _boom)
     monkeypatch.setattr("gh_puller.agent.sinks._log", logged.append)
-    agent.configure(file=False, ws_urls=[], otel_urls="http://localhost:6006/")
-    assert sinks.ensure_bus().enabled is False
+    agent.configure(ws_urls=[], otel_urls="http://localhost:6006/")
+    bus = sinks.ensure_bus()
+    assert bus.enabled is True  # 文件 sink 恒在
+    assert len(bus._sinks) == 1  # 仅文件 sink:缺依赖 OTel 未注册
     assert any("缺依赖" in m for m in logged)
 
 
@@ -1335,7 +1344,7 @@ async def test_ensure_bus_one_otel_sink_per_url(monkeypatch):
     patch(monkeypatch, "OtelSink")
     monkeypatch.setattr("gh_puller.agent.sinks._url_reachable", lambda url: True)
     monkeypatch.setattr("gh_puller.agent.sinks._log", lambda msg: None)
-    agent.configure(file=False, ws_urls=[], otel_urls="http://p1:6006/,http://p2:6006/v1/traces")
+    agent.configure(ws_urls=[], otel_urls="http://p1:6006/,http://p2:6006/v1/traces")
     assert sinks.ensure_bus().enabled is True
     assert urls == ["http://p1:6006/v1/traces", "http://p2:6006/v1/traces"]
 
@@ -1360,7 +1369,7 @@ async def test_configure_none_reseeds_env_constant(monkeypatch):
     monkeypatch.setattr("gh_puller.agent.sinks._url_reachable", lambda url: True)
     monkeypatch.setattr("gh_puller.agent.sinks._log", lambda msg: None)
     monkeypatch.setattr(sinks.envs, "AGENT_MONITOR_PHOENIX_URL", "http://envp:6006/")
-    agent.configure(file=False, ws_urls=[], otel_urls=None)  # None → 重读 envs 常量
+    agent.configure(ws_urls=[], otel_urls=None)  # None → 重读 envs 常量
     assert sinks.ensure_bus().enabled is True
     assert otel_urls == ["http://envp:6006/v1/traces"]
     # ws 半:AGENT_MONITOR_WEBUI_URL
@@ -1368,7 +1377,7 @@ async def test_configure_none_reseeds_env_constant(monkeypatch):
     patch = _rec_sink(ws_urls)
     patch(monkeypatch, "WsSink")
     monkeypatch.setattr(sinks.envs, "AGENT_MONITOR_WEBUI_URL", "ws://env/ws")
-    agent.configure(file=False, ws_urls=None, otel_urls=[])
+    agent.configure(ws_urls=None, otel_urls=[])
     assert sinks.ensure_bus().enabled is True
     assert ws_urls == ["ws://env/ws"]
 
@@ -1523,7 +1532,7 @@ def _codex_user_home(tmp_path, *, with_auth=False):
 @pytest.mark.asyncio
 async def test_codex_stream_text_deltas_deduped(monkeypatch, tmp_path):
     """文本增量优先、assistant/message 全量 + phase;delta 与 completed 恰一次(不双发)。"""
-    agent.configure(file=False, ws_urls=[], otel_urls=[])
+    agent.configure(ws_urls=[], otel_urls=[])
     got = []
     sinks.ensure_bus().add(_recv(got))
     _fake_codex(monkeypatch, [
@@ -1549,7 +1558,7 @@ async def test_codex_stream_text_deltas_deduped(monkeypatch, tmp_path):
 @pytest.mark.asyncio
 async def test_codex_stream_event_sequence(monkeypatch, tmp_path):
     """全 TAXONOMY 事件序列:session/turn/step 合成,partial header,终局 completed。"""
-    agent.configure(file=False, ws_urls=[], otel_urls=[])
+    agent.configure(ws_urls=[], otel_urls=[])
     got = []
     sinks.ensure_bus().add(_recv(got))
     _fake_codex(monkeypatch, [
@@ -1581,7 +1590,7 @@ async def test_codex_stream_event_sequence(monkeypatch, tmp_path):
 @pytest.mark.asyncio
 async def test_codex_stream_thinking_and_plan_chunks(monkeypatch, tmp_path):
     """reasoning 增量 → thinking chunk(不产出文本);reasoning/plan completed 无重复双投。"""
-    agent.configure(file=False, ws_urls=[], otel_urls=[])
+    agent.configure(ws_urls=[], otel_urls=[])
     got = []
     sinks.ensure_bus().add(_recv(got))
     _fake_codex(monkeypatch, [
@@ -1616,7 +1625,7 @@ async def test_codex_stream_summary_and_plan_deltas(monkeypatch, tmp_path):
     plan chunk,completed 兜底经 st.plan_items 防双投;有 summary 无 content 的 reasoning
     completed(无增量流)→ summary 兜底。
     """
-    agent.configure(file=False, ws_urls=[], otel_urls=[])
+    agent.configure(ws_urls=[], otel_urls=[])
     got = []
     sinks.ensure_bus().add(_recv(got))
     _fake_codex(monkeypatch, [
@@ -1654,7 +1663,7 @@ async def test_codex_stream_summary_and_plan_deltas(monkeypatch, tmp_path):
 @pytest.mark.asyncio
 async def test_codex_stream_tool_round_single_step_boundary(monkeypatch, tmp_path):
     """并行两个 mcp 工具:各 1 组 tool/call|result;随后下一 LLM item 恰开一次 step 边界。"""
-    agent.configure(file=False, ws_urls=[], otel_urls=[])
+    agent.configure(ws_urls=[], otel_urls=[])
     got = []
     sinks.ensure_bus().add(_recv(got))
     _fake_codex(monkeypatch, [
@@ -1706,7 +1715,7 @@ async def test_codex_stream_web_search_tool(monkeypatch, tmp_path):
     修复前该 item 被静默跳过(真机实测零工具事件、全程 step=1);started 是空壳
     占位(无 query)→ 不产事件;结果 content = results 原样 JSON(黑盒不透字段)。
     """
-    agent.configure(file=False, ws_urls=[], otel_urls=[])
+    agent.configure(ws_urls=[], otel_urls=[])
     got = []
     sinks.ensure_bus().add(_recv(got))
     _fake_codex(monkeypatch, [
@@ -1747,7 +1756,7 @@ async def test_codex_stream_web_search_tool(monkeypatch, tmp_path):
 @pytest.mark.asyncio
 async def test_codex_stream_command_execution_failed_is_error(monkeypatch, tmp_path):
     """commandExecution:归 shell 工具;exit_code≠0 → tool/result is_error + 文本聚合。"""
-    agent.configure(file=False, ws_urls=[], otel_urls=[])
+    agent.configure(ws_urls=[], otel_urls=[])
     got = []
     sinks.ensure_bus().add(_recv(got))
     _fake_codex(monkeypatch, [
@@ -1774,7 +1783,7 @@ async def test_codex_stream_command_execution_failed_is_error(monkeypatch, tmp_p
 @pytest.mark.asyncio
 async def test_codex_stream_failed_turn_raises(monkeypatch, tmp_path):
     """turn status=failed → RuntimeError("agent 执行失败: ..."),error stage=run,abort 终局。"""
-    agent.configure(file=False, ws_urls=[], otel_urls=[])
+    agent.configure(ws_urls=[], otel_urls=[])
     got = []
     sinks.ensure_bus().add(_recv(got))
     _fake_codex(monkeypatch, [
@@ -1795,7 +1804,7 @@ async def test_codex_stream_failed_turn_raises(monkeypatch, tmp_path):
 @pytest.mark.asyncio
 async def test_codex_stream_missing_completed_raises(monkeypatch, tmp_path):
     """流自然终止而未见 turn/completed → RuntimeError(传输中断兜底)。"""
-    agent.configure(file=False, ws_urls=[], otel_urls=[])
+    agent.configure(ws_urls=[], otel_urls=[])
     _fake_codex(monkeypatch, [
         _codex_nt("turn/started", turn=_codex_it(id="t1")),
     ], user_home=_codex_user_home(tmp_path))
@@ -1806,7 +1815,7 @@ async def test_codex_stream_missing_completed_raises(monkeypatch, tmp_path):
 @pytest.mark.asyncio
 async def test_codex_stream_sdk_error_stage_parse(monkeypatch, tmp_path):
     """SDK JSON-RPC 协议错误:原样重抛、error 事件 stage=parse。"""
-    agent.configure(file=False, ws_urls=[], otel_urls=[])
+    agent.configure(ws_urls=[], otel_urls=[])
     got = []
     sinks.ensure_bus().add(_recv(got))
     _fake_codex(monkeypatch, [], thread_raise=_CodexJsonRpcError("boom"),
@@ -1823,7 +1832,7 @@ async def test_codex_stream_sdk_error_stage_parse(monkeypatch, tmp_path):
 async def test_codex_stream_config_isolation_and_auth(monkeypatch, tmp_path):
     """config 装配:CODEX_HOME 进 env(cwd/codex_bin/overrides/launch 透传)、token →
     login_api_key、sandbox/approval 字符串 → SDK 枚举、系统提示 → base_instructions。"""
-    agent.configure(file=False, ws_urls=[], otel_urls=[])
+    agent.configure(ws_urls=[], otel_urls=[])
     _fake_codex(monkeypatch, [
         _codex_nt("turn/started", turn=_codex_it(id="t1")),
         _codex_nt("turn/completed", turn=_codex_it(id="t1", status="completed", error=None)),
@@ -1867,7 +1876,7 @@ def test_codex_turn_summary_default_and_override():
 @pytest.mark.asyncio
 async def test_codex_stream_consumer_close_closes_codex(monkeypatch, tmp_path):
     """消费者提前退场:async with 语义回收 AsyncCodex(__aexit__ 计数);终局 aborted。"""
-    agent.configure(file=False, ws_urls=[], otel_urls=[])
+    agent.configure(ws_urls=[], otel_urls=[])
     _fake_codex(monkeypatch, [
         _codex_nt("turn/started", turn=_codex_it(id="t1")),
         _codex_nt("item/started", item=_codex_it(type="agentMessage", id="m1")),
@@ -1889,7 +1898,7 @@ async def test_codex_result_empty_final_response_raises(monkeypatch, tmp_path):
     result 与 stream 同构消费通知流(_codex_drain):turn/completed 后无
     agentMessage 即无终局文本(st.final_response 空)。
     """
-    agent.configure(file=False, ws_urls=[], otel_urls=[])
+    agent.configure(ws_urls=[], otel_urls=[])
     _fake_codex(monkeypatch, [
         _codex_nt("turn/started", turn=_codex_it(id="t1")),
         _codex_nt("turn/completed", turn=_codex_it(id="t1", status="completed", error=None)),
@@ -2006,7 +2015,7 @@ async def test_llm_result_drains_stream_events(monkeypatch):
     末块 usage/finish_reason 落入 session/end。"""
     from gh_puller.agent import generators as gen_mod
 
-    agent.configure(file=False, ws_urls=[], otel_urls=[])
+    agent.configure(ws_urls=[], otel_urls=[])
     got = []
     sinks.ensure_bus().add(_recv(got))
     _FakeLLMClient.post_body = {"choices": [{"message": {"role": "assistant",
@@ -2032,3 +2041,104 @@ async def test_llm_result_drains_stream_events(monkeypatch):
     assert end["data"]["usage"] == {"input_tokens": 2, "output_tokens": 1,
                                     "cache_read_input_tokens": 0}
     assert end["data"]["stop_reason"] == "stop"
+
+
+# ---------------------------------------------------------------------------
+# 心跳(静默补发):_guard 内启停,活动期零行、静默期每条间隔补发;session/end 恒为末行
+# ---------------------------------------------------------------------------
+
+
+async def _slow_stream(self):
+    """每批通知后停 50ms(制造 > interval 的静默缺口)。"""
+    for n in type(self).notifs:
+        yield n
+        await asyncio.sleep(0.05)
+
+
+async def _busy_stream(self):
+    """通知以 1ms 节奏流动(远小于 interval:活动期)。"""
+    for n in type(self).notifs:
+        yield n
+        await asyncio.sleep(0.001)
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_fills_quiet_gap(monkeypatch, tmp_path):
+    """静默补发:interval 0.01s + 事件间 50ms 静默 → 心跳周期性出现,seq 稠密,
+    session/end 恒为末条;run 结束后心跳任务已取消,不再发布(无泄漏)。"""
+    monkeypatch.setattr(envs, "AGENT_MONITOR_HEARTBEAT_SECS", 0.01)
+    agent.configure(ws_urls=[], otel_urls=[])
+    got = []
+    sinks.ensure_bus().add(_recv(got))
+    monkeypatch.setattr(_FakeTurnHandle, "stream", _slow_stream)
+    _fake_codex(monkeypatch, [
+        _codex_nt("turn/started", turn=_codex_it(id="t1")),
+        _codex_nt("item/started", item=_codex_it(type="agentMessage", id="m1")),
+        _codex_nt("item/agentMessage/delta", delta="hi", item_id="m1"),
+        _codex_nt("item/completed",
+                  item=_codex_it(type="agentMessage", id="m1", text="hi", phase=None)),
+        _codex_nt("turn/completed", turn=_codex_it(id="t1", status="completed", error=None)),
+    ], user_home=_codex_user_home(tmp_path))
+    await _fold(agent.Codex(_codex_options(codex_home=str(tmp_path))).stream("prompt",
+                                                                             session_name="x"))
+    await asyncio.sleep(0.05)
+    assert any(g["type"] == "session/heartbeat" for g in got)
+    assert [g["type"] for g in got][-2:] == ["turn/end", "session/end"]  # cancel 先于 finish
+    assert [g["seq"] for g in got] == list(range(len(got)))  # 流内 seq 稠密(心跳同序)
+    n = len(got)
+    await asyncio.sleep(0.08)  # 数拍后:心跳任务已取消,不再发布
+    assert len(got) == n
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_absent_while_busy(monkeypatch, tmp_path):
+    """活动期零心跳:事件间隙(1ms)≪ interval(10ms) → 无 session/heartbeat 行(防 spam)。"""
+    monkeypatch.setattr(envs, "AGENT_MONITOR_HEARTBEAT_SECS", 0.01)
+    agent.configure(ws_urls=[], otel_urls=[])
+    got = []
+    sinks.ensure_bus().add(_recv(got))
+    monkeypatch.setattr(_FakeTurnHandle, "stream", _busy_stream)
+    _fake_codex(monkeypatch, [
+        _codex_nt("turn/started", turn=_codex_it(id="t1")),
+        _codex_nt("item/started", item=_codex_it(type="agentMessage", id="m1")),
+        _codex_nt("item/agentMessage/delta", delta="hi", item_id="m1"),
+        _codex_nt("item/completed",
+                  item=_codex_it(type="agentMessage", id="m1", text="hi", phase=None)),
+        _codex_nt("turn/completed", turn=_codex_it(id="t1", status="completed", error=None)),
+    ], user_home=_codex_user_home(tmp_path))
+    await _fold(agent.Codex(_codex_options(codex_home=str(tmp_path))).stream("prompt",
+                                                                             session_name="x"))
+    await asyncio.sleep(0.05)
+    assert "session/heartbeat" not in [g["type"] for g in got]
+    assert got[-1]["type"] == "session/end"
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_stops_on_aborted_run(monkeypatch, tmp_path):
+    """异常路径(thread_start 抛):error + finish(False);心跳一并取消,末行 aborted,零泄漏。"""
+    monkeypatch.setattr(envs, "AGENT_MONITOR_HEARTBEAT_SECS", 0.01)
+    agent.configure(ws_urls=[], otel_urls=[])
+    got = []
+    sinks.ensure_bus().add(_recv(got))
+    _fake_codex(monkeypatch, [], thread_raise=RuntimeError("boom"),
+                user_home=_codex_user_home(tmp_path))
+    with pytest.raises(RuntimeError, match="boom"):
+        await _fold(agent.Codex(_codex_options(codex_home=str(tmp_path))).stream("q",
+                                                                                 session_name="x"))
+    await asyncio.sleep(0.05)
+    assert got[-1]["type"] == "session/end" and got[-1]["data"]["state"] == "aborted"
+    n = len(got)
+    await asyncio.sleep(0.08)
+    assert len(got) == n
+
+
+@pytest.mark.asyncio
+async def test_file_sink_writes_heartbeat_row(tmp_path):
+    """session/heartbeat(非 stream 投影)→ 落盘;信封带 ignorable(LOG_TYPES 契约)。"""
+    sink = FileSink(str(tmp_path))
+    await sink.consume(_evt("session/start", session="s4", seq=0, run_id="r4",
+                            label="wiki:structure", provider="anthropic", model=""))
+    await sink.consume(_evt("session/heartbeat", session="s4", seq=1))
+    lines = [json.loads(line) for line in (tmp_path / "sessions" / "s4.jsonl").read_text().splitlines()]
+    assert [ln["type"] for ln in lines] == ["session/start", "session/heartbeat"]
+    assert lines[-1]["ignorable"] is True  # 读者按"可跳过"契约统一处理

@@ -65,7 +65,7 @@ pytestmark = pytest.mark.skipif(
 @pytest_asyncio.fixture(autouse=True)
 async def _monitor_cleanup():
     yield
-    agent.configure(file=False, ws_urls=[], otel_urls=[])  # 关闭文件 sink + 取消 worker
+    agent.configure(ws_urls=[], otel_urls=[])  # 撤 ws/otel + 取消 worker;文件落盘默认重定向(conftest tmp)
     await asyncio.sleep(0.01)
 
 
@@ -86,10 +86,11 @@ def _jsonl_consume(events: list[dict]):
 async def _capture(runner):
     """一次生成器运行的事件捕获:返回 (产出, 事件列表)。
 
-    configure(file=False, ...) 后 ensure_bus 是空 bus,显式 .add() 收集 sink 才
-    enabled —— recorder 的零开销短路(无 sink 直接不构造事件)不会误触发。
+    configure(...) 撤掉 ws/otel;ensure_bus 恒挂文件 sink(落 conftest tmp,
+    由文件侧验证另测),此处再显式 .add() 收集 sink —— recorder 的零开销短路
+    (无 bus 直接不构造事件)不会误触发。
     """
-    agent.configure(file=False, ws_urls=[], otel_urls=[])
+    agent.configure(ws_urls=[], otel_urls=[])
     events: list[dict] = []
     sinks.ensure_bus().add(_jsonl_consume(events))
     result = await runner()

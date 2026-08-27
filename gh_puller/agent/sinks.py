@@ -6,7 +6,7 @@
   膨胀;折叠恢复规范见 gh_puller.agent.events;取代 v1 的聚合行,旧格式不兼容,
   历史数据需手动清理);
 - Web/WS sink(AGENT_MONITOR_WEBUI_URL,默认 ws://localhost:8765/ws,逗号分隔多 hub):
-  事件流推送给独立 hub(apps/agent-dashboard/server/,WS 端点 /ws),浏览器实时查看;
+  事件流推送给独立 hub(apps/agent-monitor/server/,WS 端点 /ws),浏览器实时查看;
 - OTel sink(AGENT_MONITOR_PHOENIX_URL,默认 http://localhost:6006/):事件流 → span 树 →
   OTLP HTTP(Phoenix 等后端;实现见本文件 OtelSink)。默认值经 ensure_bus 底层的
   _url_reachable TCP 探活:端点可达且 opentelemetry 可导入才注册(置空关闭)。
@@ -61,9 +61,11 @@ class FileSink:
     字段查会话来源(<ns>/<uuid4>,ns 由上层业务定)。Linux 查询友好:
     tail -f sessions/*.jsonl 实时看;jq 过滤并按折叠规范
     (gh_puller.agent.events)还原任意时刻消息上下文。session/end 留作文件
-    脏终行;崩溃残留 = 无终态行的文件(= running,排查素材),hub seed 按
-    "有无 session/end" 判态并支持按需重判(见 hub.py)。无 session/start 起点
-    的事件不可分组,丢弃(同 v1 语义)。
+    脏终行;运行期静默补发的 session/heartbeat(ignorable)同样落盘 —— 文件
+    mtime 持续前进,hub 侧方可区分"活着但静默"与"进程已死"(无终态行且
+    mtime 静止超租约 → 孤儿 aborted,见 hub.py 租约扫描)。崩溃残留 = 无终态
+    行的文件(超租约前显示 running,是排查素材)。无 session/start 起点的
+    事件不可分组,丢弃(同 v1 语义)。
     """
 
     def __init__(self, root: str):
@@ -452,7 +454,8 @@ def _default_otel_urls() -> list[str]:
 
 
 _cfg = {
-    "file": True,  # 文件 sink 默认恒开(env 已无 AGENT_MONITOR_FILE;运行时 configure(file=...) 可关/重定向)
+    # 文件 sink 恒开(系统约定:监控真源恒在盘;AGENT_MONITOR_FILE env 与运行时
+    # configure(file=...) 开关均已移除,隔离/嵌入/测试只经 file_dir 重定向)
     "file_dir": envs.AGENT_MONITOR_DIR,
     "ws_urls": _split_urls(envs.AGENT_MONITOR_WEBUI_URL),
     "otel_urls": _default_otel_urls(),
@@ -460,16 +463,16 @@ _cfg = {
 _bus: EventBus | None = None
 
 
-def configure(*, file=None, file_dir=None, ws_urls=None, otel_urls=None) -> None:
+def configure(*, file_dir=None, ws_urls=None, otel_urls=None) -> None:
     """重配监控(测试/嵌入用);缺省取 envs 常量,生效于下一次事件发布。
 
     ws_urls / otel_urls:URL 列表或逗号分隔字符串;None → 重读对应 env 常量
     (otel 为 _OTEL_BACKENDS 全表);空 → 不部署该类 sink(每 URL 一个 sink 实例)。
-    file 运行时开关保留(默认 True):测试需停用/重定向文件观测,避免写真实 monitor 目录。
+    file_dir:文件 sink 落盘目录(恒开,不可关)——测试/嵌入重定向到 tmp 目录,
+    避免写真实 monitor 目录。
     关闭旧 bus(取消 sink 任务),新配置惰性重建 —— 幂等,可反复调用。
     """
     global _bus
-    _cfg["file"] = True if file is None else bool(file)
     _cfg["file_dir"] = envs.AGENT_MONITOR_DIR if file_dir is None else file_dir
     _cfg["ws_urls"] = _split_urls(envs.AGENT_MONITOR_WEBUI_URL if ws_urls is None else ws_urls)
     _cfg["otel_urls"] = _default_otel_urls() if otel_urls is None else _split_urls(otel_urls)
@@ -488,8 +491,7 @@ def ensure_bus() -> EventBus:
     global _bus
     if _bus is None:
         b = EventBus()
-        if _cfg["file"]:
-            b.add(FileSink(_cfg["file_dir"]).consume)
+        b.add(FileSink(_cfg["file_dir"]).consume)
         for url in _cfg["ws_urls"]:
             if not _url_reachable(url):
                 _log(f"ws sink 未启用: 端口不可达 {url}")
