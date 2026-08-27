@@ -284,7 +284,7 @@ class OtelSink:
 
     def _on_chunk(self, state: dict, evt: dict) -> None:
         c = evt["data"]["chunk"]
-        if c.get("type") == "text":
+        if c.get("type") == "content":
             state["buf"] += c.get("text") or ""
         elif c.get("type") == "thinking":
             state["thinking"] += c.get("text") or ""
@@ -337,17 +337,7 @@ class OtelSink:
     def _on_info(self, state: dict, evt: dict) -> None:
         t = evt.get("type")
         d = evt.get("data") or {}
-        if t == "request/header":
-            h = d.get("header") or {}
-            _attrs(state["root"], {
-                "gh_puller.request_reason": d.get("reason"),
-                "gh_puller.request_partial": d.get("partial"),
-                "gh_puller.system_chars": len(str(h.get("system") or "")),
-                "gh_puller.tool_count": len(h.get("tools") or []),
-            })
-        elif t == "context/inject":
-            state["context_chars"] += len(str(d.get("text") or ""))
-        elif t == "context/modify":
+        if t == "context/modify":
             state["modifies"].append(d.get("kind"))
         elif t == "turn/end":
             state["root"].set_attribute("gh_puller.turn_reason", d.get("reason"))

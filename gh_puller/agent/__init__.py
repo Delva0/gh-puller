@@ -1,19 +1,25 @@
 """agent 调用统一入口 + 流式监控(事件模型/适配器/观测通道按关注点拆分)。
 
 其他模块不再直接调用 ClaudeSDKClient / httpx,一律经本包函数(无感,对外语义不变)。
-架构:events.py(事件模型) ⊂ sinks.py(观测通道) ⊂ run.py(单次运行事件发布器) ⊂
-generators.py(BaseGenerator 基类 + ClaudeCode/OpenAI/Dsh/Codex 四个生成器 + 解析/统一分派):
-- cc_stream / cc_text / cc_result(adapters.py):Claude Code(SDK)调用。文本增量
-  StreamEvent `text_delta` 优先、AssistantMessage 兜底(仅在未产出任何增量时)、
-  ResultMessage.is_error → RuntimeError("agent 执行失败: ...") —— 与 deepwiki
-  原 `_agent_stream` 漏斗逐字节一致;thinking/工具增量只进监控事件流,不改变产出。
-- llm_complete / llm_stream(adapters.py):OpenAI 兼容端点(httpx);异常原样抛,重试留给调用方。
-- dsh_stream / dsh_text / dsh_result(adapters.py):DeepSeek Harness(SDK)调用。
-  dsh 原生事件 1:1 投影为监控事件流;非 completed 的 finish_reason →
-  RuntimeError("agent 执行失败: ...")(与 cc is_error 语义对齐)。
-- codex_stream / codex_text / codex_result(adapters.py):OpenAI Codex(SDK)调用。
-  codex 通知流合成 TAXONOMY(无 seq 编号 → cc 式合成);turn 非 completed →
-  RuntimeError("agent 执行失败: ...")(与 cc is_error 语义对齐)。
+架构:events.py(事件模型) ⊂ sinks.py(观测通道) ⊂ configs.py(generator config
+世界:TypedDict 契约/SDK 字段映射/header 投影/隔离组合装配) ⊂ generators.py
+(BaseGenerator 基类 + ClaudeCode/OpenAI/Dsh/Codex 四个生成器;API 契约见
+generators.py 模块 docstring —— stream 流式产出 assistant 文本增量,result 只拿
+最后一轮输出,无 text):
+- config 在生成器**构造时期**注入:`GENERATORS[gid](config)` 得到适配器实例,
+  stream/result 只收运行时参数(prompt/会话/run 元数据);键集白名单校验在
+  上层(各 Config TypedDict 即契约,见 configs.py)。
+- ClaudeCode(SDK):流式产出 assistant 文本增量(StreamEvent `text_delta` 优先、
+  AssistantMessage 兜底);is_error → RequestFailedError;thinking/工具增量只进
+  监控事件流,不改变产出。
+- OpenAI(httpx):OpenAI 兼容端点;complete/stream 收请求体 payload(异常原样抛,
+  重试留给调用方);result = complete 语义。
+- Dsh(DeepSeek Harness SDK):dsh 原生事件 1:1 投影为监控事件流;result =
+  RunResult.final_response;非 completed 的 finish_reason → RequestFailedError
+  (与 cc is_error 语义对齐)。
+- Codex(OpenAI Codex SDK):codex 通知流合成 TAXONOMY(无 seq 编号 → cc 式合成);
+  result = TurnResult.final_response;turn 非 completed → RequestFailedError
+  (与 cc is_error 语义对齐)。
 - configure / ensure_bus / EventBus / FileSink / WsSink(sinks.py):监控运行时重配、
   惰性构建总线与文件/WS 观测通道(AGENT_MONITOR_DIR / AGENT_MONITOR_WEBUI_URL,
   逗号分隔多地址,每地址一个 sink 实例;OtelSink 亦在 sinks.py,经
@@ -28,27 +34,11 @@ put_nowait 到每 sink 的 asyncio.Queue,永不阻塞调用)→ sink worker 消�
 须自行经 loop.call_soon_threadsafe 转发。
 """
 
-from .generators import (
-    GENERATORS,
-    RequestFailedError,
-    cc_result,
-    cc_stream,
-    cc_text,
-    codex_result,
-    codex_stream,
-    codex_text,
-    dsh_cordis_path,
-    dsh_result,
-    dsh_stream,
-    dsh_text,
-    generate_result,
-    generate_stream,
-    generate_text,
-    llm_complete,
-    llm_stream,
-    resolve_generator,
-)
+from .configs import (ClaudeConfig, CodexConfig, DshConfig, OpenAIConfig,
+                      codex_home_path, dsh_cordis_path)
 from .events import LOG_TYPES, SURFACE_TYPES, TAXONOMY, new_event, truncate, type_of
+from .generators import (GENERATORS, ClaudeCode, Codex, Dsh, OpenAI,
+                         RequestFailedError)
 from .sinks import EventBus, FileSink, WsSink, configure, ensure_bus
 
 __all__ = [
@@ -64,21 +54,15 @@ __all__ = [
     "configure",
     "ensure_bus",
     "GENERATORS",
-    "resolve_generator",
     "RequestFailedError",
-    "generate_stream",
-    "generate_text",
-    "generate_result",
-    "cc_stream",
-    "cc_text",
-    "cc_result",
-    "dsh_stream",
-    "dsh_text",
-    "dsh_result",
+    "ClaudeCode",
+    "OpenAI",
+    "Dsh",
+    "Codex",
+    "ClaudeConfig",
+    "DshConfig",
+    "CodexConfig",
+    "OpenAIConfig",
     "dsh_cordis_path",
-    "codex_stream",
-    "codex_text",
-    "codex_result",
-    "llm_complete",
-    "llm_stream",
+    "codex_home_path",
 ]

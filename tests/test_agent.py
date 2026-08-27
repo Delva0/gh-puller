@@ -97,8 +97,8 @@ async def test_bus_drop_oldest_when_full():
 def test_configure_disabled_short_circuits():
     """file/ws 全关:bus 无 sink,事件不构造(无 uuid/json 开销)、目录不建。"""
     agent.configure(file=False, ws_urls=[], otel_urls=[])
-    run = EventRecorder("s1", "anthropic", "", label="t")
-    run.event("session/start", run_id=None, label="t", provider="anthropic", model="")
+    run = EventRecorder("s1", label="t")
+    run.event("session/start", run_id=None, label="t", model="")
     bus = sinks._bus
     assert bus is None  # 新语义:无任何通道时不建总线(事件零开销短路)
 
@@ -111,7 +111,7 @@ def test_configure_disabled_short_circuits():
 def _evt(evt_type: str, session: str = "s1", seq: int = 0, **data) -> dict:
     """测试用具:built 信封事件(seq 显式,data 经 new_event 校验)。"""
     return {**new_event(evt_type, **data), "session": session, "label": "wiki:structure",
-            "provider": "anthropic", "model": "", "run_id": None, "seq": seq}
+            "seq": seq}
 
 
 @pytest.mark.asyncio
@@ -126,7 +126,7 @@ async def test_file_sink_flat_layout_nonstream_projection(tmp_path):
     assert flat.exists()
     # assistant/chunk 不落盘(非流式事件流投影):文件 seq 出现洞(0 → 2)
     await sink.consume(_evt("assistant/chunk", session="judge:llm/0460e1e9-5155-4014-9054-a39986462b20",
-                            seq=1, chunk={"type": "text", "index": 0, "text": "你好"}))
+                            seq=1, chunk={"type": "content", "index": 0, "text": "你好"}))
     await sink.consume(_evt("assistant/message", session="judge:llm/0460e1e9-5155-4014-9054-a39986462b20",
                             seq=2,
                             message={"role": "assistant", "content": [{"type": "text", "text": "你好"}]},
@@ -192,7 +192,7 @@ async def test_stream_adapter_normalizes_events():
     got = []
     bus = sinks.ensure_bus()
     bus.add(_recv(got))
-    run = EventRecorder("s1", "anthropic", "", label="t")
+    run = EventRecorder("s1", label="t")
     run.start()
     # 第 1 步:正文块 + 思考块
     _handle_stream_event(run, {"type": "content_block_start", "index": 0, "content_block": {"type": "text"}})
@@ -267,12 +267,12 @@ async def test_assistant_message_monitors_but_never_duplicates():
         stop_reason="end_turn",
         usage=types.SimpleNamespace(input_tokens=3, output_tokens=5, cache_read_input_tokens=1),
     )
-    run = EventRecorder("s1", "anthropic", "", label="t")
+    run = EventRecorder("s1", label="t")
     _handle_assistant_message(run, msg, already_yielded=False)
     assert run.text_chars == 2
     await asyncio.sleep(0.05)
     asst = next(g for g in got if g["type"] == "assistant/message")
-    assert asst["data"]["message"]["content"][0] == {"type": "text", "text": "hi"}
+    assert asst["data"]["message"]["content"][0] == {"type": "content", "text": "hi"}
     assert asst["data"]["usage"] == {
         "input_tokens": 3, "output_tokens": 5, "cache_read_input_tokens": 1,
     }
@@ -280,7 +280,7 @@ async def test_assistant_message_monitors_but_never_duplicates():
     assert asst["data"]["stop_reason"] == "end_turn"
     synth = next(g for g in got if g["type"] == "tool/call")  # 兜底合成
     assert synth["data"]["callId"] == "t2" and synth["data"]["arguments"] == '{"path": "a.py"}'
-    run2 = EventRecorder("s2", "anthropic", "", label="t")
+    run2 = EventRecorder("s2", label="t")
     _handle_assistant_message(run2, msg, already_yielded=True)  # 已产出 → 不重复
     assert run2.text_chars == 0
 
@@ -330,6 +330,13 @@ class _AsyncIter:
             raise StopAsyncIteration from None
 
 
+class _FakeClaudeAgentOptions:
+    """形似 ClaudeAgentOptions:记录构造 kwargs(cc 经 configs.claude_options 装配)。"""
+
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+
+
 class _FakeStreamEvent:
     def __init__(self, event):
         self.event = event
@@ -375,6 +382,26 @@ class _FakeClient:
         return _AsyncIter(type(self).msgs)
 
 
+class _FakeToolResultBlock:
+    """形似 SDK ToolResultBlock(partial 模式工具结果经 UserMessage 透传)。"""
+
+    def __init__(self, tool_use_id, content=None, is_error=None):
+        self.tool_use_id = tool_use_id
+        self.content = content
+        self.is_error = is_error
+
+
+class _FakeUserMessage:
+    """形似 SDK UserMessage。"""
+
+    def __init__(self, content, parent_tool_use_id=None):
+        self.content = content
+        self.parent_tool_use_id = parent_tool_use_id
+        self.tool_use_result = None
+        self.origin = None
+        self.uuid = None
+
+
 def _fake_sdk(msgs):
     """构造假 claude_agent_sdk 模块(仅 cc_* 需要的成员),monkeypatch 注入 sys.modules。"""
     mod = types.ModuleType("claude_agent_sdk")
@@ -382,12 +409,20 @@ def _fake_sdk(msgs):
     mod.StreamEvent = _FakeStreamEvent
     mod.AssistantMessage = _FakeAssistantMessage
     mod.ResultMessage = _FakeResultMessage
+    mod.UserMessage = _FakeUserMessage
+    mod.ToolResultBlock = _FakeToolResultBlock
     mod.ClaudeSDKClient = _FakeClient
+    mod.ClaudeAgentOptions = _FakeClaudeAgentOptions
     return mod
 
 
 def _options():
-    return types.SimpleNamespace(model="", system_prompt="sys", allowed_tools=None, mcp_servers=None)
+    return {"model": "", "system_prompt": "sys"}
+
+
+async def _fold(chunks):
+    """旧 text 语义适配(text 已废):断言值取流增量折叠。"""
+    return "".join([c async for c in chunks])
 
 
 @pytest.mark.asyncio
@@ -405,7 +440,7 @@ async def test_cc_stream_exact_output_no_duplicates(monkeypatch, tmp_path):
         _FakeResultMessage(result="hi好"),
     ])
     monkeypatch.setitem(sys.modules, "claude_agent_sdk", sdk)
-    chunks = [c async for c in agent.cc_stream(_options(), "prompt", session_name="x")]
+    chunks = [c async for c in agent.ClaudeCode(_options()).stream("prompt", session_name="x")]
     assert "".join(chunks) == "hi好"
     assert not (tmp_path / "sessions").exists()  # 未构建 FileSink,无写盘
 
@@ -425,16 +460,71 @@ async def test_cc_stream_captures_event_sequence(monkeypatch):
         _FakeResultMessage(result="hi", usage=types.SimpleNamespace(input_tokens=2, output_tokens=1)),
     ])
     monkeypatch.setitem(sys.modules, "claude_agent_sdk", sdk)
-    await agent.cc_text(_options(), "整段 prompt ⚙", session_name="x", run_id="r1")
+    await _fold(agent.ClaudeCode(_options()).stream("整段 prompt ⚙", session_name="x", run_id="r1"))
     await asyncio.sleep(0.05)
     types_ = [g["type"] for g in got]
-    assert types_[0] == "session/start" and got[0]["run_id"] == "r1"
-    assert "user/message" in types_ and "request/header" in types_ and "assistant/message" in types_
+    assert types_[0] == "config/init" and got[1]["data"]["run_id"] == "r1"  # 配置快照先于 session/start
+    assert "user/message" in types_ and "assistant/message" in types_
     assert types_[-2:] == ["turn/end", "session/end"] and got[-1]["data"]["state"] == "completed"
     um = next(g for g in got if g["type"] == "user/message")
     assert um["data"]["message"]["content"][0]["text"] == "整段 prompt ⚙"  # 全量不截断
     rs = next(g for g in got if g["type"] == "session/end")
     assert rs["data"]["usage"] == {"input_tokens": 2, "output_tokens": 1, "cache_read_input_tokens": None}
+
+
+@pytest.mark.asyncio
+async def test_cc_stream_partial_markers_rebuild_and_boundary(monkeypatch):
+    """partial 模式(真机 CLI 形状):AssistantMessage=空内容标记 → 缓冲重建全量;
+    工具结果经 UserMessage(tool_result 块)合成 tool/result + 置 _tool_pending
+    → 下条 assistant 消息(message_start)开 step 边界(修复前两者皆无)。"""
+    agent.configure(file=False, ws_urls=[], otel_urls=[])
+    got = []
+    sinks.ensure_bus().add(_recv(got))
+    sdk = _fake_sdk([
+        # 消息 1:thinking 段(增量 → 空标记)
+        _FakeStreamEvent({"type": "content_block_start", "index": 0,
+                          "content_block": {"type": "thinking"}}),
+        _FakeStreamEvent({"type": "content_block_delta", "index": 0,
+                          "delta": {"type": "thinking_delta", "thinking": "深"}}),
+        _FakeStreamEvent({"type": "content_block_stop", "index": 0}),
+        _FakeAssistantMessage(content=[]),
+        # 消息 2:工具调用(流路径合成 tool/call)→ 空标记
+        _FakeStreamEvent({"type": "content_block_start", "index": 0,
+                          "content_block": {"type": "tool_use", "id": "t1", "name": "WebSearch"}}),
+        _FakeStreamEvent({"type": "content_block_delta", "index": 0,
+                          "delta": {"type": "input_json_delta", "partial_json": '{"q": "x"}'}}),
+        _FakeStreamEvent({"type": "content_block_stop", "index": 0}),
+        _FakeAssistantMessage(content=[]),
+        # 工具结果:UserMessage(tool_result 块)→ tool/result + _tool_pending
+        _FakeUserMessage([_FakeToolResultBlock(
+            "t1", [{"type": "text", "text": "R 结果"}], is_error=False)]),
+        # 消息 3:新一轮 assistant(message_start → 开边界)→ text 段 → 空标记
+        _FakeStreamEvent({"type": "message_start", "message": {"role": "assistant"}}),
+        _FakeStreamEvent({"type": "content_block_start", "index": 0,
+                          "content_block": {"type": "text"}}),
+        _FakeStreamEvent({"type": "content_block_delta", "index": 0,
+                          "delta": {"type": "text_delta", "text": "答案"}}),
+        _FakeStreamEvent({"type": "content_block_stop", "index": 0}),
+        _FakeAssistantMessage(content=[]),
+        _FakeResultMessage(result="答案"),
+    ])
+    monkeypatch.setitem(sys.modules, "claude_agent_sdk", sdk)
+    assert await _fold(agent.ClaudeCode(_options()).stream("prompt", session_name="x")) == "答案"
+    await asyncio.sleep(0.05)
+    msgs = [g for g in got if g["type"] == "assistant/message"]
+    # 空标记重建:msg1 = thinking;末条 = text(增量 → 标记)
+    assert len(msgs) == 3
+    assert msgs[0]["data"]["message"]["content"] == [{"type": "thinking", "text": "深"}]
+    assert msgs[-1]["data"]["message"]["content"] == [{"type": "content", "text": "答案"}]
+    tr = [g for g in got if g["type"] == "tool/result"]
+    assert len(tr) == 1 and tr[0]["data"]["is_error"] is False
+    assert tr[0]["data"]["message"]["content"][0]["content"] == "R 结果"
+    assert tr[0]["data"]["name"] == "WebSearch"
+    assert tr[0]["data"]["sourceSeqs"] == [g["seq"] for g in got if g["type"] == "tool/call"]
+    # 工具结果后开步边界:step/end + step/start;末条消息归属 step 2
+    assert [g["type"] for g in got if g["type"] in ("step/end", "step/start")] == \
+        ["step/start", "step/end", "step/start", "step/end"]
+    assert msgs[-1]["data"]["step"] == 2
 
 
 @pytest.mark.asyncio
@@ -446,7 +536,7 @@ async def test_cc_text_fallback_without_partials(monkeypatch, tmp_path):
         _FakeResultMessage(result="hi好world"),
     ])
     monkeypatch.setitem(sys.modules, "claude_agent_sdk", sdk)
-    assert await agent.cc_text(_options(), "prompt", session_name="x") == "hi好world"
+    assert await _fold(agent.ClaudeCode(_options()).stream("prompt", session_name="x")) == "hi好world"
     assert not (tmp_path / "sessions").exists()
 
 
@@ -457,7 +547,7 @@ async def test_cc_stream_error_semantics(monkeypatch, tmp_path):
     sdk = _fake_sdk([_FakeResultMessage(result="", is_error=True, errors=["boom"])])
     monkeypatch.setitem(sys.modules, "claude_agent_sdk", sdk)
     with pytest.raises(agent.RequestFailedError, match="boom"):
-        async for _ in agent.cc_stream(_options(), "p", session_name="x"):
+        async for _ in agent.ClaudeCode(_options()).stream("p", session_name="x"):
             pass
     assert not (tmp_path / "sessions").exists()
 
@@ -525,9 +615,9 @@ def _dsh_chunk(ctype, **fields):
 
 
 def _dsh_options(**kw):
-    """dsh options 鸭子类型(provider 缺省 deepseek-official)。"""
-    return types.SimpleNamespace(provider="deepseek-official", model="m1",
-                                 session_root="/tmp/x", **kw)
+    """dsh config dict(provider 缺省 deepseek-official)。"""
+    return {"provider": "deepseek-official", "model": "m1",
+            "session_root": "/tmp/x", **kw}
 
 
 def _fake_dsh(monkeypatch, notifs, *, finish_reason="completed", final_response="hi好",
@@ -635,22 +725,22 @@ async def test_dsh_stream_yields_and_projects_taxonomy(monkeypatch):
         _dsh_note("turn/end", seq=22, session_id=sid, data={"turn": 1, "reason": {"kind": "completed"}}),
     ]
     _fake_dsh(monkeypatch, notes, finish_reason="completed", final_response="hi好!", session_id=sid)
-    chunks = [c async for c in agent.dsh_stream(_dsh_options(), "prompt",
+    chunks = [c async for c in agent.Dsh(_dsh_options()).stream("prompt",
                                                 session=f"deepwiki:wiki/{sid}",
                                                 session_name="wiki:structure")]
     assert "".join(chunks) == "hi好!"
     await asyncio.sleep(0.05)
     types_ = [g["type"] for g in got]
-    assert types_[0] == "session/start" and got[0]["provider"] == "deepseek"
-    assert types_[:4] == ["session/start", "turn/start", "step/start", "user/message"]
+    assert types_[0] == "config/init" and types_[1] == "session/start"
+    assert types_[:5] == ["config/init", "session/start", "turn/start", "step/start", "user/message"]
     assert [g["seq"] for g in got] == list(range(len(got)))  # 投影流 seq 稠密
     # user/message 重塑:扁平化 → gh 嵌套 message + source
     um = next(g for g in got if g["type"] == "user/message")
     assert um["data"]["message"] == {"role": "user", "content": [{"type": "text", "text": "prompt"}]}
     assert um["data"]["source"] == {"kind": "user"}
-    # 工具:块端 tool_input 增量与合成 tool/call(显式同 id 事件去重 → 恰一条)
+    # 工具:块端 tool_call 增量与合成 tool/call(显式同 id 事件去重 → 恰一条)
     tool_inputs = [g for g in got if g["type"] == "assistant/chunk"
-                   and g["data"]["chunk"].get("type") == "tool_input"]
+                   and g["data"]["chunk"].get("type") == "tool_call"]
     assert [t["data"]["chunk"]["partial_json"] for t in tool_inputs] == ['{"q"', ': "x"}']
     tc = [g for g in got if g["type"] == "tool/call"]
     assert len(tc) == 1 and tc[0]["data"]["arguments"] == '{"q": "x"}'
@@ -705,13 +795,13 @@ async def test_dsh_stream_source_seqs_mapped(monkeypatch):
         _dsh_note("turn/end", seq=10, session_id=sid, data={"turn": 1, "reason": {"kind": "completed"}}),
     ]
     _fake_dsh(monkeypatch, notes, session_id=sid)
-    assert await agent.dsh_text(_dsh_options(), "q", session=f"deepwiki:wiki/{sid}") == "AB"
+    assert await _fold(agent.Dsh(_dsh_options()).stream("q", session=f"deepwiki:wiki/{sid}")) == "AB"
     await asyncio.sleep(0.05)
     chunks = [g for g in got if g["type"] == "assistant/chunk"]
-    assert [g["seq"] for g in chunks] == [4, 5]  # gh seq(dsh 5/7 → 投影后 4/5)
+    assert [g["seq"] for g in chunks] == [5, 6]  # gh seq(dsh 5/7 → 投影后 5/6;config/init 占 0)
     am = next(g for g in got if g["type"] == "assistant/message")
-    assert am["data"]["sourceSeqs"] == [4, 5]
-    assert 6 not in am["data"]["sourceSeqs"]  # 无裸 dsh seq
+    assert am["data"]["sourceSeqs"] == [5, 6]
+    assert 7 not in am["data"]["sourceSeqs"]  # 无裸 dsh seq
 
 
 @pytest.mark.asyncio
@@ -743,11 +833,11 @@ async def test_dsh_stream_skips_non_taxonomy_events(monkeypatch):
         _dsh_note("turn/end", seq=11, session_id=sid, data={"turn": 1, "reason": {"kind": "completed"}}),
     ]
     _fake_dsh(monkeypatch, notes, session_id=sid)
-    assert await agent.dsh_text(_dsh_options(), "q", session=f"deepwiki:wiki/{sid}") == "ok"
+    assert await _fold(agent.Dsh(_dsh_options()).stream("q", session=f"deepwiki:wiki/{sid}")) == "ok"
     await asyncio.sleep(0.05)
     assert set(g["type"] for g in got) <= set(agent.TAXONOMY)  # 无 ValueError,只出 TAXONOMY
     texts = [g["data"]["chunk"].get("text") for g in got
-             if g["type"] == "assistant/chunk" and g["data"]["chunk"].get("type") == "text"]
+             if g["type"] == "assistant/chunk" and g["data"]["chunk"].get("type") == "content"]
     assert texts == ["ok"]
 
 
@@ -781,7 +871,7 @@ async def test_dsh_stream_tool_result_reshaped(monkeypatch):
         _dsh_note("turn/end", seq=6, session_id=sid, data={"turn": 1, "reason": {"kind": "completed"}}),
     ]
     _fake_dsh(monkeypatch, notes, session_id=sid, final_response="")
-    await agent.dsh_text(_dsh_options(), "q", session=f"deepwiki:wiki/{sid}")
+    await _fold(agent.Dsh(_dsh_options()).stream("q", session=f"deepwiki:wiki/{sid}"))
     await asyncio.sleep(0.05)
     tr = next(g for g in got if g["type"] == "tool/result")
     assert tr["data"]["message"]["content"][0] == {"type": "tool_result", "tool_use_id": "t9",
@@ -815,7 +905,7 @@ async def test_dsh_stream_reasoning_delta_is_thinking_chunk(monkeypatch):
         _dsh_note("turn/end", seq=7, session_id=sid, data={"turn": 1, "reason": {"kind": "completed"}}),
     ]
     _fake_dsh(monkeypatch, notes, session_id=sid)
-    assert await agent.dsh_text(_dsh_options(), "q", session=f"deepwiki:wiki/{sid}") == "回答"
+    assert await _fold(agent.Dsh(_dsh_options()).stream("q", session=f"deepwiki:wiki/{sid}")) == "回答"
     await asyncio.sleep(0.05)
     th = next(g for g in got if g["type"] == "assistant/chunk"
               and g["data"]["chunk"].get("type") == "thinking")
@@ -843,7 +933,7 @@ async def test_dsh_stream_non_completed_reason_raises(monkeypatch):
     ]
     _fake_dsh(monkeypatch, notes, finish_reason="max-tokens", final_response="部分", session_id=sid)
     with pytest.raises(agent.RequestFailedError, match="max-tokens"):
-        async for _ in agent.dsh_stream(_dsh_options(), "q", session=f"deepwiki:wiki/{sid}"):
+        async for _ in agent.Dsh(_dsh_options()).stream("q", session=f"deepwiki:wiki/{sid}"):
             pass
     await asyncio.sleep(0.05)
     assert [g["type"] for g in got].count("turn/end") == 1  # dsh 已转发 → 不合成(epilogue=False)
@@ -866,7 +956,7 @@ async def test_dsh_stream_sdk_protocol_error_stage_parse(monkeypatch):
     ]
     _fake_dsh(monkeypatch, notes, session_id=sid, sdk_raise=_DshSdkProtocolError("boom"))
     with pytest.raises(_DshSdkProtocolError, match="boom"):
-        await agent.dsh_text(_dsh_options(), "q", session=f"deepwiki:wiki/{sid}")
+        await _fold(agent.Dsh(_dsh_options()).stream("q", session=f"deepwiki:wiki/{sid}"))
     await asyncio.sleep(0.05)
     err = next(g for g in got if g["type"] == "error")
     assert err["data"]["stage"] == "parse"
@@ -891,7 +981,7 @@ async def test_dsh_result_empty_final_response_raises(monkeypatch):
     ]
     _fake_dsh(monkeypatch, notes, finish_reason="completed", final_response="", session_id=sid)
     with pytest.raises(agent.RequestFailedError, match="未产出最终结果"):
-        await agent.dsh_result(_dsh_options(), "q", session=f"deepwiki:wiki/{sid}")
+        await agent.Dsh(_dsh_options()).result("q", session=f"deepwiki:wiki/{sid}")
 
 
 @pytest.mark.asyncio
@@ -910,10 +1000,10 @@ async def test_dsh_harness_fields_and_session_id(monkeypatch):
         _dsh_note("turn/end", seq=4, session_id=sid, data={"turn": 1, "reason": {"kind": "completed"}}),
     ]
     _fake_dsh(monkeypatch, notes, session_id=sid)
-    options = types.SimpleNamespace(provider="deepseek-official", model="m1", cwd="/repo",
-                                    session_root="/dsh-sessions", env={"A": "1"},
-                                    shutdown_timeout_seconds=None)
-    assert await agent.dsh_text(options, "job", session=f"judge:llm/{sid}") == "hi好"
+    options = {"provider": "deepseek-official", "model": "m1", "cwd": "/repo",
+               "session_root": "/dsh-sessions", "env": {"A": "1"},
+               "shutdown_timeout_seconds": None}
+    assert await _fold(agent.Dsh(options).stream("job", session=f"judge:llm/{sid}")) == "hi好"
     kwargs, input, session_id = _FakeHarness.calls[0]
     assert kwargs == {"provider": "deepseek-official", "model": "m1", "cwd": "/repo",
                       "session_root": "/dsh-sessions", "env": {"A": "1"},
@@ -927,14 +1017,14 @@ async def test_run_epilogue_and_prologue_preserve_cc_defaults():
     agent.configure(file=False, ws_urls=[], otel_urls=[])
     got = []
     sinks.ensure_bus().add(_recv(got))
-    run = EventRecorder("s1", "anthropic", "", label="t")
+    run = EventRecorder("s1", label="t")
     run.start()
     run.finish(True)
     await asyncio.sleep(0.05)
     assert [g["type"] for g in got] == ["session/start", "turn/start", "step/start",
                                         "step/end", "turn/end", "session/end"]
     got.clear()
-    run2 = EventRecorder("s2", "deepseek", "", label="t")
+    run2 = EventRecorder("s2", label="t")
     run2.start(prologue=False)
     run2.finish(True, epilogue=False)
     await asyncio.sleep(0.05)
@@ -967,7 +1057,7 @@ async def test_dsh_stream_user_message_fallback(monkeypatch):
         _dsh_note("turn/end", seq=5, session_id=sid, data={"turn": 1, "reason": {"kind": "completed"}}),
     ]
     _fake_dsh(monkeypatch, notes, session_id=sid)
-    assert await agent.dsh_text(_dsh_options(), "prompt", session=f"deepwiki:wiki/{sid}") == "a"
+    assert await _fold(agent.Dsh(_dsh_options()).stream("prompt", session=f"deepwiki:wiki/{sid}")) == "a"
     await asyncio.sleep(0.05)
     ums = [g for g in got if g["type"] == "user/message"]
     assert len(ums) == 1
@@ -1009,8 +1099,8 @@ async def test_ws_sink_forwards_raw_events_only(monkeypatch):
     sink = agent.WsSink("ws://preview/ws")
     evts = [
         _evt("session/start", seq=0, run_id=None, label="wiki:structure", provider="anthropic", model=""),
-        _evt("assistant/chunk", seq=1, chunk={"type": "text", "index": 0, "text": "你好"}),
-        _evt("assistant/chunk", seq=2, chunk={"type": "text", "index": 0, "text": "世界"}),
+        _evt("assistant/chunk", seq=1, chunk={"type": "content", "index": 0, "text": "你好"}),
+        _evt("assistant/chunk", seq=2, chunk={"type": "content", "index": 0, "text": "世界"}),
     ]
     for e in evts:
         await sink.consume(e)
@@ -1051,8 +1141,8 @@ async def test_otel_span_tree():
         _evt("session/start", seq=0, run_id="r1", label="wiki:structure",
              provider="anthropic", model=""),
         _evt("step/start", seq=1, turn=1, step=1),
-        _evt("assistant/chunk", seq=2, chunk={"type": "text", "index": 0, "text": "你好"}),
-        _evt("assistant/chunk", seq=3, chunk={"type": "text", "index": 0, "text": "世界"}),
+        _evt("assistant/chunk", seq=2, chunk={"type": "content", "index": 0, "text": "你好"}),
+        _evt("assistant/chunk", seq=3, chunk={"type": "content", "index": 0, "text": "世界"}),
         _evt("assistant/message", seq=4, message={"role": "assistant", "content": []},
              usage={"input_tokens": 3, "output_tokens": 5, "cache_read_input_tokens": 1},
              stop_reason="end_turn", surfaceOp="append"),
@@ -1146,7 +1236,7 @@ async def test_otel_failure_isolated(monkeypatch):
     sink = OtelSink("http://preview/v1/traces", tracer=_BoomTracer())
     await sink.consume(_evt("session/start", seq=0, run_id=None, label="wiki:structure",
                             provider="anthropic", model=""))  # start_span 抛 → 吞掉不抛
-    await sink.consume(_evt("assistant/chunk", seq=1, chunk={"type": "text", "index": 0, "text": "x"}))  # 已报过 → 静默
+    await sink.consume(_evt("assistant/chunk", seq=1, chunk={"type": "content", "index": 0, "text": "x"}))  # 已报过 → 静默
     assert len(logged) == 1
     assert "otel sink 消费失败" in logged[0]
 
@@ -1322,9 +1412,10 @@ class _FakeCodexConfig:
 
 
 class _FakeTurnHandle:
-    """形似 AsyncTurnHandle:stream() 重放注入通知后自然结束(异步生成器)。"""
+    """形似 AsyncTurnHandle:stream() 重放注入通知后自然结束;run() 返回注入的 turn_result。"""
 
     notifs: list = []
+    turn_result: object = None
 
     def __init__(self, thread_id, turn_id):
         self.thread_id = thread_id
@@ -1333,6 +1424,9 @@ class _FakeTurnHandle:
     async def stream(self):
         for n in type(self).notifs:
             yield n
+
+    async def run(self):
+        return type(self).turn_result
 
 
 class _FakeThread:
@@ -1414,7 +1508,7 @@ def _codex_it(**fields):
 
 
 def _codex_options(**kw):
-    return types.SimpleNamespace(model="m1", system_prompt="sys", **kw)
+    return {"model": "m1", "system_prompt": "sys", **kw}
 
 
 def _codex_user_home(tmp_path, *, with_auth=False):
@@ -1441,13 +1535,12 @@ async def test_codex_stream_text_deltas_deduped(monkeypatch, tmp_path):
                   item=_codex_it(type="agentMessage", id="m1", text="hi好", phase="final_answer")),
         _codex_nt("turn/completed", turn=_codex_it(id="t1", status="completed", error=None)),
     ], user_home=_codex_user_home(tmp_path))
-    chunks = [c async for c in agent.codex_stream(_codex_options(codex_home=str(tmp_path)),
-                                                  "prompt", session_name="x")]
+    chunks = [c async for c in agent.Codex(_codex_options(codex_home=str(tmp_path))).stream("prompt", session_name="x")]
     assert "".join(chunks) == "hi好"
     await asyncio.sleep(0.05)
     asst = next(g for g in got if g["type"] == "assistant/message")
     assert asst["data"]["message"]["content"] == [
-        {"type": "text", "text": "hi好", "phase": "final_answer"}]
+        {"type": "content", "text": "hi好", "phase": "final_answer"}]
     assert asst["data"]["sourceSeqs"] == \
         [g["seq"] for g in got if g["type"] == "assistant/chunk"]  # 增量 seq 引用
     assert len([g for g in got if g["type"] == "assistant/chunk"]) == 2
@@ -1471,16 +1564,13 @@ async def test_codex_stream_event_sequence(monkeypatch, tmp_path):
                                         last=None)),
         _codex_nt("turn/completed", turn=_codex_it(id="t1", status="completed", error=None)),
     ], user_home=_codex_user_home(tmp_path))
-    await agent.codex_text(_codex_options(codex_home=str(tmp_path)), "整段 prompt ⚙",
-                           session_name="x", run_id="r1")
+    await _fold(agent.Codex(_codex_options(codex_home=str(tmp_path))).stream("整段 prompt ⚙",
+                           session_name="x", run_id="r1"))
     await asyncio.sleep(0.05)
     types_ = [g["type"] for g in got]
-    assert types_[:4] == ["session/start", "turn/start", "step/start", "user/message"]
-    assert got[0]["provider"] == "openai" and got[0]["run_id"] == "r1"
+    assert types_[:5] == ["config/init", "session/start", "turn/start", "step/start", "user/message"]
+    assert got[1]["data"]["run_id"] == "r1"  # session/start(索引 1)携带身份
     assert [g["seq"] for g in got] == list(range(len(got)))  # 合成流 seq 稠密
-    hdr = next(g for g in got if g["type"] == "request/header")
-    assert hdr["data"]["partial"] is True  # SDK 不暴露请求体(cc 同语义)
-    assert hdr["data"]["header"]["config"]["provider"] == "openai"
     um = next(g for g in got if g["type"] == "user/message")
     assert um["data"]["message"]["content"][0]["text"] == "整段 prompt ⚙"
     assert types_[-2:] == ["turn/end", "session/end"] and got[-1]["data"]["state"] == "completed"
@@ -1508,13 +1598,57 @@ async def test_codex_stream_thinking_and_plan_chunks(monkeypatch, tmp_path):
                   item=_codex_it(type="agentMessage", id="m1", text="回答", phase=None)),
         _codex_nt("turn/completed", turn=_codex_it(id="t1", status="completed", error=None)),
     ], user_home=_codex_user_home(tmp_path))
-    assert await agent.codex_text(_codex_options(codex_home=str(tmp_path)), "q",
-                                  session_name="x") == "回答"
+    assert await _fold(agent.Codex(_codex_options(codex_home=str(tmp_path))).stream("q",
+                                  session_name="x")) == "回答"
     await asyncio.sleep(0.05)
     kinds = [g["data"]["chunk"].get("type") for g in got
              if g["type"] == "assistant/chunk"]
-    assert kinds == ["thinking", "plan", "text"]  # reasoning completed 未重复;plan 恰一次
+    assert kinds == ["thinking", "plan", "content"]  # reasoning completed 未重复;plan 恰一次
     assert kinds.count("plan") == 1
+
+
+@pytest.mark.asyncio
+async def test_codex_stream_summary_and_plan_deltas(monkeypatch, tmp_path):
+    """摘要增量(summaryTextDelta)与 plan 增量(plan/delta)按真实段位/逐条输出。
+
+    CoT 加密模型的可见推理只有摘要:summaryPartAdded 标记段位起点(无文本不产事件),
+    段序由 summaryTextDelta 的 summary_index 承载(index 跳变=新段);plan/delta 逐条
+    plan chunk,completed 兜底经 st.plan_items 防双投;有 summary 无 content 的 reasoning
+    completed(无增量流)→ summary 兜底。
+    """
+    agent.configure(file=False, ws_urls=[], otel_urls=[])
+    got = []
+    sinks.ensure_bus().add(_recv(got))
+    _fake_codex(monkeypatch, [
+        _codex_nt("turn/started", turn=_codex_it(id="t1")),
+        _codex_nt("item/started", item=_codex_it(type="reasoning", id="r1")),
+        _codex_nt("item/reasoning/summaryPartAdded", item_id="r1", summary_index=0),
+        _codex_nt("item/reasoning/summaryTextDelta", delta="深", item_id="r1", summary_index=0),
+        _codex_nt("item/reasoning/summaryPartAdded", item_id="r1", summary_index=1),
+        _codex_nt("item/reasoning/summaryTextDelta", delta="思", item_id="r1", summary_index=1),
+        _codex_nt("item/completed", item=_codex_it(type="reasoning", id="r1",
+                                                   content=[], summary=["深", "思"])),
+        _codex_nt("item/started", item=_codex_it(type="plan", id="p1")),
+        _codex_nt("item/plan/delta", delta="先查", item_id="p1"),
+        _codex_nt("item/plan/delta", delta="再写", item_id="p1"),
+        _codex_nt("item/completed", item=_codex_it(type="plan", id="p1", text="先查再写")),
+        _codex_nt("item/completed", item=_codex_it(type="reasoning", id="r2",
+                                                   content=[], summary=["兜底"])),
+        _codex_nt("item/started", item=_codex_it(type="agentMessage", id="m1")),
+        _codex_nt("item/agentMessage/delta", delta="回答", item_id="m1"),
+        _codex_nt("item/completed",
+                  item=_codex_it(type="agentMessage", id="m1", text="回答", phase=None)),
+        _codex_nt("turn/completed", turn=_codex_it(id="t1", status="completed", error=None)),
+    ], user_home=_codex_user_home(tmp_path))
+    assert await _fold(agent.Codex(_codex_options(codex_home=str(tmp_path))).stream("q",
+                                  session_name="x")) == "回答"
+    await asyncio.sleep(0.05)
+    chunks = [g["data"]["chunk"] for g in got if g["type"] == "assistant/chunk"]
+    assert [c["type"] for c in chunks] == \
+        ["thinking", "thinking", "plan", "plan", "thinking", "content"]
+    assert [c["index"] for c in chunks[:2]] == [0, 1]  # 摘要段位真实承载(index 跳变=新段)
+    assert [c["text"] for c in chunks] == ["深", "思", "先查", "再写", "兜底", "回答"]
+    assert [c["index"] for c in chunks[2:4]] == [0, 0]  # plan 无段位字段,恒定单文档
 
 
 @pytest.mark.asyncio
@@ -1546,8 +1680,8 @@ async def test_codex_stream_tool_round_single_step_boundary(monkeypatch, tmp_pat
                   item=_codex_it(type="agentMessage", id="m2", text="final", phase=None)),
         _codex_nt("turn/completed", turn=_codex_it(id="t1", status="completed", error=None)),
     ], user_home=_codex_user_home(tmp_path))
-    assert await agent.codex_text(_codex_options(codex_home=str(tmp_path)), "q",
-                                  session_name="x") == "final"
+    assert await _fold(agent.Codex(_codex_options(codex_home=str(tmp_path))).stream("q",
+                                  session_name="x")) == "final"
     await asyncio.sleep(0.05)
     calls = [g for g in got if g["type"] == "tool/call"]
     assert len(calls) == 2
@@ -1566,6 +1700,51 @@ async def test_codex_stream_tool_round_single_step_boundary(monkeypatch, tmp_pat
 
 
 @pytest.mark.asyncio
+async def test_codex_stream_web_search_tool(monkeypatch, tmp_path):
+    """webSearch item(web_search 特性):completed 全字段 → tool/call|result + 单步边界。
+
+    修复前该 item 被静默跳过(真机实测零工具事件、全程 step=1);started 是空壳
+    占位(无 query)→ 不产事件;结果 content = results 原样 JSON(黑盒不透字段)。
+    """
+    agent.configure(file=False, ws_urls=[], otel_urls=[])
+    got = []
+    sinks.ensure_bus().add(_recv(got))
+    _fake_codex(monkeypatch, [
+        _codex_nt("turn/started", turn=_codex_it(id="t1")),
+        _codex_nt("item/started", item=_codex_it(type="agentMessage", id="m1")),
+        _codex_nt("item/agentMessage/delta", delta="先查", item_id="m1"),
+        _codex_nt("item/started",
+                  item=_codex_it(type="webSearch", id="w1", query="", action=None, results=None)),
+        _codex_nt("item/completed",
+                  item=_codex_it(type="webSearch", id="w1", query="gh-puller README",
+                                 action=_codex_it(type="search", query="gh-puller README",
+                                                  queries=None),
+                                 results=[{"url": "https://x/g", "title": "t", "snippet": "s"}])),
+        _codex_nt("item/started", item=_codex_it(type="agentMessage", id="m2")),
+        _codex_nt("item/agentMessage/delta", delta="答案", item_id="m2"),
+        _codex_nt("item/completed",
+                  item=_codex_it(type="agentMessage", id="m2", text="答案", phase=None)),
+        _codex_nt("turn/completed", turn=_codex_it(id="t1", status="completed", error=None)),
+    ], user_home=_codex_user_home(tmp_path))
+    assert await _fold(agent.Codex(_codex_options(codex_home=str(tmp_path))).stream("q",
+                                  session_name="x")) == "先查答案"
+    await asyncio.sleep(0.05)
+    calls = [g for g in got if g["type"] == "tool/call"]
+    assert len(calls) == 1
+    assert calls[0]["data"]["name"] == "web_search"
+    assert json.loads(calls[0]["data"]["arguments"]) == {
+        "query": "gh-puller README", "action": {"type": "search", "query": "gh-puller README"}}
+    res = [g for g in got if g["type"] == "tool/result"][0]
+    assert res["data"]["is_error"] is False
+    assert res["data"]["message"]["content"][0]["content"] == \
+        json.dumps([{"url": "https://x/g", "title": "t", "snippet": "s"}], ensure_ascii=False)
+    assert res["data"]["sourceSeqs"] == [calls[0]["seq"]]
+    # webSearch 后:单次 step 边界(与其它工具同类);末位 step/end = epilogue
+    assert [g["type"] for g in got if g["type"] in ("step/start", "step/end")] == \
+        ["step/start", "step/end", "step/start", "step/end"]
+
+
+@pytest.mark.asyncio
 async def test_codex_stream_command_execution_failed_is_error(monkeypatch, tmp_path):
     """commandExecution:归 shell 工具;exit_code≠0 → tool/result is_error + 文本聚合。"""
     agent.configure(file=False, ws_urls=[], otel_urls=[])
@@ -1581,7 +1760,7 @@ async def test_codex_stream_command_execution_failed_is_error(monkeypatch, tmp_p
                                                    error=_codex_it(message="boom"))),
     ], user_home=_codex_user_home(tmp_path))
     with pytest.raises(agent.RequestFailedError, match="boom"):
-        async for _ in agent.codex_stream(_codex_options(codex_home=str(tmp_path)), "q"):
+        async for _ in agent.Codex(_codex_options(codex_home=str(tmp_path))).stream("q"):
             pass
     await asyncio.sleep(0.05)
     call = next(g for g in got if g["type"] == "tool/call")
@@ -1604,7 +1783,7 @@ async def test_codex_stream_failed_turn_raises(monkeypatch, tmp_path):
                                                    error=_codex_it(message="boom"))),
     ], user_home=_codex_user_home(tmp_path))
     with pytest.raises(agent.RequestFailedError, match="boom"):
-        async for _ in agent.codex_stream(_codex_options(codex_home=str(tmp_path)), "q"):
+        async for _ in agent.Codex(_codex_options(codex_home=str(tmp_path))).stream("q"):
             pass
     await asyncio.sleep(0.05)
     err = next(g for g in got if g["type"] == "error")
@@ -1621,7 +1800,7 @@ async def test_codex_stream_missing_completed_raises(monkeypatch, tmp_path):
         _codex_nt("turn/started", turn=_codex_it(id="t1")),
     ], user_home=_codex_user_home(tmp_path))
     with pytest.raises(agent.RequestFailedError, match="turn 未收到完成事件"):
-        await agent.codex_text(_codex_options(codex_home=str(tmp_path)), "q", session_name="x")
+        await _fold(agent.Codex(_codex_options(codex_home=str(tmp_path))).stream("q", session_name="x"))
 
 
 @pytest.mark.asyncio
@@ -1633,7 +1812,7 @@ async def test_codex_stream_sdk_error_stage_parse(monkeypatch, tmp_path):
     _fake_codex(monkeypatch, [], thread_raise=_CodexJsonRpcError("boom"),
                 user_home=_codex_user_home(tmp_path))
     with pytest.raises(_CodexJsonRpcError, match="boom"):
-        await agent.codex_text(_codex_options(codex_home=str(tmp_path)), "q", session_name="x")
+        await _fold(agent.Codex(_codex_options(codex_home=str(tmp_path))).stream("q", session_name="x"))
     await asyncio.sleep(0.05)
     err = next(g for g in got if g["type"] == "error")
     assert err["data"]["stage"] == "parse" and err["data"]["exc_type"] == "_CodexJsonRpcError"
@@ -1649,14 +1828,14 @@ async def test_codex_stream_config_isolation_and_auth(monkeypatch, tmp_path):
         _codex_nt("turn/started", turn=_codex_it(id="t1")),
         _codex_nt("turn/completed", turn=_codex_it(id="t1", status="completed", error=None)),
     ], user_home=_codex_user_home(tmp_path, with_auth=True))
-    options = types.SimpleNamespace(
-        model="m1", system_prompt="sys", codex_home=str(tmp_path / "codex-home"),
-        token="sk-x", sandbox="full_access", approval_mode="auto_review",
-        cwd="/repo", codex_bin="/bin/codex", config_overrides=("k=v",),
-        launch_args_override=("l", "a"), env={"GRAPHIFY_OUT": "/g"}, effort="high",
-        base_instructions="SYSTEM",
-    )
-    await agent.codex_text(options, "prompt", session_name="x")
+    options = {
+        "model": "m1", "system_prompt": "sys", "codex_home": str(tmp_path / "codex-home"),
+        "token": "sk-x", "sandbox": "full_access", "approval_mode": "auto_review",
+        "cwd": "/repo", "codex_bin": "/bin/codex", "config_overrides": ("k=v",),
+        "launch_args_override": ("l", "a"), "env": {"GRAPHIFY_OUT": "/g"}, "effort": "high",
+        "base_instructions": "SYSTEM",
+    }
+    await _fold(agent.Codex(options).stream("prompt", session_name="x"))
     cfg = _FakeCodexConfig.instances[0]
     assert cfg.cwd == "/repo" and cfg.codex_bin == "/bin/codex"
     assert cfg.config_overrides == ("k=v",) and cfg.launch_args_override == ("l", "a")
@@ -1667,11 +1846,22 @@ async def test_codex_stream_config_isolation_and_auth(monkeypatch, tmp_path):
     assert codex.thread_start_kwargs["approval_mode"] == _FakeCodexApprovalMode.auto_review
     assert codex.thread_start_kwargs["base_instructions"] == "SYSTEM"  # 显式优先于 system_prompt
     assert codex.thread_start_kwargs["cwd"] == "/repo"  # thread cwd(工作区根)
-    assert _FakeThread.calls[0] == ("prompt", {"cwd": "/repo", "effort": "high"})  # turn 级同样透传
+    assert _FakeThread.calls[0] == ("prompt", {"cwd": "/repo", "effort": "high",
+                                               "summary": "detailed"})  # turn 级透传 + 摘要缺省打开
     # 隔离 home:config.toml 仅 graphify;token → 先断 auth 符号链接再 login
     # (防 login_api_key 穿透写穿用户真实 ~/.codex/auth.json —— 凭证进本隔离 home)
     assert (tmp_path / "codex-home" / "config.toml").read_text() == ""  # 工具桌默认不注入
     assert not (tmp_path / "codex-home" / "auth.json").exists()
+
+
+def test_codex_turn_summary_default_and_override():
+    """codex_turn 装配:缺省打开可见推理摘要(detailed);显式 none/auto 尊重。"""
+    from gh_puller.agent.configs import codex_turn
+
+    assert codex_turn({})["summary"] == "detailed"
+    assert codex_turn({"summary": "none"})["summary"] == "none"
+    assert codex_turn({"summary": "auto"})["summary"] == "auto"
+    assert codex_turn({"summary": "concise"})["summary"] == "concise"
 
 
 @pytest.mark.asyncio
@@ -1685,7 +1875,7 @@ async def test_codex_stream_consumer_close_closes_codex(monkeypatch, tmp_path):
         _codex_nt("item/completed",
                   item=_codex_it(type="agentMessage", id="m1", text="x", phase=None)),
     ], user_home=_codex_user_home(tmp_path))
-    gen = agent.codex_stream(_codex_options(codex_home=str(tmp_path)), "q", session_name="x")
+    gen = agent.Codex(_codex_options(codex_home=str(tmp_path))).stream("q", session_name="x")
     first = await gen.__anext__()
     assert first == "x"
     await gen.aclose()
@@ -1694,14 +1884,18 @@ async def test_codex_stream_consumer_close_closes_codex(monkeypatch, tmp_path):
 
 @pytest.mark.asyncio
 async def test_codex_result_empty_final_response_raises(monkeypatch, tmp_path):
-    """completed 但无产出文本 → codex_result RuntimeError(与 cc_result 同文案)。"""
+    """completed 但无产出文本 → codex_result RuntimeError(与 cc_result 同文案)。
+
+    result 与 stream 同构消费通知流(_codex_drain):turn/completed 后无
+    agentMessage 即无终局文本(st.final_response 空)。
+    """
     agent.configure(file=False, ws_urls=[], otel_urls=[])
     _fake_codex(monkeypatch, [
         _codex_nt("turn/started", turn=_codex_it(id="t1")),
         _codex_nt("turn/completed", turn=_codex_it(id="t1", status="completed", error=None)),
     ], user_home=_codex_user_home(tmp_path))
     with pytest.raises(agent.RequestFailedError, match="未产出最终结果"):
-        await agent.codex_result(_codex_options(codex_home=str(tmp_path)), "q", session_name="x")
+        await agent.Codex(_codex_options(codex_home=str(tmp_path))).result("q", session_name="x")
 
 
 def test_codex_home_setup_config_toml_and_auth(tmp_path, monkeypatch):
@@ -1709,7 +1903,7 @@ def test_codex_home_setup_config_toml_and_auth(tmp_path, monkeypatch):
     本地凭证(cc 的 CLI 自持凭证同形:重新登录即跟随,无副本陈旧)且幂等。"""
     from pathlib import Path
 
-    from gh_puller.agent.generators import _codex_home_setup
+    from gh_puller.agent.configs import codex_home_setup as _codex_home_setup
 
     user_home = tmp_path / "home"
     (user_home / ".codex").mkdir(parents=True)
@@ -1736,3 +1930,105 @@ def test_codex_home_setup_config_toml_and_auth(tmp_path, monkeypatch):
                                                 "env_vars": ["GRAPHIFY_OUT"]}])
     assert (home / "config.toml").stat().st_mtime_ns == before
     assert auth.is_symlink() and auth.resolve() == (user_home / ".codex" / "auth.json")
+
+
+# ---------------------------------------------------------------------------
+# llm 适配器(OpenAI 兼容 httpx):假客户端注入(零网络/token)
+# ---------------------------------------------------------------------------
+
+
+class _FakeLLMResp:
+    """形似 httpx 响应:桶装 json。"""
+
+    def __init__(self, body: dict):
+        self._json = body
+
+    def raise_for_status(self):
+        pass
+
+    def json(self) -> dict:
+        return self._json
+
+
+class _FakeLLMStreamRes:
+    """形似流式响应:aiter_lines 逐行吐 "data: ..." 后 [DONE]。"""
+
+    def __init__(self, chunks: list[dict]):
+        self.chunks = chunks
+
+    def raise_for_status(self):
+        pass
+
+    def aiter_lines(self):
+        async def gen():
+            for c in self.chunks:
+                yield "data: " + json.dumps(c)
+            yield "data: [DONE]"
+
+        return gen()
+
+
+class _FakeLLMClient:
+    """形似 httpx.AsyncClient:记录调用;post 桶装 json,stream 桶装 SSE。"""
+
+    post_body: dict = {}
+    stream_chunks: list[dict] = []
+    calls: list[tuple] = []
+
+    def __init__(self, timeout=None):
+        pass
+
+    async def post(self, url, **kwargs):
+        type(self).calls.append(("post", url))
+        return _FakeLLMResp(type(self).post_body)
+
+    def stream(self, method, url, **kwargs):
+        type(self).calls.append(("stream", url))
+        chunks = type(self).stream_chunks
+
+        class _CM:
+            async def __aenter__(self):
+                return _FakeLLMStreamRes(chunks)
+
+            async def __aexit__(self, *exc):
+                return False
+
+        return _CM()
+
+
+def _llm_options():
+    return {"model": "m1", "base_url": "http://fake", "api_key": "sk-fake", "provider": "p"}
+
+
+@pytest.mark.asyncio
+async def test_llm_result_drains_stream_events(monkeypatch):
+    """llm result 经流式端点抽取:事件与 stream 同构(逐 delta chunk,非整段 1 条);
+    末块 usage/finish_reason 落入 session/end。"""
+    from gh_puller.agent import generators as gen_mod
+
+    agent.configure(file=False, ws_urls=[], otel_urls=[])
+    got = []
+    sinks.ensure_bus().add(_recv(got))
+    _FakeLLMClient.post_body = {"choices": [{"message": {"role": "assistant",
+                                                         "content": "整段"}}]}
+    _FakeLLMClient.stream_chunks = [
+        {"choices": [{"delta": {"content": "好"}}]},
+        {"choices": [{"delta": {"content": "了"}, "finish_reason": "stop"}],
+         "usage": {"input_tokens": 2, "output_tokens": 1, "cache_read_input_tokens": 0}},
+    ]
+    _FakeLLMClient.calls = []
+    monkeypatch.setattr(gen_mod.httpx, "AsyncClient", _FakeLLMClient)
+    payload = {"messages": [{"role": "user", "content": "问题"}], "max_tokens": 16}
+    out = await agent.OpenAI(_llm_options()).result(payload, session_name="x")
+    assert out == "好了"
+    await asyncio.sleep(0.05)
+    # result 走流式端点,不再单发 POST
+    assert ("stream", "http://fake/chat/completions") in [c[:2] for c in _FakeLLMClient.calls]
+    assert ("post", "http://fake/chat/completions") not in [c[:2] for c in _FakeLLMClient.calls]
+    chunks = [g for g in got if g["type"] == "assistant/chunk"]
+    assert [c["data"]["chunk"]["text"] for c in chunks] == ["好", "了"]  # 逐 delta
+    end = got[-1]
+    assert end["type"] == "session/end" and end["data"]["state"] == "completed"
+    assert end["data"]["usage"] == {"input_tokens": 2, "output_tokens": 1,
+                                    "cache_read_input_tokens": 0}
+    assert end["data"]["stop_reason"] == "stop"

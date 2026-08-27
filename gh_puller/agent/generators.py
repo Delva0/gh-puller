@@ -1,31 +1,47 @@
 """生成器层:BaseGenerator 基类 + ClaudeCode / OpenAI / Dsh / Codex 四个生成器。
 
-分层纪律(本文件 = 生成器层/SDK/HTTP):
-- 只依赖标准库与事件层(.events/.sinks/.run),不认识上层业务(prompt/任务/缓存)
-  —— 工具桌经 options 通用注入(mcp_servers),零具体工具名/业务 env 硬编码;
-- 每个生成器类自持本体(id/name/config_kind/缺省等类属性)—— 无注册表类型,
-  集合就是 `_GENERATORS`(id → 实例 的简单映射);
-- 解析/统一分派是纯函数:resolve_generator(校验/规范化,运行前 ValueError)
-  与 generate_stream/text/result(SDK 失败抛 RequestFailedError → 统一包装
-  「agent 执行失败: ...」;llm 异常原样);
-- 模块级绑定(cc_stream = _claude.stream 等)签名逐参数等于历史函数。
+层级纪律(本文件 = 生成器层/SDK/HTTP;config 世界在 configs.py,本文件只消费):
+- 只依赖标准库、事件层(.events/.sinks)与 config 层(.configs),不认识上层
+  业务(prompt/任务/缓存)—— 工具桌经 config 通用注入(mcp_servers),零具体
+  工具名/业务 env 硬编码;SDK 字段映射/header 投影/隔离组合装配均在 configs.py;
+- 每个生成器自持本体(id/name/config 元数据类属性);config 在**构造时期**注入
+  —— `ClaudeCode(config)` 之类,stream/result 只收运行时参数(prompt/会话/run
+  元数据),无 config 参数;
+- 无注册表实例:集合就是 `GENERATORS`(id → 类的简单映射),上层自排/校验
+  config(键集白名单见 configs.py 各 TypedDict)后直接 `GENERATORS[id](config)`
+  构造适配器实例、直呼其 stream/result;失败抛 RequestFailedError(detail 为
+  失败原因;llm 异常原样,重试留给调用方)。
+
+API 契约(人类开发者正式定义):
+- `stream(prompt)`:流式输出 agent 所有 message 产出,其中 assistant 输出包含
+  chunk —— 即逐段文本增量 async generator;thinking/工具调用只进监控事件流,
+  不构成产出。
+- `result(prompt) -> str`:非流式,只拿 agent 最后一轮(最后一次生成轮)的
+  assistant 输出;对 llm 而言 result 就是其输出(complete 语义,payload =
+  OpenAI 兼容请求体;实现内部经流式端点抽取 —— 事件粒度与 stream 同构,非
+  单发整段)。
+- 无 text() API。
+
+config 概念(契约与映射见 configs.py 模块 docstring):每生成器一个 TypedDict
+(ClaudeConfig/DshConfig/CodexConfig/OpenAIConfig),键可省略;SDK 专属名映射
+(config_path → settings/cordis 等)与隔离组合装配(dsh cordis / codex home)
+全在 configs.py,本层运行前不做逐键校验。
 """
 
 import asyncio
 import contextlib
-import hashlib
 import json
 import os
-import shutil
-import tempfile
+from collections.abc import AsyncIterator
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 
 import httpx
 
-from .events import TAXONOMY, new_event
+from .configs import (claude_options, codex_config, codex_home, codex_thread,
+                      codex_turn, codex_val, dsh_harness)
+from .events import TAXONOMY
 from .events import _normalize_usage, EventRecorder, _session_id
-from .sinks import ensure_bus
 
 
 class RequestFailedError(Exception):
@@ -55,19 +71,6 @@ def _dsh_session_id(session: str) -> str:
     return (session or "agent").rsplit("/", 1)[-1]
 
 
-def _dsh_options_fields(options) -> dict:
-    """鸭子类型 dsh options → DeepSeekHarness 构造 kwargs(None 跳过 → 走 SDK 配置缺省)。
-
-    DeepSeekHarnessConfig 是 dataclass 而非 pydantic(无 model_dump),且
-    DeepSeekHarness.__init__(config=None, **kwargs) 同时传 config 与 kwargs 会
-    TypeError —— 恒走 kwargs;调用方自组装 options(仿 cc 的 ClaudeAgentOptions 透传)。
-    """
-    names = ("provider", "model", "max_tokens", "cwd", "runtime_cwd", "session_root",
-             "cordis", "env", "runtime_bin", "launch_args_override",
-             "request_timeout_seconds", "shutdown_timeout_seconds", "base_url", "api_key")
-    return {k: v for k in names if (v := getattr(options, k, None)) is not None}
-
-
 def _dsh_stage(exc: Exception, protocol_errors: tuple) -> str:
     """dsh 异常 stage:协议解析失败(SdkProtocolError/JsonRpcError)归 parse,其余沿 _stage_of。
 
@@ -78,125 +81,8 @@ def _dsh_stage(exc: Exception, protocol_errors: tuple) -> str:
     return _stage_of(exc)
 
 
-_DSH_CORDIS_FILE: str | None = None  # 内容哈希键控缓存(每次调用少写盘;内容变了自然换文件名)
-
-
-def dsh_cordis_path(mcp_servers: list[dict] | None = None) -> str:
-    """dsh 内置隔离组合文件路径(DSH_CORDIS_CONFIG 只认文件路径;按内容哈希落盘一次)。
-
-    组合蓝图见下方 `_DSH_CORDIS_YAML`(镜像 dsh 官方 minimal.cordis.yml;SDK/
-    JSON-RPC 路径只读这一个文件,无用户级 patch 层/无 XDG 配置 —— 组合即隔离
-    边界)。语义同 cc `setting_sources=[]` 的默认位:上层不传 cordis(None)时,
-    dsh_stream 回退本组合(默认隔离);上层显式提供 cordis(如
-    组合文件缺省路径)则全权交给上层(隔离与否由上层组合保证)。
-    mcp_servers = 调用方经 options 注入的通用工具桌描述(附加 mcp 服务器段)。
-    """
-    global _DSH_CORDIS_FILE
-    if mcp_servers is None:
-        if _DSH_CORDIS_FILE is None:
-            _DSH_CORDIS_FILE = _dsh_cordis_write(None)
-        return _DSH_CORDIS_FILE
-    return _dsh_cordis_write(mcp_servers)  # 带工具桌:按内容哈希直写(不占默认缓存)
-
-
-def _dsh_cordis_write(mcp_servers: list[dict] | None) -> str:
-    """最小隔离组合 + 可选附加 mcp 服务器段(通用描述,内容哈希落盘一次)。
-
-    调用方(上层装配层)以 mcp_servers=[{"id","serverName","command","args",...}]
-    注入引擎工具桌 —— 本层只按通用结构渲染,不认识任何具体工具名。
-    """
-    digest = hashlib.sha1(_DSH_CORDIS_YAML.encode()).hexdigest()[:8]
-    text = _DSH_CORDIS_YAML
-    for spec in mcp_servers or []:
-        text = _dsh_mcp_section(spec) + text
-        digest = hashlib.sha1((digest + repr(sorted(spec.items()))).encode()).hexdigest()[:8]
-    path = Path(tempfile.gettempdir()) / "gh-puller" / f"dsh-cordis-{digest}.yml"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if not path.exists():
-        path.write_text(text, encoding="utf-8")
-    return str(path)
-
-
-def _dsh_mcp_section(spec: dict) -> str:
-    """通用 mcp 服务器描述 → 组合 YAML 段(dsh-mcp-client 行,零具体工具名)。"""
-    args = " ".join(f"'{a}'" for a in spec.get("args") or [])
-    return (
-        f"- id: {spec.get('id', 'mcp-server')}\n"
-        f"  name: '@deepseek-ai/dsh-mcp-client'\n"
-        f"  config:\n"
-        f"    serverName: {spec.get('serverName', '')}\n"
-        f"    transport: stdio\n"
-        f"    command: {spec.get('command', 'python3')}\n"
-        f"    args: [{args}]\n"
-        f"    cwd: !!js process.env.DSH_CWD ?? process.cwd()\n"
-        f"    failOnStartupError: true\n"
-        f"    reconnect:\n      enabled: false\n"
-    )
-
-
-# 组合层隔离逐项(cordis.yml 之外再无配置注入面;余下环境残留 DSH_HOME/之类
-# 无任何已装载组件读取 —— SDK 路径无 home patch/settings/credentials 装载):
-# workspaceContext(禁 $DSH_HOME/AGENTS.md 与 checkout 的 AGENTS.md/CLAUDE.md 链)、
-# skills(禁用户 $DSH_HOME/skills、$DSH_AGENTS_HOME/skills、项目 .dsh/skills 与
-# 捆绑技能目录)、includeHarnessIdentity/includeRuntimeContext(提示词注入)、
-# toolBash/toolJobs/goals(面模型工具域)。附加工具桌(引擎 MCP 服务器)由调用方经
-# mcp_servers 通用描述注入(_dsh_mcp_section 渲染;无 .mcp.json/全局发现)。
-# hooks 未装载(配置文件型,须显式挂)。
-_DSH_CORDIS_YAML = """- id: sdk-jsonrpc-server
-  name: '@deepseek-ai/dsh-sdk-jsonrpc-server'
-  config:
-    maxTokensAsSuccess: false
-- id: llm-deepseek
-  name: '@deepseek-ai/dsh-llm-deepseek'
-- id: sandbox
-  name: '@deepseek-ai/dsh-sandbox-local'
-- id: sandbox-policy
-  name: '@deepseek-ai/dsh-sandbox-policy'
-  config:
-    mode: danger-full-access
-    workspaceRoot: !!js process.env.DSH_CWD ?? process.cwd()
-- id: subprocess
-  name: '@deepseek-ai/dsh-subprocess-local'
-- id: pty
-  name: '@deepseek-ai/dsh-terminal'
-- id: terminal-bash
-  name: '@deepseek-ai/dsh-terminal-bash'
-  config:
-    timeoutMs: 300000
-- id: fs-local
-  name: '@deepseek-ai/dsh-fs-local'
-  config:
-    cwd: !!js process.env.DSH_CWD ?? process.cwd()
-- id: agent-spine
-  name: '@deepseek-ai/dsh-agent-spine-demo'
-  config:
-    includeHarnessIdentity: false
-    includeRuntimeContext: false
-    persona: !!js process.env.DSH_SYSTEM_PROMPT ?? 'You are a helpful software engineer assistant.'
-    workspaceContext: false
-    skills:
-      enabled: false
-    toolBash: false
-    toolJobs: false
-    goals: false
-- id: persistent-bash
-  name: '@deepseek-ai/dsh-tool-bash-persistent'
-  config:
-    timeoutMs: 300000
-- id: str-replace-editor
-  name: '@deepseek-ai/dsh-tool-str-replace-editor'
-  config:
-    maxOutputChars: 16000
-- id: sessions
-  name: '@deepseek-ai/dsh-session-persistence-jsonl'
-  config:
-    root: !!js process.env.DSH_SESSION_ROOT ?? './.sessions'
-    compression: none
-"""
-
-
 def _handle_stream_event(run: EventRecorder, event: dict) -> None:
-    """归一化 SDK 原始流事件(cursor 型)→ 监控事件;不改动文本产出路径(产出在 cc_stream)。
+    """归一化 SDK 原始流事件(cursor 型)→ 监控事件;不改动文本产出路径(产出在 stream)。
 
     映射:content_block_delta → assistant/chunk(原始增量,含 thinking/tool_input);
     tool_use 收尾 → tool/call(原始 arguments JSON 字符串);tool_result 收尾 →
@@ -207,6 +93,11 @@ def _handle_stream_event(run: EventRecorder, event: dict) -> None:
         if run._tool_pending and (event.get("message") or {}).get("role") == "assistant":
             run.step_boundary()
             run._tool_pending = False
+        return
+    if typ == "message_delta":
+        stop = (event.get("delta") or {}).get("stop_reason")
+        if stop:
+            run._msg_stop_reason = stop  # 消息级 stop_reason(SDK 消息标记不带)
         return
     if typ == "content_block_start":
         cb = event.get("content_block") or {}
@@ -239,7 +130,7 @@ def _handle_stream_event(run: EventRecorder, event: dict) -> None:
         if dtype == "input_json_delta":
             piece = delta.get("partial_json") or ""
             run._tool_use_pieces.setdefault(idx, []).append(piece)
-            run.chunk({"type": "tool_input", "index": idx, "partial_json": piece})
+            run.chunk({"type": "tool_call", "index": idx, "partial_json": piece})
         return
     if typ == "content_block_stop":
         idx = event.get("index", -1)
@@ -254,6 +145,7 @@ def _handle_stream_event(run: EventRecorder, event: dict) -> None:
                 call_id=tid, name=run.tool_names.get(tid),
                 is_error=run._tool_result["is_error"], src_seq=run._call_seqs.get(tid),
             )
+            run._tool_results_seen.add(tid)  # 用户消息双路去重(见 _handle_user_message)
             run._tool_result = None
             return
         if idx in run._active_tool_use:
@@ -271,6 +163,9 @@ def _handle_assistant_message(run: EventRecorder, msg, already_yielded: bool) ->
 
     sourceSeqs = 本 step 已发 chunk 的 seq;文本/思考/tool_use 块全量入 message;
     无流事件的 tool_use 兜底补合成 tool/call(流路径已由 content_block_stop 发射)。
+    partial 模式(真机 CLI 2.1.237):SDK 消息标记 content 为空,全量 message
+    从本消息增量缓冲(_msg_text/_msg_thinking/_msg_tool_calls)重建 ——
+    事件序 = 增量 → 标记,标记即该消息收尾。
     """
     content = []
     for b in msg.content:
@@ -279,20 +174,37 @@ def _handle_assistant_message(run: EventRecorder, msg, already_yielded: bool) ->
             text = getattr(b, "text", None) or ""
             if text and not already_yielded:
                 run.text(text)
-            content.append({"type": "text", "text": text})
+            content.append({"type": "content", "text": text})
         elif t == "thinking":
-            content.append({"type": "thinking", "thinking": getattr(b, "thinking", None) or ""})
+            content.append({"type": "thinking", "text": getattr(b, "thinking", None) or ""})
         elif t == "tool_use":
-            entry = {"type": "tool_use", "id": getattr(b, "id", None) or "",
+            entry = {"type": "tool_call", "id": getattr(b, "id", None) or "",
                      "name": getattr(b, "name", None) or ""}
             if getattr(b, "input", None) is not None:
                 entry["input"] = b.input
             content.append(entry)
+    if not content:
+        # 重建:[thinking, text, tool_use…];工具调用经独立 tool/call 事件承载,
+        # 此处仅入消息块(顺序对齐 SDK 内容块惯例)
+        if run._msg_thinking:
+            content.append({"type": "thinking", "text": run._msg_thinking})
+        if run._msg_text:
+            content.append({"type": "content", "text": run._msg_text})
+        for tid, name, arguments in run._msg_tool_calls:
+            entry = {"type": "tool_call", "id": tid, "name": name}
+            if arguments:
+                try:
+                    entry["input"] = json.loads(arguments)
+                except json.JSONDecodeError:
+                    entry["input"] = arguments
+            content.append(entry)
+    stop_reason = getattr(msg, "stop_reason", None) or run._msg_stop_reason
+    run._msg_reset()
     run.event(
         "assistant/message", turn=run.turn, step=run.step,
         message={"role": "assistant", "content": content},
         usage=_normalize_usage(getattr(msg, "usage", None)),
-        stop_reason=getattr(msg, "stop_reason", None),
+        stop_reason=stop_reason,
         surfaceOp="append", sourceSeqs=list(run._chunk_seqs),
     )
     for block in msg.content:  # 兜底:无 input_json_delta 的 SDK 路径
@@ -304,43 +216,43 @@ def _handle_assistant_message(run: EventRecorder, msg, already_yielded: bool) ->
                           json.dumps(getattr(block, "input", None) or {}))
 
 
-def _options_header(options, provider: str) -> dict:
-    """ClaudeAgentOptions → request/header 的 header 快照(partial 语义见调用方)。
+def _handle_user_message(run: EventRecorder, msg) -> None:
+    """SDK user 段消息:partial 模式(真机 CLI 2.1.237)工具结果经 UserMessage 透传
+    (流里无 tool_result 内容块)——— 合成 tool/result + 置 _tool_pending。
 
-    SDK 不暴露 rendered system / resolved 工具 schema,只取调用方 options:
-    system_prompt 全量、工具名清单(allowed_tools + mcp 前缀),tools 无 schema。
-    model 只取 options.model(透传面;file 类的模型随配置文件由 SDK 自行装载,
-    本层不读文件)。
+    与流路径(content_block_stop tool_result)互斥去重:同 callId 先到先得
+    (_tool_results_seen);元信息(tool_use_result/origin)v1 不落事件。
     """
-    system = getattr(options, "system_prompt", None) or ""
-    names = list(getattr(options, "allowed_tools", None) or [])
-    names.extend(f"mcp__{name}__" for name in (getattr(options, "mcp_servers", None) or {}))
-    return {"config": {"provider": provider, "model": getattr(options, "model", None) or ""},
-            "system": system or None, "tools": [{"name": n} for n in names] or None}
+    from claude_agent_sdk import ToolResultBlock  # lazy:测试可喂假模块
 
-
-def _llm_header(payload: dict, provider: str) -> dict:
-    """OpenAI payload → request/header 的 header 快照(请求体全可见 → 精确)。
-
-    system 消息并入 system 字符串;tools 归一 {name, description?, input_schema?};
-    config 透传 model 与常用标量(JSON 可序列化)。
-    """
-    system = "\n\n".join(str(m.get("content") or "")
-                         for m in payload.get("messages", []) if m.get("role") == "system")
-    tools: list[dict] = []
-    for t in payload.get("tools") or []:
-        f = t.get("function") or t
-        tools.append({"name": f.get("name") or "", "description": f.get("description"),
-                      "input_schema": f.get("input_schema") or f.get("parameters")})
-    config: dict = {"provider": provider, "model": payload.get("model")}
-    for k in ("temperature", "max_tokens", "top_p", "response_format"):
-        if payload.get(k) is not None:
-            config[k] = payload[k]
-    return {"config": config, "system": system or None, "tools": tools or None}
+    blocks = getattr(msg, "content", None)
+    if not isinstance(blocks, list):
+        return
+    for block in blocks:
+        if not isinstance(block, ToolResultBlock):
+            continue
+        tid = block.tool_use_id or ""
+        if tid in run._tool_results_seen:
+            continue
+        is_error = bool(block.is_error)
+        raw = block.content
+        if isinstance(raw, list):
+            text = "".join(str(c.get("text") or "")
+                           for c in raw if isinstance(c, dict) and c.get("type") == "text")
+        else:
+            text = raw or ""
+        run.tool_result(
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": tid,
+                                          "content": text, "is_error": is_error}]},
+            call_id=tid, name=run.tool_names.get(tid),
+            is_error=is_error, src_seq=run._call_seqs.get(tid),
+        )
+        run._tool_results_seen.add(tid)
+        run._tool_pending = True  # 工具结果后 → 下条 assistant 消息(message_start)开 step 边界
 
 
 def _llm_emit_messages(run: EventRecorder, payload: dict) -> None:
-    """payload messages → surface 事件(仅 user/assistant 折叠;system 已入 header)。"""
+    """payload messages → surface 事件(仅 user/assistant 折叠;system 不进折叠)。"""
     for m in payload.get("messages", []):
         role = m.get("role")
         content = m.get("content")
@@ -365,33 +277,38 @@ def _llm_headers(headers: dict | None, api_key: str | None) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# 共享基类:run 装配 / 事件守卫 / text、result 缺省实现
+# config 类型与映射契约:configs.py(TypedDict + SDK 字段映射/header 投影/隔离组合)
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# 共享基类:run 装配 / 事件守卫 / stream、result 契约定形
 # ---------------------------------------------------------------------------
 
 
 class BaseGenerator:
     """生成器共享骨架:cc = 单一权威合成;dsh = 双权威投影(对齐器);llm = 直连 HTTP。
 
-    子类只要写差异驱动循环(stream / complete);text、result 的整收缺省已含。
-    公共 kwarg(会话/run 元数据)逐参数与历史模块级函数一致 —— 底部以单例绑定
-    回模块级公开名(cc_stream = _claude.stream 等),签名不变。
+    子类只要写差异驱动循环(stream)与终局语义(result);公共 kwarg(会话/run
+    元数据)逐参数一致。config 在**构造时期**注入(副本存 self.config),运行时
+    方法不再收 config(契约见模块 docstring)。
 
-    generator = 本项目生成管线 id(cc|dsh|codex|llm);provider_id = 该路对应的
-    provider 连接语义(anthropic|deepseek|openai)—— 与 duck options 里的
-    SDK 侧字段(如 dsh provider="deepseek-official")是两回事。
+    generator = 本项目生成管线 id(cc|dsh|codex|llm)。监控侧 agent 自身 meta
+    只此一项 + config(事件 envelope 即 generator/model 与各 config 派生事件)。
     """
 
     generator = ""  # 生成管线 id(cc|dsh|codex|llm)
-    provider_id = ""  # 事件封套 provider 字段值(anthropic|deepseek|openai)
 
-    def _recorder(self, *, model: str, session: str | None = None, session_ns: str | None = None,
+    def __init__(self, config: dict):
+        self.config = dict(config)  # 构造期注入;副本防 SDK 篡改
+
+    def _recorder(self, *, session: str | None = None, session_ns: str | None = None,
              run_id: str | None = None, session_name: str | None = None,
              meta: dict | None = None,
-             provider: str | None = None, generator: str | None = None) -> EventRecorder:
-        """公共 kwarg → EventRecorder(session id 规则/信封 provider+generator 取类属性;不含 context/retry)。"""
+             generator: str | None = None) -> EventRecorder:
+        """公共 kwarg → EventRecorder(session id 规则/信封 generator 取类属性;不含 context/retry)。"""
         return EventRecorder(_session_id(session, session_ns, run_id, session_name),
-                    provider or self.provider_id,
-                    model, generator=generator or self.generator,
+                    generator=generator or self.generator,
                     label=session_name, run_id=run_id, meta=meta)
 
     @contextlib.asynccontextmanager
@@ -414,86 +331,68 @@ class BaseGenerator:
         finally:
             run.finish(ok, epilogue=epilogue() if callable(epilogue) else epilogue)
 
-    async def stream(self, options, prompt: str, *, session: str | None = None,
+    async def stream(self, prompt: str, *, session: str | None = None,
                      session_name: str | None = None, run_id: str | None = None,
                      session_ns: str | None = None,
                      context: list[dict] | None = None, retry: dict | None = None,
-                     meta: dict | None = None):
-        """流式应答(子类必写):文本增量 async generator;监控事件经 run 信封发布。"""
+                     meta: dict | None = None) -> AsyncIterator[str]:
+        """流式应答(子类必写):assistant 文本增量 async generator(见模块契约)。"""
         raise NotImplementedError
 
-    async def text(self, options, prompt: str, *, session: str | None = None,
-                   session_name: str | None = None, run_id: str | None = None,
-                   session_ns: str | None = None,
-                   context: list[dict] | None = None, retry: dict | None = None,
-                   meta: dict | None = None) -> str:
-        """整收应答缺省:收集流式文本(cc_text / dsh_text 共用)。"""
-        parts: list[str] = []
-        async for chunk in self.stream(options, prompt, session=session, session_name=session_name,
-                                       run_id=run_id, session_ns=session_ns,
-                                       context=context, retry=retry, meta=meta):
-            parts.append(chunk)
-        return "".join(parts)
-
-    async def result(self, options, prompt: str, *, session: str | None = None,
+    async def result(self, prompt: str, *, session: str | None = None,
                      session_name: str | None = None, run_id: str | None = None,
                      session_ns: str | None = None,
                      context: list[dict] | None = None, retry: dict | None = None,
                      meta: dict | None = None) -> str:
-        """非流式最终结果缺省:整收 + 空结果 → RuntimeError(dsh_result 语义)。
-
-        不适用于需要专用最终结果通道的 SDK(如 cc 的 ResultMessage.result,见子类覆盖)。
-        """
-        text = await self.text(options, prompt, session=session, session_name=session_name,
-                               run_id=run_id, session_ns=session_ns,
-                               context=context, retry=retry, meta=meta)
-        if not text:
-            raise RequestFailedError("未产出最终结果")
-        return text
+        """非流式最终结果(子类必写):只拿最后一轮 assistant 输出(见模块契约)。"""
+        raise NotImplementedError
 
 
 # ---------------------------------------------------------------------------
-# Claude Code(SDK)包装:cc_stream / cc_text / cc_result
+# Claude Code(SDK)包装
 # ---------------------------------------------------------------------------
 
 
 class ClaudeCode(BaseGenerator):
-    """cc:Claude Code 命令。配置形态:file 类 —— config_path 指向 settings JSON。"""
+    """cc:Claude Code 命令。配置形态:file 类 —— config_path 指向 settings JSON。
 
-    id = "cc"
-    name = "Claude Code"
-    capability = "anthropic-agent-api"
-    config_kind = "file"
-    config_path_env = "DEEPWIKI_CC_CONFIG"
-    config_default = str(Path.home() / ".claude" / "settings.json")
-    """cc:SDK 原料流 → 本地合成(唯一权威,无投影层;why 见模块 docstring)。"""
+    ClaudeConfig → ClaudeAgentOptions(**config),config_path → settings(SDK 传
+    --settings,只装载所选文件);凭证随所选 settings 文件(SDK CLI 侧登录)。
+    构造期即建立客户端(configs.claude_options 绑定 + ClaudeSDKClient 对象):
+    一个实例 = 一个客户端 = 一次上游对话;连接进入(子进程 spawn)仍在调用期。
+    """
 
     generator = "cc"
-    provider_id = "anthropic"
 
-    async def stream(self, options, prompt: str, *, session: str | None = None,
+    def __init__(self, config: dict):
+        super().__init__(config)
+        from claude_agent_sdk import ClaudeSDKClient  # lazy:测试可喂假模块
+
+        self._client = ClaudeSDKClient(options=claude_options(config))
+
+    async def stream(self, prompt: str, *, session: str | None = None,
                      session_name: str | None = None, run_id: str | None = None,
                      session_ns: str | None = None,
                      context: list[dict] | None = None, retry: dict | None = None,
                      meta: dict | None = None):
         """Claude Code 流式应答(监控 + 执行)。
 
-        对外产出:文本增量(StreamEvent text_delta 优先,AssistantMessage 兜底,
-        ResultMessage.is_error → RequestFailedError(detail)(文案归组合层包装));
-        thinking/工具增量仅进事件流。options 整体透传(调用方自组装,含工具/MCP
-        服务器注入)。context = 上下文说明事件列表(context/inject|modify,{type,data}
+        对外产出:assistant 文本增量(StreamEvent text_delta 优先,AssistantMessage
+        兜底,ResultMessage.is_error → RequestFailedError(detail));thinking/工具
+        增量仅进事件流。config 整体透传为 ClaudeAgentOptions(config_path →
+        settings)。context = 上下文说明事件列表(context/modify,{type,data}
         形),重放于 session/start 之后。
         """
-        from claude_agent_sdk import AssistantMessage, ClaudeSDKClient, ResultMessage, StreamEvent
+        from claude_agent_sdk import AssistantMessage, ResultMessage, StreamEvent, UserMessage
 
-        run = self._recorder(model=getattr(options, "model", None) or "",
-                        session=session, session_ns=session_ns, run_id=run_id,
+        config = self.config  # 构造期注入;运行时不再有 config 参数
+        run = self._recorder(session=session, session_ns=session_ns, run_id=run_id,
                         session_name=session_name, meta=meta)
+        run.init_config(config)  # 构造期配置快照(session/start 之前)
         run.start(context=context, retry=retry)
         run.user_message({"role": "user", "content": [{"type": "text", "text": prompt}]})
-        run.event("request/header", header=_options_header(options, self.provider_id), reason="initial", partial=True)
         yielded = False
-        async with self._guard(run), ClaudeSDKClient(options=options) as client:
+        async with self._guard(run), self._client as client:  # 客户端构造期已建(一实例一客户端)
             await client.query(prompt)
             async for msg in client.receive_response():
                 if isinstance(msg, StreamEvent):
@@ -501,7 +400,10 @@ class ClaudeCode(BaseGenerator):
                     event = msg.event
                     if event.get("type") == "content_block_delta":
                         delta = event.get("delta") or {}
-                        if delta.get("type") == "text_delta" and delta.get("text"):
+                        # 工具结果文本增量已归属 tool/result(_handle_stream_event),
+                        # 不构成 assistant 产出 → 不得 yield(与 text_chars 同口径)
+                        if delta.get("type") == "text_delta" and delta.get("text") \
+                                and run._tool_result is None:
                             yielded = True
                             yield delta["text"]
                 elif isinstance(msg, AssistantMessage):
@@ -512,37 +414,38 @@ class ClaudeCode(BaseGenerator):
                             text = getattr(block, "text", None)
                             if text:
                                 yield text
+                elif isinstance(msg, UserMessage):
+                    _handle_user_message(run, msg)  # 工具结果(partial 模式经 user 消息透传)
                 elif isinstance(msg, ResultMessage):
                     if msg.is_error:
                         detail = (msg.errors or [])[-1] if msg.errors else msg.result
                         raise RequestFailedError(detail or msg.subtype)
                     run.result_meta(msg)
 
-    async def result(self, options, prompt: str, *, session: str | None = None,
+    async def result(self, prompt: str, *, session: str | None = None,
                      session_name: str | None = None, run_id: str | None = None,
                      session_ns: str | None = None,
                      context: list[dict] | None = None, retry: dict | None = None,
                      meta: dict | None = None) -> str:
-        """非流式取最终结果(judge 用):失败或无结果 → RuntimeError(调用方降级)。
+        """非流式最终结果:只拿最后一轮 —— ResultMessage.result 本身(非流式文本
+        拼装,保留「agent 未产出最终结果」语义);失败或无结果 → RequestFailedError。"""
+        from claude_agent_sdk import AssistantMessage, ResultMessage, StreamEvent, UserMessage
 
-        覆盖基类缺省:返回 ResultMessage.result 本身(非流式文本拼装),保留
-        "agent 未产出最终结果" 语义。
-        """
-        from claude_agent_sdk import AssistantMessage, ClaudeSDKClient, ResultMessage, StreamEvent
-
-        run = self._recorder(model=getattr(options, "model", None) or "",
-                        session=session, session_ns=session_ns, run_id=run_id,
+        config = self.config  # 构造期注入;运行时不再有 config 参数
+        run = self._recorder(session=session, session_ns=session_ns, run_id=run_id,
                         session_name=session_name, meta=meta)
+        run.init_config(config)  # 构造期配置快照(session/start 之前)
         run.start(context=context, retry=retry)
         run.user_message({"role": "user", "content": [{"type": "text", "text": prompt}]})
-        run.event("request/header", header=_options_header(options, self.provider_id), reason="initial", partial=True)
-        async with self._guard(run), ClaudeSDKClient(options=options) as client:
+        async with self._guard(run), self._client as client:  # 客户端构造期已建(一实例一客户端)
             await client.query(prompt)
             async for msg in client.receive_response():
                 if isinstance(msg, StreamEvent):
                     _handle_stream_event(run, msg.event)
                 elif isinstance(msg, AssistantMessage):
                     _handle_assistant_message(run, msg, already_yielded=run.text_chars > 0)
+                elif isinstance(msg, UserMessage):
+                    _handle_user_message(run, msg)  # 工具结果(partial 模式经 user 消息透传)
                 elif isinstance(msg, ResultMessage):
                     if msg.is_error:
                         detail = (msg.errors or [])[-1] if msg.errors else msg.result
@@ -556,123 +459,153 @@ class ClaudeCode(BaseGenerator):
 
 
 # ---------------------------------------------------------------------------
-# OpenAI 兼容(httpx)包装:llm_complete / llm_stream
+# OpenAI 兼容(httpx)包装
 # ---------------------------------------------------------------------------
 
 
 class OpenAI(BaseGenerator):
-    """llm:OpenAI 兼容端点(httpx 直连)。配置形态:object 类(provider/model/凭证)。"""
+    """llm:OpenAI 兼容端点(httpx 直连)。配置形态:object 类(OpenAIConfig)。
 
-    id = "llm"
-    name = "LLM"
-    capability = "chat-completions"
-    config_kind = "object"
-    provider = "openai"  # 唯一支持 provider
-    model_env = "LLM_MODEL"
-    api_key_env = "OPENAI_API_KEY"
-    base_url_env = "OPENAI_BASE_URL"
-    base_url_default = "https://api.openai.com/v1"
-    models = ("gpt-5.6-luna", "gpt-5.3-codex", "gpt-5.1-codex")
-    supports_custom_model = True
-    """OpenAI 兼容(httpx 直连):无 agent 形态,入口为 complete(非流式)/ stream(SSE)。"""
+    构造期即建 HTTP 客户端(一实例一客户端);单次调用的 timeout/headers/请求体
+    (payload)仍按调用覆盖(请求级 timeout)。
+    """
 
     generator = "llm"
-    provider_id = "openai"
 
-    async def complete(
-        self, *, url: str, payload: dict, api_key: str | None = None,
+    def __init__(self, config: dict):
+        super().__init__(config)
+        self._client = httpx.AsyncClient(timeout=None)  # 无超时缺省;单次经请求级 timeout 覆盖
+
+    async def result(
+        self, payload: dict, *,
         timeout: httpx.Timeout | None = None, headers: dict | None = None,
         session: str | None = None, session_name: str | None = None,
         run_id: str | None = None, session_ns: str | None = None,
         context: list[dict] | None = None, retry: dict | None = None,
         meta: dict | None = None,
     ) -> str:
-        """OpenAI 兼容非流式补全(异常原样抛,重试留给调用方)。
+        """OpenAI 兼容补全终局语义:返回最终文本(异常原样抛,重试留给调用方)。
 
-        payload 为 chat/completions 请求体(须含 model/messages;其余键原样透传,
-        如 response_format/temperature/max_tokens —— 兼容题库扩展点),HTTP body 与直连一致。
-        事件:payload 全量消息 → surface(可折叠恢复该请求输入);响应当次
-        text 增量 + assistant/message + 每 tool_call 一个 tool/call(原始 arguments 字符串)。
+        config = OpenAIConfig(model/base_url/api_key) 构造注入;payload 为
+        chat/completions 请求体(messages;model 可省略 —— 经 config 注入;其余
+        键原样透传,如 response_format/temperature/max_tokens)。事件:请求体全量
+        消息 → surface(可折叠恢复该请求输入);响应当次 text + assistant/message
+        + 每 tool_call 一个 tool/call(原始 arguments 字符串)。
+
+        实现:内部经流式端点抽取(stream() 拖到底)—— **事件面与 stream 同构**:
+        逐 delta chunk,观测粒度与 cc/codex 一致(旧实现单发非流式 complete,
+        整个回答只发 1 条 assistant/chunk)。
         """
-        model = payload["model"]
-        run = self._recorder(model=model, session=session, session_ns=session_ns, run_id=run_id,
-                        session_name=session_name, meta=meta)
-        run.start(context=context, retry=retry)
-        _llm_emit_messages(run, payload)
-        run.event("request/header", header=_llm_header(payload, self.provider_id), reason="initial")
-        run.event("request/context", provider=self.provider_id, model=model)
-        async with self._guard(run, error_stage=_stage_of), httpx.AsyncClient(timeout=timeout) as client:
-            resp = await client.post(f"{url}/chat/completions", json=payload,
-                                     headers=_llm_headers(headers, api_key))
-            resp.raise_for_status()
-            data = resp.json()
-            msg = data["choices"][0]["message"] or {}
-            content = msg.get("content") or ""
-            usage = data.get("usage") or {}
-            if content:
-                run.text(content)
-            blocks = [{"type": "text", "text": content}] if content else []
-            for tc in msg.get("tool_calls") or []:
-                fn = tc.get("function") or {}
-                args = fn.get("arguments") or ""
-                try:
-                    parsed = json.loads(args) if args else None
-                except json.JSONDecodeError:
-                    parsed = args
-                blocks.append({"type": "tool_use", "id": tc.get("id"),
-                               "name": fn.get("name") or "", "input": parsed})
-                run.tool_call(tc.get("id") or "", fn.get("name"), args)
-            norm_usage = _normalize_usage(usage)
-            run.event(
-                "assistant/message", turn=run.turn, step=run.step,
-                message={"role": "assistant", "content": blocks},
-                usage=norm_usage, stop_reason=msg.get("stop_reason"),
-                surfaceOp="append", sourceSeqs=list(run._chunk_seqs),
-            )
-            run.result_usage = norm_usage
-            run.result_stop_reason = msg.get("stop_reason")
-            return content
+        parts = []
+        async for part in self.stream(payload, timeout=timeout, headers=headers,
+                                      session=session, session_name=session_name,
+                                      run_id=run_id, session_ns=session_ns,
+                                      context=context, retry=retry, meta=meta):
+            parts.append(part)
+        return "".join(parts)
 
     async def stream(
-        self, *, url: str, payload: dict, api_key: str | None = None,
+        self, payload: dict, *,
         timeout: httpx.Timeout | None = None, headers: dict | None = None,
         session: str | None = None, session_name: str | None = None,
         run_id: str | None = None, session_ns: str | None = None,
         context: list[dict] | None = None, retry: dict | None = None,
         meta: dict | None = None,
     ):
-        """OpenAI 兼容流式补全(SSE 逐 delta):payload 语义同 complete,附加 stream=True。"""
-        run = self._recorder(model=payload["model"], session=session, session_ns=session_ns,
+        """OpenAI 兼容流式补全(SSE 逐 delta):config/payload 分工与 complete 同,
+        请求体附加 stream=True;delta.tool_calls 分片归并 → tool/call + tool_use 块
+        (与 complete 同归一;旧实现只认 text delta,流式工具调用不可观测)。"""
+        config = self.config  # 构造期注入;运行时不再有 config 参数
+        body = dict(payload)
+        body["model"] = payload.get("model") or config.get("model") or ""
+        body["stream"] = True
+        run = self._recorder(session=session, session_ns=session_ns,
                         run_id=run_id, session_name=session_name, meta=meta)
+        run.init_config(config)  # 构造期配置快照(session/start 之前)
         run.start(context=context, retry=retry)
-        _llm_emit_messages(run, payload)
-        run.event("request/header", header=_llm_header(payload, self.provider_id), reason="initial")
-        run.event("request/context", provider=self.provider_id, model=payload["model"])
+        _llm_emit_messages(run, body)
         full = ""
-        body: dict = {**payload, "stream": True}
+        full_reasoning = ""
+        tools: dict[int, dict] = {}  # index → {id, name, pieces}(delta.tool_calls 分片归并)
+        seg = None  # 当前段:thinking|content|tool_call;段完成即发该段的 assistant/message 聚合
+
+        def _close_seg():
+            """当前段完成 → 一条 assistant/message(该段全量聚合;段状 = 粘合边界)。"""
+            nonlocal seg
+            if seg is None:
+                return
+            if seg == "thinking":
+                blocks = [{"type": "thinking", "text": full_reasoning}]
+            elif seg == "content":
+                blocks = [{"type": "content", "text": full}]
+            else:  # tool_call:每调用一个块(与 tool/call 事件同序列)
+                blocks = []
+                for slot in tools.values():
+                    args = "".join(slot["pieces"])
+                    try:
+                        parsed = json.loads(args) if args else None
+                    except json.JSONDecodeError:
+                        parsed = args
+                    blocks.append({"type": "tool_call", "id": slot["id"],
+                                   "name": slot["name"], "input": parsed})
+                    run.tool_call(slot["id"], slot["name"], args)
+            seg = None
+            run.event(
+                "assistant/message", turn=run.turn, step=run.step,
+                message={"role": "assistant", "content": blocks},
+                surfaceOp="append", sourceSeqs=list(run._chunk_seqs),
+            )
+
+        url = config.get("base_url")
+        api_key = config.get("api_key")
         async with (self._guard(run, error_stage=_stage_of),
-                    httpx.AsyncClient(timeout=timeout) as client,
-                    client.stream("POST", f"{url}/chat/completions", json=body,
-                                  headers=_llm_headers(headers, api_key)) as resp):
+                    self._client.stream("POST", f"{url}/chat/completions", json=body,
+                                        headers=_llm_headers(headers, api_key),
+                                        timeout=timeout) as resp):
             resp.raise_for_status()
             async for line in resp.aiter_lines():
                 if not line.startswith("data:"):
                     continue
-                payload = line[len("data:"):].strip()
-                if not payload or payload == "[DONE]":
+                chunk = line[len("data:"):].strip()
+                if not chunk or chunk == "[DONE]":
                     break
-                choices = json.loads(payload).get("choices") or []
-                text = (choices[0].get("delta") or {}).get("content") or ""
+                data = json.loads(chunk)
+                choices = data.get("choices") or []
+                delta = (choices[0].get("delta") or {}) if choices else {}
+                if data.get("usage"):
+                    run.result_usage = _normalize_usage(data["usage"])  # 末块 usage(可选扩展)
+                fin = choices[0].get("finish_reason") if choices else None
+                if fin:
+                    run.result_stop_reason = fin  # 末块 finish_reason → session/end
+                thinking = delta.get("reasoning_content") or ""
+                text = delta.get("content") or ""
+                if thinking:  # 思考增量 → thinking chunk(段序 0;cc/dsh/codex 同位语义)
+                    if seg in ("content", "tool_call"):
+                        _close_seg()
+                    full_reasoning += thinking
+                    run.chunk({"type": "thinking", "index": 0, "text": thinking})
+                    seg = "thinking"
                 if text:
+                    if seg in ("thinking", "tool_call"):
+                        _close_seg()  # 段边界:thinking 段完成先聚合(→ 本行后才出 content 段)
                     full += text
-                    run.text(text)
+                    run.text(text, index=1 if full_reasoning else 0)  # 段序:thinking 之后 → 1
+                    seg = "content"
                     yield text
-            run.event(
-                "assistant/message", turn=run.turn, step=run.step,
-                message={"role": "assistant", "content": [{"type": "text", "text": full}]},
-                surfaceOp="append", sourceSeqs=list(run._chunk_seqs),
-            )
-
+                for tc in delta.get("tool_calls") or []:
+                    if seg in ("thinking", "content"):
+                        _close_seg()
+                    seg = "tool_call"
+                    slot = tools.setdefault(tc.get("index", 0),
+                                            {"id": "", "name": "", "pieces": []})
+                    fn = tc.get("function") or {}
+                    if tc.get("id"):
+                        slot["id"] = tc["id"]
+                    if fn.get("name"):
+                        slot["name"] = fn["name"]
+                    if fn.get("arguments"):
+                        slot["pieces"].append(fn["arguments"])
+            _close_seg()  # 流末:收尾当前段(纯 thinking/无后续段也保证聚合)
 
 # ---------------------------------------------------------------------------
 # DeepSeek Harness(SDK)投影全家(模块级:纯 dict 构造,测试可喂假 Notification)
@@ -680,7 +613,7 @@ class OpenAI(BaseGenerator):
 
 
 class _DshProj:
-    """dsh 会话事件 → gh 事件流的投影状态(单次 dsh_stream 调用一个实例)。
+    """dsh 会话事件 → gh 事件流的投影状态(单次 stream 调用一个实例)。
 
     seq_map: dsh session 事件 seq → gh 封套 seq。dsh seq 统计包括被跳过的插件
     事件(字段悬空),gh seq 只算本项目 TAXONOMY 投影 —— sourceEventSeqs 必须
@@ -768,7 +701,7 @@ def _project_dsh_chunk(run: EventRecorder, proj: _DshProj, dsh_seq, chunk: dict)
             slot["name"] = chunk["name"]
         piece = chunk.get("argumentsDelta") or ""
         slot["pieces"].append(piece)
-        proj.track(dsh_seq, lambda: run.chunk({"type": "tool_input", "index": idx,
+        proj.track(dsh_seq, lambda: run.chunk({"type": "tool_call", "index": idx,
                                                "partial_json": piece}))
         return []
     if ctype == "block-end":
@@ -805,7 +738,7 @@ def _project_dsh_chunk(run: EventRecorder, proj: _DshProj, dsh_seq, chunk: dict)
 def _project_dsh_event(run: EventRecorder, proj: _DshProj, notif) -> list[str]:
     """dsh 通知 → gh TAXONOMY 事件投影(纯 dict 构造,测试可喂假 Notification)。
 
-    返回本事件产生的文本增量(供 dsh_stream yield)。规则:
+    返回本事件产生的文本增量(供 stream yield)。规则:
     - 只认 session.event 且 sessionId 匹配本运行(SDK 在过滤前即回调所有会话通知,
       子代理等其它会话在此静默丢弃);
     - 非 TAXONOMY 类型(dsh 插件扩展事件)静默跳过 —— new_event 对未知 type 抛 ValueError;
@@ -864,10 +797,6 @@ def _project_dsh_event(run: EventRecorder, proj: _DshProj, notif) -> list[str]:
         proj.track(dsh_seq, lambda: run.user_message(
             message, source=data.get("source"),
             surface_op=envelope.get("surfaceOp") or "append"))
-    elif evt_type == "request/header":
-        proj.forward(dsh_seq, "request/header", **data)  # 完整 header(真实 system/tools)
-    elif evt_type == "request/context":
-        proj.forward(dsh_seq, "request/context", **data)
     elif evt_type == "assistant/chunk":
         run.turn = data.get("turn", run.turn)
         run.step = data.get("step", run.step)
@@ -936,69 +865,55 @@ def _project_dsh_event(run: EventRecorder, proj: _DshProj, notif) -> list[str]:
     return []
 
 
-def _dsh_worker(fields: dict, prompt: str, session_id: str, pump):
-    """同步线程体:构造 harness(子进程 spawn + initialize)→ 阻塞 run 至 idle。
+def _dsh_worker(harness, prompt: str, session_id: str, pump):
+    """同步线程体:进入已构造的 harness(子进程 spawn + initialize)→ 阻塞 run 至 idle。
 
     整个体在 executor 线程执行;即使外层 asyncio task 被取消(消费者提前退场),
     线程仍会自然跑完 —— with 块负责回收子进程,不泄漏。
     """
-    from deepseek_harness import DeepSeekHarness  # lazy:调用时构造(与 cc 同法)
-
-    with DeepSeekHarness(**fields) as harness:
-        return harness.run(prompt, session_id=session_id, on_notification=pump)
+    with harness as h:
+        return h.run(prompt, session_id=session_id, on_notification=pump)
 
 
 # ---------------------------------------------------------------------------
-# DeepSeek Harness(SDK)包装:dsh_stream / dsh_text / dsh_result
+# DeepSeek Harness(SDK)包装
 # ---------------------------------------------------------------------------
 
 
 class Dsh(BaseGenerator):
-    """dsh:DeepSeek Harness 组合。配置形态:file 类 —— config_path 指向 cordis 文件。"""
+    """dsh:DeepSeek Harness 组合。配置形态:file 类 —— config_path 指向 cordis 文件。
 
-    id = "dsh"
-    name = "DeepSeek Harness"
-    capability = "deepseek-route"
-    config_kind = "file"
-    config_path_env = "DEEPWIKI_DSH_CORDIS"
-    config_default = None
-    """dsh:事件词汇同源但 dsh 是第二权威 → _DshProj 投影对齐(why 见模块 docstring)。"""
+    DshConfig → DeepSeekHarness kwargs(configs.dsh_fields:config_path → cordis、
+    system_prompt → env.DSH_SYSTEM_PROMPT;未提供 cordis 时回退内置隔离组合);模型/
+    凭证随组合配置(SDK 读进程环境兜底)。
+    """
+
+    """dsh:事件词汇同源但 dsh 是第二权威 → _DshProj 投影对齐(why 见模块 docstring)。
+
+    构造期即建 harness 对象(configs.dsh_harness 绑定 config):一个实例 = 一个
+    harness = 一次 dsh 会话;子进程 spawn/initialize 在进入(with)时进行。
+    """
 
     generator = "dsh"
-    provider_id = "deepseek"
 
-    async def stream(self, options, prompt: str, *, session: str | None = None,
-                     session_name: str | None = None, run_id: str | None = None,
-                     session_ns: str | None = None,
-                     context: list[dict] | None = None, retry: dict | None = None,
-                     meta: dict | None = None):
-        """dsh(DeepSeek Harness SDK)流式应答(监控 + 执行)。
+    def __init__(self, config: dict):
+        super().__init__(config)
+        self._harness = dsh_harness(config)  # SDK 实例构造期已建(config→SDK 装配在 configs.py)
 
-        对外产出:与 cc_stream 同契约 —— 文本增量(assistant/chunk 的 text-delta),
-        非 completed 的 finish_reason → RuntimeError("agent 执行失败: ...");
-        thinking/工具增量只进事件流,不改变产出。dsh 原生事件 1:1 投影为监控
-        事件流(turn/step/stop_reason 均取自主干事件,见 _project_dsh_event);
-        session/start|end 由本层合成(dsh 仅有 session/end-seed)。
-
-        options = 调用方组装的鸭子类型配置(仿 cc 的 options 透传):provider(缺省
-        "deepseek-official" 经 SDK 侧域)、model、cwd、session_root、cordis、env、
-        max_tokens、base_url、api_key 等,None 跳过(见 _dsh_options_fields);其中
-        **cordis 缺省回退内置隔离组合**(dsh_cordis_path,上层未提供即默认隔离;
-        显式提供则全权交上层)。
-
-        SDK run() 为同步阻塞:经 asyncio.to_thread 执行,on_notification 回调在线程
-        侧经 call_soon_threadsafe 泵入队列,本生成器逐条消费 —— 保持 asyncio 接口
-        形态不变。阻塞性:单次运行一 turn to_idle,无逐 prompt 取消(见 dsh 协议)。
-        """
+    @contextlib.asynccontextmanager
+    async def _run_context(self, prompt: str, *, session: str | None = None,
+                           session_name: str | None = None, run_id: str | None = None,
+                           session_ns: str | None = None,
+                           context: list[dict] | None = None, retry: dict | None = None,
+                           meta: dict | None = None):
+        """dsh 运行装配(stream/result 共用):recorder/proj/字段/worker 线程/队列;
+        guard 内 yield (run, proj, queue, task),退出取消未完成 worker。"""
         from deepseek_harness import errors as _dsh_errors
 
-        run = self._recorder(model=getattr(options, "model", None) or "",
-                        session=session, session_ns=session_ns, run_id=run_id,
+        config = self.config  # 构造期注入;运行时不再有 config 参数
+        run = self._recorder(session=session, session_ns=session_ns, run_id=run_id,
                         session_name=session_name, meta=meta)
         proj = _DshProj(run, prompt, _dsh_session_id(run.session))
-        fields = _dsh_options_fields(options)
-        fields.setdefault("cordis", dsh_cordis_path(getattr(options, "mcp_servers", None)))
-        # 上层未提供 mcp_servers → 缺省隔离组合(见 dsh_cordis_path)
         queue: asyncio.Queue = asyncio.Queue()  # 无界:1:1 于运行时事件流,永不阻塞发布侧
         loop = asyncio.get_running_loop()
 
@@ -1008,11 +923,12 @@ class Dsh(BaseGenerator):
 
         async def _worker() -> None:
             try:
-                result = await asyncio.to_thread(_dsh_worker, fields, prompt, proj.session_id, pump)
+                result = await asyncio.to_thread(_dsh_worker, self._harness, prompt, proj.session_id, pump)
                 loop.call_soon_threadsafe(queue.put_nowait, ("done", result))
             except Exception as exc:  # noqa: BLE001 —— 异常经队列送消费侧统一 error/finish
                 loop.call_soon_threadsafe(queue.put_nowait, ("exc", exc))
 
+        run.init_config(config)  # 构造期配置快照(session/start 之前)
         run.start(context=context, retry=retry, prologue=False)  # dsh 自带 turn/step 生命周期
         async with self._guard(
             run,
@@ -1022,92 +938,67 @@ class Dsh(BaseGenerator):
         ):
             task = asyncio.create_task(_worker())
             try:
-                while True:
-                    kind, item = await queue.get()
-                    if kind == "notif":
-                        for delta in _project_dsh_event(run, proj, item):
-                            yield delta
-                    elif kind == "exc":
-                        raise item
-                    else:  # ("done", RunResult):run() 返回前所有通知已交付,无竞态
-                        if item.finish_reason != "completed":
-                            raise RequestFailedError(item.finish_reason)
-                        break
+                yield run, proj, queue
             finally:
                 if not task.done():
                     task.cancel()  # 消费者提前退场:executor 线程继续自然跑完(见 _dsh_worker)
 
+    async def stream(self, prompt: str, *, session: str | None = None,
+                     session_name: str | None = None, run_id: str | None = None,
+                     session_ns: str | None = None,
+                     context: list[dict] | None = None, retry: dict | None = None,
+                     meta: dict | None = None):
+        """dsh 流式应答(监控 + 执行)。
+
+        对外产出:assistant 文本增量(assistant/chunk 的 text-delta);turn 非
+        completed → RequestFailedError;thinking/工具增量只进事件流。dsh 原生
+        事件 1:1 投影为监控事件流(经 _project_dsh_event);SDK run() 为同步
+        阻塞 → asyncio.to_thread 执行(单次运行一 turn to_idle,无逐 prompt 取消)。
+        """
+        async with self._run_context(prompt, session=session, session_name=session_name,
+                                     run_id=run_id, session_ns=session_ns,
+                                     context=context, retry=retry, meta=meta) as (run, proj, queue):
+            while True:
+                kind, item = await queue.get()
+                if kind == "notif":
+                    for delta in _project_dsh_event(run, proj, item):
+                        yield delta
+                elif kind == "exc":
+                    raise item
+                else:  # ("done", RunResult):run() 返回前所有通知已交付,无竞态
+                    if item.finish_reason != "completed":
+                        raise RequestFailedError(item.finish_reason)
+                    break
+
+    async def result(self, prompt: str, *, session: str | None = None,
+                     session_name: str | None = None, run_id: str | None = None,
+                     session_ns: str | None = None,
+                     context: list[dict] | None = None, retry: dict | None = None,
+                     meta: dict | None = None) -> str:
+        """非流式最终结果:只拿最后一轮 —— RunResult.final_response;非 completed
+        / 未产出 → RequestFailedError。"""
+        async with self._run_context(prompt, session=session, session_name=session_name,
+                                     run_id=run_id, session_ns=session_ns,
+                                     context=context, retry=retry, meta=meta) as (run, proj, queue):
+            while True:
+                kind, item = await queue.get()
+                if kind == "notif":
+                    for _ in _project_dsh_event(run, proj, item):
+                        pass
+                elif kind == "exc":
+                    raise item
+                else:
+                    if item.finish_reason != "completed":
+                        raise RequestFailedError(item.finish_reason)
+                    final = item.final_response or ""
+                    if not final:
+                        raise RequestFailedError("未产出最终结果")
+                    return final
+
 
 # ---------------------------------------------------------------------------
-# Codex(OpenAI Codex SDK)包装:codex_stream / codex_text / codex_result
+# Codex(OpenAI Codex SDK)包装
 # ---------------------------------------------------------------------------
-
-
-def _codex_val(x):
-    """枚举成员 → 值(pydantic/codex 枚举 .value;普通值原样)—— 状态比较统一走值。"""
-    return getattr(x, "value", x)
-
-
-def _codex_lookup(v, enum_cls, label):
-    """options 的 Sandbox/ApprovalMode(名字/值/枚举成员)→ SDK 枚举;None → None。
-
-    调用方常传字符串("full_access" / "auto_review");高级用户可传 SDK 枚举。
-    名字与值双匹配 —— 防 str 子类枚举当 str 用后按名匹配失真。
-    """
-    if v is None:
-        return None
-    if isinstance(v, enum_cls):
-        return v
-    raw = _codex_val(v)
-    for member in enum_cls:
-        if raw in (member.name, member.value):
-            return member
-    raise ValueError(f"codex {label} 取值非法(可选 {[m.name for m in enum_cls]}): {v!r}")
-
-
-def _codex_config_fields(options) -> dict:
-    """鸭子类型 codex options → CodexConfig 构造 kwargs(None 跳过 → 走 SDK 缺省)。
-
-    与 _dsh_options_fields 同法:调用方自组装 options(仿 cc 的 ClaudeAgentOptions 透传);
-    env 由调用流合并 CODEX_HOME 后整传入 —— SDK 从不自设 CODEX_HOME,隔离点见
-    codex_home_path / _codex_home_setup。
-    """
-    names = ("cwd", "codex_bin", "config_overrides", "launch_args_override", "env")
-    return {k: v for k, v in ((k, getattr(options, k, None)) for k in names) if v is not None}
-
-
-def _codex_thread_fields(options) -> dict:
-    """codex options → AsyncCodex.thread_start 透传 kwargs(sandbox/approval_mode 由
-    stream 内经 _codex_lookup 转换后塞入,此处只保留其余自由字段)。
-
-    system_prompt 缺省映射 base_instructions(与 cc 的 system_prompt 同位语义)。
-    """
-    names = ("base_instructions", "developer_instructions", "personality", "ephemeral",
-             "model", "model_provider", "service_tier", "config", "cwd",
-             "session_start_source", "thread_source")
-    fields = {k: v for k, v in ((k, getattr(options, k, None)) for k in names) if v is not None}
-    if getattr(options, "system_prompt", None) and "base_instructions" not in fields:
-        fields["base_instructions"] = options.system_prompt
-    return fields
-
-
-def _codex_turn_fields(options) -> dict:
-    """codex options → AsyncThread.turn 透传 kwargs。"""
-    names = ("cwd", "effort", "output_schema", "personality", "service_tier", "summary")
-    return {k: v for k, v in ((k, getattr(options, k, None)) for k in names) if v is not None}
-
-
-def _codex_header(options) -> dict:
-    """codex options → request/header 的 header 快照(partial=True:SDK 不暴露请求体)。
-
-    工具名清单 = allowed_tools 显式 + mcp_servers 键展开(通用命名约定,无具体工具名);
-    仅监控用,无 schema。
-    """
-    system = getattr(options, "system_prompt", None) or ""
-    names = list(getattr(options, "allowed_tools", None) or [])
-    names.extend(f"mcp__{name}__" for name in (getattr(options, "mcp_servers", None) or {}))
-    return {"config": {"provider": "openai", "model": getattr(options, "model", None) or ""},
-            "system": system or None, "tools": [{"name": n} for n in names] or None}
 
 
 def _codex_args_json(arguments) -> str:
@@ -1139,93 +1030,8 @@ def _codex_stage(exc: Exception, protocol_errors: tuple) -> str:
     return _stage_of(exc)
 
 
-def codex_home_path() -> str:
-    """codex 隔离 home 路径(缺省 ~/.gh-puller/codex-home;显式经 options.codex_home)。
-
-    与 dsh_cordis_path 同位语义:app-server 只读本目录(CODEX_HOME 下 config.toml /
-    auth.json / sessions),不读用户 ~/.codex —— 目录即隔离边界;目录稳定(会话持久,
-    thread_resume 可用),区别于 dsh_cordis 的 temp+内容哈希(文件名固定 config.toml,
-    无法按内容换名,见 _codex_home_setup 的内容比对改写)。
-    """
-    return str(Path.home() / ".gh-puller" / "codex-home")
-
-
-def _codex_config_toml_content(*, mcp_servers: list[dict] | None = None) -> str:
-    """隔离 config.toml 内容:按调用方注入的通用 mcp 服务器描述渲染(组合即隔离边界,
-    镜像 dsh 的 _DSH_CORDIS_YAML —— 无用户 model_provider/keys/mcp/hook/高级设置)。
-
-    每条 spec 应带 id/command/args/env_vars(值不内联,每 run 经 CodexConfig.env 注入
-    app-server 进程环境,再由 rmcp stdio 启动器按白名单取走)。mcp_servers 空 → 空
-    config(无附加工具桌);本层不识别任何具体工具名。
-    """
-    sections = []
-    for spec in mcp_servers or []:
-        name = spec.get("id", "mcp-server")
-        cmd = json.dumps(spec.get("command", ""))
-        args = json.dumps(spec.get("args", []))
-        env_vars = json.dumps(spec.get("env_vars", []))
-        sections.append(
-            f"[mcp_servers.{name}]\n"
-            f"command = {cmd}\n"
-            f"args = {args}\n"
-            f"env_vars = {env_vars}\n"
-            "startup_timeout_sec = 30\n"
-            "required = true\n"
-        )
-    return "\n".join(sections)
-
-
-def _codex_home_setup(home, *, auth_src: str | Path | None = None,
-                      config_path: str | Path | None = None,
-                      mcp_servers: list[dict] | None = None) -> str:
-    """确保 codex 隔离 home 就绪:config.toml + auth 引导;内容不变不重写。
-
-    config_path(file 类契约,纯透传):home/config.toml 改为指向该文件的**符号链接**
-    (与 auth.json 引导同模式:零读取零解析,SDK 经 CODEX_HOME 原生装载所选文件,
-    用户全责)。符号链接不可用(windows/文件系统限制)时回落复制。
-    缺省(无 config_path):按 mcp_servers(通用描述)渲染 config.toml(空 → 无附加工具桌)。
-    auth 引导(cc 同形:凭证通道不隔离,隔离只管设置面 —— 见 cc setting_sources=[]):
-    home/auth.json 缺失且 auth_src(缺省 ~/.codex/auth.json)存在 → **符号链接**——
-    与 cc 的 CLI 自持凭证一样实时引用(重新登录/revoke 即跟随,无副本陈旧);旧副本
-    (非符号链接)存在时替换为链接。符号链接不可用(windows/文件系统限制)时回落复制。
-    auth_src 传 False 可关闭引导(纯隔离无凭证态);显式 token 走 login_api_key 时
-    app-server 自写 home/auth.json(先删符号链接再真写,不冲突)。
-    """
-    home = Path(home)
-    home.mkdir(parents=True, exist_ok=True)
-    cfg_path = home / "config.toml"
-    if config_path is not None:
-        p = Path(config_path)
-        if not p.is_file():  # resolve_target 已校验;防御双检
-            raise FileNotFoundError(f"codex 配置文件不存在: {p}")
-        if cfg_path.is_symlink() or cfg_path.exists():
-            cfg_path.unlink()  # 覆盖写穿悬空链接文件(符号链接须先 unlink)
-        try:
-            cfg_path.symlink_to(p)
-        except OSError:  # windows/不可符号链接 → 复制兜底
-            shutil.copyfile(p, cfg_path)
-        return str(home)
-    content = _codex_config_toml_content(mcp_servers=mcp_servers)
-    if not cfg_path.exists() or cfg_path.is_symlink() \
-            or cfg_path.read_text(encoding="utf-8") != content:
-        if cfg_path.is_symlink():  # 上一 config_path 世代残留:必须 unlink 防写穿
-            cfg_path.unlink()
-        cfg_path.write_text(content, encoding="utf-8")
-    auth = home / "auth.json"
-    if auth_src is not False and not auth.is_symlink():
-        src = Path(auth_src) if auth_src else Path.home() / ".codex" / "auth.json"
-        if src.exists():
-            if auth.exists() or auth.is_symlink():
-                auth.unlink()  # 旧副本(含悬空链接)→ 替换为链接或复制
-            try:
-                auth.symlink_to(src)
-            except OSError:  # windows/不支持符号链接 → 复制兜底(陈旧风险可忽略:覆写即重置)
-                shutil.copyfile(src, auth)
-    return str(home)
-
-
 class _CodexSynth:
-    """codex 通知 → gh 事件流的合成状态(单次 codex_stream 调用一个实例)。
+    """codex 通知 → gh 事件流的合成状态(单次 stream 调用一个实例)。
 
     为什么是合成而非投影(对比 _DshProj):codex 通知不携带 seq/turn/step 编号、无
     生命周期事件、无 sourceEventSeqs —— 流顺序是唯一权威(与 cc 同构);合成器只维护
@@ -1242,6 +1048,7 @@ class _CodexSynth:
         self.tool_round_open = False  # 本轮已发 tool/result → 下次 LLM item 开一次 step 边界(聚合并行工具)
         self.plan_items: set[str] = set()  # 已发 plan 文本的 itemId(防 delta/completed 双投)
         self.saw_turn_completed = False
+        self.final_response = ""  # 末条 agentMessage 文本(result 终局语义,同 TurnResult)
 
 
 def _codex_item(item) -> Any:
@@ -1273,7 +1080,7 @@ def _codex_tool_result(item, itype: str) -> dict:
             if structured is not None:
                 content_parts.append(json.dumps(structured))
         is_error = (getattr(item, "error", None) is not None
-                    or _codex_val(getattr(item, "status", None)) == "failed")
+                    or codex_val(getattr(item, "status", None)) == "failed")
         arguments = _codex_args_json(getattr(item, "arguments", None))
     elif itype == "dynamicToolCall":
         name = getattr(item, "tool", None) or ""
@@ -1283,7 +1090,7 @@ def _codex_tool_result(item, itype: str) -> dict:
             if _codex_item_type(ci) == "inputText"
         ]
         is_error = (getattr(item, "success", None) is False
-                    or _codex_val(getattr(item, "status", None)) == "failed")
+                    or codex_val(getattr(item, "status", None)) == "failed")
         arguments = _codex_args_json(getattr(item, "arguments", None))
     else:  # commandExecution
         name = "shell"
@@ -1291,7 +1098,7 @@ def _codex_tool_result(item, itype: str) -> dict:
         command = getattr(item, "command", None) or ""
         cwd = getattr(item, "cwd", None) or ""
         is_error = (getattr(item, "exit_code", None) not in (None, 0)
-                    or _codex_val(getattr(item, "status", None)) == "failed")
+                    or codex_val(getattr(item, "status", None)) == "failed")
         # 字段为 LegacyAppPathString(pydantic 路径类型,str 子类)→ 归一为纯 str 再 JSON
         arguments = json.dumps({k: str(v) for k, v in (("command", command), ("cwd", cwd)) if v})
     return {"name": name, "content": "\n".join(p for p in content_parts if p),
@@ -1308,10 +1115,12 @@ def _codex_item_completed(run: EventRecorder, st: _CodexSynth, payload) -> list[
         text = "".join(pieces) or (getattr(item, "text", None) or "")
         if not pieces and text:
             run.text(text)  # 兜底:无增量事件(流缺 chunk)→ 整块一次(cc AssistantMessage 兜底对齐)
-        message = {"role": "assistant", "content": [{"type": "text", "text": text}]}
+        if text:
+            st.final_response = text  # 末条 agentMessage = result 终局文本
+        message = {"role": "assistant", "content": [{"type": "content", "text": text}]}
         phase = getattr(item, "phase", None)
         if phase is not None:
-            message["content"][0]["phase"] = _codex_val(phase)
+            message["content"][0]["phase"] = codex_val(phase)
         run.event("assistant/message", turn=run.turn, step=run.step, message=message,
                   surfaceOp="append", sourceSeqs=list(run._chunk_seqs))
         return [text] if not pieces and text else []
@@ -1328,10 +1137,12 @@ def _codex_item_completed(run: EventRecorder, st: _CodexSynth, payload) -> list[
         )
         return []
     if itype == "reasoning":
-        # thinking 已逐条流式化(见 reasoning/textDelta);仅无 delta 的项整块兜底一次
+        # thinking 已逐条流式化(见 reasoning/textDelta · summaryTextDelta);仅无 delta
+        # 的项整块兜底一次:全量 CoT(content)优先,加密模型仅有摘要(summary)
         content = getattr(item, "content", None) or []
-        if content and item_id not in st.reasoning_seen:
-            run.chunk({"type": "thinking", "index": 0, "text": "\n".join(content)})
+        pieces = content or (getattr(item, "summary", None) or [])
+        if pieces and item_id not in st.reasoning_seen:
+            run.chunk({"type": "thinking", "index": 0, "text": "\n".join(pieces)})
         return []
     if itype == "plan":
         text = getattr(item, "text", None) or ""
@@ -1339,13 +1150,38 @@ def _codex_item_completed(run: EventRecorder, st: _CodexSynth, payload) -> list[
             st.plan_items.add(item_id)
             run.chunk({"type": "plan", "index": 0, "text": text})
         return []
-    return []  # userMessage 已由 run.user_message 合成;fileChange/webSearch/子代理等 v1 静默跳过
+    if itype == "webSearch":
+        # Codex 内置网络搜索(web_search_request):started 是空壳占位(query=""/action=None),
+        # 只认 completed 全字段(item 无 error/status —— 失败由 turn 级表达,见 turn/completed)
+        st.tool_round_open = True
+        act = _codex_item(getattr(item, "action", None))
+        action = None
+        if act is not None:
+            action = {"type": getattr(act, "type", None) or "other"}
+            for k in ("query", "queries", "url", "pattern"):
+                v = getattr(act, k, None)
+                if isinstance(v, (str, list)) and v:
+                    action[k] = v
+        arguments = json.dumps({"query": getattr(item, "query", None) or "",
+                                **({"action": action} if action else {})},
+                               ensure_ascii=False)
+        results = getattr(item, "results", None) or []  # opaque JSON(SDK 不保证字段形状)
+        content = json.dumps(results, ensure_ascii=False, default=str) if results else ""
+        run.tool_call(item_id, "web_search", arguments)
+        run.tool_result(
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": item_id,
+                                          "content": content, "is_error": False}]},
+            call_id=item_id, name="web_search", is_error=False,
+            src_seq=run._call_seqs.get(item_id),
+        )
+        return []
+    return []  # userMessage 已由 run.user_message 合成;fileChange/子代理等 v1 静默跳过
 
 
 def _handle_codex_notification(run: EventRecorder, st: _CodexSynth, notif) -> list[str]:
     """codex 通知 → gh TAXONOMY 事件合成(纯鸭子读取,测试可喂假 Notification)。
 
-    返回本事件产生的文本增量(供 codex_stream yield);codex 无 seq,顺序即通知流顺序;
+    返回本事件产生的文本增量(供 stream yield);codex 无 seq,顺序即通知流顺序;
     turn/step 生命周期由 run.start / step_boundary 合成(prologue 同 cc),codex 的
     turn/started|completed 只贡献 stop_reason / 失败判定。
     """
@@ -1358,7 +1194,7 @@ def _handle_codex_notification(run: EventRecorder, st: _CodexSynth, notif) -> li
     if method == "turn/completed":
         st.saw_turn_completed = True
         turn = getattr(payload, "turn", None) or {}
-        kind = _codex_val(getattr(turn, "status", None))
+        kind = codex_val(getattr(turn, "status", None))
         run.result_stop_reason = kind if isinstance(kind, str) else None
         if kind != "completed":
             error = getattr(turn, "error", None) or {}
@@ -1385,9 +1221,20 @@ def _handle_codex_notification(run: EventRecorder, st: _CodexSynth, notif) -> li
         delta = getattr(payload, "delta", None) or ""
         if delta:
             st.reasoning_seen.add(getattr(payload, "item_id", None) or "")
-            index = getattr(payload, "content_index", None)
+            # 全量 CoT 增量段位 = content_index;摘要增量段位 = summary_index(真实段序,
+            # 段界即 index 跳变;summaryPartAdded 无文本不产事件,段位语义由此承载)
+            index = (getattr(payload, "content_index", None)
+                     if method == "item/reasoning/textDelta"
+                     else getattr(payload, "summary_index", None))
             run.chunk({"type": "thinking", "index": index if index is not None else 0,
                        "text": delta})
+        return []
+    if method == "item/plan/delta":
+        # plan 与文本并行增量:逐条 plan chunk;completed 兜底防重复见 st.plan_items
+        delta = getattr(payload, "delta", None) or ""
+        if delta:
+            st.plan_items.add(getattr(payload, "item_id", None) or "")
+            run.chunk({"type": "plan", "index": 0, "text": delta})  # 无段位字段,单文档
         return []
     if method == "item/completed":
         return _codex_item_completed(run, st, payload)
@@ -1397,269 +1244,196 @@ def _handle_codex_notification(run: EventRecorder, st: _CodexSynth, notif) -> li
         if breakdown is not None:
             run.result_usage = _normalize_usage(breakdown)  # 末条为准 → session/end(同 dsh)
         return []
-    return []  # plan/delta、outputDelta、progress 等:增量已由项目侧逐条投影或属日志型,v1 不进流
+    return []  # summaryPartAdded(段位由 delta 的 summary_index 承载)、outputDelta、progress
+    # 等:无文本增量或属日志型,v1 不进流
+
+
+async def _codex_drain(handle, run: EventRecorder, st: _CodexSynth):
+    """codex 通知流 → 文本增量(stream/result 共用):turn 未完成 → RequestFailedError。
+
+    result 与 stream 同构:终局文本取 st.final_response(末条 agentMessage);
+    不再直取 TurnResult(handle.run() 不暴露通知,事件流将只有生命周期)。
+    """
+    async for notif in handle.stream():
+        for delta in _handle_codex_notification(run, st, notif):
+            yield delta
+    if not st.saw_turn_completed:
+        raise RequestFailedError("turn 未收到完成事件")
 
 
 class Codex(BaseGenerator):
     """codex:OpenAI Codex 命令。配置形态:file 类 —— config_path 指向 config.toml。
 
     SDK 原料通知流 → 本地合成(唯一权威,无投影层;why 见 _CodexSynth docstring);
-    config_path 纯透传(home config.toml 符号链接),mcp_servers 通用注入工具桌。
+    CodexConfig → SDK 装配件(configs.codex_*:codex_home/codex_config/codex_thread/
+    codex_turn);config_path 纯透传(home config.toml 符号链接),mcp_servers 通用注入
+    工具桌;codex_home 缺省回退内置隔离目录,system_prompt → base_instructions。
     """
 
-    id = "codex"
-    name = "Codex"
-    capability = "responses"
-    config_kind = "file"
-    config_path_env = "DEEPWIKI_CODEX_CONFIG"
-    config_default = None
-
     generator = "codex"
-    provider_id = "openai"
 
-    async def stream(self, options, prompt: str, *, session: str | None = None,
+    def __init__(self, config: dict):
+        super().__init__(config)
+        from openai_codex import AsyncCodex  # lazy:测试可喂假模块
+
+        self._codex = AsyncCodex(config=codex_config(config))  # SDK 客户端构造期已建(一实例一客户端)
+
+    async def stream(self, prompt: str, *, session: str | None = None,
                      session_name: str | None = None, run_id: str | None = None,
                      session_ns: str | None = None,
                      context: list[dict] | None = None, retry: dict | None = None,
                      meta: dict | None = None):
-        """Codex(OpenAI Codex SDK)流式应答(监控 + 执行)。
+        """Codex 流式应答(监控 + 执行)。
 
-        对外产出:与 cc_stream 同契约 —— 文本增量(item/agentMessage/delta 优先、
-        item/completed 整块兜底),turn 非 completed → RuntimeError("agent 执行失败: ...");
-        thinking/plan/工具增量只进事件流,不改变产出。codex 通知 1:1 合成 TAXONOMY
-        (无 seq 编号 → 本地合成,见 _CodexSynth);session/turn/step 生命周期由本层合成。
+        对外产出:assistant 文本增量(item/agentMessage/delta 优先、item/completed
+        整块兜底),turn 非 completed → RequestFailedError;thinking/plan/工具增量
+        只进事件流。codex 通知 1:1 合成 TAXONOMY(无 seq 编号 → 本地合成,见
+        _CodexSynth);session/turn/step 生命周期由本层合成。
 
-        options = 调用方组装的鸭子类型配置(仿 dsh 的 options 透传,字段见
-        _codex_field_* 白名单):codex_home/sandbox(full_access 缺省态在调用方侧
-        定)/approval_mode/model/system_prompt → base_instructions/token/env/cwd/
-        codex_bin/config_overrides/launch_args_override/effort/output_schema 等;
-        **codex_home 缺省回退内置隔离目录**(codex_home_path:config.toml 按 mcp_servers
-        渲染 + auth 引导复制,隔离语义同 dsh_cordis_path),显式提供则全权交上层。
+        CodexConfig 键集:codex_home/sandbox/approval_mode/model/system_prompt →
+        base_instructions/token/env/cwd/codex_bin/config_path/config_overrides/
+        launch_args_override/effort/output_schema/mcp_servers 等(None 跳过,见
+        configs.codex_config/thread/turn);codex_home 缺省回退内置隔离目录(隔离语义同 dsh 组合)。
 
-        凭证(cc 同形:环境隔离不隔离凭证通道 —— 隔离只管 config.toml/sessions 设置面,
-        凭证明细见 _codex_home_setup):零配置缺省符号链接引用真实 ~/.codex/auth.json
-        (如 cc 复用 claude CLI 本地登录);显式 options.token → login_api_key 写本隔离
-        home(断链后落盘,不碰用户真实凭证文件);两者皆无且无本地凭证则认证失败由 SDK 报错。
+        凭证(cc 同形:环境隔离不隔离凭证通道):零配置缺省符号链接引用真实
+        ~/.codex/auth.json;显式 config.token → login_api_key 写本隔离 home。
         """
-        from openai_codex import ApprovalMode, AsyncCodex, CodexConfig, JsonRpcError, Sandbox
+        from openai_codex import JsonRpcError
 
-        run = self._recorder(model=getattr(options, "model", None) or "",
-                        session=session, session_ns=session_ns, run_id=run_id,
+        config = self.config  # 构造期注入;运行时不再有 config 参数
+        run = self._recorder(session=session, session_ns=session_ns, run_id=run_id,
                         session_name=session_name, meta=meta)
+        run.init_config(config)  # 构造期配置快照(session/start 之前)
         run.start(context=context, retry=retry)
         run.user_message({"role": "user", "content": [{"type": "text", "text": prompt}]})
-        run.event("request/header", header=_codex_header(options), reason="initial", partial=True)
         st = _CodexSynth(run, prompt)
-        home = getattr(options, "codex_home", None) or codex_home_path()
-        home = _codex_home_setup(home,
-                                 config_path=getattr(options, "config_path", None),
-                                 mcp_servers=getattr(options, "mcp_servers", None))
-
-        fields = _codex_config_fields(options)
-        env = dict(getattr(options, "env", None) or {})
-        env["CODEX_HOME"] = home  # SDK 从不设 CODEX_HOME;隔离凭它生效(见 codex_home_path)
-        fields["env"] = env
-        config = CodexConfig(**fields)
-
-        thread_fields = _codex_thread_fields(options)
-        if (sandbox := getattr(options, "sandbox", None)) is not None:
-            thread_fields["sandbox"] = _codex_lookup(sandbox, Sandbox, "Sandbox")
-        if (approval := getattr(options, "approval_mode", None)) is not None:
-            thread_fields["approval_mode"] = _codex_lookup(approval, ApprovalMode, "approval_mode")
-        token = getattr(options, "token", None) or ""
-        timeout = getattr(options, "timeout_seconds", None)
-
+        timeout = config.get("timeout_seconds")
+        home = codex_home(config)  # config → 隔离 home(装配在 configs.py)
         guard = self._guard(run, error_stage=lambda exc: _codex_stage(exc, (JsonRpcError,)))
-        async with guard, AsyncCodex(config=config) as codex:
-            if token:
+        async with guard, self._codex as codex:  # 客户端构造期已建(一实例一客户端)
+            if (token := config.get("token") or ""):
                 # 显式 token → 登录凭证属本隔离 home:先断符号链接防穿透写坏用户 ~/.codex/auth.json
                 auth = Path(home) / "auth.json"
                 if auth.is_symlink():
                     auth.unlink()
                 await codex.login_api_key(token)
-            thread = await codex.thread_start(**thread_fields)
-            handle = await thread.turn(prompt, **_codex_turn_fields(options))
-
-            async def _consume():
-                async for notif in handle.stream():
-                    for delta in _handle_codex_notification(run, st, notif):
-                        yield delta
-                if not st.saw_turn_completed:
-                    raise RequestFailedError("turn 未收到完成事件")
+            thread = await codex.thread_start(**codex_thread(config))
+            handle = await thread.turn(prompt, **codex_turn(config))
 
             if timeout is not None:
                 async with asyncio.timeout(timeout):  # 兜底 review/approval 等待挂流
-                    async for chunk in _consume():
+                    async for chunk in _codex_drain(handle, run, st):
                         yield chunk
             else:
-                async for chunk in _consume():
+                async for chunk in _codex_drain(handle, run, st):
                     yield chunk
 
+    async def result(self, prompt: str, *, session: str | None = None,
+                     session_name: str | None = None, run_id: str | None = None,
+                     session_ns: str | None = None,
+                     context: list[dict] | None = None, retry: dict | None = None,
+                     meta: dict | None = None) -> str:
+        """非流式最终结果:只拿最后一轮 —— 通知流末条 agentMessage 文本
+        (st.final_response);turn 非 completed / 未产出 → RequestFailedError。
+
+        与 stream 同构消费通知流(_codex_drain):事件全量合成。旧实现直取
+        handle.run() 的 TurnResult —— 不暴露通知,事件流只有生命周期,
+        观测不到 assistant/工具事件。
+        """
+        from openai_codex import JsonRpcError
+
+        config = self.config  # 构造期注入;运行时不再有 config 参数
+        run = self._recorder(session=session, session_ns=session_ns, run_id=run_id,
+                        session_name=session_name, meta=meta)
+        run.init_config(config)  # 构造期配置快照(session/start 之前)
+        run.start(context=context, retry=retry)
+        run.user_message({"role": "user", "content": [{"type": "text", "text": prompt}]})
+        st = _CodexSynth(run, prompt)  # result 与 stream 同构:合成器照常驱动
+        timeout = config.get("timeout_seconds")
+        home = codex_home(config)  # config → 隔离 home(装配在 configs.py)
+        guard = self._guard(run, error_stage=lambda exc: _codex_stage(exc, (JsonRpcError,)))
+        async with guard, self._codex as codex:  # 客户端构造期已建(一实例一客户端)
+            if (token := config.get("token") or ""):
+                auth = Path(home) / "auth.json"
+                if auth.is_symlink():
+                    auth.unlink()
+                await codex.login_api_key(token)
+            thread = await codex.thread_start(**codex_thread(config))
+            handle = await thread.turn(prompt, **codex_turn(config))
+            if timeout is not None:
+                async with asyncio.timeout(timeout):  # 兜底 review/approval 等待挂流
+                    async for _ in _codex_drain(handle, run, st):
+                        pass
+            else:
+                async for _ in _codex_drain(handle, run, st):
+                    pass
+        final = st.final_response or ""
+        if not final:
+            raise RequestFailedError("未产出最终结果")
+        return final
+
 
 # ---------------------------------------------------------------------------
-# 模块级绑定:公开名与签名逐参数等于历史自由函数(调用方按名导入不受影响)
+# 生成器映射:id → 类(简单映射;构造 = GENERATORS[id](config),config 契约见 configs.py)
 # ---------------------------------------------------------------------------
 
-_claude = ClaudeCode()
-_openai = OpenAI()
-_dsh = Dsh()
-_codex = Codex()
-
-cc_stream = _claude.stream
-cc_text = _claude.text
-cc_result = _claude.result
-
-llm_complete = _openai.complete
-llm_stream = _openai.stream
-
-dsh_stream = _dsh.stream
-dsh_text = _dsh.text
-dsh_result = _dsh.result
-
-codex_stream = _codex.stream
-codex_text = _codex.text
-codex_result = _codex.result
+GENERATORS: dict[str, type[BaseGenerator]] = {"cc": ClaudeCode, "dsh": Dsh,
+                                             "codex": Codex, "llm": OpenAI}
+"""生成器注册表:id → 类;构造 = GENERATORS[id](config)(config 契约见 configs.py)。"""
 
 
 # ---------------------------------------------------------------------------
-
+# 直白 API 用法演示:四生成器「你好」问候(上层 API 参考)
+# `python -m gh_puller.agent.generators`
 # ---------------------------------------------------------------------------
-# 生成器映射 + 解析(纯函数)+ 统一分派
-# ---------------------------------------------------------------------------
-
-_GENERATORS: dict[str, BaseGenerator] = {"cc": _claude, "dsh": _dsh, "codex": _codex,
-                                       "llm": _openai}
-GENERATORS = _GENERATORS  # 简单映射(展示投影用;类型见各生成器类属性)
 
 
-def resolve_generator(generator_id: str | None, config: Mapping | None = None,
-                      get_env=None):
-    """(纯函数)g id + 配置 dict → (适配器实例, 规范化配置 dict)。
+if __name__ == "__main__":
+    """cc/codex/llm 三生成器 stream/result 演示(真实任务):访问 GitHub 仓库并一句话
+    介绍 —— result() 各生成器最后一轮语义(多轮工具用后只取终稿)在真实任务下可验。
+    cc/codex 零配置走缺省隔离(llm 按环境取值 OPENAI_BASE_URL/LLM_MODEL/OPENAI_API_KEY);
+    真实任务各生成器可加工具授权:cc 见下方 allowed_tools,codex 以 web_search。
+    注:dsh 不在此演示 —— 本机 SDK 载体(runtime exe)未构建,见 dsh 真机测试恢复点。"""
 
-    - 未知 id → ValueError;键集白名单按类 config_kind 校验(混键/非法键 → 运行前失败)。
-    - file 类(cc/dsh/codex):config_path = 显式 > env(config_path_env)> class 缺省;
-      ~ 展开并绝对化,提供即校验存在/可读。
-    - object 类(llm):provider(model 等)仅认可 "openai"(非法组合运行前抛);
-      model/api_key/base_url 显式 > env > 类缺省。
-    - get_env:key → 环境值 的注入(缺省 os.environ.get;测试传假函数,纯函数可单测)。
-    """
-    if get_env is None:
-        get_env = lambda key: os.environ.get(key, "")
-    config = dict(config or {})
-    generator_id = generator_id or get_env("DEEPWIKI_GENERATOR") or "cc"
-    gen = _GENERATORS.get(generator_id)
-    if gen is None:
-        raise ValueError(f"未知 generator: {generator_id!r}(可选 {sorted(_GENERATORS)})")
-    allowed = {"config_path"} if gen.config_kind == "file" \
-        else {"provider", "model", "base_url", "api_key"}
-    bad_keys = sorted(set(config) - allowed)
-    if bad_keys:
-        raise ValueError(
-            f"generator={generator_id!r} 的 generator_config 仅接受 {sorted(allowed)}"
-            f"(dict 按 generator 包装各自配置);非法键: {bad_keys}"
-        )
-    if gen.config_kind == "file":
-        config_path = config.get("config_path") or get_env(gen.config_path_env or "") \
-            or (gen.config_default or "")
-        if config_path:
-            config_path = os.path.abspath(os.path.expanduser(config_path))
-            if not os.path.isfile(config_path):
-                raise ValueError(
-                    f"generator={generator_id!r} 的配置文件不存在: {config_path}"
-                    f"(可在 generator_config.config_path 提供或设置 {gen.config_path_env or ''})"
-                )
-        return gen, {"config_path": config_path or ""}
-    provider = config.get("provider") or gen.provider
-    if provider != gen.provider:
-        raise ValueError(f"非法组合: generator={generator_id!r} 不支持 provider={provider!r}")
-    return gen, {
-        "provider": provider,
-        "model": config.get("model") or get_env(gen.model_env or "") or "",
-        "api_key": config.get("api_key") or get_env(gen.api_key_env or "") or None,
-        "base_url": config.get("base_url") or get_env(gen.base_url_env or "") or gen.base_url_default,
-    }
+    QUESTION = "请访问 https://github.com/yankils/hello-world 并写一句话介绍这个仓库。"
 
+    async def _demo(gid: str) -> None:
+        config: dict = {}
+        if gid == "cc":
+            # 访问类任务:开放 WebFetch/WebSearch,多轮预算放宽(工具轮次 + 终局)
+            config = {"allowed_tools": ["WebFetch", "WebSearch"], "max_turns": 6}
+        elif gid == "codex":
+            config = {"web_search": True,  # Codex 内置网络搜索:默认安全关闭,须显式启用
+                      "sandbox": "full_access", "approval_mode": "auto_review"}
+        else:  # llm
+            config = {
+                "base_url": os.environ.get("OPENAI_BASE_URL") or "https://api.openai.com/v1",
+                "model": os.environ.get("LLM_MODEL") or "gpt-5.6-luna",
+                "api_key": os.environ.get("OPENAI_API_KEY"),
+            }
+        gen = GENERATORS[gid](config)  # 构造期注入 config;stream/result 只收运行时参数
+        if gid == "llm":
+            prompt = {"messages": [{"role": "user", "content": QUESTION}], "max_tokens": 256}
+        else:
+            prompt = QUESTION
 
-def _llm_url(resolved: Mapping) -> str:
-    return resolved["base_url"] or OpenAI.base_url_default
+        print(f"[{gid}] 流式(stream):")
+        parts = [c async for c in gen.stream(prompt, session_name=f"demo:{gid}")]
+        print("".join(parts) or "(无产出)")
 
+        print(f"[{gid}] 终局(result):")
+        final = await gen.result(prompt, session_name=f"demo-result:{gid}")
+        print(final or "(空)")
 
-async def generate_stream(
-    prompt: str, *,
-    target: Mapping | None = None,
-    options: Mapping | None = None,
-    session: str | None = None, session_name: str | None = None, run_id: str | None = None,
-    session_ns: str | None = None,
-    context: list[dict] | None = None, retry: dict | None = None,
-    meta: dict | None = None, get_env=None,
-):
-    """统一流式分派:按 target.generator 选生成器;契约同各专用 stream / result。
+    async def _main() -> None:
+        for gid in GENERATORS:
+            if gid == "dsh":
+                continue  # 载体未构建,见 dsh 真机测试 TODO(不阻塞演示)
+            try:
+                await _demo(gid)
+            except Exception as e:  # noqa: BLE001 —— 演示脚本:逐路汇报不中断
+                print(f"[{gid}] 失败: {type(e).__name__}: {e}")
+        print("演示结束")
 
-    target = {"generator": id, "generator_config": {...}};options:agent 类 → 适配器
-    鸭子选项(工具装配等),llm → chat/completions 请求体 dict(messages 等键;
-    model 由解析结果注入)。agent 失败抛 RequestFailedError → 包装为
-    RuntimeError("agent 执行失败: {detail}")(对外文案不变);llm 异常原样透传。
-    """
-    gen, resolved = resolve_generator((target or {}).get("generator"),
-                                      (target or {}).get("generator_config"), get_env)
-    if gen.config_kind == "object":
-        payload = {**dict(options or {"messages": []}), "model": resolved["model"]}
-        async for chunk in _openai.stream(url=_llm_url(resolved), payload=payload,
-                                          api_key=resolved["api_key"],
-                                          session=session, session_name=session_name,
-                                          run_id=run_id, session_ns=session_ns,
-                                          context=context, retry=retry, meta=meta):
-            yield chunk
-        return
-    try:
-        async for chunk in gen.stream(
-            options, prompt, session=session, session_name=session_name, run_id=run_id,
-            session_ns=session_ns, context=context, retry=retry, meta=meta,
-        ):
-            yield chunk
-    except RequestFailedError as e:
-        raise RuntimeError(f"agent 执行失败: {e.detail}") from e
+    asyncio.run(_main())
 
-
-async def generate_text(
-    prompt: str, *, target: Mapping | None = None, options: Mapping | None = None,
-    session: str | None = None, session_name: str | None = None, run_id: str | None = None,
-    session_ns: str | None = None,
-    context: list[dict] | None = None, retry: dict | None = None,
-    meta: dict | None = None, get_env=None,
-) -> str:
-    """统一整收(流式文本拼装);语义同 BaseGenerator.text 缺省。"""
-    parts: list[str] = []
-    async for chunk in generate_stream(
-        prompt, target=target, options=options, session=session, session_name=session_name,
-        run_id=run_id, session_ns=session_ns, context=context, retry=retry, meta=meta,
-        get_env=get_env,
-    ):
-        parts.append(chunk)
-    return "".join(parts)
-
-
-async def generate_result(
-    prompt: str, *, target: Mapping | None = None, options: Mapping | None = None,
-    session: str | None = None, session_name: str | None = None, run_id: str | None = None,
-    session_ns: str | None = None,
-    context: list[dict] | None = None, retry: dict | None = None,
-    meta: dict | None = None, get_env=None,
-) -> str:
-    """统一非流式最终结果(llm 走非流式 complete;agent 走专用 result 通道)。"""
-    gen, resolved = resolve_generator((target or {}).get("generator"),
-                                      (target or {}).get("generator_config"), get_env)
-    if gen.config_kind == "object":
-        payload = {**dict(options or {"messages": []}), "model": resolved["model"]}
-        return await _openai.complete(url=_llm_url(resolved), payload=payload,
-                                      api_key=resolved["api_key"],
-                                      session=session, session_name=session_name,
-                                      run_id=run_id, session_ns=session_ns,
-                                      context=context, retry=retry, meta=meta)
-    try:
-        return await gen.result(
-            options, prompt, session=session, session_name=session_name, run_id=run_id,
-            session_ns=session_ns, context=context, retry=retry, meta=meta,
-        )
-    except RequestFailedError as e:
-        raise RuntimeError(f"agent 执行失败: {e.detail}") from e

@@ -15,10 +15,10 @@ seq 序列是流式事件流的稠密序号;文件侧(非流式投影)按行跳�
 与 seq < x 比较,不要求稠密 —— 读者(含前端)不得假定文件 seq 连续。
 - surface 事件 user/message / assistant/message / tool/result 携带全量消息与
   surfaceOp(append 或 {op:'replace', start, end});
-- request/header 快照(ignorable 日志型)给出 config/system/tools ——
-  任意时刻的请求 payload = 该时刻前最近的 header + 折叠到该时刻的 surface;
-- context/inject / context/modify 是上下文注入/修改的解释事件(日志型,不折动),
-  折叠正确性与它们无关 —— 丢弃也只是少了解释,不会误解消息历史。
+- config/init(ignorable 日志型)= **构造期初始配置快照**,在 session/start 之前打印
+  (对应 self._client 的初始配置;api_key/token/base_url 等凭证与端点面剥离,不入流);
+- context/modify 是上下文修改的解释事件(日志型,不折动),折叠正确性与它无关 ——
+  丢弃也只是少了解释,不会误解消息历史。
 
 折叠恢复规范(与 ui/src/monitor/surface.ts 同份语义,本模块不落 Python 实现,
 契约测试见 tests/test_event_taxonomy.py):
@@ -39,6 +39,8 @@ import json
 import time
 import uuid
 
+from gh_puller.utils import _log
+
 
 # 事件全量 taxonomy(点号→斜杠命名,与 dsh type 风格对齐)
 TAXONOMY = frozenset(
@@ -54,9 +56,7 @@ TAXONOMY = frozenset(
         "assistant/message",
         "tool/call",
         "tool/result",
-        "request/header",
-        "request/context",
-        "context/inject",
+        "config/init",
         "context/modify",
         "error",
     }
@@ -73,9 +73,7 @@ NON_STREAM_TYPES = TAXONOMY - {"assistant/chunk"}
 
 # ignorable 日志型事件:读者可安全跳过(不影响消息派生/请求重建);缺失 ignorable
 # 标记的未知类型 → 必须可解析(读者应报错,防静默丢消息)
-LOG_TYPES = frozenset(
-    {"request/header", "request/context", "context/inject", "context/modify"}
-)
+LOG_TYPES = frozenset({"config/init", "context/modify"})
 
 
 def type_of(evt: dict) -> str:
@@ -89,7 +87,8 @@ def type_of(evt: dict) -> str:
 def new_event(evt_type: str, **data) -> dict:
     """构造事件信封:补 id/ts,type/data 分组,校验 type 与字段可 JSON 序列化。
 
-    会话属性(session/run_id/label/provider/model/seq)由适配器附加,不在此处;
+    封套身份仅 session + seq(接收端按 session 归组、seq 排序);
+    run_id/label/generator/model/retry/meta 是 session/start 的**快照**,不逐事件携带;
     surface 事件强制校验 message + surfaceOp(防适配器漏字段导致折叠不可复现)。
     """
     if evt_type not in TAXONOMY:
@@ -172,14 +171,12 @@ def set_active_bus(bus: "EventBus | None") -> None:
 class EventRecorder:
     """单次运行的事件发布器:维护会话信封/turn/step/seq 计数,归一化后广播事件。"""
 
-    def __init__(self, session: str, provider: str, model: str, *, generator: str = "",
+    def __init__(self, session: str, *, generator: str = "",
                  label: str | None = None,
                  run_id: str | None = None, meta=None):
         self.session = session
         self.label = label or session
-        self.provider = provider
         self.generator = generator
-        self.model = model
         self.run_id = run_id
         self.meta = meta
         self.seq = 0
@@ -194,6 +191,12 @@ class EventRecorder:
         self._tool_result: dict | None = None
         self._chunk_seqs: list[int] = []  # 本 step 的 assistant/chunk seq(消息 sourceSeqs)
         self._call_seqs: dict[str, int] = {}  # callId → tool/call 的 seq
+        self._tool_results_seen: set[str] = set()  # 已发射 tool/result 的 callId(流/用户消息双路去重)
+        # partial 模式重建缓冲(cc 真机 CLI:SDK 消息标记 content 为空,全量从本消息增量重建)
+        self._msg_text = ""  # 本 assistant 消息的文本增量累计
+        self._msg_thinking = ""  # 本 assistant 消息的思考增量累计
+        self._msg_tool_calls: list[tuple[str, str, str]] = []  # (callId, name, arguments)
+        self._msg_stop_reason: str | None = None  # message_delta.stop_reason(消息级)
         self._step_open = False
         self._ended = False
         self._reason: str | None = None  # error 事件后供 session/end.reason 使用
@@ -207,16 +210,20 @@ class EventRecorder:
         if bus is None or not bus.enabled:
             return None  # 无通道:零开销短路(publish 语义不变)
         evt = new_event(evt_type, **data)
-        evt["session"] = self.session
-        evt["run_id"] = self.run_id
-        evt["label"] = self.label
-        evt["generator"] = self.generator
-        evt["provider"] = self.provider
-        evt["model"] = self.model
+        evt["session"] = self.session  # 身份仅 session;元数据快照见 session/start
         evt["seq"] = self.seq
         self.seq += 1
         bus.publish(evt)
         return evt
+
+    def init_config(self, config: dict) -> None:
+        """构造期初始配置快照(config/init;凭证/端点面剥离;须在 start() 之前打印)。
+
+        对应 self._client 的初始配置 —— config 的观测面统一在此,不再附着
+        session/start 与 turn/start(身份 = session id;元数据快照见本事件)。
+        """
+        creds = ("api_key", "token", "base_url")
+        self.event("config/init", config={k: v for k, v in config.items() if k not in creds})
 
     def start(self, *, context: list[dict] | None = None, retry: dict | None = None,
               prologue: bool = True) -> None:
@@ -226,7 +233,7 @@ class EventRecorder:
         不合成 turn/start + step/start,且 _step_open 保持 False(dsh 路径不调 step_boundary)。
         """
         self.event("session/start", run_id=self.run_id, label=self.label, generator=self.generator,
-                   provider=self.provider, model=self.model, retry=retry, meta=self.meta)
+                   retry=retry, meta=self.meta)
         for ctx in context or []:
             self.event(ctx["type"], **ctx["data"])  # 日志型说明事件:重放于 turn 之前
         if prologue:
@@ -240,8 +247,16 @@ class EventRecorder:
             self.event("step/end", turn=self.turn, step=self.step)
         self.step += 1
         self._chunk_seqs = []
+        self._msg_reset()  # 新 LLM 轮:旧消息缓冲(若有残留)清空
         self._step_open = True
         self.event("step/start", turn=self.turn, step=self.step)
+
+    def _msg_reset(self) -> None:
+        """本 assistant 消息增量缓冲清零(消息标记/新消息起点处调用)。"""
+        self._msg_text = ""
+        self._msg_thinking = ""
+        self._msg_tool_calls = []
+        self._msg_stop_reason = None
 
     def user_message(self, message: dict, *, source: dict | None = None,
                      surface_op: str | dict = "append") -> None:
@@ -252,20 +267,28 @@ class EventRecorder:
                    source=source, surfaceOp=surface_op)
 
     def chunk(self, chunk: dict) -> None:
-        """assistant/chunk 原始增量;seq 记入本 step 的 sourceSeqs。"""
+        """assistant/chunk 原始增量;seq 记入本 step 的 sourceSeqs。
+
+        段型 schema:{"type": "thinking"|"content"|"tool_call"(|"plan"), "index": 段序,
+        "text": 文本增量}(type 已定段名,文本字段统一 text;tool_call 负载为 partial_json)。
+        """
         evt = self.event("assistant/chunk", turn=self.turn, step=self.step, chunk=chunk)
         if evt is not None:
             self._chunk_seqs.append(evt["seq"])
+        if chunk.get("type") == "thinking":
+            self._msg_thinking += chunk.get("text", "")
 
     def text(self, text: str, *, index: int = 0) -> None:
         self.text_chars += len(text)
-        self.chunk({"type": "text", "index": index, "text": text})
+        self._msg_text += text
+        self.chunk({"type": "content", "index": index, "text": text})
 
     def tool_call(self, call_id: str, name: str | None, arguments: str) -> None:
         evt = self.event("tool/call", turn=self.turn, step=self.step, callId=call_id,
                          name=name, arguments=arguments)
         if evt is not None:
             self._call_seqs[call_id] = evt["seq"]
+        self._msg_tool_calls.append((call_id, name, arguments))
 
     def tool_result(self, message: dict, *, call_id: str, name: str | None,
                     is_error: bool, src_seq: int | None = None) -> None:
