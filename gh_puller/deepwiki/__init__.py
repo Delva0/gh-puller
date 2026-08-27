@@ -10,9 +10,10 @@
   单次补全,检索上下文 = graphify 子图 → 真实代码行窗)。提示词全部为 deepwiki-open 原文。
 
 已知简化(v1,详见 gh_puller/envs.py):克隆走 git CLI;token 上限按字符数/4 估算;
-语言仅 en/zh;聊天记忆由单次 agent 会话内承。模型极简:选型 dict(choice)= {generator,
-generator_config};解析/校验唯一知识源在 deepwiki.utils._resolve_generator 纯函数
-(agent 侧契约见 gh_puller.agent.configs.py)。
+语言仅 en/zh;聊天记忆由单次 agent 会话内承。模型极简:选型为 generator +
+generator_config 两个散装字段(engine 全部函数同签名;wire 的 target dict 在 app 层拆包);
+解析/校验唯一知识源在 deepwiki.utils.resolve_generator 纯函数(agent 侧契约见
+gh_puller.agent.configs.py)。
 
 本包是引擎(无 FastAPI 依赖):HTTP 端点层(SSE/WS)在 apps/deepwiki-webui/server/app.py;
 任务状态机/调度/进度投影在其 server/tasks.py。续跑落盘(deepwiki_resume_*)语义见 ./cache.py。

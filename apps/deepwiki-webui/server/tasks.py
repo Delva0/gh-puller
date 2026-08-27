@@ -49,7 +49,7 @@ from gh_puller.deepwiki.cache import (
     _wiki_cache_dir,
 )
 from gh_puller.deepwiki.wiki import _wiki_pipeline
-from gh_puller.deepwiki.utils import _log, _merge_creds, _resolve_generator, _strip_creds
+from gh_puller.deepwiki.utils import log, merge_creds, resolve_generator, strip_creds
 from gh_puller.utils import (
     Repo,
     TaskStatus,
@@ -122,7 +122,7 @@ class WikiTask(BaseModel):
     def key(self) -> str:
         """注册表去重键 = repo 键 + target 判等摘要:同一仓库/语言下
         不同 target 的任务可并发并存(隔离生成产物与续跑状态)。"""
-        return f"{self.repo_key}@{_generator_digest(self.request['target'])}"
+        return f"{self.repo_key}@{_generator_digest(self.request['target'].get('generator'), self.request['target'].get('generator_config'))}"
 
     def to_status(self) -> dict:
         r = self.request
@@ -276,35 +276,35 @@ class WikiTaskRegistry(TaskRegistry):
     async def is_cached(self, task: WikiTask) -> bool:
         r = task.request
         cache = await read_wiki_cache(
-            r["owner"], r["repo"], r["type"], r["language"], digest=_generator_digest(r["target"])
+            r["owner"], r["repo"], r["type"], r["language"], digest=_generator_digest(r["target"].get("generator"), r["target"].get("generator_config"))
         )
         if cache is None:
             return False
         # 判等身份与缓存内记录对齐(旧缓存字段缺失/旧契约 → 判不匹配,重新生成)
-        if _cache_generator_matches(cache, r["target"]):
+        if _cache_generator_matches(cache, r["target"].get("generator"), r["target"].get("generator_config")):
             return True
-        _log(
+        log(
             f"成品缓存 target 不匹配({_cache_identity(cache)!r} vs "
-            f"{_resolve_generator(r['target'])!r}),忽略并重新生成: {r['owner']}/{r['repo']}"
+            f"{resolve_generator(r['target'])!r}),忽略并重新生成: {r['owner']}/{r['repo']}"
         )
         return False
 
     async def on_cache_hit(self, task: WikiTask) -> None:
         r = task.request
         await delete_resume_state(
-            r["owner"], r["repo"], r["type"], r["language"], digest=_generator_digest(r["target"])
+            r["owner"], r["repo"], r["type"], r["language"], digest=_generator_digest(r["target"].get("generator"), r["target"].get("generator_config"))
         )
 
     async def load_resume(self, task: WikiTask) -> WikiTask | None:
         r = task.request
         state = await read_resume_state(
-            r["owner"], r["repo"], r["type"], r["language"], digest=_generator_digest(r["target"])
+            r["owner"], r["repo"], r["type"], r["language"], digest=_generator_digest(r["target"].get("generator"), r["target"].get("generator_config"))
         )
         if state is None:
             return None
         # 状态文件按 target 摘要隔离(同仓库不同 target 并存);凭证从当前提交合并
         # (落盘状态只存公开三元组,见 _persist_state)
-        merged = {**state["request"], "target": _merge_creds(state["request"].get("target"), r["target"])}
+        merged = {**state["request"], "target": merge_creds(state["request"].get("target"), r["target"])}
         return WikiTask(
             request=merged,  # dict → BaseModel 校验重建
             status=(
@@ -341,11 +341,11 @@ registry = WikiTaskRegistry(
 async def _persist_state(task: WikiTask) -> None:
     """把任务当前进度落盘(结构/已完成页/状态);并发写由模块锁串行。
 
-    落盘即剥离凭证:request.target 存 _strip_creds(只含判等身份字段),
+    落盘即剥离凭证:request.target 存 strip_creds(只含判等身份字段),
     续跑合并用户重新提交的凭证(见 WikiTaskRegistry.load_resume)。
     """
     req = dict(task.request)
-    req["target"] = _strip_creds(task.request["target"])  # strip → 公开三元组(仅判等身份字段)
+    req["target"] = strip_creds(task.request["target"])  # strip → 公开三元组(仅判等身份字段)
     state = {
         "version": 1,
         "request": req,
@@ -359,7 +359,7 @@ async def _persist_state(task: WikiTask) -> None:
     async with _state_write_lock:
         await write_resume_state(
             req["owner"], req["repo"], req["type"], req["language"], state,
-            digest=_generator_digest(req["target"]),
+            digest=_generator_digest(req["target"].get("generator"), req["target"].get("generator_config")),
         )
 
 
@@ -402,12 +402,12 @@ async def generate_repo_wiki(task: WikiTask) -> None:
     r = task.request
     try:
         await _persist_state(task)  # 入口即落盘:中断于索引/结构阶段的也能续跑
-        pipeline = _wiki_pipeline(r["target"])  # 唯一分派:全流程共用一个实例
+        pipeline = _wiki_pipeline(r["target"].get("generator"), r["target"].get("generator_config"))  # 唯一分派:全流程共用一个实例
         repo = Repo(r["repo_url"], r["type"], access_token=r.get("token"))
         # 索引:只建一次(v1 无增量;已存在即跳过)
         if not _index_ready(repo):
             task.status = TaskStatus.INDEXING
-            _log(f"索引中: {task.repo_key}")
+            log(f"索引中: {task.repo_key}")
             extra_excludes = (
                 [*r["excluded_dirs"], *r["excluded_files"]]
                 if (r["excluded_dirs"] or r["excluded_files"]) else None
@@ -417,7 +417,7 @@ async def generate_repo_wiki(task: WikiTask) -> None:
         prepared = await _prepare_repo(r, repo)
 
         if task.wiki_structure is None or pipeline.needs_structure_regenerate(
-            project_key=task.repo_key, choice=r["target"],
+            project_key=task.repo_key, generator=r["target"].get("generator"), generator_config=r["target"].get("generator_config"),
         ):
             # 续跑:结构已落盘(cc 下以交付文件为准,被删则强制重生成)则跳过 agent 调用
             task.status = TaskStatus.DETERMINING_STRUCTURE
@@ -427,22 +427,24 @@ async def generate_repo_wiki(task: WikiTask) -> None:
         task.status = TaskStatus.GENERATING
         task.generated_pages.update(
             await pipeline.hydrate_pages(
-                project_key=task.repo_key, choice=r["target"], repo=prepared.repo,
+                project_key=task.repo_key, generator=r["target"].get("generator"), generator_config=r["target"].get("generator_config"), repo=prepared.repo,
                 structure=task.wiki_structure, default_branch=prepared.default_branch,
             )
         )  # cc 以文件为权威覆盖落盘 state 旧文本;llm no-op(返回空快照)
         pages = await _generate_pages(task, pipeline, prepared)
 
         if not await save_generated_wiki(
-            r["owner"], r["repo"], r["type"], r["repo_url"], r["target"],
+            r["owner"], r["repo"], r["type"], r["repo_url"],
             task.wiki_structure, pages, language=r["language"],
+            generator=r["target"].get("generator"),
+            generator_config=r["target"].get("generator_config"),
         ):
             raise RuntimeError("写 wiki 缓存失败")  # 不删状态:再提交仅重试写缓存
         await delete_resume_state(
-            r["owner"], r["repo"], r["type"], r["language"], digest=_generator_digest(r["target"])
+            r["owner"], r["repo"], r["type"], r["language"], digest=_generator_digest(r["target"].get("generator"), r["target"].get("generator_config"))
         )
         task.status = TaskStatus.COMPLETED
-        _log(f"wiki 任务完成: {task.repo_key}")
+        log(f"wiki 任务完成: {task.repo_key}")
     except asyncio.CancelledError:  # Ctrl+C/停机:尽力持久化一次后重新抛出
         await _persist_state(task)
         raise
@@ -450,7 +452,7 @@ async def generate_repo_wiki(task: WikiTask) -> None:
         task.status = TaskStatus.FAILED
         task.error = str(e)
         await _persist_state(task)  # FAILED 也落盘,后续提交可续跑
-        _log(f"wiki 任务失败: {task.repo_key} - {e}")
+        log(f"wiki 任务失败: {task.repo_key} - {e}")
 
 
 async def _determine_structure(
@@ -460,7 +462,7 @@ async def _determine_structure(
     r = task.request
     task.default_branch = prepared.default_branch  # 记录(进度/展示;URL 单源见 PreparedRepo)
     return await pipeline.determine_structure(
-        choice=r["target"], repo=prepared.repo, owner=r["owner"], repo_name=r["repo"],
+        generator=r["target"].get("generator"), generator_config=r["target"].get("generator_config"), repo=prepared.repo, owner=r["owner"], repo_name=r["repo"],
         file_tree=prepared.file_tree, readme=prepared.readme,
         comprehensive=r["comprehensive"], language=r["language"], run_id=task.repo_key,
     )
@@ -472,7 +474,7 @@ async def _generate_page(
     """生成单个页面(编排:取流水线实例与仓库上下文;内容与终态格式化收在 pipeline 内)。"""
     r = task.request
     content = await pipeline.generate_page(
-        choice=r["target"], repo=prepared.repo, page=page,
+        generator=r["target"].get("generator"), generator_config=r["target"].get("generator_config"), repo=prepared.repo, page=page,
         language=r["language"], default_branch=prepared.default_branch, run_id=task.repo_key,
     )
     return dataclasses.replace(page, content=content)
@@ -487,12 +489,12 @@ async def _generate_page_with_retry(
             return await _generate_page(task, page, pipeline, prepared)
         except Exception as e:  # noqa: BLE001 - 瞬时/永久错误统一由重试预算兜底
             last_error = e
-            _log(f"页面 {page.id} 生成失败(尝试 {attempt + 1}/{_WIKI_PAGE_RETRIES + 1}): {e}")
+            log(f"页面 {page.id} 生成失败(尝试 {attempt + 1}/{_WIKI_PAGE_RETRIES + 1}): {e}")
     # 重试耗尽:回退错误占位页,保证整个 wiki 仍能完成
     content = f"Error generating content: {last_error}"
     r = task.request
     pipeline.write_error_page(
-        project_key=task.repo_key, choice=r["target"], page=page, content=content,
+        project_key=task.repo_key, generator=r["target"].get("generator"), generator_config=r["target"].get("generator_config"), page=page, content=content,
     )
     return dataclasses.replace(page, content=content)
 

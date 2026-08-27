@@ -34,7 +34,7 @@ from typing import TYPE_CHECKING, Literal
 
 from .. import envs
 from ..utils import Repo, TaskStatus, _log
-from .utils import _config_kind, _generator_identity, _resolve_generator
+from .utils import config_kind, generator_identity, resolve_generator
 
 if TYPE_CHECKING:  # 仅注解:wiki.py 反向依赖本模块,避免运行时导入环
     from .wiki import WikiPage, WikiStructureModel
@@ -75,20 +75,20 @@ def _index_ready(repo: Repo) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def _generator_digest(choice: dict | None = None, get_env=None) -> str:
+def _generator_digest(generator: str | None = None, generator_config: dict | None = None, get_env=None) -> str:
     """generator 选型判等身份(不含凭证)的稳定摘要(8 hex)。
 
     身份 = generator + 配置摘要:file 类 = config_path(路径是身份;内容随文件,
     不读取);object 类 = provider|model。任务 id / 续跑状态 / 成品缓存路径共用:
     同一仓库与语言下不同选型的结果可以并发并存且互不串用。
     """
-    generator_id, resolved = _resolve_generator(choice, get_env)
+    generator_id, resolved = resolve_generator(generator, generator_config, get_env)
     return _generator_digest_of(generator_id, resolved)
 
 
 def _generator_digest_of(generator_id: str, resolved: dict) -> str:
     return hashlib.sha1(
-        f"{generator_id}|{_generator_identity(generator_id, resolved)}".encode()
+        f"{generator_id}|{generator_identity(generator_id, resolved)}".encode()
     ).hexdigest()[:8]
 
 
@@ -101,10 +101,10 @@ def _cache_identity(cache: dict) -> tuple[str, str]:
     return (generator, f"{cache.get('provider') or ''}|{cache.get('model') or ''}")
 
 
-def _cache_generator_matches(cache: dict, choice: dict | None) -> bool:
+def _cache_generator_matches(cache: dict, generator: str | None = None, generator_config: dict | None = None) -> bool:
     """成品缓存与公开选型是否同轨(摘要隔离后的二次校验,防手改文件名)。"""
-    generator_id, resolved = _resolve_generator(choice)
-    return _cache_identity(cache) == (generator_id, _generator_identity(generator_id, resolved))
+    generator_id, resolved = resolve_generator(generator, generator_config)
+    return _cache_identity(cache) == (generator_id, generator_identity(generator_id, resolved))
 
 
 def _wiki_cache_path(
@@ -154,8 +154,8 @@ async def save_wiki_cache(
 
 async def save_generated_wiki(
     owner: str, repo: str, repo_type: str, repo_url: str,
-    choice: dict | None, structure: WikiStructureModel,
-    pages: dict[str, WikiPage], language: str = "en",
+    structure: WikiStructureModel, pages: dict[str, WikiPage], language: str = "en",
+    generator: str | None = None, generator_config: dict | None = None,
 ) -> bool:
     """把一次完整生成结果落成品缓存(缓存层职责:判等身份 + 组装 + 写盘)。
 
@@ -164,8 +164,8 @@ async def save_generated_wiki(
     (键集逐字保留),公开身份入缓存、凭证不进(**token=None**);file 类不落
     provider/model(provider=None/model="")。
     """
-    generator_id, resolved = _resolve_generator(choice)
-    identity = _generator_identity(generator_id, resolved)  # file 类:config_path;object:"provider|model"
+    generator_id, resolved = resolve_generator(generator, generator_config)
+    identity = generator_identity(generator_id, resolved)  # file 类:config_path;object:"provider|model"
     object_parts = identity.split("|", 1)
     cache_record = {
         "wiki_structure": dataclasses.asdict(structure),
@@ -182,7 +182,7 @@ async def save_generated_wiki(
         "provider": object_parts[0] if len(object_parts) > 1 else None,  # object 类才落
         "model": object_parts[1] if len(object_parts) > 1 else "",  # 旧缓存兼容字段
         "generator": generator_id,  # 成品缓存记判等身份,cache 命中时校验(见 is_cached)
-        "config_path": identity if _config_kind(generator_id) == "file" else None,
+        "config_path": identity if config_kind(generator_id) == "file" else None,
     }
     return await save_wiki_cache(
         owner=owner,

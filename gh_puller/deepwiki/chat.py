@@ -1,7 +1,7 @@
 """chat 主线:一次 chat 问答的流式应答(纯文本 chunk 序列,前后端协议同原
 research_chat)。
 
-入口 chat_stream 按 choice.generator 内联分派(cc/dsh/codex → _agent_chat 现代
+入口 chat_stream 按 generator 内联分派(cc/dsh/codex → _agent_chat 现代
 agent 模式:一次提问 agent 内部多轮工具调用;llm → _llm_chat 原式单次补全,
 分派规则与 wiki._wiki_pipeline 同);本主线专用 helper:历史转写
 (_render_natural_history / _build_turn_history)、continuation 回退
@@ -14,8 +14,9 @@ Ask.tsx 的提取/完成判定正则,见常量注释)。跨功能通用 helper(�
 from __future__ import annotations
 
 from .. import envs  # 模块对象绑定:属性一律调用时取(patch/强刷活性)
-from ..utils import Repo, _estimate_tokens, _log
+from ..utils import Repo, _estimate_tokens
 from . import utils
+from .utils import log
 
 # ---------------------------------------------------------------------------
 # 深研究模板(agent 路 = 折叠版:一次回答完成整轮研究;llm 路 = 原版 5 轮协议,
@@ -143,19 +144,13 @@ IMPORTANT:You MUST respond in {language_name} language.
 # ---------------------------------------------------------------------------
 
 
-def _render_natural_history(messages: list[dict]) -> tuple[str, list[dict]]:
-    """agent 路对话历史:自然转写(无 <turn>/<conversation_history> 伪标签),含裁剪说明事件。"""
+def _render_natural_history(messages: list[dict]) -> str:
+    """agent 路对话历史:自然转写(无 <turn>/<conversation_history> 伪标签);输入过大时省略历史。"""
     history_parts: list[str] = []
-    context: list[dict] = []
     if len(messages) > 1:
         last = messages[-1]
         if _estimate_tokens(last.get("content", "")) > envs.CHAT_TOKEN_LIMIT_ESTIMATE:
-            _log(f"输入过大(估算 {_estimate_tokens(last.get('content', ''))} tokens),省略对话历史")
-            context.append({"type": "context/modify",
-                            "data": {"target": "chat-history", "kind": "trim",
-                                     "cause": "token-limit", "detail": "省略对话历史",
-                                     "removed": {"n_turns": len(messages) - 1,
-                                                 "est_tokens": _estimate_tokens(last.get("content", ""))}}})
+            log(f"输入过大(估算 {_estimate_tokens(last.get('content', ''))} tokens),省略对话历史")
         else:
             for i in range(0, len(messages) - 1, 2):
                 user, assistant = messages[i], messages[i + 1]
@@ -164,8 +159,8 @@ def _render_natural_history(messages: list[dict]) -> tuple[str, list[dict]]:
                         f"User: {user.get('content', '')}\nAssistant: {assistant.get('content', '')}"
                     )
     if history_parts:
-        return "Previous conversation:\n" + "\n\n".join(history_parts) + "\n\n", context
-    return "", context
+        return "Previous conversation:\n" + "\n\n".join(history_parts) + "\n\n"
+    return ""
 
 
 def _build_turn_history(messages: list[dict]) -> str:
@@ -196,7 +191,7 @@ def _resolve_chat_continuation(last: dict, messages: list[dict]) -> None:
 
 
 async def _agent_chat(
-    *, choice: dict | None, repo: Repo, messages: list[dict],
+    *, generator: str | None = None, generator_config: dict | None = None, repo: Repo, messages: list[dict],
     language: str = "en", research_iteration: int = 1,
 ):
     """一次 chat 问答的流式应答(纯文本 chunk 序列,前后端协议同原 research_chat);
@@ -208,7 +203,7 @@ async def _agent_chat(
         raise ValueError("Last message must be from the user")
 
     # 注:未索引的前置校验属端点守卫,已上移到应用层,生成器内不再重复
-    fmt = utils._prompt_fmt(repo, language=language)
+    fmt = utils.prompt_fmt(repo, language=language)
     is_deep = last.get("mode") == "deep_research"
     if is_deep:
         # 折叠:一次回答完成整轮研究(agent 内部多轮工具调用);continuation 回退
@@ -218,29 +213,25 @@ async def _agent_chat(
     else:
         system = utils._SIMPLE_CHAT_SYSTEM_PROMPT.format(**fmt)
 
-    # 对话历史自然转写(无 <turn> 伪标签);输入过大时省略历史。
-    # 裁剪/注记作为监控上下文说明事件(context/modify)伴跑,不改变折叠结果
-    adapter = utils._adapter(choice, system_prompt=system, repo=repo)
-    history, context = _render_natural_history(messages)
-    context.append({"type": "context/modify",
-                    "data": {"target": "user-message", "phase": "prompt-assembly",
-                             "provenance": "deepwiki:note", "text": utils._agent_note(adapter.generator)}})
+    # 对话历史自然转写(无 <turn> 伪标签);输入过大时省略历史。引擎不传
+    # context 类"假日志"事件(监控事件由适配器内 EventRecorder 发布)
+    adapter = utils.adapter(generator, generator_config=generator_config, system_prompt=system, repo=repo)
+    history = _render_natural_history(messages)
 
-    prompt = history + utils._agent_note(adapter.generator) + f"<query>\n{last.get('content', '')}\n</query>\n\nAssistant: "
+    prompt = history + utils.agent_note(adapter.generator) + f"<query>\n{last.get('content', '')}\n</query>\n\nAssistant: "
     try:
         async for chunk in adapter.stream(
-            prompt, session_name=f"chat:{repo.name}",
-            run_id=f"chat:{repo.name}", context=context,
+            prompt, session_name=f"chat:{repo.name}", run_id=f"chat:{repo.name}",
         ):
             yield chunk
     except Exception as e:  # 执行期失败降级为可读错误文本(同原 stream_and_fallback 语义)
-        err = utils._failure(e)  # RequestFailedError 先转「agent 执行失败」再降级(同原包装时序)
-        _log(f"chat agent 错误: {err}")
+        err = utils.failure(e)  # RequestFailedError 先转「agent 执行失败」再降级(同原包装时序)
+        log(f"chat agent 错误: {err}")
         yield f"\n\n(抱歉,本次请求处理失败: {err})"
 
 
 async def _llm_chat(
-    *, choice: dict | None, repo: Repo, messages: list[dict],
+    *, generator: str | None = None, generator_config: dict | None = None, repo: Repo, messages: list[dict],
     language: str = "en", research_iteration: int = 1,
 ):
     """llm 路 chat:原版 research_chat 等价(模式/迭代选模板、原版历史拼接、
@@ -251,7 +242,7 @@ async def _llm_chat(
     if last.get("role") != "user":
         raise ValueError("Last message must be from the user")
 
-    fmt = utils._prompt_fmt(repo, language=language)
+    fmt = utils.prompt_fmt(repo, language=language)
     is_deep = last.get("mode") == "deep_research"
     if is_deep:
         # 原版复刻:5 轮迭代由前端驱动,后端只按迭代号选模板 + 拼历史
@@ -268,8 +259,8 @@ async def _llm_chat(
         system = utils._SIMPLE_CHAT_SYSTEM_PROMPT.format(**fmt)
 
     history = _build_turn_history(messages)
-    async for chunk in utils._llm_research_chat(
-        system, last.get("content", ""), choice=choice, repo=repo,
+    async for chunk in utils.llm_research_chat(
+        system, last.get("content", ""), generator=generator, generator_config=generator_config, repo=repo,
         session_name=f"chat:{repo.name}", run_id=f"chat:{repo.name}",
         conversation_history=history,
     ):
@@ -282,14 +273,14 @@ async def _llm_chat(
 
 
 async def chat_stream(
-    *, choice: dict | None, repo: Repo, messages: list[dict],
+    *, generator: str | None = None, generator_config: dict | None = None, repo: Repo, messages: list[dict],
     language: str = "en", research_iteration: int = 1,
 ):
-    """一次 chat 问答的流式应答(纯文本 chunk 序列,前后端协议同原 research_chat);按 choice.generator 分派双路。"""
-    gen = utils._resolve_generator(choice)[0]
+    """一次 chat 问答的流式应答(纯文本 chunk 序列,前后端协议同原 research_chat);按 generator 分派双路。"""
+    gen = utils.resolve_generator(generator, generator_config)[0]
     impl = _agent_chat if gen in ("cc", "dsh", "codex") else _llm_chat
     async for chunk in impl(
-        choice=choice, repo=repo, messages=messages,
+        generator=generator, generator_config=generator_config, repo=repo, messages=messages,
         language=language, research_iteration=research_iteration,
     ):
         yield chunk

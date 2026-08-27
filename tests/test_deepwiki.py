@@ -28,7 +28,7 @@ from gh_puller.deepwiki import (
 from gh_puller.deepwiki import utils as deepwiki_utils
 from gh_puller.deepwiki.cache import _generator_digest, _graph_dir, _resume_state_path
 from gh_puller.deepwiki.codemap import _locate_snippet
-from gh_puller.deepwiki.utils import _adapter, _agent_note, _graphify_mcp
+from gh_puller.deepwiki.utils import _graphify_mcp, adapter, agent_note
 from gh_puller.deepwiki.wiki import (
     RepoUrlContext,
     _wiki_pipeline,
@@ -192,7 +192,7 @@ def _make_request(owner: str, repo: str) -> dict:
 
 def _digest_of(choice: "dict | None") -> str:
     """选型 dict → 稳定摘要(测试与实现共用一个函数)。"""
-    return _generator_digest(choice)
+    return _generator_digest((choice or {}).get("generator"), (choice or {}).get("generator_config"))
 
 
 def _repo_of(req: dict) -> Repo:
@@ -200,10 +200,16 @@ def _repo_of(req: dict) -> Repo:
     return Repo(req["repo_url"], req["type"], access_token=req.get("token"))
 
 
+def _gen_kwargs(choice: dict | None) -> dict:
+    """散装参数测试辅助:选型 dict(wire target)→ generator/generator_config 拆分 kwargs。"""
+    c = choice or {}
+    return {"generator": c.get("generator"), "generator_config": c.get("generator_config")}
+
+
 async def _chat(req: dict) -> list[str]:
     """散装参数测试辅助:调用模块级 chat_stream(请求为 dict;agent/llm 分派随 target)。"""
     return [c async for c in deepwiki.chat_stream(
-        choice=req["target"], repo=_repo_of(req), messages=req["messages"],
+        **_gen_kwargs(req["target"]), repo=_repo_of(req), messages=req["messages"],
         language=req.get("language", "en"),
         research_iteration=req.get("research_iteration", 1),
     )]
@@ -212,7 +218,7 @@ async def _chat(req: dict) -> list[str]:
 async def _codemap(req: dict) -> list[dict]:
     """散装参数测试辅助:调用模块级 generate_codemap 并解析 NDJSON 事件(请求为 dict)。"""
     return [json.loads(ev) async for ev in deepwiki.generate_codemap(
-        choice=req["target"], repo=_repo_of(req), question=req["question"],
+        **_gen_kwargs(req["target"]), repo=_repo_of(req), question=req["question"],
         language=req.get("language", "en"),
     )]
 
@@ -258,18 +264,18 @@ class _FakeGenerator:
 
 @pytest.mark.asyncio
 async def test_agent_dispatch_by_generator(monkeypatch):
-    """分派冒烟(原 generate_* 迁移测试接替):模块级 _adapter 按 choice.generator
-    经 GENERATORS[gid](config) 收敛构造;空选型走 env 缺省。"""
+    """分派冒烟(原 generate_* 迁移测试接替):模块级 adapter 按 generator
+    (wire target 拆包)经 GENERATORS[gid](config) 收敛构造;空选型走 env 缺省。"""
     for gid in ("cc", "dsh", "codex"):
         monkeypatch.setitem(GENERATORS, gid, _FakeGenerator)
         monkeypatch.setattr(_FakeGenerator, "generator", gid)
-        adapter = _adapter({"generator": gid}, system_prompt="s")
-        assert adapter.generator == gid and isinstance(adapter, _FakeGenerator)
-        assert adapter.config["system_prompt"] == "s"  # 构造期注入(config 整体)
+        inst = adapter(**_gen_kwargs({"generator": gid}), system_prompt="s")
+        assert inst.generator == gid and isinstance(inst, _FakeGenerator)
+        assert inst.config["system_prompt"] == "s"  # 构造期注入(config 整体)
     monkeypatch.setattr(deepwiki.envs, "DEEPWIKI_GENERATOR", "codex")
-    adapter = _adapter({})  # 空选型走 env 缺省
-    assert adapter.generator == "codex" and isinstance(adapter, _FakeGenerator)
-    assert "config_path" not in adapter.config  # 无配置:概念键缺失 → SDK 缺省隔离
+    inst = adapter(**_gen_kwargs({}))  # 空选型走 env 缺省
+    assert inst.generator == "codex" and isinstance(inst, _FakeGenerator)
+    assert "config_path" not in inst.config  # 无配置:概念键缺失 → SDK 缺省隔离
 
 
 def test_dsh_options_config(monkeypatch, tmp_path):
@@ -278,7 +284,7 @@ def test_dsh_options_config(monkeypatch, tmp_path):
     repo = Repo(str(tmp_path), "local")
     monkeypatch.setitem(GENERATORS, "dsh", _FakeGenerator)
     monkeypatch.setattr(_FakeGenerator, "generator", "dsh")
-    cfg = _adapter({"generator": "dsh"}, system_prompt="sys", repo=repo).config
+    cfg = adapter(**_gen_kwargs({"generator": "dsh"}), system_prompt="sys", repo=repo).config
     assert cfg["cwd"] == str(tmp_path)
     assert "model" not in cfg  # model 随组合配置(file 类不在请求面)
     assert "api_key" not in cfg and "base_url" not in cfg
@@ -287,13 +293,13 @@ def test_dsh_options_config(monkeypatch, tmp_path):
     assert cfg["system_prompt"] == "sys"  # 契约键(agent dsh_fields 映射 DSH_SYSTEM_PROMPT)
     assert cfg["mcp_servers"] == _graphify_mcp("dsh")
     assert "config_path" not in cfg  # 默认不传 → agent 缺省隔离组合
-    cfg2 = _adapter({"generator": "dsh"}, system_prompt="sys").config
+    cfg2 = adapter(**_gen_kwargs({"generator": "dsh"}), system_prompt="sys").config
     assert "cwd" not in cfg2  # repo 空:不固定 cwd(走进程缺省)
     # file 类契约:config_path(经 resolve 解析;env DEEPWIKI_DSH_CORDIS 为 env 缺省)即 cordis
     cordis = tmp_path / "cordis.yml"
     cordis.write_text("{}", encoding="utf-8")
     monkeypatch.setattr(deepwiki.envs, "DEEPWIKI_DSH_CORDIS", str(cordis))
-    assert _adapter({"generator": "dsh"}).config["config_path"] == str(cordis)
+    assert adapter(**_gen_kwargs({"generator": "dsh"})).config["config_path"] == str(cordis)
 
 
 def test_dsh_cordis_isolation_and_graphify():
@@ -326,22 +332,22 @@ def test_wiki_pipeline_dsh_uses_agent(monkeypatch):
 
 def test_agent_note_tool_name_by_generator():
     """图工具指引按后端切换(cc 的 graphify_query / dsh 的 mcp__graphify__query_graph)。"""
-    assert "graphify_query" in _agent_note("cc")
-    assert "mcp__graphify__query_graph" not in _agent_note("cc")
-    assert "mcp__graphify__query_graph" in _agent_note("dsh")
-    assert "graphify_query" not in _agent_note("dsh")
-    assert "mcp__graphify__query_graph" in _agent_note("codex")
+    assert "graphify_query" in agent_note("cc")
+    assert "mcp__graphify__query_graph" not in agent_note("cc")
+    assert "mcp__graphify__query_graph" in agent_note("dsh")
+    assert "graphify_query" not in agent_note("dsh")
+    assert "mcp__graphify__query_graph" in agent_note("codex")
 
 
 def test_agent_options_cc_setting_sources_isolated(monkeypatch):
     """cc 完全隔离本地 claude 配置(setting_sources=[]):用户级 MCP/skills/hooks 不掺入 agent;
     config_path 概念键纯透传(路径直传 SDK,不读文件)。"""
     monkeypatch.setitem(GENERATORS, "cc", _FakeGenerator)
-    cfg = _adapter({}, system_prompt="sys").config
+    cfg = adapter(**_gen_kwargs({}), system_prompt="sys").config
     assert cfg["setting_sources"] == []
     assert cfg["config_path"] == os.path.abspath(deepwiki.envs.DEEPWIKI_CC_CONFIG)  # env 缺省
-    cfg2 = _adapter(
-        {"generator": "cc", "generator_config": {"config_path": "/tmp/dw-test-settings.json"}},
+    cfg2 = adapter(
+        **_gen_kwargs({"generator": "cc", "generator_config": {"config_path": "/tmp/dw-test-settings.json"}}),
         system_prompt="sys",
     ).config
     assert cfg2["setting_sources"] == []
@@ -349,13 +355,14 @@ def test_agent_options_cc_setting_sources_isolated(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_chat_stream_context_events(monkeypatch):
-    """chat 历史裁剪 → context/modify(trim);agent 注记 → context/modify(provenance);run_id 关联会话组。"""
+async def test_chat_stream_history_trim_no_context(monkeypatch):
+    """chat 历史裁剪仍发生(输入过大省略历史);引擎不再传 context(假日志事件已清除,
+    监控由适配器内 EventRecorder 发布);run_id 关联会话组。"""
     captured = {}
 
-    async def fake_stream(options, prompt, *, session_name=None, run_id=None, context=None,
+    async def fake_stream(options, prompt, *, session_name=None, run_id=None,
                           retry=None, meta=None):
-        captured.update(session=session_name, run_id=run_id, context=context, prompt=prompt)
+        captured.update(session=session_name, run_id=run_id, prompt=prompt)
         yield "hi"
 
     monkeypatch.setattr(GENERATORS["cc"], "stream", fake_stream)  # 适配器单例直连(agent 路)
@@ -371,13 +378,10 @@ async def test_chat_stream_context_events(monkeypatch):
     assert "".join(got) == "hi"
     assert captured["run_id"] == captured["session"]  # 会话组名与监控名同一来源(chat:<repo>)
     assert captured["run_id"].startswith("chat:")
-    trim, note = captured["context"]
-    assert trim["type"] == "context/modify" and trim["data"]["kind"] == "trim"
-    assert trim["data"]["target"] == "chat-history" and trim["data"]["removed"]["n_turns"] == 2
-    assert note["type"] == "context/modify" and note["data"]["provenance"] == "deepwiki:note"
-    assert "注记全文入事件" not in captured["prompt"]  # 主题:注记仍原样在 prompt 里(非空即错),见下行
+    assert "context" not in captured  # 引擎不再传 context
     assert "<note>" in captured["prompt"] and "<query>\nq2\n</query>" in captured["prompt"]
-    assert "<conversation_history>" not in captured["prompt"]  # 被裁剪
+    assert "Previous conversation:" not in captured["prompt"]  # 被裁剪
+    assert "<conversation_history>" not in captured["prompt"]
 
 
 # ---------------------------------------------------------------------------
@@ -391,9 +395,9 @@ def test_agent_cache_naming():
     pipeline = deepwiki.AgentWikiPipeline()
     project_key = deepwiki.repo_key_of("local", "local", "deepwiki-open")
     prefix = f"{project_key}_{_digest_of(request['target'])}"
-    assert pipeline._agent_cache_structure_path(project_key, request["target"]).name == f"{prefix}-structure.md"
-    assert pipeline._agent_cache_page_path(project_key, request["target"], "page-1").name == f"{prefix}-page-1.md"
-    assert pipeline._agent_cache_page_path(project_key, request["target"], "overview").name == \
+    assert pipeline._agent_cache_structure_path(project_key, **_gen_kwargs(request["target"])).name == f"{prefix}-structure.md"
+    assert pipeline._agent_cache_page_path(project_key, "page-1", **_gen_kwargs(request["target"])).name == f"{prefix}-page-1.md"
+    assert pipeline._agent_cache_page_path(project_key, "overview", **_gen_kwargs(request["target"])).name == \
         f"{prefix}-page_overview.md"
 
 
@@ -401,9 +405,9 @@ def test_sanitize_page_id_no_escape():
     r = _make_request("sanitize-io", "demo")
     project_key = deepwiki.repo_key_of(r["type"], r["owner"], r["repo"])
     pipeline = deepwiki.AgentWikiPipeline()
-    out = pipeline._agent_cache_page_path(project_key, r["target"], "../../evil")
-    assert out.parent == pipeline._agent_cache_dir(project_key, r["target"])
-    assert out.relative_to(pipeline._agent_cache_dir(project_key, r["target"])).parent == Path(".")
+    out = pipeline._agent_cache_page_path(project_key, "../../evil", **_gen_kwargs(r["target"]))
+    assert out.parent == pipeline._agent_cache_dir(project_key, **_gen_kwargs(r["target"]))
+    assert out.relative_to(pipeline._agent_cache_dir(project_key, **_gen_kwargs(r["target"]))).parent == Path(".")
 
 
 def test_agent_options_cc_delivery(monkeypatch, tmp_path):
@@ -412,8 +416,8 @@ def test_agent_options_cc_delivery(monkeypatch, tmp_path):
     model/凭证不在装配层(经 target 绑定)。"""
     repo = Repo(str(tmp_path), "local")
     monkeypatch.setitem(GENERATORS, "cc", _FakeGenerator)
-    cfg = _adapter(
-        {}, system_prompt="", repo=repo,
+    cfg = adapter(
+        **_gen_kwargs({}), system_prompt="", repo=repo,
         agent_output_dir=str(tmp_path / "out"), agent_write_mode=True,
     ).config
     assert cfg["cwd"] == str(tmp_path)
@@ -423,7 +427,7 @@ def test_agent_options_cc_delivery(monkeypatch, tmp_path):
     assert cfg["config_path"] == os.path.abspath(deepwiki.envs.DEEPWIKI_CC_CONFIG)  # env 缺省
     for t in ("Read", "Grep", "Glob", "Write", "graphify_query"):
         assert t in cfg["allowed_tools"], t
-    cfg2 = _adapter({}, system_prompt="", repo=repo).config
+    cfg2 = adapter(**_gen_kwargs({}), system_prompt="", repo=repo).config
     assert cfg2["cwd"] == str(tmp_path)
     assert "add_dirs" not in cfg2 and "permission_mode" not in cfg2  # 缺键 → SDK 缺省
     for t in ("Read", "Grep", "Glob", "graphify_query"):
@@ -455,10 +459,10 @@ NODE d [src=src/c.py community=c1]
 
 def test_subgraph_hits_parse():
     """解析 NODE(src/loc)/EDGE(at=) 标注:容忍截断前缀行,空 loc 或无 loc 跳过。"""
-    hits = deepwiki.utils._subgraph_hits(_SUBGRAPH_ANSWER)
+    hits = deepwiki.utils.subgraph_hits(_SUBGRAPH_ANSWER)
     assert hits == {"src/a.py": [5, 12, 40]}
     assert "src/b.py" not in hits and "src/c.py" not in hits
-    assert deepwiki.utils._subgraph_hits("no matches here\n") == {}
+    assert deepwiki.utils.subgraph_hits("no matches here\n") == {}
 
 
 @pytest.mark.asyncio
@@ -469,13 +473,13 @@ async def test_subgraph_src_blocks_windows_merge(tmp_path, monkeypatch):
         "\n".join(f"line {i}" for i in range(1, 101)), encoding="utf-8"
     )
     monkeypatch.setattr(deepwiki.envs, "CHAT_TOKEN_LIMIT_ESTIMATE", 20000)
-    blocks, degraded = deepwiki.utils._subgraph_src_blocks(
+    blocks, degraded = deepwiki.utils.subgraph_src_blocks(
         str(tmp_path), {"src/a.py": [5, 9]}, radius=8
     )
     assert not degraded and len(blocks) == 1
     assert blocks[0]["start_line"] == 1 and blocks[0]["end_line"] == 17
     assert blocks[0]["text"] == "\n".join(f"line {i}" for i in range(1, 18))
-    blocks, degraded = deepwiki.utils._subgraph_src_blocks(
+    blocks, degraded = deepwiki.utils.subgraph_src_blocks(
         str(tmp_path), {"src/a.py": [5, 45]}, radius=8
     )
     assert not degraded and len(blocks) == 2
@@ -488,17 +492,17 @@ def test_subgraph_src_blocks_per_file_cap_and_budget(tmp_path):
     d = tmp_path / "src"
     d.mkdir()
     (d / "a.py").write_text("\n".join(f"line {i}" for i in range(1, 51)), encoding="utf-8")
-    blocks, degraded = deepwiki.utils._subgraph_src_blocks(
+    blocks, degraded = deepwiki.utils.subgraph_src_blocks(
         str(tmp_path), {"src/a.py": [25]}, radius=8, per_file_cap=30,
     )
     assert not degraded and len(blocks) == 1
     assert len(blocks[0]["text"]) == 30
     assert blocks[0]["end_line"] == blocks[0]["start_line"] + blocks[0]["text"].count("\n")
-    blocks, degraded = deepwiki.utils._subgraph_src_blocks(
+    blocks, degraded = deepwiki.utils.subgraph_src_blocks(
         str(tmp_path), {"src/a.py": [25]}, radius=8, budget_chars=5,
     )
     assert (blocks, degraded) == ([], True)
-    blocks, degraded = deepwiki.utils._subgraph_src_blocks(str(tmp_path), {"nope.py": [1]})
+    blocks, degraded = deepwiki.utils.subgraph_src_blocks(str(tmp_path), {"nope.py": [1]})
     assert (blocks, degraded) == ([], False)
 
 
@@ -510,13 +514,13 @@ def test_format_subgraph_context():
         {"path": "src/a.py", "text": "y = 2", "start_line": 10, "end_line": 20},
         {"path": "src/b.py", "text": "z = 3", "start_line": 5, "end_line": 9},
     ]
-    text = deepwiki.utils._format_subgraph_context(blocks)
+    text = deepwiki.utils.format_subgraph_context(blocks)
     assert text.startswith("\n\n----------## File Path: src/a.py\n\n")  # 原版联结式
     assert text.count("## File Path:") == 2
     assert "[lines 1-1]\nx = 1" in text and "[lines 10-20]\ny = 2" in text
     assert "## File Path: src/b.py\n\n[lines 5-9]\nz = 3" in text
-    assert deepwiki.utils._format_subgraph_context([]) == ""
-    assert deepwiki.utils._format_subgraph_context([{"path": "a.py", "text": "t", "start_line": 1, "end_line": 1}]) \
+    assert deepwiki.utils.format_subgraph_context([]) == ""
+    assert deepwiki.utils.format_subgraph_context([{"path": "a.py", "text": "t", "start_line": 1, "end_line": 1}]) \
         .startswith("\n\n----------## File Path: a.py")
 
 
@@ -537,9 +541,9 @@ async def test_llm_chat_stream_prompt_and_context(monkeypatch, tmp_path):
         captured["query"] = question
         return {"answer": "NODE f [src=src/a.py loc=L1 community=c0]\n"}
 
-    async def fake_llm_stream(prompt, *, choice=None, session_name=None, run_id=None,
-                              context=None, **kw):
-        captured.update(session=session_name, prompt=prompt, choice=choice)
+    async def fake_llm_stream(prompt, *, generator=None, generator_config=None,
+                              session_name=None, run_id=None, **kw):
+        captured.update(session=session_name, prompt=prompt, generator=generator)
         yield "HELLO"
 
     monkeypatch.setattr(deepwiki.graphify, "query", fake_query)
@@ -554,7 +558,7 @@ async def test_llm_chat_stream_prompt_and_context(monkeypatch, tmp_path):
     got = await _chat(request)
     assert "".join(got) == "HELLO"
     assert captured["session"] == f"chat:{Repo(str(tmp_path), 'local').name}"
-    assert captured["choice"] == request["target"]  # llm 路:model/url/api_key 由选型注入(经 _adapter)
+    assert captured["generator"] == "llm"  # llm 路:model/url/api_key 由选型注入(经 adapter)
     msg = captured["prompt"]  # 模块级 llm_stream 只收单条 user 消息(payload 为内部形态)
     assert msg.startswith("/no_think ")
     assert "expert code analyst" in msg  # SIMPLE 角色模板
@@ -578,8 +582,8 @@ async def test_llm_chat_continuation_and_iteration_templates(monkeypatch, tmp_pa
         captured["query"] = question
         return {"answer": ""}
 
-    async def fake_llm_stream(prompt, *, choice=None, session_name=None, run_id=None,
-                              context=None, **kw):
+    async def fake_llm_stream(prompt, *, generator=None, generator_config=None,
+                              session_name=None, run_id=None, **kw):
         captured["prompt"] = prompt
         yield ""
 
@@ -612,8 +616,8 @@ async def test_llm_chat_error_fallbacks(monkeypatch, tmp_path):
 
     monkeypatch.setattr(deepwiki.graphify, "query", fake_query)
 
-    async def fake_llm_stream(prompt, *, choice=None, session_name=None, run_id=None,
-                              context=None, **kw):
+    async def fake_llm_stream(prompt, *, generator=None, generator_config=None,
+                              session_name=None, run_id=None, **kw):
         captured["prompt"] = prompt
         yield "ok"
 
@@ -624,16 +628,16 @@ async def test_llm_chat_error_fallbacks(monkeypatch, tmp_path):
         "messages": [{"role": "user", "content": "hi"}],
     }
     got = await _chat(request)
-    assert "".join(got) == "ok"  # 图无命中也一样回答
+    assert "".join(got) == "ok"  # 图无命中也一样回答(无检索增强 note)
     assert "Answering without retrieval augmentation." in captured["prompt"]
-    # 图谱查询失败 → 同样降级 note(不引入任何错误文本)
+    # 图谱查询失败 → 直接 raise(检索失败不得带病继续)
     def boom(question, **kw):
         raise RuntimeError("graph is gone")
 
     monkeypatch.setattr(deepwiki.graphify, "query", boom)
-    got = await _chat(request)
-    assert "".join(got) == "ok"
-    assert "Answering without retrieval augmentation." in captured["prompt"]
+    with pytest.raises(RuntimeError, match="代码图谱不可用"):
+        _ = await _chat(request)
+    monkeypatch.setattr(deepwiki.graphify, "query", fake_query)  # 还原:后续只测 llm 层错误
     # 非 token 错误 → "Error with openai API: ..." 原版式文本进流
     async def err_stream(prompt, **kw):
         raise RuntimeError("llm down")
@@ -694,8 +698,8 @@ async def test_llm_codemap_events_sequence(monkeypatch, tmp_path):
         }],
     }
 
-    async def fake_llm_complete(prompt, *, choice=None, session_name=None, run_id=None,
-                                context=None, **kw):
+    async def fake_llm_complete(prompt, *, generator=None, generator_config=None,
+                                session_name=None, run_id=None, **kw):
         calls.append(("complete", session_name, prompt))
         if session_name == "codemap:skeleton":
             return json.dumps(skeleton)
@@ -740,8 +744,8 @@ async def test_llm_codemap_not_indexed_and_retry_and_degraded(monkeypatch, tmp_p
     repo_dir.mkdir()
     complete_calls = []
 
-    async def fake_llm_complete(prompt, *, choice=None, session_name=None,
-                                run_id=None, context=None, **kw):
+    async def fake_llm_complete(prompt, *, generator=None, generator_config=None,
+                                session_name=None, run_id=None, **kw):
         complete_calls.append(session_name)
         raise RuntimeError("unreachable")  # 不应被调用段在此触发前提供有效返回
 
@@ -776,8 +780,8 @@ async def test_llm_codemap_skeleton_retry_and_enrich_degrade(monkeypatch, tmp_pa
     def fake_query(question, **kw):
         return {"answer": "NODE f [src=src/a.py loc=L1 community=c0]\n"}
 
-    async def fake_llm_complete(prompt, *, choice=None, session_name=None,
-                                run_id=None, context=None, **kw):
+    async def fake_llm_complete(prompt, *, generator=None, generator_config=None,
+                                session_name=None, run_id=None, **kw):
         complete_calls.append(session_name)
         if session_name == "codemap:skeleton":
             return json.dumps(skeleton)
@@ -796,7 +800,7 @@ async def test_llm_codemap_skeleton_retry_and_enrich_degrade(monkeypatch, tmp_pa
     assert events[7] == {"type": "done"}
     assert complete_calls == ["codemap:skeleton", "codemap:enrich", "codemap:enrich"]  # 富化重试 2 次(原版)
     # 骨架重试耗尽 → error 事件,无 codemap/done
-    async def garbage(prompt, *, choice=None, session_name=None, **kw):
+    async def garbage(prompt, *, generator=None, generator_config=None, session_name=None, **kw):
         return "not json"
 
     monkeypatch.setattr(deepwiki_utils, "llm_complete", garbage)
@@ -903,20 +907,20 @@ async def test_chat_and_codemap_dispatch_by_generator(monkeypatch):
     }
     monkeypatch.setattr(deepwiki.envs, "DEEPWIKI_GENERATOR", "cc")
     assert [c async for c in deepwiki.chat_stream(
-        choice=chat_req["target"], repo=_repo_of(chat_req), messages=chat_req["messages"],
+        **_gen_kwargs(chat_req["target"]), repo=_repo_of(chat_req), messages=chat_req["messages"],
         language="en",
     )] == ["c"]
     assert [ev async for ev in deepwiki.generate_codemap(
-        choice=codemap_req["target"], repo=_repo_of(codemap_req),
+        **_gen_kwargs(codemap_req["target"]), repo=_repo_of(codemap_req),
         question=codemap_req["question"], language="en",
     )] == ["c"]
     monkeypatch.setattr(deepwiki.envs, "DEEPWIKI_GENERATOR", "llm")
     assert [c async for c in deepwiki.chat_stream(
-        choice=chat_req["target"], repo=_repo_of(chat_req), messages=chat_req["messages"],
+        **_gen_kwargs(chat_req["target"]), repo=_repo_of(chat_req), messages=chat_req["messages"],
         language="en",
     )] == ["l"]
     assert [ev async for ev in deepwiki.generate_codemap(
-        choice=codemap_req["target"], repo=_repo_of(codemap_req),
+        **_gen_kwargs(codemap_req["target"]), repo=_repo_of(codemap_req),
         question=codemap_req["question"], language="en",
     )] == ["l"]
     assert calls == ["cc", "cc-codemap", "llm", "llm-codemap"]
@@ -971,12 +975,12 @@ def test_codex_options_config(monkeypatch, tmp_path):
     repo = Repo(str(tmp_path), "local")
     monkeypatch.setitem(GENERATORS, "codex", _FakeGenerator)
     monkeypatch.setattr(_FakeGenerator, "generator", "codex")
-    cfg = _adapter({"generator": "codex"}, system_prompt="sys", repo=repo).config
+    cfg = adapter(**_gen_kwargs({"generator": "codex"}), system_prompt="sys", repo=repo).config
     assert "model" not in cfg and cfg["cwd"] == str(tmp_path)
     assert cfg["env"] == {"GRAPHIFY_OUT": str(_graph_dir(repo))}
     assert cfg["mcp_servers"] == _graphify_mcp("codex")  # 零配置缺省隔离 config.toml 带图工具
     assert cfg["sandbox"] == "full_access" and cfg["approval_mode"] == "auto_review"
-    cfg2 = _adapter({"generator": "codex"}, system_prompt="sys").config
+    cfg2 = adapter(**_gen_kwargs({"generator": "codex"}), system_prompt="sys").config
     assert "cwd" not in cfg2 and "env" not in cfg2 and "mcp_servers" not in cfg2  # repo 空:不固定 cwd/图
     assert "model" not in cfg2  # 缺省交给 SDK 缺省模型
     # 学 cc 凭证面:envs 无 CODEX_* 常量(防误引入"看起来必须配置"的 env 骨架)
@@ -1006,5 +1010,5 @@ def test_wiki_pipeline_codex_uses_agent(monkeypatch):
 
 def test_agent_note_codex_uses_mcp_graphify():
     """图工具指引按后端切换:codex 与 dsh 同款 mcp__graphify__query_graph(隔离 config.toml 装载)。"""
-    assert "mcp__graphify__query_graph" in _agent_note("codex")
-    assert "graphify_query" not in _agent_note("codex")
+    assert "mcp__graphify__query_graph" in agent_note("codex")
+    assert "graphify_query" not in agent_note("codex")

@@ -35,7 +35,7 @@ from gh_puller.deepwiki import (
     read_wiki_cache,
 )
 from gh_puller.deepwiki.cache import _generator_digest, _index_ready
-from gh_puller.deepwiki.utils import _log
+from gh_puller.deepwiki.utils import log
 
 # 语言契约(引擎层移出:仅 HTTP 层展示用;提示词语言名在 utils.language_name)
 _LANGUAGE_NAMES: dict[str, str] = {
@@ -215,7 +215,7 @@ async def prepare_repo_index(request: RepoPrepareRequest):
                 break
         exc = task.exception()
         if exc is not None:
-            _log(f"仓库索引失败: {exc}")
+            log(f"仓库索引失败: {exc}")
             yield f"event: error\ndata: {json.dumps({'error': str(exc)})}\n\n"
         else:
             yield "event: done\ndata: ok\n\n"
@@ -284,7 +284,7 @@ async def handle_websocket_chat(websocket: WebSocket):
             await websocket.send_text(str(e))
             return
         async for chunk in chat_stream(
-            choice=request.target, repo=repo,
+            generator=request.target.get("generator"), generator_config=request.target.get("generator_config"), repo=repo,
             messages=[m.model_dump() for m in request.messages],
             language=request.language, research_iteration=request.research_iteration,
         ):
@@ -292,7 +292,7 @@ async def handle_websocket_chat(websocket: WebSocket):
                 break
             await websocket.send_text(chunk)
     except WebSocketDisconnect:
-        _log("chat WebSocket 断开")
+        log("chat WebSocket 断开")
     except ValueError as e:
         _send_if_connect(websocket, f"Error preparing retriever: {e}")
     except Exception as e:  # noqa: BLE001
@@ -315,7 +315,7 @@ async def chat_completions_stream(request: ChatCompletionRequest):
         raise HTTPException(status_code=425, detail=str(e))
     try:
         stream = chat_stream(
-            choice=request.target, repo=repo,
+            generator=request.target.get("generator"), generator_config=request.target.get("generator_config"), repo=repo,
             messages=[m.model_dump() for m in request.messages],
             language=request.language, research_iteration=request.research_iteration,
         )
@@ -335,15 +335,15 @@ async def handle_websocket_codemap(websocket: WebSocket):
         request = CodeMapRequest(**await websocket.receive_json())
         repo = Repo(request.repo_url, request.type, access_token=request.token)
         async for event in generate_codemap(
-            choice=request.target, repo=repo, question=request.question, language=request.language,
+            generator=request.target.get("generator"), generator_config=request.target.get("generator_config"), repo=repo, question=request.question, language=request.language,
         ):
             if websocket.application_state != WebSocketState.CONNECTED:
                 break
             await websocket.send_text(event)
     except WebSocketDisconnect:
-        _log("codemap WebSocket 断开")
+        log("codemap WebSocket 断开")
     except Exception as e:  # noqa: BLE001
-        _log(f"codemap 生成异常: {e}")
+        log(f"codemap 生成异常: {e}")
         if websocket.application_state == WebSocketState.CONNECTED:
             await websocket.send_text(_event(type="error", message=str(e)))
     finally:
@@ -356,7 +356,7 @@ async def codemap_stream(request: CodeMapRequest):
     try:
         repo = Repo(request.repo_url, request.type, access_token=request.token)
         stream = generate_codemap(
-            choice=request.target, repo=repo, question=request.question, language=request.language,
+            generator=request.target.get("generator"), generator_config=request.target.get("generator_config"), repo=repo, question=request.question, language=request.language,
         )
         return StreamingResponse(stream, media_type="application/x-ndjson")
     except Exception as e:  # noqa: BLE001
@@ -415,7 +415,7 @@ async def get_local_repo_structure(path: str | None = Query(None, description="P
         file_tree_lines, readme_content = read_repo_file_tree(path)
         return {"file_tree": "\n".join(sorted(file_tree_lines)), "readme": readme_content}
     except Exception as e:  # noqa: BLE001
-        _log(f"local_repo/structure 异常: {e}")
+        log(f"local_repo/structure 异常: {e}")
         return JSONResponse(status_code=500, content={"error": f"Error processing local repository: {e}"})
 
 
@@ -428,7 +428,7 @@ def _query_choice_digest(generator: str, config_path: str, provider: str, model:
         gc["provider"] = provider
     if model:
         gc["model"] = model
-    return _generator_digest({"generator": generator or "", "generator_config": gc})
+    return _generator_digest(generator or "", gc)
 
 
 @app.get("/api/wiki_cache")

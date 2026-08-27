@@ -1,19 +1,21 @@
 """deepwiki 引擎共用 helper(generator 选型/判等/凭证规则簇 + 域内日志 + repo 键
-+ 跨功能通用收编:pipelines 装配、llm 传输、llm 路补全协议、Llm 路检索工具簇、
++ 跨功能通用收编:四路装配、llm 传输、llm 路补全协议、Llm 路检索工具簇、
 提示词共性常量、索引保障服务)。
 
 规划格局(按功能为主线):wiki/chat/codemap 三个功能模块各自收编本功能专用
-helper;跨功能通用helper归本模块,由功能模块经本模块属性调用(模块对象绑定+
-属性调用 —— llm_stream/llm_complete 等 monkeypatch 位点打在本模块,不得
-from-import 后裸名调用,测试 patch 活性依赖)。
-本模块因 _graphify_server/_adapter 需与 claude_agent_sdk 顶层 import,__非__
-sdk-free(models/cache 保持 sdk-free);被 wiki/chat/codemap 直连,deepwiki 主干
+helper;跨功能通用 helper 归本模块,由功能模块经本模块**属性调用**
+(utils.xxx 调用时取 —— llm_stream/llm_complete 等 monkeypatch 位点打在本模块,
+不得 from-import 后裸名调用,测试 patch 活性依赖)。
+本模块因 _graphify_server/adapter 需与 claude_agent_sdk 顶层 import,__非__
+sdk-free(wiki/cache 保持 sdk-free);被 wiki/chat/codemap 直连,deepwiki 主干
 白名单 re-export。
 
-术语:引擎内部一律说 generator(选型 dict = {generator, generator_config});
-"target" 只存在于一个冻结边界 —— wire 字段(apps/schemas)。choices 经
-_resolve_generator 解析(唯一知识源)。envs/graphify 保持模块对象绑定 +
-属性调用(调用时取;测试 monkeypatch/强刷活性)。
+术语:引擎内部一律说 generator(选型 dict = {generator, generator_config} 已
+**拆除**:函数签名统一为 generator + generator_config 两个散装参数,wire 字段
+"target" 只在 app 层存在,由 apps/deepwiki-webui 拆包传入;解析/判等经
+resolve_generator 唯一知识源)。envs/graphify 保持模块对象绑定 + 属性调用
+(调用时取;测试 monkeypatch/强刷活性)。对外函数无下划线前缀(常数与
+纯内部 helper 除外)。
 """
 
 import asyncio
@@ -32,7 +34,7 @@ from ..utils import Repo, _estimate_tokens
 from ..utils import _log as _utils_log
 
 # 进度日志走 stderr(同 graphify.py 约定);prefix 固定 [deepwiki]
-_log = partial(_utils_log, prefix="deepwiki")
+log = partial(_utils_log, prefix="deepwiki")
 
 
 # ---------------------------------------------------------------------------
@@ -51,20 +53,21 @@ _FILE_CONFIG_PATH_ENV = {"cc": "DEEPWIKI_CC_CONFIG", "dsh": "DEEPWIKI_DSH_CORDIS
                          "codex": "DEEPWIKI_CODEX_CONFIG"}
 
 
-def _resolve_generator(choice: dict | None = None, get_env=None) -> tuple[str, dict]:
-    """generator 选型 dict({generator, generator_config})→ (generator id, 规范化配置);
-    空选型走 env 缺省(与运行期一致)。
+def resolve_generator(generator: str | None = None, generator_config: dict | None = None,
+                      get_env=None) -> tuple[str, dict]:
+    """generator 选型 → (generator id, 规范化配置);空选型走 env 缺省(与运行期一致)。
 
-    本层自称:未知 id 报错;file 类(cc/dsh/codex)config_path = 显式 > env 缺省
-    (> 空),~ 展开并绝对化 —— 对象类(llm)透传(api_key/base_url 等由调用方自管)。
+    选型 dict({generator, generator_config})在引擎内已拆除为两个散装参数;
+    未知 id 报错;file 类(cc/dsh/codex)config_path = 显式 > env 缺省(> 空),
+    ~ 展开并绝对化 —— 对象类(llm)透传(api_key/base_url 等由调用方自管)。
     envs 走模块对象 getattr(测试 monkeypatch 与 pop+delattr 强刷均生效)。
     """
     if get_env is None:
         get_env = _default_get_env
-    gen_id = (choice or {}).get("generator") or get_env("DEEPWIKI_GENERATOR") or "cc"
+    gen_id = generator or get_env("DEEPWIKI_GENERATOR") or "cc"
     if gen_id not in GENERATORS:
         raise ValueError(f"未知 generator: {gen_id!r}(可选 {sorted(GENERATORS)})")
-    resolved = dict((choice or {}).get("generator_config") or {})
+    resolved = dict(generator_config or {})
     env_key = _FILE_CONFIG_PATH_ENV.get(gen_id)
     if env_key:
         config_path = resolved.get("config_path") or get_env(env_key) or ""
@@ -74,19 +77,19 @@ def _resolve_generator(choice: dict | None = None, get_env=None) -> tuple[str, d
     return gen_id, resolved
 
 
-def _config_kind(generator_id: str) -> str:
+def config_kind(generator_id: str) -> str:
     """file/object 配置类别(cache 落盘/凭证处置决策用)。"""
     return "file" if generator_id in _FILE_CONFIG_PATH_ENV else "object"
 
 
-def _generator_identity(generator_id: str, resolved: dict) -> str:
+def generator_identity(generator_id: str, resolved: dict) -> str:
     """判等身份(不含凭证):file 类 = config_path;object 类 = "provider|model"。"""
-    if _config_kind(generator_id) == "file":
+    if config_kind(generator_id) == "file":
         return resolved.get("config_path", "") or ""
     return f"{resolved.get('provider', '')}|{resolved.get('model', '')}"
 
 
-def _strip_creds(config: dict) -> dict:
+def strip_creds(config: dict) -> dict:
     """落盘形态:拷贝并剥离 generator_config 内 api_key/base_url(config_path 非凭证,保留)。"""
     out = dict(config)
     gc = dict(out.get("generator_config") or {})
@@ -96,7 +99,7 @@ def _strip_creds(config: dict) -> dict:
     return out
 
 
-def _merge_creds(base: dict, other: dict | None) -> dict:
+def merge_creds(base: dict, other: dict | None) -> dict:
     """落盘形态保持自身;object 类凭证(api_key/base_url 于 generator_config 内)取 other。"""
     out = dict(base)
     oc = dict((other or {}).get("generator_config") or {})
@@ -114,7 +117,8 @@ def repo_key_of(repo_type: str, owner: str, repo: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# 提示词共性常量(跨功能:wiki(llm 路 system)/chat/codemap 共用)
+# 提示词共性常量(跨功能:wiki(llm 路 system)/chat/codemap 共用;
+# 语言展示表 _LANGUAGE_NAMES 仅 HTTP 层用时,已在 apps/deepwiki-webui/server/app.py)
 # ---------------------------------------------------------------------------
 
 _LANGUAGE_NAMES_RAW = {
@@ -131,7 +135,7 @@ _LANGUAGE_NAMES_RAW = {
 }
 
 
-def _language_name(language: str) -> str:
+def language_name(language: str) -> str:
     """语言名(缺省 English;未知语言也回退 English,与原 lang.json 语义一致)。"""
     return _LANGUAGE_NAMES_RAW.get(language, "English")
 
@@ -177,7 +181,7 @@ This file contains...
 </style>"""
 
 
-def _agent_note(generator: str) -> str:
+def agent_note(generator: str) -> str:
     """注入到 user 消息的指引段(供 agent 知道用图工具获取带行号的代码上下文)。
 
     dsh/codex 后端的图工具名不同(dsh 经组合内置 mcp-client、codex 经隔离
@@ -198,18 +202,18 @@ def _agent_note(generator: str) -> str:
     )
 
 
-def _prompt_fmt(repo: Repo, *, language: str = "en") -> dict:
+def prompt_fmt(repo: Repo, *, language: str = "en") -> dict:
     """提示词格式化用的公共字段(repo 域对象 + 语言散装)。"""
     return {
         "repo_type": repo.repo_type,
         "repo_url": repo.repo_url,
         "repo_name": repo.name,
-        "language_name": _language_name(language or "en"),
+        "language_name": language_name(language or "en"),
     }
 
 
 # ---------------------------------------------------------------------------
-# 四路装配(适配器构造入口 _adapter + graphify MCP 工具桌 + llm 传输)
+# 四路装配(适配器构造入口 adapter + graphify MCP 工具桌 + llm 传输)
 # ---------------------------------------------------------------------------
 
 
@@ -230,7 +234,7 @@ def _graphify_mcp(backend: str) -> list[dict]:
 def _graphify_server(repo: Repo):
     """进程内 MCP server:把 graphify.query 封装为 graphify_query 工具(闭包绑定图路径)。"""
 
-    from .cache import _graph_path  # lazy:cache 反向依赖本模块(见 circular import)
+    from .cache import _graph_path  # lazy:cache 反向依赖本模块(see circular import)
 
     graph_path = _graph_path(repo)
 
@@ -253,11 +257,12 @@ def _graphify_server(repo: Repo):
     return create_sdk_mcp_server("graphify", tools=[graphify_query])
 
 
-def _adapter(choice: dict | None, *, system_prompt: str = "", repo: Repo | None = None,
-             agent_output_dir: str | None = None, agent_write_mode: bool = False):
-    """choice → 适配器实例(四路收敛构造入口;≈ GENERATORS[gid](config) 一行)。
+def adapter(generator: str | None = None, *, generator_config: dict | None = None,
+            system_prompt: str = "", repo: Repo | None = None,
+            agent_output_dir: str | None = None, agent_write_mode: bool = False):
+    """generator → 适配器实例(四路收敛构造入口;≈ GENERATORS[gid](config) 一行)。
 
-    gid 经 _resolve_generator(file 类 config_path 规范化);llm 路 resolved 即
+    gid 经 resolve_generator(file 类 config_path 规范化);llm 路 resolved 即
     OpenAIConfig(概念键透传)。cc/dsh/codex 按 agent.configs.py TypedDict 键集
     组装 config dict(空/None 不落键;SDK 映射全在 agent 侧 —— 本层零 SDK 字段名;
     config_path 纯透传,本层不读文件;模型/凭证随所选配置):
@@ -268,7 +273,7 @@ def _adapter(choice: dict | None, *, system_prompt: str = "", repo: Repo | None 
       无落盘);
     - dsh:provider/session_root/runtime_cwd + system_prompt → 组合 persona
       (非空才注入,空回退缺省);mcp_servers 通用描述注入图工具桌
-      (适配层零工具名;对 agent 为 mcp__graphify__query_graph,见 _agent_note);
+      (适配层零工具名;对 agent 为 mcp__graphify__query_graph,见 agent_note);
     - codex:system_prompt → thread_start.base_instructions;config_path 纯透传
       (home config.toml 符号链接);mcp_servers 通用描述 + env.GRAPHIFY_OUT 注入
       隔离 home 工具桌(零配置缺省即带图;sandbox 缺省 full_access,镜像 dsh
@@ -276,9 +281,9 @@ def _adapter(choice: dict | None, *, system_prompt: str = "", repo: Repo | None 
 
     一个实例 = 一次对话(重试/每阶段刷新构造;构造期即装配 SDK 对象)。
     """
-    from .cache import _graph_dir  # lazy:cache 反向依赖本模块(见 circular import)
+    from .cache import _graph_dir  # lazy:cache 反向依赖本模块(see circular import)
 
-    gid, resolved = _resolve_generator(choice)
+    gid, resolved = resolve_generator(generator, generator_config)
     if gid == "llm":
         return GENERATORS["llm"](resolved)
     if gid == "dsh":
@@ -326,28 +331,28 @@ def _adapter(choice: dict | None, *, system_prompt: str = "", repo: Repo | None 
     return GENERATORS[gid](options)
 
 
-async def llm_stream(prompt: str, *, choice: dict | None, session_name: str, run_id: str,
-                     context: list[dict] | None = None):
+async def llm_stream(prompt: str, *, generator: str | None, generator_config: dict | None,
+                     session_name: str, run_id: str):
     """llm 路统一流式补全口(单条 user 消息;payload 独立于 config 运行时传入)。
 
-    内部经 _adapter 构造(模型/url/凭证随所选 choice,OpenAIConfig 即 resolved);
-    本模块裸名供 wiki/chat 经模块对象调用 —— 本模块是测试 monkeypatch 位点。
+    内部经 adapter 构造(模型/url/凭证随所选 generator);本模块是测试
+    monkeypatch 位点(经 utils.llm_stream 属性替换)。
     """
-    adapter = _adapter(choice)
-    payload = {"messages": [{"role": "user", "content": prompt}], "model": adapter.config.get("model")}
-    async for chunk in adapter.stream(payload, session_name=session_name, run_id=run_id, context=context):
+    inst = adapter(generator, generator_config=generator_config)
+    payload = {"messages": [{"role": "user", "content": prompt}], "model": inst.config.get("model")}
+    async for chunk in inst.stream(payload, session_name=session_name, run_id=run_id):
         yield chunk
 
 
-async def llm_complete(prompt: str, *, choice: dict | None, session_name: str, run_id: str,
-                       context: list[dict] | None = None) -> str:
+async def llm_complete(prompt: str, *, generator: str | None, generator_config: dict | None,
+                       session_name: str, run_id: str) -> str:
     """llm 路统一整收补全口(单条 user 消息;同 llm_stream 装配)。"""
-    adapter = _adapter(choice)
-    payload = {"messages": [{"role": "user", "content": prompt}], "model": adapter.config.get("model")}
-    return await adapter.result(payload, session_name=session_name, run_id=run_id, context=context)
+    inst = adapter(generator, generator_config=generator_config)
+    payload = {"messages": [{"role": "user", "content": prompt}], "model": inst.config.get("model")}
+    return await inst.result(payload, session_name=session_name, run_id=run_id)
 
 
-def _failure(exc: Exception) -> Exception:
+def failure(exc: Exception) -> Exception:
     """RequestFailedError → RuntimeError("agent 执行失败: ...")(对外文案,
     原 agent.generate_* file 类分支的包装);其余异常原样返回。
     链式追溯由唯一 raise 点(_deliver)以 raise ... from 补上。"""
@@ -357,7 +362,8 @@ def _failure(exc: Exception) -> Exception:
 
 
 # ---------------------------------------------------------------------------
-# Llm 路检索工具簇(graphify 子图 → 真实代码行窗;chat/codemap/wiki(llm 路)共用)
+# Llm 路检索工具簇(graphify 子图 → 真实代码行窗;chat/codemap/wiki(llm 路)共用。
+# 检索失败 → raise:管道不作无检索降级,不许"带病继续")
 # ---------------------------------------------------------------------------
 
 
@@ -365,7 +371,7 @@ def _failure(exc: Exception) -> Exception:
 _FILE_INLINE_CAP = 8000
 
 
-def _subgraph_hits(answer: str) -> dict[str, list[int]]:
+def subgraph_hits(answer: str) -> dict[str, list[int]]:
     """解析 graphify.query 的 answer 标注 → {file: [行号...]}。
 
     NODE 行形如 `NODE <label> [src=<file> loc=L<line> community=<cid>]`,
@@ -387,7 +393,7 @@ def _subgraph_hits(answer: str) -> dict[str, list[int]]:
     return {p: sorted(set(lines)) for p, lines in hits.items()}
 
 
-def _subgraph_src_blocks(
+def subgraph_src_blocks(
     save_path: str,
     hits: dict[str, list[int]],
     *,
@@ -400,7 +406,7 @@ def _subgraph_src_blocks(
     每文件:命中行 ±radius 展开、相邻窗(间距 ≤ 2*radius)合并、夹到文件行界;
     单文件累计字符封顶 per_file_cap(溢出窗截断,后续窗丢弃);
     全量累计超 budget_chars(缺省 CHAT_TOKEN_LIMIT_ESTIMATE*4)即整组降级
-    (返回 ([], True));调用方据此跳过注入(提示词注"无检索增强"note)。
+    (返回 ([], True));调用方(graphify_context)据此 raise。
     OSError/解码失败的文件跳过(其余文件正常)。
     """
     budget = budget_chars if budget_chars is not None else envs.CHAT_TOKEN_LIMIT_ESTIMATE * 4
@@ -441,7 +447,7 @@ def _subgraph_src_blocks(
     return blocks, False
 
 
-def _format_subgraph_context(blocks: list[dict[str, Any]]) -> str:
+def format_subgraph_context(blocks: list[dict[str, Any]]) -> str:
     """代码窗 → 原版 _format_context 同式文本(chat/codemap 共用)。
 
     按文件分组:每组 `## File Path: {path}` 头 + 每窗 `[lines A-B]\n<code>`
@@ -459,9 +465,13 @@ def _format_subgraph_context(blocks: list[dict[str, Any]]) -> str:
     return "\n\n" + ("-" * 10) + "\n\n".join(context_parts)
 
 
-async def _graphify_context(repo: Repo, question: str) -> dict[str, Any]:
-    """graphify.query + 子图 → 真实代码行窗;任何失败吞掉置 error(服务降级,不抛)。"""
-    from .cache import _graph_path  # lazy:cache 反向依赖本模块(见 circular import)
+async def graphify_context(repo: Repo, question: str) -> dict[str, Any]:
+    """graphify.query + 子图 → 真实代码行窗。
+
+    检索是正确作答的前提:图谱查询失败与超预算降级均直接 raise(不再以
+    "无检索增强"降级继续)。
+    """
+    from .cache import _graph_path  # lazy:cache 反向依赖本模块(see circular import)
 
     try:
         result = await asyncio.to_thread(
@@ -469,22 +479,24 @@ async def _graphify_context(repo: Repo, question: str) -> dict[str, Any]:
         )
         answer = result.get("answer") or ""
     except Exception as exc:
-        _log(f"图谱查询失败,降级: {type(exc).__name__}: {exc}")
-        return {"hits": {}, "blocks": [], "degraded": False, "error": f"{type(exc).__name__}: {exc}"}
-    hits = _subgraph_hits(answer)
+        raise RuntimeError(f"代码图谱不可用: {type(exc).__name__}: {exc}") from exc
+    hits = subgraph_hits(answer)
     if not hits:
-        return {"hits": {}, "blocks": [], "degraded": False, "error": None}
-    blocks, degraded = _subgraph_src_blocks(repo.save_path, hits)
-    return {"hits": hits, "blocks": blocks, "degraded": degraded, "error": None}
+        return {"hits": {}, "blocks": []}
+    blocks, degraded = subgraph_src_blocks(repo.save_path, hits)
+    if degraded:
+        raise RuntimeError("检索上下文超出预算")
+    return {"hits": hits, "blocks": blocks}
 
 
 # ---------------------------------------------------------------------------
 # llm 路补全协议(research_chat 等价:检索上下文注入 + token 超限简化重试;
-# wiki(llm 路 structure/page)/chat 共用)
+# wiki(llm 路 structure/page)/chat 共用;context 事件已全部清除 —— 引擎不向
+# agent 传输层传 context,失败即 raise/流错误文本,不做"假日志"事件)
 # ---------------------------------------------------------------------------
 
 
-def _build_service_prompt(
+def build_service_prompt(
     system_prompt: str, query: str, *, conversation_history: str = "", context: str = "",
     simplify: bool = False,
 ) -> str:
@@ -514,84 +526,56 @@ def _is_token_limit_error(exc: Exception) -> bool:
     ))
 
 
-async def _llm_research_chat(
-    system: str, query: str, *, choice, repo: Repo, session_name: str, run_id: str,
+async def llm_research_chat(
+    system: str, query: str, *, generator: str | None, generator_config: dict | None,
+    repo: Repo, session_name: str, run_id: str,
     conversation_history: str = "",
 ):
-    """原版 research_chat 等价(LLM 路流式):见 _llm_research_stream 所述语义;
-    失败语义与原版一致(错误文本进流,不抛出)。"""
-    async for chunk in _llm_research_stream(
-        system, query, choice=choice, repo=repo, session_name=session_name, run_id=run_id,
-        conversation_history=conversation_history,
-    ):
-        yield chunk
-
-
-async def _llm_research_stream(
-    system: str, query: str, *, choice, repo: Repo, session_name: str, run_id: str,
-    conversation_history: str = "",
-):
-    """原版 research_chat 语义(LLM 路逐段对齐):
+    """原版 research_chat 语义(流式整口;已合并原 _llm_research_chat/_stream):
 
     - 最后一问估算超 CHAT_TOKEN_LIMIT_ESTIMATE(原 MAX_INPUT_TOKENS=7500)→ 跳过检索;
-    - 检索上下文 = 图谱子图→真实代码窗(原 RAG 的适配点),经 prompt_builder 同式拼装
-      (<START_OF_CONTEXT> 包裹;为空注"无检索增强"note);
+    - 检索上下文 = 图谱子图→真实代码窗(原 RAG 的适配点),经 prompt_builder 同式
+      拼装(<START_OF_CONTEXT> 包裹;为空注"无检索增强"note);图谱失败/超预算
+      直接 raise(检索失败不继续);
     - stream_and_fallback:token 超限 → 简化提示词重试(去掉检索上下文)→ 致歉;
       其余异常 → "Error with openai API: {e}" 文本进流。
     """
-    context: list[dict] = []
     context_text = ""
     if _estimate_tokens(query) > envs.CHAT_TOKEN_LIMIT_ESTIMATE:
-        _log(f"输入过大(估算 {_estimate_tokens(query)} tokens),跳过检索上下文(原版 MAX_INPUT_TOKENS 语义)")
-        context.append({"type": "context/modify",
-                        "data": {"target": "query", "kind": "trim",
-                                 "cause": "token-limit", "detail": "输入过大,跳过检索"}})
+        log(f"输入过大(估算 {_estimate_tokens(query)} tokens),跳过检索上下文(原版 MAX_INPUT_TOKENS 语义)")
     else:
-        ctx = await _graphify_context(repo, query)
-        for b in ctx["blocks"]:
-            context.append({"type": "context/modify",
-                            "data": {"target": "query", "phase": "prompt-assembly",
-                                     "provenance": f"deepwiki:graph:{b['path']}",
-                                     "text": b["text"]}})
-        if ctx["degraded"]:
-            context.append({"type": "context/modify",
-                            "data": {"target": "query", "kind": "degrade",
-                                     "cause": "token-limit", "detail": "检索上下文超限"}})
-        if ctx["error"]:
-            context.append({"type": "context/modify",
-                            "data": {"target": "query", "kind": "degrade",
-                                     "cause": "graph-error",
-                                     "detail": f"代码图谱不可用: {ctx['error']}"}})
-        context_text = _format_subgraph_context(ctx["blocks"])
+        ctx = await graphify_context(repo, query)  # 图谱失败/超预算 → raise
+        context_text = format_subgraph_context(ctx["blocks"])
 
-    prompt = _build_service_prompt(
+    prompt = build_service_prompt(
         system, query, conversation_history=conversation_history, context=context_text
     )
-    simplified = _build_service_prompt(
+    simplified = build_service_prompt(
         system, query, conversation_history=conversation_history, simplify=True
     )
     try:
         async for chunk in llm_stream(
-            prompt, choice=choice, session_name=session_name, run_id=run_id, context=context,
+            prompt, generator=generator, generator_config=generator_config,
+            session_name=session_name, run_id=run_id,
         ):
             yield chunk
     except Exception as e:
         if _is_token_limit_error(e):
-            _log("token 超限,简化为无检索上下文重试")
+            log("token 超限,简化为无检索上下文重试")
             try:
                 async for chunk in llm_stream(
-                    simplified, choice=choice, session_name=session_name, run_id=run_id,
-                    context=context,
+                    simplified, generator=generator, generator_config=generator_config,
+                    session_name=session_name, run_id=run_id,
                 ):
                     yield chunk
             except Exception as e2:  # noqa: BLE001 - 简化重试失败 → 致歉文本(原版同式)
-                _log(f"简化重试失败: {e2}")
+                log(f"简化重试失败: {e2}")
                 yield (
                     "\nI apologize, but your request is too large for me to process. "
                     "Please try a shorter query or break it into smaller parts."
                 )
         else:
-            _log(f"chat llm 错误: {e}")
+            log(f"chat llm 错误: {e}")
             yield f"\nError with openai API: {e}"
 
 
@@ -603,7 +587,7 @@ async def _llm_research_stream(
 
 async def _run_extract(repo: Repo, *, extra_excludes: list[str] | None = None) -> dict:
     """graphify.extract 建图(code_only 纯本地 AST,无 key 可跑);失败返回错误态 dict,不抛。"""
-    from .cache import _graph_dir  # lazy:cache 反向依赖本模块(见 circular import)
+    from .cache import _graph_dir  # lazy:cache 反向依赖本模块(see circular import)
 
     return await asyncio.to_thread(
         graphify.extract,
@@ -621,7 +605,7 @@ async def ensure_index(repo: Repo, *, extra_excludes: list[str] | None = None) -
     (防文件树静默退化为空);建图失败(extract 错误态)→ RuntimeError 上抛,
     由调用方决定上报/置任务 FAILED。
     """
-    from .cache import _index_ready  # lazy:cache 反向依赖本模块(见 circular import)
+    from .cache import _index_ready  # lazy:cache 反向依赖本模块(see circular import)
 
     if not repo.downloaded and not repo.is_local:
         await asyncio.to_thread(repo.download)
