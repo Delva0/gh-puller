@@ -29,7 +29,7 @@ from gh_puller.deepwiki import (
     save_wiki_cache,
     write_resume_state,
 )
-from gh_puller.deepwiki import pipeline as deepwiki_pipeline
+from gh_puller.deepwiki import utils as deepwiki_utils
 from gh_puller.deepwiki.cache import (
     _generator_digest,
     _graph_dir,
@@ -492,7 +492,7 @@ async def test_page_llm_through_research_chat(tmp_path, monkeypatch):
         yield "LLM-CONTENT"
 
     monkeypatch.setattr(deepwiki.graphify, "query", fake_query)
-    monkeypatch.setattr(deepwiki_pipeline, "llm_stream", fake_llm_stream)
+    monkeypatch.setattr(deepwiki_utils, "llm_stream", fake_llm_stream)
     request = {**_make_request("llm-page", "demo"), "target": {"generator": "llm"}}
     page = WikiPage(
         id="p1", title="Page p1", content="", filePaths=["src/a.py"],
@@ -535,7 +535,7 @@ async def test_page_llm_input_too_large_skips_retrieval(tmp_path, monkeypatch):
         yield "HUGE"
 
     monkeypatch.setattr(deepwiki.graphify, "query", fake_query)
-    monkeypatch.setattr(deepwiki_pipeline, "llm_stream", fake_llm_stream)
+    monkeypatch.setattr(deepwiki_utils, "llm_stream", fake_llm_stream)
     request = {**_make_request("llm-huge", "demo"), "target": {"generator": "llm"}}
     page = WikiPage(
         id="p1", title="x" * 40000, content="", filePaths=[],
@@ -621,7 +621,7 @@ async def test_determine_structure_llm_streams(monkeypatch):
         captured["query"] = question
         return {"answer": ""}
 
-    monkeypatch.setattr(deepwiki_pipeline, "llm_stream", fake_llm_stream)
+    monkeypatch.setattr(deepwiki_utils, "llm_stream", fake_llm_stream)
     monkeypatch.setattr(deepwiki.graphify, "query", fake_query)
     request = {**_make_request("llm-struct", "demo"), "target": {"generator": "llm"}}
     repo = Repo("/tmp/gh-puller-test-repo", "local")

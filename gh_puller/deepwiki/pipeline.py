@@ -1,28 +1,18 @@
-"""生成协议层(双路包装类 + 四路装配 + chat/codemap 服务胶水)。
+"""生成协议层(双路包装类 + 服务入口)——拆分中间态(commit 1):跨功能通用
+helper 已迁出(提示词共性/四路装配/检索簇/research 协议/索引保障 → utils.py;
+wiki 的解析/渲染/页面提示词 → wiki.py;codemap 提示词/接地 → codemap.py;
+chat 延续回退 → chat.py),本模块经 re-export 保持裸名解析(类仍暂居,待
+二次迁移随类入 wiki/chat/codemap 后本文件删除)。
 
-职责边界:
-- 提示词组装、对话历史转写、检索上下文注入、agent 交付件路径、llm 单次补全生成链
-  收进各 pipeline 类(self._xxx());协议方法只收 request(**零任务运行时包装**:
-  进度/状态/去重均为 app 侧 runtime,见 apps/deepwiki-webui/server/tasks.py),
-  页面内容在返回前完成终态格式化(`_finalize_page_content`,与续跑水合同式)。
-- agent 调用面(模块级最小函数集):_adapter(choice → 适配器实例,四路装配
-  内联)+ llm_stream/llm_complete(llm 传输)+ graphify MCP 工具桌;调用点经
-  _adapter 一行取适配器实例后直呼 stream/result(session/run/context/retry
-  原生 kwarg,监控事件由适配器内 EventRecorder 发布;无统一分派聚合层)。
-  claude_agent_sdk import 独占本模块(sdk-free 的子模块不得反向依赖)。
-- 服务分派:_wiki_pipeline 按 choice.generator 双路(wiki 与 chat/codemap
-  同开关,模块级 chat_stream/generate_codemap 包装);RequestFailedError →
-  RuntimeError("agent 执行失败: ...") 文案组装在 AgentWikiPipeline。
-- 按核心概念收编本模块(原 structure/index/渲染段已消除):模型产出 XML 解析、
-  codemap 引用接地、交付内容引用渲染只服务生成协议;索引保障服务(clone+建图/
-  未索引前置校验)与 chat/codemap 服务入口同属本层;图产物 dir/path 在 cache。
-- envs/graphify 保持模块对象绑定 + 属性调用(envs.CHAT_TOKEN_LIMIT_ESTIMATE 等
-  调用时取;graphify.query 不得改 from-import,monkeypatch 活性依赖)。
-- 引擎内部不出现 "target" 概念:选型 dict({generator, generator_config})统一叫
-  choice;"target" 只存在于 wire 字段(apps/schemas)。
-
-后续拆分备注(2026-08):提示词常量可独立 prompts.py;LlmWikiPipeline._subgraph_*
-检索工具簇可独立 retrieval.py。
+类职责注释(仍适用直至迁移):
+- 提示词组装、对话历史转写、检索上下文注入、agent 交付件路径与 llm 单次补全
+  生成链收进各 pipeline 类(self._xxx());协议方法只收 request(**零任务运行时
+  包装**:进度/状态/去重均为 app 侧 runtime,见 apps/deepwiki-webui/server/tasks.py),
+  页面内容在返回前完成终态格式化(_finalize_page_content,与续跑水合同式)。
+- claude_agent_sdk import 已随四路装配迁 utils(本模块 sdk-free 化)。
+- 服务分派:_wiki_pipeline 按 choice.generator 双路(wiki;chat/codemap 同开关,
+  模块级 chat_stream/generate_codemap 包装);RequestFailedError → RuntimeError
+  包装(_failure)在 utils。
 """
 
 from __future__ import annotations
@@ -31,16 +21,11 @@ import asyncio
 import dataclasses
 import json
 import os
-import re
-import sys
-import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any
 
-from claude_agent_sdk import create_sdk_mcp_server, tool
-
-from .. import envs, graphify  # 模块对象绑定:属性一律调用时取(patch/强刷活性)
-from ..agent import GENERATORS, RequestFailedError
+from .. import envs  # 模块对象绑定:属性一律调用时取(patch/强刷活性)
+from ..agent import RequestFailedError
 from ..utils import (
     Repo,
     _estimate_tokens,
@@ -49,663 +34,59 @@ from ..utils import (
     _find_readme_path,
     _phase,
     _sanitize_path_seg,
-    _strip_markdown_fences,
 )
-from .cache import (
-    _AGENT_CACHE_DIRNAME,
-    _generator_digest,
-    _graph_dir,
-    _graph_path,
-    _index_ready,
-    _wiki_cache_dir,
+
+# ---------------------------------------------------------------------------
+# 拆分 shim:已迁定义经此保持裸名解析(类仍在本模块;测试直导私有名保持可用)。
+# 本文件仅剩这些转发 + 下方类;转发名不加 noqa 的为仍在本模块被调用者。
+# ---------------------------------------------------------------------------
+from . import utils  # noqa: E402 —— 类体内经 utils.xxx 属性调用(monkeypatch 位点活性,见本文件头)
+from .cache import _AGENT_CACHE_DIRNAME, _generator_digest, _index_ready, _wiki_cache_dir
+from .chat import _resolve_chat_continuation  # noqa: E402,F401 —— 类(chat_stream)裸名调用/补全 shim
+from .codemap import (  # noqa: E402,F401
+    _CODEMAP_ENRICH_PROMPT,
+    _CODEMAP_SKELETON_PROMPT,
+    _ground_citations,
+    _locate_snippet,
 )
-from .models import CodeMap, WikiPage, WikiSection, WikiStructureModel, codemap_of
-from .utils import _log, _resolve_generator
-
-# ---------------------------------------------------------------------------
-# 提示词(原文移植自 deepwiki-open api/prompts.py 与 api/services/wiki/prompts.py)
-# ---------------------------------------------------------------------------
-
-_LANGUAGE_NAMES: dict[str, str] = {
-    "en": "English",
-    "zh": "Mandarin Chinese (中文)",
-}
-
-_LANGUAGE_NAMES_RAW = {
-    "en": "English",
-    "ja": "Japanese (日本語)",
-    "zh": "Mandarin Chinese (中文)",
-    "zh-tw": "Traditional Chinese (繁體中文)",
-    "es": "Spanish (Español)",
-    "kr": "Korean (한국어)",
-    "vi": "Vietnamese (Tiếng Việt)",
-    "pt-br": "Brazilian Portuguese (Português Brasileiro)",
-    "fr": "Français (French)",
-    "ru": "Русский (Russian)",
-}
-
-
-def _language_name(language: str) -> str:
-    """语言名(缺省 English;未知语言也回退 English,与原 lang.json 语义一致)。"""
-    return _LANGUAGE_NAMES_RAW.get(language, "English")
-
-
-_SIMPLE_CHAT_SYSTEM_PROMPT = """<role>
-You are an expert code analyst examining the {repo_type} repository: {repo_url} ({repo_name}).
-You provide direct, concise, and accurate information about code repositories.
-You NEVER start responses with markdown headers or code fences.
-IMPORTANT:You MUST respond in {language_name} language.
-</role>
-
-<guidelines>
-- Answer the user's question directly without ANY preamble or filler phrases
-- DO NOT include any rationale, explanation, or extra comments.
-- DO NOT start with preambles like "Okay, here's a breakdown" or "Here's an explanation"
-- DO NOT start with markdown headers like "## Analysis of..." or any file path references
-- DO NOT start with ```markdown code fences
-- DO NOT end your response with ``` closing fences
-- DO NOT start by repeating or acknowledging the question
-- JUST START with the direct answer to the question
-
-<example_of_what_not_to_do>
-```markdown
-## Analysis of `adalflow/adalflow/datasets/gsm8k.py`
-
-This file contains...
-```
-</example_of_what_not_to_do>
-
-- Format your response with proper markdown including headings, lists, and code blocks WITHIN your answer
-- For code analysis, organize your response with clear sections
-- Think step by step and structure your answer logically
-- Start with the most relevant information that directly addresses the user's query
-- Be precise and technical when discussing code
-- Your response language should be in the same language as the user's query
-</guidelines>
-
-<style>
-- Use concise, direct language
-- Prioritize accuracy over verbosity
-- When showing code, include line numbers and file paths when relevant
-- Use markdown formatting to improve readability
-</style>"""
-
-
-
-# codemap 生成 - 阶段 1:分析代码并产出 codemap 骨架(带 JSON 输出格式与引用接地规则)
-_CODEMAP_SKELETON_PROMPT = """<role>
-You are an expert code analyst building a "codemap" for the {repo_type} repository: {repo_url} ({repo_name}).
-A codemap is a structured, step-by-step guide that answers a usage/how-to question, where every
-step is grounded in REAL source code from the repository.
-IMPORTANT: All human-readable text (titles, labels, summary) MUST be written in {language_name} language.
-</role>
-
-<task>
-Using ONLY the code provided in <START_OF_CONTEXT>...<END_OF_CONTEXT>, produce a codemap that
-answers the user's question. Organise the answer as numbered sections (1, 2, 3...), each containing
-ordered sub-steps (1a, 1b, 1c...). Every sub-step must reference the real source it comes from.
-</task>
-
-<grounding_rules>
-- You may ONLY cite files that appear in the context as a "## File Path: <path>" header. Never invent a path.
-- Each chunk in the context is prefixed with a "[lines A-B]" marker. Use those numbers to fill start_line/end_line.
-- The "snippet" field MUST be copied VERBATIM from the context (an exact substring). Do not paraphrase it.
-- The "code" field is a short example snippet illustrating the step; keep it minimal and runnable-looking.
-- If the context does not contain enough to answer, produce fewer sections rather than fabricating.
-</grounding_rules>
-
-<output_format>
-Output ONLY a single JSON object, no markdown fences, no commentary before or after. Shape:
-{{
-  "title": "<short title of the guide>",
-  "summary": "<1-3 sentence intro; you may reference steps like [1a] [2a]>",
-  "sections": [
-    {{
-      "id": "1",
-      "title": "<section title>",
-      "guide": "",
-      "diagram": "",
-      "steps": [
-        {{
-          "id": "1a",
-          "label": "<short step title>",
-          "code": "<example code>",
-          "citation": {{
-            "file_path": "<path from a ## File Path header>",
-            "start_line": <int>,
-            "end_line": <int>,
-            "snippet": "<verbatim substring from that file's context>"
-          }}
-        }}
-      ]
-    }}
-  ]
-}}
-Leave every "guide" and "diagram" field as an empty string "" in this phase.
-</output_format>"""
-
-# codemap 生成 - 阶段 2:填充散文指南与 mermaid 图
-_CODEMAP_ENRICH_PROMPT = """<role>
-You are enriching an existing codemap skeleton for the {repo_type} repository: {repo_url} ({repo_name}).
-IMPORTANT: All prose MUST be written in {language_name} language.
-</role>
-
-<task>
-You are given a codemap JSON skeleton (in <SKELETON>) and the original source context.
-For EACH section, write:
-- "guide": a concise prose explanation (2-4 sentences) of what the section accomplishes.
-- "diagram": a valid Mermaid diagram source string (e.g. a "graph LR" or "flowchart TD") that
-  illustrates the flow of that section. Use only Mermaid syntax; do NOT wrap it in ```mermaid fences.
-Keep every other field (title, summary, steps, citations, ids) EXACTLY as given. Do not add or remove steps.
-</task>
-
-<output_format>
-Output ONLY the complete updated JSON object with the same shape as the skeleton, now with
-"guide" and "diagram" filled for each section. No markdown fences, no commentary.
-</output_format>"""
-
-
-def _build_page_prompt(title: str, file_links: str, language: str) -> str:
-    """单个 wiki 页面生成提示词(移植 generatePageContent;file_links 为预建的 "- [path](url)" 行)。"""
-    return f"""You are an expert technical writer and software architect.
-Your task is to generate a comprehensive and accurate technical wiki page in Markdown format about a specific feature, system, or module within a given software project.
-
-You will be given:
-1. The "[WIKI_PAGE_TOPIC]" for the page you need to create.
-2. A list of "[RELEVANT_SOURCE_FILES]" from the project that you MUST use as the sole basis for the content. You have access to the full content of these files. You MUST use AT LEAST 5 relevant source files for comprehensive coverage - if fewer are provided, search for additional related files in the codebase.
-
-CRITICAL STARTING INSTRUCTION:
-The very first thing on the page MUST be a `<details>` block listing ALL the `[RELEVANT_SOURCE_FILES]` you used to generate the content. There MUST be AT LEAST 5 source files listed - if fewer were provided, you MUST find additional related files to include.
-Do not provide any acknowledgements, disclaimers, apologies, or any other preface before the `<details>` block. JUST START with the `<details>` block.
-Format the block EXACTLY like the following template, reproducing it verbatim (do not add line numbers, do not convert the links to plain text, do not add any other text):
-<details>
-<summary>Relevant source files</summary>
-
-The following files were used as context for generating this wiki page:
-
-{file_links}
-<!-- Add additional relevant files if fewer than 5 were provided -->
-</details>
-
-Immediately after the `<details>` block, the main title of the page should be a H1 Markdown heading: `# {title}`.
-
-Based ONLY on the content of the `[RELEVANT_SOURCE_FILES]`:
-
-1.  **Introduction:** Start with a concise introduction (1-2 paragraphs) explaining the purpose, scope, and high-level overview of "{title}" within the context of the overall project. If relevant, and if information is available in the provided files, link to other potential wiki pages using the format `[Link Text](#page-anchor-or-id)`.
-
-2.  **Detailed Sections:** Break down "{title}" into logical sections using H2 (`##`) and H3 (`###`) Markdown headings. For each section:
-    *   Explain the architecture, components, data flow, or logic relevant to the section's focus, as evidenced in the source files.
-    *   Identify key functions, classes, data structures, API endpoints, or configuration elements pertinent to that section.
-
-3.  **Mermaid Diagrams:**
-    *   EXTENSIVELY use Mermaid diagrams (e.g., `flowchart TD`, `sequenceDiagram`, `classDiagram`, `erDiagram`, `graph TD`) to visually represent architectures, flows, relationships, and schemas found in the source files.
-    *   Ensure diagrams are accurate and directly derived from information in the `[RELEVANT_SOURCE_FILES]`.
-    *   Provide a brief explanation before or after each diagram to give context.
-    *   CRITICAL: All diagrams MUST follow strict vertical orientation:
-       - Use "graph TD" (top-down) directive for flow diagrams
-       - NEVER use "graph LR" (left-right)
-       - Maximum node width should be 3-4 words
-       - For sequence diagrams:
-         - Start with "sequenceDiagram" directive on its own line
-         - Define ALL participants at the beginning using "participant" keyword
-         - Optionally specify participant types: actor, boundary, control, entity, database, collections, queue
-         - Use descriptive but concise participant names, or use aliases: "participant A as Alice"
-         - Use the correct Mermaid arrow syntax (8 types available):
-           - -> solid line without arrow (rarely used)
-           - --> dotted line without arrow (rarely used)
-           - ->> solid line with arrowhead (most common for requests/calls)
-           - -->> dotted line with arrowhead (most common for responses/returns)
-           - ->x solid line with X at end (failed/error message)
-           - -->x dotted line with X at end (failed/error response)
-           - -) solid line with open arrow (async message, fire-and-forget)
-           - --) dotted line with open arrow (async response)
-           - Examples: A->>B: Request, B-->>A: Response, A->xB: Error, A-)B: Async event
-         - Use +/- suffix for activation boxes: A->>+B: Start (activates B), B-->>-A: End (deactivates B)
-         - Group related participants using "box": box GroupName ... end
-         - Use structural elements for complex flows:
-           - loop LoopText ... end (for iterations)
-           - alt ConditionText ... else ... end (for conditionals)
-           - opt OptionalText ... end (for optional flows)
-           - par ParallelText ... and ... end (for parallel actions)
-           - critical CriticalText ... option ... end (for critical regions)
-           - break BreakText ... end (for breaking flows/exceptions)
-         - Add notes for clarification: "Note over A,B: Description", "Note right of A: Detail"
-         - Use autonumber directive to add sequence numbers to messages
-         - NEVER use flowchart-style labels like A--|label|-->B. Always use a colon for labels: A->>B: My Label
-
-4.  **Tables:**
-    *   Use Markdown tables to summarize information such as:
-        *   Key features or components and their descriptions.
-        *   API endpoint parameters, types, and descriptions.
-        *   Configuration options, their types, and default values.
-        *   Data model fields, types, constraints, and descriptions.
-
-5.  **Code Snippets (ENTIRELY OPTIONAL):**
-    *   Include short, relevant code snippets (e.g., Python, Java, JavaScript, SQL, JSON, YAML) directly from the `[RELEVANT_SOURCE_FILES]` to illustrate key implementation details, data structures, or configurations.
-    *   Ensure snippets are well-formatted within Markdown code blocks with appropriate language identifiers.
-
-6.  **Source Citations (EXTREMELY IMPORTANT):**
-    *   For EVERY piece of significant information, explanation, diagram, table entry, or code snippet, you MUST cite the specific source file(s) and relevant line numbers from which the information was derived.
-    *   Place citations at the end of the paragraph, under the diagram/table, or after the code snippet.
-    *   Use the EXACT format below, and ALWAYS use the FULL repository-relative path exactly as it appears in the "Relevant source files" list above — NEVER a bare filename (e.g. use `src/lightning/pytorch/loops/fit_loop.py`, not `fit_loop.py`):
-        *   Range: `Sources: [src/full/path/file.ext:start_line-end_line]()`
-        *   Single line: `Sources: [src/full/path/file.ext:line_number]()`
-        *   Multiple files: `Sources: [src/full/path/a.ext:1-10](), [src/full/path/b.ext:5](), [src/full/path/c.ext]()` (omit line numbers when the whole file is relevant).
-    *   The word `Sources:` MUST be placed BEFORE the opening bracket, never inside it (write `Sources: [path]()`, NOT `[Sources: path]()`).
-    *   Leave the parentheses `()` EMPTY — they are resolved into real links automatically. Do not put a URL inside them.
-    *   If an entire section is overwhelmingly based on one or two files, you can cite them under the section heading in addition to more specific citations within the section.
-    *   IMPORTANT: You MUST cite AT LEAST 5 different source files throughout the wiki page to ensure comprehensive coverage.
-
-7.  **Technical Accuracy:** All information must be derived SOLELY from the `[RELEVANT_SOURCE_FILES]`. Do not infer, invent, or use external knowledge about similar systems or common practices unless it's directly supported by the provided code. If information is not present in the provided files, do not include it or explicitly state its absence if crucial to the topic.
-
-8.  **Clarity and Conciseness:** Use clear, professional, and concise technical language suitable for other developers working on or learning about the project. Avoid unnecessary jargon, but use correct technical terms where appropriate.
-
-9.  **Conclusion/Summary:** End with a brief summary paragraph if appropriate for "{title}", reiterating the key aspects covered and their significance within the project.
-
-IMPORTANT: Generate the content in {_language_name(language)} language.
-
-Remember:
-- Ground every claim in the provided source files.
-- Prioritize accuracy and direct representation of the code's functionality and structure.
-- Structure the document logically for easy understanding by other developers.
-"""
-
-
-_COMPREHENSIVE_STRUCTURE = """
-Create a structured wiki with the following main sections:
-- Overview (general information about the project)
-- System Architecture (how the system is designed)
-- Core Features (key functionality)
-- Data Management/Flow: If applicable, how data is stored, processed, accessed, and managed (e.g., database schema, data pipelines, state management).
-- Frontend Components (UI elements, if applicable.)
-- Backend Systems (server-side components)
-- Model Integration (AI model connections)
-- Deployment/Infrastructure (how to deploy, what's the infrastructure like)
-- Extensibility and Customization: If the project architecture supports it, explain how to extend or customize its functionality (e.g., plugins, theming, custom modules, hooks).
-
-Each section should contain relevant pages. For example, the "Frontend Components" section might include pages for "Home Page", "Repository Wiki Page", "Ask Component", etc.
-
-Return your analysis in the following XML format:
-
-<wiki_structure>
-  <title>[Overall title for the wiki]</title>
-  <description>[Brief description of the repository]</description>
-  <sections>
-    <section id="section-1">
-      <title>[Section title]</title>
-      <pages>
-        <page_ref>page-1</page_ref>
-        <page_ref>page-2</page_ref>
-      </pages>
-      <subsections>
-        <section_ref>section-2</section_ref>
-      </subsections>
-    </section>
-    <!-- More sections as needed -->
-  </sections>
-  <pages>
-    <page id="page-1">
-      <title>[Page title]</title>
-      <description>[Brief description of what this page will cover]</description>
-      <importance>high|medium|low</importance>
-      <relevant_files>
-        <file_path>[Path to a relevant file]</file_path>
-        <!-- More file paths as needed -->
-      </relevant_files>
-      <related_pages>
-        <related>page-2</related>
-        <!-- More related page IDs as needed -->
-      </related_pages>
-      <parent_section>section-1</parent_section>
-    </page>
-    <!-- More pages as needed -->
-  </pages>
-</wiki_structure>
-"""
-
-_CONCISE_STRUCTURE = """
-Return your analysis in the following XML format:
-
-<wiki_structure>
-  <title>[Overall title for the wiki]</title>
-  <description>[Brief description of the repository]</description>
-  <pages>
-    <page id="page-1">
-      <title>[Page title]</title>
-      <description>[Brief description of what this page will cover]</description>
-      <importance>high|medium|low</importance>
-      <relevant_files>
-        <file_path>[Path to a relevant file]</file_path>
-        <!-- More file paths as needed -->
-      </relevant_files>
-      <related_pages>
-        <related>page-2</related>
-        <!-- More related page IDs as needed -->
-      </related_pages>
-    </page>
-    <!-- More pages as needed -->
-  </pages>
-</wiki_structure>
-"""
-
-
-# ---------------------------------------------------------------------------
-# 模型产出解析(移植 api/services/wiki/structure.py):wiki 结构 XML 容错链
-# 与 codemap 引用接地;只服务下方双路生成协议
-# ---------------------------------------------------------------------------
-
-
-def _normalize_importance(value: str | None) -> str:
-    v = (value or "").strip().lower()
-    return v if v in ("high", "medium", "low") else "medium"
-
-
-def _page_from_element(el: ET.Element, index: int) -> WikiPage:
-    return WikiPage(
-        id=el.get("id") or f"page-{index + 1}",
-        title=(el.findtext("title") or "").strip(),
-        content="",
-        filePaths=[e.text.strip() for e in el.iter("file_path") if e.text and e.text.strip()],
-        importance=_normalize_importance(el.findtext("importance")),
-        relatedPages=[e.text.strip() for e in el.iter("related") if e.text and e.text.strip()],
-    )
-
-
-def _pages_via_regex(xml_text: str) -> list[WikiPage]:
-    """严格 XML 解析失败或零页面时的正则兜底。"""
-    pages: list[WikiPage] = []
-    for i, block in enumerate(re.findall(r"<page\b[\s\S]*?</page>", xml_text)):
-        pid = re.search(r'<page\s+id="([^"]+)"', block)
-        title = re.search(r"<title>([\s\S]*?)</title>", block)
-        importance = re.search(r"<importance>([\s\S]*?)</importance>", block)
-        file_paths = [m.strip() for m in re.findall(r"<file_path>([\s\S]*?)</file_path>", block) if m.strip()]
-        related = [m.strip() for m in re.findall(r"<related>([\s\S]*?)</related>", block) if m.strip()]
-        pages.append(
-            WikiPage(
-                id=pid.group(1) if pid else f"page-{i + 1}",
-                title=title.group(1).strip() if title else "",
-                content="",
-                filePaths=file_paths,
-                importance=_normalize_importance(importance.group(1) if importance else None),
-                relatedPages=related,
-            )
-        )
-    return pages
-
-
-def _parse_sections(root: ET.Element) -> tuple[list[WikiSection], list[str]]:
-    sections: list[WikiSection] = []
-    referenced: set[str] = set()
-    for i, el in enumerate(root.iter("section")):
-        sid = el.get("id") or f"section-{i + 1}"
-        subs = [e.text.strip() for e in el.iter("section_ref") if e.text and e.text.strip()]
-        sections.append(
-            WikiSection(
-                id=sid,
-                title=(el.findtext("title") or "").strip(),
-                pages=[e.text.strip() for e in el.iter("page_ref") if e.text and e.text.strip()],
-                subsections=subs or None,
-            )
-        )
-        referenced.update(subs)
-    root_sections = [s.id for s in sections if s.id not in referenced]
-    return sections, root_sections
-
-
-def _first_group(pattern: str, text: str) -> str:
-    m = re.search(pattern, text)
-    return m.group(1).strip() if m else ""
-
-
-def _sections_via_regex(xml_text: str) -> tuple[list[WikiSection], list[str]]:
-    """严格解析失败时恢复完整 <section> 块(镜像 _parse_sections)。"""
-    sections: list[WikiSection] = []
-    referenced: set[str] = set()
-    for i, block in enumerate(re.findall(r"<section\b[\s\S]*?</section>", xml_text)):
-        sid = re.search(r'<section\s+id="([^"]+)"', block)
-        title = re.search(r"<title>([\s\S]*?)</title>", block)
-        page_refs = [m.strip() for m in re.findall(r"<page_ref>([\s\S]*?)</page_ref>", block) if m.strip()]
-        subs = [m.strip() for m in re.findall(r"<section_ref>([\s\S]*?)</section_ref>", block) if m.strip()]
-        sections.append(
-            WikiSection(
-                id=sid.group(1) if sid else f"section-{i + 1}",
-                title=title.group(1).strip() if title else "",
-                pages=page_refs,
-                subsections=subs or None,
-            )
-        )
-        referenced.update(subs)
-    root_sections = [s.id for s in sections if s.id not in referenced]
-    return sections, root_sections
-
-
-def parse_wiki_structure(text: str, comprehensive: bool) -> WikiStructureModel:
-    """解析模型产出的 XML 结构;容错:剥 markdown fence、转义裸 &、正则兜底;无 <wiki_structure> 抛 ValueError。"""
-    text = re.sub(r"^```(?:xml)?\s*", "", text.strip(), flags=re.IGNORECASE)
-    text = re.sub(r"```\s*$", "", text)
-
-    match = re.search(r"<wiki_structure>[\s\S]*?</wiki_structure>", text)
-    if match:
-        xml_text = match.group(0)
-    else:
-        # 截断响应:从开标签救取到文末(补合成闭合),让下方正则兜底恢复完整块
-        open_match = re.search(r"<wiki_structure>[\s\S]*", text)
-        if not open_match:
-            raise ValueError("No valid <wiki_structure> XML found in response")
-        _log("响应疑似被截断(缺 </wiki_structure>),按完整块救取")
-        xml_text = f"{open_match.group(0)}\n</wiki_structure>"
-
-    xml_text = re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]", "", xml_text)
-    xml_text = re.sub(r"&(?!(?:amp|lt|gt|quot|apos|#\d+|#x[0-9a-fA-F]+);)", "&amp;", xml_text)
-
-    root: ET.Element | None = None
-    try:
-        root = ET.fromstring(xml_text)
-    except ET.ParseError as e:
-        _log(f"严格 XML 解析失败,用正则兜底: {e}")
-
-    if root is not None:
-        title = root.findtext("title") or ""
-        description = root.findtext("description") or ""
-        pages = [_page_from_element(el, i) for i, el in enumerate(root.iter("page"))]
-    else:
-        # 头版 <title>/<description> 最先出现;页面级同名标签在后面
-        title = _first_group(r"<title>([\s\S]*?)</title>", xml_text)
-        description = _first_group(r"<description>([\s\S]*?)</description>", xml_text)
-        pages = []
-
-    if not pages:
-        _log("XML 解析无页面,用正则兜底")
-        pages = _pages_via_regex(xml_text)
-
-    sections: list[WikiSection] = []
-    root_sections: list[str] = []
-    if comprehensive:
-        if root is not None:
-            sections, root_sections = _parse_sections(root)
-        else:
-            sections, root_sections = _sections_via_regex(xml_text)
-
-    return WikiStructureModel(
-        id="wiki",
-        title=title.strip(),
-        description=description.strip(),
-        pages=pages,
-        sections=sections,
-        rootSections=root_sections,
-    )
-
-
-def _locate_snippet(text: str, snippet: str) -> tuple[int, int] | None:
-    """在文本中定位 snippet 的 1-based 行号范围(LLM 给的行号不可靠,snippet 为权威)。"""
-    snippet = snippet.strip("\n")
-    if not snippet:
-        return None
-    pos = text.find(snippet)
-    if pos != -1:
-        start = text.count("\n", 0, pos) + 1
-        return start, start + snippet.count("\n")
-    first = next((ln.strip() for ln in snippet.splitlines() if ln.strip()), "")
-    if first:
-        idx = text.find(first)
-        if idx != -1:
-            start = text.count("\n", 0, idx) + 1
-            return start, start + snippet.count("\n")
-    return None
-
-
-def _ground_citations(codemap: CodeMap, repo_dir: str) -> None:
-    """用真实源码里的 snippet 位置覆盖每条引用的行号范围(codemap 接地)。"""
-    file_cache: dict[str, str | None] = {}
-    for section in codemap.sections:
-        for step in section.steps:
-            cit = step.citation
-            if not cit or not cit.snippet or not cit.file_path:
-                continue
-            if cit.file_path not in file_cache:
-                path = os.path.join(repo_dir, cit.file_path)
-                try:
-                    with open(path, encoding="utf-8") as f:
-                        file_cache[cit.file_path] = f.read()
-                except (OSError, UnicodeDecodeError):
-                    file_cache[cit.file_path] = None
-            text = file_cache[cit.file_path]
-            if not text:
-                continue
-            loc = _locate_snippet(text, cit.snippet)
-            if loc:
-                cit.start_line, cit.end_line = loc
-
-
-# ---------------------------------------------------------------------------
-# 引用渲染(仓库相对路径 → web URL 的交付终态格式化;只服务本模块的页面产出)
-# ---------------------------------------------------------------------------
-
-
-class RepoUrlContext:
-    """把仓库相对路径转成 web URL 所需的一切(local/无 URL → 返回裸路径)。"""
-
-    def __init__(self, type: str, repo_url: str | None, default_branch: str):
-        self.type = type
-        self.repo_url = repo_url
-        self.default_branch = default_branch
-
-
-def generate_file_url(file_path: str, ctx: RepoUrlContext) -> str:
-    if ctx.type == "local" or not ctx.repo_url:
-        return file_path
-    if ctx.type == "github":
-        return f"{ctx.repo_url}/blob/{ctx.default_branch}/{file_path}"
-    if ctx.type == "gitlab":
-        return f"{ctx.repo_url}/-/blob/{ctx.default_branch}/{file_path}"
-    if ctx.type == "bitbucket":
-        return f"{ctx.repo_url}/src/{ctx.default_branch}/{file_path}"
-    return file_path
-
-
-def _escape_label(s: str) -> str:
-    """转义 '[' / ']' 使路径能作为 Markdown 链接普通文本渲染。"""
-    return re.sub(r"([\[\]])", r"\\\1", s)
-
-
-def _line_anchor(repo_type: str, start: str | None, end: str | None) -> str:
-    if not start:
-        return ""
-    if repo_type == "github":
-        return f"#L{start}-L{end}" if end else f"#L{start}"
-    if repo_type == "gitlab":
-        return f"#L{start}-{end}" if end else f"#L{start}"
-    if repo_type == "bitbucket":
-        return f"#lines-{start}:{end}" if end else f"#lines-{start}"
-    return ""
-
-
-def _citation_link(path: str, start: str | None, end: str | None, ctx: RepoUrlContext) -> str | None:
-    """把 `path[:start[-end]]` 解析为 Markdown 链接;local/未知 host 返回 None。"""
-    url = generate_file_url(path, ctx)
-    if url == path:
-        return None
-    line_part = (f":{start}-{end}" if end else f":{start}") if start else ""
-    anchor = _line_anchor(ctx.type, start, end)
-    return f"[{_escape_label(path)}{line_part}]({url}{anchor})"
-
-
-_DETAILS_RE = re.compile(
-    r"<details>\s*<summary>\s*Relevant source files\s*</summary>[\s\S]*?</details>",
-    re.IGNORECASE,
+from .models import WikiPage, WikiStructureModel, codemap_of
+from .utils import (  # noqa: E402,F401
+    _FILE_INLINE_CAP,
+    _LANGUAGE_NAMES,
+    _LANGUAGE_NAMES_RAW,
+    _SIMPLE_CHAT_SYSTEM_PROMPT,
+    _adapter,
+    _agent_note,
+    _build_service_prompt,
+    _failure,
+    _format_subgraph_context,
+    _graphify_context,
+    _graphify_mcp,
+    _graphify_server,
+    _is_token_limit_error,
+    _language_name,
+    _llm_research_chat,
+    _llm_research_stream,
+    _log,
+    _prompt_fmt,
+    _resolve_generator,
+    _run_extract,
+    _subgraph_hits,
+    _subgraph_src_blocks,
+    ensure_index,
+    llm_complete,
+    llm_stream,
 )
-_GENERIC_RE = re.compile(r"\[([^\[\]\s()]+?\.[A-Za-z0-9]+)(?::(\d+)(?:-(\d+))?)?\]\(\)")
-_PREFIXED_RE = re.compile(
-    r"\[(Sources?|Source):\s*([^\[\]\s():]+?)(?::(\d+)(?:-(\d+))?)?\]\(\)",
-    re.IGNORECASE,
+from .wiki import (  # noqa: E402,F401
+    _COMPREHENSIVE_STRUCTURE,
+    _CONCISE_STRUCTURE,
+    RepoUrlContext,
+    _build_page_prompt,
+    _finalize_page_content,
+    parse_wiki_structure,
+    post_process_wiki_content,
+    render_file_links,
 )
-_STRAY_PARENS_RE = re.compile(r"(\]\([^)\s]+\))\(\)")
-
-
-def render_file_links(file_paths: list[str], ctx: RepoUrlContext) -> str:
-    """规范式文件链接行(带 _escape_label):llm 页 prompt 与 post_process 详情块共用。"""
-    return "\n".join(f"- [{_escape_label(p)}]({generate_file_url(p, ctx)})" for p in file_paths)
-
-
-def post_process_wiki_content(content: str, file_paths: list[str], ctx: RepoUrlContext) -> str:
-    """后处理模型产出的 wiki markdown:重建 <details> 块、解析各种空括号引用为真实链接。"""
-    processed = content
-
-    # 1. 用已知文件列表重建 <details> 块
-    if file_paths:
-        links = render_file_links(file_paths, ctx)
-        details_block = (
-            "<details>\n"
-            "<summary>Relevant source files</summary>\n\n"
-            "The following files were used as context for generating this wiki page:\n\n"
-            f"{links}\n"
-            "</details>"
-        )
-        if _DETAILS_RE.search(processed):
-            processed = _DETAILS_RE.sub(lambda _m: details_block, processed)
-        else:
-            processed = f"{details_block}\n\n{processed}"
-
-    # 2. 按已知 filePaths 解析空引用(最长优先)
-    if file_paths:
-        alternation = "|".join(re.escape(p) for p in sorted(file_paths, key=len, reverse=True))
-        citation_re = re.compile(r"\[(" + alternation + r")(?::(\d+)(?:-(\d+))?)?\]\(\)")
-
-        def _repl_known(m: re.Match) -> str:
-            link = _citation_link(m.group(1), m.group(2), m.group(3), ctx)
-            return link if link is not None else m.group(0)
-
-        processed = citation_re.sub(_repl_known, processed)
-
-    # 3. 剩余形如文件路径的空引用
-    def _repl_generic(m: re.Match) -> str:
-        link = _citation_link(m.group(1), m.group(2), m.group(3), ctx)
-        return link if link is not None else m.group(0)
-
-    processed = _GENERIC_RE.sub(_repl_generic, processed)
-
-    # 4. `[Sources: 裸文件名:行]()` 通过 basename 查回全路径
-    if file_paths:
-        by_basename: dict[str, str] = {}
-        for p in file_paths:
-            by_basename.setdefault(p.rsplit("/", 1)[-1], p)
-
-        def _repl_prefixed(m: re.Match) -> str:
-            prefix, token, start, end = m.group(1), m.group(2), m.group(3), m.group(4)
-            full_path = token if "/" in token else by_basename.get(token)
-            if not full_path:
-                return m.group(0)
-            link = _citation_link(full_path, start, end, ctx)
-            if link is None:
-                return m.group(0)
-            return f"{prefix}: {link}"
-
-        processed = _PREFIXED_RE.sub(_repl_prefixed, processed)
-
-    # 5. 去掉完成链接后的冗余空 "()"
-    processed = _STRAY_PARENS_RE.sub(r"\1", processed)
-    return processed
-
 
 # ---------------------------------------------------------------------------
 # 双路包装类分派总则
@@ -714,170 +95,9 @@ def post_process_wiki_content(content: str, file_paths: list[str], ctx: RepoUrlC
 # codemap 同开关(choice 缺省走 env 默认)。
 # 边界:语义属于单路生成协议的 helper(提示词组装/历史转写/检索上下文注入/
 # agent 交付件路径/llm 一次问答生成链)收进对应 pipeline 类为 self._xxx();
-# 共用构建件与低层支撑保持模块级。类方法体内一律以模块全局名引用
-# _adapter/llm_stream/llm_complete/envs.*(调用时动态解析),
-# 保证调用时动态解析(测试 monkeypatch 与 envs 切换均生效,不得实例捕获或模块级快照)。
-
-
-# ---------------------------------------------------------------------------
-# 四路装配(适配器构造入口 _adapter + graphify MCP 工具桌 + llm 传输)
-# ---------------------------------------------------------------------------
-
-
-def _graphify_mcp(backend: str) -> list[dict]:
-    """引擎图工具桌(graphify 属引擎内建)→ 适配层通用 mcp_servers 描述。
-
-    backend="dsh":组合 mcp-client 行(id mcp-graphify / serverName graphify);
-    backend="codex":config.toml 段(id graphify + env_vars 白名单透传 GRAPHIFY_OUT)。
-    """
-    command = os.environ.get("GRAPHIFY_MCP_PYTHON") or sys.executable
-    if backend == "dsh":
-        return [{"id": "mcp-graphify", "serverName": "graphify",
-                 "command": command, "args": ["-m", "graphify.serve"]}]
-    return [{"id": "graphify", "command": command, "args": ["-m", "graphify.serve"],
-             "env_vars": ["GRAPHIFY_OUT"]}]
-
-
-def _graphify_server(repo: Repo):
-    """进程内 MCP server:把 graphify.query 封装为 graphify_query 工具(闭包绑定图路径)。"""
-
-    graph_path = _graph_path(repo)
-
-    @tool(
-        "graphify_query",
-        "Query this repository's code graph and return the related code subgraph "
-        "(functions/classes/call relationships as text), with `Source: <file path> L<line> "
-        "markers. Use it to get code structure and line-number references.",
-        {"question": str},
-    )
-    async def graphify_query(args: dict) -> dict:
-        try:
-            question = (args.get("question") or "").strip()
-            result = graphify.query(question, graph_path=graph_path)
-            text = result.get("answer") or ""
-        except Exception as exc:
-            text = f"Graph query failed: {type(exc).__name__}: {exc}"
-        return {"content": [{"type": "text", "text": text.strip() or "(No matching results in code graph)"}]}
-
-    return create_sdk_mcp_server("graphify", tools=[graphify_query])
-
-
-def _adapter(choice: dict | None, *, system_prompt: str = "", repo: Repo | None = None,
-             agent_output_dir: str | None = None, agent_write_mode: bool = False):
-    """choice → 适配器实例(四路收敛构造入口;≈ GENERATORS[gid](config) 一行)。
-
-    gid 经 _resolve_generator(file 类 config_path 规范化);llm 路 resolved 即
-    OpenAIConfig(概念键透传)。cc/dsh/codex 按 agent.configs.py TypedDict 键集
-    组装 config dict(空/None 不落键;SDK 映射全在 agent 侧 —— 本层零 SDK 字段名;
-    config_path 纯透传,本层不读文件;模型/凭证随所选配置):
-    - cc:工具隔离(setting_sources=[] + 内置 graphify 进程内 server),repo 非空时
-      cwd 固定仓库根(SDK 缺省 = 进程 cwd,曾导致 agent 串到 gh-puller 把 docs
-      写入其中);agent_write_mode(交付件落盘,wiki 结构/页面)追加 Write/add_dirs/
-      acceptEdits,默认模式只开放 Read/Grep/Glob(chat/codemap 的 agent 自读代码,
-      无落盘);
-    - dsh:provider/session_root/runtime_cwd + system_prompt → 组合 persona
-      (非空才注入,空回退缺省);mcp_servers 通用描述注入图工具桌
-      (适配层零工具名;对 agent 为 mcp__graphify__query_graph,见 _agent_note);
-    - codex:system_prompt → thread_start.base_instructions;config_path 纯透传
-      (home config.toml 符号链接);mcp_servers 通用描述 + env.GRAPHIFY_OUT 注入
-      隔离 home 工具桌(零配置缺省即带图;sandbox 缺省 full_access,镜像 dsh
-      danger-full-access,可覆写)。
-
-    一个实例 = 一次对话(重试/每阶段刷新构造;构造期即装配 SDK 对象)。
-    """
-    gid, resolved = _resolve_generator(choice)
-    if gid == "llm":
-        return GENERATORS["llm"](resolved)
-    if gid == "dsh":
-        options: dict[str, Any] = {
-            "provider": "deepseek-official",  # dsh SDK 原生 provider 路由名(gh provider id 是 deepseek)
-            "session_root": envs.DSH_SESSION_ROOT,
-            "runtime_cwd": envs.DSH_RUNTIME_CWD,  # .env 加载点越过任务 checkout(见 envs)
-            "system_prompt": system_prompt,  # → 组合 persona(agent dsh_fields 映射,空则缺省)
-        }
-        if resolved.get("config_path"):
-            options["config_path"] = resolved["config_path"]
-        if repo is not None:
-            options["cwd"] = os.path.abspath(repo.save_path)
-            options["mcp_servers"] = _graphify_mcp("dsh")  # 引擎工具桌经通用描述注入(适配层零工具名)
-    elif gid == "codex":
-        options = {
-            "system_prompt": system_prompt,
-            "sandbox": "full_access",  # 高自由度缺省(镜像 dsh danger-full-access;可覆写)
-            "approval_mode": "auto_review",
-        }
-        if resolved.get("config_path"):
-            options["config_path"] = resolved["config_path"]
-        if repo is not None:
-            options["cwd"] = os.path.abspath(repo.save_path)
-            options["env"] = {"GRAPHIFY_OUT": str(_graph_dir(repo))}
-            options["mcp_servers"] = _graphify_mcp("codex")  # 零配置缺省隔离 config.toml 带图工具
-    else:  # cc
-        options = {
-            "system_prompt": system_prompt,
-            "include_partial_messages": True,
-            "setting_sources": [],  # 完全隔离本地 claude 配置(用户级 MCP/skills/hooks 不掺入 agent)
-        }
-        if resolved.get("config_path"):
-            options["config_path"] = resolved["config_path"]  # 纯透传:SDK 经 --settings 装载,本层不读文件
-        if repo is not None:
-            options["cwd"] = os.path.abspath(repo.save_path)
-            options["mcp_servers"] = {"graphify": _graphify_server(repo)}
-            tools = ["Read", "Grep", "Glob", "graphify_query", "mcp__graphify__graphify_query"]
-            if agent_write_mode:
-                if agent_output_dir:
-                    options["add_dirs"] = [os.path.abspath(agent_output_dir)]
-                options["permission_mode"] = "acceptEdits"
-                tools = ["Write", *tools]
-            options["allowed_tools"] = tools
-    return GENERATORS[gid](options)
-
-
-async def llm_stream(prompt: str, *, choice: dict | None, session_name: str, run_id: str,
-                     context: list[dict] | None = None):
-    """llm 路统一流式补全口(单条 user 消息;payload 独立于 config 运行时传入)。
-
-    内部经 _adapter 构造(模型/url/凭证随所选 choice,OpenAIConfig 即 resolved);
-    本模块裸名调用 —— deepwiki_pipeline.llm_stream 是测试 monkeypatch 位点。
-    """
-    adapter = _adapter(choice)
-    payload = {"messages": [{"role": "user", "content": prompt}], "model": adapter.config.get("model")}
-    async for chunk in adapter.stream(payload, session_name=session_name, run_id=run_id, context=context):
-        yield chunk
-
-
-async def llm_complete(prompt: str, *, choice: dict | None, session_name: str, run_id: str,
-                       context: list[dict] | None = None) -> str:
-    """llm 路统一整收补全口(单条 user 消息;同 llm_stream 装配)。"""
-    adapter = _adapter(choice)
-    payload = {"messages": [{"role": "user", "content": prompt}], "model": adapter.config.get("model")}
-    return await adapter.result(payload, session_name=session_name, run_id=run_id, context=context)
-
-
-def _agent_note(generator: str) -> str:
-    """注入到 user 消息的指引段(供 agent 知道用图工具获取带行号的代码上下文)。
-
-    dsh/codex 后端的图工具名不同(dsh 经组合内置 mcp-client、codex 经隔离
-    config.toml 装载 graphify,对 agent 均为 mcp__graphify__query_graph;cc 为
-    graphify_query)—— 指引按后端切换,防 agent 找错工具名而放弃图语境。
-    """
-    if generator in ("dsh", "codex"):
-        return (
-            "<note>You may use the mcp__graphify__query_graph tool to inspect this "
-            "repository's code graph whenever you need code context or exact file/line "
-            "references for citations. "
-            "Its results mark sources as `Source: <file path> L<line number>`.</note>\n\n"
-        )
-    return (
-        "<note>You may use the graphify_query tool to inspect this repository's code graph "
-        "whenever you need code context or exact file/line references for citations. "
-        "Its results mark sources as `Source: <file path> L<line number>`.</note>\n\n"
-    )
-
-
-def _finalize_page_content(content: str, page: WikiPage, ctx: RepoUrlContext) -> str:
-    """页面交付的终态格式化(剥代码围栏 + 引用后处理);新鲜生成与续跑水合同一收口。"""
-    return post_process_wiki_content(_strip_markdown_fences(content), list(page.filePaths), ctx)
+# 共用构建件与低层支撑保持模块级(迁 utils/wiki/chat/codemap)。类方法体内一律
+# 以模块全局名引用 _adapter/llm_stream/llm_complete/envs.*(调用时动态解析,
+# 保证调用时动态解析:测试 monkeypatch 与 envs 切换均生效,不得实例捕获或模块级快照)。
 
 
 class WikiPipeline:
@@ -1015,15 +235,6 @@ IMPORTANT:You MUST respond in {language_name} language.
     # agent 交付通道(适配器构造统一经模块级 _adapter;直呼 stream/result)
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _failure(exc: Exception) -> Exception:
-        """RequestFailedError → RuntimeError("agent 执行失败: ...")(对外文案,
-        原 agent.generate_* file 类分支的包装);其余异常原样返回。
-        链式追溯由唯一 raise 点(_deliver)以 raise ... from 补上。"""
-        if isinstance(exc, RequestFailedError):
-            return RuntimeError(f"agent 执行失败: {exc.detail}")
-        return exc
-
     async def _deliver(
         self, adapter: Any, prompt: str, out_path: Path,
         label: str | None = None, *, run_id: str | None = None,
@@ -1040,7 +251,7 @@ IMPORTANT:You MUST respond in {language_name} language.
             async for _ in adapter.stream(prompt, session_name=label, run_id=run_id):
                 pass
         except RequestFailedError as e:
-            raise self._failure(e) from e
+            raise _failure(e) from e
         text = await asyncio.to_thread(out_path.read_text, encoding="utf-8")
         if not text.strip():
             raise RuntimeError(f"agent 未产出交付文件: {out_path}")
@@ -1233,7 +444,7 @@ IMPORTANT:
             ):
                 yield chunk
         except Exception as e:  # 执行期失败降级为可读错误文本(同原 stream_and_fallback 语义)
-            err = self._failure(e)  # RequestFailedError 先转「agent 执行失败」再降级(同原包装时序)
+            err = _failure(e)  # RequestFailedError 先转「agent 执行失败」再降级(同原包装时序)
             _log(f"chat agent 错误: {err}")
             yield f"\n\n(抱歉,本次请求处理失败: {err})"
 
@@ -1265,7 +476,7 @@ IMPORTANT:
                     )
                     return _extract_json(raw)
                 except Exception as e:  # noqa: BLE001 - 重试预算兜底(RequestFailedError 先转文案)
-                    last_error = self._failure(e)
+                    last_error = _failure(e)
                     _log(f"codemap JSON 解析尝试 {attempt}/{attempts} 失败: {last_error}")
             raise ValueError(f"Model did not return valid JSON after {attempts} attempts: {last_error}")
 
@@ -1298,7 +509,7 @@ IMPORTANT:
             final = codemap_of(_extract_json(raw))
             yield _phase("diagrams", "done")
         except Exception as e:  # noqa: BLE001
-            err = self._failure(e)  # RequestFailedError 先转「agent 执行失败」再降级(同原包装时序)
+            err = _failure(e)  # RequestFailedError 先转「agent 执行失败」再降级(同原包装时序)
             _log(f"codemap 指南/图失败,使用骨架: {err}")
             yield _phase("diagrams", "done", degraded=True)
 
@@ -1309,9 +520,6 @@ IMPORTANT:
 
 class LlmWikiPipeline(WikiPipeline):
     """llm 路对外 API 包装:deepwiki-open 原式单次补全(内容内联进 prompt,无工具)。"""
-
-    # 纯 LLM 路径单文件内联截断(字符)
-    _FILE_INLINE_CAP = 8000
 
     _DEEP_RESEARCH_FIRST_ITERATION_PROMPT = """<role>
 You are an expert code analyst examining the {repo_type} repository: {repo_url} ({repo_name}).
@@ -1393,7 +601,7 @@ IMPORTANT:You MUST respond in {language_name} language.
 - Provide a complete and definitive answer to the original question
 - Do NOT include general repository information unless directly relevant to the query
 - Focus exclusively on the specific topic being researched
-- NEVER respond with "Continue the research" as an answer - always provide a complete conclusion
+- NEVER respond with "Continue the research" as an answer - always provide a complete answer
 - If the topic is about a specific file or feature (like "Dockerfile"), focus ONLY on that file or feature
 - Ensure your conclusion builds on and references key findings from previous iterations
 </guidelines>
@@ -1405,113 +613,6 @@ IMPORTANT:You MUST respond in {language_name} language.
 - Structure your response with clear headings
 - End with actionable insights or recommendations when appropriate
 </style>"""
-
-    def _subgraph_hits(self, answer: str) -> dict[str, list[int]]:
-        """解析 graphify.query 的 answer 标注 → {file: [行号...]}。
-
-        NODE 行形如 `NODE <label> [src=<file> loc=L<line> community=<cid>]`,
-        EDGE 行以 ` at=<file>:L<line>` 结尾;容忍 [i] TRUNCATED / over-budget
-        前缀行与 ... (truncated 尾行;非匹配行忽略,loc 缺失/为空的文件跳过)。
-        """
-        hits: dict[str, list[int]] = {}
-        for raw in answer.splitlines():
-            m = re.match(r"^NODE\s+.+?\s+\[([^\]]*)\]$", raw)
-            if m:
-                src = re.search(r"\bsrc=(\S+)\b", m.group(1))
-                loc = re.search(r"\bloc=(L?\d+)\b", m.group(1))
-                if src and loc:
-                    hits.setdefault(src.group(1), []).append(int(loc.group(1).lstrip("L")))
-                continue
-            m = re.search(r"\bat=([^:\s]+):(L\d+)$", raw)
-            if m:
-                hits.setdefault(m.group(1), []).append(int(m.group(2)[1:]))
-        return {p: sorted(set(lines)) for p, lines in hits.items()}
-
-    def _subgraph_src_blocks(
-        self, save_path: str,
-        hits: dict[str, list[int]],
-        *,
-        radius: int = 12,
-        per_file_cap: int = _FILE_INLINE_CAP,
-        budget_chars: int | None = None,
-    ) -> tuple[list[dict[str, Any]], bool]:
-        """命中行窗提取:{file: [行号]} → [{path,text,start_line,end_line}...], (blocks, degraded)。
-
-        每文件:命中行 ±radius 展开、相邻窗(间距 ≤ 2*radius)合并、夹到文件行界;
-        单文件累计字符封顶 per_file_cap(溢出窗截断,后续窗丢弃);
-        全量累计超 budget_chars(缺省 CHAT_TOKEN_LIMIT_ESTIMATE*4)即整组降级
-        (返回 ([], True));调用方据此跳过注入(提示词注"无检索增强"note)。
-        OSError/解码失败的文件跳过(其余文件正常)。
-        """
-        budget = budget_chars if budget_chars is not None else envs.CHAT_TOKEN_LIMIT_ESTIMATE * 4
-        blocks: list[dict[str, Any]] = []
-        total = 0
-        for path in sorted(hits):
-            try:
-                full_text = Path(save_path, path).read_text(encoding="utf-8")
-            except OSError:
-                continue
-            lines = full_text.splitlines()
-            n_lines = len(lines)
-            # 命中行 → 合并后的窗区间
-            windows: list[tuple[int, int]] = []
-            for line in sorted(set(hits[path])):
-                start = max(1, line - radius)
-                end = min(n_lines, line + radius)
-                if windows and start <= windows[-1][1] + 1:
-                    windows[-1] = (windows[-1][0], max(windows[-1][1], end))
-                else:
-                    windows.append((start, end))
-            file_chars = 0
-            for start, end in windows:
-                seg_text = "\n".join(lines[start - 1:end])
-                if not seg_text.strip():
-                    continue
-                remain = per_file_cap - file_chars
-                if len(seg_text) > remain:
-                    if remain <= 0:
-                        break
-                    seg_text = seg_text[:remain]
-                    end = start + seg_text.count("\n")
-                file_chars += len(seg_text)
-                if total + len(seg_text) > budget:  # 先按单文件截断,再整体预算判断
-                    return [], True
-                blocks.append({"path": path, "text": seg_text, "start_line": start, "end_line": end})
-                total += len(seg_text)
-        return blocks, False
-
-    def _format_subgraph_context(self, blocks: list[dict[str, Any]]) -> str:
-        """代码窗 → 原版 _format_context 同式文本(chat/codemap 共用)。
-
-        按文件分组:每组 `## File Path: {path}` 头 + 每窗 `[lines A-B]\n<code>`
-        (窗间空行);文件段以原版同式(`"\\n\\n" + "-"*10 + "\\n\\n".join(parts)`)
-        联结。空输入 → ""(上层 prompt_builder 会注入"无检索增强"note)。"""
-        if not blocks:
-            return ""  # 原版由调用方兜底(无文档时不调用);空输入保持 "" 供 prompt_builder 注 note
-        groups: dict[str, list[dict[str, Any]]] = {}
-        for b in blocks:
-            groups.setdefault(b["path"], []).append(b)
-        context_parts: list[str] = []
-        for path, blks in groups.items():
-            chunk_texts = [f"[lines {b['start_line']}-{b['end_line']}]\n{b['text']}" for b in blks]
-            context_parts.append(f"## File Path: {path}\n\n" + "\n\n".join(chunk_texts))
-        return "\n\n" + ("-" * 10) + "\n\n".join(context_parts)
-
-    async def _graphify_context(self, repo: Repo, question: str) -> dict[str, Any]:
-        """graphify.query + 子图 → 真实代码行窗;任何失败吞掉置 error(服务降级,不抛)。"""
-        try:
-            result = await asyncio.to_thread(
-                graphify.query, question, graph_path=str(_graph_path(repo))
-            )
-            answer = result.get("answer") or ""
-        except Exception as exc:
-            _log(f"图谱查询失败,降级: {type(exc).__name__}: {exc}")
-            return {"hits": {}, "blocks": [], "degraded": False, "error": f"{type(exc).__name__}: {exc}"}
-        hits = self._subgraph_hits(answer)
-        if not hits:
-            return {"hits": {}, "blocks": [], "degraded": False, "error": None}
-        blocks, degraded = self._subgraph_src_blocks(repo.save_path, hits)
-        return {"hits": hits, "blocks": blocks, "degraded": degraded, "error": None}
 
     def _build_turn_history(self, messages: list[dict]) -> str:
         """LLM 路对话历史:恒拼 <turn> 成对序列(原版无裁剪;输入过大仅跳过检索上下文)。"""
@@ -1525,113 +626,6 @@ IMPORTANT:You MUST respond in {language_name} language.
                 )
         return f"<conversation_history>\n{turns}</conversation_history>\n\n" if turns else ""
 
-    def _build_service_prompt(
-        self, system_prompt: str, query: str, *, conversation_history: str = "", context: str = "",
-        simplify: bool = False,
-    ) -> str:
-        """原版 api/chat/_prompts.py prompt_builder 逐字移植(单条 user 消息)。
-
-        结构:/no_think + 系统提示词 → <conversation_history> → 检索上下文
-        (<START_OF_CONTEXT> 包裹;为空注"无检索增强"note)或简化 note(输入超限时)
-        → <query>…</query> + Assistant:。"""
-        prompt = f"/no_think {system_prompt}\n\n"
-        if conversation_history:
-            prompt += f"<conversation_history>\n{conversation_history}</conversation_history>\n\n"
-        if not simplify:
-            if context.strip():
-                prompt += f"<START_OF_CONTEXT>\n{context}\n<END_OF_CONTEXT>\n\n"
-            else:
-                prompt += "<note>Answering without retrieval augmentation.</note>\n\n"
-        else:
-            prompt += "<note>Answering without retrieval augmentation due to input size constraints.</note>\n\n"
-        return prompt + f"<query>\n{query}\n</query>\n\nAssistant: "
-
-    def _is_token_limit_error(self, exc: Exception) -> bool:
-        """原版 api/chat/__init__.py is_token_limit_error 的判断子串(大小写不敏感)。"""
-        error_message = str(exc).lower()
-        return any(k in error_message for k in (
-            "maximum context length", "token limit", "too many tokens",
-        ))
-
-    async def _llm_research_chat(
-        self, system: str, query: str, *, choice, repo: Repo, session_name: str, run_id: str,
-        conversation_history: str = "",
-    ):
-        """原版 research_chat 等价(LLM 路流式):见 _llm_research_stream 所述语义;
-        失败语义与原版一致(错误文本进流,不抛出)。"""
-        async for chunk in self._llm_research_stream(
-            system, query, choice=choice, repo=repo, session_name=session_name, run_id=run_id,
-            conversation_history=conversation_history,
-        ):
-            yield chunk
-
-    async def _llm_research_stream(
-        self, system: str, query: str, *, choice, repo: Repo, session_name: str, run_id: str,
-        conversation_history: str = "",
-    ):
-        """原版 research_chat 语义(LLM 路逐段对齐):
-
-        - 最后一问估算超 CHAT_TOKEN_LIMIT_ESTIMATE(原 MAX_INPUT_TOKENS=7500)→ 跳过检索;
-        - 检索上下文 = 图谱子图→真实代码窗(原 RAG 的适配点),经 prompt_builder 同式拼装
-          (<START_OF_CONTEXT> 包裹;为空注"无检索增强"note);
-        - stream_and_fallback:token 超限 → 简化提示词重试(去掉检索上下文)→ 致歉;
-          其余异常 → "Error with openai API: {e}" 文本进流。
-        """
-        context: list[dict] = []
-        context_text = ""
-        if _estimate_tokens(query) > envs.CHAT_TOKEN_LIMIT_ESTIMATE:
-            _log(f"输入过大(估算 {_estimate_tokens(query)} tokens),跳过检索上下文(原版 MAX_INPUT_TOKENS 语义)")
-            context.append({"type": "context/modify",
-                            "data": {"target": "query", "kind": "trim",
-                                     "cause": "token-limit", "detail": "输入过大,跳过检索"}})
-        else:
-            ctx = await self._graphify_context(repo, query)
-            for b in ctx["blocks"]:
-                context.append({"type": "context/modify",
-                                "data": {"target": "query", "phase": "prompt-assembly",
-                                         "provenance": f"deepwiki:graph:{b['path']}",
-                                         "text": b["text"]}})
-            if ctx["degraded"]:
-                context.append({"type": "context/modify",
-                                "data": {"target": "query", "kind": "degrade",
-                                         "cause": "token-limit", "detail": "检索上下文超限"}})
-            if ctx["error"]:
-                context.append({"type": "context/modify",
-                                "data": {"target": "query", "kind": "degrade",
-                                         "cause": "graph-error",
-                                         "detail": f"代码图谱不可用: {ctx['error']}"}})
-            context_text = self._format_subgraph_context(ctx["blocks"])
-
-        prompt = self._build_service_prompt(
-            system, query, conversation_history=conversation_history, context=context_text
-        )
-        simplified = self._build_service_prompt(
-            system, query, conversation_history=conversation_history, simplify=True
-        )
-        try:
-            async for chunk in llm_stream(
-                prompt, choice=choice, session_name=session_name, run_id=run_id, context=context,
-            ):
-                yield chunk
-        except Exception as e:
-            if self._is_token_limit_error(e):
-                _log("token 超限,简化为无检索上下文重试")
-                try:
-                    async for chunk in llm_stream(
-                        simplified, choice=choice, session_name=session_name, run_id=run_id,
-                        context=context,
-                    ):
-                        yield chunk
-                except Exception as e2:  # noqa: BLE001 - 简化重试失败 → 致歉文本(原版同式)
-                    _log(f"简化重试失败: {e2}")
-                    yield (
-                        "\nI apologize, but your request is too large for me to process. "
-                        "Please try a shorter query or break it into smaller parts."
-                    )
-            else:
-                _log(f"chat llm 错误: {e}")
-                yield f"\nError with openai API: {e}"
-
     async def determine_structure(
         self, *, choice: dict | None, repo: Repo, owner: str, repo_name: str,
         file_tree: list[str], readme: str, comprehensive: bool, language: str, run_id: str,
@@ -1643,7 +637,7 @@ IMPORTANT:You MUST respond in {language_name} language.
         )
         system = _SIMPLE_CHAT_SYSTEM_PROMPT.format(**_prompt_fmt(repo, language=language))
         parts: list[str] = []
-        async for chunk in self._llm_research_chat(
+        async for chunk in _llm_research_chat(
             system, prompt, choice=choice, repo=repo,
             session_name="wiki:structure", run_id=run_id,
         ):
@@ -1708,7 +702,7 @@ IMPORTANT:
         prompt = _build_page_prompt(page.title, file_links, language)
         system = _SIMPLE_CHAT_SYSTEM_PROMPT.format(**_prompt_fmt(repo, language=language))
         parts: list[str] = []
-        async for chunk in self._llm_research_chat(
+        async for chunk in _llm_research_chat(
             system, prompt, choice=choice, repo=repo,
             session_name=f"wiki:page:{page.id}", run_id=run_id,
         ):
@@ -1744,7 +738,7 @@ IMPORTANT:
             system = _SIMPLE_CHAT_SYSTEM_PROMPT.format(**fmt)
 
         history = self._build_turn_history(messages)
-        async for chunk in self._llm_research_chat(
+        async for chunk in _llm_research_chat(
             system, last.get("content", ""), choice=choice, repo=repo,
             session_name=f"chat:{repo.name}", run_id=f"chat:{repo.name}",
             conversation_history=history,
@@ -1763,7 +757,7 @@ IMPORTANT:
             yield _phase("analyzing", "done", chunk_count=0)
             yield _event(type="error", stage="analyzing", message=f"仓库尚未索引,请先 /repo/prepare: {repo.name}")
             return
-        ctx = await self._graphify_context(repo, question)
+        ctx = await _graphify_context(repo, question)
         yield _phase("analyzing", "done", chunk_count=len(ctx["blocks"]))
 
         fmt = _prompt_fmt(repo, language=language)
@@ -1781,14 +775,14 @@ IMPORTANT:
                             "data": {"target": "codemap", "kind": "degrade",
                                      "cause": "graph-error",
                                      "detail": f"代码图谱不可用: {ctx['error']}"}})
-        context_text = self._format_subgraph_context(ctx["blocks"])
+        context_text = _format_subgraph_context(ctx["blocks"])
 
         async def _run_llm_json(prompt: str, attempts: int, session_name: str) -> dict:
             """整收 + 解析 JSON;仅解析失败重试(原版 _generate_json 语义:
             传输异常直接上抛,由阶段 try 处理)。"""
             last_error: Exception | None = None
             for attempt in range(1, attempts + 1):
-                raw = await llm_complete(
+                raw = await utils.llm_complete(
                     prompt, choice=choice,
                     session_name=session_name, run_id=f"codemap:{repo.name}",
                     context=context,
@@ -1802,7 +796,7 @@ IMPORTANT:
 
         # ---- 阶段 1b:骨架 ----------------------------------------------------
         yield _phase("initial_codemap", "start")
-        skeleton_prompt = self._build_service_prompt(
+        skeleton_prompt = _build_service_prompt(
             _CODEMAP_SKELETON_PROMPT.format(**fmt), question, context=context_text
         )
         try:
@@ -1818,7 +812,7 @@ IMPORTANT:
         enrich_query = (
             f"{question}\n\n<SKELETON>\n{json.dumps(dataclasses.asdict(skeleton))}\n</SKELETON>"
         )
-        enrich_prompt = self._build_service_prompt(
+        enrich_prompt = _build_service_prompt(
             _CODEMAP_ENRICH_PROMPT.format(**fmt), enrich_query, context=context_text
         )
         final = skeleton
@@ -1852,25 +846,6 @@ def _wiki_pipeline(choice: dict | None = None) -> WikiPipeline:
 # ---------------------------------------------------------------------------
 
 
-def _prompt_fmt(repo: Repo, *, language: str = "en") -> dict:
-    """提示词格式化用的公共字段(repo 域对象 + 语言散装)。"""
-    return {
-        "repo_type": repo.repo_type,
-        "repo_url": repo.repo_url,
-        "repo_name": repo.name,
-        "language_name": _language_name(language or "en"),
-    }
-
-
-def _resolve_chat_continuation(last: dict, messages: list[dict]) -> None:
-    """continuation 回退(移植 research.py):末条含 continue+research 时换回首个用户消息(就地改 last['content'])。"""
-    if "continue" in last.get("content", "").lower() and "research" in last.get("content", "").lower():
-        for msg in messages:
-            if msg.get("role") == "user" and "continue" not in msg.get("content", "").lower():
-                last["content"] = msg["content"].strip()
-                break
-
-
 async def chat_stream(
     *, choice: dict | None, repo: Repo, messages: list[dict],
     language: str = "en", research_iteration: int = 1,
@@ -1891,36 +866,3 @@ async def generate_codemap(
         choice=choice, repo=repo, question=question, language=language,
     ):
         yield ev
-
-
-# ---------------------------------------------------------------------------
-# 索引保障服务(clone + 建图;/repo/prepare 与 wiki 任务主流程共用。
-# 未索引前置校验属端点守卫,在 apps/deepwiki-webui/server/app.py)
-# ---------------------------------------------------------------------------
-
-
-async def _run_extract(repo: Repo, *, extra_excludes: list[str] | None = None) -> dict:
-    """graphify.extract 建图(code_only 纯本地 AST,无 key 可跑);失败返回错误态 dict,不抛。"""
-    return await asyncio.to_thread(
-        graphify.extract,
-        path=repo.save_path,
-        code_only=True,
-        out_dir=_graph_dir(repo),
-        extra_excludes=extra_excludes,
-    )
-
-
-async def ensure_index(repo: Repo, *, extra_excludes: list[str] | None = None) -> None:
-    """索引保障(克隆 + 建图):已 ready 直接返回。
-
-    克隆判断独立于 ready 与否 —— graph.json 在但克隆目录被删时补克隆
-    (防文件树静默退化为空);建图失败(extract 错误态)→ RuntimeError 上抛,
-    由调用方决定上报/置任务 FAILED。
-    """
-    if not repo.downloaded and not repo.is_local:
-        await asyncio.to_thread(repo.download)
-    if not _index_ready(repo):
-        result = await _run_extract(repo, extra_excludes=extra_excludes)
-        if result.get("error"):
-            raise RuntimeError(result["error"])
-

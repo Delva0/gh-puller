@@ -35,8 +35,7 @@ from gh_puller.deepwiki import (
     read_wiki_cache,
 )
 from gh_puller.deepwiki.cache import _generator_digest, _index_ready
-from gh_puller.deepwiki.pipeline import _LANGUAGE_NAMES
-from gh_puller.deepwiki.utils import _log
+from gh_puller.deepwiki.utils import _LANGUAGE_NAMES, _log
 from gh_puller.utils import (
     Repo,
     TaskStatus,

@@ -25,7 +25,7 @@ from gh_puller.deepwiki import (
     write_resume_state,
 )
 from gh_puller.agent import GENERATORS, RequestFailedError
-from gh_puller.deepwiki import pipeline as deepwiki_pipeline
+from gh_puller.deepwiki import utils as deepwiki_utils
 from gh_puller.deepwiki.cache import _generator_digest, _graph_dir, _resume_state_path
 from gh_puller.deepwiki.pipeline import (
     RepoUrlContext,
@@ -457,11 +457,10 @@ NODE d [src=src/c.py community=c1]
 
 def test_subgraph_hits_parse():
     """解析 NODE(src/loc)/EDGE(at=) 标注:容忍截断前缀行,空 loc 或无 loc 跳过。"""
-    pipeline = deepwiki.LlmWikiPipeline()
-    hits = pipeline._subgraph_hits(_SUBGRAPH_ANSWER)
+    hits = deepwiki.utils._subgraph_hits(_SUBGRAPH_ANSWER)
     assert hits == {"src/a.py": [5, 12, 40]}
     assert "src/b.py" not in hits and "src/c.py" not in hits
-    assert pipeline._subgraph_hits("no matches here\n") == {}
+    assert deepwiki.utils._subgraph_hits("no matches here\n") == {}
 
 
 @pytest.mark.asyncio
@@ -472,14 +471,13 @@ async def test_subgraph_src_blocks_windows_merge(tmp_path, monkeypatch):
         "\n".join(f"line {i}" for i in range(1, 101)), encoding="utf-8"
     )
     monkeypatch.setattr(deepwiki.envs, "CHAT_TOKEN_LIMIT_ESTIMATE", 20000)
-    pipeline = deepwiki.LlmWikiPipeline()
-    blocks, degraded = pipeline._subgraph_src_blocks(
+    blocks, degraded = deepwiki.utils._subgraph_src_blocks(
         str(tmp_path), {"src/a.py": [5, 9]}, radius=8
     )
     assert not degraded and len(blocks) == 1
     assert blocks[0]["start_line"] == 1 and blocks[0]["end_line"] == 17
     assert blocks[0]["text"] == "\n".join(f"line {i}" for i in range(1, 18))
-    blocks, degraded = pipeline._subgraph_src_blocks(
+    blocks, degraded = deepwiki.utils._subgraph_src_blocks(
         str(tmp_path), {"src/a.py": [5, 45]}, radius=8
     )
     assert not degraded and len(blocks) == 2
@@ -492,18 +490,17 @@ def test_subgraph_src_blocks_per_file_cap_and_budget(tmp_path):
     d = tmp_path / "src"
     d.mkdir()
     (d / "a.py").write_text("\n".join(f"line {i}" for i in range(1, 51)), encoding="utf-8")
-    pipeline = deepwiki.LlmWikiPipeline()
-    blocks, degraded = pipeline._subgraph_src_blocks(
+    blocks, degraded = deepwiki.utils._subgraph_src_blocks(
         str(tmp_path), {"src/a.py": [25]}, radius=8, per_file_cap=30,
     )
     assert not degraded and len(blocks) == 1
     assert len(blocks[0]["text"]) == 30
     assert blocks[0]["end_line"] == blocks[0]["start_line"] + blocks[0]["text"].count("\n")
-    blocks, degraded = pipeline._subgraph_src_blocks(
+    blocks, degraded = deepwiki.utils._subgraph_src_blocks(
         str(tmp_path), {"src/a.py": [25]}, radius=8, budget_chars=5,
     )
     assert (blocks, degraded) == ([], True)
-    blocks, degraded = pipeline._subgraph_src_blocks(str(tmp_path), {"nope.py": [1]})
+    blocks, degraded = deepwiki.utils._subgraph_src_blocks(str(tmp_path), {"nope.py": [1]})
     assert (blocks, degraded) == ([], False)
 
 
@@ -515,14 +512,13 @@ def test_format_subgraph_context():
         {"path": "src/a.py", "text": "y = 2", "start_line": 10, "end_line": 20},
         {"path": "src/b.py", "text": "z = 3", "start_line": 5, "end_line": 9},
     ]
-    pipeline = deepwiki.LlmWikiPipeline()
-    text = pipeline._format_subgraph_context(blocks)
+    text = deepwiki.utils._format_subgraph_context(blocks)
     assert text.startswith("\n\n----------## File Path: src/a.py\n\n")  # 原版联结式
     assert text.count("## File Path:") == 2
     assert "[lines 1-1]\nx = 1" in text and "[lines 10-20]\ny = 2" in text
     assert "## File Path: src/b.py\n\n[lines 5-9]\nz = 3" in text
-    assert pipeline._format_subgraph_context([]) == ""
-    assert pipeline._format_subgraph_context([{"path": "a.py", "text": "t", "start_line": 1, "end_line": 1}]) \
+    assert deepwiki.utils._format_subgraph_context([]) == ""
+    assert deepwiki.utils._format_subgraph_context([{"path": "a.py", "text": "t", "start_line": 1, "end_line": 1}]) \
         .startswith("\n\n----------## File Path: a.py")
 
 
@@ -549,7 +545,7 @@ async def test_llm_chat_stream_prompt_and_context(monkeypatch, tmp_path):
         yield "HELLO"
 
     monkeypatch.setattr(deepwiki.graphify, "query", fake_query)
-    monkeypatch.setattr(deepwiki_pipeline, "llm_stream", fake_llm_stream)
+    monkeypatch.setattr(deepwiki_utils, "llm_stream", fake_llm_stream)
     request = {
         "repo_url": str(tmp_path), "type": "local", "language": "en",
         "target": {"generator": "llm"}, "token": None,
@@ -590,7 +586,7 @@ async def test_llm_chat_continuation_and_iteration_templates(monkeypatch, tmp_pa
         yield ""
 
     monkeypatch.setattr(deepwiki.graphify, "query", fake_query)
-    monkeypatch.setattr(deepwiki_pipeline, "llm_stream", fake_llm_stream)
+    monkeypatch.setattr(deepwiki_utils, "llm_stream", fake_llm_stream)
     request = {
         "repo_url": str(tmp_path), "type": "local", "language": "en",
         "target": {"generator": "llm"}, "token": None, "research_iteration": 3,
@@ -623,7 +619,7 @@ async def test_llm_chat_error_fallbacks(monkeypatch, tmp_path):
         captured["prompt"] = prompt
         yield "ok"
 
-    monkeypatch.setattr(deepwiki_pipeline, "llm_stream", fake_llm_stream)
+    monkeypatch.setattr(deepwiki_utils, "llm_stream", fake_llm_stream)
     request = {
         "repo_url": str(tmp_path), "type": "local", "language": "en",
         "target": {"generator": "llm"}, "token": None,
@@ -645,7 +641,7 @@ async def test_llm_chat_error_fallbacks(monkeypatch, tmp_path):
         raise RuntimeError("llm down")
         yield  # 保持 async generator
 
-    monkeypatch.setattr(deepwiki_pipeline, "llm_stream", err_stream)
+    monkeypatch.setattr(deepwiki_utils, "llm_stream", err_stream)
     got = await _chat(deepwiki.LlmWikiPipeline(), request)
     assert "Error with openai API: llm down" in "".join(got)
     # token 超限 → 简化提示词重试一次
@@ -657,7 +653,7 @@ async def test_llm_chat_error_fallbacks(monkeypatch, tmp_path):
             raise RuntimeError("maximum context length exceeded")
         yield "SIMPLIFIED"
 
-    monkeypatch.setattr(deepwiki_pipeline, "llm_stream", token_stream)
+    monkeypatch.setattr(deepwiki_utils, "llm_stream", token_stream)
     got = await _chat(deepwiki.LlmWikiPipeline(), request)
     assert "".join(got) == "SIMPLIFIED"
     assert len(calls) == 2
@@ -667,7 +663,7 @@ async def test_llm_chat_error_fallbacks(monkeypatch, tmp_path):
         raise RuntimeError("too many tokens")
         yield
 
-    monkeypatch.setattr(deepwiki_pipeline, "llm_stream", token_stream2)
+    monkeypatch.setattr(deepwiki_utils, "llm_stream", token_stream2)
     got = await _chat(deepwiki.LlmWikiPipeline(), request)
     assert "I apologize, but your request is too large for me to process" in "".join(got)
 
@@ -709,7 +705,7 @@ async def test_llm_codemap_events_sequence(monkeypatch, tmp_path):
             {**skeleton["sections"][0], "guide": "g", "diagram": "graph TD"}]})
 
     monkeypatch.setattr(deepwiki.graphify, "query", fake_query)
-    monkeypatch.setattr(deepwiki_pipeline, "llm_complete", fake_llm_complete)
+    monkeypatch.setattr(deepwiki_utils, "llm_complete", fake_llm_complete)
     request = {
         "repo_url": str(repo_dir), "type": "local", "language": "en",
         "target": {"generator": "llm"}, "token": None, "question": "how to call f?",
@@ -751,7 +747,7 @@ async def test_llm_codemap_not_indexed_and_retry_and_degraded(monkeypatch, tmp_p
         complete_calls.append(session_name)
         raise RuntimeError("unreachable")  # 不应被调用段在此触发前提供有效返回
 
-    monkeypatch.setattr(deepwiki_pipeline, "llm_complete", fake_llm_complete)
+    monkeypatch.setattr(deepwiki_utils, "llm_complete", fake_llm_complete)
     request = {
         "repo_url": str(repo_dir), "type": "local", "language": "en",
         "target": {"generator": "llm"}, "token": None, "question": "q",
@@ -790,7 +786,7 @@ async def test_llm_codemap_skeleton_retry_and_enrich_degrade(monkeypatch, tmp_pa
         return "this is not json"
 
     monkeypatch.setattr(deepwiki.graphify, "query", fake_query)
-    monkeypatch.setattr(deepwiki_pipeline, "llm_complete", fake_llm_complete)
+    monkeypatch.setattr(deepwiki_utils, "llm_complete", fake_llm_complete)
     request = {
         "repo_url": str(repo_dir), "type": "local", "language": "en",
         "target": {"generator": "llm"}, "token": None, "question": "how to call f?",
@@ -805,7 +801,7 @@ async def test_llm_codemap_skeleton_retry_and_enrich_degrade(monkeypatch, tmp_pa
     async def garbage(prompt, *, choice=None, session_name=None, **kw):
         return "not json"
 
-    monkeypatch.setattr(deepwiki_pipeline, "llm_complete", garbage)
+    monkeypatch.setattr(deepwiki_utils, "llm_complete", garbage)
     events = await _codemap(deepwiki.LlmWikiPipeline(), request)
     assert events[3]["type"] == "error" and events[3]["stage"] == "initial_codemap"
     assert events[3]["message"].startswith("Model did not return valid JSON")
