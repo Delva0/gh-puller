@@ -585,7 +585,7 @@ async def test_generate_repo_wiki_cc_assemble_and_resume(tmp_path, monkeypatch):
     await tasks.generate_repo_wiki(task)
     assert task.status == TaskStatus.COMPLETED
     digest = generator_digest(request["target"].get("generator"), request["target"].get("generator_config"))
-    cache_path = Path(wiki_cache_dir()) / f"deepwiki_cache_local_local_demo_en_{digest}.json"
+    cache_path = Path(wiki_cache_dir()) / "local_local_demo" / f"cache_local_local_demo_en_{digest}.json"
     assert cache_path.exists()
     data = json.loads(cache_path.read_text(encoding="utf-8"))
     assert set(data["generated_pages"]) == {"p1", "p2", "p3"}

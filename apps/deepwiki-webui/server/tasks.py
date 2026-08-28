@@ -74,7 +74,7 @@ _WIKI_TASK_TTL_SECONDS = envs.WIKI_TASK_TTL_SECONDS
 
 # 状态写锁:并发页生成器的落盘写串行化(asyncio 3.10+ 的 Lock 不再绑定 loop,模块级安全)
 _state_write_lock = asyncio.Lock()
-# 引擎导入零副作用(不再建目录),缓存目录创建由本模块(App 进程)负责
+# 引擎导入零副作用(不再建目录),deepwiki 根(缓存根 = 项目文件夹顶层)创建由本模块(App 进程)负责
 os.makedirs(wiki_cache_dir(), exist_ok=True)
 
 
@@ -398,7 +398,7 @@ async def _prepare_repo(request: dict, repo: Repo) -> PreparedRepo:
 async def generate_repo_wiki(task: WikiTask) -> None:
     """驱动一个任务走完状态机(索引 → 结构 → 页面 → 缓存),失败置 FAILED。
 
-    进度中途落盘(deepwiki_resume_*):结构确定后与每页完成后各写一次,
+    进度中途落盘(resume_*):结构确定后与每页完成后各写一次,
     失败/取消也尽力写;同仓库再次提交时从落盘状态续跑(见 TaskRegistry.submit)。
     """
     r = task.request

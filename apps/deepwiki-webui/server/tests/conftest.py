@@ -5,7 +5,8 @@ envs.py 在导入时单点快照 os.environ —— 必须在任何 gh_puller 导
   ~/.claude/settings.json 是否存在;
 - 强制 DEEPWIKI_ROOT = tmp(而非 setdefault:外层环境已设也隔离);并 pop + 清除包属性
   强刷 gh_puller.envs(全量套件下其它测试可能已先导入并快照真实根)。
-- 引擎导入已零副作用(不再自动建 wikicache):此处显式建好,状态 IO 原语测试的前置。
+- 引擎导入已零副作用(不再自动建目录):deepwiki 根即 mkdtemp 已存在,状态 IO
+  原语测试无需额外前置(项目子目录在写路径时创建)。
 """
 
 import contextlib
@@ -22,8 +23,6 @@ os.environ["DEEPWIKI_ROOT"] = tempfile.mkdtemp(prefix="deepwiki-webui-test-")
 sys.modules.pop("gh_puller.envs", None)
 with contextlib.suppress(AttributeError, KeyError):
     delattr(sys.modules["gh_puller"], "envs")
-os.makedirs(os.path.join(os.environ["DEEPWIKI_ROOT"], "wikicache"), exist_ok=True)
-
 import pytest  # noqa: E402
 
 

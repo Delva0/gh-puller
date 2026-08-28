@@ -6,7 +6,7 @@
 (每会话事件按 seq 索引;完备真源是 FileSink 磁盘 JSONL —— 启动种子加载后,
 历史查看不再为空),写盘是 FileSink 的事,重启 hub 列表与历史均在。
 
-磁盘布局扁平(sessions/<uuid>.jsonl,见 gh_puller.agent.sinks.FileSink):
+磁盘布局扁平(<uuid>.jsonl,根 = AGENT_MONITOR_DIR,见 gh_puller.agent.sinks.FileSink):
 分类学隐式化 —— 会话键 = 文件内 session/start 的 session 字段(<ns>/<uuid4>),
 状态 = 有无 session/end(有:按 data.state 分 completed/aborted;无:running;
 若文件 mtime 静止超过租约(AGENT_MONITOR_LEASE_SECS)则派生 aborted —— 崩溃残留
@@ -86,10 +86,10 @@ class _Hub:
         """会话 → 磁盘文件路径(扁平布局);root 未设 → None。"""
         if not self.root:
             return None
-        return Path(self.root) / "sessions" / f"{_file_stem(session)}.jsonl"
+        return Path(self.root) / f"{_file_stem(session)}.jsonl"
 
     def seed(self, root: str | None) -> None:
-        """启动种子:扫描 sessions/*.jsonl 扁平文件,载入事件溯源格式。
+        """启动种子:扫描根目录下的 *.jsonl 扁平文件,载入事件溯源格式。
 
         会话键取文件内 session/start 的 session 字段(文件名只是 stem,无状态目录);
         状态隐式判定:文件含 session/end → 按 data.state 分 completed/aborted,
@@ -99,7 +99,7 @@ class _Hub:
         if not root:
             return
         self.root = root
-        base = Path(root) / "sessions"
+        base = Path(root)
         for path in sorted(base.glob("*.jsonl")):
             try:
                 lines = path.read_text(encoding="utf-8").splitlines()
@@ -267,7 +267,7 @@ class _Hub:
     def _session_events(self, sess: _Session) -> dict[int, dict]:
         """磁盘 + 内存合并事件(seq 键;内存更新,覆盖磁盘同 seq —— live 优先)。
 
-        文件为扁平布局(sessions/<uuid>.jsonl);seq 允许洞(洞=被跳过的
+        文件为扁平布局(<uuid>.jsonl);seq 允许洞(洞=被跳过的
         assistant/chunk),按键合并天然兼容。
         """
         merged: dict[int, dict] = {}

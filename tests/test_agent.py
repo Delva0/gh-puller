@@ -104,7 +104,7 @@ async def test_recorder_self_init_bus_on_first_event(monkeypatch, tmp_path):
     run = EventRecorder("s1", label="t")
     run.event("session/start", run_id=None, label="t", model="")  # 触发自建
     assert sinks._bus is not None
-    assert (tmp_path / "sessions").exists()  # 恒开 FileSink:落盘目录即建
+    assert len(sinks._bus._sinks) == 1  # 恒开 FileSink 已注册(落盘根即配置目录,无 sessions 子层)
     n_sinks = len(sinks._bus._sinks)
     run.event("turn/start", turn=1)  # 复用同一总线,不重复建
     assert sinks.ensure_bus() is sinks._bus and len(sinks._bus._sinks) == n_sinks
@@ -170,12 +170,12 @@ def _evt(evt_type: str, session: str = "s1", seq: int = 0, **data) -> dict:
 @pytest.mark.asyncio
 async def test_file_sink_flat_layout_nonstream_projection(tmp_path):
     sink = FileSink(str(tmp_path))
-    # session/start → 扁平 sessions/ 即创建,append 实时可见,行即原始事件;
+    # session/start → 扁平根即创建,append 实时可见,行即原始事件;
     # 会话 id 带 ns(judge:llm/uuid):文件名只取 "/" 后段
     await sink.consume(_evt("session/start", session="judge:llm/0460e1e9-5155-4014-9054-a39986462b20",
                             seq=0, run_id="r1", label="wiki:structure",
                             provider="anthropic", model=""))
-    flat = tmp_path / "sessions" / "0460e1e9-5155-4014-9054-a39986462b20.jsonl"
+    flat = tmp_path /"0460e1e9-5155-4014-9054-a39986462b20.jsonl"
     assert flat.exists()
     # assistant/chunk 不落盘(非流式事件流投影):文件 seq 出现洞(0 → 2)
     await sink.consume(_evt("assistant/chunk", session="judge:llm/0460e1e9-5155-4014-9054-a39986462b20",
@@ -192,13 +192,13 @@ async def test_file_sink_flat_layout_nonstream_projection(tmp_path):
                             seq=3, state="completed", ok=True,
                             duration_ms=10, text_chars=2, num_steps=1))
     assert flat.exists()
-    assert not list((tmp_path / "sessions").glob("completed"))
-    assert not list((tmp_path / "sessions").glob("running"))
-    assert not list((tmp_path / "sessions").glob("*.tmp"))
+    assert not list(tmp_path.glob("completed"))
+    assert not list(tmp_path.glob("running"))
+    assert not list(tmp_path.glob("*.tmp"))
     final = [json.loads(line) for line in flat.read_text().splitlines()]
     assert final[-1]["type"] == "session/end" and final[-1]["data"]["state"] == "completed"
     # 无序文件:目录里只有一个扁平文件
-    assert [p.name for p in (tmp_path / "sessions").glob("*.jsonl")] == [
+    assert [p.name for p in tmp_path.glob("*.jsonl")] == [
         "0460e1e9-5155-4014-9054-a39986462b20.jsonl"]
 
 
@@ -212,7 +212,7 @@ async def test_file_sink_aborted_by_error(tmp_path):
     await sink.consume(_evt("session/end", session="s2", seq=2, state="aborted", ok=False,
                             reason="RuntimeError: agent 执行失败", duration_ms=5,
                             text_chars=0, num_steps=1))
-    aborted = tmp_path / "sessions" / "s2.jsonl"  # 扁平:无 state 目录
+    aborted = tmp_path /"s2.jsonl"  # 扁平:无 state 目录
     assert aborted.exists()
     final = [json.loads(line) for line in aborted.read_text().splitlines()]
     assert final[-1]["type"] == "session/end" and final[-1]["data"]["state"] == "aborted"
@@ -225,7 +225,7 @@ async def test_file_sink_crash_residue_stays_flat(tmp_path):
     sink = FileSink(str(tmp_path))
     await sink.consume(_evt("session/start", session="s3", seq=0, run_id="r3",
                             label="wiki:structure", provider="anthropic", model=""))
-    path = tmp_path / "sessions" / "s3.jsonl"
+    path = tmp_path /"s3.jsonl"
     assert path.exists()
     final = [json.loads(line) for line in path.read_text().splitlines()]
     assert [ln["type"] for ln in final] == ["session/start"]
@@ -496,7 +496,7 @@ async def test_cc_stream_exact_output_no_duplicates(monkeypatch, tmp_path):
     chunks = [c async for c in agent.ClaudeCode(_options()).stream("prompt", session_name="x")]
     assert "".join(chunks) == "hi好"
     await asyncio.sleep(0.05)  # 等 bus 末拍落盘
-    files = list((tmp_path / "sessions").glob("*.jsonl"))
+    files = list(tmp_path.glob("*.jsonl"))
     assert any("session/end" in f.read_text(encoding="utf-8") for f in files)  # 会话已落盘(tmp 隔离)
 
 
@@ -594,7 +594,7 @@ async def test_cc_text_fallback_without_partials(monkeypatch, tmp_path):
     monkeypatch.setitem(sys.modules, "claude_agent_sdk", sdk)
     assert await _fold(agent.ClaudeCode(_options()).stream("prompt", session_name="x")) == "hi好world"
     await asyncio.sleep(0.05)
-    files = list((tmp_path / "sessions").glob("*.jsonl"))
+    files = list(tmp_path.glob("*.jsonl"))
     assert any("session/end" in f.read_text(encoding="utf-8") for f in files)
 
 
@@ -609,7 +609,7 @@ async def test_cc_stream_error_semantics(monkeypatch, tmp_path):
         async for _ in agent.ClaudeCode(_options()).stream("p", session_name="x"):
             pass
     await asyncio.sleep(0.05)
-    files = list((tmp_path / "sessions").glob("*.jsonl"))
+    files = list(tmp_path.glob("*.jsonl"))
     assert any("session/end" in f.read_text(encoding="utf-8") for f in files)
 
 
@@ -1415,8 +1415,7 @@ async def test_file_sink_on_by_default(monkeypatch, tmp_path):
     monkeypatch.setattr("gh_puller.agent.sinks._url_reachable", lambda url: False)
     agent.configure(file_dir=str(tmp_path), ws_urls=[], otel_urls=[])
     bus = sinks.ensure_bus()  # file=None → True(无 env 可读)
-    assert bus.enabled is True
-    assert (tmp_path / "sessions").exists()
+    assert bus.enabled is True  # 恒开:无 env 可关
 
 
 @pytest.mark.asyncio
@@ -2220,7 +2219,7 @@ async def test_file_sink_touch_updates_mtime_no_row(tmp_path):
     sink = FileSink(str(tmp_path))
     await sink.consume(_evt("session/start", session="s4", seq=0, run_id="r4",
                             label="wiki:structure", provider="anthropic", model=""))
-    path = tmp_path / "sessions" / "s4.jsonl"
+    path = tmp_path /"s4.jsonl"
     before = path.stat().st_mtime_ns
     await asyncio.sleep(0.01)  # 时钟推进,确保 utime 目标时间戳不同
     await sink.touch("s4")

@@ -40,7 +40,7 @@ DSH_RUNTIME_CWD = os.path.expanduser(os.environ.get("DSH_RUNTIME_CWD", "~/.gh-pu
 # dsh 的文件类 config 缺省 env(承接旧"自定义组合文件"语义;经 resolve 解析为 config_path)
 DEEPWIKI_DSH_CORDIS = os.environ.get("DEEPWIKI_DSH_CORDIS", "")
 
-# ---- 产物根目录:repos/ 克隆目录、graphify-out/ 索引、wikicache/ 缓存 ----
+# ---- 产物根目录:repos/ 克隆目录、graphify/ 图索引、wiki/ 缓存容器(内部按项目分 <repo_key>/ 文件夹:json + agent_cache/) ----
 DEEPWIKI_ROOT = os.path.expanduser(os.environ.get("DEEPWIKI_ROOT", "~/.gh-puller/deepwiki"))
 
 # ---- wiki 删除授权(与原后端同式:字符串真值判定) ----
@@ -66,7 +66,8 @@ CHAT_TOKEN_LIMIT_ESTIMATE = int(os.environ.get("DEEPWIKI_CHAT_TOKEN_LIMIT", "750
 # ---- agent 流式监控(文件观测默认恒开;Web/WS 经 AGENT_MONITOR_WEBUI_URL,OTel 经 AGENT_MONITOR_PHOENIX_URL) ----
 # 两 URL 均逗号分隔多地址(每地址一个 sink 实例,预留);空 → 不启用该类 sink。
 # 新 OTel 后端(如 AGENT_MONITOR_LANGFUSE_URL,默认 "")= 此处一个常量 + sinks._OTEL_BACKENDS 表一条。
-AGENT_MONITOR_DIR = os.path.expanduser(os.environ.get("AGENT_MONITOR_DIR", "~/.gh-puller/agent-monitor"))
+# 该目录即会话 jsonl 落盘根(无 sessions 子层):~/.gh-puller/agent-sessions/<uuid>.jsonl。
+AGENT_MONITOR_DIR = os.path.expanduser(os.environ.get("AGENT_MONITOR_DIR", "~/.gh-puller/agent-sessions"))
 # 默认 = 内部 agent-monitor hub(apps/agent-monitor,AGENT_MONITOR_PORT 联动)
 AGENT_MONITOR_WEBUI_URL = os.environ.get("AGENT_MONITOR_WEBUI_URL", "ws://localhost:8765/ws")
 AGENT_MONITOR_PORT = int(os.environ.get("AGENT_MONITOR_PORT", "8765"))

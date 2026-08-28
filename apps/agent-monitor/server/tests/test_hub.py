@@ -5,7 +5,7 @@
 - subscribe:evt_ready{lastSeq} → 实时 evt 推送(带 seq);换会话替换订阅 + 断连清理;
 - history:seq 升序分页(尾部/翻旧页/缺会话空页),磁盘+内存合并(扁平布局);
 - ping→pong;GET /(与 /viewer)出 viewer HTML,其它路径 404;
-- 重启种子(扁平 sessions/*.jsonl):隐式分类学 —— 会话键=事件内 session 字段,
+- 重启种子(扁平 *.jsonl,根 = AGENT_MONITOR_DIR):隐式分类学 —— 会话键=事件内 session 字段,
   有 session/end → completed/aborted,无 → running;按需重判(mtime 变 → 尾部找终态);
   旧 v1 聚合行/坏行文件跳过不崩;
 - 租约(孤儿判定):无终态行 + 文件 mtime 静止超租约 → 派生 aborted(seed 与 scan
@@ -155,11 +155,11 @@ def test_history_merges_disk_and_memory(tmp_path):
     扁平布局:会话键取事件内 session 字段(文件名只是 stem);文件 seq 可带洞
     (洞=被跳过的 chunk),合并按键天然兼容。
     """
-    (tmp_path / "sessions").mkdir(parents=True)
+    tmp_path.mkdir(parents=True, exist_ok=True)  # 扁平根:jsonl 直放 tmp_path(无 sessions 子层)
     disk = [_evt("session/start", "merge1", seq=0, run_id="r",
                  label="l", provider="claude", model="m"),
             _user_evt("merge1", 1, "disk-msg")]
-    (tmp_path / "sessions" / "merge1.jsonl").write_text(
+    (tmp_path /"merge1.jsonl").write_text(
         "".join(json.dumps(e, ensure_ascii=False) + "\n" for e in disk), encoding="utf-8")
     hub = _Hub()
     hub.seed(str(tmp_path))
@@ -202,7 +202,7 @@ def test_disk_seed_index_and_history(tmp_path):
     隐式分类学:文件有 session/end → completed;无 → running。会话键取事件内
     session 字段(文件名只是 stem)。
     """
-    (tmp_path / "sessions").mkdir(parents=True)
+    tmp_path.mkdir(parents=True, exist_ok=True)  # 扁平根:jsonl 直放 tmp_path(无 sessions 子层)
     a = [
         _evt("session/start", "judge:llm/seed-a", seq=0, run_id=None, label="judge:llm",
              provider="openai", model="m"),
@@ -213,11 +213,11 @@ def test_disk_seed_index_and_history(tmp_path):
         _evt("session/end", "judge:llm/seed-a", seq=3, state="completed", ok=True,
              duration_ms=5, text_chars=1, num_steps=1),
     ]
-    (tmp_path / "sessions" / "seed-a.jsonl").write_text(
+    (tmp_path /"seed-a.jsonl").write_text(
         "".join(json.dumps(x, ensure_ascii=False) + "\n" for x in a), encoding="utf-8")
     r = _evt("session/start", "chat:demo/seed-r", seq=0, run_id="chat:demo", label="chat:demo",
              provider="claude", model="")
-    (tmp_path / "sessions" / "seed-r.jsonl").write_text(
+    (tmp_path /"seed-r.jsonl").write_text(
         json.dumps(r, ensure_ascii=False) + "\n", encoding="utf-8")
 
     hub = _Hub()
@@ -240,10 +240,10 @@ def test_disk_seed_index_and_history(tmp_path):
 
 def test_seed_recheck_heals_state_on_mtime_change(tmp_path):
     """按需重判(index 时):running 会话文件 mtime 变化 → 重读尾部找终态,翻转为完成。"""
-    (tmp_path / "sessions").mkdir(parents=True)
+    tmp_path.mkdir(parents=True, exist_ok=True)  # 扁平根:jsonl 直放 tmp_path(无 sessions 子层)
     r = _evt("session/start", "seed-r", seq=0, run_id="chat:demo", label="chat:demo",
              provider="claude", model="")
-    path = tmp_path / "sessions" / "seed-r.jsonl"
+    path = tmp_path /"seed-r.jsonl"
     path.write_text(json.dumps(r, ensure_ascii=False) + "\n", encoding="utf-8")
 
     hub = _Hub()
@@ -262,10 +262,10 @@ def test_seed_recheck_heals_state_on_mtime_change(tmp_path):
 
 def test_seed_recheck_no_mtime_change_keeps_state(tmp_path):
     """按需重判:文件 mtime 未变 → 零重读,状态保持 running(stat 与读盘分离)。"""
-    (tmp_path / "sessions").mkdir(parents=True)
+    tmp_path.mkdir(parents=True, exist_ok=True)  # 扁平根:jsonl 直放 tmp_path(无 sessions 子层)
     r = _evt("session/start", "seed-r", seq=0, run_id="chat:demo", label="chat:demo",
              provider="claude", model="")
-    path = tmp_path / "sessions" / "seed-r.jsonl"
+    path = tmp_path /"seed-r.jsonl"
     path.write_text(json.dumps(r, ensure_ascii=False) + "\n", encoding="utf-8")
 
     hub = _Hub()
@@ -276,20 +276,20 @@ def test_seed_recheck_no_mtime_change_keeps_state(tmp_path):
 
 def test_seed_skips_old_format_and_corrupt_lines(tmp_path):
     """旧 v1 聚合行(无 seq/type)与坏行:整文件/半行跳过不崩;剩余会话照常。"""
-    (tmp_path / "sessions").mkdir(parents=True)
+    tmp_path.mkdir(parents=True, exist_ok=True)  # 扁平根:jsonl 直放 tmp_path(无 sessions 子层)
     old_format = [
         {"type": "session.start", "session": "old-a", "label": "l", "provider": "p",
          "model": "m", "state": "running", "ts": 1},
         {"type": "session.end", "state": "completed", "ts": 2},
     ]
-    (tmp_path / "sessions" / "old-a.jsonl").write_text(
+    (tmp_path /"old-a.jsonl").write_text(
         "".join(json.dumps(x, ensure_ascii=False) + "\n" for x in old_format),
         encoding="utf-8")
     good = [_evt("session/start", "seed-b", seq=0, run_id=None, label="l",
                  provider="claude", model="")]
     bad_line = _evt("assistant/chunk", "seed-b", seq=1, turn=1, step=1,
                     chunk={"type": "text", "index": 0, "text": "ok"})
-    (tmp_path / "sessions" / "seed-b.jsonl").write_text(
+    (tmp_path /"seed-b.jsonl").write_text(
         json.dumps(good[0], ensure_ascii=False) + "\n{broken\n"
         + json.dumps(bad_line, ensure_ascii=False) + "\n", encoding="utf-8")
 
@@ -362,10 +362,10 @@ def test_delete_removes_memory_and_disk_and_broadcasts(tmp_path):
 
     磁盘会话(种子)与内存会话(生产端 live)同删一留;磁盘文件同步删除
     (只删内存则重启后复活)。"""
-    (tmp_path / "sessions").mkdir(parents=True)
+    tmp_path.mkdir(parents=True, exist_ok=True)  # 扁平根:jsonl 直放 tmp_path(无 sessions 子层)
     disk = [_evt("session/start", "gh-puller/dsk", seq=0, run_id="r", label="l"),
             _user_evt("gh-puller/dsk", 1, "hi")]
-    (tmp_path / "sessions" / "dsk.jsonl").write_text(
+    (tmp_path /"dsk.jsonl").write_text(
         "".join(json.dumps(x, ensure_ascii=False) + "\n" for x in disk), encoding="utf-8")
     hub = _Hub()
     hub.seed(str(tmp_path))
@@ -382,7 +382,7 @@ def test_delete_removes_memory_and_disk_and_broadcasts(tmp_path):
                 assert idx["type"] == "index"
                 assert {s["session"] for s in idx["sessions"]} == {"live1"}
                 assert "gh-puller/dsk" not in hub.sessions
-                assert not (tmp_path / "sessions" / "dsk.jsonl").exists()
+                assert not (tmp_path /"dsk.jsonl").exists()
                 # 幽灵删除:不动状态,仍回 index 帧(客户端以索引回响推进列表)
                 v.send_text(json.dumps({"type": "delete", "session": "ghost"},
                                        ensure_ascii=False))
@@ -414,9 +414,9 @@ def test_no_index_spam_on_same_session_events(client):
 
 def _stale_file(tmp_path, session, *, mtime) -> Path:
     """写仅 session/start 的种子文件(os.utime 回拨到指定 mtime),返回路径。"""
-    (tmp_path / "sessions").mkdir(parents=True, exist_ok=True)
+    tmp_path.mkdir(parents=True, exist_ok=True)  # 扁平根:jsonl 直放 tmp_path(无 sessions 子层)
     start = _evt("session/start", session, seq=0, run_id="chat:demo", label="chat:demo")
-    path = tmp_path / "sessions" / f"{session.rsplit('/', 1)[-1]}.jsonl"
+    path = tmp_path /f"{session.rsplit('/', 1)[-1]}.jsonl"
     path.write_text(json.dumps(start, ensure_ascii=False) + "\n", encoding="utf-8")
     os.utime(path, (mtime, mtime))
     return path
@@ -434,10 +434,10 @@ def test_lease_seed_flips_stale_crash_residue(tmp_path):
 
 def test_lease_keeps_fresh_running_sessions(tmp_path):
     """活动会话(含心跳行,mtime 新鲜):seed/scan 均保持 running。"""
-    (tmp_path / "sessions").mkdir(parents=True)
+    tmp_path.mkdir(parents=True, exist_ok=True)  # 扁平根:jsonl 直放 tmp_path(无 sessions 子层)
     rows = [_evt("session/start", "chat:live", seq=0, run_id="chat:demo", label="chat:demo"),
             _evt("session/heartbeat", "chat:live", seq=1)]
-    (tmp_path / "sessions" / "chat-live.jsonl").write_text(
+    (tmp_path /"chat-live.jsonl").write_text(
         "".join(json.dumps(x, ensure_ascii=False) + "\n" for x in rows), encoding="utf-8")
     hub = _Hub(lease_secs=150)
     hub.seed(str(tmp_path))

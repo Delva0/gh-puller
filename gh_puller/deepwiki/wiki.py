@@ -19,6 +19,7 @@ import dataclasses
 import json
 import os
 import re
+import shutil
 import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
@@ -563,21 +564,40 @@ def _finalize_page_content(content: str, page: WikiPage, ctx: RepoUrlContext) ->
 
 
 # ---------------------------------------------------------------------------
-# wiki 产物持久化(cache.py 消除后的 wiki 主线侧):成品缓存(deepwiki_cache_*)、
-# 续跑状态(deepwiki_resume_*)、processed 列表与导出;数据形态为纯 dict。
-# wikicache 根经 wiki_cache_dir() **调用时**解析 envs.DEEPWIKI_ROOT —— 测试
-# pop+delattr 强刷后跟随新根。
+# wiki 产物持久化(cache.py 消除后的 wiki 主线侧):成品缓存(cache_*)、
+# 续跑状态(resume_*)、processed 列表与导出;数据形态为纯 dict。
+# 布局:deepwiki 根下 wiki/ 缓存容器,其内按项目分文件夹(<repo_key>/ 下 json +
+# agent_cache/);与 repos/(克隆)、graphify/(索引)在根下互不污染。根经
+# wiki_cache_dir() **调用时**解析 envs.DEEPWIKI_ROOT —— 测试 pop+delattr 强刷后跟随新根。
 # ---------------------------------------------------------------------------
 
 _AGENT_CACHE_DIRNAME = "agent_cache"
 
-_WIKI_PREFIX = "deepwiki_cache_"
-_RESUME_STATE_PREFIX = "deepwiki_resume_"
+_WIKI_PREFIX = "cache_"
+_RESUME_STATE_PREFIX = "resume_"
 
 
 def wiki_cache_dir() -> str:
-    """wikicache 根(调用时解析 envs.DEEPWIKI_ROOT —— 测试 pop+delattr 强刷后须跟随新根)。"""
-    return os.path.join(envs.DEEPWIKI_ROOT, "wikicache")
+    """缓存根 = deepwiki/wiki(调用时解析 envs.DEEPWIKI_ROOT —— 测试 pop+delattr 强刷后须跟随新根)。
+
+    与 repos/(克隆)、graphify/(索引)在 deepwiki 根下平级;层内项目按
+    <repo_key>/ 分文件夹(见 wiki_project_dir)。
+    """
+    return os.path.join(envs.DEEPWIKI_ROOT, "wiki")
+
+
+def _project_seg(project_key: str) -> str:
+    """项目目录段 = 项目键的安全化(单点规则:读写两侧恒同源)。
+
+    项目键 = 请求入参 repo_key(type_owner_repo,见 utils.repo_key_of);
+    graph/repos 克隆用 URL 派生的 Repo.name,属旁支,不经此段。
+    """
+    return _sanitize_path_seg(project_key)
+
+
+def wiki_project_dir(owner: str, repo: str, repo_type: str) -> str:
+    """项目缓存根:deepwiki/wiki/<repo_key>,调用时解析 envs(测试强刷后跟随新根)。"""
+    return os.path.join(wiki_cache_dir(), _project_seg(utils.repo_key_of(repo_type, owner, repo)))
 
 
 def _wiki_cache_path(
@@ -585,7 +605,7 @@ def _wiki_cache_path(
 ) -> str:
     suffix = f"_{digest}" if digest else ""
     filename = f"{_WIKI_PREFIX}{repo_type}_{owner}_{repo}_{language}{suffix}.json"
-    return os.path.join(wiki_cache_dir(), filename)
+    return os.path.join(wiki_project_dir(owner, repo, repo_type), filename)
 
 
 def resume_state_path(
@@ -593,7 +613,7 @@ def resume_state_path(
 ) -> str:
     suffix = f"_{digest}" if digest else ""
     filename = f"{_RESUME_STATE_PREFIX}{repo_type}_{owner}_{repo}_{language}{suffix}.json"
-    return os.path.join(wiki_cache_dir(), filename)
+    return os.path.join(wiki_project_dir(owner, repo, repo_type), filename)
 
 
 def wiki_cache_exists(owner: str, repo: str, repo_type: str, language: str, digest: str = "") -> bool:
@@ -624,6 +644,7 @@ async def save_wiki_cache(
 ) -> bool:
     path = _wiki_cache_path(owner, repo, repo_type, language, digest)
     try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)  # 首次生成:项目目录未建
         await asyncio.to_thread(
             lambda: Path(path).write_text(json.dumps(wiki_cache), encoding="utf-8")
         )
@@ -678,18 +699,17 @@ async def save_generated_wiki(
 async def delete_wiki_cache(
     owner: str, repo: str, repo_type: str, language: str, digest: str = ""
 ) -> bool:
-    path = _wiki_cache_path(owner, repo, repo_type, language, digest)
-    deleted = False
-    if os.path.exists(path):
-        os.remove(path)
-        deleted = True
-    # 删除缓存同时清续跑状态(本选型 + 旧格式无摘要文件),避免裸 state 无清理途径
-    for state_path in (resume_state_path(owner, repo, repo_type, language, digest),
-                       resume_state_path(owner, repo, repo_type, language)):
-        if os.path.exists(state_path):
-            os.remove(state_path)
-            deleted = True
-    return deleted
+    """删除整个项目缓存目录(用户语义:删缓存 = 删项目/,json+resume+agent_cache 全清)。
+
+    签名保留 (owner, repo, repo_type, language, digest) 契约,参数仅用于定位项目
+    目录;删除粒度 = 项目 —— 同项目多语言/多选型并存时连删整个项目(用户明确选择)。
+    项目目录不存在 → False(404 语义)。
+    """
+    proj_dir = wiki_project_dir(owner, repo, repo_type)
+    if not os.path.exists(proj_dir):
+        return False
+    shutil.rmtree(proj_dir, ignore_errors=True)
+    return True
 
 
 async def write_resume_state(
@@ -705,6 +725,7 @@ async def write_resume_state(
     path = resume_state_path(owner, repo, repo_type, language, digest)
     tmp = f"{path}.tmp"
     try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)  # 首次生成:项目目录未建
         await asyncio.to_thread(
             lambda: Path(tmp).write_text(json.dumps(state), encoding="utf-8")
         )
@@ -758,37 +779,42 @@ async def list_wiki_cache() -> list[dict]:
     if not os.path.exists(wiki_cache_dir()):
         return []
     entries: list[dict] = []
-    for filename in await asyncio.to_thread(os.listdir, wiki_cache_dir()):
-        if not (filename.startswith(_WIKI_PREFIX) and filename.endswith(".json")):
+    for dirname in await asyncio.to_thread(os.listdir, wiki_cache_dir()):
+        proj_dir = os.path.join(wiki_cache_dir(), dirname)
+        # wiki/ 层即项目文件夹容器(与 repos/graphify 在根下平级隔离):只跳过 dot/非目录
+        if dirname.startswith(".") or not os.path.isdir(proj_dir):
             continue
-        file_path = os.path.join(wiki_cache_dir(), filename)
-        try:
-            stats = await asyncio.to_thread(os.stat, file_path)
-            parts = os.path.splitext(filename)[0].removeprefix(_WIKI_PREFIX).split("_")
-            # 列尾 _<digest8> 为公开选型摘要(同一仓库多选型并存);缺省无摘要(旧缓存兼容)
-            has_digest = len(parts) > 1 and len(parts[-1]) == 8 and re.fullmatch(r"[0-9a-f]+", parts[-1])
-            language_idx = -2 if has_digest else -1
-            owner = parts[1]
-            repo = "_".join(parts[2:language_idx])
-            entries.append(
-                {
-                    "id": filename,
-                    "owner": owner,
-                    "repo": repo,
-                    "repo_type": parts[0],
-                    "language": parts[language_idx],
-                    "status": TaskStatus.COMPLETED,
-                    "digest": parts[-1] if has_digest else "",
-                    "pages_done": 0,
-                    "pages_total": 0,
-                    "current_page_ids": [],
-                    "error": None,
-                    "submitted_at": int(stats.st_mtime * 1000),
-                    "name": f"{owner}/{repo}",
-                }
-            )
-        except Exception:
-            log(f"解析缓存文件失败: {file_path}")
+        for filename in await asyncio.to_thread(os.listdir, proj_dir):
+            if not (filename.startswith(_WIKI_PREFIX) and filename.endswith(".json")):
+                continue
+            file_path = os.path.join(proj_dir, filename)
+            try:
+                stats = await asyncio.to_thread(os.stat, file_path)
+                parts = os.path.splitext(filename)[0].removeprefix(_WIKI_PREFIX).split("_")
+                # 列尾 _<digest8> 为公开选型摘要(同一仓库多选型并存);缺省无摘要(旧缓存兼容)
+                has_digest = len(parts) > 1 and len(parts[-1]) == 8 and re.fullmatch(r"[0-9a-f]+", parts[-1])
+                language_idx = -2 if has_digest else -1
+                owner = parts[1]
+                repo = "_".join(parts[2:language_idx])
+                entries.append(
+                    {
+                        "id": filename,
+                        "owner": owner,
+                        "repo": repo,
+                        "repo_type": parts[0],
+                        "language": parts[language_idx],
+                        "status": TaskStatus.COMPLETED,
+                        "digest": parts[-1] if has_digest else "",
+                        "pages_done": 0,
+                        "pages_total": 0,
+                        "current_page_ids": [],
+                        "error": None,
+                        "submitted_at": int(stats.st_mtime * 1000),
+                        "name": f"{owner}/{repo}",
+                    }
+                )
+            except Exception:
+                log(f"解析缓存文件失败: {file_path}")
     return entries
 
 
@@ -911,7 +937,9 @@ class AgentWikiPipeline(WikiPipeline):
         return _sanitize_path_seg(f"{project_key}_{utils.generator_digest(generator, generator_config)}")
 
     def _agent_cache_dir(self, project_key: str, generator: str | None = None, generator_config: dict | None = None) -> Path:
-        return Path(wiki_cache_dir()) / _AGENT_CACHE_DIRNAME / self._proj_key(project_key, generator, generator_config)
+        """agent 交付件目录:deepwiki/wiki/<项目>/agent_cache/ 平铺(无 <proj>/ 子层;
+        交付文件名仍带 <proj> 前缀,见 _agent_cache_structure_path/_agent_cache_page_path)。"""
+        return Path(wiki_cache_dir()) / _project_seg(project_key) / _AGENT_CACHE_DIRNAME
 
     def _agent_cache_structure_path(self, project_key: str, generator: str | None = None, generator_config: dict | None = None) -> Path:
         """cc 结构交付文件:{proj}-structure.md。"""

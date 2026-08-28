@@ -12,7 +12,8 @@ envs.py 在导入时单点快照 os.environ —— 因此必须在 conftest 导�
 - AGENT_MONITOR_DIR(tmp,强制赋值):agent 监控文件 sink 恒开(configure 已无 file
   开关),测试默认落盘必须重定向到临时目录;同上述强刷,任何模块重新导入都命中
   tmp 而非真实 ~/.gh-puller。
-- 引擎导入零副作用(不再自动建 wikicache):显式建好,状态 IO 原语测试的前置。
+- 引擎导入零副作用(不再自动建目录):deepwiki 根即 mkdtemp 已存在(App 进程侧
+  建根与项目子目录),状态 IO 原语测试无需额外前置。
 """
 
 import os
@@ -31,8 +32,6 @@ try:
     delattr(sys.modules["gh_puller"], "envs")
 except (AttributeError, KeyError):
     pass
-os.makedirs(os.path.join(os.environ["DEEPWIKI_ROOT"], "wikicache"), exist_ok=True)
-
 import pytest  # noqa: E402
 
 

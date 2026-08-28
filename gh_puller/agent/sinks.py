@@ -1,7 +1,7 @@
 """监控观测通道:sink 基础设施(事件总线/文件/WS/OTel)与运行时配置。
 
 用户定义两种观测通道,无控制台通道:
-- 文件 sink(默认恒开):AGENT_MONITOR_DIR/sessions/<uuid>.jsonl 扁平布局,
+- 文件 sink(默认恒开):AGENT_MONITOR_DIR/<uuid>.jsonl 扁平布局,
   每行一条非流式事件流事件(TAXONOMY − assistant/chunk,message 粒度,防日志
   膨胀;折叠恢复规范见 gh_puller.agent.events;取代 v1 的聚合行,旧格式不兼容,
   历史数据需手动清理);
@@ -53,14 +53,15 @@ def _log(msg: str) -> None:
 class FileSink:
     """文件观测通道:每会话一个 JSONL,只落非流式事件流(message 粒度)。
 
-    布局扁平:sessions/<uuid>.jsonl(uuid 段 = session id 最后一个 "/" 后段),
+    布局扁平:<uuid>.jsonl(uuid 段 = session id 最后一个 "/" 后段,根 =
+    AGENT_MONITOR_DIR,无 sessions 子层),
     一行一条事件(按 seq 排序来自适配器);assistant/chunk 直接跳过 —— 文件
     seq 允许洞,洞 = 被跳过的流式事件(契约见 gh_puller.agent.events,前端
     折叠只比较 seq,不要求稠密)。分类学隐式化:不再有运行/完成/中止目录,
     状态在事件里 —— grep '"type":"session/end"' 查终态(按 data.state 分
     完成/中止)、grep '"type":"error"' 查错误、grep 'session/start' 的 session
     字段查会话来源(<ns>/<uuid4>,ns 由上层业务定)。Linux 查询友好:
-    tail -f sessions/*.jsonl 实时看;jq 过滤并按折叠规范
+    tail -f <root>/*.jsonl 实时看;jq 过滤并按折叠规范
     (gh_puller.agent.events)还原任意时刻消息上下文。session/end 留作文件
     脏终行;会话保鲜(keep-warm,见 generators._guard)经 FileSink.touch 直触
     mtime,**不写行** —— 文件 mtime 持续前进,hub 侧方可区分"活着但静默"与"进程已死"
@@ -72,7 +73,7 @@ class FileSink:
     def __init__(self, root: str):
         self.root = Path(root)
         self._files: dict[str, Path] = {}  # session → 当前文件(注册用;终态不移走)
-        (self.root / "sessions").mkdir(parents=True, exist_ok=True)
+        self.root.mkdir(parents=True, exist_ok=True)
 
     async def consume(self, evt: dict) -> None:
         if evt["type"] not in NON_STREAM_TYPES:
@@ -88,7 +89,7 @@ class FileSink:
             f.flush()
 
     def _open(self, session: str) -> None:
-        self._files[session] = self.root / "sessions" / f"{_file_stem(session)}.jsonl"
+        self._files[session] = self.root / f"{_file_stem(session)}.jsonl"
 
     async def touch(self, session: str) -> None:
         """会话保鲜原语:只 os.utime 更新文件 mtime,**不写任何行、不加内容**。

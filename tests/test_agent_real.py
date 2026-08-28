@@ -76,7 +76,7 @@ async def _read_single_session(tmp_path) -> list[dict]:
     超时则返回当前内容,由 _assert_flow 收紧报错。文件名不按 ns 匹配,只数
     目录下唯一 jsonl(会话 id = <ns>/<uuid>,文件取 uuid 段)。
     """
-    sess = tmp_path / "sessions"
+    sess = tmp_path
     for _ in range(40):
         files = sorted(sess.glob("*.jsonl"))
         if len(files) == 1:
@@ -96,7 +96,7 @@ def _assert_flow(events: list[dict], provider: str, model: str, generator: str =
     整块合成),或完全流式后端(如 DeepSeek anthropic 兼容端:文本全走
     chunk,折叠消息 content 可为空)下由 session/end.text_chars 证明。
     """
-    assert events, "sessions 下应有事件落盘"
+    assert events, "根下应有事件落盘"
     assert events[0]["type"] == "session/start", events[0]
     assert events[0]["provider"] == provider, events[0]
     assert events[0]["model"] == model, events[0]

@@ -16,7 +16,7 @@ generator_config 两个散装字段(engine 全部函数同签名;wire 的 target
 gh_puller.agent.configs.py)。
 
 本包是引擎(无 FastAPI 依赖):HTTP 端点层(SSE/WS)在 apps/deepwiki-webui/server/app.py;
-任务状态机/调度/进度投影在其 server/tasks.py。续跑落盘(deepwiki_resume_*)语义见 ./cache.py。
+任务状态机/调度/进度投影在其 server/tasks.py。续跑落盘(resume_*)语义见 ./wiki.py。
 
 子模块结构(本文件只做公共白名单 re-export,不含任何实现):
 - cache      产物布局(graphify 图/wiki 成品缓存/续跑状态) + 导出 + 判等摘要族

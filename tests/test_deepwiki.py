@@ -3,7 +3,7 @@
 不调 Claude agent(不依赖 API key / CLI):
 - 环境变量要求:ANTHROPIC_API_KEY 不设;DEEPWIKI_ROOT/CC 配置钉临时目录(见 tests/conftest.py)。
 - 覆盖:纯函数层(结构解析 / 引用后处理 / snippet 定位 / JSON 修复)、Repo 克隆语义、
-  缓存与状态文件 IO 原语(离线:真实写临时 wikicache)。
+  缓存与状态文件 IO 原语(离线:真实写临时 DEEPWIKI_ROOT,按 <repo_key>/ 项目文件夹布局)。
 - wiki 任务 runtime(注册表/主流程/进度落盘投影)测试见
   apps/deepwiki-webui/server/tests/test_tasks.py;HTTP 端点契约测试见同目录 test_app.py。
 """
@@ -21,8 +21,10 @@ from gh_puller.deepwiki import (
     WikiPage,
     WikiStructureModel,
     delete_resume_state,
+    delete_wiki_cache,
     list_wiki_cache,
     read_resume_state,
+    save_wiki_cache,
     write_resume_state,
 )
 from gh_puller.deepwiki import utils as deepwiki_utils
@@ -247,10 +249,52 @@ async def test_wiki_task_state_roundtrip_atomic():
     loaded = await read_resume_state("state-io", "demo", "local", "en", digest=digest)
     assert loaded is not None
     assert loaded == state  # 纯 dict json 往返(Enum 为 str 子类,判等成立)
-    # 状态文件以 deepwiki_resume_ 前缀命名,不污染成品缓存列表
+    # 状态文件以 resume_ 前缀命名,不污染成品缓存列表
     assert await list_wiki_cache() == []
     assert await delete_resume_state("state-io", "demo", "local", "en", digest=digest) is True
     assert not os.path.exists(path)
+
+
+@pytest.mark.asyncio
+async def test_cache_new_layout_by_project_dir():
+    """成品缓存落 deepwiki 根下 <repo_key>/ 文件夹:json 文件名带完整段(list 反解
+    language/digest 的唯一无歧义来源);根下旁支目录(repos/graphify/agent_cache 的 md)
+    不参与列表。"""
+    root = Path(deepwiki.envs.DEEPWIKI_ROOT)
+    d1 = _digest_of({"generator": "cc"})
+    d2 = _digest_of({"generator": "llm"})
+    record = {"wiki_structure": dataclasses.asdict(_make_structure(["p1"])), "generated_pages": {}}
+    assert await save_wiki_cache("layout-io", "demo", "local", "en", record, digest=d1) is True
+    assert await save_wiki_cache("layout-io", "demo", "local", "zh", record, digest=d2) is True
+    proj_dir = root / "wiki" / "local_layout-io_demo"
+    assert (proj_dir / f"cache_local_layout-io_demo_en_{d1}.json").exists()
+    assert (proj_dir / f"cache_local_layout-io_demo_zh_{d2}.json").exists()
+    # 旁支干扰:repos/graphify(根下,与 wiki/ 平级)与 agent_cache 交付件(md)均不计数
+    (root / "repos" / "cache_local_layout-io_demo_en_zzzzzzzz.json").parent.mkdir(parents=True, exist_ok=True)
+    (root / "repos" / "cache_local_layout-io_demo_en_zzzzzzzz.json").write_text("{}")
+    (root / "graphify").mkdir(exist_ok=True)
+    (proj_dir / "agent_cache").mkdir(parents=True, exist_ok=True)
+    (proj_dir / "agent_cache" / "local_layout-io_demo_00000000-structure.md").write_text("x")
+    entries = await list_wiki_cache()
+    assert len(entries) == 2, [e["id"] for e in entries]
+    by_lang = {(e["owner"], e["repo"], e["repo_type"], e["language"]): e for e in entries}
+    assert by_lang[("layout-io", "demo", "local", "en")]["digest"] == d1
+    assert by_lang[("layout-io", "demo", "local", "zh")]["digest"] == d2
+
+
+@pytest.mark.asyncio
+async def test_cache_delete_removes_whole_project():
+    """删除缓存 = 删整个项目目录(json + agent_cache 全清;同项目连删,用户语义)。"""
+    request = _make_request("layout-io", "demo")
+    d1 = generator_digest(request["target"])
+    record = {"wiki_structure": dataclasses.asdict(_make_structure(["p1"])), "generated_pages": {}}
+    assert await save_wiki_cache("layout-io", "demo", "local", "en", record, digest=d1) is True
+    proj_dir = Path(deepwiki.envs.DEEPWIKI_ROOT) / "wiki" / "local_layout-io_demo"
+    (proj_dir / "agent_cache").mkdir(parents=True, exist_ok=True)
+    (proj_dir / "agent_cache" / "local_layout-io_demo_x-structure.md").write_text("x")
+    assert await delete_wiki_cache("layout-io", "demo", "local", "en") is True
+    assert not proj_dir.exists()
+    assert await delete_wiki_cache("layout-io", "demo", "local", "en") is False
 
 
 class _FakeGenerator:
