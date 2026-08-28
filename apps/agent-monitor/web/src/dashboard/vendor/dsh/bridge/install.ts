@@ -31,6 +31,7 @@ import { createChatStore } from '../ui-conversation/src/client/stores'
 import type { ChatViewInjected } from '../ui-conversation/src/client/contract/slots'
 import { NS as CONV_NS, zh as convZh, en as convEn } from '../ui-conversation/src/client/locales'
 import { apply as applyTrajectory } from '../ui-trajectory/src/client'
+import { apply as applyTool } from '../ui-tool/src/client'
 
 export interface DshInstall {
   registry: SlotRegistry
@@ -80,6 +81,8 @@ function installOnce(store: DshSessionStore, shell: DshShellComponent): DshInsta
       },
       bind: ns => localeFace.bind(ns),
     },
+    // `~` 缩短仅外观:session 日志/hub 协议无 home 字段,留待协议补充后启用真实源
+    hostDescription: { getSnapshot: () => ({ home: undefined }), subscribe: () => () => {} },
     loadOlder: sessionId => store.loadOlder(sessionId),
   }
   applyTrajectory(face)
@@ -188,6 +191,7 @@ function installOnce(store: DshSessionStore, shell: DshShellComponent): DshInsta
 
   registerConversationNodes(face)
   registerChatNodeRenderers(face)
+  applyTool(face)
 
   registry.setHostFaces({
     sessions: { list: store.list, currentProvideInfo: store.provideInfo },

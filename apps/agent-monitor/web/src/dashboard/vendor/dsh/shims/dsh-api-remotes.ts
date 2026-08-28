@@ -27,16 +27,9 @@ export interface ConnectionHandle {
   start(sinks: unknown, config?: unknown): { stop(): void }
 }
 
-export interface ToolCallView {
-  name?: string
-  arguments?: unknown
-  previewMarkdown?: string
-}
-export interface ToolResultView {
-  isError?: boolean
-  message?: string
-  previewMarkdown?: string
-}
+/** RPC 帧面视图(dsh core/tools presentation 全集,1:1 复制见 tools-presentation.ts)。 */
+import type { ToolCallView, ToolResultView } from './tools-presentation.ts'
+export type { ToolCallView, ToolResultView } from './tools-presentation.ts'
 export type ToolEventView =
   | { for: 'call'; view: ToolCallView }
   | { for: 'result'; view: ToolResultView }

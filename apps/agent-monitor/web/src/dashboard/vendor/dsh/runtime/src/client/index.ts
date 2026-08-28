@@ -14,6 +14,7 @@ import type { SessionId } from '../../../shims/dsh-api-remotes.ts'
 import type { SessionProjectionMap } from '@dsh/session-projection'
 import type { Branded } from '../../../shims/dsh-brand.ts'
 
+export { abbreviateHomePath, resolveWorkspacePath } from './workspaces/path.ts'
 export type { SessionId } from '../../../shims/dsh-api-remotes.ts'
 import type { ConversationSnapshot } from './sessions/conversation.ts'
 

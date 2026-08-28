@@ -17,6 +17,7 @@ export default defineConfig({
       '@dsh/cordis': resolve(import.meta.dirname, './src/dashboard/vendor/dsh/shims/cordis.ts'),
       '@dsh/session': resolve(import.meta.dirname, './src/dashboard/vendor/dsh/session/types.ts'),
       '@dsh/session-projection': resolve(import.meta.dirname, './src/dashboard/vendor/dsh/session-projection.ts'),
+      '@dsh/ui-tool': resolve(import.meta.dirname, './src/dashboard/vendor/dsh/ui-tool/src/client/index.ts'),
     },
   },
   build: {

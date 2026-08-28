@@ -2,10 +2,15 @@
 // 折叠恢复规范:surface 节点(带 surfaceOp 的用户/助手/工具结果消息)按 seq 升序重放,
 // 任意时刻的 messages = 折叠 seq<x 的前缀并派生(见 surface.ts)。
 
-/** 消息块(text/thinking/tool_use/tool_result;与 Python 侧 data.message.content 同形)。 */
+/** 消息块(与 gh_puller/agent/generators.py 协议词表同形)。
+ * text 为 user 消息块、content 为 assistant 可见文本、thinking{text} 为思考、
+ * tool_call{id,name,input} 为工具调用(input 为 dict 或 JSON 字符串);
+ * `text`(assistant 侧)与 `tool_use` 为历史 legacy,保留兼容。 */
 export type Block =
   | { type: 'text'; text: string }
-  | { type: 'thinking'; thinking: string }
+  | { type: 'content'; text: string }
+  | { type: 'thinking'; text: string }
+  | { type: 'tool_call'; id?: string; name?: string; input?: unknown }
   | { type: 'tool_use'; id?: string; name?: string; input?: unknown }
   | { type: 'tool_result'; tool_use_id?: string; content?: string; is_error?: boolean }
   | { [key: string]: unknown };
@@ -56,7 +61,7 @@ export interface MessageData {
 export interface ChunkData {
   turn?: number;
   step?: number;
-  chunk: { type: 'text' | 'thinking' | 'tool_input'; index: number; text?: string; partial_json?: string };
+  chunk: { type: 'content' | 'thinking' | 'tool_call' | 'text' | 'tool_input'; index: number; text?: string; partial_json?: string };
 }
 
 export interface ToolCallData {

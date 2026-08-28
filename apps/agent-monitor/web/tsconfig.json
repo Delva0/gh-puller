@@ -22,6 +22,9 @@
       ],
       "@dsh/session-projection": [
         "./src/dashboard/vendor/dsh/session-projection.ts"
+      ],
+      "@dsh/ui-tool": [
+        "./src/dashboard/vendor/dsh/ui-tool/src/client/index.ts"
       ]
     },
     "lib": [
