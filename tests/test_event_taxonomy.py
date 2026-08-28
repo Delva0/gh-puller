@@ -412,9 +412,12 @@ def test_fold_replace_unknown_shadow_raises():
         fold_events(events)
 
 
-def test_fold_ignores_session_heartbeat():
-    """session/heartbeat(TAXONOMY 内非 surface,ignorable)掺杂流:折叠节点与消息派生
-    与无心跳流完全一致(心跳不折面、不派生、不改变消息上下文)。"""
+def test_fold_skips_legacy_session_heartbeat():
+    """回归:旧版 .jsonl 的 session/heartbeat 行(顶层 ignorable:true)不被折叠拒读。
+
+    session/heartbeat 已从 TAXONOMY 移除(不再发射),但历史文件的该行仍须被读者
+    安全跳过:折叠节点与消息派生与无心跳流完全一致(不进面、不派生、不比照必读)。
+    """
     base = [evt(0, "session/start", run_id="r", label="l", generator="cc"),
             evt(1, "user/message", turn=1, step=1,
                 message={"role": "user", "content": [{"type": "text", "text": "hi"}]},
@@ -426,9 +429,11 @@ def test_fold_ignores_session_heartbeat():
                 surfaceOp="append", sourceSeqs=[2]),
             evt(4, "session/end", state="completed", ok=True, duration_ms=1,
                 text_chars=1, num_steps=1)]
+    hb = evt(1, "session/heartbeat")
+    hb["ignorable"] = True  # 旧格式产物标记(读者按可跳过契约统一处理)
     # 心跳夹在流中(占位 seq,保持稠密):与基准同节点、同消息
     with_hb = [evt(0, "session/start", run_id="r", label="l", generator="cc"),
-               evt(1, "session/heartbeat"),
+               hb,
                evt(2, "user/message", turn=1, step=1,
                    message={"role": "user", "content": [{"type": "text", "text": "hi"}]},
                    source={"kind": "user"}, surfaceOp="append"),
@@ -441,4 +446,6 @@ def test_fold_ignores_session_heartbeat():
                    text_chars=1, num_steps=1)]
     assert fold_events(with_hb)[0] == [2, 4]  # 心跳不进面:节点恰为 user/assistant message
     assert messages_at(with_hb, 10**9) == messages_at(base, 10**9)  # 消息上下文一致
-    assert new_event("session/heartbeat")["ignorable"] is True  # LOG_TYPES 契约
+    # 新事件模型:session/heartbeat 不再是合法类型(TAXONOMY 外,旧文件靠 ignorable 兜底)
+    with pytest.raises(ValueError, match="未知事件 type"):
+        new_event("session/heartbeat")

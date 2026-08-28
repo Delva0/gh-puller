@@ -30,6 +30,7 @@ from gh_puller.agent.generators import (
     EventRecorder,
     _session_id,
 )
+from gh_puller.agent.events import set_active_bus
 from gh_puller.agent.sinks import OtelSink
 
 
@@ -94,14 +95,65 @@ async def test_bus_drop_oldest_when_full():
     await asyncio.sleep(0)
 
 
-def test_configure_disabled_short_circuits():
-    """ws/otel 全关后:bus 惰性重建 —— 未 ensure_bus 前事件零开销短路
-    (无 uuid/json 开销)、sessions 目录不建(文件 sink 恒在,总线未建不启动)。"""
-    agent.configure(ws_urls=[], otel_urls=[])
+@pytest.mark.asyncio
+async def test_recorder_self_init_bus_on_first_event(monkeypatch, tmp_path):
+    """录前自足:配置后未显式 ensure_bus —— 首次事件即自建总线(FileSink 恒开落配置目录),
+    会话事件正常发布(不再"未 ensure 即零短路"),且同总线幂等复用。"""
+    agent.configure(file_dir=str(tmp_path), ws_urls=[], otel_urls=[])
+    assert sinks._bus is None
     run = EventRecorder("s1", label="t")
-    run.event("session/start", run_id=None, label="t", model="")
-    bus = sinks._bus
-    assert bus is None  # 新语义:配置即关旧总线,未 ensure_bus 则无总线(事件零开销短路)
+    run.event("session/start", run_id=None, label="t", model="")  # 触发自建
+    assert sinks._bus is not None
+    assert (tmp_path / "sessions").exists()  # 恒开 FileSink:落盘目录即建
+    n_sinks = len(sinks._bus._sinks)
+    run.event("turn/start", turn=1)  # 复用同一总线,不重复建
+    assert sinks.ensure_bus() is sinks._bus and len(sinks._bus._sinks) == n_sinks
+
+
+def test_recorder_event_no_loop_degrades_safe(tmp_path):
+    """同步构造(无运行中事件循环):event 降级短路(返回 None),不因自建总线抛 RuntimeError。"""
+    agent.configure(file_dir=str(tmp_path), ws_urls=[], otel_urls=[])
+    run = EventRecorder("s2", label="t")
+    assert run.event("session/start", run_id=None, label="t", model="") is None
+
+
+@pytest.mark.asyncio
+async def test_init_config_folds_sdk_objects():
+    """config/init 遇不可序列化装配对象(mcp SDK Server 实例等)→ 折叠为 <类型名> 入流:
+
+    new_event 的 JSON 校验在构造期即通过,不炸交付主路径;mcp_servers 装配形态
+    (type/name)保留,凭证剥离沿用旧语义。
+    """
+
+    class Server:  # 模拟 mcp SDK 装配对象(不可 JSON 化)
+        pass
+
+    got = []
+    bus = EventBus()
+    bus.add(_recv(got))
+    set_active_bus(bus)
+    try:
+        run = EventRecorder("s1", label="t")
+        run.init_config({
+            "system_prompt": "sp",
+            "config_path": "/tmp/dw-settings.json",
+            "api_key": "sk-secret",  # 凭证剥离:不入流
+            "mcp_servers": {"graphify": {"type": "sdk", "name": "graphify",
+                                         "instance": Server()}},
+        })
+        await asyncio.sleep(0.05)  # 轮转一拍,让 drain 消费
+    finally:
+        set_active_bus(None)
+        bus.shutdown()
+    assert got, "config/init 应正常发布(不抛 TypeError)"
+    assert got[0]["type"] == "config/init"
+    cfg = got[0]["data"]["config"]
+    assert cfg["system_prompt"] == "sp"
+    assert cfg["config_path"] == "/tmp/dw-settings.json"
+    assert "api_key" not in cfg  # 凭证剥离
+    assert cfg["mcp_servers"]["graphify"] == {"type": "sdk", "name": "graphify",
+                                              "instance": "<Server>"}
+    json.dumps(got[0])  # 事件整体可再序列化
 
 
 # ---------------------------------------------------------------------------
@@ -428,8 +480,8 @@ async def _fold(chunks):
 
 @pytest.mark.asyncio
 async def test_cc_stream_exact_output_no_duplicates(monkeypatch, tmp_path):
-    """禁用监控 + 假 SDK:产出逐字节一致(content 增量优先,AssistantMessage 不重复兜底),
-    monitor 目录不建(零副作用)。"""
+    """假 SDK:产出逐字节一致(content 增量优先,AssistantMessage 不重复兜底);
+    监控自足(agent/ 首跑建 FileSink),会话落到配置的 tmp 目录(不写真实 monitor)。"""
     agent.configure(file_dir=str(tmp_path), ws_urls=[], otel_urls=[])
     sdk = _fake_sdk([
         _FakeStreamEvent({"type": "content_block_start", "index": 0, "content_block": {"type": "text"}}),
@@ -443,7 +495,9 @@ async def test_cc_stream_exact_output_no_duplicates(monkeypatch, tmp_path):
     monkeypatch.setitem(sys.modules, "claude_agent_sdk", sdk)
     chunks = [c async for c in agent.ClaudeCode(_options()).stream("prompt", session_name="x")]
     assert "".join(chunks) == "hi好"
-    assert not (tmp_path / "sessions").exists()  # 未构建 FileSink,无写盘
+    await asyncio.sleep(0.05)  # 等 bus 末拍落盘
+    files = list((tmp_path / "sessions").glob("*.jsonl"))
+    assert any("session/end" in f.read_text(encoding="utf-8") for f in files)  # 会话已落盘(tmp 隔离)
 
 
 @pytest.mark.asyncio
@@ -530,7 +584,8 @@ async def test_cc_stream_partial_markers_rebuild_and_boundary(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_cc_text_fallback_without_partials(monkeypatch, tmp_path):
-    """无 partial 事件:AssistantMessage 整块兜底一次,输出与原漏斗一致。"""
+    """无 partial 事件:AssistantMessage 整块兜底一次,输出与原漏斗一致;
+    监控自足落盘 tmp(会话/止行齐备)。"""
     agent.configure(file_dir=str(tmp_path), ws_urls=[], otel_urls=[])
     sdk = _fake_sdk([
         _FakeAssistantMessage(content=[types.SimpleNamespace(type="text", text="hi好world")]),
@@ -538,19 +593,24 @@ async def test_cc_text_fallback_without_partials(monkeypatch, tmp_path):
     ])
     monkeypatch.setitem(sys.modules, "claude_agent_sdk", sdk)
     assert await _fold(agent.ClaudeCode(_options()).stream("prompt", session_name="x")) == "hi好world"
-    assert not (tmp_path / "sessions").exists()
+    await asyncio.sleep(0.05)
+    files = list((tmp_path / "sessions").glob("*.jsonl"))
+    assert any("session/end" in f.read_text(encoding="utf-8") for f in files)
 
 
 @pytest.mark.asyncio
 async def test_cc_stream_error_semantics(monkeypatch, tmp_path):
-    """is_error 的 ResultMessage → RuntimeError"agent 执行失败: ..."(与旧漏斗同一文案)。"""
+    """is_error 的 ResultMessage → RuntimeError"agent 执行失败: ..."(与旧漏斗同一文案);
+    会话仍落盘(tmp,含 aborted 终态)。"""
     agent.configure(file_dir=str(tmp_path), ws_urls=[], otel_urls=[])
     sdk = _fake_sdk([_FakeResultMessage(result="", is_error=True, errors=["boom"])])
     monkeypatch.setitem(sys.modules, "claude_agent_sdk", sdk)
     with pytest.raises(agent.RequestFailedError, match="boom"):
         async for _ in agent.ClaudeCode(_options()).stream("p", session_name="x"):
             pass
-    assert not (tmp_path / "sessions").exists()
+    await asyncio.sleep(0.05)
+    files = list((tmp_path / "sessions").glob("*.jsonl"))
+    assert any("session/end" in f.read_text(encoding="utf-8") for f in files)
 
 
 # ---------------------------------------------------------------------------
@@ -2044,7 +2104,8 @@ async def test_llm_result_drains_stream_events(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# 心跳(静默补发):_guard 内启停,活动期零行、静默期每条间隔补发;session/end 恒为末行
+# 会话保鲜(keep-warm):_guard 内启停,每 interval 触一次文件 mtime(只动时间戳、
+# 不落行、无 session/heartbeat 事件);session/end 恒为末行;run 收尾即取消(无泄漏)
 # ---------------------------------------------------------------------------
 
 
@@ -2056,20 +2117,27 @@ async def _slow_stream(self):
 
 
 async def _busy_stream(self):
-    """通知以 1ms 节奏流动(远小于 interval:活动期)。"""
+    """通知以 8ms 节奏流动(< interval 10ms:活动期;总时长 > interval,保鲜仍触)。"""
     for n in type(self).notifs:
         yield n
-        await asyncio.sleep(0.001)
+        await asyncio.sleep(0.008)
 
 
 @pytest.mark.asyncio
-async def test_heartbeat_fills_quiet_gap(monkeypatch, tmp_path):
-    """静默补发:interval 0.01s + 事件间 50ms 静默 → 心跳周期性出现,seq 稠密,
-    session/end 恒为末条;run 结束后心跳任务已取消,不再发布(无泄漏)。"""
+async def test_keepwarm_touches_during_quiet_gap(monkeypatch, tmp_path):
+    """静默保鲜:interval 0.01s + 事件间 50ms 静默 → keep-warm 每 interval 触一次
+    sinks.touch(只动 mtime、不发 session/heartbeat 事件);session/end 恒为末条;
+    run 结束后保鲜任务已取消,不再触(无泄漏)。"""
     monkeypatch.setattr(envs, "AGENT_MONITOR_HEARTBEAT_SECS", 0.01)
-    agent.configure(ws_urls=[], otel_urls=[])
+    agent.configure(file_dir=str(tmp_path), ws_urls=[], otel_urls=[])
     got = []
     sinks.ensure_bus().add(_recv(got))
+    touched: list[str] = []
+
+    async def _fake_touch(session: str) -> None:
+        touched.append(session)
+
+    monkeypatch.setattr(sinks, "touch", _fake_touch)
     monkeypatch.setattr(_FakeTurnHandle, "stream", _slow_stream)
     _fake_codex(monkeypatch, [
         _codex_nt("turn/started", turn=_codex_it(id="t1")),
@@ -2081,22 +2149,29 @@ async def test_heartbeat_fills_quiet_gap(monkeypatch, tmp_path):
     ], user_home=_codex_user_home(tmp_path))
     await _fold(agent.Codex(_codex_options(codex_home=str(tmp_path))).stream("prompt",
                                                                              session_name="x"))
-    await asyncio.sleep(0.05)
-    assert any(g["type"] == "session/heartbeat" for g in got)
+    await asyncio.sleep(0.05)  # 等 bus 末拍(终局事件)到达 got
+    assert touched  # 静默缺口 ≥1 拍:保鲜触发过(事件模型不再有心跳行)
+    assert "session/heartbeat" not in [g["type"] for g in got]
     assert [g["type"] for g in got][-2:] == ["turn/end", "session/end"]  # cancel 先于 finish
-    assert [g["seq"] for g in got] == list(range(len(got)))  # 流内 seq 稠密(心跳同序)
-    n = len(got)
-    await asyncio.sleep(0.08)  # 数拍后:心跳任务已取消,不再发布
-    assert len(got) == n
+    n = len(touched)
+    await asyncio.sleep(0.1)  # 数拍后:保鲜任务已取消,不再触
+    assert len(touched) == n
 
 
 @pytest.mark.asyncio
-async def test_heartbeat_absent_while_busy(monkeypatch, tmp_path):
-    """活动期零心跳:事件间隙(1ms)≪ interval(10ms) → 无 session/heartbeat 行(防 spam)。"""
+async def test_keepwarm_unconditional_during_busy(monkeypatch, tmp_path):
+    """保鲜无静默判断:活动期(1ms 节奏)也逐拍触发 —— 事件密时 mtime 本就新鲜,
+    多触一次无副作用;任何时刻都不再出现 session/heartbeat(防 spam 结构消除)。"""
     monkeypatch.setattr(envs, "AGENT_MONITOR_HEARTBEAT_SECS", 0.01)
-    agent.configure(ws_urls=[], otel_urls=[])
+    agent.configure(file_dir=str(tmp_path), ws_urls=[], otel_urls=[])
     got = []
     sinks.ensure_bus().add(_recv(got))
+    touched: list[str] = []
+
+    async def _fake_touch(session: str) -> None:
+        touched.append(session)
+
+    monkeypatch.setattr(sinks, "touch", _fake_touch)
     monkeypatch.setattr(_FakeTurnHandle, "stream", _busy_stream)
     _fake_codex(monkeypatch, [
         _codex_nt("turn/started", turn=_codex_it(id="t1")),
@@ -2109,17 +2184,24 @@ async def test_heartbeat_absent_while_busy(monkeypatch, tmp_path):
     await _fold(agent.Codex(_codex_options(codex_home=str(tmp_path))).stream("prompt",
                                                                              session_name="x"))
     await asyncio.sleep(0.05)
+    assert touched  # 活动期同按 cadence 保鲜(无条件)
     assert "session/heartbeat" not in [g["type"] for g in got]
     assert got[-1]["type"] == "session/end"
 
 
 @pytest.mark.asyncio
-async def test_heartbeat_stops_on_aborted_run(monkeypatch, tmp_path):
-    """异常路径(thread_start 抛):error + finish(False);心跳一并取消,末行 aborted,零泄漏。"""
+async def test_keepwarm_stops_on_aborted_run(monkeypatch, tmp_path):
+    """异常路径(thread_start 抛):error + finish(False);保鲜任务一并取消,末行 aborted,零泄漏。"""
     monkeypatch.setattr(envs, "AGENT_MONITOR_HEARTBEAT_SECS", 0.01)
-    agent.configure(ws_urls=[], otel_urls=[])
+    agent.configure(file_dir=str(tmp_path), ws_urls=[], otel_urls=[])
     got = []
     sinks.ensure_bus().add(_recv(got))
+    touched: list[str] = []
+
+    async def _fake_touch(session: str) -> None:
+        touched.append(session)
+
+    monkeypatch.setattr(sinks, "touch", _fake_touch)
     _fake_codex(monkeypatch, [], thread_raise=RuntimeError("boom"),
                 user_home=_codex_user_home(tmp_path))
     with pytest.raises(RuntimeError, match="boom"):
@@ -2127,18 +2209,24 @@ async def test_heartbeat_stops_on_aborted_run(monkeypatch, tmp_path):
                                                                                  session_name="x"))
     await asyncio.sleep(0.05)
     assert got[-1]["type"] == "session/end" and got[-1]["data"]["state"] == "aborted"
-    n = len(got)
-    await asyncio.sleep(0.08)
-    assert len(got) == n
+    n = len(touched)
+    await asyncio.sleep(0.1)
+    assert len(touched) == n  # 保鲜任务已取消(无泄漏)
 
 
 @pytest.mark.asyncio
-async def test_file_sink_writes_heartbeat_row(tmp_path):
-    """session/heartbeat(非 stream 投影)→ 落盘;信封带 ignorable(LOG_TYPES 契约)。"""
+async def test_file_sink_touch_updates_mtime_no_row(tmp_path):
+    """FileSink.touch:只 os.utime 更新 mtime、不写行;未知 session no-op,失败静默。"""
     sink = FileSink(str(tmp_path))
     await sink.consume(_evt("session/start", session="s4", seq=0, run_id="r4",
                             label="wiki:structure", provider="anthropic", model=""))
-    await sink.consume(_evt("session/heartbeat", session="s4", seq=1))
-    lines = [json.loads(line) for line in (tmp_path / "sessions" / "s4.jsonl").read_text().splitlines()]
-    assert [ln["type"] for ln in lines] == ["session/start", "session/heartbeat"]
-    assert lines[-1]["ignorable"] is True  # 读者按"可跳过"契约统一处理
+    path = tmp_path / "sessions" / "s4.jsonl"
+    before = path.stat().st_mtime_ns
+    await asyncio.sleep(0.01)  # 时钟推进,确保 utime 目标时间戳不同
+    await sink.touch("s4")
+    assert path.stat().st_mtime_ns > before  # mtime 前进
+    lines = [json.loads(line) for line in path.read_text().splitlines()]
+    assert [ln["type"] for ln in lines] == ["session/start"]  # 未写入任何新行
+    await sink.touch("unknown")  # 未知会话:no-op 不炸
+    await sink.touch("s4")  # 再触幂等
+    assert [json.loads(line)["type"] for line in path.read_text().splitlines()] == ["session/start"]

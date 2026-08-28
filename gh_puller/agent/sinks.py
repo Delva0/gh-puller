@@ -22,6 +22,7 @@ put_nowait 到每 sink 的 asyncio.Queue,永不阻塞调用)→ sink worker 消�
 
 import asyncio
 import json
+import os
 import socket
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -61,9 +62,9 @@ class FileSink:
     字段查会话来源(<ns>/<uuid4>,ns 由上层业务定)。Linux 查询友好:
     tail -f sessions/*.jsonl 实时看;jq 过滤并按折叠规范
     (gh_puller.agent.events)还原任意时刻消息上下文。session/end 留作文件
-    脏终行;运行期静默补发的 session/heartbeat(ignorable)同样落盘 —— 文件
-    mtime 持续前进,hub 侧方可区分"活着但静默"与"进程已死"(无终态行且
-    mtime 静止超租约 → 孤儿 aborted,见 hub.py 租约扫描)。崩溃残留 = 无终态
+    脏终行;会话保鲜(keep-warm,见 generators._guard)经 FileSink.touch 直触
+    mtime,**不写行** —— 文件 mtime 持续前进,hub 侧方可区分"活着但静默"与"进程已死"
+    (无终态行且 mtime 静止超租约 → 孤儿 aborted,见 hub.py 租约扫描)。崩溃残留 = 无终态
     行的文件(超租约前显示 running,是排查素材)。无 session/start 起点的
     事件不可分组,丢弃(同 v1 语义)。
     """
@@ -88,6 +89,21 @@ class FileSink:
 
     def _open(self, session: str) -> None:
         self._files[session] = self.root / "sessions" / f"{_file_stem(session)}.jsonl"
+
+    async def touch(self, session: str) -> None:
+        """会话保鲜原语:只 os.utime 更新文件 mtime,**不写任何行、不加内容**。
+
+        供 keep-warm 定时器(见 generators._guard)在 agent 静默期调用 —— 监控端
+        (agent-monitor hub)按"无终态行且 mtime 静止超租约"区分沉默与死亡。
+        未知 session / 文件缺失 / utime 失败:静默 no-op(保鲜是尽力而为的旁路)。
+        """
+        path = self._files.get(session)
+        if path is None:
+            return
+        try:
+            os.utime(path, None)
+        except OSError as exc:
+            _log(f"FileSink.touch 失败 {path.name}: {exc}")
 
 
 class WsSink:
@@ -461,6 +477,8 @@ _cfg = {
     "otel_urls": _default_otel_urls(),
 }
 _bus: EventBus | None = None
+# 文件 sink 实例注册表(keep-warm 的 touch 直达;ensure_bus 建、configure 清)
+_file_sinks: list[FileSink] = []
 
 
 def configure(*, file_dir=None, ws_urls=None, otel_urls=None) -> None:
@@ -472,14 +490,25 @@ def configure(*, file_dir=None, ws_urls=None, otel_urls=None) -> None:
     避免写真实 monitor 目录。
     关闭旧 bus(取消 sink 任务),新配置惰性重建 —— 幂等,可反复调用。
     """
-    global _bus
+    global _bus, _file_sinks
     _cfg["file_dir"] = envs.AGENT_MONITOR_DIR if file_dir is None else file_dir
     _cfg["ws_urls"] = _split_urls(envs.AGENT_MONITOR_WEBUI_URL if ws_urls is None else ws_urls)
     _cfg["otel_urls"] = _default_otel_urls() if otel_urls is None else _split_urls(otel_urls)
     if _bus is not None:
         _bus.shutdown()
         _bus = None
+    _file_sinks = []
     set_active_bus(None)
+
+
+async def touch(session: str) -> None:
+    """会话保鲜入口(keep-warm 定时器直连):扇出到已注册文件 sink 的 touch。
+
+    touch 是文件 sink 的职责(sinks.py 层只做扇出);无文件 sink → no-op;
+    单个 sink 失败只记 stderr,不冒泡(保鲜是尽力而为的旁路)。
+    """
+    for fs in _file_sinks:
+        await fs.touch(session)
 
 
 def ensure_bus() -> EventBus:
@@ -488,10 +517,12 @@ def ensure_bus() -> EventBus:
     每 URL 注册条件:TCP 可达(_url_reachable);OTel 还要求 opentelemetry 可导入
     (OtelSink 构造,缺失 → ImportError 降级);任一不满足 → 日志并跳过该实例。
     """
-    global _bus
+    global _bus, _file_sinks
     if _bus is None:
         b = EventBus()
-        b.add(FileSink(_cfg["file_dir"]).consume)
+        fs = FileSink(_cfg["file_dir"])
+        _file_sinks.append(fs)  # touch 扇出门(与事件通道同一实例)
+        b.add(fs.consume)
         for url in _cfg["ws_urls"]:
             if not _url_reachable(url):
                 _log(f"ws sink 未启用: 端口不可达 {url}")

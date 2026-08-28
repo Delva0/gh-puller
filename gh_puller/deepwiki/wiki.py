@@ -19,6 +19,7 @@ import dataclasses
 import json
 import os
 import re
+import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime
@@ -940,14 +941,18 @@ class AgentWikiPipeline(WikiPipeline):
         """
         out_path = Path(out_path)
         out_path.parent.mkdir(parents=True, exist_ok=True)  # add_dirs 指向目录须先存在(agent Write 可直接落)
+        t0 = time.time()
+        log(f"agent 交付开始 label={label} run_id={run_id} out={out_path.name}")
         try:
             async for _ in adapter.stream(prompt, session_name=label, run_id=run_id):
                 pass
         except RequestFailedError as e:
+            log(f"agent 交付失败 label={label} run_id={run_id} 耗时={time.time() - t0:.1f}s -> {e}")
             raise utils.failure(e) from e
         text = await asyncio.to_thread(out_path.read_text, encoding="utf-8")
         if not text.strip():
             raise RuntimeError(f"agent 未产出交付文件: {out_path}")
+        log(f"agent 交付完成 label={label} run_id={run_id} 耗时={time.time() - t0:.1f}s")
         return text
 
     def needs_structure_regenerate(self, *, project_key: str, generator: str | None = None, generator_config: dict | None = None) -> bool:

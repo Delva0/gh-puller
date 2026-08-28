@@ -16,12 +16,14 @@ seq 序列是流式事件流的稠密序号;文件侧(非流式投影)按行跳�
 - surface 事件 user/message / assistant/message / tool/result 携带全量消息与
   surfaceOp(append 或 {op:'replace', start, end});
 - config/init(ignorable 日志型)= **构造期初始配置快照**,在 session/start 之前打印
-  (对应 self._client 的初始配置;api_key/token/base_url 等凭证与端点面剥离,不入流);
+  (对应 self._client 的初始配置;api_key/token/base_url 等凭证与端点面剥离,不入流;
+  SDK 装配对象如 mcp.server.Server 实例折叠为类型名,见 _jsonable);
 - context/modify 是上下文修改的解释事件(日志型,不折动),折叠正确性与它无关 ——
   丢弃也只是少了解释,不会误解消息历史;
-- session/heartbeat(ignorable 日志型)= 运行期静默补发:进程仍活但连续超过
-  AGENT_MONITOR_HEARTBEAT_SECS 无落盘事件时,每条间隔补发一条 —— 让文件 mtime 保持
-  前进,监测端(agent-monitor hub)借"无终态行且 mtime 静止超租约"判定会话已死。
+- **会话保活不再走事件**:session 活着但静默时的"保鲜"由 generators._guard 的
+  keep-warm 定时器调 sinks.touch(session) 直触文件 mtime(只动时间、不加行),
+  监测端(agent-monitor hub)借"无终态行且 mtime 静止超租约"判定会话已死 ——
+  本文件不再有 session/heartbeat 事件(已从模型的静默补发事件里移除)。
 
 折叠恢复规范(与 ui/src/monitor/surface.ts 同份语义,本模块不落 Python 实现,
 契约测试见 tests/test_event_taxonomy.py):
@@ -34,7 +36,10 @@ seq/run_id 等会话属性由调用方(EventRecorder,见下)附加;new_event 只
 信封(seq 不在此分配,防止双写)。
 
 事件域全集 = 本文件(模型 TAXONOMY/new_event + 单次调用记录器 EventRecorder +
-进程内总线 EventBus):纯 stdlib,零 SDK/envs 依赖;sinks.py 是观测通道层。
+进程内总线 EventBus):**导入期**纯 stdlib、零 SDK/envs;sinks.py 是观测通道层。
+运行期仅两处懒耦合(方法内 from .sinks import,零导入副作用):
+- _ensure_maybe_bus(首次事件自足建总线,app/生成器不管理该机制);
+- _keepwarm_loop(touch 是 FileSink 的职责,本层只做节奏)。
 """
 
 import asyncio
@@ -50,7 +55,6 @@ TAXONOMY = frozenset(
     {
         "session/start",
         "session/end",
-        "session/heartbeat",  # 静默补发(见 docstring):非流式落盘,进 NON_STREAM_TYPES
         "turn/start",
         "turn/end",
         "step/start",
@@ -77,7 +81,7 @@ NON_STREAM_TYPES = TAXONOMY - {"assistant/chunk"}
 
 # ignorable 日志型事件:读者可安全跳过(不影响消息派生/请求重建);缺失 ignorable
 # 标记的未知类型 → 必须可解析(读者应报错,防静默丢消息)
-LOG_TYPES = frozenset({"config/init", "context/modify", "session/heartbeat"})
+LOG_TYPES = frozenset({"config/init", "context/modify"})
 
 
 def type_of(evt: dict) -> str:
@@ -120,6 +124,22 @@ def truncate(text: str | None, n: int) -> tuple[int, str]:
     if len(text) <= n:
         return (len(text), text)
     return (len(text), text[:n] + "…")
+
+
+def _jsonable(value):
+    """事件载荷降级(递归):dict/list 透传,标量原样,其余对象折叠为 `<类型名>`。
+
+    config/init 快照只作观测 —— SDK 装配对象(mcp_servers 里的 mcp.server.Server
+    实例等)以类型名占位入流、不落实例,保证 new_event 的 JSON 校验在构造期即
+    通过(而非主路径抛 "not JSON serializable" 打死交付)。
+    """
+    if isinstance(value, dict):
+        return {k: _jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonable(v) for v in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return f"<{type(value).__name__}>"
 
 
 # ---------------------------------------------------------------------------
@@ -172,6 +192,26 @@ def set_active_bus(bus: "EventBus | None") -> None:
     _active_bus = bus
 
 
+def _ensure_maybe_bus() -> "EventBus | None":
+    """录前自足:监控总线未建则懒建(任意会话的首次事件触达);返回当前总线或 None。
+
+    机制归事件层 —— 宿主 app / 生成器层无需 ensure_bus,任何会话记录即自动挂接
+    FileSink(恒开)+ 可达 WS/OTel。懒 import 保持本模块**导入期**纯 stdlib/零 sinks
+    (ensure_bus 须在运行中的事件循环内调用,event() 恒在 loop 内)。幂等:建后即短路。
+    """
+    bus = _active_bus
+    if bus is None:
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return None  # 无运行中事件循环(同步构造/离线测试):降级短路(不建裸任务)
+        from .sinks import ensure_bus  # noqa: PLC0415 —— 运行期才耦合 sinks(零导入期副作用)
+
+        ensure_bus()
+        bus = _active_bus
+    return bus
+
+
 class EventRecorder:
     """单次运行的事件发布器:维护会话信封/turn/step/seq 计数,归一化后广播事件。"""
 
@@ -188,7 +228,8 @@ class EventRecorder:
         self.step = 1  # 一次 LLM 请求 = 一个 step;工具结果后的新请求 +1
         self.text_chars = 0
         self.t0 = time.monotonic()  # run 起点(与 start() 方法分名)
-        self.last_file_ts = time.time()  # 最后一条落盘(非 chunk)事件 ts;心跳静默判定锚点
+        self._keepwarm_task: asyncio.Task | None = None  # 会话保鲜定时器(会话记录器原生)
+        self._keepwarm_interval: float | None = None
         self.tool_names: dict[str, str] = {}  # tool_use_id → 工具名(tool/result 归一化用)
         self._tool_pending = False  # 本轮工具结果已发 → 下个 assistant 消息段开新 step
         self._active_tool_use: dict[int, str] = {}  # 块 index → tool_use_id
@@ -211,15 +252,13 @@ class EventRecorder:
 
     def event(self, evt_type: str, **data) -> dict | None:
         """造信封并发布;返回事件(seq 已分配);无 sink 时返回 None(零开销短路)。"""
-        bus = _active_bus
+        bus = _ensure_maybe_bus()  # 录前自足:首次事件即建监控总线(幂等;随 event 恒在 loop 内)
         if bus is None or not bus.enabled:
             return None  # 无通道:零开销短路(publish 语义不变)
         evt = new_event(evt_type, **data)
         evt["session"] = self.session  # 身份仅 session;元数据快照见 session/start
         evt["seq"] = self.seq
         self.seq += 1
-        if evt_type != "assistant/chunk":
-            self.last_file_ts = evt["ts"]  # 非流式事件 = 文件动静(chunk 不进盘,不参与静默判定)
         bus.publish(evt)
         return evt
 
@@ -228,9 +267,58 @@ class EventRecorder:
 
         对应 self._client 的初始配置 —— config 的观测面统一在此,不再附着
         session/start 与 turn/start(身份 = session id;元数据快照见本事件)。
+        SDK 装配对象(如 mcp_servers 的 mcp.server.Server 实例)经 _jsonable 折叠
+        为类型名 —— 快照只看装配形态,不落实例,不炸 JSON 校验。
         """
         creds = ("api_key", "token", "base_url")
-        self.event("config/init", config={k: v for k, v in config.items() if k not in creds})
+        self.event("config/init",
+                   config=_jsonable({k: v for k, v in config.items() if k not in creds}))
+
+    # ------------------------------------------------------------------
+    # 会话保活(fs touch 保鲜;会话记录器原生能力):agent 静默期不动事件流,只触文件
+    # mtime —— 供监控端(hub)按"mtime 静止超租约"区分"活着但静默"与"进程已死"。
+    # 不再发 heartbeat 事件;cadence 由调用方注入(零 env 依赖);触达经 sinks.touch
+    # (touch 是 FileSink 的职责,见 sinks.py)。
+    # ------------------------------------------------------------------
+
+    def start_keepwarm(self, interval: float) -> None:
+        """run 进行中启动保鲜定时器(cadence = interval 秒);幂等。
+
+        仅当 interval>0 且有活跃监控总线时才建任务(否则无可保鲜对象,避免空转)。
+        finish 前由 stop_keepwarm 取消(await 保证退场);_keepwarm_loop 只真睡
+        `asyncio.sleep(interval)`,每拍对会话文件 os.utime,绝不 busy-loop。
+        """
+        if self._keepwarm_task is not None or interval <= 0 or _active_bus is None:
+            return
+        self._keepwarm_interval = interval
+        self._keepwarm_task = asyncio.create_task(self._keepwarm_loop(interval))
+
+    async def stop_keepwarm(self) -> None:
+        """取消并等待保鲜任务退场(幂等);finish 前调用,保证 session/end 恒末行。
+
+        取消在 run 生命周期(而非依赖 session/end 行送达)完成——即便该行被有界
+        队列挤掉,保鲜也已停,mtime 才可冻结交 hub 租约判死。
+        """
+        task = self._keepwarm_task
+        self._keepwarm_task = None
+        if task is None:
+            return
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    async def _keepwarm_loop(self, interval: float) -> None:
+        """每 sleep(interval) 经 sinks.touch(session) 对会话文件触一次 mtime。
+
+        touch 是文件 sink 的职责(见 sinks.FileSink.touch),本层只做节奏与自停;
+        懒 import 避免 events→sinks 的导入期耦合(运行期才触达)。无静默判断 ——
+        os.utime 便宜,会话开着就保鲜;事件密时 mtime 本就新鲜,多触一次无副作用。
+        总线被关闭(configure)后 touch 扇出为空,自然 no-op。
+        """
+        from .sinks import touch  # noqa: PLC0415 —— 懒 import:运行期才耦合 sinks(零导入期副作用)
+
+        while True:
+            await asyncio.sleep(interval)
+            await touch(self.session)
 
     def start(self, *, context: list[dict] | None = None, retry: dict | None = None,
               prologue: bool = True) -> None:
@@ -322,6 +410,11 @@ class EventRecorder:
         if self._ended:
             return
         self._ended = True
+        # 防御:不经 _guard 的 stop_keepwarm 直接结束的路径,也取消保鲜任务(非 await;
+        # _guard 路径已 await,此处兜底防对侧任务在 session/end 之后仍 touch)。
+        if self._keepwarm_task is not None:
+            self._keepwarm_task.cancel()
+            self._keepwarm_task = None
         state = "completed" if ok else "aborted"
         data = {"state": state, "ok": ok,
                 "duration_ms": int((time.monotonic() - self.t0) * 1000),

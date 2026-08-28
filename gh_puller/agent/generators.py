@@ -32,7 +32,6 @@ import asyncio
 import contextlib
 import json
 import os
-import time
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
@@ -323,14 +322,15 @@ class BaseGenerator:
         只捕获 Exception(消费者提前关闭的 GeneratorExit、CancelledError 为
         BaseException,不落 error 事件,靠 finally 兜底 finish(False) —— 与历史
         try/except/finally 语义一致);run.finish 本身幂等。
-        heartbeat_secs:静默补发间隔(None → envs 常量;≤0 → 不起心跳任务)。会话期间
-        连续超过该间隔无落盘事件时补发 session/heartbeat —— 文件 mtime 持续前进,
-        hub 侧租约方可区别"活着但静默"与"进程已死"(见 hub.py 租约扫描)。
+        heartbeat_secs:会话保鲜间隔(None → envs 常量;≤0 → 不起保鲜任务)。会话期间
+        每该间隔触一次会话文件 mtime(只动时间戳、不发事件、绝不 busy-loop),由
+        EventRecorder.start_keepwarm 承担(守卫层只注入 cadence),hub 侧租约据此
+        区别"活着但静默"与"进程已死"(见 hub.py 租约扫描)。
         """
         if heartbeat_secs is None:
             heartbeat_secs = envs.AGENT_MONITOR_HEARTBEAT_SECS
-        task = asyncio.create_task(self._heartbeat(run, heartbeat_secs)) \
-            if heartbeat_secs and heartbeat_secs > 0 else None
+        if heartbeat_secs and heartbeat_secs > 0:
+            run.start_keepwarm(heartbeat_secs)
         ok = False
         try:
             yield
@@ -339,28 +339,10 @@ class BaseGenerator:
             run.error(exc, error_stage(exc) if error_stage else "run")
             raise
         finally:
-            # 先取消再收尾:心跳不再发布 → session/end 恒为最后一条合法行(末行断言依赖)
-            if task is not None:
-                task.cancel()
-                await asyncio.gather(task, return_exceptions=True)  # 等退场,防 pending 任务告警
+            # 先停保鲜再收尾:停后文件 mtime 冻结 → 崩溃残留由租约判定 aborted;
+            # session/end 恒为最后一条合法行(末行断言依赖)。
+            await run.stop_keepwarm()
             run.finish(ok, epilogue=epilogue() if callable(epilogue) else epilogue)
-
-    @staticmethod
-    async def _heartbeat(run: EventRecorder, interval: float) -> None:
-        """静默补发循环:睡到"锚点+interval",期间无新落盘(非 chunk)事件才补发一条。
-
-        活动期(事件密于 interval)醒来即重置锚点、零发声 —— 会话日志不刷心跳行;
-        静默跨过 interval 时按节奏补发,保证文件 mtime 至多每 interval 动一次
-        (长 LLM turn 中 chunk 密发但不落盘,正靠此路径维持进度)。
-        """
-        anchor = run.last_file_ts
-        while True:
-            delay = anchor + interval - time.time()
-            if delay > 0:
-                await asyncio.sleep(delay)
-            if run.last_file_ts <= anchor:
-                run.event("session/heartbeat")
-            anchor = run.last_file_ts
 
     async def stream(self, prompt: str, *, session: str | None = None,
                      session_name: str | None = None, run_id: str | None = None,
