@@ -284,16 +284,20 @@ export default function RepoWikiPage() {
   const loadWikiFromServerCache = useCallback(async (): Promise<boolean> => {
     setLoadingMessage(t("loading.fetchingCache"));
     try {
+      // 缓存按提交侧同款 target 派生判等摘要(buildTargetRequest 会补注册表缺省,
+      // 如 cc 的 configDefault);raw 空参会让服务端按 env 缺省解析,与生成时的
+      // 摘要不一致 → 报"已缓存但加载失败"。
+      const cachedTarget = await buildTargetRequest(targetConfig);
       const params = new URLSearchParams({
         owner: effectiveRepoInfo.owner,
         repo: effectiveRepoInfo.repo,
         repo_type: effectiveRepoInfo.type,
         language: language,
         comprehensive: isComprehensiveView.toString(),
-        generator: targetConfig.generator || '',
-        config_path: targetConfig.config_path || '',
-        provider: targetConfig.provider || '',
-        model: targetConfig.model || '',
+        generator: cachedTarget.generator,
+        config_path: cachedTarget.generator_config.config_path || '',
+        provider: cachedTarget.generator_config.provider || '',
+        model: cachedTarget.generator_config.model || '',
       });
       const response = await fetch(`/api/wiki_cache?${params.toString()}`);
 
@@ -441,7 +445,7 @@ export default function RepoWikiPage() {
       console.error('Error loading from server cache:', error);
       return false;
     }
-  }, [effectiveRepoInfo, language, isComprehensiveView, t("loading.fetchingCache")]);
+  }, [effectiveRepoInfo, targetConfig, language, isComprehensiveView, t("loading.fetchingCache")]);
 
   // Map a backend task structure to the local WikiStructure shape used by the
   // progress UI (importance coercion + default sections/rootSections).
@@ -669,15 +673,18 @@ export default function RepoWikiPage() {
     setIsLoading(true); // Show loading indicator immediately
 
     try {
+      // 与 loadWikiFromServerCache 同款:删除须命中与生成时一致的摘要
+      // (buildTargetRequest 补注册表缺省),否则刷新后重新提交仍 from_cache=true。
+      const target = await buildTargetRequest(targetConfig);
       const params = new URLSearchParams({
         owner: effectiveRepoInfo.owner,
         repo: effectiveRepoInfo.repo,
         repo_type: effectiveRepoInfo.type,
         language: language,
-        generator: targetConfig.generator || '',
-        config_path: targetConfig.config_path || '',
-        provider: targetConfig.provider || '',
-        model: targetConfig.model || '',
+        generator: target.generator,
+        config_path: target.generator_config.config_path || '',
+        provider: target.generator_config.provider || '',
+        model: target.generator_config.model || '',
         comprehensive: isComprehensiveView.toString(),
         authorization_code: authCode,
       });
