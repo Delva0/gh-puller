@@ -20,3 +20,29 @@ html, body, #root {
 body {
   margin: 0;
 }
+
+/* 宿主侧 dsh 面板修正:本宿主无浮动 composer,清零其高度变量,让「回到底部」按钮
+   与轨迹底边距紧贴底边(dsh 占位 152px 会把它顶到距底 168px 处)。 */
+.ghp-dsh-host {
+  --dsh-composer-height: 0px;
+}
+
+/* 侧栏控件统一:ThemeToggle 内联 p-2(36px 盒)+ 20px icon,收窄为固定 28px、
+   icon 16px 居中;与 ··· 菜单锚点、语言切换钮三者同尺寸(小一圈)。 */
+.theme-toggle-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+}
+/* 图标随盒收窄并与 28px 盒同心(组件内残存 w-5/inset-0 会把 svg 往外撑)。 */
+.theme-toggle-button > div {
+  width: 16px;
+  height: 16px;
+}
+.theme-toggle-button svg {
+  width: 16px;
+  height: 16px;
+}

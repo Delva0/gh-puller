@@ -9,7 +9,7 @@ import { useMemo, useState } from 'react';
 import { StateBadge } from '@gh-puller/ui';
 import { useLanguage } from '@gh-puller/ui';
 import type { SessionMeta } from '../monitor-data';
-import { Menu, RiskConfirmation } from '../vendor/dsh/ui-primitives/src/index.ts';
+import { IconEllipsisOutline16, Menu, RiskConfirmation } from '../vendor/dsh/ui-primitives/src/index.ts';
 
 interface Props {
   sessions: SessionMeta[];
@@ -60,7 +60,7 @@ export default function MonitorSessionList({ sessions, current, onSelect, onDele
             </div>
           )}
           {/* 行拆两段:选择区(button)+ 菜单锚点;避免嵌套 button 的非法 DOM */}
-          <div className="flex items-center">
+          <div className="flex items-center pr-2">
             <button
               type="button"
               onClick={() => { setMenuFor(null); onSelect(s.session); }}
@@ -97,9 +97,9 @@ export default function MonitorSessionList({ sessions, current, onSelect, onDele
                   aria-label={t('session.actions')}
                   aria-haspopup="menu"
                   onClick={() => setMenuFor(menuFor === s.session ? null : s.session)}
-                  className="flex size-9 shrink-0 items-center justify-center rounded-md border border-[var(--border-color)] text-sm text-[var(--muted)] hover:border-[var(--accent-primary)] hover:text-[var(--foreground)]"
+                  className="flex size-7 shrink-0 items-center justify-center rounded-md border border-[var(--border-color)] text-[var(--muted)] hover:border-[var(--accent-primary)] hover:text-[var(--foreground)]"
                 >
-                  ···
+                  <IconEllipsisOutline16 size={16} />
                 </button>
               }
             />

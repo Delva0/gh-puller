@@ -18,7 +18,7 @@ uv --directory apps/agent-monitor/server run uvicorn hub:app --port 8765
 pnpm --dir apps/agent-monitor/web dev
 
 # 构建 viewer(单文件产物落入 server/static/)
-pnpm -r build
+pnpm --dir apps/agent-monitor/web build
 ```
 
 浏览器打开 `http://localhost:8765/` 即查看端;生产侧 LLM 调用默认自动对接

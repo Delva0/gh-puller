@@ -26,9 +26,15 @@
 }
 
 .header {
-  position: relative;
+  /* 悬浮面包屑条:滚动时吸附在滚动体顶部,覆盖其下内容(类 VS Code 面包屑)。
+     z-index 取在 CodeBlock sticky 横幅(z 6)之上、composer(z 7,本宿主无)同级;
+     底色兜底,避免滚动内容从文字缝隙透出。 */
+  position: sticky;
+  top: 0;
+  z-index: 7;
   flex: none;
   padding: 12px 28px 0 20px;
+  background: var(--dsw-alias-bg-base);
   border-bottom: 1px solid transparent;
 }
 
