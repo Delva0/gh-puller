@@ -448,7 +448,7 @@ export function deriveTrajectoryLayout(input: TrajectoryLayoutInput): readonly T
           laidList.push(laid)
           index = laid.cell.index
         }
-        pushStep(0, 1, laidList)
+        pushStep(node.turn ?? 0, node.step ?? 1, laidList)
       }
       prevAbsTime = finiteTime(node.time) ?? prevAbsTime
     }

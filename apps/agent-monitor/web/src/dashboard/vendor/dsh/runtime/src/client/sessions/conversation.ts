@@ -188,6 +188,9 @@ export interface ToolResultNode {
   /** Unix epoch ms from the tool/result session event. */
   time: number
   callId: string
+  /** Owning step (from the tool/result event); used for trajectory step grouping. */
+  turn?: number
+  step?: number
   /** Call head backfilled from the in-window tool/call; null when window truncation left the call outside (card head shows callId). */
   call: { name: string; argsRaw: string } | null
   /** Unix epoch ms of the paired tool/call when the call is still in-window; used for call-row duration. */
