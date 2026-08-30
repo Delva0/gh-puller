@@ -1,4 +1,5 @@
 """deepwiki 引擎共用 helper(generator 选型/判等/凭证规则簇 + 域内日志 + repo 键
+
 + 跨功能通用收编:四路装配、llm 传输、llm 路补全协议、Llm 路检索工具簇、
 提示词共性常量、索引保障服务)。
 
@@ -56,16 +57,19 @@ _FILE_CONFIG_PATH_ENV = {"cc": "DEEPWIKI_CC_CONFIG", "dsh": "DEEPWIKI_DSH_CORDIS
 
 def resolve_generator(generator: str | None = None, generator_config: dict | None = None,
                       get_env=None) -> tuple[str, dict]:
-    """generator 选型 → (generator id, 规范化配置);空选型走 env 缺省(与运行期一致)。
+    """generator 选型 → (generator id, 规范化配置);空选型 = 引擎内建缺省 cc。
 
     选型 dict({generator, generator_config})在引擎内已拆除为两个散装参数;
     未知 id 报错;file 类(cc/dsh/codex)config_path = 显式 > env 缺省(> 空),
     ~ 展开并绝对化 —— 对象类(llm)透传(api_key/base_url 等由调用方自管)。
-    envs 走模块对象 getattr(测试 monkeypatch 与 pop+delattr 强刷均生效)。
+    "缺省生成器"是上层(webui)政策:由 apps/deepwiki-webui/server/app.py 边界注入
+    (DEEPWIKI_GENERATOR),引擎本身不读 env 选型;get_env 仅服务 file 类
+    config_path 的 env 缺省,走模块对象 getattr(测试 monkeypatch 与
+    pop+delattr 强刷均生效)。
     """
     if get_env is None:
         get_env = _default_get_env
-    gen_id = generator or get_env("DEEPWIKI_GENERATOR") or "cc"
+    gen_id = generator or "cc"
     if gen_id not in GENERATORS:
         raise ValueError(f"未知 generator: {gen_id!r}(可选 {sorted(GENERATORS)})")
     resolved = dict(generator_config or {})
@@ -152,8 +156,9 @@ def generator_digest(generator: str | None = None, generator_config: dict | None
 
 
 def _generator_digest_of(generator_id: str, resolved: dict) -> str:
-    return hashlib.sha1(
-        f"{generator_id}|{generator_identity(generator_id, resolved)}".encode()
+    # sha1 仅作生成器身份指纹(缓存摘要),非安全用途
+    return hashlib.sha1(  # noqa: S324
+        f"{generator_id}|{generator_identity(generator_id, resolved)}".encode(),
     ).hexdigest()[:8]
 
 
@@ -290,7 +295,6 @@ def _graphify_mcp(backend: str) -> list[dict]:
 
 def _graphify_server(repo: Repo):
     """进程内 MCP server:把 graphify.query 封装为 graphify_query 工具(闭包绑定图路径)。"""
-
     gp = graph_path(repo)
 
     @tool(
@@ -407,8 +411,10 @@ async def llm_complete(prompt: str, *, generator: str | None, generator_config: 
 
 def failure(exc: Exception) -> Exception:
     """RequestFailedError → RuntimeError("agent 执行失败: ...")(对外文案,
+
     原 agent.generate_* file 类分支的包装);其余异常原样返回。
-    链式追溯由唯一 raise 点(_deliver)以 raise ... from 补上。"""
+    链式追溯由唯一 raise 点(_deliver)以 raise ... from 补上。
+    """
     if isinstance(exc, RequestFailedError):
         return RuntimeError(f"agent 执行失败: {exc.detail}")
     return exc
@@ -428,7 +434,8 @@ def build_service_prompt(
 
     结构:/no_think + 系统提示词 → <conversation_history> → 检索上下文
     (<START_OF_CONTEXT> 包裹;为空注"无检索增强"note)或简化 note(输入超限时)
-    → <query>…</query> + Assistant:。"""
+    → <query>…</query> + Assistant:。
+    """
     prompt = f"/no_think {system_prompt}\n\n"
     if conversation_history:
         prompt += f"<conversation_history>\n{conversation_history}</conversation_history>\n\n"
@@ -472,10 +479,10 @@ async def llm_research_chat(
         context_text = format_subgraph_context(ctx["blocks"])
 
     prompt = build_service_prompt(
-        system, query, conversation_history=conversation_history, context=context_text
+        system, query, conversation_history=conversation_history, context=context_text,
     )
     simplified = build_service_prompt(
-        system, query, conversation_history=conversation_history, simplify=True
+        system, query, conversation_history=conversation_history, simplify=True,
     )
     try:
         async for chunk in llm_stream(
@@ -492,7 +499,7 @@ async def llm_research_chat(
                     session_name=session_name, run_id=run_id,
                 ):
                     yield chunk
-            except Exception as e2:  # noqa: BLE001 - 简化重试失败 → 致歉文本(原版同式)
+            except Exception as e2:
                 log(f"简化重试失败: {e2}")
                 yield (
                     "\nI apologize, but your request is too large for me to process. "
@@ -574,7 +581,7 @@ def subgraph_src_blocks(
                 if remain <= 0:
                     break
                 seg_text = seg_text[:remain]
-                end = start + seg_text.count("\n")
+                end = start + seg_text.count("\n")  # noqa: PLW2901 - 行窗被截断后终点须回算,同名字段语义不变
             file_chars += len(seg_text)
             if total + len(seg_text) > budget:  # 先按单文件截断,再整体预算判断
                 return [], True
@@ -584,11 +591,12 @@ def subgraph_src_blocks(
 
 
 def format_subgraph_context(blocks: list[dict[str, Any]]) -> str:
-    """代码窗 → 原版 _format_context 同式文本(chat/codemap 共用)。
+    r"""代码窗 → 原版 _format_context 同式文本(chat/codemap 共用)。
 
     按文件分组:每组 `## File Path: {path}` 头 + 每窗 `[lines A-B]\n<code>`
     (窗间空行);文件段以原版同式(`"\n\n" + "-"*10 + "\n\n".join(parts)`)
-    联结。空输入 → ""(上层 prompt_builder 会注入"无检索增强"note)。"""
+    联结。空输入 → ""(上层 prompt_builder 会注入"无检索增强"note)。
+    """
     if not blocks:
         return ""  # 原版由调用方兜底(无文档时不调用);空输入保持 "" 供 prompt_builder 注 note
     groups: dict[str, list[dict[str, Any]]] = {}
@@ -609,7 +617,7 @@ async def graphify_context(repo: Repo, question: str) -> dict[str, Any]:
     """
     try:
         result = await asyncio.to_thread(
-            graphify.query, question, graph_path=str(graph_path(repo))
+            graphify.query, question, graph_path=str(graph_path(repo)),
         )
         answer = result.get("answer") or ""
     except Exception as exc:

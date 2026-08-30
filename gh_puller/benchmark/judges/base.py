@@ -13,6 +13,7 @@ ParallelJudge 扩展点、输出契约与 SequenceJudge 完全一致,仅执行�
 """
 
 import asyncio
+from typing import ClassVar
 
 from gh_puller.benchmark.types import Answer
 
@@ -21,7 +22,7 @@ class SequenceJudge:
     """半抽象基类：子类 = 一套题目序列（+ 可选钩子覆盖）。"""
 
     # 扩展点：题目序列，本质 list（dict：{"id", "question", "ref_answer": [...]}）
-    questions: list = []
+    questions: ClassVar[list] = []
     judge_name: str = "sequence"  # 输出中的 judge 标识
 
     def load_questions(self) -> list:
@@ -33,7 +34,10 @@ class SequenceJudge:
         return q["question"]
 
     async def judge_one(self, q, a: Answer) -> dict:
-        """单题评判：默认按 q["ref_answer"] 关键词（不区分大小写）命中计分；结果 = 上下文四字段 + judgment（评判）。子类可 override（可为 async，等待外部输入）。"""
+        """单题评判：默认按 q["ref_answer"] 关键词（不区分大小写）命中计分；结果 = 上下文四字段 + judgment（评判）。
+
+        子类可 override（可为 async，等待外部输入）。
+        """
         ref = q["ref_answer"]
         text = a.text.lower()
         hits = sum(k.lower() in text for k in ref)
@@ -86,6 +90,6 @@ class ParallelJudge(SequenceJudge):
                 "ref_answer": list(q.get("ref_answer", [])),
                 "error": f"{type(r).__name__}: {r}",
             }
-            for q, r in zip(questions, results)
+            for q, r in zip(questions, results, strict=True)  # gather 保序,两序列恒等长
         ]
         return {"judge": self.judge_name, "total_questions": len(results), "results": results}

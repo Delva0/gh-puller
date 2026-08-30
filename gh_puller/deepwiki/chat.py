@@ -1,4 +1,5 @@
 """chat 主线:一次 chat 问答的流式应答(纯文本 chunk 序列,前后端协议同原
+
 research_chat)。
 
 入口 chat_stream 按 generator 内联分派(cc/dsh/codex → _agent_chat 现代
@@ -43,7 +44,7 @@ IMPORTANT:You MUST respond in {language_name} language.
 - NEVER write "## Next Steps"; NEVER respond with "Continue the research".
 - Do NOT use "## Conclusion" or "## Summary" as section headings (only "## Final Conclusion").
 - Focus EXCLUSIVELY on the user's query; cite specific files and code sections when relevant.
-</guidelines>"""
+</guidelines>"""  # noqa: E501 - prompt 原文移植,单行语义不拆
 
 _DEEP_RESEARCH_FIRST_ITERATION_PROMPT = """<role>
 You are an expert code analyst examining the {repo_type} repository: {repo_url} ({repo_name}).
@@ -104,7 +105,7 @@ IMPORTANT:You MUST respond in {language_name} language.
 - Focus on providing new information, not repeating what's already been covered
 - Use markdown formatting to improve readability
 - Cite specific files and code sections when relevant
-</style>"""
+</style>"""  # noqa: E501 - prompt 原文移植,单行语义不拆
 
 _DEEP_RESEARCH_FINAL_ITERATION_PROMPT = """<role>
 You are an expert code analyst examining the {repo_type} repository: {repo_url} ({repo_name}).
@@ -136,7 +137,7 @@ IMPORTANT:You MUST respond in {language_name} language.
 - Cite specific files and code sections when relevant
 - Structure your response with clear headings
 - End with actionable insights or recommendations when appropriate
-</style>"""
+</style>"""  # noqa: E501 - prompt 原文移植,单行语义不拆
 
 
 # ---------------------------------------------------------------------------
@@ -156,7 +157,7 @@ def _render_natural_history(messages: list[dict]) -> str:
                 user, assistant = messages[i], messages[i + 1]
                 if user.get("role") == "user" and assistant.get("role") == "assistant":
                     history_parts.append(
-                        f"User: {user.get('content', '')}\nAssistant: {assistant.get('content', '')}"
+                        f"User: {user.get('content', '')}\nAssistant: {assistant.get('content', '')}",
                     )
     if history_parts:
         return "Previous conversation:\n" + "\n\n".join(history_parts) + "\n\n"
@@ -195,7 +196,9 @@ async def _agent_chat(
     language: str = "en", research_iteration: int = 1,
 ):
     """一次 chat 问答的流式应答(纯文本 chunk 序列,前后端协议同原 research_chat);
-    现代 agent 模式:一次提问,agent 内部多轮工具调用完成,不做协议级轮转。"""
+
+    现代 agent 模式:一次提问,agent 内部多轮工具调用完成,不做协议级轮转。
+    """
     if not messages:
         raise ValueError("No messages provided")
     last = messages[-1]
@@ -218,7 +221,10 @@ async def _agent_chat(
     adapter = utils.adapter(generator, generator_config=generator_config, system_prompt=system, repo=repo)
     history = _render_natural_history(messages)
 
-    prompt = history + utils.agent_note(adapter.generator) + f"<query>\n{last.get('content', '')}\n</query>\n\nAssistant: "
+    prompt = (
+        history + utils.agent_note(adapter.generator)
+        + f"<query>\n{last.get('content', '')}\n</query>\n\nAssistant: "
+    )
     try:
         async for chunk in adapter.stream(
             prompt, session_name=f"chat:{repo.name}", run_id=f"chat:{repo.name}",
@@ -235,7 +241,9 @@ async def _llm_chat(
     language: str = "en", research_iteration: int = 1,
 ):
     """llm 路 chat:原版 research_chat 等价(模式/迭代选模板、原版历史拼接、
-    输入过大跳过检索、prompt_builder 拼装、token 超限简化重试)。"""
+
+    输入过大跳过检索、prompt_builder 拼装、token 超限简化重试)。
+    """
     if not messages:
         raise ValueError("No messages provided")
     last = messages[-1]
@@ -253,7 +261,7 @@ async def _llm_chat(
             system = _DEEP_RESEARCH_FINAL_ITERATION_PROMPT.format(**fmt)
         else:
             system = _DEEP_RESEARCH_INTERMEDIATE_ITERATION_PROMPT.format(
-                **fmt, research_iteration=research_iteration
+                **fmt, research_iteration=research_iteration,
             )
     else:
         system = utils._SIMPLE_CHAT_SYSTEM_PROMPT.format(**fmt)

@@ -33,6 +33,7 @@ OPENAI_BASE_URL / OPENAI_MODEL 等由 graphify 库层读取），本模块不接
   不调用该私有名。
 """
 
+import contextlib
 import json
 import os
 import time
@@ -61,7 +62,8 @@ from graphify.cli import (
     _zero_node_stamped_code_sources,
 )
 from graphify.cluster import cluster, score_all
-from graphify.detect import detect, detect_incremental, save_manifest as _save_manifest
+from graphify.detect import detect, detect_incremental
+from graphify.detect import save_manifest as _save_manifest
 from graphify.export import (
     MALFORMED_GRAPH,
     backup_if_protected,
@@ -129,9 +131,11 @@ def _dedupe_ordered(items) -> list:
 
 def _load_graph(graph_path: str | Path, *, preserve_direction: bool = False) -> tuple[Any, dict]:
     """显式路径加载 graph.json → (图, 原始 dict)。复刻 CLI 前置与归一：
+
     存在性(FileNotFoundError) → 后缀 .json(ValueError) → 大小上限(ValueError 传播)
     → links/edges 归一；preserve_direction 时保留 _src/_tgt 端点标记（#2309，
-    不覆盖已存在的标记），供 query 渲染真实调用方向。"""
+    不覆盖已存在的标记），供 query 渲染真实调用方向。
+    """
     gp = Path(graph_path).expanduser()
     if not gp.exists():
         raise FileNotFoundError(f"graph file not found: {gp}")
@@ -165,7 +169,8 @@ def _communities_from_graph(graph_path: Path, G) -> tuple[dict[int, list[str]], 
 
     .graphify_analysis.json 是规范来源；但 post-commit / watch 重建路径不重新
     生成它（CLI 注释 #1019），此时节点上的 community 属性佐证仍可重建社区——
-    缺失则各导出格式会退化。labels 同理读 .graphify_labels.json。"""
+    缺失则各导出格式会退化。labels 同理读 .graphify_labels.json。
+    """
     an_path = Path(graph_path).parent / ".graphify_analysis.json"
     communities: dict[int, list[str]] = {}
     if an_path.exists():
@@ -200,7 +205,8 @@ def _ast_resolution_context(graph_path: Path, target: Path, detection: dict) -> 
     changed→unchanged 的调用边会在合并时静默消失。从已持久化的图取 AST 层
     节点（含 _callable/_callable_class 标记，#2438）与 contains/method 边
     （#2437），作用域限定在"未改动且存活"的 corpus —— 已删/已排除/重提取
-    文件中的符号绝不参与。图不可读时 fail-open（返回空集，即修复前行为）。"""
+    文件中的符号绝不参与。图不可读时 fail-open（返回空集，即修复前行为）。
+    """
     try:
         check_graph_file_size_cap(graph_path)
         data = json.loads(graph_path.read_text(encoding="utf-8"))
@@ -386,7 +392,7 @@ def extract(
             _seen_files = {f for _fl in files_by_type.values() for f in _fl}
             _seen_files.update(detection.get("unclassified", []))
             graph_stale_sources = _stale_graph_sources(
-                existing_graph_path, target, _seen_files, detection=detection
+                existing_graph_path, target, _seen_files, detection=detection,
             )
             # #2543 heal:陈旧"成功戳"的代码文件(提取当年失败仍被戳为完成)
             # 重新入列;若本轮再失败则本次不留戳,不会死循环
@@ -398,7 +404,7 @@ def extract(
             if _healed_sources:
                 _msg(
                     f"re-queuing {len(_healed_sources)} manifest-stamped code file(s) "
-                    "with no nodes in graph.json (prior failed extraction, #2543)"
+                    "with no nodes in graph.json (prior failed extraction, #2543)",
                 )
                 code_files.extend(Path(p) for p in _healed_sources)
         else:
@@ -421,7 +427,7 @@ def extract(
         if code_only and semantic_files:
             _msg(
                 f"--code-only: skipping {len(semantic_files)} non-code file(s) "
-                f"({len(doc_files)} docs, {len(paper_files)} papers, {len(image_files)} images)"
+                f"({len(doc_files)} docs, {len(paper_files)} papers, {len(image_files)} images)",
             )
             semantic_files = []
             doc_files = paper_files = image_files = []
@@ -438,7 +444,7 @@ def extract(
                 _msg(
                     f"deep mode: widening semantic pass from {len(semantic_files)} "
                     f"changed to {len(_deep_all)} live doc/paper/image file(s); the "
-                    "deep semantic cache decides what is re-extracted"
+                    "deep semantic cache decides what is re-extracted",
                 )
             semantic_files = _deep_all
         _unclassified = detection.get("unclassified", [])
@@ -450,12 +456,12 @@ def extract(
             _msg(
                 f"{len(code_files)} code, {len(doc_files)} docs, "
                 f"{len(paper_files)} papers, {len(image_files)} images changed; "
-                f"{unchanged_total} unchanged; {len(deleted_files)} deleted{_excl_note}"
+                f"{unchanged_total} unchanged; {len(deleted_files)} deleted{_excl_note}",
             )
         else:
             _msg(
                 f"found {len(code_files)} code, {len(doc_files)} docs, "
-                f"{len(paper_files)} papers, {len(image_files)} images"
+                f"{len(paper_files)} papers, {len(image_files)} images",
             )
         # 扫描未完整（权限/IO 错误）与后方部分失败同属"不完整"：最终写图
         # 交给 #479 守卫拒绝覆盖更大的完整图，除非 allow_partial
@@ -473,7 +479,7 @@ def extract(
             # 合并时消失。从已持久化的图喂只读解析上下文;图不可读时 fail-open。
             if incremental_mode and existing_graph_path.exists():
                 _ctx_nodes, _ctx_edges = _ast_resolution_context(
-                    existing_graph_path, target, detection
+                    existing_graph_path, target, detection,
                 )
                 if _ctx_nodes:
                     _ast_kwargs["resolution_context_nodes"] = _ctx_nodes
@@ -506,13 +512,13 @@ def extract(
             if backend_eff is None:
                 raise RuntimeError(
                     "no LLM backend detected (doc/paper/image files need semantic "
-                    "extraction); pass backend=... or extract(code_only=True)"
+                    "extraction); pass backend=... or extract(code_only=True)",
                 )
             if backend_eff not in BACKENDS:
                 raise ValueError(f"unknown backend: {backend_eff}")
             if not _get_backend_api_key(backend_eff):
                 raise RuntimeError(
-                    f"backend '{backend_eff}' requires {_format_backend_env_keys(backend_eff)}"
+                    f"backend '{backend_eff}' requires {_format_backend_env_keys(backend_eff)}",
                 )
             # prompt 是语义缓存的键组分之一：读与写必须同一 prompt，
             # 否则写入的条目永远匹配不上下一次读取（#1939）
@@ -567,7 +573,7 @@ def extract(
                 if uncached_paths and _chunk_stats["succeeded"] == 0:
                     raise RuntimeError(
                         f"all semantic chunks failed for backend '{backend_eff}' "
-                        f"({len(uncached_paths)} uncached files)"
+                        f"({len(uncached_paths)} uncached files)",
                     )
                 if _chunk_stats["total"] and _chunk_stats["succeeded"] < _chunk_stats["total"]:
                     _extraction_incomplete = True
@@ -604,21 +610,17 @@ def extract(
                         _abs = Path(target) / _abs
                     if not _abs.is_file():
                         continue  # 已删除/缺失:留白使其条目被清扫
-                    try:
+                    with contextlib.suppress(OSError):
                         _live_hashes.add(file_hash(_abs, target, cache_root=cache_root,
                                                    cache_root_final=True))
-                    except OSError:
-                        pass
             for _namespace in ("semantic", "semantic-deep"):
                 _sem_dir = gout / "cache" / _namespace
                 if not _sem_dir.is_dir():
                     continue
                 for _entry in _sem_dir.rglob("*.json"):
                     if _entry.stem not in _live_hashes:
-                        try:
+                        with contextlib.suppress(OSError):
                             _entry.unlink()
-                        except OSError:
-                            pass
         except Exception as exc:
             _msg(f"warning: could not prune semantic cache: {exc}")
 
@@ -667,13 +669,13 @@ def extract(
                     and not deleted_files):
                 if graph_stale_sources:
                     _n_pruned = _prune_graph_json_sources(
-                        existing_graph_path, graph_stale_sources
+                        existing_graph_path, graph_stale_sources,
                     )
                     if _n_pruned:
                         _msg(
                             f"pruned {_n_pruned} node(s) from "
                             f"{len(graph_stale_sources)} source file(s) no longer "
-                            "in the scan (deleted or excluded)."
+                            "in the scan (deleted or excluded).",
                         )
                 _msg("no incremental changes detected (--no-cluster); outputs left untouched.")
                 try:
@@ -692,7 +694,7 @@ def extract(
                 # 全部节点会被静默丢弃。先把现有图合并前移(replace/prune 语义
                 # 与 build_merge 一致;幸存者 prepend 保证下面 dedupe 保留 fresh 属性)
                 _raw_prune_sources = _dedupe_ordered(
-                    list(deleted_files) + list(excluded_files) + graph_stale_sources
+                    list(deleted_files) + list(excluded_files) + graph_stale_sources,
                 )
                 try:
                     merged = merge_raw_extraction(
@@ -721,15 +723,13 @@ def extract(
                     raise RuntimeError(
                         "extraction was incomplete and the resulting graph "
                         "may shrink: refusing to overwrite a complete graph with "
-                        "a partial one; pass allow_partial=True to override"
+                        "a partial one; pass allow_partial=True to override",
                     )
             backup_if_protected(gout)
             write_json_atomic(graph_json_path, merged, indent=2)
-            try:
-                # #2012:记录扫描根,供后续 build_merge 相对化删除路径
+            # #2012:记录扫描根,供后续 build_merge 相对化删除路径(尽力而为)
+            with contextlib.suppress(OSError):
                 (gout / ".graphify_root").write_text(str(target), encoding="utf-8")
-            except OSError:
-                pass
             try:
                 _save_manifest(_manifest_files, manifest_path=str(manifest_path),
                                kind="both", root=target, scan_corpus=_scan_corpus,
@@ -744,7 +744,7 @@ def extract(
                 # 剪掉当前扫描不再覆盖的一切:真正删除的 manifest 行、活着但
                 # 被排除的行(#1908)、图自身的 stale 源(#1909)
                 _prune_sources = _dedupe_ordered(
-                    list(deleted_files) + list(excluded_files) + graph_stale_sources
+                    list(deleted_files) + list(excluded_files) + graph_stale_sources,
                 )
                 try:
                     G = build_merge([merged], graph_path=existing_graph_path,
@@ -760,7 +760,7 @@ def extract(
             if G.number_of_nodes() == 0:
                 raise RuntimeError(
                     "graph is empty — extraction produced no nodes (possible causes: "
-                    "all files skipped, binary-only corpus, or LLM returned no edges)"
+                    "all files skipped, binary-only corpus, or LLM returned no edges)",
                 )
             communities = cluster(G, resolution=resolution, exclude_hubs_percentile=exclude_hubs)
             cohesion = score_all(G, communities)
@@ -782,12 +782,10 @@ def extract(
                 raise RuntimeError(
                     "extraction was incomplete and the resulting graph is smaller "
                     "than the existing one: refusing to overwrite a complete graph "
-                    "with a partial one; pass allow_partial=True to override"
+                    "with a partial one; pass allow_partial=True to override",
                 )
-            try:
+            with contextlib.suppress(OSError):
                 (gout / ".graphify_root").write_text(str(target), encoding="utf-8")
-            except OSError:
-                pass
             if merged.get("output_tokens", 0) > 0:
                 (gout / ".graphify_semantic_marker").write_text(
                     json.dumps({"output_tokens": merged["output_tokens"]}), encoding="utf-8")
@@ -815,16 +813,14 @@ def extract(
             result["communities"] = len(communities)
         _msg(f"wrote {graph_json_path}: {result['nodes']} nodes, "
              f"{result['edges']} edges, {result['communities']} communities")
-        result["elapsed_seconds"] = time.perf_counter() - t0
-        return result
     except Exception as exc:
-        result["elapsed_seconds"] = time.perf_counter() - t0
         result["error"] = f"{type(exc).__name__}: {exc}"
-        return result
+    result["elapsed_seconds"] = time.perf_counter() - t0
+    return result
 
 
 def export(
-    format: Literal["html", "svg", "falkordb", "tree", "callflow-html"],
+    format: Literal["html", "svg", "falkordb", "tree", "callflow-html"],  # noqa: A002 - 上游 CLI 同名形参,公开 API 一致性优先
     *,
     graph_path: str | Path | None = None,  # None → cwd 下 <GRAPHIFY_OUT>/graph.json
     output: str | Path | None = None,  # html/svg/tree/callflow-html 的目标文件；falkordb 无 push 时忽略
@@ -907,10 +903,9 @@ def export(
             out = str(gp.parent / "cypher.txt")
             to_cypher(G, out)
             result["output"] = out
-        return result
     except Exception as exc:
         result["error"] = f"{type(exc).__name__}: {exc}"
-        return result
+    return result
 
 
 def query(
@@ -931,30 +926,24 @@ def query(
     t0 = time.perf_counter()
     gp = Path(graph_path).expanduser().resolve() if graph_path else _default_graph_path().resolve()
     G, raw = _load_graph(gp, preserve_direction=True)
-    try:
-        # 旧节点 ID 方案提示（仅提示，不阻断，#1504）
+    # 旧节点 ID 方案提示（仅提示，不阻断，#1504）
+    with contextlib.suppress(Exception):
         if graph_has_legacy_ids(raw.get("nodes", [])):
             _log("query", "note: graph uses the pre-#1504 node-ID scheme; "
                           "rebuild with extract(force=True) to get path-qualified IDs")
-    except Exception:
-        pass
     answer = _query_graph_text(G, question, mode=mode, depth=depth,
                                token_budget=token_budget,
                                context_filters=context_filters or [], graph_path=str(gp))
     duration_ms = (time.perf_counter() - t0) * 1000
     # 关联记录与 query 时间戳均为尽力而为：失败不阻断回答
-    try:
+    with contextlib.suppress(Exception):
         querylog.log_query(kind="query", question=question, corpus=str(gp),
                            result=answer, mode=mode, depth=depth,
                            token_budget=token_budget, duration_ms=duration_ms)
-    except Exception:
-        pass
-    try:
+    with contextlib.suppress(Exception):
         stamp = gp.parent / "cache" / "last_query_stamp"
         stamp.parent.mkdir(parents=True, exist_ok=True)
         write_text_atomic(stamp, str(time.time()))
-    except Exception:
-        pass
     return {
         "question": question,
         "answer": answer,

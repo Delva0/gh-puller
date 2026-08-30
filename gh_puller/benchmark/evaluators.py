@@ -32,7 +32,7 @@ from gh_puller.agent import ClaudeCode, OpenAI
 from gh_puller.envs import CLAUDE_JUDGE_MODEL, LLM_JUDGE_API_KEY, LLM_JUDGE_MODEL, LLM_JUDGE_URL
 from gh_puller.envs import TIMEOUT as GLOBAL_TIMEOUT
 
-__all__ = ["Evaluator", "LLMEvaluator", "ClaudeEvaluator", "HumanEvaluator"]
+__all__ = ["ClaudeEvaluator", "Evaluator", "HumanEvaluator", "LLMEvaluator"]
 
 # 单题评分超时:connect 短(端点不可达时快速降级),read 取全局单题超时上限
 TIMEOUT = httpx.Timeout(connect=5.0, read=GLOBAL_TIMEOUT, write=30.0, pool=5.0)
@@ -214,7 +214,7 @@ setInterval(poll, 500);
 poll();
 </script>
 </body>
-</html>"""
+</html>"""  # noqa: E501 - 内嵌 JS 评审页原文,单行语义不拆
 
 
 class HumanEvaluator:

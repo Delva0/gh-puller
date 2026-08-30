@@ -28,41 +28,37 @@ generators.py 模块 docstring —— stream 流式产出 assistant 文本增量
 - TAXONOMY / SURFACE_TYPES / LOG_TYPES / new_event / type_of / truncate(events.py):
   事件溯源式纯 dict 事件模型(折叠恢复规范见 events.py 模块 docstring),零 SDK 依赖。
 
-管道:适配器归一化 SDK/HTTP 对象 → 事件 dict(envelope) → EventBus 扇出(publish 仅
-put_nowait 到每 sink 的 asyncio.Queue,永不阻塞调用)→ sink worker 消费(文件写盘)。
-线程模型:v1 只有异步调用方,publish 为 loop-affine;若未来出现线程调用方,
-须自行经 loop.call_soon_threadsafe 转发。
+管道:适配器归一化 SDK/HTTP 对象 → 事件 dict(envelope) → EventBus 扇出 → sink worker 消费
+(publish 语义与线程模型见 events.py EventBus;观测通道见 sinks.py)。
 """
 
-from .configs import (ClaudeConfig, CodexConfig, DshConfig, OpenAIConfig,
-                      codex_home_path, dsh_cordis_path)
+from .configs import ClaudeConfig, CodexConfig, DshConfig, OpenAIConfig, codex_home_path, dsh_cordis_path
 from .events import LOG_TYPES, SURFACE_TYPES, TAXONOMY, new_event, truncate, type_of
-from .generators import (GENERATORS, ClaudeCode, Codex, Dsh, OpenAI,
-                         RequestFailedError)
+from .generators import GENERATORS, ClaudeCode, Codex, Dsh, OpenAI, RequestFailedError
 from .sinks import EventBus, FileSink, WsSink, configure, ensure_bus
 
 __all__ = [
-    "TAXONOMY",
-    "SURFACE_TYPES",
-    "LOG_TYPES",
-    "new_event",
-    "type_of",
-    "truncate",
-    "EventBus",
-    "FileSink",
-    "WsSink",
-    "configure",
-    "ensure_bus",
-    "GENERATORS",
-    "RequestFailedError",
-    "ClaudeCode",
-    "OpenAI",
-    "Dsh",
-    "Codex",
-    "ClaudeConfig",
-    "DshConfig",
-    "CodexConfig",
-    "OpenAIConfig",
-    "dsh_cordis_path",
-    "codex_home_path",
+                      "GENERATORS",
+                      "LOG_TYPES",
+                      "SURFACE_TYPES",
+                      "TAXONOMY",
+                      "ClaudeCode",
+                      "ClaudeConfig",
+                      "Codex",
+                      "CodexConfig",
+                      "Dsh",
+                      "DshConfig",
+                      "EventBus",
+                      "FileSink",
+                      "OpenAI",
+                      "OpenAIConfig",
+                      "RequestFailedError",
+                      "WsSink",
+                      "codex_home_path",
+                      "configure",
+                      "dsh_cordis_path",
+                      "ensure_bus",
+                      "new_event",
+                      "truncate",
+                      "type_of",
 ]

@@ -97,9 +97,8 @@ class VllmMechJudge(ParallelJudge):
             j = r.get("judgment", {})
             if isinstance(j.get("overall"), (int, float)):
                 overall.append(j["overall"])
-            for k in dims:
-                v = (j.get("dimensions") or {}).get(k)
-                if isinstance(v, (int, float)):
+            for k, v in (j.get("dimensions") or {}).items():
+                if k in dims and isinstance(v, (int, float)):
                     dims[k].append(v)
         out["summary"] = {
             "overall_mean": round(sum(overall) / len(overall), 2) if overall else None,

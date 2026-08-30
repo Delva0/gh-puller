@@ -1,4 +1,5 @@
 """codemap 主线:两阶段 codemap 生成(骨架 → 指南/图),NDJSON 事件流;阶段失败
+
 语义与原相同(骨架失败 error 事件;指南/图失败退化为骨架)。
 
 入口 generate_codemap 按 generator 内联分派(cc/dsh/codex →
@@ -227,7 +228,8 @@ def _codemap_note() -> str:
 
 
 async def _agent_codemap(
-    *, generator: str | None = None, generator_config: dict | None = None, repo: Repo, question: str, language: str = "en",
+    *, generator: str | None = None, generator_config: dict | None = None, repo: Repo,
+    question: str, language: str = "en",
 ):
     """两阶段 codemap 生成(骨架 → 指南/图),NDJSON 事件流;阶段失败语义与原相同。"""
     yield _phase("analyzing", "start")
@@ -245,7 +247,8 @@ async def _agent_codemap(
         for attempt in range(1, attempts + 1):
             try:
                 adapter = utils.adapter(
-                    generator, generator_config=generator_config, system_prompt=_CODEMAP_SKELETON_PROMPT.format(**fmt), repo=repo
+                    generator, generator_config=generator_config, repo=repo,
+                    system_prompt=_CODEMAP_SKELETON_PROMPT.format(**fmt),
                 )
                 raw = await adapter.result(
                     prompt, session_name="codemap:skeleton",
@@ -253,7 +256,7 @@ async def _agent_codemap(
                     retry={"attempt": attempt, "prev_error": str(last_error)} if last_error else None,
                 )
                 return _extract_json(raw)
-            except Exception as e:  # noqa: BLE001 - 重试预算兜底(RequestFailedError 先转文案)
+            except Exception as e:
                 last_error = utils.failure(e)
                 log(f"codemap JSON 解析尝试 {attempt}/{attempts} 失败: {last_error}")
         raise ValueError(f"Model did not return valid JSON after {attempts} attempts: {last_error}")
@@ -263,7 +266,7 @@ async def _agent_codemap(
     skeleton_prompt = _codemap_note() + f"<query>\n{question}\n</query>\n\nAssistant: "
     try:
         skeleton = codemap_of(await _run_json(skeleton_prompt))
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         log(f"codemap 骨架失败: {e}")
         yield _event(type="error", stage="initial_codemap", message=str(e))
         return
@@ -278,7 +281,7 @@ async def _agent_codemap(
     final = skeleton
     try:
         adapter = utils.adapter(
-            generator, generator_config=generator_config, system_prompt=_CODEMAP_ENRICH_PROMPT.format(**fmt), repo=repo
+            generator, generator_config=generator_config, system_prompt=_CODEMAP_ENRICH_PROMPT.format(**fmt), repo=repo,
         )
         raw = await adapter.result(
             enrich_prompt, session_name="codemap:enrich",
@@ -286,7 +289,7 @@ async def _agent_codemap(
         )
         final = codemap_of(_extract_json(raw))
         yield _phase("diagrams", "done")
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         err = utils.failure(e)  # RequestFailedError 先转「agent 执行失败」再降级(同原包装时序)
         log(f"codemap 指南/图失败,使用骨架: {err}")
         yield _phase("diagrams", "done", degraded=True)
@@ -297,11 +300,14 @@ async def _agent_codemap(
 
 
 async def _llm_codemap(
-    *, generator: str | None = None, generator_config: dict | None = None, repo: Repo, question: str, language: str = "en",
+    *, generator: str | None = None, generator_config: dict | None = None, repo: Repo,
+    question: str, language: str = "en",
 ):
     """llm 路 codemap(原版等价):analyzing 阶段完成检索(chunk_count=窗口数);
+
     双提示词经 build_service_prompt(utils 收编;与 chat 同构);JSON 解析失败重试——骨架 3 次、
-    富化 2 次(传输错误直接上抛);富化失败 degraded;引用接地两路共用。"""
+    富化 2 次(传输错误直接上抛);富化失败 degraded;引用接地两路共用。
+    """
     # ---- 阶段 1a:analyzing(原版 RAG 检索;此处 = 图谱子图→真实代码窗) ----
     yield _phase("analyzing", "start")
     if not utils.index_ready(repo):
@@ -316,7 +322,9 @@ async def _llm_codemap(
 
     async def _run_llm_json(prompt: str, attempts: int, session_name: str) -> dict:
         """整收 + 解析 JSON;仅解析失败重试(原版 _generate_json 语义:
-        传输异常直接上抛,由阶段 try 处理)。"""
+
+        传输异常直接上抛,由阶段 try 处理)。
+        """
         last_error: Exception | None = None
         for attempt in range(1, attempts + 1):
             raw = await utils.llm_complete(
@@ -325,7 +333,7 @@ async def _llm_codemap(
             )
             try:
                 return _extract_json(raw)
-            except Exception as e:  # noqa: BLE001
+            except Exception as e:
                 last_error = e
                 log(f"codemap JSON 解析尝试 {attempt}/{attempts} 失败: {e}")
         raise ValueError(f"Model did not return valid JSON after {attempts} attempts: {last_error}")
@@ -333,11 +341,11 @@ async def _llm_codemap(
     # ---- 阶段 1b:骨架 ----------------------------------------------------
     yield _phase("initial_codemap", "start")
     skeleton_prompt = utils.build_service_prompt(
-        _CODEMAP_SKELETON_PROMPT.format(**fmt), question, context=context_text
+        _CODEMAP_SKELETON_PROMPT.format(**fmt), question, context=context_text,
     )
     try:
         skeleton = codemap_of(await _run_llm_json(skeleton_prompt, 3, "codemap:skeleton"))
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         log(f"codemap 骨架失败: {e}")
         yield _event(type="error", stage="initial_codemap", message=str(e))
         return
@@ -349,15 +357,15 @@ async def _llm_codemap(
         f"{question}\n\n<SKELETON>\n{json.dumps(dataclasses.asdict(skeleton))}\n</SKELETON>"
     )
     enrich_prompt = utils.build_service_prompt(
-        _CODEMAP_ENRICH_PROMPT.format(**fmt), enrich_query, context=context_text
+        _CODEMAP_ENRICH_PROMPT.format(**fmt), enrich_query, context=context_text,
     )
     final = skeleton
     try:
         final = codemap_of(
-            await _run_llm_json(enrich_prompt, 2, "codemap:enrich")
+            await _run_llm_json(enrich_prompt, 2, "codemap:enrich"),
         )
         yield _phase("diagrams", "done")
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         log(f"codemap 指南/图失败,使用骨架: {e}")
         yield _phase("diagrams", "done", degraded=True)
 
@@ -372,7 +380,8 @@ async def _llm_codemap(
 
 
 async def generate_codemap(
-    *, generator: str | None = None, generator_config: dict | None = None, repo: Repo, question: str, language: str = "en",
+    *, generator: str | None = None, generator_config: dict | None = None, repo: Repo,
+    question: str, language: str = "en",
 ):
     """两阶段 codemap 生成(骨架 → 指南/图),NDJSON 事件流;阶段失败语义与原相同;按 generator 分派双路。"""
     gen = utils.resolve_generator(generator, generator_config)[0]

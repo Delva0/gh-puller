@@ -5,7 +5,8 @@
 - 原后端 RAG(adalflow + FAISS 检索)整体切除:索引 = graphify.extract 纯本地 AST
   建图(<DEEPWIKI_ROOT>/graphify/<repo>/graph.json);检索 = graphify.query 封装为
   agent 的图工具。
-- 双路生成(envs.DEEPWIKI_GENERATOR 统一开关):agent 路(cc/dsh/codex,Claude Agent SDK
+- 双路生成(缺省开关 = 上层 webui 在边界注入的 DEEPWIKI_GENERATOR;引擎空选型内建
+  cc):agent 路(cc/dsh/codex,Claude Agent SDK
   或同类 harness 自读代码 + 图工具,wiki 交付件 Write 落盘)/ llm 路(deepwiki-open 原式
   单次补全,检索上下文 = graphify 子图 → 真实代码行窗)。提示词全部为 deepwiki-open 原文。
 
@@ -69,37 +70,37 @@ from .wiki import (
 )
 
 __all__ = [
-    # 契约 dataclass 族(wiki / codemap)
-    "WikiPage",
-    "WikiSection",
-    "WikiStructureModel",
+    "AgentWikiPipeline",
     "CodeMap",
     "CodeMapCitation",
-    "CodeMapStep",
     "CodeMapSection",
+    "CodeMapStep",
+    "LlmWikiPipeline",
+    # 契约 dataclass 族(wiki / codemap)
+    "WikiPage",
+    "WikiPipeline",
+    "WikiSection",
+    "WikiStructureModel",
+    # 服务入口:chat/codemap/wiki 三主线
+    "chat_stream",
     # 构造器(dict → model)
     "codemap_of",
-    "wiki_structure_of",
-    # 仓库键(utils)
-    "repo_key_of",
+    "delete_resume_state",
+    "delete_wiki_cache",
     # 索引保障服务(utils;/repo/prepare 与 wiki 任务主流程共用)
     "ensure_index",
-    # 缓存 / 续跑状态 / 导出(cache)
+    "export_wiki",
+    "generate_codemap",
+    "list_processed_projects",
+    "list_wiki_cache",
+    "read_resume_state",
+    "read_wiki_cache",
+    # 仓库键 — utils
+    "repo_key_of",
+    # 缓存/续跑状态/导出:utils
     "save_generated_wiki",
     "save_wiki_cache",
-    "read_wiki_cache",
-    "delete_wiki_cache",
-    "list_wiki_cache",
-    "list_processed_projects",
-    "export_wiki",
     "wiki_cache_exists",
+    "wiki_structure_of",
     "write_resume_state",
-    "read_resume_state",
-    "delete_resume_state",
-    # 服务入口(chat/codemap/wiki)
-    "chat_stream",
-    "generate_codemap",
-    "WikiPipeline",
-    "AgentWikiPipeline",
-    "LlmWikiPipeline",
 ]

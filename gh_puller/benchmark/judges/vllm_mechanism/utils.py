@@ -48,10 +48,10 @@ def auto_user_prompt(question: str, ref: str, answer: str) -> str:
 def coerce_verdict(data) -> dict:
     """自动评测输出规范化:维度补齐/限幅 0-10、overall 限幅、reason 兜底;结构不合法时抛异常由调用方降级。"""
     if not isinstance(data, dict):
-        raise ValueError("评测输出不是 JSON 对象")
+        raise TypeError("评测输出不是 JSON 对象")
     dims = data.get("dimensions")
     if not isinstance(dims, dict):
-        raise ValueError("评测输出缺 dimensions")
+        raise TypeError("评测输出缺 dimensions")
     return {
         "dimensions": {k: min(max(float(dims.get(k, 0)), 0.0), 10.0) for k in DIMENSIONS},
         "overall": min(max(float(data.get("overall", 0)), 0.0), 10.0),

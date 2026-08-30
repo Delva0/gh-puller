@@ -10,7 +10,7 @@ import asyncio
 import importlib.util
 import json
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -175,7 +175,7 @@ def main() -> None:
     ap.add_argument(
         "--out-dir",
         type=Path,
-        default=Path("outputs") / datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S"),
+        default=Path("outputs") / datetime.now(UTC).strftime("%Y%m%d_%H%M%S"),
     )  # 输出目录，默认 outputs/<时间戳>（parse_args 时求值一次，每次运行独立目录）
     args = ap.parse_args()
 

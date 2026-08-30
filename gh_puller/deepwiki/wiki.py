@@ -1,4 +1,5 @@
 """wiki 主线(wiki 结构/页面生成协议):双路包装类(WikiPipeline/AgentWikiPipeline/
+
 LlmWikiPipeline)经 _wiki_pipeline 按 generator 挑选(见文件尾),加
 本主线专用 helper:wiki 结构确定的提示词(_COMPREHENSIVE/_CONCISE_STRUCTURE)与
 页面提示词(_build_page_prompt)、模型产出 XML 解析(parse_wiki_structure 容错链)、
@@ -200,7 +201,7 @@ Remember:
 - Ground every claim in the provided source files.
 - Prioritize accuracy and direct representation of the code's functionality and structure.
 - Structure the document logically for easy understanding by other developers.
-"""
+"""  # noqa: E501 - prompt 原文移植,单行语义不拆
 
 
 _COMPREHENSIVE_STRUCTURE = """
@@ -253,7 +254,7 @@ Return your analysis in the following XML format:
     <!-- More pages as needed -->
   </pages>
 </wiki_structure>
-"""
+"""  # noqa: E501 - 结构模板原文移植,单行语义不拆
 
 _CONCISE_STRUCTURE = """
 Return your analysis in the following XML format:
@@ -319,7 +320,7 @@ def _pages_via_regex(xml_text: str) -> list[WikiPage]:
                 filePaths=file_paths,
                 importance=_normalize_importance(importance.group(1) if importance else None),
                 relatedPages=related,
-            )
+            ),
         )
     return pages
 
@@ -336,7 +337,7 @@ def _parse_sections(root: ET.Element) -> tuple[list[WikiSection], list[str]]:
                 title=(el.findtext("title") or "").strip(),
                 pages=[e.text.strip() for e in el.iter("page_ref") if e.text and e.text.strip()],
                 subsections=subs or None,
-            )
+            ),
         )
         referenced.update(subs)
     root_sections = [s.id for s in sections if s.id not in referenced]
@@ -363,7 +364,7 @@ def _sections_via_regex(xml_text: str) -> tuple[list[WikiSection], list[str]]:
                 title=title.group(1).strip() if title else "",
                 pages=page_refs,
                 subsections=subs or None,
-            )
+            ),
         )
         referenced.update(subs)
     root_sections = [s.id for s in sections if s.id not in referenced]
@@ -391,7 +392,7 @@ def parse_wiki_structure(text: str, comprehensive: bool) -> WikiStructureModel:
 
     root: ET.Element | None = None
     try:
-        root = ET.fromstring(xml_text)
+        root = ET.fromstring(xml_text)  # noqa: S314 - 输入已剥 fence/转义裸 &,解析失败走正则兜底,非安全面
     except ET.ParseError as e:
         log(f"严格 XML 解析失败,用正则兜底: {e}")
 
@@ -435,7 +436,7 @@ def parse_wiki_structure(text: str, comprehensive: bool) -> WikiStructureModel:
 class RepoUrlContext:
     """把仓库相对路径转成 web URL 所需的一切(local/无 URL → 返回裸路径)。"""
 
-    def __init__(self, type: str, repo_url: str | None, default_branch: str):
+    def __init__(self, type: str, repo_url: str | None, default_branch: str):  # noqa: A002 - type 为缓存 repo.type 落盘键,上游契约同名
         self.type = type
         self.repo_url = repo_url
         self.default_branch = default_branch
@@ -553,8 +554,7 @@ def post_process_wiki_content(content: str, file_paths: list[str], ctx: RepoUrlC
         processed = _PREFIXED_RE.sub(_repl_prefixed, processed)
 
     # 5. 去掉完成链接后的冗余空 "()"
-    processed = _STRAY_PARENS_RE.sub(r"\1", processed)
-    return processed
+    return _STRAY_PARENS_RE.sub(r"\1", processed)
 
 
 def _finalize_page_content(content: str, page: WikiPage, ctx: RepoUrlContext) -> str:
@@ -601,7 +601,7 @@ def wiki_project_dir(owner: str, repo: str, repo_type: str) -> str:
 
 
 def _wiki_cache_path(
-    owner: str, repo: str, repo_type: str, language: str, digest: str = ""
+    owner: str, repo: str, repo_type: str, language: str, digest: str = "",
 ) -> str:
     suffix = f"_{digest}" if digest else ""
     filename = f"{_WIKI_PREFIX}{repo_type}_{owner}_{repo}_{language}{suffix}.json"
@@ -609,7 +609,7 @@ def _wiki_cache_path(
 
 
 def resume_state_path(
-    owner: str, repo: str, repo_type: str, language: str, digest: str = ""
+    owner: str, repo: str, repo_type: str, language: str, digest: str = "",
 ) -> str:
     suffix = f"_{digest}" if digest else ""
     filename = f"{_RESUME_STATE_PREFIX}{repo_type}_{owner}_{repo}_{language}{suffix}.json"
@@ -621,7 +621,7 @@ def wiki_cache_exists(owner: str, repo: str, repo_type: str, language: str, dige
 
 
 async def read_wiki_cache(
-    owner: str, repo: str, repo_type: str, language: str, digest: str = ""
+    owner: str, repo: str, repo_type: str, language: str, digest: str = "",
 ) -> dict | None:
     """读取成品缓存(passthrough dict);无文件/坏 JSON/非 dict → None。"""
     if not wiki_cache_exists(owner, repo, repo_type, language, digest):
@@ -630,12 +630,12 @@ async def read_wiki_cache(
     try:
         text = await asyncio.to_thread(lambda: Path(path).read_text(encoding="utf-8"))
         data = json.loads(text)
-        if not isinstance(data, dict):
-            return None
-        return data
     except Exception:
         log(f"读取 wiki 缓存失败: {path}")
         return None
+    if not isinstance(data, dict):
+        return None
+    return data
 
 
 async def save_wiki_cache(
@@ -646,12 +646,12 @@ async def save_wiki_cache(
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)  # 首次生成:项目目录未建
         await asyncio.to_thread(
-            lambda: Path(path).write_text(json.dumps(wiki_cache), encoding="utf-8")
+            lambda: Path(path).write_text(json.dumps(wiki_cache), encoding="utf-8"),
         )
-        return True
     except OSError:
         log(f"写 wiki 缓存失败: {path}")
         return False
+    return True
 
 
 async def save_generated_wiki(
@@ -697,7 +697,7 @@ async def save_generated_wiki(
 
 
 async def delete_wiki_cache(
-    owner: str, repo: str, repo_type: str, language: str, digest: str = ""
+    owner: str, repo: str, repo_type: str, language: str, digest: str = "",
 ) -> bool:
     """删除整个项目缓存目录(用户语义:删缓存 = 删项目/,json+resume+agent_cache 全清)。
 
@@ -706,7 +706,7 @@ async def delete_wiki_cache(
     项目目录不存在 → False(404 语义)。
     """
     proj_dir = wiki_project_dir(owner, repo, repo_type)
-    if not os.path.exists(proj_dir):
+    if not os.path.exists(proj_dir):  # noqa: ASYNC240 - 轻量存在性检查,缓存层 os.path 约定
         return False
     shutil.rmtree(proj_dir, ignore_errors=True)
     return True
@@ -727,43 +727,43 @@ async def write_resume_state(
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)  # 首次生成:项目目录未建
         await asyncio.to_thread(
-            lambda: Path(tmp).write_text(json.dumps(state), encoding="utf-8")
+            lambda: Path(tmp).write_text(json.dumps(state), encoding="utf-8"),
         )
         os.replace(tmp, path)
-        return True
     except OSError as e:
         log(f"写续跑状态失败: {path} - {e}")
         with contextlib.suppress(OSError):
             os.remove(tmp)
         return False
+    return True
 
 
 async def read_resume_state(
-    owner: str, repo: str, repo_type: str, language: str, digest: str = ""
+    owner: str, repo: str, repo_type: str, language: str, digest: str = "",
 ) -> dict | None:
     """读取续跑状态;无文件/坏 JSON/缺 request 键 → None(自动降级为全新生成)。
 
     浅检(非 dict / 缺 request)回 None:手编坏文件视同"无状态",防下游 KeyError。
     """
     path = resume_state_path(owner, repo, repo_type, language, digest)
-    if not os.path.exists(path):
+    if not os.path.exists(path):  # noqa: ASYNC240 - 轻量存在性检查,缓存层 os.path 约定
         return None
     try:
         text = await asyncio.to_thread(lambda: Path(path).read_text(encoding="utf-8"))
         data = json.loads(text)
-        if not isinstance(data, dict) or "request" not in data:
-            return None
-        return data
     except Exception as e:
         log(f"读取续跑状态失败: {path} :: {type(e).__name__}: {e}")
         return None
+    if not isinstance(data, dict) or "request" not in data:
+        return None
+    return data
 
 
 async def delete_resume_state(
-    owner: str, repo: str, repo_type: str, language: str, digest: str = ""
+    owner: str, repo: str, repo_type: str, language: str, digest: str = "",
 ) -> bool:
     path = resume_state_path(owner, repo, repo_type, language, digest)
-    if not os.path.exists(path):
+    if not os.path.exists(path):  # noqa: ASYNC240 - 轻量存在性检查,缓存层 os.path 约定
         return False
     os.remove(path)
     return True
@@ -776,13 +776,13 @@ async def list_wiki_cache() -> list[dict]:
     pages_done/pages_total/current_page_ids/error/submitted_at + computed name),
     由 app 响应模型校验出网;status 恒为 COMPLETED(文件存在即完成产物)。
     """
-    if not os.path.exists(wiki_cache_dir()):
+    if not os.path.exists(wiki_cache_dir()):  # noqa: ASYNC240 - 轻量存在性检查,缓存层 os.path 约定
         return []
     entries: list[dict] = []
     for dirname in await asyncio.to_thread(os.listdir, wiki_cache_dir()):
         proj_dir = os.path.join(wiki_cache_dir(), dirname)
         # wiki/ 层即项目文件夹容器(与 repos/graphify 在根下平级隔离):只跳过 dot/非目录
-        if dirname.startswith(".") or not os.path.isdir(proj_dir):
+        if dirname.startswith(".") or not os.path.isdir(proj_dir):  # noqa: ASYNC240 - 轻量目录检查,缓存层 os.path 约定
             continue
         for filename in await asyncio.to_thread(os.listdir, proj_dir):
             if not (filename.startswith(_WIKI_PREFIX) and filename.endswith(".json")):
@@ -811,7 +811,7 @@ async def list_wiki_cache() -> list[dict]:
                         "error": None,
                         "submitted_at": int(stats.st_mtime * 1000),
                         "name": f"{owner}/{repo}",
-                    }
+                    },
                 )
             except Exception:
                 log(f"解析缓存文件失败: {file_path}")
@@ -839,11 +839,11 @@ async def list_processed_projects() -> list[dict]:
 def export_wiki(
     repo_url: str,
     pages: list[dict],
-    format: Literal["json", "markdown"],
+    format: Literal["json", "markdown"],  # noqa: A002 - 上游 io.py 同名形参,公开 API 一致性优先
     timestamp: datetime | None = None,
 ) -> str:
     """导出 wiki 为 markdown/json 字符串(与 io.py 同式;pages 为 dict 列表)。"""
-    dt = timestamp or datetime.now()
+    dt = timestamp or datetime.now()  # noqa: DTZ005 - 展示用时间戳,本地时区即预期
     if format == "json":
         export_data = {
             "metadata": {
@@ -876,6 +876,7 @@ def export_wiki(
             markdown += f"{page['content']}\n\n"
             markdown += "---\n\n"
         return markdown
+    raise ValueError(f"unsupported export format: {format!r}")  # Literal 契约外兜底,防静默 None
 
 # ---------------------------------------------------------------------------
 # 双路包装类分发总则
@@ -895,7 +896,9 @@ class WikiPipeline:
     对象携带(repo_url/repo_type/token),其余字段逐个 keyword 显式传入。
     """
 
-    def needs_structure_regenerate(self, *, project_key: str, generator: str | None = None, generator_config: dict | None = None) -> bool:
+    def needs_structure_regenerate(
+        self, *, project_key: str, generator: str | None = None, generator_config: dict | None = None,
+    ) -> bool:
         """结构是否需要强制重生成(cc 路:structure 交付文件缺失;llm 路恒 False)。"""
         return False
 
@@ -910,12 +913,14 @@ class WikiPipeline:
         return {}
 
     def write_error_page(
-        self, *, project_key: str, generator: str | None = None, generator_config: dict | None = None, page: WikiPage, content: str,
+        self, *, project_key: str, page: WikiPage, content: str,
+        generator: str | None = None, generator_config: dict | None = None,
     ) -> None:
         """重试耗尽后的占位页持久化(cc 路写交付文件供续跑跳过;llm 路 no-op)。"""
 
     async def determine_structure(
-        self, *, generator: str | None = None, generator_config: dict | None = None, repo: Repo, owner: str, repo_name: str,
+        self, *, repo: Repo, owner: str, repo_name: str,
+        generator: str | None = None, generator_config: dict | None = None,
         file_tree: list[str], readme: str, comprehensive: bool, language: str, run_id: str,
     ) -> WikiStructureModel:
         raise NotImplementedError
@@ -933,20 +938,30 @@ class AgentWikiPipeline(WikiPipeline):
 
     def _proj_key(self, project_key: str, generator: str | None = None, generator_config: dict | None = None) -> str:
         """项目键 {repo_key}_{digest}:digest = generator 判等摘要
-        (同一仓库/语言下不同 generator 的交付文件并存,与成品缓存同规则)。"""
+
+        (同一仓库/语言下不同 generator 的交付文件并存,与成品缓存同规则)。
+        """
         return _sanitize_path_seg(f"{project_key}_{utils.generator_digest(generator, generator_config)}")
 
-    def _agent_cache_dir(self, project_key: str, generator: str | None = None, generator_config: dict | None = None) -> Path:
+    def _agent_cache_dir(
+        self, project_key: str, generator: str | None = None, generator_config: dict | None = None,
+    ) -> Path:
         """agent 交付件目录:deepwiki/wiki/<项目>/agent_cache/ 平铺(无 <proj>/ 子层;
-        交付文件名仍带 <proj> 前缀,见 _agent_cache_structure_path/_agent_cache_page_path)。"""
+
+        交付文件名仍带 <proj> 前缀,见 _agent_cache_structure_path/_agent_cache_page_path)。
+        """
         return Path(wiki_cache_dir()) / _project_seg(project_key) / _AGENT_CACHE_DIRNAME
 
-    def _agent_cache_structure_path(self, project_key: str, generator: str | None = None, generator_config: dict | None = None) -> Path:
+    def _agent_cache_structure_path(
+        self, project_key: str, generator: str | None = None, generator_config: dict | None = None,
+    ) -> Path:
         """cc 结构交付文件:{proj}-structure.md。"""
         proj = self._proj_key(project_key, generator, generator_config)
         return self._agent_cache_dir(project_key, generator, generator_config) / f"{proj}-structure.md"
 
-    def _agent_cache_page_path(self, project_key: str, page_id: str, generator: str | None = None, generator_config: dict | None = None) -> Path:
+    def _agent_cache_page_path(
+        self, project_key: str, page_id: str, generator: str | None = None, generator_config: dict | None = None,
+    ) -> Path:
         """cc 页面交付文件:{proj}-<id>.md(id 形如 page-N 时直接采用,否则 {proj}-page_<id>;id 经安全化)。"""
         proj = self._proj_key(project_key, generator, generator_config)
         seg = _sanitize_path_seg(page_id)
@@ -962,6 +977,7 @@ class AgentWikiPipeline(WikiPipeline):
         label: str | None = None, *, run_id: str | None = None,
     ) -> str:
         """agent 交付件统一落盘口:提示词只给路径,agent 用自身工具读码并把成品写入
+
         out_path;产生以文件为准(流式文本仅作监控/错误检测),未产出文件即任务失败。
 
         adapter 为构造期注入 config 的实例(config 由 utils.adapter 装配);
@@ -983,12 +999,15 @@ class AgentWikiPipeline(WikiPipeline):
         log(f"agent 交付完成 label={label} run_id={run_id} 耗时={time.time() - t0:.1f}s")
         return text
 
-    def needs_structure_regenerate(self, *, project_key: str, generator: str | None = None, generator_config: dict | None = None) -> bool:
+    def needs_structure_regenerate(
+        self, *, project_key: str, generator: str | None = None, generator_config: dict | None = None,
+    ) -> bool:
         """structure 交付文件被删即强制重生成(续跑失效)。"""
         return not self._agent_cache_structure_path(project_key, generator, generator_config).exists()
 
     async def determine_structure(
-        self, *, generator: str | None = None, generator_config: dict | None = None, repo: Repo, owner: str, repo_name: str,
+        self, *, repo: Repo, owner: str, repo_name: str,
+        generator: str | None = None, generator_config: dict | None = None,
         file_tree: list[str], readme: str, comprehensive: bool, language: str, run_id: str,
     ) -> WikiStructureModel:
         """cc(agent)结构:交付文件已存在即跳过 agent(续跑);否则 agent 落盘 structure.md 后读回解析。"""
@@ -1002,7 +1021,7 @@ class AgentWikiPipeline(WikiPipeline):
             readme_path = _find_readme_path(file_tree)
             prompt = self._build_structure_prompt(
                 owner, repo_name, "\n".join(file_tree), readme_path,
-                os.path.abspath(repo.save_path), comprehensive, language,
+                os.path.abspath(repo.save_path), comprehensive, language,  # noqa: ASYNC240 - 轻量路径派生
                 str(struct_path), generator=adapter.generator,
             )
             content = await self._deliver(adapter, prompt, struct_path,
@@ -1016,7 +1035,9 @@ class AgentWikiPipeline(WikiPipeline):
         generator: str = "cc",
     ) -> str:
         """cc(agent)结构提示词(现代 agent 风格):输入只给路径(文件树+README 路径),不内联内容;
-        成品 XML 由 agent 用 Write 工具直接落盘 out_path,而不是作为 result 文本返回。"""
+
+        成品 XML 由 agent 用 Write 工具直接落盘 out_path,而不是作为 result 文本返回。
+        """
         structure_format = _COMPREHENSIVE_STRUCTURE if comprehensive else _CONCISE_STRUCTURE
         page_count = "8-12" if comprehensive else "4-6"
         kind = "comprehensive" if comprehensive else "concise"
@@ -1065,7 +1086,7 @@ IMPORTANT:
 2. Each page should focus on a specific aspect of the codebase (e.g., architecture, key features, setup)
 3. The relevant_files should be actual files from the repository that would be used to generate that page
 4. Do not inline file contents into this prompt — use your tools to read the files.
-{utils.agent_note(generator)}"""
+{utils.agent_note(generator)}"""  # noqa: E501 - prompt 原文移植,单行语义不拆
 
     @staticmethod
     def _build_page_prompt(title: str, file_paths: list[str], out_path: str, language: str) -> str:
@@ -1086,7 +1107,9 @@ IMPORTANT:
         language: str, default_branch: str, run_id: str,
     ) -> str:
         """cc 路单页:交付文件已存在即读回(续跑,文件为权威);否则 agent 落盘 page_<id>.md;
-        读回内容经终态格式化后返回(与续跑水合同式)。"""
+
+        读回内容经终态格式化后返回(与续跑水合同式)。
+        """
         out_path = self._agent_cache_page_path(run_id, page.id, generator=generator, generator_config=generator_config)
         if out_path.exists():
             content = await asyncio.to_thread(out_path.read_text, encoding="utf-8")
@@ -1095,7 +1118,7 @@ IMPORTANT:
                                      agent_output_dir=str(out_path.parent),
                                      agent_write_mode=True)
             prompt = utils.agent_note(adapter.generator) + self._build_page_prompt(
-                page.title, list(page.filePaths), str(out_path), language
+                page.title, list(page.filePaths), str(out_path), language,
             )
             content = await self._deliver(adapter, prompt, out_path,
                                           label=f"wiki:page:{page.id}", run_id=run_id)
@@ -1107,28 +1130,33 @@ IMPORTANT:
         structure: WikiStructureModel, default_branch: str,
     ) -> dict[str, WikiPage]:
         """cc 路径:从已落盘的页交付文件水合(文件为权威,覆盖 state 旧文本);
-        返回页快照 dict(不触碰任务运行时字段;无文件的页留给调用方生成)。"""
+
+        返回页快照 dict(不触碰任务运行时字段;无文件的页留给调用方生成)。
+        """
         ctx = RepoUrlContext(type=repo.repo_type, repo_url=repo.repo_url, default_branch=default_branch)
         generated: dict[str, WikiPage] = {}
         for page in structure.pages:
-            out_path = self._agent_cache_page_path(project_key, page.id, generator=generator, generator_config=generator_config)
+            out_path = self._agent_cache_page_path(
+                project_key, page.id, generator=generator, generator_config=generator_config)
             if not out_path.exists():
                 continue
             content = await asyncio.to_thread(out_path.read_text, encoding="utf-8")
             generated[page.id] = dataclasses.replace(
-                page, content=_finalize_page_content(content, page, ctx)
+                page, content=_finalize_page_content(content, page, ctx),
             )
         return generated
 
     def write_error_page(
-        self, *, project_key: str, generator: str | None = None, generator_config: dict | None = None, page: WikiPage, content: str,
+        self, *, project_key: str, page: WikiPage, content: str,
+        generator: str | None = None, generator_config: dict | None = None,
     ) -> None:
         """重试耗尽(cc 路):占位文本也落盘,续跑跳过占位页;用户删除该文件即可重试。"""
         try:
-            out_path = self._agent_cache_page_path(project_key, page.id, generator=generator, generator_config=generator_config)
+            out_path = self._agent_cache_page_path(
+                project_key, page.id, generator=generator, generator_config=generator_config)
             out_path.parent.mkdir(parents=True, exist_ok=True)
             out_path.write_text(content, encoding="utf-8")
-        except OSError as e:  # noqa: BLE001 - 占位写入失败不阻断任务完成
+        except OSError as e:
             log(f"写入占位页文件失败: {page.id} - {e}")
 
 
@@ -1136,21 +1164,24 @@ class LlmWikiPipeline(WikiPipeline):
     """llm 路对外 API 包装:deepwiki-open 原式单次补全(内容内联进 prompt,无工具)。"""
 
     async def determine_structure(
-        self, *, generator: str | None = None, generator_config: dict | None = None, repo: Repo, owner: str, repo_name: str,
+        self, *, repo: Repo, owner: str, repo_name: str,
+        generator: str | None = None, generator_config: dict | None = None,
         file_tree: list[str], readme: str, comprehensive: bool, language: str, run_id: str,
     ) -> WikiStructureModel:
         """llm 路结构:原版经 research_chat(结构提示词为查询,SIMPLE 角色模板 +
-        检索上下文注入 + prompt_builder 拼装);内容错误时解析失败 → 任务 FAILED。"""
+
+        检索上下文注入 + prompt_builder 拼装);内容错误时解析失败 → 任务 FAILED。
+        """
         prompt = self._build_structure_prompt(
-            owner, repo_name, "\n".join(file_tree), readme, comprehensive, language
+            owner, repo_name, "\n".join(file_tree), readme, comprehensive, language,
         )
         system = utils._SIMPLE_CHAT_SYSTEM_PROMPT.format(**utils.prompt_fmt(repo, language=language))
-        parts: list[str] = []
-        async for chunk in utils.llm_research_chat(
-            system, prompt, generator=generator, generator_config=generator_config, repo=repo,
-            session_name="wiki:structure", run_id=run_id,
-        ):
-            parts.append(chunk)
+        parts = [
+            chunk async for chunk in utils.llm_research_chat(
+                system, prompt, generator=generator, generator_config=generator_config, repo=repo,
+                session_name="wiki:structure", run_id=run_id,
+            )
+        ]
         return parse_wiki_structure("".join(parts), comprehensive=comprehensive)
 
     @staticmethod
@@ -1197,25 +1228,27 @@ IMPORTANT:
 1. Create {page_count} pages that would make a {kind} wiki for this repository
 2. Each page should focus on a specific aspect of the codebase (e.g., architecture, key features, setup)
 3. The relevant_files should be actual files from the repository used to generate that page
-4. Return ONLY valid XML with the structure specified above, with no markdown code block delimiters"""
+4. Return ONLY valid XML with the structure specified above, with no markdown code block delimiters"""  # noqa: E501 - prompt 原文移植,单行语义不拆
 
     async def generate_page(
         self, *, generator: str | None = None, generator_config: dict | None = None, repo: Repo, page: WikiPage,
         language: str, default_branch: str, run_id: str,
     ) -> str:
         """llm 路单页:原版同式——页面提示词(仅文件链接,不内联内容)
+
         作为查询经 research_chat 等价流(检索上下文注入;流错误为内容而非抛出,
-        重试只覆盖校验/检索前置异常——与原版一致)。返回前经终态格式化(同 cc 路)。"""
+        重试只覆盖校验/检索前置异常——与原版一致)。返回前经终态格式化(同 cc 路)。
+        """
         ctx = RepoUrlContext(type=repo.repo_type, repo_url=repo.repo_url, default_branch=default_branch)
         file_links = render_file_links(list(page.filePaths), ctx)
         prompt = _build_page_prompt(page.title, file_links, language)
         system = utils._SIMPLE_CHAT_SYSTEM_PROMPT.format(**utils.prompt_fmt(repo, language=language))
-        parts: list[str] = []
-        async for chunk in utils.llm_research_chat(
-            system, prompt, generator=generator, generator_config=generator_config, repo=repo,
-            session_name=f"wiki:page:{page.id}", run_id=run_id,
-        ):
-            parts.append(chunk)
+        parts = [
+            chunk async for chunk in utils.llm_research_chat(
+                system, prompt, generator=generator, generator_config=generator_config, repo=repo,
+                session_name=f"wiki:page:{page.id}", run_id=run_id,
+            )
+        ]
         return _finalize_page_content("".join(parts), page, ctx)
 
 

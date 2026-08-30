@@ -1,6 +1,6 @@
 """监控观测通道:sink 基础设施(事件总线/文件/WS/OTel)与运行时配置。
 
-用户定义两种观测通道,无控制台通道:
+观测通道三种,无控制台通道:
 - 文件 sink(默认恒开):AGENT_MONITOR_DIR/<uuid>.jsonl 扁平布局,
   每行一条非流式事件流事件(TAXONOMY − assistant/chunk,message 粒度,防日志
   膨胀;折叠恢复规范见 gh_puller.agent.events;取代 v1 的聚合行,旧格式不兼容,
@@ -14,10 +14,7 @@
 新增 OTel 后端(Langfuse 等)= envs.py 一个常量 + 本文件 _OTEL_BACKENDS 表一条;
 多地址(逗号分隔)由 ensure_bus 逐 URL 注册同类 sink 实例,单 sink 类不改动。
 
-管道:适配器(adapters)归一化 SDK/HTTP 对象 → 事件流 dict → EventBus 扇出(publish 仅
-put_nowait 到每 sink 的 asyncio.Queue,永不阻塞调用)→ sink worker 消费(文件写盘)。
-线程模型:v1 只有异步调用方,publish 为 loop-affine;若未来出现线程调用方,
-须自行经 loop.call_soon_threadsafe 转发。
+管道与 publish 语义/线程模型(有界队列、loop-affine):见 events.py EventBus —— 本文件是观测通道层。
 """
 
 import asyncio
@@ -29,7 +26,7 @@ from urllib.parse import urlsplit
 
 from .. import envs
 from ..utils import _log as _utils_log
-from .events import EventBus, NON_STREAM_TYPES, set_active_bus, truncate
+from .events import NON_STREAM_TYPES, EventBus, set_active_bus, truncate
 
 
 def _file_stem(session: str) -> str:
@@ -84,7 +81,7 @@ class FileSink:
         path = self._files.get(session)
         if path is None:
             return
-        with open(path, "a", encoding="utf-8") as f:
+        with open(path, "a", encoding="utf-8") as f:  # noqa: ASYNC230 - 文件 sink 本就同步落盘(逐事件追加即返回)
             f.write(json.dumps(evt, ensure_ascii=False) + "\n")
             f.flush()
 
@@ -130,7 +127,7 @@ class WsSink:
             self._q.put_nowait(evt)
 
     async def _run(self) -> None:
-        import websockets
+        import websockets  # 惰性导入:仅实际部署 WS sink 时才要求 websockets 依赖
 
         wait = 1
         while True:
@@ -159,9 +156,8 @@ def _attrs(span, mapping: dict) -> None:
     for key, value in mapping.items():
         if value is None:
             continue
-        if isinstance(value, (list, dict)):
-            value = json.dumps(value, ensure_ascii=False)
-        span.set_attribute(key, value)
+        span.set_attribute(
+            key, json.dumps(value, ensure_ascii=False) if isinstance(value, (list, dict)) else value)
 
 
 def _otel():
@@ -202,7 +198,7 @@ class OtelSink:
         self.tracer = tracer
         if self.tracer is None:
             tp = TracerProvider(
-                resource=Resource({"service.name": envs.OTEL_SERVICE_NAME})
+                resource=Resource({"service.name": envs.OTEL_SERVICE_NAME}),
             )
             tp.add_span_processor(SimpleSpanProcessor(otel_exporter(endpoint=endpoint)))
             self.tracer = tp.get_tracer("gh-puller.agent-monitor")
@@ -425,8 +421,8 @@ def _split_urls(raw) -> list[str]:
     if raw is None:
         return out
     items = raw.split(",") if isinstance(raw, str) else raw
-    for item in items:
-        item = str(item).strip()
+    for raw_item in items:
+        item = str(raw_item).strip()
         if item and item not in out:
             out.append(item)
     return out
@@ -434,6 +430,7 @@ def _split_urls(raw) -> list[str]:
 
 def _otel_traces_url(base: str) -> str:
     """OTLP 便捷归一:path 为空或 "/" → 补 /v1/traces(默认 http://localhost:6006/ 即生效);
+
     完整 OTLP URL(如 langfuse 的 /api/public/otel/v1/traces)原样通过。
 
     归一放在封装层(ensure_bus)而非 OtelSink 内部:OtelSink 契约保持"完整 OTLP

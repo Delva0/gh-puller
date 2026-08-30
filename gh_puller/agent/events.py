@@ -49,7 +49,6 @@ import uuid
 
 from gh_puller.utils import _log
 
-
 # 事件全量 taxonomy(点号→斜杠命名,与 dsh type 风格对齐)
 TAXONOMY = frozenset(
     {
@@ -67,7 +66,7 @@ TAXONOMY = frozenset(
         "config/init",
         "context/modify",
         "error",
-    }
+    },
 )
 
 # surface 事件:消息上下文的可折叠集合(必带全量 message 与合法 surfaceOp)
@@ -187,7 +186,7 @@ _active_bus: "EventBus | None" = None  # 由 sinks.configure/ensure_bus 单向�
 
 
 def set_active_bus(bus: "EventBus | None") -> None:
-    """设置当前总线(由观测通道层 enclose)0;None = 无通道(事件发布零开销短路)。"""
+    """设置当前总线(仅观测通道层调用);None = 无通道(事件发布零开销短路)。"""
     global _active_bus
     _active_bus = bus
 
@@ -205,7 +204,7 @@ def _ensure_maybe_bus() -> "EventBus | None":
             asyncio.get_running_loop()
         except RuntimeError:
             return None  # 无运行中事件循环(同步构造/离线测试):降级短路(不建裸任务)
-        from .sinks import ensure_bus  # noqa: PLC0415 —— 运行期才耦合 sinks(零导入期副作用)
+        from .sinks import ensure_bus
 
         ensure_bus()
         bus = _active_bus
@@ -314,7 +313,7 @@ class EventRecorder:
         os.utime 便宜,会话开着就保鲜;事件密时 mtime 本就新鲜,多触一次无副作用。
         总线被关闭(configure)后 touch 扇出为空,自然 no-op。
         """
-        from .sinks import touch  # noqa: PLC0415 —— 懒 import:运行期才耦合 sinks(零导入期副作用)
+        from .sinks import touch
 
         while True:
             await asyncio.sleep(interval)
@@ -374,11 +373,13 @@ class EventRecorder:
             self._msg_thinking += chunk.get("text", "")
 
     def text(self, text: str, *, index: int = 0) -> None:
+        """content 段便捷发射:text_chars 只累计 content(thinking/tool_input 不计)。"""
         self.text_chars += len(text)
         self._msg_text += text
         self.chunk({"type": "content", "index": index, "text": text})
 
     def tool_call(self, call_id: str, name: str | None, arguments: str) -> None:
+        """tool/call 事件:callId 为 wire 键;seq 记入 _call_seqs,供 tool_result 回填 sourceSeqs。"""
         evt = self.event("tool/call", turn=self.turn, step=self.step, callId=call_id,
                          name=name, arguments=arguments)
         if evt is not None:
@@ -387,6 +388,11 @@ class EventRecorder:
 
     def tool_result(self, message: dict, *, call_id: str, name: str | None,
                     is_error: bool, src_seq: int | None = None) -> None:
+        """tool/result surface 事件:callId 关联对应 tool/call,sourceSeqs = 该 tool/call 的 seq。
+
+        src_seq 由调用方传入(通常 _call_seqs.get(call_id));None → 省略 sourceSeqs 键
+        (无可溯源的 tool/call seq)。
+        """
         data = {"turn": self.turn, "step": self.step, "message": message, "is_error": is_error,
                 "surfaceOp": "append", "callId": call_id}
         if name:
@@ -419,10 +425,12 @@ class EventRecorder:
         data = {"state": state, "ok": ok,
                 "duration_ms": int((time.monotonic() - self.t0) * 1000),
                 "text_chars": self.text_chars, "num_steps": self.step}
-        for k, v in (("usage", self.result_usage), ("stop_reason", self.result_stop_reason),
-                     ("total_cost_usd", self.result_cost_usd)):
-            if v is not None:
-                data[k] = v
+        data |= {
+            k: v
+            for k, v in (("usage", self.result_usage), ("stop_reason", self.result_stop_reason),
+                         ("total_cost_usd", self.result_cost_usd))
+            if v is not None
+        }
         if not ok and self._reason:
             data["reason"] = self._reason
         if epilogue:
@@ -441,9 +449,13 @@ class EventRecorder:
         return self._step_open
 
 
-# EventBus(进程内单例;publish 非阻塞,失败只记 stderr)
 class EventBus:
-    """进程内异步事件总线:publish 只 put_nowait 到每 sink 队列,慢 sink 只拖 sink,不拖调用。"""
+    """进程内异步事件总线:publish 只 put_nowait 到每 sink 队列,永不阻塞调用方;慢 sink 只拖 sink 自己。
+
+    有界队列(5000)满 → 丢最旧、新事件优先;publish 为 loop-affine(v1 仅异步
+    调用方,线程调用方须经 loop.call_soon_threadsafe 转发)。进程内单例,由
+    sinks.ensure_bus 惰性构建(configure 关闭重建)。
+    """
 
     def __init__(self):
         self._sinks: list[asyncio.Queue[dict]] = []

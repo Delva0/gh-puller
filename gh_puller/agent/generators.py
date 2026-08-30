@@ -39,10 +39,8 @@ from typing import Any
 import httpx
 
 from .. import envs  # 模块对象绑定:属性一律调用时取(patch/强刷活性)
-from .configs import (claude_options, codex_config, codex_home, codex_thread,
-                      codex_turn, codex_val, dsh_harness)
-from .events import TAXONOMY
-from .events import _normalize_usage, EventRecorder, _session_id
+from .configs import claude_options, codex_config, codex_home, codex_thread, codex_turn, codex_val, dsh_harness
+from .events import TAXONOMY, EventRecorder, _normalize_usage, _session_id
 
 
 class RequestFailedError(Exception):
@@ -218,9 +216,9 @@ def _handle_assistant_message(run: EventRecorder, msg, already_yielded: bool) ->
 
 
 def _handle_user_message(run: EventRecorder, msg) -> None:
-    """SDK user 段消息:partial 模式(真机 CLI 2.1.237)工具结果经 UserMessage 透传
-    (流里无 tool_result 内容块)——— 合成 tool/result + 置 _tool_pending。
+    """SDK user 段消息(partial 模式)→ 合成 tool/result + 置 _tool_pending。
 
+    真机 CLI 2.1.237:工具结果经 UserMessage 透传(流里无 tool_result 内容块)。
     与流路径(content_block_stop tool_result)互斥去重:同 callId 先到先得
     (_tool_results_seen);元信息(tool_use_result/origin)v1 不落事件。
     """
@@ -278,11 +276,6 @@ def _llm_headers(headers: dict | None, api_key: str | None) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# config 类型与映射契约:configs.py(TypedDict + SDK 字段映射/header 投影/隔离组合)
-# ---------------------------------------------------------------------------
-
-
-# ---------------------------------------------------------------------------
 # 共享基类:run 装配 / 事件守卫 / stream、result 契约定形
 # ---------------------------------------------------------------------------
 
@@ -294,14 +287,14 @@ class BaseGenerator:
     元数据)逐参数一致。config 在**构造时期**注入(副本存 self.config),运行时
     方法不再收 config(契约见模块 docstring)。
 
-    generator = 本项目生成管线 id(cc|dsh|codex|llm)。监控侧 agent 自身 meta
-    只此一项 + config(事件 envelope 即 generator/model 与各 config 派生事件)。
+    监控侧 agent 自身 meta 只 generator 一项 + config(事件 envelope 即
+    generator/model 与各 config 派生事件)。
     """
 
     generator = ""  # 生成管线 id(cc|dsh|codex|llm)
 
     def __init__(self, config: dict):
-        self.config = dict(config)  # 构造期注入;副本防 SDK 篡改
+        self.config = dict(config)  # 副本防 SDK 篡改
 
     def _recorder(self, *, session: str | None = None, session_ns: str | None = None,
              run_id: str | None = None, session_name: str | None = None,
@@ -398,14 +391,14 @@ class ClaudeCode(BaseGenerator):
         """
         from claude_agent_sdk import AssistantMessage, ResultMessage, StreamEvent, UserMessage
 
-        config = self.config  # 构造期注入;运行时不再有 config 参数
+        config = self.config
         run = self._recorder(session=session, session_ns=session_ns, run_id=run_id,
                         session_name=session_name, meta=meta)
-        run.init_config(config)  # 构造期配置快照(session/start 之前)
+        run.init_config(config)
         run.start(context=context, retry=retry)
         run.user_message({"role": "user", "content": [{"type": "text", "text": prompt}]})
         yielded = False
-        async with self._guard(run), self._client as client:  # 客户端构造期已建(一实例一客户端)
+        async with self._guard(run), self._client as client:
             await client.query(prompt)
             async for msg in client.receive_response():
                 if isinstance(msg, StreamEvent):
@@ -440,17 +433,19 @@ class ClaudeCode(BaseGenerator):
                      session_ns: str | None = None,
                      context: list[dict] | None = None, retry: dict | None = None,
                      meta: dict | None = None) -> str:
-        """非流式最终结果:只拿最后一轮 —— ResultMessage.result 本身(非流式文本
-        拼装,保留「agent 未产出最终结果」语义);失败或无结果 → RequestFailedError。"""
+        """非流式最终结果:只拿最后一轮 —— 直接取 ResultMessage.result(不从流式文本拼装)。
+
+        保留「agent 未产出最终结果」语义;失败或无结果 → RequestFailedError。
+        """
         from claude_agent_sdk import AssistantMessage, ResultMessage, StreamEvent, UserMessage
 
-        config = self.config  # 构造期注入;运行时不再有 config 参数
+        config = self.config
         run = self._recorder(session=session, session_ns=session_ns, run_id=run_id,
                         session_name=session_name, meta=meta)
-        run.init_config(config)  # 构造期配置快照(session/start 之前)
+        run.init_config(config)
         run.start(context=context, retry=retry)
         run.user_message({"role": "user", "content": [{"type": "text", "text": prompt}]})
-        async with self._guard(run), self._client as client:  # 客户端构造期已建(一实例一客户端)
+        async with self._guard(run), self._client as client:
             await client.query(prompt)
             async for msg in client.receive_response():
                 if isinstance(msg, StreamEvent):
@@ -487,11 +482,12 @@ class OpenAI(BaseGenerator):
 
     def __init__(self, config: dict):
         super().__init__(config)
-        self._client = httpx.AsyncClient(timeout=None)  # 无超时缺省;单次经请求级 timeout 覆盖
+        # 流式长连接不设全局超时,由请求级 timeout 覆盖
+        self._client = httpx.AsyncClient(timeout=None)  # noqa: S113 - 流式长连接不设全局超时,由请求级覆盖
 
     async def result(
         self, payload: dict, *,
-        timeout: httpx.Timeout | None = None, headers: dict | None = None,
+        timeout: httpx.Timeout | None = None, headers: dict | None = None,  # noqa: ASYNC109 - httpx.Timeout 请求级形参,非 asyncio 超时模式
         session: str | None = None, session_name: str | None = None,
         run_id: str | None = None, session_ns: str | None = None,
         context: list[dict] | None = None, retry: dict | None = None,
@@ -509,32 +505,32 @@ class OpenAI(BaseGenerator):
         逐 delta chunk,观测粒度与 cc/codex 一致(旧实现单发非流式 complete,
         整个回答只发 1 条 assistant/chunk)。
         """
-        parts = []
-        async for part in self.stream(payload, timeout=timeout, headers=headers,
-                                      session=session, session_name=session_name,
-                                      run_id=run_id, session_ns=session_ns,
-                                      context=context, retry=retry, meta=meta):
-            parts.append(part)
+        parts = [part async for part in self.stream(
+            payload, timeout=timeout, headers=headers, session=session,
+            session_name=session_name, run_id=run_id, session_ns=session_ns,
+            context=context, retry=retry, meta=meta)]
         return "".join(parts)
 
     async def stream(
         self, payload: dict, *,
-        timeout: httpx.Timeout | None = None, headers: dict | None = None,
+        timeout: httpx.Timeout | None = None, headers: dict | None = None,  # noqa: ASYNC109 - httpx.Timeout 请求级形参,非 asyncio 超时模式
         session: str | None = None, session_name: str | None = None,
         run_id: str | None = None, session_ns: str | None = None,
         context: list[dict] | None = None, retry: dict | None = None,
         meta: dict | None = None,
     ):
-        """OpenAI 兼容流式补全(SSE 逐 delta):config/payload 分工与 complete 同,
-        请求体附加 stream=True;delta.tool_calls 分片归并 → tool/call + tool_use 块
-        (与 complete 同归一;旧实现只认 text delta,流式工具调用不可观测)。"""
-        config = self.config  # 构造期注入;运行时不再有 config 参数
+        """OpenAI 兼容流式补全(SSE 逐 delta):config/payload 分工与 result 同,请求体附加 stream=True。
+
+        delta.tool_calls 分片归并 → tool/call + tool_use 块(旧实现只认 text delta,
+        流式工具调用不可观测)。
+        """
+        config = self.config
         body = dict(payload)
         body["model"] = payload.get("model") or config.get("model") or ""
         body["stream"] = True
         run = self._recorder(session=session, session_ns=session_ns,
                         run_id=run_id, session_name=session_name, meta=meta)
-        run.init_config(config)  # 构造期配置快照(session/start 之前)
+        run.init_config(config)
         run.start(context=context, retry=retry)
         _llm_emit_messages(run, body)
         full = ""
@@ -898,20 +894,17 @@ class Dsh(BaseGenerator):
 
     DshConfig → DeepSeekHarness kwargs(configs.dsh_fields:config_path → cordis、
     system_prompt → env.DSH_SYSTEM_PROMPT;未提供 cordis 时回退内置隔离组合);模型/
-    凭证随组合配置(SDK 读进程环境兜底)。
-    """
-
-    """dsh:事件词汇同源但 dsh 是第二权威 → _DshProj 投影对齐(why 见模块 docstring)。
-
-    构造期即建 harness 对象(configs.dsh_harness 绑定 config):一个实例 = 一个
-    harness = 一次 dsh 会话;子进程 spawn/initialize 在进入(with)时进行。
+    凭证随组合配置(SDK 读进程环境兜底)。事件词汇同源但 dsh 是第二权威 → _DshProj
+    投影对齐(why 见 _DshProj docstring)。构造期即建 harness 对象(configs.dsh_harness
+    绑定 config):一个实例 = 一个 harness = 一次 dsh 会话;子进程 spawn/initialize
+    在进入(with)时进行。
     """
 
     generator = "dsh"
 
     def __init__(self, config: dict):
         super().__init__(config)
-        self._harness = dsh_harness(config)  # SDK 实例构造期已建(config→SDK 装配在 configs.py)
+        self._harness = dsh_harness(config)
 
     @contextlib.asynccontextmanager
     async def _run_context(self, prompt: str, *, session: str | None = None,
@@ -919,11 +912,13 @@ class Dsh(BaseGenerator):
                            session_ns: str | None = None,
                            context: list[dict] | None = None, retry: dict | None = None,
                            meta: dict | None = None):
-        """dsh 运行装配(stream/result 共用):recorder/proj/字段/worker 线程/队列;
-        guard 内 yield (run, proj, queue, task),退出取消未完成 worker。"""
+        """dsh 运行装配(stream/result 共用):recorder/proj/队列/worker 线程。
+
+        guard 内 yield (run, proj, queue),退出取消未完成 worker。
+        """
         from deepseek_harness import errors as _dsh_errors
 
-        config = self.config  # 构造期注入;运行时不再有 config 参数
+        config = self.config
         run = self._recorder(session=session, session_ns=session_ns, run_id=run_id,
                         session_name=session_name, meta=meta)
         proj = _DshProj(run, prompt, _dsh_session_id(run.session))
@@ -938,10 +933,10 @@ class Dsh(BaseGenerator):
             try:
                 result = await asyncio.to_thread(_dsh_worker, self._harness, prompt, proj.session_id, pump)
                 loop.call_soon_threadsafe(queue.put_nowait, ("done", result))
-            except Exception as exc:  # noqa: BLE001 —— 异常经队列送消费侧统一 error/finish
+            except Exception as exc:
                 loop.call_soon_threadsafe(queue.put_nowait, ("exc", exc))
 
-        run.init_config(config)  # 构造期配置快照(session/start 之前)
+        run.init_config(config)
         run.start(context=context, retry=retry, prologue=False)  # dsh 自带 turn/step 生命周期
         async with self._guard(
             run,
@@ -988,8 +983,7 @@ class Dsh(BaseGenerator):
                      session_ns: str | None = None,
                      context: list[dict] | None = None, retry: dict | None = None,
                      meta: dict | None = None) -> str:
-        """非流式最终结果:只拿最后一轮 —— RunResult.final_response;非 completed
-        / 未产出 → RequestFailedError。"""
+        """非流式最终结果:只拿最后一轮 —— RunResult.final_response;非 completed 或未产出 → RequestFailedError。"""
         async with self._run_context(prompt, session=session, session_name=session_name,
                                      run_id=run_id, session_ns=session_ns,
                                      context=context, retry=retry, meta=meta) as (run, proj, queue):
@@ -1281,6 +1275,7 @@ class Codex(BaseGenerator):
     CodexConfig → SDK 装配件(configs.codex_*:codex_home/codex_config/codex_thread/
     codex_turn);config_path 纯透传(home config.toml 符号链接),mcp_servers 通用注入
     工具桌;codex_home 缺省回退内置隔离目录,system_prompt → base_instructions。
+    构造期即建 SDK 客户端(AsyncCodex 绑定 config);连接与 thread 建立在调用期。
     """
 
     generator = "codex"
@@ -1289,7 +1284,7 @@ class Codex(BaseGenerator):
         super().__init__(config)
         from openai_codex import AsyncCodex  # lazy:测试可喂假模块
 
-        self._codex = AsyncCodex(config=codex_config(config))  # SDK 客户端构造期已建(一实例一客户端)
+        self._codex = AsyncCodex(config=codex_config(config))
 
     async def stream(self, prompt: str, *, session: str | None = None,
                      session_name: str | None = None, run_id: str | None = None,
@@ -1303,27 +1298,24 @@ class Codex(BaseGenerator):
         只进事件流。codex 通知 1:1 合成 TAXONOMY(无 seq 编号 → 本地合成,见
         _CodexSynth);session/turn/step 生命周期由本层合成。
 
-        CodexConfig 键集:codex_home/sandbox/approval_mode/model/system_prompt →
-        base_instructions/token/env/cwd/codex_bin/config_path/config_overrides/
-        launch_args_override/effort/output_schema/mcp_servers 等(None 跳过,见
-        configs.codex_config/thread/turn);codex_home 缺省回退内置隔离目录(隔离语义同 dsh 组合)。
+        config 键集即 configs.CodexConfig(装配见 configs.codex_config/thread/turn)。
 
         凭证(cc 同形:环境隔离不隔离凭证通道):零配置缺省符号链接引用真实
         ~/.codex/auth.json;显式 config.token → login_api_key 写本隔离 home。
         """
         from openai_codex import JsonRpcError
 
-        config = self.config  # 构造期注入;运行时不再有 config 参数
+        config = self.config
         run = self._recorder(session=session, session_ns=session_ns, run_id=run_id,
                         session_name=session_name, meta=meta)
-        run.init_config(config)  # 构造期配置快照(session/start 之前)
+        run.init_config(config)
         run.start(context=context, retry=retry)
         run.user_message({"role": "user", "content": [{"type": "text", "text": prompt}]})
         st = _CodexSynth(run, prompt)
         timeout = config.get("timeout_seconds")
         home = codex_home(config)  # config → 隔离 home(装配在 configs.py)
         guard = self._guard(run, error_stage=lambda exc: _codex_stage(exc, (JsonRpcError,)))
-        async with guard, self._codex as codex:  # 客户端构造期已建(一实例一客户端)
+        async with guard, self._codex as codex:
             if (token := config.get("token") or ""):
                 # 显式 token → 登录凭证属本隔离 home:先断符号链接防穿透写坏用户 ~/.codex/auth.json
                 auth = Path(home) / "auth.json"
@@ -1346,26 +1338,25 @@ class Codex(BaseGenerator):
                      session_ns: str | None = None,
                      context: list[dict] | None = None, retry: dict | None = None,
                      meta: dict | None = None) -> str:
-        """非流式最终结果:只拿最后一轮 —— 通知流末条 agentMessage 文本
-        (st.final_response);turn 非 completed / 未产出 → RequestFailedError。
+        """非流式最终结果:只拿最后一轮 —— 通知流末条 agentMessage 文本(st.final_response)。
 
-        与 stream 同构消费通知流(_codex_drain):事件全量合成。旧实现直取
-        handle.run() 的 TurnResult —— 不暴露通知,事件流只有生命周期,
-        观测不到 assistant/工具事件。
+        turn 非 completed / 未产出 → RequestFailedError。与 stream 同构消费通知流
+        (_codex_drain):事件全量合成。旧实现直取 handle.run() 的 TurnResult ——
+        不暴露通知,事件流只有生命周期,观测不到 assistant/工具事件。
         """
         from openai_codex import JsonRpcError
 
-        config = self.config  # 构造期注入;运行时不再有 config 参数
+        config = self.config
         run = self._recorder(session=session, session_ns=session_ns, run_id=run_id,
                         session_name=session_name, meta=meta)
-        run.init_config(config)  # 构造期配置快照(session/start 之前)
+        run.init_config(config)
         run.start(context=context, retry=retry)
         run.user_message({"role": "user", "content": [{"type": "text", "text": prompt}]})
         st = _CodexSynth(run, prompt)  # result 与 stream 同构:合成器照常驱动
         timeout = config.get("timeout_seconds")
         home = codex_home(config)  # config → 隔离 home(装配在 configs.py)
         guard = self._guard(run, error_stage=lambda exc: _codex_stage(exc, (JsonRpcError,)))
-        async with guard, self._codex as codex:  # 客户端构造期已建(一实例一客户端)
+        async with guard, self._codex as codex:
             if (token := config.get("token") or ""):
                 auth = Path(home) / "auth.json"
                 if auth.is_symlink():
@@ -1392,21 +1383,20 @@ class Codex(BaseGenerator):
 
 GENERATORS: dict[str, type[BaseGenerator]] = {"cc": ClaudeCode, "dsh": Dsh,
                                              "codex": Codex, "llm": OpenAI}
-"""生成器注册表:id → 类;构造 = GENERATORS[id](config)(config 契约见 configs.py)。"""
 
 
 # ---------------------------------------------------------------------------
-# 直白 API 用法演示:四生成器「你好」问候(上层 API 参考)
+# 直白 API 用法演示:cc/codex/llm 三生成器真实任务(stream/result 上层 API 参考)
 # `python -m gh_puller.agent.generators`
 # ---------------------------------------------------------------------------
 
 
 if __name__ == "__main__":
-    """cc/codex/llm 三生成器 stream/result 演示(真实任务):访问 GitHub 仓库并一句话
-    介绍 —— result() 各生成器最后一轮语义(多轮工具用后只取终稿)在真实任务下可验。
-    cc/codex 零配置走缺省隔离(llm 按环境取值 OPENAI_BASE_URL/LLM_MODEL/OPENAI_API_KEY);
-    真实任务各生成器可加工具授权:cc 见下方 allowed_tools,codex 以 web_search。
-    注:dsh 不在此演示 —— 本机 SDK 载体(runtime exe)未构建,见 dsh 真机测试恢复点。"""
+    # cc/codex/llm 三生成器 stream/result 演示(真实任务):访问 GitHub 仓库并一句话
+    # 介绍 —— result() 各生成器最后一轮语义(多轮工具用后只取终稿)在真实任务下可验。
+    # cc/codex 零配置走缺省隔离(llm 按环境取值 OPENAI_BASE_URL/LLM_MODEL/OPENAI_API_KEY);
+    # 真实任务各生成器可加工具授权:cc 见下方 allowed_tools,codex 以 web_search。
+    # 注:dsh 不在此演示 —— 本机 SDK 载体(runtime exe)未构建,见 dsh 真机测试恢复点。
 
     QUESTION = "请访问 https://github.com/yankils/hello-world 并写一句话介绍这个仓库。"
 
@@ -1425,10 +1415,10 @@ if __name__ == "__main__":
                 "api_key": os.environ.get("OPENAI_API_KEY"),
             }
         gen = GENERATORS[gid](config)  # 构造期注入 config;stream/result 只收运行时参数
-        if gid == "llm":
-            prompt = {"messages": [{"role": "user", "content": QUESTION}], "max_tokens": 256}
-        else:
-            prompt = QUESTION
+        prompt = (
+            {"messages": [{"role": "user", "content": QUESTION}], "max_tokens": 256}
+            if gid == "llm" else QUESTION
+        )
 
         print(f"[{gid}] 流式(stream):")
         parts = [c async for c in gen.stream(prompt, session_name=f"demo:{gid}")]
@@ -1444,7 +1434,7 @@ if __name__ == "__main__":
                 continue  # 载体未构建,见 dsh 真机测试 TODO(不阻塞演示)
             try:
                 await _demo(gid)
-            except Exception as e:  # noqa: BLE001 —— 演示脚本:逐路汇报不中断
+            except Exception as e:
                 print(f"[{gid}] 失败: {type(e).__name__}: {e}")
         print("演示结束")
 

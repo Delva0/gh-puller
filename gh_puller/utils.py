@@ -22,7 +22,7 @@ import os
 import re
 import subprocess
 import sys
-from enum import Enum
+from enum import StrEnum
 from pathlib import Path
 from typing import Literal
 from urllib.parse import quote, urlparse, urlunparse
@@ -144,9 +144,9 @@ class Repo:
                 if self.access_token:  # 一律抹掉 token(原始与百分号编码两种形态)
                     token = self.access_token
                     msg = msg.replace(token, "***TOKEN***").replace(
-                        quote(token, safe=""), "***TOKEN***"
+                        quote(token, safe=""), "***TOKEN***",
                     )
-                raise ValueError(msg)
+                raise ValueError(msg) from e
 
     def __repr__(self) -> str:
         return f"{self.repo_type}: {self.name}"
@@ -180,10 +180,7 @@ def _should_process_file(
     for excluded in excluded_dirs:
         if excluded.strip("/") in rel_parts:
             return False
-    for excluded_file in excluded_files:
-        if name == excluded_file:
-            return False
-    return True
+    return name not in excluded_files
 
 
 def iterate_files(
@@ -215,7 +212,7 @@ def iterate_files(
             continue
         rel_parts = tuple(p.relative_to(root).parts)
         if _should_process_file(
-            rel_parts, use_inclusion, inc_dirs, inc_files, exc_dirs, exc_files
+            rel_parts, use_inclusion, inc_dirs, inc_files, exc_dirs, exc_files,
         ):
             results.append("/".join(rel_parts))
     return results
@@ -296,8 +293,7 @@ def _estimate_tokens(text: str) -> int:
 def _strip_markdown_fences(content: str) -> str:
     """剥离整体 markdown code fence(模型偶尔会包一层)。"""
     content = re.sub(r"^```markdown\s*", "", content, flags=re.IGNORECASE)
-    content = re.sub(r"```\s*$", "", content)
-    return content
+    return re.sub(r"```\s*$", "", content)
 
 
 def _event(**payload) -> str:
@@ -312,8 +308,7 @@ def _phase(phase: str, status: str, **extra) -> str:
 def _repair_json(candidate: str) -> str:
     """修复常见 LLM JSON 瑕疵(尾逗号、`" "key":`)。"""
     repaired = re.sub(r",\s*([}\]])", r"\1", candidate)  # trailing commas
-    repaired = re.sub(r'"\s+"(\w+)"\s*:', r'"\1":', repaired)
-    return repaired
+    return re.sub(r'"\s+"(\w+)"\s*:', r'"\1":', repaired)
 
 
 def _extract_json(text: str) -> dict:
@@ -362,7 +357,7 @@ def _extract_json(text: str) -> dict:
 # ---------------------------------------------------------------------------
 
 
-class TaskStatus(str, Enum):
+class TaskStatus(StrEnum):
     PENDING = "pending"
     INDEXING = "indexing"
     DETERMINING_STRUCTURE = "determining_structure"

@@ -29,7 +29,6 @@ import tempfile
 from pathlib import Path
 from typing import TypedDict
 
-
 # ---------------------------------------------------------------------------
 # config 类型(每生成器一种 dict schema;键可省略,键集即解析层白名单语义)
 # ---------------------------------------------------------------------------
@@ -52,8 +51,7 @@ class ClaudeConfig(TypedDict, total=False):
 
 
 class DshConfig(TypedDict, total=False):
-    """dsh 运行时 config:映射 DeepSeekHarness kwargs;config_path → cordis,
-    system_prompt → env.DSH_SYSTEM_PROMPT。"""
+    """dsh 运行时 config:映射 DeepSeekHarness kwargs(config_path → cordis,system_prompt → env.DSH_SYSTEM_PROMPT)。"""
 
     provider: str
     model: str
@@ -73,8 +71,7 @@ class DshConfig(TypedDict, total=False):
 
 
 class CodexConfig(TypedDict, total=False):
-    """codex 运行时 config:映射 CodexConfig/thread/turn kwargs;system_prompt →
-    base_instructions。"""
+    """codex 运行时 config:映射 CodexConfig/thread/turn kwargs;system_prompt → base_instructions。"""
 
     model: str
     system_prompt: str
@@ -148,10 +145,10 @@ def codex_config_fields(config: dict) -> dict:
 
 
 def codex_thread_fields(config: dict) -> dict:
-    """CodexConfig → AsyncCodex.thread_start 透传 kwargs(sandbox/approval_mode 由
-    调用方经 codex_lookup 转换后塞入,此处只保留其余自由字段)。
+    """CodexConfig → AsyncCodex.thread_start 透传 kwargs。
 
-    system_prompt 缺省映射 base_instructions(与 cc 的 system_prompt 同位语义)。
+    sandbox/approval_mode 由调用方经 codex_lookup 转换后塞入,此处只保留其余自由
+    字段;system_prompt 缺省映射 base_instructions(与 cc 的 system_prompt 同位语义)。
     """
     names = ("base_instructions", "developer_instructions", "personality", "ephemeral",
              "model", "model_provider", "service_tier", "config", "cwd",
@@ -209,8 +206,10 @@ def codex_config(config: dict):
 
 
 def codex_thread(config: dict) -> dict:
-    """CodexConfig → AsyncCodex.thread_start kwargs(sandbox/approval_mode 经
-    codex_lookup 转枚举;其余见 codex_thread_fields)。"""
+    """CodexConfig → AsyncCodex.thread_start kwargs。
+
+    sandbox/approval_mode 经 codex_lookup 转枚举;其余见 codex_thread_fields。
+    """
     from openai_codex import ApprovalMode, Sandbox  # lazy:测试可喂假模块
 
     fields = codex_thread_fields(config)
@@ -287,14 +286,14 @@ def codex_home_path() -> str:
 
 def _codex_config_toml_content(*, mcp_servers: list[dict] | None = None,
                                web_search: bool = False) -> str:
-    """隔离 config.toml 内容:按调用方注入的通用 mcp 服务器描述渲染(组合即隔离边界,
-    镜像 dsh 的 _DSH_CORDIS_YAML —— 无用户 model_provider/keys/mcp/hook/高级设置)。
+    """隔离 config.toml 内容:按调用方注入的通用 mcp 服务器描述渲染(组合即隔离边界,镜像 dsh 的 _DSH_CORDIS_YAML)。
 
-    每条 spec 应带 id/command/args/env_vars(值不内联,每 run 经 CodexConfig.env 注入
-    app-server 进程环境,再由 rmcp stdio 启动器按白名单取走)。mcp_servers 空 → 空
-    config(无附加工具桌);本层不识别任何具体工具名。
-    web_search = True → [features] web_search_request(Codex 内置网络搜索工具;CLI
-    默认出于安全关闭,须显式启用 —— 产物隔离边界内的用户级开关)。
+    无用户 model_provider/keys/mcp/hook/高级设置。每条 spec 应带 id/command/args/
+    env_vars(值不内联,每 run 经 CodexConfig.env 注入 app-server 进程环境,再由
+    rmcp stdio 启动器按白名单取走)。mcp_servers 空 → 空 config(无附加工具桌);
+    本层不识别任何具体工具名。web_search = True → [features] web_search_request
+    (Codex 内置网络搜索工具;CLI 默认出于安全关闭,须显式启用 —— 产物隔离边界内的
+    用户级开关)。
     """
     sections = []
     for spec in mcp_servers or []:
@@ -308,7 +307,7 @@ def _codex_config_toml_content(*, mcp_servers: list[dict] | None = None,
             f"args = {args}\n"
             f"env_vars = {env_vars}\n"
             "startup_timeout_sec = 30\n"
-            "required = true\n"
+            "required = true\n",
         )
     if web_search:
         sections.append("[features]\nweb_search_request = true\n")
@@ -398,11 +397,12 @@ def _dsh_cordis_write(mcp_servers: list[dict] | None) -> str:
     调用方(上层装配层)以 mcp_servers=[{"id","serverName","command","args",...}]
     注入引擎工具桌 —— 本层只按通用结构渲染,不认识任何具体工具名。
     """
-    digest = hashlib.sha1(_DSH_CORDIS_YAML.encode()).hexdigest()[:8]
+    # sha1 仅作内容指纹派生缓存文件名,非安全用途
+    digest = hashlib.sha1(_DSH_CORDIS_YAML.encode()).hexdigest()[:8]  # noqa: S324
     text = _DSH_CORDIS_YAML
     for spec in mcp_servers or []:
         text = _dsh_mcp_section(spec) + text
-        digest = hashlib.sha1((digest + repr(sorted(spec.items()))).encode()).hexdigest()[:8]
+        digest = hashlib.sha1((digest + repr(sorted(spec.items()))).encode()).hexdigest()[:8]  # noqa: S324
     path = Path(tempfile.gettempdir()) / "gh-puller" / f"dsh-cordis-{digest}.yml"
     path.parent.mkdir(parents=True, exist_ok=True)
     if not path.exists():
