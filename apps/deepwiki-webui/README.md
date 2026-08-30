@@ -11,7 +11,8 @@ DeepWiki 兼容 Web 界面(完整应用,`server/` + `web/` 两个子项目):
 # 依赖安装(仓库根,单一 lockfile)
 pnpm install
 
-# 终端 1:后端(端口默认 8001,env 单点读取见 gh_puller/envs.py)
+# 终端 1:后端(端口默认 8001,uvicorn CLI `--port` 指定;包内 env 见 gh_puller/envs.py,
+# 服务端专属 env(PORT/DEEPWIKI_AUTH_*/调度参数)见 server/app.py 与 server/tasks.py)
 uv --directory apps/deepwiki-webui/server run uvicorn app:app --port 8001
 
 # 终端 2:前端(端口默认 3000)

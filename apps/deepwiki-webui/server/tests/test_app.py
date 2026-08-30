@@ -15,11 +15,11 @@ import time
 os.environ.setdefault("DEEPWIKI_ROOT", tempfile.mkdtemp(prefix="deepwiki-app-test-"))
 
 from fastapi.testclient import TestClient
-from gh_puller.deepwiki.utils import graph_path
 from gh_puller.utils import Repo, TaskStatus
 
 import tasks
 from app import app as server_app
+from generators import graph_path
 
 
 def _write_corpus(root) -> str:
@@ -27,7 +27,7 @@ def _write_corpus(root) -> str:
     d = root / "corpus"
     d.mkdir()
     (d / "app.py").write_text(
-        "import utils\n\n\ndef main():\n    return utils.hello('x')\n", encoding="utf-8"
+        "import utils\n\n\ndef main():\n    return utils.hello('x')\n", encoding="utf-8",
     )
     (d / "utils.py").write_text("def hello(name):\n    return f'hi {name}'\n", encoding="utf-8")
     (d / "README.md").write_text("# Demo\n", encoding="utf-8")
@@ -103,7 +103,7 @@ def test_index_status_not_indexed(tmp_path):
     raw_create = str(tmp_path / "empty_src")
     os.makedirs(raw_create)
     assert _client().get(
-        "/repo/index/status", params={"repo_url": str(raw_create), "type": "local"}
+        "/repo/index/status", params={"repo_url": str(raw_create), "type": "local"},
     ).json() == {"ready": False}
 
 
@@ -207,7 +207,7 @@ def test_prepare_local_repo(tmp_path):
     assert not os.path.exists(os.path.join(raw, "graphify-out"))
     # 索引后就绪探针翻转
     assert _client().get(
-        "/repo/index/status", params={"repo_url": raw, "type": "local"}
+        "/repo/index/status", params={"repo_url": raw, "type": "local"},
     ).json() == {"ready": True}
 
 

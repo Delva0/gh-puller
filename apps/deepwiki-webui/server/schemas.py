@@ -9,7 +9,9 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from gh_puller.utils import RepoType, TaskStatus
+# pydantic 在模型构建期按模块命名空间解析字段注解,RepoType/TaskStatus 必须是
+# 真实模块级名字,不能收进 TYPE_CHECKING 块(否则运行时报 class not found)。
+from gh_puller.utils import RepoType, TaskStatus  # noqa: TC002 - pydantic 运行时解析注解需此名
 from pydantic import BaseModel, Field, computed_field, field_validator
 
 # ---------------------------------------------------------------------------

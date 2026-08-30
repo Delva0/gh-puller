@@ -35,7 +35,7 @@ IMPORTANT:You MUST respond in {language_name} language.
 
 <guidelines>
 - This is the ONLY response of the research process: finish the entire investigation in this one answer.
-- USE YOUR TOOLS (Read / Grep / Glob / graphify_query) to inspect the repository code for evidence before writing; repeated tool rounds are expected.
+- USE YOUR TOOLS (Read / Grep / Glob) to inspect the repository code for evidence before writing; repeated tool rounds are expected.
 - Your answer MUST contain EXACTLY these sections, in this order:
   1. Begin with "## Research Plan" - the approach and initial findings for the investigation
   2. Then one or more progress sections "## Research Update 1", "## Research Update 2", ... with deeper findings from your tool exploration
@@ -217,19 +217,19 @@ async def _agent_chat(
         system = utils._SIMPLE_CHAT_SYSTEM_PROMPT.format(**fmt)
 
     # 对话历史自然转写(无 <turn> 伪标签);输入过大时省略历史。引擎不传
-    # context 类"假日志"事件(监控事件由适配器内 EventRecorder 发布)
+    # context 类"假日志"事件(监控事件由适配器内 EventRecorder 发布)。
+    # 工具指引(tool_note)由上层经 generator_config 注入 —— 引擎零工具假设。
     adapter = utils.adapter(generator, generator_config=generator_config, system_prompt=system, repo=repo)
     history = _render_natural_history(messages)
 
     prompt = (
-        history + utils.agent_note(adapter.generator)
+        history + (generator_config or {}).get("tool_note", "")
         + f"<query>\n{last.get('content', '')}\n</query>\n\nAssistant: "
     )
     try:
-        async for chunk in adapter.stream(
-            prompt, session_name=f"chat:{repo.name}", run_id=f"chat:{repo.name}",
-        ):
-            yield chunk
+        async with adapter.session(session_name=f"chat:{repo.name}", run_id=f"chat:{repo.name}"):
+            async for chunk in adapter.stream(prompt):
+                yield chunk
     except Exception as e:  # 执行期失败降级为可读错误文本(同原 stream_and_fallback 语义)
         err = utils.failure(e)  # RequestFailedError 先转「agent 执行失败」再降级(同原包装时序)
         log(f"chat agent 错误: {err}")

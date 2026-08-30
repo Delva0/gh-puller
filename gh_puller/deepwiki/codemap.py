@@ -217,23 +217,13 @@ def _ground_citations(codemap: CodeMap, repo_dir: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _codemap_note() -> str:
-    """codemap 指引(仅 cc/agent 路用):先查图谱再构造,引用行号取自 Source 标记。"""
-    return (
-        "<note>Before answering, use the graphify_query tool to inspect the repository "
-        "code graph (its result carries `Source: <file path> L<line>` markers). "
-        "When filling citation.file_path / start_line / end_line, use those paths and line "
-        "numbers, and make the 'snippet' a verbatim substring of the code shown in the result.</note>\n\n"
-    )
-
-
 async def _agent_codemap(
     *, generator: str | None = None, generator_config: dict | None = None, repo: Repo,
     question: str, language: str = "en",
 ):
     """两阶段 codemap 生成(骨架 → 指南/图),NDJSON 事件流;阶段失败语义与原相同。"""
     yield _phase("analyzing", "start")
-    if not utils.index_ready(repo):
+    if not utils.graph_service(generator_config).ready(repo):
         yield _phase("analyzing", "done", chunk_count=0)
         yield _event(type="error", stage="analyzing", message=f"仓库尚未索引,请先 /repo/prepare: {repo.name}")
         return
@@ -250,20 +240,20 @@ async def _agent_codemap(
                     generator, generator_config=generator_config, repo=repo,
                     system_prompt=_CODEMAP_SKELETON_PROMPT.format(**fmt),
                 )
-                raw = await adapter.result(
-                    prompt, session_name="codemap:skeleton",
-                    run_id=f"codemap:{repo.name}",
+                async with adapter.session(
+                    session_name="codemap:skeleton", run_id=f"codemap:{repo.name}",
                     retry={"attempt": attempt, "prev_error": str(last_error)} if last_error else None,
-                )
+                ):
+                    raw = await adapter.result(prompt)
                 return _extract_json(raw)
             except Exception as e:
                 last_error = utils.failure(e)
                 log(f"codemap JSON 解析尝试 {attempt}/{attempts} 失败: {last_error}")
         raise ValueError(f"Model did not return valid JSON after {attempts} attempts: {last_error}")
 
-    # 阶段 1:骨架
+    # 阶段 1:骨架;工具指引(codemap_note)由上层经 generator_config 注入 —— 引擎零工具假设
     yield _phase("initial_codemap", "start")
-    skeleton_prompt = _codemap_note() + f"<query>\n{question}\n</query>\n\nAssistant: "
+    skeleton_prompt = (generator_config or {}).get("codemap_note", "") + f"<query>\n{question}\n</query>\n\nAssistant: "
     try:
         skeleton = codemap_of(await _run_json(skeleton_prompt))
     except Exception as e:
@@ -277,16 +267,17 @@ async def _agent_codemap(
     enrich_query = (
         f"{question}\n\n<SKELETON>\n{json.dumps(dataclasses.asdict(skeleton))}\n</SKELETON>"
     )
-    enrich_prompt = _codemap_note() + f"<query>\n{enrich_query}\n</query>\n\nAssistant: "
+    enrich_prompt = (
+        (generator_config or {}).get("codemap_note", "")
+        + f"<query>\n{enrich_query}\n</query>\n\nAssistant: "
+    )
     final = skeleton
     try:
         adapter = utils.adapter(
             generator, generator_config=generator_config, system_prompt=_CODEMAP_ENRICH_PROMPT.format(**fmt), repo=repo,
         )
-        raw = await adapter.result(
-            enrich_prompt, session_name="codemap:enrich",
-            run_id=f"codemap:{repo.name}",
-        )
+        async with adapter.session(session_name="codemap:enrich", run_id=f"codemap:{repo.name}"):
+            raw = await adapter.result(enrich_prompt)
         final = codemap_of(_extract_json(raw))
         yield _phase("diagrams", "done")
     except Exception as e:
@@ -308,13 +299,13 @@ async def _llm_codemap(
     双提示词经 build_service_prompt(utils 收编;与 chat 同构);JSON 解析失败重试——骨架 3 次、
     富化 2 次(传输错误直接上抛);富化失败 degraded;引用接地两路共用。
     """
-    # ---- 阶段 1a:analyzing(原版 RAG 检索;此处 = 图谱子图→真实代码窗) ----
+    # ---- 阶段 1a:analyzing(原版 RAG 检索;此处 = 图服务子图→真实代码窗) ----
     yield _phase("analyzing", "start")
-    if not utils.index_ready(repo):
+    if not utils.graph_service(generator_config).ready(repo):
         yield _phase("analyzing", "done", chunk_count=0)
         yield _event(type="error", stage="analyzing", message=f"仓库尚未索引,请先 /repo/prepare: {repo.name}")
         return
-    ctx = await utils.graphify_context(repo, question)  # 图谱失败/超预算 → raise
+    ctx = await utils.graph_service(generator_config).context(repo, question)  # 图谱失败/超预算 → raise
     yield _phase("analyzing", "done", chunk_count=len(ctx["blocks"]))
 
     fmt = utils.prompt_fmt(repo, language=language)

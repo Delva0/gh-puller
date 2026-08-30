@@ -567,7 +567,7 @@ def _finalize_page_content(content: str, page: WikiPage, ctx: RepoUrlContext) ->
 # wiki 产物持久化(cache.py 消除后的 wiki 主线侧):成品缓存(cache_*)、
 # 续跑状态(resume_*)、processed 列表与导出;数据形态为纯 dict。
 # 布局:deepwiki 根下 wiki/ 缓存容器,其内按项目分文件夹(<repo_key>/ 下 json +
-# agent_cache/);与 repos/(克隆)、graphify/(索引)在根下互不污染。根经
+# agent_cache/);与 repos/(克隆)、图产物根(索引)在根下互不污染。根经
 # wiki_cache_dir() **调用时**解析 envs.DEEPWIKI_ROOT —— 测试 pop+delattr 强刷后跟随新根。
 # ---------------------------------------------------------------------------
 
@@ -580,7 +580,7 @@ _RESUME_STATE_PREFIX = "resume_"
 def wiki_cache_dir() -> str:
     """缓存根 = deepwiki/wiki(调用时解析 envs.DEEPWIKI_ROOT —— 测试 pop+delattr 强刷后须跟随新根)。
 
-    与 repos/(克隆)、graphify/(索引)在 deepwiki 根下平级;层内项目按
+    与 repos/(克隆)、图产物根(索引)在 deepwiki 根下平级;层内项目按
     <repo_key>/ 分文件夹(见 wiki_project_dir)。
     """
     return os.path.join(envs.DEEPWIKI_ROOT, "wiki")
@@ -781,7 +781,7 @@ async def list_wiki_cache() -> list[dict]:
     entries: list[dict] = []
     for dirname in await asyncio.to_thread(os.listdir, wiki_cache_dir()):
         proj_dir = os.path.join(wiki_cache_dir(), dirname)
-        # wiki/ 层即项目文件夹容器(与 repos/graphify 在根下平级隔离):只跳过 dot/非目录
+        # wiki/ 层即项目文件夹容器(与 repos/图产物根 在根下平级隔离):只跳过 dot/非目录
         if dirname.startswith(".") or not os.path.isdir(proj_dir):  # noqa: ASYNC240 - 轻量目录检查,缓存层 os.path 约定
             continue
         for filename in await asyncio.to_thread(os.listdir, proj_dir):
@@ -988,8 +988,9 @@ class AgentWikiPipeline(WikiPipeline):
         t0 = time.time()
         log(f"agent 交付开始 label={label} run_id={run_id} out={out_path.name}")
         try:
-            async for _ in adapter.stream(prompt, session_name=label, run_id=run_id):
-                pass
+            async with adapter.session(session_name=label, run_id=run_id):
+                async for _ in adapter.stream(prompt):
+                    pass
         except RequestFailedError as e:
             log(f"agent 交付失败 label={label} run_id={run_id} 耗时={time.time() - t0:.1f}s -> {e}")
             raise utils.failure(e) from e
@@ -1022,7 +1023,7 @@ class AgentWikiPipeline(WikiPipeline):
             prompt = self._build_structure_prompt(
                 owner, repo_name, "\n".join(file_tree), readme_path,
                 os.path.abspath(repo.save_path), comprehensive, language,  # noqa: ASYNC240 - 轻量路径派生
-                str(struct_path), generator=adapter.generator,
+                str(struct_path), tool_note=(generator_config or {}).get("tool_note", ""),
             )
             content = await self._deliver(adapter, prompt, struct_path,
                                           label="wiki:structure", run_id=run_id)
@@ -1032,11 +1033,12 @@ class AgentWikiPipeline(WikiPipeline):
     def _build_structure_prompt(
         owner: str, repo_name: str, file_tree: str, readme_path: str | None,
         repo_root: str, comprehensive: bool, language: str, out_path: str,
-        generator: str = "cc",
+        tool_note: str = "",
     ) -> str:
         """cc(agent)结构提示词(现代 agent 风格):输入只给路径(文件树+README 路径),不内联内容;
 
-        成品 XML 由 agent 用 Write 工具直接落盘 out_path,而不是作为 result 文本返回。
+        成品 XML 由 agent 用 Write 工具直接落盘 out_path;工具指引(tool_note)由上层经
+        generator_config 注入(引擎不假设任何工具)。
         """
         structure_format = _COMPREHENSIVE_STRUCTURE if comprehensive else _CONCISE_STRUCTURE
         page_count = "8-12" if comprehensive else "4-6"
@@ -1086,7 +1088,7 @@ IMPORTANT:
 2. Each page should focus on a specific aspect of the codebase (e.g., architecture, key features, setup)
 3. The relevant_files should be actual files from the repository that would be used to generate that page
 4. Do not inline file contents into this prompt — use your tools to read the files.
-{utils.agent_note(generator)}"""  # noqa: E501 - prompt 原文移植,单行语义不拆
+{tool_note}"""  # noqa: E501 - prompt 原文移植,单行语义不拆
 
     @staticmethod
     def _build_page_prompt(title: str, file_paths: list[str], out_path: str, language: str) -> str:
@@ -1117,7 +1119,7 @@ IMPORTANT:
             adapter = utils.adapter(generator, generator_config=generator_config, repo=repo,
                                      agent_output_dir=str(out_path.parent),
                                      agent_write_mode=True)
-            prompt = utils.agent_note(adapter.generator) + self._build_page_prompt(
+            prompt = (generator_config or {}).get("tool_note", "") + self._build_page_prompt(
                 page.title, list(page.filePaths), str(out_path), language,
             )
             content = await self._deliver(adapter, prompt, out_path,

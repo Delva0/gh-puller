@@ -2,8 +2,9 @@
 
 DeepWiki 兼容前端（Next.js 15 + React 19 + Tailwind v4，前端契约与 MIT 协议 deepwiki-open 一致）。
 配合后端使用：HTTP 端点层是仓库 `apps/deepwiki-webui/server/app.py`（独立 uv 项目，FastAPI），引擎/任务层在 `gh_puller/deepwiki/`。
-Claude Code agent 生成仓库 wiki / 跑 codemap / 回答代码问题，
-代码图谱检索由 `gh_puller/graphify.py` 提供（经 `graphify_query` 工具注入 agent）。
+Claude Code agent 生成仓库 wiki / 跑 codemap / 回答代码问题；
+代码图谱检索（建图/查询/MCP 工具桌）由后端 `apps/deepwiki-webui/server/generators.py` 组装
+（图服务经 `generator_config` 注入引擎,`graphify_query` 工具注入 agent）。
 
 ## 快速上手
 
@@ -35,14 +36,17 @@ pnpm --dir apps/deepwiki-webui/web dev
 | `NEXT_PUBLIC_API_PORT` | `8001` | 浏览器直连后端 HTTP/WS 的端口（与后端 `PORT` 联动） |
 | `NEXT_PUBLIC_WS_BASE_URL` | 按 host + `NEXT_PUBLIC_API_PORT` 推导 | 浏览器直连后端 WebSocket 的地址（省略时按当前页 host 推导） |
 
-后端（全部收敛在 `gh_puller/envs.py`）：cc（file 类）配置随本地 Claude settings JSON —— 缺省
+后端（包内契约在 `gh_puller/envs.py`；服务端专属在 `server/app.py` / `server/tasks.py`）：cc（file 类）配置随本地 Claude settings JSON —— 缺省
 `~/.claude/settings.json`（`DEEPWIKI_CC_CONFIG` 可覆写；模型/凭证/服务端点全在该文件内，服务端原样
 透传给 agent SDK）；进程环境 `.env` 的 `ANTHROPIC_API_KEY`/`ANTHROPIC_BASE_URL` 对 cc 子进程同样
-生效（环境继承兜底）；llm（object 类）用 `OPENAI_API_KEY`/`OPENAI_BASE_URL`/`LLM_MODEL`。
-`DEEPWIKI_ROOT`（产物根目录，默认 `~/.adalflow`：
-`repos/` 克隆目录与 `wikicache/` 缓存都在其下；目录须可写，必要时 `sudo chown -R delva ~/.adalflow`）、
-`PORT`（默认 8001）、
-`DEEPWIKI_AUTH_MODE` / `DEEPWIKI_AUTH_CODE`（wiki 删除授权）、`DEEPWIKI_MAX_CONCURRENT_WIKI_TASKS` 等调度参数。
+生效（环境继承兜底）；llm（object 类）用 `OPENAI_API_KEY`/`OPENAI_BASE_URL`/`LLM_MODEL`。以上
+凭证/模型名均由 agent SDK 直读进程环境（非 envs.py 常量）。
+`DEEPWIKI_ROOT`（产物根目录，默认 `~/.gh-puller/deepwiki`：
+`repos/` 克隆目录、`graphify/` 图索引与 `wiki/` 缓存容器在其下；目录须可写，必要时
+`sudo chown -R delva ~/.gh-puller`）。
+服务端专属：`PORT`（默认 8001）、`DEEPWIKI_AUTH_MODE` / `DEEPWIKI_AUTH_CODE`（wiki 删除授权）、
+`DEEPWIKI_GENERATOR`（缺省生成器，空选型经 app 边界注入；引擎空选型 = 内建 cc）、
+`DEEPWIKI_MAX_CONCURRENT_WIKI_TASKS` 等调度参数。
 
 ## 端口与契约
 
