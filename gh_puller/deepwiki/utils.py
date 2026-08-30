@@ -50,7 +50,7 @@ def _default_get_env(key: str) -> str:
 
 
 # file 类生成器(它们的 config 是一条配置文件路径)→ config_path 的 env 缺省键;
-# 这是本层的契约知识(agent 包不提供任何缺省/元数据假设,见 configs.py 上层自验哲学)。
+# 这是本层的契约知识(agent 包不提供任何缺省/元数据假设,上层自验哲学见 generators/ 各文件 config 契约)。
 _FILE_CONFIG_PATH_ENV = {"cc": "DEEPWIKI_CC_CONFIG", "dsh": "DEEPWIKI_DSH_CORDIS",
                          "codex": "DEEPWIKI_CODEX_CONFIG"}
 
@@ -322,7 +322,7 @@ def adapter(generator: str | None = None, *, generator_config: dict | None = Non
     """generator → 适配器实例(四路收敛构造入口;≈ GENERATORS[gid](config) 一行)。
 
     gid 经 resolve_generator(file 类 config_path 规范化);llm 路 resolved 即
-    OpenAIConfig(概念键透传)。cc/dsh/codex 按 agent.configs.py TypedDict 键集
+    OpenAIConfig(概念键透传)。cc/dsh/codex 按 agent/generators/ 各文件 TypedDict 键集
     组装 config dict(空/None 不落键;SDK 映射全在 agent 侧 —— 本层零 SDK 字段名;
     config_path 纯透传,本层不读文件;模型/凭证随所选配置):
     - cc:工具隔离(setting_sources=[] + 内置 graphify 进程内 server),repo 非空时

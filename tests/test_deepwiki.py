@@ -1037,7 +1037,7 @@ def test_codex_home_isolation_and_graphify(tmp_path):
     """codex 隔离 home:config.toml 仅 graphify 单服务器 + env_vars 白名单,无用户配置面
     (与 cc setting_sources=[] / dsh 内置 cordis 同语义)。"""
     from gh_puller.agent import dsh_cordis_path  # noqa 引用仅保持模块级存在(下方用 engine 注入)
-    from gh_puller.agent.configs import codex_home_setup  # 装配收口在 configs 层(generators 零装配)
+    from gh_puller.agent.generators.codex import codex_home_setup  # 装配收口在 generators 包(codex.py 自持,上层零装配)
     home = codex_home_setup(str(tmp_path / "graph"), auth_src=False,
                             mcp_servers=_graphify_mcp("codex"))
     text = Path(home, "config.toml").read_text(encoding="utf-8")

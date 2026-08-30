@@ -60,7 +60,7 @@ class FileSink:
     字段查会话来源(<ns>/<uuid4>,ns 由上层业务定)。Linux 查询友好:
     tail -f <root>/*.jsonl 实时看;jq 过滤并按折叠规范
     (gh_puller.agent.events)还原任意时刻消息上下文。session/end 留作文件
-    脏终行;会话保鲜(keep-warm,见 generators._guard)经 FileSink.touch 直触
+    脏终行;会话保鲜(keep-warm,见 generators.base._guard)经 FileSink.touch 直触
     mtime,**不写行** —— 文件 mtime 持续前进,hub 侧方可区分"活着但静默"与"进程已死"
     (无终态行且 mtime 静止超租约 → 孤儿 aborted,见 hub.py 租约扫描)。崩溃残留 = 无终态
     行的文件(超租约前显示 running,是排查素材)。无 session/start 起点的
@@ -91,7 +91,7 @@ class FileSink:
     async def touch(self, session: str) -> None:
         """会话保鲜原语:只 os.utime 更新文件 mtime,**不写任何行、不加内容**。
 
-        供 keep-warm 定时器(见 generators._guard)在 agent 静默期调用 —— 监控端
+        供 keep-warm 定时器(见 generators.base._guard)在 agent 静默期调用 —— 监控端
         (agent-monitor hub)按"无终态行且 mtime 静止超租约"区分沉默与死亡。
         未知 session / 文件缺失 / utime 失败:静默 no-op(保鲜是尽力而为的旁路)。
         """

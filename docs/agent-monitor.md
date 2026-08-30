@@ -3,7 +3,7 @@
 
 The following files were used as context for generating this wiki page:
 
-- [gh_puller/agent/generators.py](gh_puller/agent/generators.py)
+- [gh_puller/agent/generators/](gh_puller/agent/generators/)
 - [gh_puller/agent/events.py](gh_puller/agent/events.py)
 - [gh_puller/agent/sinks.py](gh_puller/agent/sinks.py)
 - [gh_puller/envs.py](gh_puller/envs.py)
@@ -14,7 +14,7 @@ The following files were used as context for generating this wiki page:
 
 # Agent Streaming Monitor: Event-Sourced Log + Web/WS Hub
 
-Every LLM call in this repository — Claude Code agent calls (`cc_stream` / `cc_text` / `cc_result`, the single streaming funnel that `deepwiki` and the claude judge previously drilled directly into the SDK) and plain OpenAI-compatible calls (`llm_complete` / `llm_stream`) — flows through the wrappers in `gh_puller/agent/`. Callers keep their exact signature and semantics (same `RuntimeError` wording, same fallback order, same text chunks); the monitor is invisible to them. In exchange, every call is observed on **three channels**: a **file sink** (on by default), the internal **Web/WS hub** (agent-monitor; on when its endpoint is reachable), and an **OTel trace export** (Phoenix-compatible backends; on when endpoint reachable + opentelemetry importable). Sources: [gh_puller/agent/generators.py:cc_stream/cc_result/llm_stream]()
+Every LLM call in this repository — Claude Code agent calls (`cc_stream` / `cc_text` / `cc_result`, the single streaming funnel that `deepwiki` and the claude judge previously drilled directly into the SDK) and plain OpenAI-compatible calls (`llm_complete` / `llm_stream`) — flows through the wrappers in `gh_puller/agent/`. Callers keep their exact signature and semantics (same `RuntimeError` wording, same fallback order, same text chunks); the monitor is invisible to them. In exchange, every call is observed on **three channels**: a **file sink** (on by default), the internal **Web/WS hub** (agent-monitor; on when its endpoint is reachable), and an **OTel trace export** (Phoenix-compatible backends; on when endpoint reachable + opentelemetry importable). Sources: [gh_puller/agent/generators/:cc_stream/cc_result/llm_stream]()
 
 The observation model is **event-sourcing**: a single lossless append-only event log per run, aligned with the deepseek-harness invariant — the LLM `messages` context is *derived* by a surface fold, not snapshotted. The event log splits into two granularities:
 

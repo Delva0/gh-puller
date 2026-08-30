@@ -1,14 +1,14 @@
 """agent 调用统一入口 + 流式监控(事件模型/适配器/观测通道按关注点拆分)。
 
 其他模块不再直接调用 ClaudeSDKClient / httpx,一律经本包函数(无感,对外语义不变)。
-架构:events.py(事件模型) ⊂ sinks.py(观测通道) ⊂ configs.py(generator config
-世界:TypedDict 契约/SDK 字段映射/header 投影/隔离组合装配) ⊂ generators.py
-(BaseGenerator 基类 + ClaudeCode/OpenAI/Dsh/Codex 四个生成器;API 契约见
-generators.py 模块 docstring —— stream 流式产出 assistant 文本增量,result 只拿
-最后一轮输出,无 text):
+架构:events.py(事件模型) ⊂ sinks.py(观测通道) ⊂ generators/(生成器包:逐
+generator 一文件 = config 世界(TypedDict 契约/SDK 字段映射/header 投影/隔离
+组合装配)+ 适配器本体;base.py 共享基类,utils.py 共享原子;API 契约见
+generators/__init__.py 包 docstring —— stream 流式产出 assistant 文本增量,
+result 只拿最后一轮输出,无 text):
 - config 在生成器**构造时期**注入:`GENERATORS[gid](config)` 得到适配器实例,
   stream/result 只收运行时参数(prompt/会话/run 元数据);键集白名单校验在
-  上层(各 Config TypedDict 即契约,见 configs.py)。
+  上层(各 Config TypedDict 即契约,见 generators/ 各文件)。
 - ClaudeCode(SDK):流式产出 assistant 文本增量(StreamEvent `text_delta` 优先、
   AssistantMessage 兜底);is_error → RequestFailedError;thinking/工具增量只进
   监控事件流,不改变产出。
@@ -32,9 +32,21 @@ generators.py 模块 docstring —— stream 流式产出 assistant 文本增量
 (publish 语义与线程模型见 events.py EventBus;观测通道见 sinks.py)。
 """
 
-from .configs import ClaudeConfig, CodexConfig, DshConfig, OpenAIConfig, codex_home_path, dsh_cordis_path
 from .events import LOG_TYPES, SURFACE_TYPES, TAXONOMY, new_event, truncate, type_of
-from .generators import GENERATORS, ClaudeCode, Codex, Dsh, OpenAI, RequestFailedError
+from .generators import (
+    GENERATORS,
+    ClaudeCode,
+    ClaudeConfig,
+    Codex,
+    CodexConfig,
+    Dsh,
+    DshConfig,
+    OpenAI,
+    OpenAIConfig,
+    RequestFailedError,
+    codex_home_path,
+    dsh_cordis_path,
+)
 from .sinks import EventBus, FileSink, WsSink, configure, ensure_bus
 
 __all__ = [

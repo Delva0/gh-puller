@@ -14,7 +14,7 @@
 语言仅 en/zh;聊天记忆由单次 agent 会话内承。模型极简:选型为 generator +
 generator_config 两个散装字段(engine 全部函数同签名;wire 的 target dict 在 app 层拆包);
 解析/校验唯一知识源在 deepwiki.utils.resolve_generator 纯函数(agent 侧契约见
-gh_puller.agent.configs.py)。
+gh_puller.agent.generators 各生成器文件)。
 
 本包是引擎(无 FastAPI 依赖):HTTP 端点层(SSE/WS)在 apps/deepwiki-webui/server/app.py;
 任务状态机/调度/进度投影在其 server/tasks.py。续跑落盘(resume_*)语义见 ./wiki.py。

@@ -23,14 +23,8 @@ from opentelemetry.trace import StatusCode
 
 from gh_puller import agent, envs
 from gh_puller.agent import EventBus, FileSink, new_event, sinks
-from gh_puller.agent.generators import (
-    _handle_assistant_message,
-    _handle_stream_event,
-    _normalize_usage,
-    EventRecorder,
-    _session_id,
-)
-from gh_puller.agent.events import set_active_bus
+from gh_puller.agent.events import EventRecorder, _normalize_usage, _session_id, set_active_bus
+from gh_puller.agent.generators.cc import _handle_assistant_message, _handle_stream_event
 from gh_puller.agent.sinks import OtelSink
 
 
@@ -384,7 +378,7 @@ class _AsyncIter:
 
 
 class _FakeClaudeAgentOptions:
-    """形似 ClaudeAgentOptions:记录构造 kwargs(cc 经 configs.claude_options 装配)。"""
+    """形似 ClaudeAgentOptions:记录构造 kwargs(cc 经 claude_options 装配)。"""
 
     def __init__(self, **kwargs):
         self.kwargs = kwargs
@@ -1924,7 +1918,7 @@ async def test_codex_stream_config_isolation_and_auth(monkeypatch, tmp_path):
 
 def test_codex_turn_summary_default_and_override():
     """codex_turn 装配:缺省打开可见推理摘要(detailed);显式 none/auto 尊重。"""
-    from gh_puller.agent.configs import codex_turn
+    from gh_puller.agent.generators.codex import codex_turn
 
     assert codex_turn({})["summary"] == "detailed"
     assert codex_turn({"summary": "none"})["summary"] == "none"
@@ -1971,7 +1965,7 @@ def test_codex_home_setup_config_toml_and_auth(tmp_path, monkeypatch):
     本地凭证(cc 的 CLI 自持凭证同形:重新登录即跟随,无副本陈旧)且幂等。"""
     from pathlib import Path
 
-    from gh_puller.agent.configs import codex_home_setup as _codex_home_setup
+    from gh_puller.agent.generators.codex import codex_home_setup as _codex_home_setup
 
     user_home = tmp_path / "home"
     (user_home / ".codex").mkdir(parents=True)
@@ -2072,7 +2066,7 @@ def _llm_options():
 async def test_llm_result_drains_stream_events(monkeypatch):
     """llm result 经流式端点抽取:事件与 stream 同构(逐 delta chunk,非整段 1 条);
     末块 usage/finish_reason 落入 session/end。"""
-    from gh_puller.agent import generators as gen_mod
+    from gh_puller.agent.generators import openai as gen_mod
 
     agent.configure(ws_urls=[], otel_urls=[])
     got = []

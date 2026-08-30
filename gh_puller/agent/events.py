@@ -20,7 +20,7 @@ seq 序列是流式事件流的稠密序号;文件侧(非流式投影)按行跳�
   SDK 装配对象如 mcp.server.Server 实例折叠为类型名,见 _jsonable);
 - context/modify 是上下文修改的解释事件(日志型,不折动),折叠正确性与它无关 ——
   丢弃也只是少了解释,不会误解消息历史;
-- **会话保活不再走事件**:session 活着但静默时的"保鲜"由 generators._guard 的
+- **会话保活不再走事件**:session 活着但静默时的"保鲜"由 generators.base._guard 的
   keep-warm 定时器调 sinks.touch(session) 直触文件 mtime(只动时间、不加行),
   监测端(agent-monitor hub)借"无终态行且 mtime 静止超租约"判定会话已死 ——
   本文件不再有 session/heartbeat 事件(已从模型的静默补发事件里移除)。
