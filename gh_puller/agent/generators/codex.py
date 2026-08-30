@@ -9,6 +9,7 @@ codex_turn),config_path 纯透传(home config.toml 符号链接),mcp_servers 通
 """
 
 import asyncio
+import contextlib
 import json
 import shutil
 from pathlib import Path
@@ -190,7 +191,7 @@ def _codex_config_toml_content(*, mcp_servers: list[dict] | None = None,
     """隔离 config.toml 内容:按调用方注入的通用 mcp 服务器描述渲染(组合即隔离边界,镜像 dsh 的 _DSH_CORDIS_YAML)。
 
     无用户 model_provider/keys/mcp/hook/高级设置。每条 spec 应带 id/command/args/
-    env_vars(值不内联,每 run 经 CodexConfig.env 注入 app-server 进程环境,再由
+    env_vars(值不内联,每次运行经 CodexConfig.env 注入 app-server 进程环境,再由
     rmcp stdio 启动器按白名单取走)。mcp_servers 空 → 空 config(无附加工具桌);
     本层不识别任何具体工具名。web_search = True → [features] web_search_request
     (Codex 内置网络搜索工具;CLI 默认出于安全关闭,须显式启用 —— 产物隔离边界内的
@@ -306,12 +307,12 @@ class _CodexSynth:
 
     为什么是合成而非投影(对比 _DshProj):codex 通知不携带 seq/turn/step 编号、无
     生命周期事件、无 sourceEventSeqs —— 流顺序是唯一权威(与 cc 同构);合成器只维护
-    自洽编号(run.seq 自己数、turn/step 自开合、tool/call|result 自合成),去重是
+    自洽编号(event_recorder.seq 自己数、turn/step 自开合、tool/call|result 自合成),去重是
     字典/布尔判断,没有第二套编号要伺候。
     """
 
-    def __init__(self, run: EventRecorder, prompt: str):
-        self.run = run
+    def __init__(self, event_recorder: EventRecorder, prompt: str):
+        self.event_recorder = event_recorder
         self.prompt = prompt
         self.turn_id: str | None = None  # turn/started 的 turn.id(记录用;路由已由 SDK 按 turn 过滤)
         self.agent_pieces: dict[str, list[str]] = {}  # itemId → agentMessage 增量碎片(去重/消息组装)
@@ -376,7 +377,7 @@ def _codex_tool_result(item, itype: str) -> dict:
             "is_error": is_error, "arguments": arguments}
 
 
-def _codex_item_completed(run: EventRecorder, st: _CodexSynth, payload) -> list[str]:
+def _codex_item_completed(event_recorder: EventRecorder, st: _CodexSynth, payload) -> list[str]:
     """item/completed → surface/工具事件合成(纯 dict 构造,测试可喂假 Notification)。"""
     item = _codex_item(payload.item)
     itype = _codex_item_type(item)
@@ -385,26 +386,26 @@ def _codex_item_completed(run: EventRecorder, st: _CodexSynth, payload) -> list[
         pieces = st.agent_pieces.get(item_id) or []
         text = "".join(pieces) or (getattr(item, "text", None) or "")
         if not pieces and text:
-            run.text(text)  # 兜底:无增量事件(流缺 chunk)→ 整块一次(cc AssistantMessage 兜底对齐)
+            event_recorder.text(text)  # 兜底:无增量事件(流缺 chunk)→ 整块一次(cc AssistantMessage 兜底对齐)
         if text:
             st.final_response = text  # 末条 agentMessage = result 终局文本
         message = {"role": "assistant", "content": [{"type": "content", "text": text}]}
         phase = getattr(item, "phase", None)
         if phase is not None:
             message["content"][0]["phase"] = codex_val(phase)
-        run.event("assistant/message", turn=run.turn, step=run.step, message=message,
-                  surfaceOp="append", sourceSeqs=list(run._chunk_seqs))
+        event_recorder.event("assistant/message", turn=event_recorder.turn, step=event_recorder.step, message=message,
+                  surfaceOp="append", sourceSeqs=list(event_recorder._chunk_seqs))
         return [text] if not pieces and text else []
     if itype in ("dynamicToolCall", "mcpToolCall", "commandExecution"):
         st.tool_round_open = True
         info = _codex_tool_result(item, itype)
         call_id = item_id
-        run.tool_call(call_id, info["name"], info["arguments"])
-        run.tool_result(
+        event_recorder.tool_call(call_id, info["name"], info["arguments"])
+        event_recorder.tool_result(
             {"role": "user", "content": [{"type": "tool_result", "tool_use_id": call_id,
                                           "content": info["content"], "is_error": info["is_error"]}]},
             call_id=call_id, name=info["name"], is_error=info["is_error"],
-            src_seq=run._call_seqs.get(call_id),
+            src_seq=event_recorder._call_seqs.get(call_id),
         )
         return []
     if itype == "reasoning":
@@ -413,13 +414,13 @@ def _codex_item_completed(run: EventRecorder, st: _CodexSynth, payload) -> list[
         content = getattr(item, "content", None) or []
         pieces = content or (getattr(item, "summary", None) or [])
         if pieces and item_id not in st.reasoning_seen:
-            run.chunk({"type": "thinking", "index": 0, "text": "\n".join(pieces)})
+            event_recorder.chunk({"type": "thinking", "index": 0, "text": "\n".join(pieces)})
         return []
     if itype == "plan":
         text = getattr(item, "text", None) or ""
         if text and item_id not in st.plan_items:
             st.plan_items.add(item_id)
-            run.chunk({"type": "plan", "index": 0, "text": text})
+            event_recorder.chunk({"type": "plan", "index": 0, "text": text})
         return []
     if itype == "webSearch":
         # Codex 内置网络搜索(web_search_request):started 是空壳占位(query=""/action=None),
@@ -438,22 +439,22 @@ def _codex_item_completed(run: EventRecorder, st: _CodexSynth, payload) -> list[
                                ensure_ascii=False)
         results = getattr(item, "results", None) or []  # opaque JSON(SDK 不保证字段形状)
         content = json.dumps(results, ensure_ascii=False, default=str) if results else ""
-        run.tool_call(item_id, "web_search", arguments)
-        run.tool_result(
+        event_recorder.tool_call(item_id, "web_search", arguments)
+        event_recorder.tool_result(
             {"role": "user", "content": [{"type": "tool_result", "tool_use_id": item_id,
                                           "content": content, "is_error": False}]},
             call_id=item_id, name="web_search", is_error=False,
-            src_seq=run._call_seqs.get(item_id),
+            src_seq=event_recorder._call_seqs.get(item_id),
         )
         return []
-    return []  # userMessage 已由 run.user_message 合成;fileChange/子代理等 v1 静默跳过
+    return []  # userMessage 已由 event_recorder.user_message 合成;fileChange/子代理等 v1 静默跳过
 
 
-def _handle_codex_notification(run: EventRecorder, st: _CodexSynth, notif) -> list[str]:
+def _handle_codex_notification(event_recorder: EventRecorder, st: _CodexSynth, notif) -> list[str]:
     """codex 通知 → gh TAXONOMY 事件合成(纯鸭子读取,测试可喂假 Notification)。
 
     返回本事件产生的文本增量(供 stream yield);codex 无 seq,顺序即通知流顺序;
-    turn/step 生命周期由 run.start / step_boundary 合成(prologue 同 cc),codex 的
+    turn/step 生命周期由 event_recorder.start / step_boundary 合成(prologue 同 cc),codex 的
     turn/started|completed 只贡献 stop_reason / 失败判定。
     """
     method = getattr(notif, "method", "")
@@ -466,7 +467,7 @@ def _handle_codex_notification(run: EventRecorder, st: _CodexSynth, notif) -> li
         st.saw_turn_completed = True
         turn = getattr(payload, "turn", None) or {}
         kind = codex_val(getattr(turn, "status", None))
-        run.result_stop_reason = kind if isinstance(kind, str) else None
+        event_recorder.result_stop_reason = kind if isinstance(kind, str) else None
         if kind != "completed":
             error = getattr(turn, "error", None) or {}
             detail = getattr(error, "message", None) or kind
@@ -479,14 +480,14 @@ def _handle_codex_notification(run: EventRecorder, st: _CodexSynth, notif) -> li
             st.agent_pieces.setdefault(getattr(item, "id", None) or "", [])
         if itype in ("agentMessage", "reasoning", "plan") and st.tool_round_open:
             st.tool_round_open = False
-            run.step_boundary()  # 工具结果后新一轮 LLM 请求 → 新 step(单次翻转,聚合并行工具)
+            event_recorder.step_boundary()  # 工具结果后新一轮 LLM 请求 → 新 step(单次翻转,聚合并行工具)
         return []
     if method == "item/agentMessage/delta":
         text = getattr(payload, "delta", None) or ""
         if not text:
             return []
         st.agent_pieces.setdefault(getattr(payload, "item_id", None) or "", []).append(text)
-        run.text(text)
+        event_recorder.text(text)
         return [text]
     if method in ("item/reasoning/textDelta", "item/reasoning/summaryTextDelta"):
         delta = getattr(payload, "delta", None) or ""
@@ -497,7 +498,7 @@ def _handle_codex_notification(run: EventRecorder, st: _CodexSynth, notif) -> li
             index = (getattr(payload, "content_index", None)
                      if method == "item/reasoning/textDelta"
                      else getattr(payload, "summary_index", None))
-            run.chunk({"type": "thinking", "index": index if index is not None else 0,
+            event_recorder.chunk({"type": "thinking", "index": index if index is not None else 0,
                        "text": delta})
         return []
     if method == "item/plan/delta":
@@ -505,28 +506,28 @@ def _handle_codex_notification(run: EventRecorder, st: _CodexSynth, notif) -> li
         delta = getattr(payload, "delta", None) or ""
         if delta:
             st.plan_items.add(getattr(payload, "item_id", None) or "")
-            run.chunk({"type": "plan", "index": 0, "text": delta})  # 无段位字段,单文档
+            event_recorder.chunk({"type": "plan", "index": 0, "text": delta})  # 无段位字段,单文档
         return []
     if method == "item/completed":
-        return _codex_item_completed(run, st, payload)
+        return _codex_item_completed(event_recorder, st, payload)
     if method == "thread/tokenUsage/updated":
         usage = getattr(payload, "token_usage", None) or {}
         breakdown = getattr(usage, "total", None) or getattr(usage, "last", None)
         if breakdown is not None:
-            run.result_usage = _normalize_usage(breakdown)  # 末条为准 → session/end(同 dsh)
+            event_recorder.result_usage = _normalize_usage(breakdown)  # 末条为准 → session/end(同 dsh)
         return []
     return []  # summaryPartAdded(段位由 delta 的 summary_index 承载)、outputDelta、progress
     # 等:无文本增量或属日志型,v1 不进流
 
 
-async def _codex_drain(handle, run: EventRecorder, st: _CodexSynth):
+async def _codex_drain(handle, event_recorder: EventRecorder, st: _CodexSynth):
     """codex 通知流 → 文本增量(stream/result 共用):turn 未完成 → RequestFailedError。
 
     result 与 stream 同构:终局文本取 st.final_response(末条 agentMessage);
     不再直取 TurnResult(handle.run() 不暴露通知,事件流将只有生命周期)。
     """
     async for notif in handle.stream():
-        for delta in _handle_codex_notification(run, st, notif):
+        for delta in _handle_codex_notification(event_recorder, st, notif):
             yield delta
     if not st.saw_turn_completed:
         raise RequestFailedError("turn 未收到完成事件")
@@ -544,10 +545,13 @@ class Codex(BaseGenerator):
     CodexConfig → SDK 装配件(下方 codex_*:codex_home/codex_config/codex_thread/
     codex_turn);config_path 纯透传(home config.toml 符号链接),mcp_servers 通用注入
     工具桌;codex_home 缺省回退内置隔离目录,system_prompt → base_instructions。
-    构造期即建 SDK 客户端(AsyncCodex 绑定 config);连接与 thread 建立在调用期。
+    构造期即建 SDK 客户端绑定(AsyncCodex 绑定 config);连接(AsyncCodex 进入)在
+    生成器 with 段(__aenter__),未显式 with 时由 stream/result 自动进入;thread
+    建立在调用期。
     """
 
     generator = "codex"
+    provider = "openai"
 
     def __init__(self, config: dict):
         super().__init__(config)
@@ -555,12 +559,23 @@ class Codex(BaseGenerator):
 
         self._codex = AsyncCodex(config=codex_config(config))
 
-    async def stream(self, prompt: str, *, session: str | None = None,
-                     session_name: str | None = None, run_id: str | None = None,
-                     session_ns: str | None = None,
-                     context: list[dict] | None = None, retry: dict | None = None,
-                     meta: dict | None = None):
-        """Codex 流式应答(监控 + 执行)。
+    async def _enter(self):
+        await self._codex.__aenter__()  # 连接进入
+
+    async def _exit(self, exc):
+        await self._codex.__aexit__(*exc)  # 连接回收
+
+    @contextlib.asynccontextmanager
+    async def session(self, **kw):
+        """codex 会话:协议层错误(JsonRpcError)归 parse;其余循基类编排。"""
+        from openai_codex import JsonRpcError
+
+        async with super().session(error_stage=lambda exc: _codex_stage(exc, (JsonRpcError,)),
+                                   **kw):
+            yield
+
+    async def stream(self, prompt: str):
+        """Codex 流式驱动(纯载荷;会话元数据经 session())。
 
         对外产出:assistant 文本增量(item/agentMessage/delta 优先、item/completed
         整块兜底),turn 非 completed → RequestFailedError;thinking/plan/工具增量
@@ -572,74 +587,56 @@ class Codex(BaseGenerator):
         凭证(cc 同形:环境隔离不隔离凭证通道):零配置缺省符号链接引用真实
         ~/.codex/auth.json;显式 config.token → login_api_key 写本隔离 home。
         """
-        from openai_codex import JsonRpcError
-
         config = self.config
-        run = self._recorder(session=session, session_ns=session_ns, run_id=run_id,
-                        session_name=session_name, meta=meta)
-        run.init_config(config)
-        run.start(context=context, retry=retry)
-        run.user_message({"role": "user", "content": [{"type": "text", "text": prompt}]})
-        st = _CodexSynth(run, prompt)
+        event_recorder = self._require_event_recorder()
+        event_recorder.user_message({"role": "user", "content": [{"type": "text", "text": prompt}]})
+        st = _CodexSynth(event_recorder, prompt)
         timeout = config.get("timeout_seconds")
         home = codex_home(config)  # config → 隔离 home(装配在本文件)
-        guard = self._guard(run, error_stage=lambda exc: _codex_stage(exc, (JsonRpcError,)))
-        async with guard, self._codex as codex:
-            if (token := config.get("token") or ""):
-                # 显式 token → 登录凭证属本隔离 home:先断符号链接防穿透写坏用户 ~/.codex/auth.json
-                auth = Path(home) / "auth.json"
-                if auth.is_symlink():
-                    auth.unlink()
-                await codex.login_api_key(token)
-            thread = await codex.thread_start(**codex_thread(config))
-            handle = await thread.turn(prompt, **codex_turn(config))
+        if (token := config.get("token") or ""):
+            # 显式 token → 登录凭证属本隔离 home:先断符号链接防穿透写坏用户 ~/.codex/auth.json
+            auth = Path(home) / "auth.json"
+            if auth.is_symlink():
+                auth.unlink()
+            await self._codex.login_api_key(token)
+        thread = await self._codex.thread_start(**codex_thread(config))
+        handle = await thread.turn(prompt, **codex_turn(config))
 
-            if timeout is not None:
-                async with asyncio.timeout(timeout):  # 兜底 review/approval 等待挂流
-                    async for chunk in _codex_drain(handle, run, st):
-                        yield chunk
-            else:
-                async for chunk in _codex_drain(handle, run, st):
+        if timeout is not None:
+            async with asyncio.timeout(timeout):  # 兜底 review/approval 等待挂流
+                async for chunk in _codex_drain(handle, event_recorder, st):
                     yield chunk
+        else:
+            async for chunk in _codex_drain(handle, event_recorder, st):
+                yield chunk
 
-    async def result(self, prompt: str, *, session: str | None = None,
-                     session_name: str | None = None, run_id: str | None = None,
-                     session_ns: str | None = None,
-                     context: list[dict] | None = None, retry: dict | None = None,
-                     meta: dict | None = None) -> str:
-        """非流式最终结果:只拿最后一轮 —— 通知流末条 agentMessage 文本(st.final_response)。
+    async def result(self, prompt: str) -> str:
+        """非流式最终结果(纯载荷):只拿最后一轮 —— 通知流末条 agentMessage 文本(st.final_response)。
 
         turn 非 completed / 未产出 → RequestFailedError。与 stream 同构消费通知流
         (_codex_drain):事件全量合成。旧实现直取 handle.run() 的 TurnResult ——
         不暴露通知,事件流只有生命周期,观测不到 assistant/工具事件。
         """
-        from openai_codex import JsonRpcError
-
         config = self.config
-        run = self._recorder(session=session, session_ns=session_ns, run_id=run_id,
-                        session_name=session_name, meta=meta)
-        run.init_config(config)
-        run.start(context=context, retry=retry)
-        run.user_message({"role": "user", "content": [{"type": "text", "text": prompt}]})
-        st = _CodexSynth(run, prompt)  # result 与 stream 同构:合成器照常驱动
+        event_recorder = self._require_event_recorder()
+        event_recorder.user_message({"role": "user", "content": [{"type": "text", "text": prompt}]})
+        st = _CodexSynth(event_recorder, prompt)  # result 与 stream 同构:合成器照常驱动
         timeout = config.get("timeout_seconds")
         home = codex_home(config)  # config → 隔离 home(装配在本文件)
-        guard = self._guard(run, error_stage=lambda exc: _codex_stage(exc, (JsonRpcError,)))
-        async with guard, self._codex as codex:
-            if (token := config.get("token") or ""):
-                auth = Path(home) / "auth.json"
-                if auth.is_symlink():
-                    auth.unlink()
-                await codex.login_api_key(token)
-            thread = await codex.thread_start(**codex_thread(config))
-            handle = await thread.turn(prompt, **codex_turn(config))
-            if timeout is not None:
-                async with asyncio.timeout(timeout):  # 兜底 review/approval 等待挂流
-                    async for _ in _codex_drain(handle, run, st):
-                        pass
-            else:
-                async for _ in _codex_drain(handle, run, st):
+        if (token := config.get("token") or ""):
+            auth = Path(home) / "auth.json"
+            if auth.is_symlink():
+                auth.unlink()
+            await self._codex.login_api_key(token)
+        thread = await self._codex.thread_start(**codex_thread(config))
+        handle = await thread.turn(prompt, **codex_turn(config))
+        if timeout is not None:
+            async with asyncio.timeout(timeout):  # 兜底 review/approval 等待挂流
+                async for _ in _codex_drain(handle, event_recorder, st):
                     pass
+        else:
+            async for _ in _codex_drain(handle, event_recorder, st):
+                pass
         final = st.final_response or ""
         if not final:
             raise RequestFailedError("未产出最终结果")

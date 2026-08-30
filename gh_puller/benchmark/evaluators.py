@@ -80,9 +80,11 @@ class LLMEvaluator:
             if nudge:
                 payload["messages"].append({"role": "user", "content": self.retry_nudge})
             try:
-                content = await OpenAI(
+                llm = OpenAI(
                     {"model": self.model, "base_url": self.url, "api_key": LLM_JUDGE_API_KEY},
-                ).result(payload, timeout=TIMEOUT, headers=headers, session_name="judge:llm")
+                )
+                async with llm.session(session_name="judge:llm"):
+                    content = await llm.result(payload, timeout=TIMEOUT, headers=headers)
                 return self.coerce(json.loads(content))
             except Exception as e:  # 网络/HTTP/解析失败:继续下一轮,耗尽后降级
                 last_err = e
@@ -113,9 +115,9 @@ class ClaudeEvaluator:
         try:
             options = self.make_options(question, ref, answer)
             config = vars(options) if hasattr(options, "__dict__") else dict(options)
-            result = await ClaudeCode(config).result(
-                self.user_prompt(question, ref, answer), session_name="judge:claude",
-            )
+            gen = ClaudeCode(config)
+            async with gen.session(session_name="judge:claude"):
+                result = await gen.result(self.user_prompt(question, ref, answer))
             return self.coerce(json.loads(result))
         except Exception as e:  # SDK/解析异常:降级输出,不抛出
             return {"dimensions": {}, "overall": 0, "reason": f"评测失败: {type(e).__name__}: {e}"}

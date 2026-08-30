@@ -9,6 +9,11 @@ result 只拿最后一轮输出,无 text):
 - config 在生成器**构造时期**注入:`GENERATORS[gid](config)` 得到适配器实例,
   stream/result 只收运行时参数(prompt/会话/run 元数据);键集白名单校验在
   上层(各 Config TypedDict 即契约,见 generators/ 各文件)。
+- 生成器即对应 client 的包装,**唯一 with 入口是 session()**:`async with gen.session(...)`
+  = 一次上游对话 —— 会话元数据(session/session_name/run_id/context/retry/meta)
+  经 API 注入,enter = recorder 装配 + session/start + 客户端 spawn,exit = 收尾
+  (finish/error)+ 客户端回收(监控与客户端同寿);stream/result 只收运行时载荷
+  (prompt/payload),在 session 块内调用(范例见 generators/__init__.py __main__)。
 - ClaudeCode(SDK):流式产出 assistant 文本增量(StreamEvent `text_delta` 优先、
   AssistantMessage 兜底);is_error → RequestFailedError;thinking/工具增量只进
   监控事件流,不改变产出。

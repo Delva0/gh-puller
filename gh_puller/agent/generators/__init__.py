@@ -14,6 +14,13 @@
   config(键集白名单见各生成器文件 TypedDict)后直接 `GENERATORS[id](config)`
   构造适配器实例、直呼其 stream/result;失败抛 RequestFailedError(detail 为
   失败原因;llm 异常原样,重试留给调用方)。
+- with 语义(生成器 = 对应 client 的包装,**唯一入口是 session**):`async with
+  GENERATORS[id](config).session(...)` = 一次上游对话 —— 会话元数据(session/
+  session_name/run_id/context/retry/meta)在 session 注入,进入 = recorder 装配 +
+  session/start + 客户端 spawn(子类 _enter/_exit 钩子随 session 生命周期),退出
+  = 收尾(finish/error) + 客户端回收 —— 监控与客户端同寿;
+  - stream/result 只收运行时载荷(prompt/payload),**必须在 session 块内调用**
+    (元数据不进调用;块外调用 → RuntimeError)。
 
 API 契约(人类开发者正式定义):
 - `stream(prompt)`:流式输出 agent 所有 message 产出,其中 assistant 输出包含
@@ -83,6 +90,8 @@ if __name__ == "__main__":
     # 介绍 —— result() 各生成器最后一轮语义(多轮工具用后只取终稿)在真实任务下可验。
     # cc/codex 零配置走缺省隔离(llm 按环境取值 OPENAI_BASE_URL/LLM_MODEL/OPENAI_API_KEY);
     # 真实任务各生成器可加工具授权:cc 见下方 allowed_tools,codex 以 web_search。
+    # 会话语义:一次 `async with cc.session(...)` = 一次上游对话(监控装配/客户端
+    # spawn → 收尾/回收);stream/result 只收 prompt(元数据全在 session)。
     # 注:dsh 不在此演示 —— 本机 SDK 载体(runtime exe)未构建,见 dsh 真机测试恢复点。
 
     QUESTION = "请访问 https://github.com/yankils/hello-world 并写一句话介绍这个仓库。"
@@ -101,18 +110,20 @@ if __name__ == "__main__":
                 "model": os.environ.get("LLM_MODEL") or "gpt-5.6-luna",
                 "api_key": os.environ.get("OPENAI_API_KEY"),
             }
-        gen = GENERATORS[gid](config)  # 构造期注入 config;stream/result 只收运行时参数
+        cc = GENERATORS[gid](config)  # 构造期注入 config = 拿到客户端包装
         prompt = (
             {"messages": [{"role": "user", "content": QUESTION}], "max_tokens": 256}
             if gid == "llm" else QUESTION
         )
 
         print(f"[{gid}] 流式(stream):")
-        parts = [c async for c in gen.stream(prompt, session_name=f"demo:{gid}")]
+        async with cc.session(session_name=f"demo:{gid}"):  # 一次会话(监控与客户端同寿)
+            parts = [c async for c in cc.stream(prompt)]
         print("".join(parts) or "(无产出)")
 
         print(f"[{gid}] 终局(result):")
-        final = await gen.result(prompt, session_name=f"demo-result:{gid}")
+        async with cc.session(session_name=f"demo-result:{gid}"):
+            final = await cc.result(prompt)
         print(final or "(空)")
 
     async def _main() -> None:

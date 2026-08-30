@@ -20,7 +20,7 @@ seq 序列是流式事件流的稠密序号;文件侧(非流式投影)按行跳�
   SDK 装配对象如 mcp.server.Server 实例折叠为类型名,见 _jsonable);
 - context/modify 是上下文修改的解释事件(日志型,不折动),折叠正确性与它无关 ——
   丢弃也只是少了解释,不会误解消息历史;
-- **会话保活不再走事件**:session 活着但静默时的"保鲜"由 generators.base._guard 的
+- **会话保活不再走事件**:session 活着但静默时的"保鲜"由 generators.base.session 的
   keep-warm 定时器调 sinks.touch(session) 直触文件 mtime(只动时间、不加行),
   监测端(agent-monitor hub)借"无终态行且 mtime 静止超租约"判定会话已死 ——
   本文件不再有 session/heartbeat 事件(已从模型的静默补发事件里移除)。
@@ -215,11 +215,14 @@ class EventRecorder:
     """单次运行的事件发布器:维护会话信封/turn/step/seq 计数,归一化后广播事件。"""
 
     def __init__(self, session: str, *, generator: str = "",
+                 provider: str | None = None, model: str | None = None,
                  label: str | None = None,
                  run_id: str | None = None, meta=None):
         self.session = session
         self.label = label or session
         self.generator = generator
+        self.provider = provider
+        self.model = model
         self.run_id = run_id
         self.meta = meta
         self.seq = 0
@@ -327,7 +330,7 @@ class EventRecorder:
         不合成 turn/start + step/start,且 _step_open 保持 False(dsh 路径不调 step_boundary)。
         """
         self.event("session/start", run_id=self.run_id, label=self.label, generator=self.generator,
-                   retry=retry, meta=self.meta)
+                   provider=self.provider, model=self.model, retry=retry, meta=self.meta)
         for ctx in context or []:
             self.event(ctx["type"], **ctx["data"])  # 日志型说明事件:重放于 turn 之前
         if prologue:
@@ -416,7 +419,7 @@ class EventRecorder:
         if self._ended:
             return
         self._ended = True
-        # 防御:不经 _guard 的 stop_keepwarm 直接结束的路径,也取消保鲜任务(非 await;
+        # 防御:不经 session 的 stop_keepwarm 直接结束的路径,也取消保鲜任务(非 await;
         # _guard 路径已 await,此处兜底防对侧任务在 session/end 之后仍 touch)。
         if self._keepwarm_task is not None:
             self._keepwarm_task.cancel()

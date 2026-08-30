@@ -7,16 +7,17 @@
 """
 
 import asyncio
+import contextlib
 import json
 import types
+from typing import ClassVar
 
 import httpx
 import pytest
 import pytest_asyncio
 
 from gh_puller import agent
-from gh_puller.benchmark.evaluators import ClaudeEvaluator
-from gh_puller.benchmark.evaluators import LLMEvaluator
+from gh_puller.benchmark.evaluators import ClaudeEvaluator, LLMEvaluator
 
 
 @pytest_asyncio.fixture(autouse=True)
@@ -57,22 +58,33 @@ GOOD_VERDICT = '{"dimensions": {"code_essence": 8}, "overall": 7, "reason": "ok"
 async def test_claude_judge_success(monkeypatch):
     calls = []
 
-    async def fake_result(self, prompt, *, session_name=None, meta=None, **kw):
-        calls.append((self.config.get("model"), prompt, session_name))
+    @contextlib.asynccontextmanager
+    async def fake_session(self, *, session_name=None, **kw):
+        calls.append((self.config.get("model"), None, session_name))
+        yield self
+
+    async def fake_result(self, prompt, **kw):
+        calls.append((self.config.get("model"), prompt, ""))
         return GOOD_VERDICT
 
+    monkeypatch.setattr(agent.ClaudeCode, "session", fake_session)
     monkeypatch.setattr(agent.ClaudeCode, "result", fake_result)
     judge = _MiniClaude()
     r = await judge.evaluate("q", "ref", "ans")
     assert r["overall"] == 7
-    assert calls == [("", "judge q", "judge:claude")]
+    assert calls == [("", None, "judge:claude"), ("", "judge q", "")]  # 会话名在 session();载荷在 result()
 
 
 @pytest.mark.asyncio
 async def test_claude_judge_degrades_on_error_and_bad_json(monkeypatch):
-    async def fake_result(self, prompt, *, session_name=None, meta=None, **kw):
+    @contextlib.asynccontextmanager
+    async def fake_session(self, **kw):
+        yield self
+
+    async def fake_result(self, prompt, **kw):
         raise RuntimeError("boom")
 
+    monkeypatch.setattr(agent.ClaudeCode, "session", fake_session)
     monkeypatch.setattr(agent.ClaudeCode, "result", fake_result)
     judge = _MiniClaude()
     r = await judge.evaluate("q", "ref", "ans")
@@ -121,8 +133,8 @@ class _FakeSSERes:
 class _FakeHttpClient:
     """形似 httpx.AsyncClient 的假客户端:捕获请求体,按 index 返回预设响应。"""
 
-    posts: list[tuple[str, dict, dict]] = []
-    responses: list[_FakeResponse] = []
+    posts: ClassVar[list[tuple[str, dict, dict]]] = []  # 类级共享桶(测试整体替换后逐请求追加)
+    responses: ClassVar[list[_FakeResponse]] = []
 
     def __init__(self, timeout=None):
         self.timeout = timeout
@@ -133,7 +145,7 @@ class _FakeHttpClient:
     async def __aexit__(self, *exc):
         return False
 
-    async def post(self, url, json, headers, timeout=None):
+    async def post(self, url, json, headers, timeout=None):  # noqa: ASYNC109 - 与 httpx.post 同形,timeout 名属契约
         _FakeHttpClient.posts.append((url, json, headers))
         return _FakeHttpClient.responses.pop(0)
 

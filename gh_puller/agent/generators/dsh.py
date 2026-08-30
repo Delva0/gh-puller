@@ -253,8 +253,8 @@ class _DshProj:
     epilogue=not saw_turn_end)+ synth 双表达去重 + 字段改名 —— 即 _DshProj。
     """
 
-    def __init__(self, run: EventRecorder, prompt: str, session_id: str):
-        self.run = run
+    def __init__(self, event_recorder: EventRecorder, prompt: str, session_id: str):
+        self.event_recorder = event_recorder
         self.prompt = prompt
         self.session_id = session_id  # dsh session_id(JSONL 文件名;子代理会话过滤用)
         self.seq_map: dict[int, int] = {}
@@ -266,21 +266,21 @@ class _DshProj:
         self.last_finish_kind: str | None = None
 
     def track(self, dsh_seq: int, action) -> int | None:
-        """执行一次恰好发布单事件的 action(如 run.text/tool_call),记录 dsh_seq → gh seq。
+        """执行一次恰好发布单事件的 action(如 event_recorder.text/tool_call),记录 dsh_seq → gh seq。
 
-        bus disabled 时 run.seq 不增长(事件不构造)→ 不记录映射,防悬空 seq;
+        bus disabled 时 event_recorder.seq 不增长(事件不构造)→ 不记录映射,防悬空 seq;
         返回 gh seq(未发布返回 None)。
         """
-        before = self.run.seq
+        before = self.event_recorder.seq
         action()
-        if self.run.seq > before and dsh_seq is not None:
-            self.seq_map[dsh_seq] = self.run.seq - 1
-            return self.run.seq - 1
+        if self.event_recorder.seq > before and dsh_seq is not None:
+            self.seq_map[dsh_seq] = self.event_recorder.seq - 1
+            return self.event_recorder.seq - 1
         return None
 
     def forward(self, dsh_seq: int, evt_type: str, **data) -> dict | None:
         """发布 gh 事件并记录 seq 映射;返回事件(无 sink 时 None)。"""
-        evt = self.run.event(evt_type, **data)
+        evt = self.event_recorder.event(evt_type, **data)
         if evt is not None and dsh_seq is not None:
             self.seq_map[dsh_seq] = evt["seq"]
         return evt
@@ -291,20 +291,20 @@ class _DshProj:
                 if s in self.seq_map]
 
 
-def _project_dsh_chunk(run: EventRecorder, proj: _DshProj, dsh_seq, chunk: dict) -> list[str]:
+def _project_dsh_chunk(event_recorder: EventRecorder, proj: _DshProj, dsh_seq, chunk: dict) -> list[str]:
     """dsh StreamChunk → gh assistant/chunk 增量投影(逐条),返回文本增量。
 
-    文本增量走 run.text(计入 text_chars 且 yield);thinking/tool_input 只进
+    文本增量走 event_recorder.text(计入 text_chars 且 yield);thinking/tool_input 只进
     事件流不改变产出(与 cc 漏斗一致);tool-call 收尾经 block-end 的完整
     arguments 合成 tool/call(整串优先,缺失时拼 delta 碎片)。
     """
     ctype = chunk.get("type")
     if ctype == "text-delta":
         text = chunk.get("text") or ""
-        proj.track(dsh_seq, lambda: run.text(text, index=chunk.get("index", 0)))
+        proj.track(dsh_seq, lambda: event_recorder.text(text, index=chunk.get("index", 0)))
         return [text] if text else []
     if ctype == "reasoning-delta":
-        proj.track(dsh_seq, lambda: run.chunk({"type": "thinking", "index": chunk.get("index", 0),
+        proj.track(dsh_seq, lambda: event_recorder.chunk({"type": "thinking", "index": chunk.get("index", 0),
                                                "text": chunk.get("text") or ""}))
         return []
     if ctype == "tool-call-delta":
@@ -315,7 +315,7 @@ def _project_dsh_chunk(run: EventRecorder, proj: _DshProj, dsh_seq, chunk: dict)
             slot["name"] = chunk["name"]
         piece = chunk.get("argumentsDelta") or ""
         slot["pieces"].append(piece)
-        proj.track(dsh_seq, lambda: run.chunk({"type": "tool_call", "index": idx,
+        proj.track(dsh_seq, lambda: event_recorder.chunk({"type": "tool_call", "index": idx,
                                                "partial_json": piece}))
         return []
     if ctype == "block-end":
@@ -330,26 +330,26 @@ def _project_dsh_chunk(run: EventRecorder, proj: _DshProj, dsh_seq, chunk: dict)
             if not isinstance(args, str) or args == "":
                 args = "".join((slot or {}).get("pieces", []))
             # 会话日志随后仍有显式 tool/call 同 id 事件:先合成,后者去重映射(见 tool/call 分支)
-            gh_seq = proj.track(dsh_seq, lambda: run.tool_call(call_id, name, args or ""))
+            gh_seq = proj.track(dsh_seq, lambda: event_recorder.tool_call(call_id, name, args or ""))
             if gh_seq is not None and call_id:
                 proj.synth[call_id] = gh_seq
         return []
     if ctype == "usage":
         usage = chunk.get("usage")
         if usage:
-            run.result_usage = _normalize_usage(usage)
+            event_recorder.result_usage = _normalize_usage(usage)
         return []
     if ctype == "finish":
         reason = chunk.get("reason")
         kind = reason.get("kind") if isinstance(reason, dict) else reason
         if kind:
             proj.last_finish_kind = kind
-            run.result_stop_reason = kind
+            event_recorder.result_stop_reason = kind
         return []
     return []  # block-start 与未知块:信息无需事件(增量已逐条投影)
 
 
-def _project_dsh_event(run: EventRecorder, proj: _DshProj, notif) -> list[str]:
+def _project_dsh_event(event_recorder: EventRecorder, proj: _DshProj, notif) -> list[str]:
     """dsh 通知 → gh TAXONOMY 事件投影(纯 dict 构造,测试可喂假 Notification)。
 
     返回本事件产生的文本增量(供 stream yield)。规则:
@@ -375,51 +375,51 @@ def _project_dsh_event(run: EventRecorder, proj: _DshProj, notif) -> list[str]:
     # (绝不在 prologue 预发 —— dsh 会发自己的,且含插件/注入消息)。
     if evt_type.startswith("assistant/") and not proj.saw_user_message:
         proj.saw_user_message = True
-        run.user_message({"role": "user",
+        event_recorder.user_message({"role": "user",
                           "content": [{"type": "text", "text": proj.prompt}]})
 
     if evt_type == "turn/start":
-        run.turn = data.get("turn", run.turn)
-        proj.forward(dsh_seq, "turn/start", turn=run.turn)
+        event_recorder.turn = data.get("turn", event_recorder.turn)
+        proj.forward(dsh_seq, "turn/start", turn=event_recorder.turn)
     elif evt_type == "step/start":
-        run.turn = data.get("turn", run.turn)
-        run.step = data.get("step", run.step)
+        event_recorder.turn = data.get("turn", event_recorder.turn)
+        event_recorder.step = data.get("step", event_recorder.step)
         proj.tool_pieces = {}  # 块 index 每 step 从 0 重新计数
-        run._step_open = True  # 崩溃路径(无 step/end)epilogue 有可合的 step/end
-        proj.forward(dsh_seq, "step/start", turn=run.turn, step=run.step)
+        event_recorder._step_open = True  # 崩溃路径(无 step/end)epilogue 有可合的 step/end
+        proj.forward(dsh_seq, "step/start", turn=event_recorder.turn, step=event_recorder.step)
     elif evt_type == "step/end":
-        run.turn = data.get("turn", run.turn)
-        run.step = data.get("step", run.step)
-        run._step_open = False
-        proj.forward(dsh_seq, "step/end", turn=run.turn, step=run.step)
+        event_recorder.turn = data.get("turn", event_recorder.turn)
+        event_recorder.step = data.get("step", event_recorder.step)
+        event_recorder._step_open = False
+        proj.forward(dsh_seq, "step/end", turn=event_recorder.turn, step=event_recorder.step)
     elif evt_type == "turn/end":
-        run.turn = data.get("turn", run.turn)
+        event_recorder.turn = data.get("turn", event_recorder.turn)
         proj.saw_turn_end = True
         reason = data.get("reason")
         kind = reason.get("kind") if isinstance(reason, dict) else reason
-        detail = {"turn": run.turn, "reason": kind}
+        detail = {"turn": event_recorder.turn, "reason": kind}
         if isinstance(reason, dict):
             rest = {k: v for k, v in reason.items() if k != "kind"}
             if rest:
                 detail["detail"] = rest  # 结构化失败细目透传(UI 排查素材)
         if not proj.last_finish_kind and kind:
-            run.result_stop_reason = kind  # 无 finish chunk 的兜底 source
+            event_recorder.result_stop_reason = kind  # 无 finish chunk 的兜底 source
         proj.forward(dsh_seq, "turn/end", **detail)
     elif evt_type == "user/message":
         proj.saw_user_message = True
         message = {"role": data.get("role", "user"), "content": data.get("content") or []}
-        proj.track(dsh_seq, lambda: run.user_message(
+        proj.track(dsh_seq, lambda: event_recorder.user_message(
             message, source=data.get("source"),
             surface_op=envelope.get("surfaceOp") or "append"))
     elif evt_type == "assistant/chunk":
-        run.turn = data.get("turn", run.turn)
-        run.step = data.get("step", run.step)
-        return _project_dsh_chunk(run, proj, dsh_seq, data.get("chunk") or {})
+        event_recorder.turn = data.get("turn", event_recorder.turn)
+        event_recorder.step = data.get("step", event_recorder.step)
+        return _project_dsh_chunk(event_recorder, proj, dsh_seq, data.get("chunk") or {})
     elif evt_type == "assistant/message":
-        run.turn = data.get("turn", run.turn)
-        run.step = data.get("step", run.step)
+        event_recorder.turn = data.get("turn", event_recorder.turn)
+        event_recorder.step = data.get("step", event_recorder.step)
         evt_data = {
-            "turn": run.turn, "step": run.step,
+            "turn": event_recorder.turn, "step": event_recorder.step,
             "message": data.get("message") or {},
             "surfaceOp": envelope.get("surfaceOp") or "append",
         }
@@ -434,10 +434,10 @@ def _project_dsh_event(run: EventRecorder, proj: _DshProj, notif) -> list[str]:
             evt_data["sourceSeqs"] = src
         proj.forward(dsh_seq, "assistant/message", **evt_data)
         if data.get("usage"):
-            run.result_usage = _normalize_usage(data["usage"])  # 末条为准 → session/end
+            event_recorder.result_usage = _normalize_usage(data["usage"])  # 末条为准 → session/end
     elif evt_type == "tool/call":
-        run.turn = data.get("turn", run.turn)
-        run.step = data.get("step", run.step)
+        event_recorder.turn = data.get("turn", event_recorder.turn)
+        event_recorder.step = data.get("step", event_recorder.step)
         call_id = data.get("callId") or ""
         name = data.get("name")
         if call_id and name:
@@ -448,10 +448,10 @@ def _project_dsh_event(run: EventRecorder, proj: _DshProj, notif) -> list[str]:
             if dsh_seq is not None:
                 proj.seq_map[dsh_seq] = proj.synth[call_id]
         else:
-            proj.track(dsh_seq, lambda: run.tool_call(call_id, name, data.get("arguments") or ""))
+            proj.track(dsh_seq, lambda: event_recorder.tool_call(call_id, name, data.get("arguments") or ""))
     elif evt_type == "tool/result":
-        run.turn = data.get("turn", run.turn)
-        run.step = data.get("step", run.step)
+        event_recorder.turn = data.get("turn", event_recorder.turn)
+        event_recorder.step = data.get("step", event_recorder.step)
         msg = data.get("message") or {}
         card = ((msg.get("content") or [{}])[0]
                 if isinstance(msg.get("content"), list) else {})
@@ -462,7 +462,7 @@ def _project_dsh_event(run: EventRecorder, proj: _DshProj, notif) -> list[str]:
         text = "".join(b.get("text") or "" for b in (card.get("content") or [])
                        if isinstance(b, dict) and b.get("type") == "text")
         evt_data = {
-            "turn": run.turn, "step": run.step,
+            "turn": event_recorder.turn, "step": event_recorder.step,
             "message": {"role": "user", "content": [{"type": "tool_result",
                                                      "tool_use_id": call_id,
                                                      "content": text, "is_error": is_error}]},
@@ -480,13 +480,13 @@ def _project_dsh_event(run: EventRecorder, proj: _DshProj, notif) -> list[str]:
 
 
 def _dsh_worker(harness, prompt: str, session_id: str, pump):
-    """同步线程体:进入已构造的 harness(子进程 spawn + initialize)→ 阻塞 run 至 idle。
+    """同步线程体:在生成器 __aenter__ 已进入的 harness 上阻塞 run() 至 idle。
 
     整个体在 executor 线程执行;即使外层 asyncio task 被取消(消费者提前退场),
-    线程仍会自然跑完 —— with 块负责回收子进程,不泄漏。
+    线程仍会自然跑完 —— 回收经 Dsh._exit(提前退场时 detach 到后台任务等待线程
+    跑完再退出 harness;见 _wait_and_exit),不泄漏也不与 run 竞态。
     """
-    with harness as h:
-        return h.run(prompt, session_id=session_id, on_notification=pump)
+    return harness.run(prompt, session_id=session_id, on_notification=pump)
 
 
 # ---------------------------------------------------------------------------
@@ -502,31 +502,64 @@ class Dsh(BaseGenerator):
     凭证随组合配置(SDK 读进程环境兜底)。事件词汇同源但 dsh 是第二权威 → _DshProj
     投影对齐(why 见 _DshProj docstring)。构造期即建 harness 对象(dsh_harness
     绑定 config):一个实例 = 一个 harness = 一次 dsh 会话;子进程 spawn/initialize
-    在进入(with)时进行。
+    在一次会话进入时进行(session → _enter 钩子)。dsh 的 client 是同步 context
+    manager 且 run 为阻塞调用 → 进入/回收经 asyncio.to_thread 桥(harness 在
+    executor 线程使用;回收在消费者提前退场时 detach 后台执行,见 _wait_and_exit)。
     """
 
     generator = "dsh"
+    provider = "deepseek"
 
     def __init__(self, config: dict):
         super().__init__(config)
         self._harness = dsh_harness(config)
+        self._run_task: asyncio.Task | None = None  # 在飞 run(asyncio.to_thread);_exit 回收依据
+        self._teardown: asyncio.Task | None = None  # 提前退场时的后台收尸任务(持引用防 GC)
+        self._proj: _DshProj | None = None  # 最近一次运行的投影状态(会话 epilogue 读 turn/end)
+
+    async def _enter(self):
+        await asyncio.to_thread(self._harness.__enter__)  # 子进程 spawn/initialize(同步 CM,线程桥)
+
+    async def _exit(self, exc):
+        task, self._run_task = self._run_task, None
+        if task is not None and not task.done():
+            # 消费者提前退场:run 仍在 executor 线程(自然跑完)。收尸交给后台任务:
+            # 等线程结束再 __exit__ —— 不绊住消费者,也不与 run 竞态。
+            self._teardown = asyncio.create_task(self._wait_and_exit(task, exc))
+            return
+        await asyncio.to_thread(self._harness.__exit__, *exc)
+
+    async def _wait_and_exit(self, task: asyncio.Task, exc):
+        """线程侧 run 自然完成后再退出 harness(后台执行;task 被取消也照等)。"""
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        await asyncio.to_thread(self._harness.__exit__, *exc)
 
     @contextlib.asynccontextmanager
-    async def _run_context(self, prompt: str, *, session: str | None = None,
-                           session_name: str | None = None, run_id: str | None = None,
-                           session_ns: str | None = None,
-                           context: list[dict] | None = None, retry: dict | None = None,
-                           meta: dict | None = None):
-        """dsh 运行装配(stream/result 共用):recorder/proj/队列/worker 线程。
+    async def session(self, **kw):
+        """dsh 会话:协议错误归 parse;epilogue 依投影是否已见 turn/end(双权威
 
-        guard 内 yield (run, proj, queue),退出取消未完成 worker。
+        终局决定权在 dsh,收尾补充仅在崩溃路径)。
         """
         from deepseek_harness import errors as _dsh_errors
 
-        config = self.config
-        run = self._recorder(session=session, session_ns=session_ns, run_id=run_id,
-                        session_name=session_name, meta=meta)
-        proj = _DshProj(run, prompt, _dsh_session_id(run.session))
+        async with super().session(
+            error_stage=lambda exc: _dsh_stage(exc, (_dsh_errors.SdkProtocolError,
+                                                     _dsh_errors.JsonRpcError)),
+            epilogue=lambda: not bool(self._proj and self._proj.saw_turn_end),
+            prologue=False,  # dsh 自带 turn/step 生命周期
+            **kw):
+            yield
+
+    def _run_assembly(self, prompt: str) -> tuple[EventRecorder, _DshProj, asyncio.Queue]:
+        """会话内运行件装配(stream/result 共用):proj(挂实例供 epilogue)/worker 任务。
+
+        任务不在此取消:消费者提前退场时线程自然跑完,harness 由会话退出时经
+        _exit 回收(在飞 → detach 后台等线程结束再回收,见 _wait_and_exit)。
+        """
+        event_recorder = self._require_event_recorder()
+        proj = _DshProj(event_recorder, prompt, _dsh_session_id(event_recorder.session))
+        self._proj = proj
         queue: asyncio.Queue = asyncio.Queue()  # 无界:1:1 于运行时事件流,永不阻塞发布侧
         loop = asyncio.get_running_loop()
 
@@ -541,68 +574,47 @@ class Dsh(BaseGenerator):
             except Exception as exc:
                 loop.call_soon_threadsafe(queue.put_nowait, ("exc", exc))
 
-        run.init_config(config)
-        run.start(context=context, retry=retry, prologue=False)  # dsh 自带 turn/step 生命周期
-        async with self._guard(
-            run,
-            error_stage=lambda exc: _dsh_stage(exc, (_dsh_errors.SdkProtocolError,
-                                                     _dsh_errors.JsonRpcError)),
-            epilogue=lambda: not proj.saw_turn_end,
-        ):
-            task = asyncio.create_task(_worker())
-            try:
-                yield run, proj, queue
-            finally:
-                if not task.done():
-                    task.cancel()  # 消费者提前退场:executor 线程继续自然跑完(见 _dsh_worker)
+        self._run_task = asyncio.create_task(_worker())
+        return event_recorder, proj, queue
 
-    async def stream(self, prompt: str, *, session: str | None = None,
-                     session_name: str | None = None, run_id: str | None = None,
-                     session_ns: str | None = None,
-                     context: list[dict] | None = None, retry: dict | None = None,
-                     meta: dict | None = None):
-        """dsh 流式应答(监控 + 执行)。
+    async def stream(self, prompt: str):
+        """dsh 流式驱动(纯载荷;会话元数据经 session())。
 
         对外产出:assistant 文本增量(assistant/chunk 的 text-delta);turn 非
         completed → RequestFailedError;thinking/工具增量只进事件流。dsh 原生
         事件 1:1 投影为监控事件流(经 _project_dsh_event);SDK run() 为同步
         阻塞 → asyncio.to_thread 执行(单次运行一 turn to_idle,无逐 prompt 取消)。
         """
-        async with self._run_context(prompt, session=session, session_name=session_name,
-                                     run_id=run_id, session_ns=session_ns,
-                                     context=context, retry=retry, meta=meta) as (run, proj, queue):
-            while True:
-                kind, item = await queue.get()
-                if kind == "notif":
-                    for delta in _project_dsh_event(run, proj, item):
-                        yield delta
-                elif kind == "exc":
-                    raise item
-                else:  # ("done", RunResult):run() 返回前所有通知已交付,无竞态
-                    if item.finish_reason != "completed":
-                        raise RequestFailedError(item.finish_reason)
-                    break
+        event_recorder, proj, queue = self._run_assembly(prompt)
+        while True:
+            kind, item = await queue.get()
+            if kind == "notif":
+                for delta in _project_dsh_event(event_recorder, proj, item):
+                    yield delta
+            elif kind == "exc":
+                raise item
+            else:  # ("done", RunResult):run() 返回前所有通知已交付,无竞态
+                if item.finish_reason != "completed":
+                    raise RequestFailedError(item.finish_reason)
+                break
 
-    async def result(self, prompt: str, *, session: str | None = None,
-                     session_name: str | None = None, run_id: str | None = None,
-                     session_ns: str | None = None,
-                     context: list[dict] | None = None, retry: dict | None = None,
-                     meta: dict | None = None) -> str:
-        """非流式最终结果:只拿最后一轮 —— RunResult.final_response;非 completed 或未产出 → RequestFailedError。"""
-        async with self._run_context(prompt, session=session, session_name=session_name,
-                                     run_id=run_id, session_ns=session_ns,
-                                     context=context, retry=retry, meta=meta) as (run, proj, queue):
-            while True:
-                kind, item = await queue.get()
-                if kind == "notif":
-                    for _ in _project_dsh_event(run, proj, item):
-                        pass
-                elif kind == "exc":
-                    raise item
-                else:
-                    if item.finish_reason != "completed":
-                        raise RequestFailedError(item.finish_reason)
-                    final = item.final_response or ""
-                    if not final:
-                        raise RequestFailedError("未产出最终结果")
-                    return final
+    async def result(self, prompt: str) -> str:
+        """非流式最终结果(纯载荷):只拿最后一轮 —— RunResult.final_response;
+
+        非 completed 或未产出 → RequestFailedError。
+        """
+        event_recorder, proj, queue = self._run_assembly(prompt)
+        while True:
+            kind, item = await queue.get()
+            if kind == "notif":
+                for _ in _project_dsh_event(event_recorder, proj, item):
+                    pass
+            elif kind == "exc":
+                raise item
+            else:
+                if item.finish_reason != "completed":
+                    raise RequestFailedError(item.finish_reason)
+                final = item.final_response or ""
+                if not final:
+                    raise RequestFailedError("未产出最终结果")
+                return final

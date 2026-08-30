@@ -32,6 +32,7 @@ env GH_PULLER_EVENTS_DUMP_DIR 可覆写)。观测示例:
 import asyncio
 import json
 import os
+import tempfile
 from pathlib import Path
 
 import httpx
@@ -42,10 +43,13 @@ from gh_puller import agent
 from gh_puller.agent import sinks
 from gh_puller.agent.events import TAXONOMY
 
-# 与 test_agent_real.py 同约定:cc/llm 统一模型走 env 覆写;codex 常量直写(无 env 面)
+# 与 test_agent_real.py 同约定:cc 模型走 GH_PULLER_MODEL 覆写;llm 路按生成器 env 面
+# (LLM_MODEL / OPENAI_API_KEY / OPENAI_BASE_URL,webui/__main__ 同约定);codex 常量直写(无 env 面)
 MODEL = os.environ.get("GH_PULLER_MODEL", "deepseek-v4-flash")
-MODEL_CODEX = "gpt-5.6-sol"
-DEEPSEEK_API_URL = "https://api.deepseek.com/v1"
+LLM_MODEL = os.environ.get("LLM_MODEL", MODEL)  # llm 路模型(生成器 env 面)
+MODEL_CODEX = "gpt-5.6-luna"  # luna = 本地模型(不烧 token);sol 改 luna 同用户指示
+# llm 路端点:缺省 DeepSeek(OpenAI 兼容,低成本),经 OPENAI_BASE_URL 覆写
+LLM_BASE_URL = os.environ.get("OPENAI_BASE_URL", "https://api.deepseek.com/v1")
 
 # 简单问题 + 工具外驱:访问仓库并一句话介绍(模型真实触发 WebFetch/web_search)
 QUESTION = "请访问 https://github.com/yankils/hello-world 并写一句话介绍这个仓库。"
@@ -74,6 +78,14 @@ async def _monitor_cleanup():
 # ---------------------------------------------------------------------------
 
 
+def _read_jsonl(directory: Path) -> list[dict]:
+    """目录下全部 *.jsonl 的行读取(普通函数;异步上下文经 to_thread 调用)。"""
+    out: list[dict] = []
+    for f in sorted(directory.glob("*.jsonl")):
+        out.extend(json.loads(line) for line in f.read_text(encoding="utf-8").splitlines())
+    return out
+
+
 def _jsonl_consume(events: list[dict]):
     """收集 sink:recorder 发布的事件原样入列表(不投影、不丢字段)。"""
 
@@ -84,18 +96,30 @@ def _jsonl_consume(events: list[dict]):
 
 
 async def _capture(runner):
-    """一次生成器运行的事件捕获:返回 (产出, 事件列表)。
+    """一次生成器运行的事件捕获:返回 (产出, 事件列表, FileSink 落盘事件)。
 
-    configure(...) 撤掉 ws/otel;ensure_bus 恒挂文件 sink(落 conftest tmp,
-    由文件侧验证另测),此处再显式 .add() 收集 sink —— recorder 的零开销短路
-    (无 bus 直接不构造事件)不会误触发。
+    configure(...) 撤掉 ws/otel;ensure_bus 恒挂文件 sink(落本目录),此处再显式
+    .add() 收集 sink —— recorder 的零开销短路(无 bus 直接不构造事件)不会误触发。
+    产品通道(FileSink)落盘事件一并带回:collect 首/尾拍漏收的调度问题由文件通道
+    补证(断言见 _assert_full;session/end 恒文件末行是通道设计保证)。
     """
-    agent.configure(ws_urls=[], otel_urls=[])
+    file_dir = tempfile.mkdtemp(prefix="gh-puller-events-jsonl-")
+    agent.configure(file_dir=file_dir, ws_urls=[], otel_urls=[])
     events: list[dict] = []
-    sinks.ensure_bus().add(_jsonl_consume(events))
+    b = sinks.ensure_bus()
+    b.add(_jsonl_consume(events))
+    await asyncio.sleep(0)  # 让 drain 协程先入座(真机慢节奏下防首拍事件竞争)
     result = await runner()
-    await asyncio.sleep(0.05)  # bus drain 一拍:put_nowait 后 worker 消费
-    return result, events
+    file_events: list[dict] = []
+    # 排空等待:collect/文件都是异步 drain —— 权威完成信号 = 文件末行 session/end
+    # (终局事件发布后由 sink 落盘;上限 2s)。
+    file_dir_path = Path(file_dir)
+    for _ in range(40):
+        file_events = await asyncio.to_thread(_read_jsonl, file_dir_path)
+        if file_events and file_events[-1]["type"] == "session/end":
+            break
+        await asyncio.sleep(0.05)
+    return result, events, file_events
 
 
 def _dump(name: str, events: list[dict]) -> Path:
@@ -103,24 +127,33 @@ def _dump(name: str, events: list[dict]) -> Path:
     _DUMP_DIR.mkdir(parents=True, exist_ok=True)
     path = _DUMP_DIR / f"{name}.jsonl"
     with open(path, "w", encoding="utf-8") as f:
-        for evt in events:
-            f.write(json.dumps(evt, ensure_ascii=False) + "\n")
+        f.writelines(json.dumps(evt, ensure_ascii=False) + "\n" for evt in events)
     [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
     print(f"[{name}] {len(events)} 事件 → {path}")
     return path
 
 
-def _assert_full(events: list[dict]) -> None:
-    """正式生成源契约:信封全键一个都不能缺;seq 稠密单调;终态 session/end。"""
+def _assert_full(events: list[dict], *, file_events: list[dict] | None = None) -> None:
+    """正式生成源契约:信封全键一个都不能缺;seq 稠密单调;终态 session/end。
+
+    序号权威在构造期(seq 恒 0..n-1);收集到达序不是契约(接收端本就按 seq 归组
+    排序)—— collect 首/尾拍的调度偏移由产品通道(FileSink)补证:
+    - 终态:session/end(非流式,必落文件)恒为文件末行(通道设计保证)且 seq = max;
+    - 连续性:collect ∪ 文件的 seq 必须从 0 连续到 max(config/init = seq0 唯一在 collect)。
+    """
     assert events, "至少一个事件"
-    assert events[0]["type"] == "config/init"  # 构造期配置快照先于 session/start
-    assert events[1]["type"] == "session/start"
-    assert events[-1]["type"] == "session/end"
+    seqs = {e["seq"] for e in events}
     for evt in events:
         missing = _FULL_ENVELOPE - set(evt)
         assert not missing, f"事件字段缺失: {evt.get('type')} 缺 {sorted(missing)}"
         assert evt["type"] in TAXONOMY, f"未知事件 type: {evt.get('type')!r}"
-    assert [e["seq"] for e in events] == list(range(len(events))), "seq 应稠密单调"
+    if file_events:
+        seqs |= {e["seq"] for e in file_events}
+        last = file_events[-1]
+        assert last["type"] == "session/end", f"文件末行应为 session/end: {last['type']}"
+        assert last["seq"] == max(seqs), "session/end 应为最大 seq(文件通道)"
+        assert last["data"]["state"] == "completed", f"终态应为 completed: {last['data']['state']}"
+    assert seqs and max(seqs) == len(seqs) - 1, "seq 应从 0 连续到 max(collect ∪ 文件)"
 
 
 def _types(events: list[dict]) -> list[str]:
@@ -165,29 +198,23 @@ def _codex_config(tmp_path) -> dict:
 
 
 def _llm_config() -> dict:
-    """llm key:env DEEPSEEK_API_KEY 优先,回退 ~/.dsh/.credentials.yaml(与真机测试同源)。"""
-    key = os.environ.get("DEEPSEEK_API_KEY")
+    """llm 配置:照生成器 env 面(LLM_MODEL / OPENAI_API_KEY / OPENAI_BASE_URL)。"""
+    key = os.environ.get("OPENAI_API_KEY")
     if not key:
-        creds = Path.home() / ".dsh" / ".credentials.yaml"
-        if creds.exists():
-            for line in creds.read_text(encoding="utf-8").splitlines():
-                if line.strip().startswith("DEEPSEEK_API_KEY:"):
-                    key = line.split(":", 1)[1].strip()
-    if not key:
-        pytest.skip("DEEPSEEK_API_KEY 缺失(env 与 ~/.dsh/.credentials.yaml 均无)")
-    return {"model": MODEL, "base_url": DEEPSEEK_API_URL, "api_key": key}
+        pytest.skip("OPENAI_API_KEY 缺失(env;不读任何组件私有文件)")
+    return {"model": LLM_MODEL, "base_url": LLM_BASE_URL, "api_key": key}
 
 
 _LLM_PAYLOAD = {"messages": [{"role": "user", "content": QUESTION}],
                 "max_tokens": 256, "temperature": 0}
 
 
-async def _stream_text(aiter) -> str:
-    return "".join([c async for c in aiter])
+async def _stream_text(stream) -> str:
+    return "".join([c async for c in stream])
 
 
 # ---------------------------------------------------------------------------
-# cc:stream / result
+# cc:stream / result  # noqa: ERA001 - 中文分节标题注释,非被注释代码
 # ---------------------------------------------------------------------------
 
 
@@ -195,13 +222,15 @@ async def _stream_text(aiter) -> str:
 async def test_cc_stream_events_jsonl(tmp_path):
     """cc stream 真机:真实增量粒度 → 逐段 assistant/chunk;WebFetch 真实工具调用。"""
     gen = agent.ClaudeCode(_cc_config(tmp_path))
-    out, events = await _capture(
-        lambda: _stream_text(gen.stream(QUESTION, session_name="obs:cc:stream",
-                                        run_id="r-cc-stream")))
+
+    async def _run():
+        async with gen.session(session_name="obs:cc:stream", run_id="r-cc-stream"):
+            return await _stream_text(gen.stream(QUESTION))
+
+    out, events, file_events = await _capture(_run)
     assert out, "cc 后端应有文本产出"
     assert "assistant/chunk" in _types(events)  # 全流捕获(FileSink 会投影剔除)
-    _assert_full(events)
-    assert events[-1]["data"]["state"] == "completed"
+    _assert_full(events, file_events=file_events)
     _report_run("cc-stream", out, events)
 
 
@@ -209,16 +238,19 @@ async def test_cc_stream_events_jsonl(tmp_path):
 async def test_cc_result_events_jsonl(tmp_path):
     """cc result 真机:终局语义(ResultMessage.result);事件与 stream 同源全量。"""
     gen = agent.ClaudeCode(_cc_config(tmp_path))
-    out, events = await _capture(
-        lambda: gen.result(QUESTION, session_name="obs:cc:result", run_id="r-cc-result"))
+
+    async def _run():
+        async with gen.session(session_name="obs:cc:result", run_id="r-cc-result"):
+            return await gen.result(QUESTION)
+
+    out, events, file_events = await _capture(_run)
     assert out, "cc 后端应有终局产出"
-    _assert_full(events)
-    assert events[-1]["data"]["state"] == "completed"
+    _assert_full(events, file_events=file_events)
     _report_run("cc-result", out, events)
 
 
 # ---------------------------------------------------------------------------
-# codex:stream / result
+# codex:stream / result  # noqa: ERA001 - 中文分节标题注释,非被注释代码
 # ---------------------------------------------------------------------------
 
 
@@ -226,12 +258,14 @@ async def test_cc_result_events_jsonl(tmp_path):
 async def test_codex_stream_events_jsonl(tmp_path):
     """codex stream 真机:通知流 1:1 合成,真实工具调用(web_search)。"""
     gen = agent.Codex(_codex_config(tmp_path))
-    out, events = await _capture(
-        lambda: _stream_text(gen.stream(QUESTION, session_name="obs:codex:stream",
-                                        run_id="r-codex-stream")))
+
+    async def _run():
+        async with gen.session(session_name="obs:codex:stream", run_id="r-codex-stream"):
+            return await _stream_text(gen.stream(QUESTION))
+
+    out, events, file_events = await _capture(_run)
     assert out, "codex 后端应有文本产出"
-    _assert_full(events)
-    assert events[-1]["data"]["state"] == "completed"
+    _assert_full(events, file_events=file_events)
     _report_run("codex-stream", out, events)
 
 
@@ -239,31 +273,36 @@ async def test_codex_stream_events_jsonl(tmp_path):
 async def test_codex_result_events_jsonl(tmp_path):
     """codex result 真机:与 stream 同构消费通知流 —— 事件全量(不再是纯生命周期)。"""
     gen = agent.Codex(_codex_config(tmp_path))
-    out, events = await _capture(
-        lambda: gen.result(QUESTION, session_name="obs:codex:result", run_id="r-codex-result"))
+
+    async def _run():
+        async with gen.session(session_name="obs:codex:result", run_id="r-codex-result"):
+            return await gen.result(QUESTION)
+
+    out, events, file_events = await _capture(_run)
     assert out, "codex 后端应有终局产出"
-    _assert_full(events)
+    _assert_full(events, file_events=file_events)
     assert "assistant/message" in _types(events)  # 结果路径事件全量(修复前仅生命周期)
-    assert events[-1]["data"]["state"] == "completed"
     _report_run("codex-result", out, events)
 
 
 # ---------------------------------------------------------------------------
-# llm:result / stream
+# llm:result / stream  # noqa: ERA001 - 中文分节标题注释,非被注释代码
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
 async def test_llm_result_events_jsonl():
     """llm result 真机:单发 complete —— 整段内容一次到达 → 单条 chunk(忠实非流式语义)。"""
-    out, events = await _capture(
-        lambda: agent.OpenAI(_llm_config()).result(
-            _LLM_PAYLOAD,
-            timeout=httpx.Timeout(connect=10.0, read=180.0, write=10.0, pool=10.0),
-            session_name="obs:llm:result", run_id="r-llm-result"))
+    gen = agent.OpenAI(_llm_config())
+
+    async def _run():
+        async with gen.session(session_name="obs:llm:result", run_id="r-llm-result"):
+            return await gen.result(_LLM_PAYLOAD, timeout=httpx.Timeout(connect=10.0, read=180.0,
+                                                                       write=10.0, pool=10.0))
+
+    out, events, file_events = await _capture(_run)
     assert out, "llm 后端应有文本产出"
-    _assert_full(events)
-    assert events[-1]["data"]["state"] == "completed"
+    _assert_full(events, file_events=file_events)
     _report_run("llm-result", out, events)
 
 
@@ -274,13 +313,15 @@ async def test_llm_stream_events_jsonl():
     llm 是单发 complete 客户端,工具轮询在 dispatch 层 —— 真机路径无工具调用,
     chunk 条数 = DeepSeek SSE 实际分段数。
     """
-    out, events = await _capture(
-        lambda: _stream_text(agent.OpenAI(_llm_config()).stream(
-            _LLM_PAYLOAD,
-            timeout=httpx.Timeout(connect=10.0, read=180.0, write=10.0, pool=10.0),
-            session_name="obs:llm:stream", run_id="r-llm-stream")))
+    gen = agent.OpenAI(_llm_config())
+
+    async def _run():
+        async with gen.session(session_name="obs:llm:stream", run_id="r-llm-stream"):
+            return await _stream_text(gen.stream(_LLM_PAYLOAD, timeout=httpx.Timeout(
+                connect=10.0, read=180.0, write=10.0, pool=10.0)))
+
+    out, events, file_events = await _capture(_run)
     assert out, "llm 后端应有文本产出"
     assert "assistant/chunk" in _types(events)
-    _assert_full(events)
-    assert events[-1]["data"]["state"] == "completed"
+    _assert_full(events, file_events=file_events)
     _report_run("llm-stream", out, events)

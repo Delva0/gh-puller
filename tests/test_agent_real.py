@@ -2,10 +2,11 @@
 
 与 test_agent.py(mock 离线)互补:本文件实时走真实后端 —— cc spawn 本地
 claude CLI(凭证走本地 ~/.claude 配置,同 "apikey 在配置文件中" 约定)、
-llm 经 httpx 直连 DeepSeek OpenAI 兼容端(唯一需显式 api_key 的路:env
-DEEPSEEK_API_KEY 优先,回退 ~/.dsh/.credentials.yaml)、dsh 走 DeepSeek
-Harness SDK(凭证 SDK 自足)、codex 走 openai_codex SDK(隔离 home 符号链接
-引用真实 ~/.codex/auth.json,与 cc 同形——验证通道不隔离,隔离只管设置面)。
+llm 经 httpx 直连 OpenAI 兼容端(照生成器 env 面:OPENAI_API_KEY /
+OPENAI_BASE_URL / LLM_MODEL;缺省端点 DeepSeek 兼容端,仅环境变量,不读任何
+组件私有文件)、dsh 走 DeepSeek Harness SDK(凭证 SDK 自足)、codex 走
+openai_codex SDK(隔离 home 符号链接引用真实 ~/.codex/auth.json,与 cc 同形
+——验证通道不隔离,隔离只管设置面)。
 
 每路经 agent.configure(file_dir=tmp_path, ws_urls=[], otel_urls=[]) 把
 FileSink 根目录注入临时目录,并断言非流式事件流落盘契约正确
@@ -20,7 +21,6 @@ codex 常量直写 gpt-5.6-sol(chatgpt OAuth 凭据只认 models_cache 内的 5.
 import asyncio
 import json
 import os
-from pathlib import Path
 
 import httpx
 import pytest
@@ -28,10 +28,12 @@ import pytest_asyncio
 
 from gh_puller import agent
 
-MODEL = os.environ.get("GH_PULLER_MODEL", "deepseek-v4-flash")
-MODEL_CODEX = "gpt-5.6-sol"  # 常量直写:codex 无环境变量(同 cc 路线),models_cache 现存模型
+MODEL = os.environ.get("GH_PULLER_MODEL", "deepseek-v4-flash")  # cc/dsh 路(测试自定)
+LLM_MODEL = os.environ.get("LLM_MODEL", MODEL)  # llm 路按生成器 env 面(webui/__main__ 同约定)
+MODEL_CODEX = "gpt-5.6-luna"  # 常量直写:codex 无环境变量(同 cc 路线);luna = 本地模型(不烧 token)
 
-DEEPSEEK_API_URL = "https://api.deepseek.com/v1"
+# llm 路端点:缺省 DeepSeek(OpenAI 兼容,低成本),经 OPENAI_BASE_URL 覆写(与 webui/__main__ 同约定)
+LLM_BASE_URL = os.environ.get("OPENAI_BASE_URL", "https://api.deepseek.com/v1")
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("GH_PULLER_REAL_TESTS") != "1",
@@ -47,11 +49,9 @@ async def _monitor_cleanup():
     await asyncio.sleep(0.01)
 
 
-async def _collect(aiter) -> list[str]:
+async def _collect(stream) -> list[str]:
     """收满真实后端的全部文本增量,末了等一拍让 sink worker 写盘(EventBus 异步 drain)。"""
-    parts = []
-    async for p in aiter:
-        parts.append(p)
+    parts = [p async for p in stream]
     await asyncio.sleep(0.05)
     return parts
 
@@ -98,10 +98,11 @@ def _assert_flow(events: list[dict], provider: str, model: str, generator: str =
     """
     assert events, "根下应有事件落盘"
     assert events[0]["type"] == "session/start", events[0]
-    assert events[0]["provider"] == provider, events[0]
-    assert events[0]["model"] == model, events[0]
+    snapshot = events[0]["data"]  # 快照随 session/start 的 data 落地(契约见 events.py start())
+    assert snapshot["provider"] == provider, events[0]
+    assert snapshot["model"] == model, events[0]
     if generator:
-        assert events[0]["generator"] == generator, events[0]
+        assert snapshot["generator"] == generator, events[0]
     types = [e["type"] for e in events]
     assert "assistant/chunk" not in types, "文件只落非流式事件流(chunk 应被投影剔除)"
     user = next(e for e in events if e["type"] == "user/message")
@@ -127,7 +128,9 @@ async def test_cc_stream_real(tmp_path):
         "max_turns": 1,
         "include_partial_messages": True,  # 让 StreamEvent 路径真实产 chunk
     }
-    parts = await _collect(agent.ClaudeCode(config).stream("你好", session_name="real:cc", run_id="r-cc"))
+    gen = agent.ClaudeCode(config)
+    async with gen.session(session_name="real:cc", run_id="r-cc"):
+        parts = await _collect(gen.stream("你好"))
     print("cc 回复:", "".join(parts))  # pytest -s 查看真机回显
     assert "".join(parts) != "", "cc 后端应有文本增量"
     _assert_flow(await _read_single_session(tmp_path), "anthropic", MODEL, generator="cc")
@@ -135,29 +138,22 @@ async def test_cc_stream_real(tmp_path):
 
 @pytest.mark.asyncio
 async def test_llm_stream_real(tmp_path):
-    """llm 真机:httpx 直连 DeepSeek OpenAI 兼容端;key 是唯一显式参数(env 优先,回退配置文件)。"""
-    key = os.environ.get("DEEPSEEK_API_KEY")
+    """llm 真机:httpx 直连 OpenAI 兼容端;凭证照生成器 env 面(OPENAI_API_KEY,webui/__main__ 同约定)。"""
+    key = os.environ.get("OPENAI_API_KEY")
     if not key:
-        creds = Path.home() / ".dsh" / ".credentials.yaml"
-        if creds.exists():  # dsh 组件的配置文件(与生产"apikey 都在配置文件中"同源)
-            for line in creds.read_text(encoding="utf-8").splitlines():
-                if line.strip().startswith("DEEPSEEK_API_KEY:"):
-                    key = line.split(":", 1)[1].strip()
-    if not key:
-        pytest.skip("DEEPSEEK_API_KEY 缺失(env 与 ~/.dsh/.credentials.yaml 均无)")
+        pytest.skip("OPENAI_API_KEY 缺失(env;不读任何组件私有文件)")
 
     agent.configure(file_dir=str(tmp_path), ws_urls=[], otel_urls=[])
-    config = {"model": MODEL, "base_url": DEEPSEEK_API_URL, "api_key": key}
+    config = {"model": LLM_MODEL, "base_url": LLM_BASE_URL, "api_key": key}
     payload = {"messages": [{"role": "user", "content": "你好"}],
                "max_tokens": 256, "temperature": 0}
-    parts = await _collect(agent.OpenAI(config).stream(
-        payload,
-        timeout=httpx.Timeout(connect=10.0, read=180.0, write=10.0, pool=10.0),
-        session_name="real:llm", run_id="r-llm",
-    ))
+    gen = agent.OpenAI(config)
+    async with gen.session(session_name="real:llm", run_id="r-llm"):
+        parts = await _collect(gen.stream(
+            payload, timeout=httpx.Timeout(connect=10.0, read=180.0, write=10.0, pool=10.0)))
     assert "".join(parts) != "", "llm 后端应有文本增量"
     print("llm 回复:", "".join(parts))  # pytest -s 查看真机回显
-    _assert_flow(await _read_single_session(tmp_path), "openai", MODEL, generator="llm")
+    _assert_flow(await _read_single_session(tmp_path), "openai", LLM_MODEL, generator="llm")
 
 
 @pytest.mark.skip(
@@ -166,7 +162,7 @@ async def test_llm_stream_real(tmp_path):
            "demo bin 裸插件以配置文件目录为解析锚点(仓库 node_modules 无 workspace 链接、"
            "npm 无 dsh-jsonrpc-agent 发布版)、pnpm dsh web 为 http 形态不响应 stdio "
            "initialize。恢复点①:packages/examples/jsonrpc-demo 补 13 个 @deepseek-ai/dsh-* "
-           "依赖(内置 cordis 置于该包目录);②:scripts/build-exe-for-python-sdk.ts 构建。"
+           "依赖(内置 cordis 置于该包目录);②:scripts/build-exe-for-python-sdk.ts 构建。",
 )
 @pytest.mark.asyncio
 async def test_dsh_stream_real(tmp_path):
@@ -183,7 +179,9 @@ async def test_dsh_stream_real(tmp_path):
         "session_root": str(sessions),  # 隔离,dsh 会话不落真实 ~/.gh-puller
         "max_tokens": 1024,
     }
-    parts = await _collect(agent.Dsh(config).stream("你好", session_name="real:dsh", run_id="r-dsh"))
+    gen = agent.Dsh(config)
+    async with gen.session(session_name="real:dsh", run_id="r-dsh"):
+        parts = await _collect(gen.stream("你好"))
     print("dsh 回复:", "".join(parts))  # pytest -s 查看真机回显
     assert "".join(parts) != "", "dsh 后端应有文本增量"
     _assert_flow(await _read_single_session(tmp_path), "deepseek", MODEL, generator="dsh")
@@ -201,7 +199,9 @@ async def test_codex_stream_real(tmp_path):
         "cwd": str(tmp_path),
         "timeout_seconds": 300,  # 兜底防止 approval 挂流
     }
-    parts = await _collect(agent.Codex(config).stream("你好", session_name="real:codex", run_id="r-codex"))
+    gen = agent.Codex(config)
+    async with gen.session(session_name="real:codex", run_id="r-codex"):
+        parts = await _collect(gen.stream("你好"))
     print("codex 回复:", "".join(parts))  # pytest -s 查看真机回显
     assert "".join(parts) != "", "codex 后端应有文本增量"
     _assert_flow(await _read_single_session(tmp_path), "openai", MODEL_CODEX, generator="codex")
