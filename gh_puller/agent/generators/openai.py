@@ -137,16 +137,10 @@ class OpenAI(BaseGenerator):
                 blocks = [{"type": "thinking", "text": full_reasoning}]
             elif seg == "content":
                 blocks = [{"type": "content", "text": full}]
-            else:  # tool_call:每调用一个块(与 tool/call 事件同序列)
+            else:  # tool_call:工具调用只经 tool/call 事件,不入 assistant/message 消息块
                 blocks = []
                 for slot in tools.values():
                     args = "".join(slot["pieces"])
-                    try:
-                        parsed = json.loads(args) if args else None
-                    except json.JSONDecodeError:
-                        parsed = args
-                    blocks.append({"type": "tool_call", "id": slot["id"],
-                                   "name": slot["name"], "input": parsed})
                     event_recorder.tool_call(slot["id"], slot["name"], args)
             seg = None
             event_recorder.event(

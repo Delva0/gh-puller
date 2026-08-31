@@ -340,6 +340,67 @@ async def test_assistant_message_monitors_but_never_duplicates():
     assert run2.text_chars == 0
 
 
+@pytest.mark.asyncio
+async def test_assistant_message_sdk_blocks_without_type():
+    """SDK 0.2.142 起内容块为纯 dataclass(TextBlock/ThinkingBlock/ToolUseBlock 无 type 属性):
+
+    按字段判别(`_block_kind`),文本/思考照常进 message;工具调用**不入消息块**,
+    只以 tool/call 事件承载(兜底合成)。
+    """
+    agent.configure(ws_urls=[], otel_urls=[])
+    got = []
+    bus = sinks.ensure_bus()
+    bus.add(_recv(got))
+    msg = types.SimpleNamespace(
+        content=[
+            types.SimpleNamespace(text="hi"),  # TextBlock 形(无 type)
+            types.SimpleNamespace(thinking="想", signature="s"),  # ThinkingBlock 形
+            types.SimpleNamespace(id="t3", name="read_file"),  # ToolUseBlock 形(input 缺省)
+        ],
+        stop_reason=None,
+        usage=None,
+    )
+    run = EventRecorder("s1", label="t")
+    _handle_assistant_message(run, msg, already_yielded=False)
+    assert run.text_chars == 2  # 文本已事件化(chunk 路径同享)
+    await asyncio.sleep(0.05)
+    asst = next(g for g in got if g["type"] == "assistant/message")
+    assert asst["data"]["message"]["content"] == [
+        {"type": "content", "text": "hi"},
+        {"type": "thinking", "text": "想"},
+    ]
+    calls = [g for g in got if g["type"] == "tool/call"]
+    assert [e["data"]["callId"] for e in calls] == ["t3"]  # 工具调用只经 tool/call 事件
+
+
+@pytest.mark.asyncio
+async def test_tool_call_single_emit_message_first_then_stream():
+    """工具调用双发射点只发一次:消息路径先到(_call_seqs 记 seq),流 content_block_stop
+
+    迟到时不再重发(真机 2.1.251:消息标记先于流事件,曾把每个真实 tool/call 双发)。
+    """
+    agent.configure(ws_urls=[], otel_urls=[])
+    got = []
+    bus = sinks.ensure_bus()
+    bus.add(_recv(got))
+    run = EventRecorder("s1", label="t")
+    _handle_assistant_message(
+        run,
+        types.SimpleNamespace(
+            content=[types.SimpleNamespace(type="tool_use", id="t1", name="read_file")],
+            stop_reason=None,
+            usage=None,
+        ),
+        already_yielded=False,
+    )  # 消息路径:兜底补发 tool/call(记 _call_seqs)
+    _handle_stream_event(run, {"type": "content_block_start", "index": 0,
+                               "content_block": {"type": "tool_use", "id": "t1", "name": "read_file"}})
+    _handle_stream_event(run, {"type": "content_block_stop", "index": 0})  # 流路径迟到:防重不发
+    await asyncio.sleep(0.05)
+    calls = [g for g in got if g["type"] == "tool/call"]
+    assert [e["data"]["callId"] for e in calls] == ["t1"]  # 恰一次
+
+
 def test_normalize_usage_maps_sdk_and_http():
     u = types.SimpleNamespace(input_tokens=1, output_tokens=2, cache_read_input_tokens=None)
     assert _normalize_usage(u) == {"input_tokens": 1, "output_tokens": 2,
@@ -482,6 +543,16 @@ def _fake_sdk(msgs):
 
 def _options():
     return {"model": "", "system_prompt": "sys"}
+
+
+def test_cc_strict_mcp_default_isolation(monkeypatch):
+    """默认隔离:未显式给 strict_mcp_config 时装配层注入 True;显式 False 保留。"""
+    sdk = _fake_sdk([])
+    monkeypatch.setitem(sys.modules, "claude_agent_sdk", sdk)
+    gen = agent.ClaudeCode(_options())
+    assert gen._client.options.kwargs["strict_mcp_config"] is True
+    gen2 = agent.ClaudeCode({"model": "", "strict_mcp_config": False})
+    assert gen2._client.options.kwargs["strict_mcp_config"] is False
 
 
 async def _fold(chunks):

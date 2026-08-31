@@ -44,9 +44,9 @@ def evt(seq: int, evt_type: str, **data: dict) -> dict:
 def test_type_of():
     for t in TAXONOMY:
         assert type_of(evt(0, t)) == t
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="未知事件 type"):
         type_of(evt(0, "bogus"))
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="未知事件 type"):
         type_of({})
 
 
@@ -67,7 +67,7 @@ def test_stream_and_non_stream_split():
     from gh_puller.agent.events import NON_STREAM_TYPES, STREAM_TYPES
 
     assert STREAM_TYPES == TAXONOMY
-    assert NON_STREAM_TYPES == TAXONOMY - {"assistant/chunk"}
+    assert TAXONOMY - {"assistant/chunk"} == NON_STREAM_TYPES
     assert SURFACE_TYPES <= NON_STREAM_TYPES  # 折叠依赖的 surface 全在非流式集内
     assert "assistant/chunk" not in NON_STREAM_TYPES
 
@@ -85,7 +85,7 @@ def test_new_event_envelope_and_jsonable():
     assert isinstance(e["ts"], float)
     assert e["data"]["message"]["role"] == "user"
     assert "seq" not in e  # seq 由适配器分配,new_event 不写
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="未知事件 type"):
         new_event("nope")
     with pytest.raises(TypeError):  # set 不可 JSON 化
         new_event("session/start", meta={"bad": {1}})
@@ -93,11 +93,11 @@ def test_new_event_envelope_and_jsonable():
 
 def test_new_event_surface_validation():
     # surface 缺 message / 缺合法 surfaceOp 直接报错(防折叠不可复现)
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="缺 message 字段"):
         new_event("user/message", source={"kind": "user"}, surfaceOp="append")
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="缺合法 surfaceOp"):
         new_event("assistant/message", message={"role": "assistant", "content": []})
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="缺合法 surfaceOp"):
         new_event("assistant/message", message={"role": "assistant", "content": []},
                   surfaceOp="replace")  # 无 start/end 的非 append op 不合法
 
@@ -205,7 +205,9 @@ def _project(events: list[dict]) -> list[dict]:
 
 def fold_lenient(events: list[dict]) -> tuple[list[int], dict[int, dict]]:
     """宽松折叠(文件侧语义,与 ui/src/monitor/surface.ts 一致):seq 只排序比较,
-    不要求稠密 —— 洞 = 流式投影跳过的 chunk。"""
+
+    不要求稠密 —— 洞 = 流式投影跳过的 chunk。
+    """
     evs = sorted(events, key=lambda e: e["seq"])
     nodes: list[int] = []
     by_seq: dict[int, dict] = {}
@@ -243,6 +245,7 @@ def messages_at_projected(events: list[dict], x: int) -> list[dict]:
 
 def test_projection_holes_preserve_fold():
     """文件侧投影契约:chunk 全跳过后 seq 有洞,但 surface 折叠(messages)
+
     与全流逐时刻一致 —— 洞只丢打字机细节,不丢消息粒度上下文。
 
     (严格 oracle fold_events 保留"流式事件流 seq 连续"检查;投影侧用
@@ -277,7 +280,7 @@ def test_projection_holes_preserve_fold():
     for x in (3, 4, 5, 7, 9, 10, 11):
         assert messages_at(full, x) == messages_at_projected(proj, x), f"x={x}"
     # 投影侧无 chunk 的洞是合法的;全流侧(严格 oracle)洞为错 —— 两语义并存
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="不连续"):
         fold_events(proj)
     fold_lenient(proj)
 
@@ -299,8 +302,6 @@ def test_fold_cc_multi_request_exact_contexts():
             message={"role": "assistant", "content": [
                 {"type": "thinking", "thinking": "分析"},
                 {"type": "text", "text": "检查"},
-                {"type": "tool_use", "id": "t1", "name": "graphify_query",
-                 "input": {"question": "auth?"}},
             ]},
             usage={"input_tokens": 5, "output_tokens": 3}, surfaceOp="append", sourceSeqs=[5, 6, 7, 8]),
         evt(10, "tool/call", callId="t1", name="graphify_query", arguments='{"question": "auth?"}'),
@@ -331,7 +332,6 @@ def test_fold_cc_multi_request_exact_contexts():
         {"role": "assistant", "content": [
             {"type": "thinking", "thinking": "分析"},
             {"type": "text", "text": "检查"},
-            {"type": "tool_use", "id": "t1", "name": "graphify_query", "input": {"question": "auth?"}},
         ]},
         {"role": "user", "content": [
             {"type": "tool_result", "tool_use_id": "t1", "content": "auth: 详见 codemap", "is_error": False},
@@ -344,7 +344,9 @@ def test_fold_cc_multi_request_exact_contexts():
 
 def test_fold_replace_op_after_context_modify():
     """上下文修改:replace 遮蔽折叠(如聊天历史被 trim 后整条替换),折叠只认 surfaceOp;
-    context/modify 自身只做解释,不折动。"""
+
+    context/modify 自身只做解释,不折动。
+    """
     events = [
         evt(0, "session/start", label="chat:r", provider="claude", model=""),
         evt(1, "turn/start", turn=1),
@@ -362,7 +364,7 @@ def test_fold_replace_op_after_context_modify():
     assert messages_at(events, 4) == [
         {"role": "user", "content": [{"type": "text", "text": "旧问题"}]},
     ]
-    # 生效后:派生只剩新消息
+    # 生效后:派生只剩新消息  # noqa: ERA001 - 中文说明注释,非被注释代码
     assert messages_at(events, 10) == [
         {"role": "user", "content": [{"type": "text", "text": "新问题"}]},
     ]

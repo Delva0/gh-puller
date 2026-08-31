@@ -29,24 +29,46 @@ class ClaudeConfig(TypedDict, total=False):
     setting_sources: list[str]
     include_partial_messages: bool
     max_turns: int
+    strict_mcp_config: bool
 
 
 def claude_options(config: dict):
     """ClaudeConfig → ClaudeAgentOptions 实例(config_path → settings 装载)。
 
     本层只做键映射(config 原样透传 + config_path → settings),不关心 SDK 运行细节。
+    默认隔离:strict_mcp_config 未显式给定时取 True —— 无头 cc 只认 mcp_servers
+    注入的工具桌,忽略本机用户级 MCP 配置(防本机全局服务器与装配工具桌混用)。
     """
     from claude_agent_sdk import ClaudeAgentOptions  # lazy:测试可喂假模块
 
     sdk_options = {k: v for k, v in config.items() if k != "config_path"}  # 概念键不得透传
     if config.get("config_path"):  # 统一概念键 → SDK settings(--settings 装载)
         sdk_options["settings"] = config["config_path"]
+    sdk_options.setdefault("strict_mcp_config", True)  # 本层默认隔离
     return ClaudeAgentOptions(**sdk_options)
 
 
 # ---------------------------------------------------------------------------
 # 适配器:SDK 原始流事件/消息对象 → 事件 dict(纯 dict 可单测;cc 唯一权威合成)
 # ---------------------------------------------------------------------------
+
+
+def _block_kind(block) -> str:
+    """内容块判型:块多带 type 属性(离线测试假块同形);SDK 0.2.142 起 TextBlock/
+    ThinkingBlock/ToolUseBlock 为纯 dataclass(仅字段无 type),按字段判别。
+
+    ServerToolUseBlock(同 id/name/input 形)亦归 tool_use —— 服务器侧工具调用照常入事件。
+    """
+    t = getattr(block, "type", None)
+    if t is not None:
+        return t
+    if hasattr(block, "thinking"):
+        return "thinking"
+    if hasattr(block, "text"):
+        return "text"
+    if hasattr(block, "id"):
+        return "tool_use"
+    return ""
 
 
 def _handle_stream_event(event_recorder: EventRecorder, event: dict) -> None:
@@ -119,7 +141,8 @@ def _handle_stream_event(event_recorder: EventRecorder, event: dict) -> None:
         if idx in event_recorder._active_tool_use:
             tid = event_recorder._active_tool_use[idx]
             raw = "".join(event_recorder._tool_use_pieces.get(idx, []))
-            event_recorder.tool_call(tid, event_recorder.tool_names.get(tid), raw)
+            if tid not in event_recorder._call_seqs:  # 消息路径已兜底发射先到先得,流停止不再重发
+                event_recorder.tool_call(tid, event_recorder.tool_names.get(tid), raw)
             event_recorder._active_tool_use.pop(idx, None)
             event_recorder._tool_use_pieces.pop(idx, None)
             return
@@ -129,15 +152,16 @@ def _handle_stream_event(event_recorder: EventRecorder, event: dict) -> None:
 def _handle_assistant_message(event_recorder: EventRecorder, msg, already_yielded: bool) -> None:
     """整块消息:未产出增量时 text 增量一次并事件化;此后发全量 assistant/message。
 
-    sourceSeqs = 本 step 已发 chunk 的 seq;文本/思考/tool_use 块全量入 message;
-    无流事件的 tool_use 兜底补合成 tool/call(流路径已由 content_block_stop 发射)。
+    sourceSeqs = 本 step 已发 chunk 的 seq;文本/思考块入 message(content/thinking),
+    工具调用**不入消息块** —— 只经独立 tool/call 事件承载(_call_seqs 先到先得防重,
+    流路径由 content_block_stop 发射,无流事件由本函数兜底合成)。
     partial 模式(真机 CLI 2.1.237):SDK 消息标记 content 为空,全量 message
-    从本消息增量缓冲(_msg_text/_msg_thinking/_msg_tool_calls)重建 ——
+    从本消息增量缓冲(_msg_text/_msg_thinking)重建 ——
     事件序 = 增量 → 标记,标记即该消息收尾。
     """
     content = []
     for b in msg.content:
-        t = getattr(b, "type", None)
+        t = _block_kind(b)
         if t == "text":
             text = getattr(b, "text", None) or ""
             if text and not already_yielded:
@@ -145,27 +169,13 @@ def _handle_assistant_message(event_recorder: EventRecorder, msg, already_yielde
             content.append({"type": "content", "text": text})
         elif t == "thinking":
             content.append({"type": "thinking", "text": getattr(b, "thinking", None) or ""})
-        elif t == "tool_use":
-            entry = {"type": "tool_call", "id": getattr(b, "id", None) or "",
-                     "name": getattr(b, "name", None) or ""}
-            if getattr(b, "input", None) is not None:
-                entry["input"] = b.input
-            content.append(entry)
+        # tool_use 不装消息块:工具调用只以 tool/call 事件承载
     if not content:
-        # 重建:[thinking, text, tool_use…];工具调用经独立 tool/call 事件承载,
-        # 此处仅入消息块(顺序对齐 SDK 内容块惯例)
+        # 重建:[thinking, text];工具调用经独立 tool/call 事件承载,不入消息块
         if event_recorder._msg_thinking:
             content.append({"type": "thinking", "text": event_recorder._msg_thinking})
         if event_recorder._msg_text:
             content.append({"type": "content", "text": event_recorder._msg_text})
-        for tid, name, arguments in event_recorder._msg_tool_calls:
-            entry = {"type": "tool_call", "id": tid, "name": name}
-            if arguments:
-                try:
-                    entry["input"] = json.loads(arguments)
-                except json.JSONDecodeError:
-                    entry["input"] = arguments
-            content.append(entry)
     stop_reason = getattr(msg, "stop_reason", None) or event_recorder._msg_stop_reason
     event_recorder._msg_reset()
     event_recorder.event(
@@ -176,7 +186,7 @@ def _handle_assistant_message(event_recorder: EventRecorder, msg, already_yielde
         surfaceOp="append", sourceSeqs=list(event_recorder._chunk_seqs),
     )
     for block in msg.content:  # 兜底:无 input_json_delta 的 SDK 路径
-        if getattr(block, "type", None) != "tool_use":
+        if _block_kind(block) != "tool_use":
             continue
         tid = getattr(block, "id", None) or ""
         if tid and tid not in event_recorder._call_seqs:
