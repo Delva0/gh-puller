@@ -16,7 +16,7 @@ benchmark 评测相关 key 见文末分节。
 - 凭证/模型名组 ANTHROPIC_API_KEY / ANTHROPIC_BASE_URL、OPENAI_API_KEY / OPENAI_BASE_URL、
   DEEPSEEK_API_KEY / DEEPSEEK_BASE_URL、CC_MODEL / DSH_MODEL / CODEX_MODEL / LLM_MODEL ——
   由 agent SDK/生成器直读进程环境(app 侧 load_dotenv 兜底),说明见 apps/deepwiki-webui/web/README.md;
-- 死名 DEEPWIKI_PROVIDER、GRAPHIFY_OUT(缺省在 graphify.py:_GRAPHIFY_OUT)、AGENT_MONITOR_PORT(退役)。
+- 死名 DEEPWIKI_PROVIDER、GRAPHIFY_OUT(缺省在 webui 图封装层)、AGENT_MONITOR_PORT(退役)。
 """
 
 import os
@@ -36,7 +36,7 @@ DSH_RUNTIME_CWD = os.path.expanduser(os.environ.get("DSH_RUNTIME_CWD", "~/.gh-pu
 # dsh 的文件类 config 缺省 env(承接旧"自定义组合文件"语义;经 resolve 解析为 config_path)
 DEEPWIKI_DSH_CORDIS = os.environ.get("DEEPWIKI_DSH_CORDIS", "")
 
-# ---- 产物根目录:repos/ 克隆目录、graphify/ 图索引、wiki/ 缓存容器(内部按项目分 <repo_key>/ 文件夹) ----
+# ---- 产物根目录:repos/ 克隆目录、图产物索引根、wiki/ 缓存容器(内部按项目分 <repo_key>/ 文件夹) ----
 DEEPWIKI_ROOT = os.path.expanduser(os.environ.get("DEEPWIKI_ROOT", "~/.gh-puller/deepwiki"))
 
 # ---- chat 输入上限的粗略估算(不引 tiktoken:以字符数/4 近似 token) ----

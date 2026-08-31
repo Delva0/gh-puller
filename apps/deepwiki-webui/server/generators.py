@@ -24,9 +24,11 @@ from pathlib import Path
 from typing import Any
 
 from claude_agent_sdk import create_sdk_mcp_server, tool
-from gh_puller import envs, graphify  # 模块对象绑定:属性调用时取(测试 patch/强刷活性)
+from gh_puller import envs  # 模块对象绑定:属性调用时取(测试 patch/强刷活性)
 from gh_puller.deepwiki.utils import resolve_generator
 from gh_puller.utils import Repo
+
+import graphify_wrapper as graphify  # 图封装层(原 gh_puller.graphify 迁入本 app;主包已移除 graphifyy 依赖)
 
 # ---------------------------------------------------------------------------
 # 图产物路径/索引就绪(原 deepwiki.utils;图知识归本组装层)

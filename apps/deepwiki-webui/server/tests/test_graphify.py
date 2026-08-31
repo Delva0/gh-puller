@@ -1,4 +1,4 @@
-"""gh_puller.graphify 封装层的本地集成测试。
+"""graphify_wrapper(webui 图封装层)的本地集成测试。
 
 不 mock graphify 库：用真实库在 tmp_path 临时语料上跑本地流水线
 （code_only，无 LLM 成本、无网络）。覆盖 extract 主链路与降级、export 五种
@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from gh_puller.graphify import _default_graph_path, _load_graph, export, extract, query
+from graphify_wrapper import _default_graph_path, _load_graph, export, extract, query
 
 _HTML = "<!DOCTYPE html>"  # html/tree/callflow-html 共同标记
 
@@ -51,7 +51,9 @@ def test_extract_missing_path_raises(tmp_path):
 
 def test_extract_no_cluster(tmp_path):
     """no_cluster 全量路径。必须用独立语料:模块级 corpus 已被 graph_json fixture
-    建图,温跑会落入"无变化早退"(skipped)分支而不是全量 raw 写。"""
+
+    建图,温跑会落入"无变化早退"(skipped)分支而不是全量 raw 写。
+    """
     corpus = _tiny_corpus(tmp_path / "repo")
     r = extract(corpus, code_only=True, no_cluster=True)
     assert r["error"] is None
@@ -132,7 +134,7 @@ def test_load_graph_direction_fallback(tmp_path):
 def test_load_graph_suffix_validation(tmp_path):
     gp = tmp_path / "graph.xml"
     gp.write_text("{}", encoding="utf-8")
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match=r"graph file must be a \.json file"):
         _load_graph(gp)
 
 
@@ -161,7 +163,9 @@ def _tiny_corpus(d: Path) -> Path:
 
 def test_extract_out_dir_cache_layout(tmp_path):
     """给出 out_dir(=最终输出目录)时:graph.json 在 out_dir 下,缓存落 <out_dir>/cache,
-    不再出现 <out_dir>/graphify-out 层;二次运行命中新位置缓存(真实 lib,AST 本地无费用)。"""
+
+    不再出现 <out_dir>/graphify-out 层;二次运行命中新位置缓存(真实 lib,AST 本地无费用)。
+    """
     corpus = _tiny_corpus(tmp_path / "repo")
     out = tmp_path / "out"
     r = extract(corpus, code_only=True, out_dir=str(out))
@@ -285,6 +289,7 @@ def test_extract_force_env_override(tmp_path, monkeypatch):
 
 def test_extract_no_dedup_maps_build_merge_valueerror(tmp_path, monkeypatch):
     """build_merge 的 #479 ValueError（仅 --no-dedup 时 arm）映射为 error dict，
+
     旧图不被写（镜像 cli.py:3977-3983）。必须 patch 本模块的 build_merge 别名。
     """
     corpus = _tiny_corpus(tmp_path / "repo")
@@ -293,12 +298,12 @@ def test_extract_no_dedup_maps_build_merge_valueerror(tmp_path, monkeypatch):
     gp = Path(r1["graph_json"])
     before = gp.read_text(encoding="utf-8")
 
-    import gh_puller.graphify as gfx
+    import graphify_wrapper as gfx
 
     def _boom(*a, **kw):
         raise ValueError(
             "graphify: build_merge would drop 1 node(s) from sources that were "
-            "neither re-extracted nor pruned this run (#479)"
+            "neither re-extracted nor pruned this run (#479)",
         )
 
     monkeypatch.setattr(gfx, "build_merge", _boom)
@@ -309,9 +314,11 @@ def test_extract_no_dedup_maps_build_merge_valueerror(tmp_path, monkeypatch):
 
 def test_extract_no_dedup_passes_dedup_false(monkeypatch, tmp_path):
     """--no-dedup 透传 build(dedup=False)。spy 必须 patch 本模块的 build 别名
-    （import 绑定早于 monkeypatch，patch graphify.build.build 无效）。"""
+
+    （import 绑定早于 monkeypatch，patch graphify.build.build 无效）。
+    """
     corpus = _tiny_corpus(tmp_path / "repo")
-    import gh_puller.graphify as gfx
+    import graphify_wrapper as gfx
 
     calls = {}
     real = gfx.build
@@ -328,7 +335,7 @@ def test_extract_no_dedup_passes_dedup_false(monkeypatch, tmp_path):
 def test_extract_allow_partial_ast_failure(monkeypatch, tmp_path):
     """#2445:整段 AST 丢失默认致命(错误态、不写图);allow_partial 才降级续跑。"""
     corpus = _tiny_corpus(tmp_path / "repo")
-    import gh_puller.graphify as gfx
+    import graphify_wrapper as gfx
 
     def _boom(*a, **kw):
         raise RuntimeError("boom")

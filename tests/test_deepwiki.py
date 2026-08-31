@@ -206,7 +206,7 @@ def _repo_of(req: dict) -> Repo:
 class _FakeGraph:
     """图服务假类(注入 generator_config['graph']);解析/窗口属 webui generators 模块,假件只回块。
 
-    ready 可钉(未索引路径);context 记录 question(替代旧 deepwiki.graphify.query 捕获),
+    ready 可钉(未索引路径);context 记录 question(替代旧图查询捕获位点),
     可钉 blocks(行窗块,供 format_subgraph_context / chunk_count)或 error(→
     "代码图谱不可用: ..." 同式包装,检索失败须 raise 语义)。
     """
@@ -547,7 +547,7 @@ def test_format_subgraph_context():
 
 
 # ---------------------------------------------------------------------------
-# LLM 路 chat / codemap(fake graphify.query + fake llm_stream/llm_complete,全离线)
+# LLM 路 chat / codemap(fake 图服务 + fake llm_stream/llm_complete,全离线)
 # ---------------------------------------------------------------------------
 
 
@@ -681,7 +681,7 @@ async def test_llm_chat_error_fallbacks(monkeypatch, tmp_path):
 
 @pytest.mark.asyncio
 async def test_llm_codemap_events_sequence(monkeypatch, tmp_path):
-    """llm codemap:NDJSON 事件序列与 agent 路同形;一次 graphify 查询两阶段复用;
+    """llm codemap:NDJSON 事件序列与 agent 路同形;一次图检索两阶段复用;
 
     _ground_citations 以真实源码覆盖行号。
     """

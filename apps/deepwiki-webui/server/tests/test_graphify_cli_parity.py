@@ -1,7 +1,7 @@
-"""gh_puller.graphify.extract 与真 `graphify extract` CLI 的建图差分测试。
+"""graphify_wrapper.extract 与真 `graphify extract` CLI 的建图差分测试。
 
 装置:同一 tmp 语料,一侧 subprocess 跑 `python -m graphify extract . --out …`,
-另一侧子进程调 `gh_puller.graphify.extract(out_dir=…)`,然后逐产物比较。
+另一侧子进程调 `graphify_wrapper.extract(out_dir=…)`,然后逐产物比较。
 全部场景零 LLM(纯 code_only 或进程内 mock graphify.llm.extract_corpus_parallel,
 铁律:LLM 禁止真实调用)。
 
@@ -17,7 +17,7 @@ from pathlib import Path
 
 import pytest
 
-from gh_puller.graphify import extract
+from graphify_wrapper import extract
 
 # 子进程环境的 LLM 键洗净:残留 key 会让无 key 断言失效
 _LLM_KEYS = (
@@ -40,7 +40,7 @@ def _mixed_corpus(d: Path) -> Path:
     """app.py + utils.py(code AST)+ README.md(语义文件,code_only 跳过)。"""
     d.mkdir(parents=True, exist_ok=True)
     (d / "app.py").write_text(
-        "import utils\n\n\ndef main():\n    return utils.hello('x')\n", encoding="utf-8"
+        "import utils\n\n\ndef main():\n    return utils.hello('x')\n", encoding="utf-8",
     )
     (d / "utils.py").write_text("def hello(name):\n    return f'hi {name}'\n", encoding="utf-8")
     (d / "README.md").write_text("# Demo\n", encoding="utf-8")
@@ -51,13 +51,13 @@ def _cli(corpus: Path, out_root: Path, *flags: str):
     """真 CLI(subprocess)。产物在 <out_root>/graphify-out/。"""
     return subprocess.run(
         [sys.executable, "-m", "graphify", "extract", ".", "--out", str(out_root), *flags],
-        cwd=str(corpus), capture_output=True, text=True, env=_clean_env(),
+        cwd=str(corpus), capture_output=True, text=True, check=False, env=_clean_env(),
     )
 
 
 _WRAP = (
     "import json, sys\n"
-    "from gh_puller.graphify import extract\n"
+    "from graphify_wrapper import extract\n"
     "kw = json.loads(sys.argv[3]) if len(sys.argv) > 3 else {}\n"
     "print(json.dumps(extract(sys.argv[1], out_dir=sys.argv[2], **kw)))\n"
 )
@@ -67,7 +67,7 @@ def _wrap(corpus: Path, out_dir: Path, **kw) -> dict:
     """子进程内调封装(子进程=独立 stat-index 全局,与 CLI 侧天然隔离)。"""
     r = subprocess.run(
         [sys.executable, "-c", _WRAP, str(corpus), str(out_dir), json.dumps(kw)],
-        capture_output=True, text=True, env=_clean_env(), cwd=str(_REPO_ROOT),
+        capture_output=True, text=True, check=False, env=_clean_env(), cwd=str(_REPO_ROOT),
     )
     assert r.returncode == 0, r.stderr
     return json.loads(r.stdout)
@@ -79,7 +79,7 @@ def _norm_graph(p: Path) -> dict:
     nodes = sorted(raw.get("nodes", []), key=lambda n: (n.get("id"), n.get("source_file")))
     links = sorted(
         raw.get("links", raw.get("edges", [])),
-        key=lambda l: (l.get("source"), l.get("target"), l.get("relation")),
+        key=lambda ln: (ln.get("source"), ln.get("target"), ln.get("relation")),
     )
     return {k: raw.get(k) for k in ("directed", "multigraph", "hyperedges")} | {
         "nodes": nodes, "links": links,
@@ -311,9 +311,10 @@ def _dispatch_cli_extract(corpus: Path, out_root: Path, *flags: str) -> None:
 @pytest.mark.usefixtures("monkeypatch")
 def test_semantic_parity_inprocess(monkeypatch, tmp_path):
     """语义场景:LMM 走 mock;CLI 侧 dispatch_command 直调,封装侧 extract()。
+
     注意别名陷阱:封装在 import 时绑定 extract_corpus_parallel,须双侧 patch。
     """
-    import gh_puller.graphify as gfx
+    import graphify_wrapper as gfx
 
     monkeypatch.setattr("graphify.llm.extract_corpus_parallel", _fake_llm)
     monkeypatch.setattr(gfx, "extract_corpus_parallel", _fake_llm)
@@ -325,16 +326,16 @@ def test_semantic_parity_inprocess(monkeypatch, tmp_path):
     assert r["error"] is None, r
     _assert_same(cli_out, w_out)
     assert json.loads(
-        (w_out / ".graphify_semantic_marker").read_text(encoding="utf-8")
+        (w_out / ".graphify_semantic_marker").read_text(encoding="utf-8"),
     ) == {"output_tokens": 5}
     assert json.loads(
-        (cli_out / "graphify-out" / ".graphify_semantic_marker").read_text(encoding="utf-8")
+        (cli_out / "graphify-out" / ".graphify_semantic_marker").read_text(encoding="utf-8"),
     ) == {"output_tokens": 5}
 
 
 def test_semantic_force_redispatch_parity(monkeypatch, tmp_path):
     """--force:双侧都跳过语义缓存读、全部重派发(mock 调用次数 == 文件数)。"""
-    import gh_puller.graphify as gfx
+    import graphify_wrapper as gfx
 
     calls = {"n": 0}
 
@@ -356,8 +357,10 @@ def test_semantic_force_redispatch_parity(monkeypatch, tmp_path):
 
 def test_semantic_partial_chunk_incomplete_parity(monkeypatch, tmp_path):
     """部分 chunk 失败(2 个文档只成功 1 个):双侧 incomplete=True,图仍写出
-    (fresh,无旧图);marker 一致。"""
-    import gh_puller.graphify as gfx
+
+    (fresh,无旧图);marker 一致。
+    """
+    import graphify_wrapper as gfx
 
     corpus = tmp_path / "repo"
     corpus.mkdir(parents=True, exist_ok=True)
@@ -393,7 +396,7 @@ def test_semantic_partial_chunk_incomplete_parity(monkeypatch, tmp_path):
 
 def test_semantic_deep_mode_parity(monkeypatch, tmp_path):
     """--mode deep:deep 命名空间缓存(semantic-deep/),两侧同现。"""
-    import gh_puller.graphify as gfx
+    import graphify_wrapper as gfx
 
     monkeypatch.setattr("graphify.llm.extract_corpus_parallel", _fake_llm)
     monkeypatch.setattr(gfx, "extract_corpus_parallel", _fake_llm)

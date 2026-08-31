@@ -3,7 +3,7 @@
 源(对照):graphify/tests/test_relation_collapse_precedence.py、
 test_build.py(方向块 #760/#1061/#2342)、test_dedup.py(纯函数块)、
 test_merge_graphs_cli.py(#2261 方向标记)、test_query_cli.py(calls 方向渲染)。
-断言的是 graphify 库在建图/导出/方向保留上的契约 —— gh_puller.graphify 的
+断言的是 graphify 库在建图/导出/方向保留上的契约 —— graphify_wrapper 的
 extract 路径必须与之逐点一致(方向性事实:extract 链从不传 directed,
 构建无向 nx.Graph,方向真相经 _src/_tgt → 端点序保留)。
 """
@@ -17,7 +17,7 @@ from graphify.dedup import deduplicate_entities
 from graphify.export import to_json
 from graphify.extract import extract_js
 
-from gh_puller.graphify import _load_graph, extract, query
+from graphify_wrapper import _load_graph, extract, query
 
 _FIXTURES = Path(__file__).resolve().parent / "fixtures"
 
@@ -126,7 +126,9 @@ def test_build_directed_mode_is_digraph():
 
 def test_build_merge_preserves_call_edge_direction(tmp_path):
     """#760:被调方先于调用方定义时,无向存储会把边迭代成 (b, a),导出必须
-    以 _src/_tgt 弹回真实端点序(a calls b)。"""
+
+    以 _src/_tgt 弹回真实端点序(a calls b)。
+    """
     src_file = tmp_path / "x.js"
     src_file.write_text("function b() {}\nfunction a() { b(); }\n", encoding="utf-8")
     extraction = extract_js(src_file)
@@ -181,14 +183,16 @@ def _js_corpus(d: Path) -> Path:
 
 def test_extract_graph_direction_pipeline(tmp_path):
     """整链:extract → graph.json 是无向存储(directed: false)但 calls 端点
-    顺序即真实调用方向(无向存储 + _src/_tgt 弹回)。"""
+
+    顺序即真实调用方向(无向存储 + _src/_tgt 弹回)。
+    """
     corpus = _js_corpus(tmp_path / "repo")
     r = extract(corpus, code_only=True)
     assert r["error"] is None
     raw = json.loads(Path(r["graph_json"]).read_text(encoding="utf-8"))
     assert raw["directed"] is False  # 方向性事实:extract 链从不传 directed
     labels = {n["id"]: n.get("label", "") for n in raw["nodes"]}
-    calls = [l for l in raw["links"] if l.get("relation") == "calls"]
+    calls = [ln for ln in raw["links"] if ln.get("relation") == "calls"]
     assert len(calls) == 2
     for link in calls:
         assert labels[link["source"]].startswith("a") or labels[link["source"]].startswith("c")
@@ -197,7 +201,9 @@ def test_extract_graph_direction_pipeline(tmp_path):
 
 def test_extract_warm_keeps_directional_markers(tmp_path):
     """#2261 精神:增量二跑(改文件)后,方向标记仍在——_load_graph 的
-    preserve_direction 回填 _src/_tgt,且端点真实有序。"""
+
+    preserve_direction 回填 _src/_tgt,且端点真实有序。
+    """
     corpus = _js_corpus(tmp_path / "repo")
     r1 = extract(corpus, code_only=True)
     assert r1["error"] is None
@@ -209,7 +215,7 @@ def test_extract_warm_keeps_directional_markers(tmp_path):
     assert r2["error"] is None and r2["incremental"] is True
     G, data = _load_graph(r2["graph_json"], preserve_direction=True)
     labels = {i: G.nodes[i].get("label", i) for i in G.nodes}
-    calls = [l for l in data["links"] if l.get("relation") == "calls"]
+    calls = [ln for ln in data["links"] if ln.get("relation") == "calls"]
     assert len(calls) == 2
     for link in calls:
         assert link["_src"] == link["source"] and link["_tgt"] == link["target"]
@@ -235,7 +241,9 @@ def test_extract_graph_json_shape(tmp_path):
 
 def test_extract_deterministic_bytes(tmp_path):
     """同一语料两次 fresh 提取到不同 out_dir:graph.json 字节级一致
-    (非 git 语料 → built_at_commit 两侧均缺省)。"""
+
+    (非 git 语料 → built_at_commit 两侧均缺省)。
+    """
     corpus = _js_corpus(tmp_path / "repo")
     r1 = extract(corpus, code_only=True, out_dir=str(tmp_path / "out1"))
     r2 = extract(corpus, code_only=True, out_dir=str(tmp_path / "out2"))
@@ -325,7 +333,9 @@ def _write_calls_graph(tmp_path: Path) -> Path:
 @pytest.mark.parametrize("seed", ["callee_fn", "caller_fn"])
 def test_query_renders_calls_caller_to_callee(tmp_path, seed):
     """query 从被调方或调用方种子出发,渲染都是 caller_fn -> callee_fn
-    (种子在被调方时,无向遍历仍须按端点方向渲染 —— #2213/#2309 精神)。"""
+
+    (种子在被调方时,无向遍历仍须按端点方向渲染 —— #2213/#2309 精神)。
+    """
     r = query(seed, graph_path=str(_write_calls_graph(tmp_path)), token_budget=2000)
     assert r["error"] is None
     assert "caller_fn --calls" in r["answer"]

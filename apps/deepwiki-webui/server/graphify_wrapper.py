@@ -7,8 +7,9 @@
 导入时快照（graphify.paths.GRAPHIFY_OUT 在 import 时读取一次），因此任何函数
 都可在不改变工作目录的前提下运行。LLM 凭据完全来自环境变量（OPENAI_API_KEY /
 OPENAI_BASE_URL / OPENAI_MODEL 等由 graphify 库层读取），本模块不接收也不落盘
-任何 API key。graphify 是本项目的底层三方依赖（见 pyproject），因此导入一律
-在模块顶部直接 import，不做缺包防御。
+任何 API key。graphify 是本 app（webui 组装层）的底层三方依赖（见本目录
+pyproject.toml；主包 gh-puller 已不声明），因此导入一律在模块顶部直接
+import，不做缺包防御。
 
 对齐项（相对 `graphify extract` CLI，与 cli.py extract 分支逐段对照）：
 - 增量语义一致（早前的"每次全量重建"简化已移除）：graph.json 存在且非
@@ -41,6 +42,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Literal
 
+from gh_puller.utils import _log as _utils_log
 from graphify import querylog
 from graphify.analyze import god_nodes, surprising_connections
 from graphify.build import (
@@ -97,8 +99,6 @@ from graphify.watch import (
     _write_build_config,
 )
 from networkx.readwrite import json_graph
-
-from .utils import _log as _utils_log
 
 _GRAPHIFY_OUT = "graphify-out"  # GRAPHIFY_OUT 缺省值（与 graphify.paths.py 同式）
 _DEFAULT_TOKEN_BUDGET = 60_000  # 与 CLI --token-budget 缺省一致

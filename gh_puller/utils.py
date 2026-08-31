@@ -14,7 +14,7 @@
   时创建,由其持有者负责业务目录与写锁)。
 - _CLONE_ROOT 在导入时对 envs 快照(envs 为导入时单点快照,见 envs.py),
   同一进程内与 deepwiki 的 DEEPWIKI_ROOT 快照保持一致。
-- 进度日志走 stderr(同 graphify.py 约定)。
+- 进度日志走 stderr(机器结果走调用方)。
 """
 
 import json
