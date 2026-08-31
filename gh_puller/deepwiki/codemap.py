@@ -247,7 +247,7 @@ async def _codemap(
 
     # 阶段 1:骨架
     yield _phase("initial_codemap", "start")
-    skeleton_prompt = f"<query>\n{question}\n</query>\n\nAssistant: "
+    skeleton_prompt = f"{question}"
     try:
         skeleton = codemap_of(await _run_json(skeleton_prompt))
     except Exception as e:
@@ -261,7 +261,7 @@ async def _codemap(
     enrich_query = (
         f"{question}\n\n<SKELETON>\n{json.dumps(dataclasses.asdict(skeleton))}\n</SKELETON>"
     )
-    enrich_prompt = f"<query>\n{enrich_query}\n</query>\n\nAssistant: "
+    enrich_prompt = f"{enrich_query}"
     final = skeleton
     try:
         adapter = utils.adapt_generator(

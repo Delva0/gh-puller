@@ -993,8 +993,6 @@ def _build_structure_prompt(
     page_count = "8-12" if comprehensive else "4-6"
     kind = "comprehensive" if comprehensive else "concise"
     return f"""IMPORTANT: you are working INSIDE the repository (cwd = repository root at {repo_root}).
-The file contents are NOT inlined in this prompt — explore and read source files yourself
-with the Read/Grep/Glob tools.
 
 Analyze this repository {owner}/{repo_name} and create a wiki structure for it.
 
@@ -1032,8 +1030,7 @@ def _generator_cache_page_prompt(title: str, file_paths: list[str], out_path: st
     paths = "\n".join(f"- [{p}]({p})" for p in file_paths)
     return (
         "IMPORTANT: you are working INSIDE the repository (cwd = repository root). "
-        "The file contents are NOT inlined in this prompt — read the relevant source files "
-        "yourself with the Read/Grep/Glob tools. All paths below are relative to the repository root.\n\n"
+        "All paths below are relative to the repository root.\n\n"
         + _build_page_prompt(title, paths, language)
         + f"\n\nDELIVERABLE: Write the complete generated Markdown page to `{out_path}` using the "
           "Write tool (create the file; do not use Edit). Do NOT return the page in your message "

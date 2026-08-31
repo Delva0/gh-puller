@@ -209,6 +209,9 @@ def adapt_generator(generator: str | None = None, *, generator_config: dict | No
     gid, resolved = resolve_generator(generator, generator_config)
     if gid == "llm":
         return GENERATORS["llm"](resolved)
+    # 拼接:generator_config 传入的 system_prompt(用户级)在前,参数 system_prompt(task 级)追加在后
+    if resolved.get("system_prompt"):
+        system_prompt = f"{resolved['system_prompt']}\n\n{system_prompt}" if system_prompt else resolved["system_prompt"]
     if gid == "dsh":
         options: dict[str, Any] = dict(resolved)
         options.update({

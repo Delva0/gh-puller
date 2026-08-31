@@ -156,6 +156,14 @@ async def ensure_index(repo: Repo) -> None:
 # 覆盖构造参数注入(生成器选型 + 工具桌 → generator_config)
 # ---------------------------------------------------------------------------
 
+#: 图工具优先指引:经 system_prompt 注入(生成器私有档位接收:cc system_prompt /
+#: codex base_instructions / dsh DSH_SYSTEM_PROMPT / opencode instructions 文件)
+_GRAPH_FIRST_SYSTEM_PROMPT = (
+    "Prefer the gh_puller_mcp(codebase graph tools) for code queries: locate definitions, call chains "
+    "and dependencies directly by symbol name — more precise and efficient than Grep/Glob/Read."
+)
+
+
 def runtime_config(generator: str | None = None, generator_config: dict | None = None,
                    *, repo: Repo | None = None) -> dict:
     """Selection → runtime config (public config_path adapted per generator + tool-desk injection).
@@ -182,6 +190,8 @@ def runtime_config(generator: str | None = None, generator_config: dict | None =
     # codex keeps config_path; dsh has no config_path concept — nothing to adapt.
     if repo is None:
         return result
+    # if gid != "llm":
+    #     result["system_prompt"] = _GRAPH_FIRST_SYSTEM_PROMPT  # 图工具优先指引(无工具桌的 llm 不注入)
     if gid == "dsh":
         result["mcp_servers"] = _gh_puller_mcp("dsh")
     elif gid in ("codex", "opencode"):

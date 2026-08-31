@@ -109,7 +109,7 @@ async def _chat(
     history = _render_natural_history(messages)
 
     prompt = (
-        history + f"<query>\n{last.get('content', '')}\n</query>\n\nAssistant: "
+        history + f"{last.get('content', '')}"
     )
     try:
         async with adapter.session(session_name=f"chat:{repo.name}", run_id=f"chat:{repo.name}"):
