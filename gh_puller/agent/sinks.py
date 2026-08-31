@@ -50,6 +50,12 @@ def _log(msg: str) -> None:
 class FileSink:
     """文件观测通道:每会话一个 JSONL,只落非流式事件流(message 粒度)。
 
+    粒度开关:raw=False(缺省)只落非流式事件流(assistant/chunk 跳过 —— 文件
+    seq 允许洞,洞 = 被跳过的流式事件,契约见 gh_puller.agent.events,前端折叠
+    只比较 seq,不要求稠密);raw=True 落全量原始事件流(含 assistant/chunk,
+    seq 稠密,与 WS/OTel 通道承载的是同一流;经 AGENT_MONITOR_FILE_RAW=1 选开,
+    缺省关闭防日志膨胀)。
+
     布局扁平:<uuid>.jsonl(uuid 段 = session id 最后一个 "/" 后段,根 =
     AGENT_MONITOR_DIR,无 sessions 子层),
     一行一条事件(按 seq 排序来自适配器);assistant/chunk 直接跳过 —— 文件
@@ -67,14 +73,16 @@ class FileSink:
     事件不可分组,丢弃(同 v1 语义)。
     """
 
-    def __init__(self, root: str):
+    def __init__(self, root: str, *, raw: bool = False):
         self.root = Path(root)
+        self.raw = raw
         self._files: dict[str, Path] = {}  # session → 当前文件(注册用;终态不移走)
         self.root.mkdir(parents=True, exist_ok=True)
 
     async def consume(self, evt: dict) -> None:
-        if evt["type"] not in NON_STREAM_TYPES:
-            return  # 流式事件(chunk):文件只落非流式事件流,防日志膨胀
+        """逐事件追加一行至会话文件;除非 raw=True,只落非流式事件流。"""
+        if not self.raw and evt["type"] not in NON_STREAM_TYPES:
+            return  # 流式事件(chunk):文件缺省只落非流式事件流,防日志膨胀;raw=True 落全量
         session = evt.get("session", "")
         if evt["type"] == "session/start":
             self._open(session)
@@ -469,8 +477,10 @@ def _default_otel_urls() -> list[str]:
 
 _cfg = {
     # 文件 sink 恒开(系统约定:监控真源恒在盘;AGENT_MONITOR_FILE env 与运行时
-    # configure(file=...) 开关均已移除,隔离/嵌入/测试只经 file_dir 重定向)
+    # configure(file=...) 开关均已移除,隔离/嵌入/测试只经 file_dir 重定向);
+    # 事件粒度经 AGENT_MONITOR_FILE_RAW 切换:False=非流式投影,True=原始事件流(含 chunk)
     "file_dir": envs.AGENT_MONITOR_DIR,
+    "raw": envs.AGENT_MONITOR_FILE_RAW,
     "ws_urls": _split_urls(envs.AGENT_MONITOR_WEBUI_URL),
     "otel_urls": _default_otel_urls(),
 }
@@ -479,17 +489,20 @@ _bus: EventBus | None = None
 _file_sinks: list[FileSink] = []
 
 
-def configure(*, file_dir=None, ws_urls=None, otel_urls=None) -> None:
+def configure(*, file_dir=None, ws_urls=None, otel_urls=None, raw=None) -> None:
     """重配监控(测试/嵌入用);缺省取 envs 常量,生效于下一次事件发布。
 
     ws_urls / otel_urls:URL 列表或逗号分隔字符串;None → 重读对应 env 常量
     (otel 为 _OTEL_BACKENDS 全表);空 → 不部署该类 sink(每 URL 一个 sink 实例)。
     file_dir:文件 sink 落盘目录(恒开,不可关)——测试/嵌入重定向到 tmp 目录,
     避免写真实 monitor 目录。
+    raw:True → FileSink 写全量原始事件流(含 assistant/chunk);None → 重读
+    AGENT_MONITOR_FILE_RAW;False → 非流式投影(缺省)。
     关闭旧 bus(取消 sink 任务),新配置惰性重建 —— 幂等,可反复调用。
     """
     global _bus, _file_sinks
     _cfg["file_dir"] = envs.AGENT_MONITOR_DIR if file_dir is None else file_dir
+    _cfg["raw"] = envs.AGENT_MONITOR_FILE_RAW if raw is None else bool(raw)
     _cfg["ws_urls"] = _split_urls(envs.AGENT_MONITOR_WEBUI_URL if ws_urls is None else ws_urls)
     _cfg["otel_urls"] = _default_otel_urls() if otel_urls is None else _split_urls(otel_urls)
     if _bus is not None:
@@ -518,7 +531,7 @@ def ensure_bus() -> EventBus:
     global _bus, _file_sinks
     if _bus is None:
         b = EventBus()
-        fs = FileSink(_cfg["file_dir"])
+        fs = FileSink(_cfg["file_dir"], raw=_cfg["raw"])
         _file_sinks.append(fs)  # touch 扇出门(与事件通道同一实例)
         b.add(fs.consume)
         for url in _cfg["ws_urls"]:

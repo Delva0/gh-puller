@@ -230,6 +230,38 @@ async def test_file_sink_crash_residue_stays_flat(tmp_path):
     assert "session/end" not in path.read_text()
 
 
+@pytest.mark.asyncio
+async def test_file_sink_raw_stream_writes_chunks(tmp_path):
+    """原始事件流开关:raw=True 时 assistant/chunk 落盘,文件 seq 稠密(无洞)。"""
+    sink = FileSink(str(tmp_path), raw=True)
+    await sink.consume(_evt("session/start", session="raw1", seq=0, run_id="r1",
+                            label="t", provider="anthropic", model=""))
+    await sink.consume(_evt("assistant/chunk", session="raw1", seq=1,
+                            chunk={"type": "content", "index": 0, "text": "你好"}))
+    await sink.consume(_evt("assistant/message", session="raw1", seq=2,
+                            message={"role": "assistant", "content": [{"type": "text", "text": "你好"}]},
+                            surfaceOp="append", sourceSeqs=[1]))
+    lines = [json.loads(line) for line in (tmp_path / "raw1.jsonl").read_text().splitlines()]
+    assert [ln["type"] for ln in lines] == ["session/start", "assistant/chunk", "assistant/message"]
+    assert [ln["seq"] for ln in lines] == [0, 1, 2]  # 稠密:chunk 不再被跳过
+
+
+@pytest.mark.asyncio
+async def test_configure_raw_flow_switch(monkeypatch, tmp_path):
+    """configure(raw=...) → ensure_bus 的 FileSink 粒度切换;raw=None 重读 env 常量。"""
+    agent.configure(file_dir=str(tmp_path), ws_urls=[], otel_urls=[], raw=True)
+    sinks.ensure_bus()
+    assert sinks._file_sinks[0].raw is True  # 全量原始事件流(含 chunk)
+    agent.configure(file_dir=str(tmp_path), ws_urls=[], otel_urls=[], raw=None)
+    assert not sinks._file_sinks  # configure 清空注册表(待重建)
+    sinks.ensure_bus()
+    assert sinks._file_sinks[0].raw is False  # None → env 常量缺省(非流式投影)
+    monkeypatch.setattr(sinks.envs, "AGENT_MONITOR_FILE_RAW", True)
+    agent.configure(file_dir=str(tmp_path), ws_urls=[], otel_urls=[], raw=None)
+    sinks.ensure_bus()
+    assert sinks._file_sinks[0].raw is True  # None → 重读 env 常量
+
+
 # ---------------------------------------------------------------------------
 # 适配器归一化(喂形似 SDK 的纯 dict/对象)
 # ---------------------------------------------------------------------------

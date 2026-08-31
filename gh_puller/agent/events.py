@@ -8,7 +8,8 @@
 - 流式事件流(agent 事件流)= TAXONOMY 全集(STREAM_TYPES):含 assistant/chunk
   原始增量,可还原实时(逐字)上下文;WS/OTel 通道承载;
 - 非流式事件流 = TAXONOMY − {assistant/chunk}(NON_STREAM_TYPES):message 粒度,
-  assistant/message 已是定型全量,可还原任意时刻的消息上下文;filesink 只落此级。
+  assistant/message 已是定型全量,可还原任意时刻的消息上下文;filesink 缺省只落此级
+  (AGENT_MONITOR_FILE_RAW=1 → 落全量原始事件流,seq 稠密)。
 
 seq 序列是流式事件流的稠密序号;文件侧(非流式投影)按行跳过 chunk,因此
 **文件内 seq 允许洞,洞 = 被跳过的 assistant/chunk**。折叠契约只做 seq 排序
@@ -74,7 +75,8 @@ SURFACE_TYPES = frozenset({"user/message", "assistant/message", "tool/result"})
 
 # 事件流两级划分:流式事件流(agent 事件流,完整 taxonomy,可还原实时上下文)
 # 与非流式事件流(逐行跳 chunk,message 粒度,可还原任意时刻消息上下文)。
-# filesink 只落非流式事件流(NON_STREAM_TYPES);WS/OTel 通道承载完整流式事件流。
+# filesink 缺省只落非流式事件流(NON_STREAM_TYPES;AGENT_MONITOR_FILE_RAW=1 落全量);
+# WS/OTel 通道承载完整流式事件流。
 STREAM_TYPES = TAXONOMY
 NON_STREAM_TYPES = TAXONOMY - {"assistant/chunk"}
 

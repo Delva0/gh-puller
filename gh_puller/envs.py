@@ -48,6 +48,9 @@ CHAT_TOKEN_LIMIT_ESTIMATE = int(os.environ.get("DEEPWIKI_CHAT_TOKEN_LIMIT", "750
 # 该目录即会话 jsonl 落盘根(无 sessions 子层):~/.gh-puller/agent-sessions/<uuid>.jsonl;
 # hub(apps/agent-monitor/server/hub.py)为同一目录的读端(共享契约,单点在本模块)。
 AGENT_MONITOR_DIR = os.path.expanduser(os.environ.get("AGENT_MONITOR_DIR", "~/.gh-puller/agent-sessions"))
+# 文件 sink 事件粒度开关:0(缺省)→ 非流式事件流投影(逐行跳过 assistant/chunk,
+# 防日志膨胀;文件 seq 允许洞);1 → 原始事件流(全量 taxonomy 逐行落盘,seq 稠密)
+AGENT_MONITOR_FILE_RAW = os.environ.get("AGENT_MONITOR_FILE_RAW", "0") == "1"
 # 默认 = 内部 agent-monitor hub(apps/agent-monitor;hub 端口经 uvicorn CLI --port 指定,默认 8765)
 AGENT_MONITOR_WEBUI_URL = os.environ.get("AGENT_MONITOR_WEBUI_URL", "ws://localhost:8765/ws")
 # 会话心跳:静默超时(无落盘事件)的补发间隔;hub 租约按"文件 mtime 静止 > LEASE"判孤儿

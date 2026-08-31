@@ -19,7 +19,7 @@ Every LLM call in this repository — Claude Code agent calls (`cc_stream` / `cc
 The observation model is **event-sourcing**: a single lossless append-only event log per run, aligned with the deepseek-harness invariant — the LLM `messages` context is *derived* by a surface fold, not snapshotted. The event log splits into two granularities:
 
 - **流式事件流 (agent event flow, full taxonomy)** — every atomic unit including `assistant/chunk` typing deltas; restores the *real-time* context (character granularity). Carried by the WS/OTel channels.
-- **非流式事件流** — full taxonomy *minus* `assistant/chunk`; restores the *message-granularity* context (the surface fold contract does not need chunks). **FileSink 只落此级 (日志防膨胀)**; file `seq` therefore has **holes** (hole = skipped chunk), and readers must only sort/compare `seq` — never assume density (contract: [gh_puller/agent/events.py]()).
+- **非流式事件流** — full taxonomy *minus* `assistant/chunk`; restores the *message-granularity* context (the surface fold contract does not need chunks). **FileSink 缺省只落此级 (日志防膨胀)**; file `seq` therefore has **holes** (hole = skipped chunk), and readers must only sort/compare `seq` — never assume density (contract: [gh_puller/agent/events.py]()). 选 `AGENT_MONITOR_FILE_RAW=1` 时 FileSink 落**原始事件流**(含 `assistant/chunk`,seq 稠密)。
 
 - **Event log** — the raw atomic units (`session/start` → `turn/start` → `step/start` → `user/message` → `request/header` → `assistant/chunk` → `assistant/message` (`tool/call` / `tool/result`) → `step/end` → `end`), normalized by per-provider adapters into plain dicts with a per-session monotonic `seq` (from 0, contiguous within the streaming flow) and published to a single asyncio `EventBus`; `publish` is `put_nowait` only and never blocks the caller. Source: [gh_puller/agent/events.py:TAXONOMY]()
 - **Surface fold (derived)** — `user/message` / `assistant/message` / `tool/result` full messages act as *surface nodes* (each carries `surfaceOp: append | {op:'replace',start,end}`); the fold of any log prefix yields the exact `messages` context that moment, and `request/header` (a snapshot of config/system/tools; `partial:true` for the cc path, since the SDK never exposes the rendered request) pinpoints the full request payload at every `step`. Context injection is just a non-user-source `user/message`; modifications shell as `replace`. `context/inject` / `context/modify` are *log-only* explanation records (ignorable; they never move the fold) — this contract is shared with the viewer (single implementation in [ui/src/monitor/surface.ts]()) and contract-tested in [tests/test_event_taxonomy.py](). Sources: [gh_puller/agent/events.py:SURFACE_TYPES](), [ui/src/monitor/surface.ts]()
@@ -68,7 +68,7 @@ grep '"type":"session/start"' ~/.gh-puller/agent-sessions/*.jsonl
 tail -f ~/.gh-puller/agent-sessions/*.jsonl
 ```
 
-Each JSONL line is one raw non-streaming event (full content — no truncation anywhere in the log; only OTel previews truncate). `assistant/chunk` is **skipped** (log inflation), so the file `seq` has holes (hole == skipped chunk); the fold contract only compares `seq` — readers never assume density. Writes happen in the sink worker (queue drain), bounded at 5000 events drop-oldest; a slow or full disk never blocks the LLM call. A crash leaves a file **without** `session/end` (residue; hub 按"无终态行 + mtime 静止超租约"派生为 aborted,见 §3 —— 运行期静默补发的 `session/heartbeat` 行同样落盘,活会话的 mtime 不会停,读者以租约区分"活但静默"与"进程已死";残留文件即排查素材)。 **v1 迁移**:旧格式(LLM 聚合行)与本格式互不兼容,首次升级请在 hub 未启动/可停止时清理旧的 `~/.gh-puller/agent-sessions/**`(hub 会把无 `seq` 的文件整件跳过并日志)。Sources: [gh_puller/agent/sinks.py:FileSink]()
+Each JSONL line is one raw event (full content — no truncation anywhere in the log; only OTel previews truncate). By default `assistant/chunk` is **skipped** (non-stream projection, log inflation), so the file `seq` has holes (hole == skipped chunk); the fold contract only compares `seq` — readers never assume density. With `AGENT_MONITOR_FILE_RAW=1` the file carries the **full raw event flow** incl. `assistant/chunk` (seq dense — the same stream the WS/OTel channels carry). Writes happen in the sink worker (queue drain), bounded at 5000 events drop-oldest; a slow or full disk never blocks the LLM call. A crash leaves a file **without** `session/end` (residue; hub 按"无终态行 + mtime 静止超租约"派生为 aborted,见 §3 —— 运行期静默补发的 `session/heartbeat` 行同样落盘,活会话的 mtime 不会停,读者以租约区分"活但静默"与"进程已死";残留文件即排查素材)。 **v1 迁移**:旧格式(LLM 聚合行)与本格式互不兼容,首次升级请在 hub 未启动/可停止时清理旧的 `~/.gh-puller/agent-sessions/**`(hub 会把无 `seq` 的文件整件跳过并日志)。Sources: [gh_puller/agent/sinks.py:FileSink]()
 
 ## 3. Web/WS Hub (opt-in via monitor)
 
@@ -118,11 +118,12 @@ docker run --rm -p 6006:6006 -i ghcr.io/axiomhq/phoenix:latest  # 或 Axiom Phoe
 
 ## 5. Configuration
 
-Runtime override via `agent.configure(file_dir=..., ws_urls=..., otel_urls=...)`(file sink **恒开**,无开关;`file_dir` 为测试/嵌入的隔离/重定向手段);`ws_urls`/`otel_urls` 接受 URL 列表或逗号分隔字符串,`None` → 重读 env 常量;defaults come from env at import time ([gh_puller/envs.py:38-46](gh_puller/envs.py:38-46)). `ensure_bus()` 为惰性构建总线的公开入口(每 URL 一个 sink 实例):
+Runtime override via `agent.configure(file_dir=..., ws_urls=..., otel_urls=..., raw=...)`(file sink **恒开**,无开关;`file_dir` 为测试/嵌入的隔离/重定向手段);`ws_urls`/`otel_urls` 接受 URL 列表或逗号分隔字符串,`None` → 重读 env 常量;`raw` 为文件 sink 的原始事件流开关(`None` → 重读 `AGENT_MONITOR_FILE_RAW`);defaults come from env at import time ([gh_puller/envs.py:38-46](gh_puller/envs.py:38-46)). `ensure_bus()` 为惰性构建总线的公开入口(每 URL 一个 sink 实例):
 
 | Variable | Default | Meaning |
 |---|---|---|
 | `AGENT_MONITOR_DIR` | `~/.gh-puller/agent-sessions` | file sink root,即会话 jsonl 落盘根(无 sessions 子层) |
+| `AGENT_MONITOR_FILE_RAW` | `0` | file sink granularity: `0` = non-stream projection only (default, `assistant/chunk` skipped); `1` = full raw event flow incl. `assistant/chunk` (dense seq) |
 | `AGENT_MONITOR_WEBUI_URL` | `ws://localhost:8765/ws` | ws sink targets, comma-separated (one WsSink each); empty → ws sink off |
 | `AGENT_MONITOR_PORT` | `8765` | hub listen port |
 | `AGENT_MONITOR_HEARTBEAT_SECS` | `30` | producer heartbeat interval: silence (no non-chunk event) ≥ this gets one `session/heartbeat` filler row (activity periods get none) |
