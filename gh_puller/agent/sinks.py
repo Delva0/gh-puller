@@ -1,20 +1,8 @@
-"""监控观测通道:sink 基础设施(事件总线/文件/WS/OTel)与运行时配置。
+"""监控观测通道:sink 基础设施(文件/WS/OTel 三通道 + 事件总线)与运行时配置;无控制台通道。
 
-观测通道三种,无控制台通道:
-- 文件 sink(默认恒开):AGENT_MONITOR_DIR/<uuid>.jsonl 扁平布局,
-  每行一条非流式事件流事件(TAXONOMY − assistant/chunk,message 粒度,防日志
-  膨胀;折叠恢复规范见 gh_puller.agent.events;取代 v1 的聚合行,旧格式不兼容,
-  历史数据需手动清理);
-- Web/WS sink(AGENT_MONITOR_WEBUI_URL,默认 ws://localhost:8765/ws,逗号分隔多 hub):
-  事件流推送给独立 hub(apps/agent-monitor/server/,WS 端点 /ws),浏览器实时查看;
-- OTel sink(AGENT_MONITOR_PHOENIX_URL,默认 http://localhost:6006/):事件流 → span 树 →
-  OTLP HTTP(Phoenix 等后端;实现见本文件 OtelSink)。默认值经 ensure_bus 底层的
-  _url_reachable TCP 探活:端点可达且 opentelemetry 可导入才注册(置空关闭)。
-
-新增 OTel 后端(Langfuse 等)= envs.py 一个常量 + 本文件 _OTEL_BACKENDS 表一条;
-多地址(逗号分隔)由 ensure_bus 逐 URL 注册同类 sink 实例,单 sink 类不改动。
-
-管道与 publish 语义/线程模型(有界队列、loop-affine):见 events.py EventBus —— 本文件是观测通道层。
+通道角色与细项(默认恒开/逗号分隔多地址/TCP 探活注册/多后端扩展 = env 常量 +
+_OTEL_BACKENDS 一条)见实现与 envs.py;事件流语义(TAXONOMY 粒度、折叠恢复
+、message 粒度防膨胀)与 publish/线程模型(有界队列、loop-affine)见 events.py EventBus。
 """
 
 import asyncio
@@ -30,11 +18,7 @@ from .events import NON_STREAM_TYPES, EventBus, set_active_bus, truncate
 
 
 def _file_stem(session: str) -> str:
-    """会话 id → 文件名 stem(uuid 段):取最后一个 "/" 后段,保证扁平布局。
-
-    session id 形如 <ns>/<uuid4>(ns 由上层业务定);显式无斜杠 session 原样
-    (测试用 "s1" 等)。本函数不改协议,仅为文件名映射。
-    """
+    """Map a session id to the filename stem (segment after the last "/", flat layout)."""
     return session.rsplit("/", 1)[-1]
 
 
@@ -48,29 +32,19 @@ def _log(msg: str) -> None:
 
 
 class FileSink:
-    """文件观测通道:每会话一个 JSONL,只落非流式事件流(message 粒度)。
+    """File channel: one flat JSONL per session (root = AGENT_MONITOR_DIR, no sessions sublayer).
 
-    粒度开关:raw=False(缺省)只落非流式事件流(assistant/chunk 跳过 —— 文件
-    seq 允许洞,洞 = 被跳过的流式事件,契约见 gh_puller.agent.events,前端折叠
-    只比较 seq,不要求稠密);raw=True 落全量原始事件流(含 assistant/chunk,
-    seq 稠密,与 WS/OTel 通道承载的是同一流;经 AGENT_MONITOR_FILE_RAW=1 选开,
-    缺省关闭防日志膨胀)。
-
-    布局扁平:<uuid>.jsonl(uuid 段 = session id 最后一个 "/" 后段,根 =
-    AGENT_MONITOR_DIR,无 sessions 子层),
-    一行一条事件(按 seq 排序来自适配器);assistant/chunk 直接跳过 —— 文件
-    seq 允许洞,洞 = 被跳过的流式事件(契约见 gh_puller.agent.events,前端
-    折叠只比较 seq,不要求稠密)。分类学隐式化:不再有运行/完成/中止目录,
-    状态在事件里 —— grep '"type":"session/end"' 查终态(按 data.state 分
-    完成/中止)、grep '"type":"error"' 查错误、grep 'session/start' 的 session
-    字段查会话来源(<ns>/<uuid4>,ns 由上层业务定)。Linux 查询友好:
-    tail -f <root>/*.jsonl 实时看;jq 过滤并按折叠规范
-    (gh_puller.agent.events)还原任意时刻消息上下文。session/end 留作文件
-    脏终行;会话保鲜(keep-warm,见 generators.base.session)经 FileSink.touch 直触
-    mtime,**不写行** —— 文件 mtime 持续前进,hub 侧方可区分"活着但静默"与"进程已死"
-    (无终态行且 mtime 静止超租约 → 孤儿 aborted,见 hub.py 租约扫描)。崩溃残留 = 无终态
-    行的文件(超租约前显示 running,是排查素材)。无 session/start 起点的
-    事件不可分组,丢弃(同 v1 语义)。
+    Granularity switch: raw=False (default) writes only the non-stream event flow
+    (assistant/chunk skipped — file seqs may have holes; folding only compares seq);
+    raw=True writes the full raw event flow incl. assistant/chunk (dense seqs, the same
+    stream the WS/OTel channels carry; opt-in via AGENT_MONITOR_FILE_RAW=1 to avoid log
+    inflation by default). One event per line. Taxonomy is implicit:
+    state lives in the events (grep '"type":"session/end"' for the final state data.state,
+    '"type":"error"' for errors, 'session/start' for the session origin). Linux-friendly
+    monitoring: tail -f <root>/*.jsonl, jq with the folding spec (gh_puller.agent.events).
+    session/end stays the dirty last line; keep-warm touches mtime via `touch`, never
+    writes (lease judgment in events.py). Crash residue = files without a terminal line
+    (running until the lease expires). Events without a session/start origin are dropped.
     """
 
     def __init__(self, root: str, *, raw: bool = False):
@@ -80,7 +54,7 @@ class FileSink:
         self.root.mkdir(parents=True, exist_ok=True)
 
     async def consume(self, evt: dict) -> None:
-        """逐事件追加一行至会话文件;除非 raw=True,只落非流式事件流。"""
+        """Append one event line to the session file; non-stream only unless raw."""
         if not self.raw and evt["type"] not in NON_STREAM_TYPES:
             return  # 流式事件(chunk):文件缺省只落非流式事件流,防日志膨胀;raw=True 落全量
         session = evt.get("session", "")
@@ -94,15 +68,11 @@ class FileSink:
             f.flush()
 
     def _open(self, session: str) -> None:
+        """Register the session file (created on session/start)."""
         self._files[session] = self.root / f"{_file_stem(session)}.jsonl"
 
     async def touch(self, session: str) -> None:
-        """会话保鲜原语:只 os.utime 更新文件 mtime,**不写任何行、不加内容**。
-
-        供 keep-warm 定时器(见 generators.base.session)在 agent 静默期调用 —— 监控端
-        (agent-monitor hub)按"无终态行且 mtime 静止超租约"区分沉默与死亡。
-        未知 session / 文件缺失 / utime 失败:静默 no-op(保鲜是尽力而为的旁路)。
-        """
+        """Keep-warm primitive: refresh file mtime only (no writes); silent no-op on failure."""
         path = self._files.get(session)
         if path is None:
             return
@@ -113,13 +83,12 @@ class FileSink:
 
 
 class WsSink:
-    """WS 观测通道(生产端):后台任务连 hub,逐事件推送;断连静默,1→2→…→30s 指数退避。
+    """WS channel (producer side): background task pushes events to the hub, silent 1→2→…→30s backoff on disconnect.
 
-    内部有界队列(5000, drop-oldest)与 bus 队列各自兜底:断连期间积压先丢旧,
-    推送失败绝不冒泡(监控不拖累调用)。事件在 connect 后才投递:重连后从断点继续。
-
-    契约:仅转发原始事件帧(测试见 tests/test_agent.py);
-    聚合(LlmAggregator)只发生在消费端(FileSink / hub),本通道从不发送聚合/llm 行。
+    Internal bounded queue (5000, drop-oldest) absorbs backlog during disconnect;
+    push failures never bubble (monitoring must not drag callers). Events only deliver
+    after connect (reconnect resumes from the break point). Forwards raw event frames
+    only — aggregation (LlmAggregator) happens at the consumer side (FileSink / hub).
     """
 
     def __init__(self, url: str):
@@ -128,6 +97,7 @@ class WsSink:
         self._task = asyncio.create_task(self._run())
 
     async def consume(self, evt: dict) -> None:
+        """Queue one event for delivery; drops the oldest when the bounded queue is full."""
         try:
             self._q.put_nowait(evt)
         except asyncio.QueueFull:
@@ -155,12 +125,12 @@ class WsSink:
 
 
 def _ns(ts) -> int | None:
-    """事件 ts(float 秒,events.new_event)→ OTel 纳秒时间戳;缺失 → None。"""
+    """Convert an event ts (float seconds) to an OTel nanosecond timestamp; None keeps None."""
     return int(ts * 1e9) if ts else None
 
 
 def _attrs(span, mapping: dict) -> None:
-    """批量 set_attribute:None 跳过,list/dict 序列化为 JSON 字符串。"""
+    """Set span attributes in batch; None skipped, list/dict serialized as JSON."""
     for key, value in mapping.items():
         if value is None:
             continue
@@ -169,7 +139,7 @@ def _attrs(span, mapping: dict) -> None:
 
 
 def _otel():
-    """惰性导入 opentelemetry 各符号;缺失 → ImportError(可选依赖降级,由 ensure_bus 兜底)。"""
+    """Lazy import of opentelemetry symbols; missing → ImportError (optional dependency, downgraded by ensure_bus)."""
     from opentelemetry import trace
     from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
     from opentelemetry.sdk.resources import Resource
@@ -180,25 +150,23 @@ def _otel():
 
 
 class OtelSink:
-    """事件流消费端:逐会话构建 OTel span 树并经 OTLP 导出(契约同 FileSink)。
+    """Event-stream consumer: OTel span tree per session, OTLP export (event contract same as FileSink).
 
-    只消费 gh_puller.agent.events 的事件 dict(无 session/start 起点则忽略),零 SDK 依赖;
-    对外粒度落在标准 OTel 上:
-    - 根 span 一次 agent 运行(session/start → session/end),按会话维护;
-    - step/start→end 对应一次 LLM 请求,原文/思考增量只累加进 step span 属性
-      (OTLP 协议无 token 级增量语义,预览截断 300 字);
-    - tool/call / tool/result 子 span(调用参数与结果预览;is_error → ERROR);
-    - usage/停止原因/错误/上下文事件挂在根 span 属性上,gen_ai.* 兼容 Phoenix 等
-      后端的自动识别。
+    Consumes only event dicts from gh_puller.agent.events (ignored without a
+    session/start origin), zero SDK dependency. Granularity: one root span per agent
+    run (session/start → session/end); one step span per LLM request (deltas accumulate
+    into step attributes, previews truncated to 300 chars); tool/call–tool/result child
+    spans (is_error → ERROR); usage/stop_reason/error/context attributes hang on the
+    root span — gen_ai.* so Phoenix-typed backends auto-detect.
 
-    opentelemetry 为可选依赖(惰性导入于 __init__:缺失 → ImportError,由 ensure_bus
-    降级)。tracer 注入为测试用(InMemorySpanExporter);缺省懒建
-    TracerProvider(SimpleSpanProcessor + OTLPSpanExporter),endpoint 须为
-    完整 OTLP traces URL(如 http://localhost:6006/v1/traces)。
+    opentelemetry is optional (lazy import in __init__; missing → ImportError, downgraded
+    by ensure_bus). Tracer injection targets tests (InMemorySpanExporter); the default
+    lazily builds TracerProvider (SimpleSpanProcessor + OTLPSpanExporter), endpoint must
+    be a full OTLP traces URL (e.g. http://localhost:6006/v1/traces).
 
-    健壮性:span 全部显式传递父子(set_span_in_context),不使用 start_as_current_span
-    (consume 在 EventBus worker 协程中跨 await,活动 span 会错巢);失败只记 stderr
-    且每会话仅一次,绝不冒泡(监控不拖累调用)。
+    Robustness: parent context passes explicitly (set_span_in_context; consume crosses
+    awaits in the EventBus worker so active-span nesting would misnest); failures log
+    to stderr once per session, never bubble.
     """
 
     def __init__(self, endpoint: str, *, tracer=None):
@@ -216,6 +184,7 @@ class OtelSink:
     # ---- 事件分发 ----
 
     async def consume(self, evt: dict) -> None:
+        """Dispatch one event against the span tree of its session; per-session failures logged once."""
         session = evt.get("session", "")
         t = evt.get("type")
         try:
@@ -400,7 +369,7 @@ class OtelSink:
 
 
 def _tool_result_text(message: dict) -> str:
-    """tool/result 消息 → 结果文本(preview 用):拼接各块 content。"""
+    """Flatten a tool/result message into result text (previews): concat block content."""
     parts = []
     for block in message.get("content") or []:
         c = block.get("content")
@@ -424,7 +393,7 @@ _DEF_SCHEME_PORTS = {"http": 80, "https": 443, "ws": 80, "wss": 443}
 
 
 def _split_urls(raw) -> list[str]:
-    """str|序列|None → URL 列表:逗号分隔/逐条 strip/保序去重;空(None/""/空白/[]) → []。"""
+    """Normalize str|sequence|None into an ordered, deduped URL list; empty inputs → []."""
     out: list[str] = []
     if raw is None:
         return out
@@ -437,14 +406,7 @@ def _split_urls(raw) -> list[str]:
 
 
 def _otel_traces_url(base: str) -> str:
-    """OTLP 便捷归一:path 为空或 "/" → 补 /v1/traces(默认 http://localhost:6006/ 即生效);
-
-    完整 OTLP URL(如 langfuse 的 /api/public/otel/v1/traces)原样通过。
-
-    归一放在封装层(ensure_bus)而非 OtelSink 内部:OtelSink 契约保持"完整 OTLP
-    traces URL"(其 docstring 已声明);基底补路径是配置层便利,未来后端如需
-    不同路径规则,由 _OTEL_BACKENDS 条目扩展。
-    """
+    """Normalize an OTLP base URL: empty path → /v1/traces; full URLs pass through."""
     p = urlsplit(base)
     if p.path in ("", "/"):
         base = f"{p.scheme}://{p.netloc}/v1/traces"
@@ -452,7 +414,7 @@ def _otel_traces_url(base: str) -> str:
 
 
 def _url_reachable(url: str, timeout: float = _REACH_TIMEOUT_SECONDS) -> bool:
-    """同步 TCP 探活(bus 构建时对每 URL 执行一次;localhost 拒连即时返回,不含请求)。"""
+    """Sync TCP liveness probe (once per URL at bus build; localhost refusal returns immediately)."""
     p = urlsplit(url)
     try:
         host, port = p.hostname, p.port or _DEF_SCHEME_PORTS.get(p.scheme, 80)
@@ -468,7 +430,7 @@ def _url_reachable(url: str, timeout: float = _REACH_TIMEOUT_SECONDS) -> bool:
 
 
 def _default_otel_urls() -> list[str]:
-    """按 _OTEL_BACKENDS 表聚合各后端 env 常量(各自动做逗号分隔)→ URL 列表。"""
+    """Aggregate the _OTEL_BACKENDS env constants into the default OTel URL list."""
     urls: list[str] = []
     for attr, _ in _OTEL_BACKENDS:
         urls.extend(_split_urls(getattr(envs, attr)))
@@ -490,15 +452,19 @@ _file_sinks: list[FileSink] = []
 
 
 def configure(*, file_dir=None, ws_urls=None, otel_urls=None, raw=None) -> None:
-    """重配监控(测试/嵌入用);缺省取 envs 常量,生效于下一次事件发布。
+    """Reconfigure monitoring (tests/embedding); defaults re-read env constants, effective on the next publish.
 
-    ws_urls / otel_urls:URL 列表或逗号分隔字符串;None → 重读对应 env 常量
-    (otel 为 _OTEL_BACKENDS 全表);空 → 不部署该类 sink(每 URL 一个 sink 实例)。
-    file_dir:文件 sink 落盘目录(恒开,不可关)——测试/嵌入重定向到 tmp 目录,
-    避免写真实 monitor 目录。
-    raw:True → FileSink 写全量原始事件流(含 assistant/chunk);None → 重读
-    AGENT_MONITOR_FILE_RAW;False → 非流式投影(缺省)。
-    关闭旧 bus(取消 sink 任务),新配置惰性重建 —— 幂等,可反复调用。
+    Closes the old bus (cancels sink tasks); the new config rebuilds lazily — idempotent.
+
+    Args:
+        file_dir: Directory for the always-on file sink (cannot be disabled); tests/embedding
+            redirect here instead of the real monitor dir.
+        ws_urls: URL list or comma-separated string; None re-reads the env constant;
+            empty deploys none (one sink instance per URL).
+        otel_urls: URL list or comma-separated string; None re-reads the whole
+            _OTEL_BACKENDS table; empty disables OTel sinks.
+        raw: True → FileSink writes the full raw event flow (incl. assistant/chunk);
+            None re-reads AGENT_MONITOR_FILE_RAW; False → non-stream projection (default).
     """
     global _bus, _file_sinks
     _cfg["file_dir"] = envs.AGENT_MONITOR_DIR if file_dir is None else file_dir
@@ -513,20 +479,17 @@ def configure(*, file_dir=None, ws_urls=None, otel_urls=None, raw=None) -> None:
 
 
 async def touch(session: str) -> None:
-    """会话保鲜入口(keep-warm 定时器直连):扇出到已注册文件 sink 的 touch。
-
-    touch 是文件 sink 的职责(sinks.py 层只做扇出);无文件 sink → no-op;
-    单个 sink 失败只记 stderr,不冒泡(保鲜是尽力而为的旁路)。
-    """
+    """Keep-warm fan-out: forward to every registered FileSink.touch; no sink → no-op."""
     for fs in _file_sinks:
         await fs.touch(session)
 
 
 def ensure_bus() -> EventBus:
-    """惰性构建单例(带已启用 sink);须在运行中的事件循环内调用(create_task)。
+    """Lazily build the singleton bus with enabled sinks; call inside a running loop (create_task).
 
-    每 URL 注册条件:TCP 可达(_url_reachable);OTel 还要求 opentelemetry 可导入
-    (OtelSink 构造,缺失 → ImportError 降级);任一不满足 → 日志并跳过该实例。
+    Per-URL registration condition: TCP reachable (_url_reachable); OTel also requires
+    opentelemetry importable (OtelSink construction defect → ImportError downgrade).
+    Failing conditions log and skip the instance.
     """
     global _bus, _file_sinks
     if _bus is None:

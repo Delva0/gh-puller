@@ -393,8 +393,11 @@ def _codex_item_completed(event_recorder: EventRecorder, st: _CodexSynth, payloa
         phase = getattr(item, "phase", None)
         if phase is not None:
             message["content"][0]["phase"] = codex_val(phase)
+        # 块式契约:content 消息 sourceSeqs 只引本 step 的 content 批(不得用到达时刻
+        # 累计 _chunk_seqs —— 会把 thinking/plan 批 seqs 一并带进)。
         event_recorder.event("assistant/message", turn=event_recorder.turn, step=event_recorder.step, message=message,
-                  surfaceOp="append", sourceSeqs=list(event_recorder._chunk_seqs))
+                  surfaceOp="append",
+                  sourceSeqs=list(event_recorder._chunk_type_seqs.get("content", [])))
         return [text] if not pieces and text else []
     if itype in ("dynamicToolCall", "mcpToolCall", "commandExecution"):
         st.tool_round_open = True
@@ -410,11 +413,22 @@ def _codex_item_completed(event_recorder: EventRecorder, st: _CodexSynth, payloa
         return []
     if itype == "reasoning":
         # thinking 已逐条流式化(见 reasoning/textDelta · summaryTextDelta);仅无 delta
-        # 的项整块兜底一次:全量 CoT(content)优先,加密模型仅有摘要(summary)
+        # 的项整块兜底一次:全量 CoT(content)优先,加密模型仅有摘要(summary);
+        # completed 即定型:块式契约 chunk×m → assistant/message(thinking)×1
+        # (一条 reasoning 项一条消息,sourceSeqs = 本 step thinking 批 seqs)。
         content = getattr(item, "content", None) or []
         pieces = content or (getattr(item, "summary", None) or [])
-        if pieces and item_id not in st.reasoning_seen:
-            event_recorder.chunk({"type": "thinking", "index": 0, "text": "\n".join(pieces)})
+        if not pieces:
+            return []
+        if item_id not in st.reasoning_seen:
+            event_recorder.chunk({"type": "thinking", "index": 0, "text": "".join(pieces)})
+        event_recorder.event(
+            "assistant/message", turn=event_recorder.turn, step=event_recorder.step,
+            message={"role": "assistant",
+                     "content": [{"type": "thinking", "text": "".join(pieces)}]},
+            surfaceOp="append",
+            sourceSeqs=list(event_recorder._chunk_type_seqs.get("thinking", [])),
+        )
         return []
     if itype == "plan":
         text = getattr(item, "text", None) or ""
@@ -539,15 +553,16 @@ async def _codex_drain(handle, event_recorder: EventRecorder, st: _CodexSynth):
 
 
 class Codex(BaseGenerator):
-    """codex:OpenAI Codex 命令。配置形态:file 类 —— config_path 指向 config.toml。
+    """codex: OpenAI Codex command. Config shape: file-class — config_path points at config.toml.
 
-    SDK 原料通知流 → 本地合成(唯一权威,无投影层;why 见 _CodexSynth docstring);
-    CodexConfig → SDK 装配件(下方 codex_*:codex_home/codex_config/codex_thread/
-    codex_turn);config_path 纯透传(home config.toml 符号链接),mcp_servers 通用注入
-    工具桌;codex_home 缺省回退内置隔离目录,system_prompt → base_instructions。
-    构造期即建 SDK 客户端绑定(AsyncCodex 绑定 config);连接(AsyncCodex 进入)在
-    生成器 with 段(__aenter__),未显式 with 时由 stream/result 自动进入;thread
-    建立在调用期。
+    SDK raw notification stream → local synthesis (single authority, no projection
+    layer; why in _CodexSynth docstring); CodexConfig → SDK assembly parts (codex_*
+    below: codex_home/codex_config/codex_thread/codex_turn); config_path pure
+    passthrough (home config.toml symlink), mcp_servers generic tool-desk injection;
+    codex_home falls back to the built-in isolated dir, system_prompt →
+    base_instructions. SDK client binding built at construction (AsyncCodex bound to
+    config); connection (AsyncCodex enter) at the generator's with block (__aenter__),
+    stream/result auto-enter without an explicit with; the thread is created at call time.
     """
 
     generator = "codex"
@@ -567,7 +582,7 @@ class Codex(BaseGenerator):
 
     @contextlib.asynccontextmanager
     async def session(self, **kw):
-        """codex 会话:协议层错误(JsonRpcError)归 parse;其余循基类编排。"""
+        """codex session: protocol-layer errors (JsonRpcError) go to parse; the rest follows the base orchestration."""
         from openai_codex import JsonRpcError
 
         async with super().session(error_stage=lambda exc: _codex_stage(exc, (JsonRpcError,)),
@@ -575,17 +590,17 @@ class Codex(BaseGenerator):
             yield
 
     async def stream(self, prompt: str):
-        """Codex 流式驱动(纯载荷;会话元数据经 session())。
+        """Stream the codex notification flow into assistant text deltas (payload-only; metadata via session()).
 
-        对外产出:assistant 文本增量(item/agentMessage/delta 优先、item/completed
-        整块兜底),turn 非 completed → RequestFailedError;thinking/plan/工具增量
-        只进事件流。codex 通知 1:1 合成 TAXONOMY(无 seq 编号 → 本地合成,见
-        _CodexSynth);session/turn/step 生命周期由本层合成。
+        Yielded text: item/agentMessage/delta first, item/completed whole-block fallback;
+        turn non-completed → RequestFailedError; thinking/plan/tool increments only to
+        the event stream. Notifications synthesize TAXONOMY 1:1 (no seq — local
+        synthesis, _CodexSynth); session/turn/step lifecycle synthesized here.
 
-        config 键集即本文件 CodexConfig(装配见 codex_config/thread/turn)。
-
-        凭证(cc 同形:环境隔离不隔离凭证通道):零配置缺省符号链接引用真实
-        ~/.codex/auth.json;显式 config.token → login_api_key 写本隔离 home。
+        config keys = CodexConfig in this file (assembly in codex_config/thread/turn).
+        Credentials (cc-shaped: env isolation does not isolate the credential channel):
+        the zero-config default symlinks the real ~/.codex/auth.json; explicit
+        config.token writes login_api_key into this isolated home.
         """
         config = self.config
         event_recorder = self._require_event_recorder()
@@ -611,11 +626,10 @@ class Codex(BaseGenerator):
                 yield chunk
 
     async def result(self, prompt: str) -> str:
-        """非流式最终结果(纯载荷):只拿最后一轮 —— 通知流末条 agentMessage 文本(st.final_response)。
+        """Return the final round's output: the last agentMessage text of the notification stream (st.final_response).
 
-        turn 非 completed / 未产出 → RequestFailedError。与 stream 同构消费通知流
-        (_codex_drain):事件全量合成。旧实现直取 handle.run() 的 TurnResult ——
-        不暴露通知,事件流只有生命周期,观测不到 assistant/工具事件。
+        Turn non-completed / no output → RequestFailedError. Consumes the notification
+        stream with the same shape as stream (_codex_drain): full event synthesis.
         """
         config = self.config
         event_recorder = self._require_event_recorder()

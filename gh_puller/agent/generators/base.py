@@ -1,8 +1,7 @@
-"""生成器共享骨架:BaseGenerator 基类(session with 语义/收尾编排/stream、result 契约定形)。
+"""生成器共享骨架:BaseGenerator 基类 + 包内共享原子(失败异常/异常分类,utils)。
 
-本层只依赖标准库、事件层(.events)、envs 与包内 utils(共享失败/异常分类);每个
-生成器文件(cc/openai/codex/dsh)自持本体与 config 世界,差异经本基类下沉。
-API 契约(def stream/result 语义、config 构造期注入、session with 语义)见包 docstring(__init__.py)。
+依赖只指向标准库、事件层(.events)、envs;差异经本基类下沉,各生成器文件自持
+本体与 config 世界。API 契约见包 docstring(__init__.py)。
 """
 
 import contextlib
@@ -14,25 +13,19 @@ from ..events import EventRecorder, _session_id
 
 
 class BaseGenerator:
-    """生成器共享骨架:cc = 单一权威合成;dsh = 双权威投影(对齐器);llm = 直连 HTTP。
+    """Shared skeleton: per-generator differences = client access shape (synthesis/projection/direct HTTP).
 
-    子类只要写差异驱动循环(stream)与终局语义(result);公共 kwarg(会话/run
-    元数据)逐参数一致。config 在**构造时期**注入(副本存 self.config),运行时
-    方法不再收 config(契约见包 docstring)。
-
-    生成器 = 对应 client 的包装;**唯一 with 入口是 session()**:`async with
-    cc.session(...)` = 一次上游对话 —— 进入 = 会话级 event_recorder 装配并启动
-    (init_config → session/start)+ 客户端进入(子进程 spawn,_enter),退出 =
-    客户端回收(_exit)+ 收尾(error 事件 + finish)。会话元数据(session/
-    session_name/run_id/context/retry/meta)经 session() 注入;stream/result 只收
-    运行时载荷(prompt/payload),必须在 session 块内调用(块外 → RuntimeError)。
-
-    监控侧 agent 自身 meta 只 generator 一项 + config(事件 envelope 即
-    generator/model 与各 config 派生事件)。
+    Subclasses only implement the difference-driving stream loop and the final-round
+    result semantics; public kwargs (session/run metadata) are uniform per param.
+    config is injected at construction time (copy kept in self.config); runtime methods
+    take no config; with semantics (session() as the only conversation entry, out-of-block
+    calls → RuntimeError) live in the package docstring (__init__.py). Subclass hooks:
+    _enter/_exit enter/reap the client within the session lifecycle. Monitor-side agent
+    meta is only generator + config (event envelope = generator/model and config-derived events).
     """
 
-    generator = ""  # 生成管线 id(cc|dsh|codex|llm)
-    provider = ""  # 会话快照的后端域(cc=anthropic/dsh=deepseek/codex=openai/llm=openai)
+    generator = ""  # 生成管线 id(子类覆盖)
+    provider = ""  # 会话快照的后端域(子类覆盖)
 
     def __init__(self, config: dict):
         self.config = dict(config)  # 副本防 SDK 篡改
@@ -44,13 +37,26 @@ class BaseGenerator:
                       context: list[dict] | None = None, retry: dict | None = None,
                       meta: dict | None = None,
                       error_stage=None, epilogue=True, prologue=True):
-        """一次上游对话(客户端 + 监控同寿):进入即装配、退出即收官。
+        """Run one upstream conversation (client and monitoring share the lifetime): enter assembles, exit closes.
 
-        编排:会话级 event_recorder 装配并启动(init_config → session/start)→
-        客户端进入(_enter,子进程 spawn)→ yield(stream/result 在块内调用)→
-        退出:客户端回收(_exit)+ 收尾(error 事件 + finish)。子类如不同(codex 协议
-        归 parse、dsh 双权威 epilogue、start prologue、llm http/parse 分类)覆写
-        本方法转发差异参数。一次会话一次对话(实例不并发复用)。
+        Orchestration: session-level event_recorder assembled and started (init_config →
+        session/start) → client enter (_enter, child spawn) → yield (stream/result inside
+        the block) → exit: client reap (_exit) + teardown (error event + finish).
+        Subclasses covering differently (protocol-to-parse, dual-authority epilogue,
+        start prologue, http/parse classification) override this method forwarding the
+        differing params. One session = one conversation; instances are not reused concurrently.
+
+        Args:
+            session: Explicit session id; auto-derived from session_ns/run_id/session_name when omitted.
+            session_ns: Namespace for the auto-derived session id (<ns>/<uuid4>).
+            run_id: Run id recorded in the session snapshot.
+            session_name: Human-readable session label.
+            context: Context-message list (replayed as context/modify events before the run).
+            retry: Retry metadata dict recorded in session/start.
+            meta: Arbitrary metadata for the session snapshot.
+            error_stage: Exception classifier producing the error-stage label (or a string).
+            epilogue: Whether to emit turn/session finals (callable allowed).
+            prologue: Whether to emit turn/step starts (callable allowed).
         """
         event_recorder = self._recorder(session=session, session_ns=session_ns,
                         run_id=run_id, session_name=session_name, meta=meta)
@@ -60,9 +66,8 @@ class BaseGenerator:
         ok = False
         try:
             # 保鲜:会话期间每 interval 触一次会话文件 mtime(只动时间戳、不发事件、
-            # 绝不 busy-loop);hub 侧租约据此区别"活着但静默"与"进程已死"。退出先停
-            # 保鲜再收尾:停后 mtime 冻结 → 崩溃残留由租约判定 aborted;session/end
-            # 恒为最后一条合法行。≤0 → 不起保鲜任务。
+            # 绝不 busy-loop);判态语义(hub 租约)见 events.py。退出先停保鲜再收尾:
+            # 停后 mtime 冻结,session/end 恒为最后一条合法行。≤0 → 不起保鲜任务。
             heartbeat_secs = envs.AGENT_MONITOR_HEARTBEAT_SECS
             if heartbeat_secs and heartbeat_secs > 0:
                 event_recorder.start_keepwarm(heartbeat_secs)
@@ -83,27 +88,24 @@ class BaseGenerator:
             self._event_recorder = None
 
     def _require_event_recorder(self) -> EventRecorder:
-        """会话级 event_recorder(session 进入时已启动);块外调用 stream/result → 契约错误。"""
+        """Event recorder of the active session; calling stream/result outside the block raises a contract error."""
         if self._event_recorder is None:
             raise RuntimeError("stream/result 只能在 async with gen.session(...) 块内调用")
         return self._event_recorder
 
     async def _enter(self) -> None:
-        """子类钩子(随 session 生命周期):进入对应客户端(与底层 client __aenter__ 同语义)。"""
+        """Subclass hook: enter the client (same semantics as its `__aenter__`)."""
         raise NotImplementedError
 
     async def _exit(self, exc) -> None:
-        """子类钩子(随 session 生命周期):回收对应客户端(exc = 异常上下文三元组)。"""
+        """Subclass hook (within the session lifecycle): reap the underlying client (exc = exception context trio)."""
         raise NotImplementedError
 
     def _recorder(self, *, session: str | None = None, session_ns: str | None = None,
              run_id: str | None = None, session_name: str | None = None,
              meta: dict | None = None,
              generator: str | None = None) -> EventRecorder:
-        """公共 kwarg → EventRecorder(session id 规则/信封 generator 取类属性;不含 context/retry)。
-
-        provider/model 取类属性与 config(会话快照,随 session/start data 落地)。
-        """
+        """Build the EventRecorder from public kwargs (session-id rule, envelope generator from class attrs)."""
         return EventRecorder(_session_id(session, session_ns, run_id, session_name),
                     generator=generator or self.generator,
                     provider=self.provider or None,
@@ -111,12 +113,20 @@ class BaseGenerator:
                     label=session_name, run_id=run_id, meta=meta)
 
     async def stream(self, prompt: str) -> AsyncIterator[str]:
-        """流式应答(子类必写):assistant 文本增量 async generator;只在 session 块内调用。
+        """Stream the assistant text increments (subclasses implement); only callable inside a session block.
 
-        载荷 = 运行时入参(prompt;llm 为 payload + 请求级 timeout/headers),会话元数据全在 session()。
+        Args:
+            prompt: Runtime payload (prompt string; llm: payload dict + request-level timeout/headers).
+
+        Returns:
+            Async iterator of assistant text deltas.
         """
         raise NotImplementedError
 
     async def result(self, prompt: str) -> str:
-        """非流式最终结果(子类必写):只拿最后一轮 assistant 输出;只在 session 块内调用。"""
+        """Return the final round's assistant output (subclasses implement); only callable inside a session block.
+
+        Args:
+            prompt: Runtime payload (see `stream`).
+        """
         raise NotImplementedError

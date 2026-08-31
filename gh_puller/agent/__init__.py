@@ -1,40 +1,17 @@
 """agent 调用统一入口 + 流式监控(事件模型/适配器/观测通道按关注点拆分)。
 
 其他模块不再直接调用 ClaudeSDKClient / httpx,一律经本包函数(无感,对外语义不变)。
-架构:events.py(事件模型) ⊂ sinks.py(观测通道) ⊂ generators/(生成器包:逐
-generator 一文件 = config 世界(TypedDict 契约/SDK 字段映射/header 投影/隔离
-组合装配)+ 适配器本体;base.py 共享基类,utils.py 共享原子;API 契约见
-generators/__init__.py 包 docstring —— stream 流式产出 assistant 文本增量,
-result 只拿最后一轮输出,无 text):
-- config 在生成器**构造时期**注入:`GENERATORS[gid](config)` 得到适配器实例,
-  stream/result 只收运行时参数(prompt/会话/run 元数据);键集白名单校验在
-  上层(各 Config TypedDict 即契约,见 generators/ 各文件)。
-- 生成器即对应 client 的包装,**唯一 with 入口是 session()**:`async with gen.session(...)`
-  = 一次上游对话 —— 会话元数据(session/session_name/run_id/context/retry/meta)
-  经 API 注入,enter = recorder 装配 + session/start + 客户端 spawn,exit = 收尾
-  (finish/error)+ 客户端回收(监控与客户端同寿);stream/result 只收运行时载荷
-  (prompt/payload),在 session 块内调用(范例见 generators/__init__.py __main__)。
-- ClaudeCode(SDK):流式产出 assistant 文本增量(StreamEvent `text_delta` 优先、
-  AssistantMessage 兜底);is_error → RequestFailedError;thinking/工具增量只进
-  监控事件流,不改变产出。
-- OpenAI(httpx):OpenAI 兼容端点;complete/stream 收请求体 payload(异常原样抛,
-  重试留给调用方);result = complete 语义。
-- Dsh(DeepSeek Harness SDK):dsh 原生事件 1:1 投影为监控事件流;result =
-  RunResult.final_response;非 completed 的 finish_reason → RequestFailedError
-  (与 cc is_error 语义对齐)。
-- Codex(OpenAI Codex SDK):codex 通知流合成 TAXONOMY(无 seq 编号 → cc 式合成);
-  result = TurnResult.final_response;turn 非 completed → RequestFailedError
-  (与 cc is_error 语义对齐)。
-- configure / ensure_bus / EventBus / FileSink / WsSink(sinks.py):监控运行时重配、
-  惰性构建总线与文件/WS 观测通道(AGENT_MONITOR_DIR / AGENT_MONITOR_WEBUI_URL,
-  逗号分隔多地址,每地址一个 sink 实例;OtelSink 亦在 sinks.py,经
-  AGENT_MONITOR_PHOENIX_URL 启用 —— 端点可达 + opentelemetry 可导入才注册,
-  置空关闭;需显式 `from gh_puller.agent.sinks import OtelSink`,本模块不导出)。
-- TAXONOMY / SURFACE_TYPES / LOG_TYPES / new_event / type_of / truncate(events.py):
-  事件溯源式纯 dict 事件模型(折叠恢复规范见 events.py 模块 docstring),零 SDK 依赖。
 
-管道:适配器归一化 SDK/HTTP 对象 → 事件 dict(envelope) → EventBus 扇出 → sink worker 消费
-(publish 语义与线程模型见 events.py EventBus;观测通道见 sinks.py)。
+架构:events.py(事件模型) ⊂ sinks.py(观测通道) ⊂ generators/(逐生成器一
+文件:config 世界 + 适配器本体;base.py 共享骨架,utils.py 共享原子)。
+- 生成器契约(构造期注入/stream/result/唯一会话入口)见 generators/
+  __init__.py 包 docstring;逐生成器语义各自文件自述。
+- 观测通道与运行时重配见 sinks.py / envs.py(默认与启用条件挂 env;
+  OtelSink 需显式导入,本模块不导出)。
+- 事件模型(分类学/折叠恢复规范)见 events.py 模块 docstring。
+
+管道:适配器归一化 SDK/HTTP 对象 → 事件 dict → EventBus 扇出 →
+sink worker 消费(publish/线程模型见 events.py EventBus)。
 """
 
 from .events import LOG_TYPES, SURFACE_TYPES, TAXONOMY, new_event, truncate, type_of
@@ -48,6 +25,8 @@ from .generators import (
     DshConfig,
     OpenAI,
     OpenAIConfig,
+    OpenCode,
+    OpenCodeConfig,
     RequestFailedError,
     codex_home_path,
     dsh_cordis_path,
@@ -69,6 +48,8 @@ __all__ = [
                       "FileSink",
                       "OpenAI",
                       "OpenAIConfig",
+                      "OpenCode",
+                      "OpenCodeConfig",
                       "RequestFailedError",
                       "WsSink",
                       "codex_home_path",

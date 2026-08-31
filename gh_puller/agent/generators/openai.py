@@ -17,7 +17,7 @@ from .utils import _stage_of
 
 
 class OpenAIConfig(TypedDict, total=False):
-    """llm 运行时 config(model/base_url/api_key);请求体(payload)独立传入。"""
+    """llm runtime config (model/base_url/api_key); the request body (payload) is passed separately."""
 
     model: str
     base_url: str
@@ -31,7 +31,7 @@ class OpenAIConfig(TypedDict, total=False):
 
 
 def _llm_emit_messages(event_recorder: EventRecorder, payload: dict) -> None:
-    """payload messages → surface 事件(仅 user/assistant 折叠;system 不进折叠)。"""
+    """Emit payload messages as surface events (only user/assistant fold; system stays out of the fold)."""
     for m in payload.get("messages", []):
         role = m.get("role")
         content = m.get("content")
@@ -62,11 +62,12 @@ def _llm_headers(headers: dict | None, api_key: str | None) -> dict:
 
 
 class OpenAI(BaseGenerator):
-    """llm:OpenAI 兼容端点(httpx 直连)。配置形态:object 类(OpenAIConfig)。
+    """llm: OpenAI-compatible endpoint (httpx direct). Config shape: object-class (OpenAIConfig).
 
-    构造期即建 HTTP 客户端(一实例一客户端 = 连接池);客户端生命周期随一次会话
-    (`async with gen.session(...)`:连接池进入/退出)。单次调用的 timeout/headers/
-    请求体(payload)仍按调用覆盖(请求级参数在 stream/result)。
+    HTTP client built at construction (one instance one client = connection pool);
+    the client lifetime follows one session (`async with gen.session(...)`: pool
+    enter/exit). Per-call timeout/headers/body (payload) still override at the call
+    level (request-level params live in stream/result).
     """
 
     generator = "llm"
@@ -85,7 +86,7 @@ class OpenAI(BaseGenerator):
 
     @contextlib.asynccontextmanager
     async def session(self, **kw):
-        """llm 会话:error stage 挂 http/parse 分类(见 _stage_of);其余循基类编排。"""
+        """llm session: error stage hooks http/parse (_stage_of); rest follows base orchestration."""
         async with super().session(error_stage=_stage_of, **kw):
             yield
 
@@ -93,17 +94,24 @@ class OpenAI(BaseGenerator):
         self, payload: dict, *,
         timeout: httpx.Timeout | None = None, headers: dict | None = None,  # noqa: ASYNC109 - httpx.Timeout 请求级形参,非 asyncio 超时模式
     ) -> str:
-        """OpenAI 兼容补全终局语义:返回最终文本(异常原样抛,重试留给调用方)。
+        """Return the final text from an OpenAI-compatible completion (exceptions propagate; retry left to the caller).
 
-        config = OpenAIConfig(model/base_url/api_key) 构造注入;payload 为
-        chat/completions 请求体(messages;model 可省略 —— 经 config 注入;其余
-        键原样透传,如 response_format/temperature/max_tokens)。事件:请求体全量
-        消息 → surface(可折叠恢复该请求输入);响应当次 text + assistant/message
-        + 每 tool_call 一个 tool/call(原始 arguments 字符串)。
+        config = OpenAIConfig(model/base_url/api_key) injected at construction; payload
+        is the chat/completions body (messages; model optional — injected from config;
+        other keys pass through, e.g. response_format/temperature/max_tokens). Events:
+        the body's full message list → surface (foldable request input); the response
+        text + assistant/message + one tool/call per tool_call (raw arguments string).
 
-        实现:内部经流式端点抽取(stream() 拖到底)—— **事件面与 stream 同构**:
-        逐 delta chunk,观测粒度与 cc/codex 一致(旧实现单发非流式 complete,
-        整个回答只发 1 条 assistant/chunk)。
+        Implementation drains the streaming endpoint (stream() to the end) — the event
+        surface matches stream: per-delta chunks, same granularity as cc/codex.
+
+        Args:
+            payload: chat/completions request body (model injected from config when omitted).
+            timeout: Request-level HTTP timeout (None = no per-request timeout).
+            headers: Request headers (merged over the bearer/Content-Type defaults).
+
+        Returns:
+            Final assistant text of the final round.
         """
         parts = [part async for part in self.stream(payload, timeout=timeout, headers=headers)]
         return "".join(parts)
@@ -112,10 +120,18 @@ class OpenAI(BaseGenerator):
         self, payload: dict, *,
         timeout: httpx.Timeout | None = None, headers: dict | None = None,  # noqa: ASYNC109 - httpx.Timeout 请求级形参,非 asyncio 超时模式
     ):
-        """OpenAI 兼容流式补全(SSE 逐 delta):config/payload 分工与 result 同,请求体附加 stream=True。
+        """Stream an OpenAI-compatible completion (SSE per delta); body gets stream=True, config split as result.
 
-        delta.tool_calls 分片归并 → tool/call + tool_use 块(旧实现只认 text delta,
-        流式工具调用不可观测)。
+        delta.tool_calls fragments merge into the tool/call + tool_use blocks (the
+        legacy implementation knew only text deltas — streaming tool calls unobservable).
+
+        Args:
+            payload: chat/completions request body (see `result`).
+            timeout: Request-level HTTP timeout.
+            headers: Request headers.
+
+        Returns:
+            Async iterator of text deltas.
         """
         config = self.config
         body = dict(payload)
@@ -129,7 +145,7 @@ class OpenAI(BaseGenerator):
         seg = None  # 当前段:thinking|content|tool_call;段完成即发该段的 assistant/message 聚合
 
         def _close_seg():
-            """当前段完成 → 一条 assistant/message(该段全量聚合;段状 = 粘合边界)。"""
+            """Segment done → one assistant/message (full segment aggregation; segment shape = glue boundary)."""
             nonlocal seg
             if seg is None:
                 return
@@ -171,7 +187,7 @@ class OpenAI(BaseGenerator):
                     event_recorder.result_stop_reason = fin  # 末块 finish_reason → session/end
                 thinking = delta.get("reasoning_content") or ""
                 text = delta.get("content") or ""
-                if thinking:  # 思考增量 → thinking chunk(段序 0;cc/dsh/codex 同位语义)
+                if thinking:  # 思考增量 → thinking chunk(段序 0;与各 agent 生成器同位语义)
                     if seg in ("content", "tool_call"):
                         _close_seg()
                     full_reasoning += thinking

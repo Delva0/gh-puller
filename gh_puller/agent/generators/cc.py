@@ -29,7 +29,7 @@ class ClaudeConfig(TypedDict, total=False):
     setting_sources: list[str]
     include_partial_messages: bool
     max_turns: int
-    strict_mcp_config: bool
+    strict_mcp_config: bool  # setting_sources=[]不隔离mcp，需要该参数
 
 
 def claude_options(config: dict):
@@ -45,6 +45,7 @@ def claude_options(config: dict):
     if config.get("config_path"):  # 统一概念键 → SDK settings(--settings 装载)
         sdk_options["settings"] = config["config_path"]
     sdk_options.setdefault("strict_mcp_config", True)  # 本层默认隔离
+    sdk_options.setdefault("include_partial_messages", True)  # StreamEvent 路径:thinking/text chunk 流(监控重建+增量必备;SDK 缺省 False)
     return ClaudeAgentOptions(**sdk_options)
 
 
@@ -54,10 +55,11 @@ def claude_options(config: dict):
 
 
 def _block_kind(block) -> str:
-    """内容块判型:块多带 type 属性(离线测试假块同形);SDK 0.2.142 起 TextBlock/
-    ThinkingBlock/ToolUseBlock 为纯 dataclass(仅字段无 type),按字段判别。
+    """内容块判型:按 type 属性/字段判别(离线测试假块同形)。
 
-    ServerToolUseBlock(同 id/name/input 形)亦归 tool_use —— 服务器侧工具调用照常入事件。
+    SDK 0.2.142 起 TextBlock/ThinkingBlock/ToolUseBlock 为纯 dataclass(仅字段无
+    type);ServerToolUseBlock(同 id/name/input 形)亦归 tool_use —— 服务器侧工具
+    调用照常入事件。
     """
     t = getattr(block, "type", None)
     if t is not None:
@@ -178,12 +180,17 @@ def _handle_assistant_message(event_recorder: EventRecorder, msg, already_yielde
             content.append({"type": "content", "text": event_recorder._msg_text})
     stop_reason = getattr(msg, "stop_reason", None) or event_recorder._msg_stop_reason
     event_recorder._msg_reset()
+    # 块式契约:sourceSeqs 按消息内容块类型分组(think 消息只引 thinking chunk seqs,
+    # content 消息只引 content chunk seqs)——不得用到达时刻累计的 _chunk_seqs
+    # (content 消息晚到时会把 thinking 批 seqs 一并带进)。
+    src_seqs = [s for t in {b["type"] for b in content}
+                for s in event_recorder._chunk_type_seqs.get(t, [])]
     event_recorder.event(
         "assistant/message", turn=event_recorder.turn, step=event_recorder.step,
         message={"role": "assistant", "content": content},
         usage=_normalize_usage(getattr(msg, "usage", None)),
         stop_reason=stop_reason,
-        surfaceOp="append", sourceSeqs=list(event_recorder._chunk_seqs),
+        surfaceOp="append", sourceSeqs=src_seqs,
     )
     for block in msg.content:  # 兜底:无 input_json_delta 的 SDK 路径
         if _block_kind(block) != "tool_use":
@@ -235,13 +242,13 @@ def _handle_user_message(event_recorder: EventRecorder, msg) -> None:
 
 
 class ClaudeCode(BaseGenerator):
-    """cc:Claude Code 命令。配置形态:file 类 —— config_path 指向 settings JSON。
+    """cc: Claude Code command. Config shape: file-class — config_path points at a settings JSON.
 
-    ClaudeConfig → ClaudeAgentOptions(**config),config_path → settings(SDK 传
-    --settings,只装载所选文件);凭证随所选 settings 文件(SDK CLI 侧登录)。
-    构造期即建立客户端绑定(claude_options 绑定 + ClaudeSDKClient 对象):一个实例
-    = 一个客户端包装;连接进入(子进程 spawn)在一次会话开头 ——
-    `async with cc.session(...)`(session 进入)、退出回收。
+    ClaudeConfig → ClaudeAgentOptions(**config), config_path → settings (SDK passes
+    --settings, loading only that file); credentials ride the chosen settings file
+    (SDK CLI-side login). Client binding is built at construction (claude_options
+    binding + ClaudeSDKClient object): one instance = one client wrapper; connection
+    enter (child spawn) at session startup (`async with cc.session(...)`), exit reaps.
     """
 
     generator = "cc"
@@ -260,12 +267,12 @@ class ClaudeCode(BaseGenerator):
         await self._client.__aexit__(*exc)  # 子进程收殓
 
     async def stream(self, prompt: str):
-        """Claude Code 流式驱动(纯载荷;会话元数据经 session())。
+        """Stream assistant deltas from the Claude Code SDK query (payload-only; metadata via session()).
 
-        对外产出:assistant 文本增量(StreamEvent text_delta 优先,AssistantMessage
-        兜底,ResultMessage.is_error → RequestFailedError(detail));thinking/工具
-        增量仅进事件流。config 整体透传为 ClaudeAgentOptions(config_path →
-        settings)。
+        Yielded text: StreamEvent text_delta first, AssistantMessage whole-text fallback,
+        ResultMessage.is_error → RequestFailedError(detail); thinking/tool increments
+        go to the event stream only. config passes through as ClaudeAgentOptions
+        (config_path → settings).
         """
         from claude_agent_sdk import AssistantMessage, ResultMessage, StreamEvent, UserMessage
 
@@ -302,10 +309,7 @@ class ClaudeCode(BaseGenerator):
                 event_recorder.result_meta(msg)
 
     async def result(self, prompt: str) -> str:
-        """非流式最终结果(纯载荷):只拿最后一轮 —— 直接取 ResultMessage.result。
-
-        保留「agent 未产出最终结果」语义;失败或无结果 → RequestFailedError。
-        """
+        """Return the final round's output: ResultMessage.result directly; failure or no output → RequestFailedError."""
         from claude_agent_sdk import AssistantMessage, ResultMessage, StreamEvent, UserMessage
 
         event_recorder = self._require_event_recorder()

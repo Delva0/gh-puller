@@ -495,16 +495,18 @@ def _dsh_worker(harness, prompt: str, session_id: str, pump):
 
 
 class Dsh(BaseGenerator):
-    """dsh:DeepSeek Harness 组合。配置形态:file 类 —— config_path 指向 cordis 文件。
+    """dsh: DeepSeek Harness composition. Config shape: file-class — config_path points at a cordis file.
 
-    DshConfig → DeepSeekHarness kwargs(dsh_fields:config_path → cordis、
-    system_prompt → env.DSH_SYSTEM_PROMPT;未提供 cordis 时回退内置隔离组合);模型/
-    凭证随组合配置(SDK 读进程环境兜底)。事件词汇同源但 dsh 是第二权威 → _DshProj
-    投影对齐(why 见 _DshProj docstring)。构造期即建 harness 对象(dsh_harness
-    绑定 config):一个实例 = 一个 harness = 一次 dsh 会话;子进程 spawn/initialize
-    在一次会话进入时进行(session → _enter 钩子)。dsh 的 client 是同步 context
-    manager 且 run 为阻塞调用 → 进入/回收经 asyncio.to_thread 桥(harness 在
-    executor 线程使用;回收在消费者提前退场时 detach 后台执行,见 _wait_and_exit)。
+    DshConfig → DeepSeekHarness kwargs (dsh_fields: config_path → cordis,
+    system_prompt → env.DSH_SYSTEM_PROMPT; no cordis → built-in isolated composition);
+    model/credentials ride the composition (SDK reads the process env as fallback). The
+    event vocabulary is same-sourced but dsh is the second authority → _DshProj
+    projection alignment (why in _DshProj docstring). Harness object built at
+    construction (dsh_harness bound to config): one instance = one harness = one dsh
+    session; child spawn/initialize at session enter (_enter hook). dsh's client is a
+    synchronous context manager and run() blocks → enter/reap bridged via
+    asyncio.to_thread (harness used on an executor thread; premature consumer exit
+    detaches reaping to the background, see _wait_and_exit).
     """
 
     generator = "dsh"
@@ -530,16 +532,16 @@ class Dsh(BaseGenerator):
         await asyncio.to_thread(self._harness.__exit__, *exc)
 
     async def _wait_and_exit(self, task: asyncio.Task, exc):
-        """线程侧 run 自然完成后再退出 harness(后台执行;task 被取消也照等)。"""
+        """Reap the harness after the thread-side run ends naturally (background; waits even on cancel)."""
         with contextlib.suppress(asyncio.CancelledError):
             await task
         await asyncio.to_thread(self._harness.__exit__, *exc)
 
     @contextlib.asynccontextmanager
     async def session(self, **kw):
-        """dsh 会话:协议错误归 parse;epilogue 依投影是否已见 turn/end(双权威
+        """dsh session: protocol errors → parse; epilogue per projected turn/end.
 
-        终局决定权在 dsh,收尾补充仅在崩溃路径)。
+        Dual authority: dsh owns the final, teardown supplements on crash paths only.
         """
         from deepseek_harness import errors as _dsh_errors
 
@@ -552,11 +554,7 @@ class Dsh(BaseGenerator):
             yield
 
     def _run_assembly(self, prompt: str) -> tuple[EventRecorder, _DshProj, asyncio.Queue]:
-        """会话内运行件装配(stream/result 共用):proj(挂实例供 epilogue)/worker 任务。
-
-        任务不在此取消:消费者提前退场时线程自然跑完,harness 由会话退出时经
-        _exit 回收(在飞 → detach 后台等线程结束再回收,见 _wait_and_exit)。
-        """
+        """Assemble per-run parts for stream/result (proj on the instance; worker not cancelled here)."""
         event_recorder = self._require_event_recorder()
         proj = _DshProj(event_recorder, prompt, _dsh_session_id(event_recorder.session))
         self._proj = proj
@@ -578,12 +576,11 @@ class Dsh(BaseGenerator):
         return event_recorder, proj, queue
 
     async def stream(self, prompt: str):
-        """dsh 流式驱动(纯载荷;会话元数据经 session())。
+        """Project dsh native events 1:1; yield assistant text deltas.
 
-        对外产出:assistant 文本增量(assistant/chunk 的 text-delta);turn 非
-        completed → RequestFailedError;thinking/工具增量只进事件流。dsh 原生
-        事件 1:1 投影为监控事件流(经 _project_dsh_event);SDK run() 为同步
-        阻塞 → asyncio.to_thread 执行(单次运行一 turn to_idle,无逐 prompt 取消)。
+        Turn non-completed → RequestFailedError; thinking/tool increments only to the
+        event stream. SDK run() is sync-blocking → asyncio.to_thread (one turn to_idle
+        per run, no per-prompt cancellation).
         """
         event_recorder, proj, queue = self._run_assembly(prompt)
         while True:
@@ -599,10 +596,7 @@ class Dsh(BaseGenerator):
                 break
 
     async def result(self, prompt: str) -> str:
-        """非流式最终结果(纯载荷):只拿最后一轮 —— RunResult.final_response;
-
-        非 completed 或未产出 → RequestFailedError。
-        """
+        """Return the final output: RunResult.final_response; non-completed/no output → RequestFailedError."""
         event_recorder, proj, queue = self._run_assembly(prompt)
         while True:
             kind, item = await queue.get()

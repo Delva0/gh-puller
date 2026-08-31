@@ -4,23 +4,83 @@
 连续单调(**流式事件流内稠密**;非流式投影侧允许洞,见下);LLM messages 上下文
 是 surface 节点的派生(折叠)而非快照:
 
-事件流按粒度分为两级:
-- 流式事件流(agent 事件流)= TAXONOMY 全集(STREAM_TYPES):含 assistant/chunk
-  原始增量,可还原实时(逐字)上下文;WS/OTel 通道承载;
-- 非流式事件流 = TAXONOMY − {assistant/chunk}(NON_STREAM_TYPES):message 粒度,
-  assistant/message 已是定型全量,可还原任意时刻的消息上下文;filesink 缺省只落此级
-  (AGENT_MONITOR_FILE_RAW=1 → 落全量原始事件流,seq 稠密)。
+═══════════════════════════════════════════════════════════════════════
+事件流全景(时间自下而上展开;一次 LLM 回合 = 一个 step)
+═══════════════════════════════════════════════════════════════════════
+
+    session/start ──► turn/start ──► step/start
+                                        │            ┌─────────────────────┐
+                                        │ thinking   │ assistant/chunk ×m │ 流式增量(逐条)
+                                        │  批        └──────────┬──────────┘
+                                        │                       ▼
+                                        │            ┌─────────────────────┐
+                                        │            │ assistant/message ×1│ m 个 chunk 拼接
+                                        │            └─────────────────────┘
+                                        │            ┌─────────────────────┐
+                                        │ content    │ assistant/chunk ×n │ 流式增量(逐条)
+                                        │  批        └──────────┬──────────┘
+                                        │                       ▼
+                                        │            ┌─────────────────────┐
+                                        │            │ assistant/message ×1│ n 个 chunk 拼接
+                                        │            └─────────────────────┘
+                                        │            ┌─────────────────────┐
+                                        │ 工具批     │ tool/call ×k …      │ 不进消息块
+                                        │            │ tool/result ×k      │ (独立承载)
+                                        │            └─────────────────────┘
+    session/end ◄──── turn/end ◄──── step/end ◄──────┘
+
+    · user/message 落在 step/start 之后(本回合输入)
+    · thinking 批 → content 批 → 工具批:批序恒定(思考先行、消息后工具)
+    · 工具结果后的下一个回合经 step_boundary 开新 step,批内契约逐 step 成立
+
+消息块式契约(各生成器适配器统一遵守,cc/codex/opencode 同式):
+
+    ┌───────────────────┬─────────────────────────────────────────────┐
+    │ 块名              │ 序列                                         │
+    ├───────────────────┼─────────────────────────────────────────────┤
+    │ thinking 批       │ chunk(thinking) ×m ──► message(thinking) ×1 │
+    │ content 批        │ chunk(content)  ×n ──► message(content)  ×1 │
+    ├───────────────────┼─────────────────────────────────────────────┤
+    │ 规则 1 消息单型块 │ message.content 内 thinking/content 不混装  │
+    │ 规则 2 消息=拼接  │ 文本 = 该批 chunk 的全量顺序拼接             │
+    │ 规则 3 sourceSeqs │ 只引本批 chunk seq(think→thinking,content→  │
+    │                   │ content);tool/result 恒引对应 tool/call seq │
+    └───────────────────┴─────────────────────────────────────────────┘
+
+事件流两级粒度:流式事件流(TAXONOMY 全集,含 assistant/chunk——还原实时
+逐字上下文;WS/OTel 通道承载)⊃ 非流式事件流(TAXONOMY − assistant/chunk,
+message 粒度;filesink 缺省只落此级,AGENT_MONITOR_FILE_RAW=1 落全量)。
 
 seq 序列是流式事件流的稠密序号;文件侧(非流式投影)按行跳过 chunk,因此
 **文件内 seq 允许洞,洞 = 被跳过的 assistant/chunk**。折叠契约只做 seq 排序
 与 seq < x 比较,不要求稠密 —— 读者(含前端)不得假定文件 seq 连续。
-- surface 事件 user/message / assistant/message / tool/result 携带全量消息与
-  surfaceOp(append 或 {op:'replace', start, end});
-- config/init(ignorable 日志型)= **构造期初始配置快照**,在 session/start 之前打印
-  (对应 self._client 的初始配置;api_key/token/base_url 等凭证与端点面剥离,不入流;
-  SDK 装配对象如 mcp.server.Server 实例折叠为类型名,见 _jsonable);
-- context/modify 是上下文修改的解释事件(日志型,不折动),折叠正确性与它无关 ——
-  丢弃也只是少了解释,不会误解消息历史;
+
+事件家族与载荷(每个 type 的 data 键):
+
+    生命周期          session/start  run_id,label,generator,provider,model,retry,meta
+                     session/end    state,ok,duration_ms,text_chars,num_steps,usage,…
+                     turn/start|end turn 〔end 另有 reason〕
+                     step/start|end turn,step(step_boundary 成对开合)
+    ──────────────
+    surface 层       user/message       message,source,surfaceOp
+                     assistant/message message,sourceSeqs,surfaceOp
+                                       〔cc SDK 路径另带 usage/stop_reason〕
+                     tool/result       message,is_error,callId,name,sourceSeqs
+    ──────────────
+    流式层           assistant/chunk   chunk{type,index,text}
+                                       · content|thinking = 块式契约的流式增量
+                                       · tool_call|plan   = 增量段(各生成器语义)
+    ──────────────
+    工具调用         tool/call         callId,name,arguments(原始 arguments JSON)
+    ──────────────
+    日志型(ignorable) config/init    初始配置快照(凭证剥离+装配对象折叠为类型名)
+                     context/modify  上下文修改解释面(不折动)
+    错误             error            stage,exc_type,message(全量;session/end.reason ≤2000 字)
+
+surface 事件携带全量消息与 surfaceOp(append 或 {op:'replace',start,end});
+surface 事件 user/message / assistant/message / tool/result 是折叠集合
+(messages(X) 派生见下);config/init 在 session/start 之前打印;context/modify
+折叠正确性与它无关 —— 丢弃也只是少了解释,不会误解消息历史。
 - **会话保活不再走事件**:session 活着但静默时的"保鲜"由 generators.base.session 的
   keep-warm 定时器调 sinks.touch(session) 直触文件 mtime(只动时间、不加行),
   监测端(agent-monitor hub)借"无终态行且 mtime 静止超租约"判定会话已死 ——
@@ -86,7 +146,11 @@ LOG_TYPES = frozenset({"config/init", "context/modify"})
 
 
 def type_of(evt: dict) -> str:
-    """返回事件 type;未知类型 → ValueError。"""
+    """Return the event type; unknown type raises ValueError.
+
+    Args:
+        evt: Event envelope dict carrying a `type` key.
+    """
     t = evt.get("type")
     if t not in TAXONOMY:
         raise ValueError(f"未知事件 type: {t!r}")
@@ -94,11 +158,16 @@ def type_of(evt: dict) -> str:
 
 
 def new_event(evt_type: str, **data) -> dict:
-    """构造事件信封:补 id/ts,type/data 分组,校验 type 与字段可 JSON 序列化。
+    """Build an event envelope (id/ts, type/data split); validate type and JSON serializability.
 
-    封套身份仅 session + seq(接收端按 session 归组、seq 排序);
-    run_id/label/generator/model/retry/meta 是 session/start 的**快照**,不逐事件携带;
-    surface 事件强制校验 message + surfaceOp(防适配器漏字段导致折叠不可复现)。
+    Envelope identity is session + seq only (receivers group by session, order by seq);
+    run_id/label/generator/model/retry/meta live in the session/start snapshot, never
+    per event; surface events enforce message + surfaceOp (protects fold reproducibility).
+
+    Args:
+        evt_type: Event type in TAXONOMY.
+        data: Event payload matching the type semantics; surface events require
+            `message` and a valid `surfaceOp`.
     """
     if evt_type not in TAXONOMY:
         raise ValueError(f"未知事件 type: {evt_type!r}")
@@ -116,9 +185,17 @@ def new_event(evt_type: str, **data) -> dict:
 
 
 def truncate(text: str | None, n: int) -> tuple[int, str]:
-    """返回 (原长度, 预览):超长截断加省略号;None/空 → (0, "")。
+    """Return (original length, preview); long text is truncated with an ellipsis.
 
-    仅用于 OTel 等第三方通道的预览属性;监控事件本身全量不截断。
+    Only feeds preview attributes of third-party channels (OTel); monitor events are
+    never truncated.
+
+    Args:
+        text: Text to preview; None/empty yields (0, "").
+        n: Max preview length in characters.
+
+    Returns:
+        (original length, preview text) tuple.
     """
     if not text:
         return (0, "")
@@ -128,12 +205,7 @@ def truncate(text: str | None, n: int) -> tuple[int, str]:
 
 
 def _jsonable(value):
-    """事件载荷降级(递归):dict/list 透传,标量原样,其余对象折叠为 `<类型名>`。
-
-    config/init 快照只作观测 —— SDK 装配对象(mcp_servers 里的 mcp.server.Server
-    实例等)以类型名占位入流、不落实例,保证 new_event 的 JSON 校验在构造期即
-    通过(而非主路径抛 "not JSON serializable" 打死交付)。
-    """
+    """Recursively downgrade a payload; non-scalar objects collapse to a `<TypeName>` placeholder."""
     if isinstance(value, dict):
         return {k: _jsonable(v) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
@@ -150,12 +222,7 @@ def _jsonable(value):
 
 def _session_id(session: str | None, session_ns: str | None, run_id: str | None,
                 session_name: str | None) -> str:
-    """会话 id:显式 session 原样;否则 <ns>/<uuid4>(ns 由上层业务决定分类命名空间)。
-
-    ns 解析序:显式 session_ns 参数 → run_id → session_name → "agent";
-    会话 id 形如 judge:llm/0460e1e9-5155-4014-9054-a39986462b20 —— grep
-    session/start 的 session 字段即知来源;文件名只取 "/" 后段(见 FileSink)。
-    """
+    """Session id: explicit value, else `<ns>/<uuid4>`; ns = session_ns → run_id → session_name → "agent"."""
     if session:
         return session
     ns = session_ns or run_id or session_name or "agent"
@@ -163,7 +230,7 @@ def _session_id(session: str | None, session_ns: str | None, run_id: str | None,
 
 
 def _norm_token(u, keys: tuple[str, ...]):
-    """从 SDK 对象/字典取值(映射 prompt/completion_tokens 命名)的通用取值器。"""
+    """Fetch the first non-None value among the given attribute/keys (att/attr mapping helper)."""
     for k in keys:
         v = getattr(u, k, None)
         if v is None and isinstance(u, dict):
@@ -174,7 +241,7 @@ def _norm_token(u, keys: tuple[str, ...]):
 
 
 def _normalize_usage(u) -> dict | None:
-    """SDK/HTTP usage → 统一结构 {input_tokens, output_tokens, cache_read_input_tokens}。"""
+    """Map SDK/HTTP usage fields to {input_tokens, output_tokens, cache_read_input_tokens}; None keeps None."""
     if not u:
         return None
     return {
@@ -188,18 +255,17 @@ _active_bus: "EventBus | None" = None  # 由 sinks.configure/ensure_bus 单向�
 
 
 def set_active_bus(bus: "EventBus | None") -> None:
-    """设置当前总线(仅观测通道层调用);None = 无通道(事件发布零开销短路)。"""
+    """Set the active bus (called only by the observation-channel layer).
+
+    Args:
+        bus: Bus to receive events, or None to disable channels (zero-cost short-circuit).
+    """
     global _active_bus
     _active_bus = bus
 
 
 def _ensure_maybe_bus() -> "EventBus | None":
-    """录前自足:监控总线未建则懒建(任意会话的首次事件触达);返回当前总线或 None。
-
-    机制归事件层 —— 宿主 app / 生成器层无需 ensure_bus,任何会话记录即自动挂接
-    FileSink(恒开)+ 可达 WS/OTel。懒 import 保持本模块**导入期**纯 stdlib/零 sinks
-    (ensure_bus 须在运行中的事件循环内调用,event() 恒在 loop 内)。幂等:建后即短路。
-    """
+    """Lazily build the bus on the first event of any session; None outside a running loop."""
     bus = _active_bus
     if bus is None:
         try:
@@ -214,12 +280,23 @@ def _ensure_maybe_bus() -> "EventBus | None":
 
 
 class EventRecorder:
-    """单次运行的事件发布器:维护会话信封/turn/step/seq 计数,归一化后广播事件。"""
+    """Event publisher for one run: session envelope, turn/step/seq counters, normalized broadcast."""
 
     def __init__(self, session: str, *, generator: str = "",
                  provider: str | None = None, model: str | None = None,
                  label: str | None = None,
                  run_id: str | None = None, meta=None):
+        """Create the recorder bound to one session.
+
+        Args:
+            session: Session id (derivation rules in `_session_id`).
+            generator: Pipeline id of the producing generator.
+            provider: Backend domain recorded in the session snapshot.
+            model: Model name recorded in the session snapshot.
+            label: Human-readable session label (defaults to the session id).
+            run_id: Run id recorded in the session snapshot.
+            meta: Arbitrary metadata recorded in the session snapshot.
+        """
         self.session = session
         self.label = label or session
         self.generator = generator
@@ -240,6 +317,7 @@ class EventRecorder:
         self._tool_use_pieces: dict[int, list[str]] = {}  # 块 index → input_json_delta 碎片
         self._tool_result: dict | None = None
         self._chunk_seqs: list[int] = []  # 本 step 的 assistant/chunk seq(消息 sourceSeqs)
+        self._chunk_type_seqs: dict[str, list[int]] = {}  # chunk type → 本 step 的 seq(消息 sourceSeqs 按批分组)
         self._call_seqs: dict[str, int] = {}  # callId → tool/call 的 seq
         self._tool_results_seen: set[str] = set()  # 已发射 tool/result 的 callId(流/用户消息双路去重)
         # partial 模式重建缓冲(cc 真机 CLI:SDK 消息标记 content 为空,全量从本消息增量重建)
@@ -255,7 +333,15 @@ class EventRecorder:
         self.result_cost_usd: float | None = None
 
     def event(self, evt_type: str, **data) -> dict | None:
-        """造信封并发布;返回事件(seq 已分配);无 sink 时返回 None(零开销短路)。"""
+        """Build and publish one event; returns it with seq assigned.
+
+        Args:
+            evt_type: Event type in TAXONOMY.
+            data: Event payload (see `new_event`).
+
+        Returns:
+            Published event with seq assigned, or None when no channel is active.
+        """
         bus = _ensure_maybe_bus()  # 录前自足:首次事件即建监控总线(幂等;随 event 恒在 loop 内)
         if bus is None or not bus.enabled:
             return None  # 无通道:零开销短路(publish 语义不变)
@@ -267,12 +353,14 @@ class EventRecorder:
         return evt
 
     def init_config(self, config: dict) -> None:
-        """构造期初始配置快照(config/init;凭证/端点面剥离;须在 start() 之前打印)。
+        """Snapshot the construction-time config (config/init; creds/endpoints stripped).
 
-        对应 self._client 的初始配置 —— config 的观测面统一在此,不再附着
-        session/start 与 turn/start(身份 = session id;元数据快照见本事件)。
-        SDK 装配对象(如 mcp_servers 的 mcp.server.Server 实例)经 _jsonable 折叠
-        为类型名 —— 快照只看装配形态,不落实例,不炸 JSON 校验。
+        Printed before start(): the single observation surface for the client's initial
+        config; SDK assembly objects (e.g. mcp.server.Server in mcp_servers) collapse to
+        type names — only the assembly shape is observed, never instances.
+
+        Args:
+            config: Config dict as assembled at construction time.
         """
         creds = ("api_key", "token", "base_url")
         self.event("config/init",
@@ -286,11 +374,14 @@ class EventRecorder:
     # ------------------------------------------------------------------
 
     def start_keepwarm(self, interval: float) -> None:
-        """run 进行中启动保鲜定时器(cadence = interval 秒);幂等。
+        """Start the keep-warm timer (cadence = interval seconds) while the run is active; idempotent.
 
-        仅当 interval>0 且有活跃监控总线时才建任务(否则无可保鲜对象,避免空转)。
-        finish 前由 stop_keepwarm 取消(await 保证退场);_keepwarm_loop 只真睡
-        `asyncio.sleep(interval)`,每拍对会话文件 os.utime,绝不 busy-loop。
+        Only creates a task when interval > 0 and a live bus exists; `stop_keepwarm`
+        cancels it before finish; the loop just sleeps and touches the session file
+        mtime, never busy-loops.
+
+        Args:
+            interval: Seconds between mtime touches; ≤0 disables keep-warm.
         """
         if self._keepwarm_task is not None or interval <= 0 or _active_bus is None:
             return
@@ -298,10 +389,11 @@ class EventRecorder:
         self._keepwarm_task = asyncio.create_task(self._keepwarm_loop(interval))
 
     async def stop_keepwarm(self) -> None:
-        """取消并等待保鲜任务退场(幂等);finish 前调用,保证 session/end 恒末行。
+        """Cancel and await the keep-warm task (idempotent); call before finish so session/end stays the last line.
 
-        取消在 run 生命周期(而非依赖 session/end 行送达)完成——即便该行被有界
-        队列挤掉,保鲜也已停,mtime 才可冻结交 hub 租约判死。
+        Cancellation completes within the run lifecycle — even if the end line is
+        dropped by the bounded queue, keep-warm is already stopped so mtime freezes
+        for the hub lease to judge.
         """
         task = self._keepwarm_task
         self._keepwarm_task = None
@@ -311,13 +403,7 @@ class EventRecorder:
         await asyncio.gather(task, return_exceptions=True)
 
     async def _keepwarm_loop(self, interval: float) -> None:
-        """每 sleep(interval) 经 sinks.touch(session) 对会话文件触一次 mtime。
-
-        touch 是文件 sink 的职责(见 sinks.FileSink.touch),本层只做节奏与自停;
-        懒 import 避免 events→sinks 的导入期耦合(运行期才触达)。无静默判断 ——
-        os.utime 便宜,会话开着就保鲜;事件密时 mtime 本就新鲜,多触一次无副作用。
-        总线被关闭(configure)后 touch 扇出为空,自然 no-op。
-        """
+        """Sleep `interval`, then touch the session file mtime; cheap, no quiet-detection."""
         from .sinks import touch
 
         while True:
@@ -326,10 +412,15 @@ class EventRecorder:
 
     def start(self, *, context: list[dict] | None = None, retry: dict | None = None,
               prologue: bool = True) -> None:
-        """运行进入:session/start(带 retry 元数据)→ context 说明事件 → turn/start → step/start。
+        """Enter the run: session/start (with retry metadata) → context events → turn/start → step/start.
 
-        prologue=False(dsh 投影路径专用):turn/step 生命周期由 dsh 原生事件自带,
-        不合成 turn/start + step/start,且 _step_open 保持 False(dsh 路径不调 step_boundary)。
+        prologue=False (dsh projection path only): turn/step lifecycle is carried by
+        dsh's own events, no turn/start + step/start synthesized and `_step_open` stays False.
+
+        Args:
+            context: Context-modify explanation events replayed before the run.
+            retry: Retry metadata recorded in session/start.
+            prologue: Whether to synthesize turn/start and step/start.
         """
         self.event("session/start", run_id=self.run_id, label=self.label, generator=self.generator,
                    provider=self.provider, model=self.model, retry=retry, meta=self.meta)
@@ -341,17 +432,18 @@ class EventRecorder:
             self._step_open = True
 
     def step_boundary(self) -> None:
-        """上一步完成、新一步开始(工具结果后新一轮 LLM 请求);本 step 增量清空。"""
+        """Close the previous step and open the next (new LLM round after a tool result); step buffers reset."""
         if self._stepping():
             self.event("step/end", turn=self.turn, step=self.step)
         self.step += 1
         self._chunk_seqs = []
+        self._chunk_type_seqs = {}
         self._msg_reset()  # 新 LLM 轮:旧消息缓冲(若有残留)清空
         self._step_open = True
         self.event("step/start", turn=self.turn, step=self.step)
 
     def _msg_reset(self) -> None:
-        """本 assistant 消息增量缓冲清零(消息标记/新消息起点处调用)。"""
+        """Reset the current assistant-message delta buffers."""
         self._msg_text = ""
         self._msg_thinking = ""
         self._msg_tool_calls = []
@@ -359,32 +451,55 @@ class EventRecorder:
 
     def user_message(self, message: dict, *, source: dict | None = None,
                      surface_op: str | dict = "append") -> None:
-        """user/message surface 事件(source 缺省 human 用户)。"""
+        """Emit a user/message surface event.
+
+        Args:
+            message: User message dict (folds into the message surface).
+            source: Source attribution dict; defaults to {"kind": "user"}.
+            surface_op: Surface marker — "append" or a dict {"op": "replace", ...}.
+        """
         if source is None:
             source = {"kind": "user"}
         self.event("user/message", turn=self.turn, step=self.step, message=message,
                    source=source, surfaceOp=surface_op)
 
     def chunk(self, chunk: dict) -> None:
-        """assistant/chunk 原始增量;seq 记入本 step 的 sourceSeqs。
+        """Emit an assistant/chunk raw delta; its seq joins this step's tiered sourceSeqs.
 
-        段型 schema:{"type": "thinking"|"content"|"tool_call"(|"plan"), "index": 段序,
-        "text": 文本增量}(type 已定段名,文本字段统一 text;tool_call 负载为 partial_json)。
+        块式契约(见模块 docstring):type=content|thinking 的增量按批与
+        assistant/message 对偶(批内 message 定型 = 本批 chunk 拼接,sourceSeqs =
+        本批 chunk seq);type=tool_call|plan 为增量段(未定型为独立消息)。
+
+        Args:
+            chunk: Segment dict {"type": "thinking"|"content"|"tool_call"|"plan",
+                "index": segment order, "text": delta} (tool_call payload is partial JSON).
         """
         evt = self.event("assistant/chunk", turn=self.turn, step=self.step, chunk=chunk)
         if evt is not None:
             self._chunk_seqs.append(evt["seq"])
+            self._chunk_type_seqs.setdefault(str(chunk.get("type", "")), []).append(evt["seq"])
         if chunk.get("type") == "thinking":
             self._msg_thinking += chunk.get("text", "")
 
     def text(self, text: str, *, index: int = 0) -> None:
-        """content 段便捷发射:text_chars 只累计 content(thinking/tool_input 不计)。"""
+        """Convenience emitter for a content segment.
+
+        Args:
+            text: Content delta text.
+            index: Segment order within the message.
+        """
         self.text_chars += len(text)
         self._msg_text += text
         self.chunk({"type": "content", "index": index, "text": text})
 
     def tool_call(self, call_id: str, name: str | None, arguments: str) -> None:
-        """tool/call 事件:callId 为 wire 键;seq 记入 _call_seqs,供 tool_result 回填 sourceSeqs。"""
+        """Emit a tool/call event; its seq is kept for the matching tool/result sourceSeqs.
+
+        Args:
+            call_id: Tool call id (wire key `callId`).
+            name: Tool name, or None when unknown.
+            arguments: Raw arguments (JSON string or partial JSON).
+        """
         evt = self.event("tool/call", turn=self.turn, step=self.step, callId=call_id,
                          name=name, arguments=arguments)
         if evt is not None:
@@ -393,10 +508,15 @@ class EventRecorder:
 
     def tool_result(self, message: dict, *, call_id: str, name: str | None,
                     is_error: bool, src_seq: int | None = None) -> None:
-        """tool/result surface 事件:callId 关联对应 tool/call,sourceSeqs = 该 tool/call 的 seq。
+        """Emit a tool/result surface event; sourceSeqs = the matching tool/call seq.
 
-        src_seq 由调用方传入(通常 _call_seqs.get(call_id));None → 省略 sourceSeqs 键
-        (无可溯源的 tool/call seq)。
+        Args:
+            message: Tool result message dict (folds into the message surface).
+            call_id: Tool call id linking to the matching tool/call event.
+            name: Tool name, or None when unknown.
+            is_error: Whether the tool invocation failed.
+            src_seq: Seq of the matching tool/call; None omits `sourceSeqs`
+                (no traceable call seq).
         """
         data = {"turn": self.turn, "step": self.step, "message": message, "is_error": is_error,
                 "surfaceOp": "append", "callId": call_id}
@@ -407,16 +527,24 @@ class EventRecorder:
         self.event("tool/result", **data)
 
     def result_meta(self, msg) -> None:
-        """ResultMessage → session/end 汇总字段(usage/stop_reason/cost)。"""
+        """Fold a ResultMessage into the session/end summary (usage/stop_reason/cost).
+
+        Args:
+            msg: Result message carrying usage, stop_reason and total_cost_usd.
+        """
         self.result_usage = _normalize_usage(getattr(msg, "usage", None))
         self.result_stop_reason = getattr(msg, "stop_reason", None)
         self.result_cost_usd = getattr(msg, "total_cost_usd", None)
 
     def finish(self, ok: bool, *, epilogue: bool = True) -> None:
-        """finally 兜底:step/end → turn/end → session/end(幂等)。
+        """Idempotent teardown: step/end → turn/end → session/end.
 
-        epilogue=False(dsh 投影路径专用):turn/step 终局事件已由 dsh 原生事件转发,
-        只收尾 session/end(状态汇总字段组装不变)。
+        epilogue=False (dsh projection path only): turn/step finals were already
+        forwarded from dsh native events; only session/end is assembled.
+
+        Args:
+            ok: Whether the run completed (state becomes "completed", else "aborted").
+            epilogue: Whether to emit turn/step finals before session/end.
         """
         if self._ended:
             return
@@ -446,20 +574,26 @@ class EventRecorder:
         self.event("session/end", **data)
 
     def error(self, exc: Exception, stage: str) -> None:
-        """error 事件(全量 message,不截断);session/end.reason 取首 2000 字符。"""
+        """Emit an error event (full message, untruncated); session/end.reason keeps the first 2000 chars.
+
+        Args:
+            exc: The exception that failed the run.
+            stage: Failure stage label (e.g. "run", "extended", ...).
+        """
         self.event("error", stage=stage, exc_type=type(exc).__name__, message=str(exc))
         self._reason = str(exc)[:2000]
 
     def _stepping(self) -> bool:
+        """Whether enter/step lifecycle events are open."""
         return self._step_open
 
 
 class EventBus:
-    """进程内异步事件总线:publish 只 put_nowait 到每 sink 队列,永不阻塞调用方;慢 sink 只拖 sink 自己。
+    """In-process async bus: publish put_nowait to each sink queue, never blocks; a slow sink drags only itself.
 
-    有界队列(5000)满 → 丢最旧、新事件优先;publish 为 loop-affine(v1 仅异步
-    调用方,线程调用方须经 loop.call_soon_threadsafe 转发)。进程内单例,由
-    sinks.ensure_bus 惰性构建(configure 关闭重建)。
+    Bounded queue (5000): full → drop oldest, newest wins; publish is loop-affine
+    (async callers only; thread callers must forward via loop.call_soon_threadsafe).
+    Process singleton built lazily by sinks.ensure_bus (configure rebuilds it).
     """
 
     def __init__(self):
@@ -471,12 +605,17 @@ class EventBus:
         return bool(self._sinks)
 
     def add(self, consume) -> None:
-        """注册 sink 消费协程:async def consume(evt: dict) -> None。"""
+        """Register a sink consumer coroutine.
+
+        Args:
+            consume: Coroutine `async def consume(evt: dict) -> None`.
+        """
         q: asyncio.Queue[dict] = asyncio.Queue(maxsize=5000)
         self._sinks.append(q)
         self._tasks.append(asyncio.create_task(self._drain(consume, q)))
 
     async def _drain(self, consume, q) -> None:
+        """Send-queue drain coroutine; sink failures only log to stderr, never bubble to callers."""
         while True:
             evt = await q.get()
             try:
@@ -485,6 +624,11 @@ class EventBus:
                 _log(f"sink 消费失败: {type(exc).__name__}: {exc}")
 
     def publish(self, evt: dict) -> None:
+        """Fan out one event to every sink queue (never blocks the caller).
+
+        Args:
+            evt: Event dict to deliver to all sinks.
+        """
         if not self._sinks:
             return
         for q in self._sinks:
@@ -495,5 +639,6 @@ class EventBus:
                 q.put_nowait(evt)
 
     def shutdown(self) -> None:
+        """Cancel all sink tasks (bounded-queue drains); no await, callers own reaping."""
         for task in self._tasks:
             task.cancel()

@@ -1918,6 +1918,19 @@ async def test_codex_stream_thinking_and_plan_chunks(monkeypatch, tmp_path):
              if g["type"] == "assistant/chunk"]
     assert kinds == ["thinking", "plan", "content"]  # reasoning completed 未重复;plan 恰一次
     assert kinds.count("plan") == 1
+    # 块式契约:reasoning completed 定型 message(thinking);content 消息分型 sourceSeqs
+    msgs = [g for g in got if g["type"] == "assistant/message"]
+    think_msg = next(m for m in msgs
+                     if m["data"]["message"]["content"][0].get("type") == "thinking")
+    assert think_msg["data"]["message"]["content"] == [{"type": "thinking", "text": "深"}]
+    assert think_msg["data"]["sourceSeqs"] == \
+        [g["seq"] for g in got if g["type"] == "assistant/chunk"
+         and g["data"]["chunk"].get("type") == "thinking"]
+    content_msg = next(m for m in msgs
+                       if m["data"]["message"]["content"][0].get("type") == "content")
+    assert content_msg["data"]["sourceSeqs"] == \
+        [g["seq"] for g in got if g["type"] == "assistant/chunk"
+         and g["data"]["chunk"].get("type") == "content"]
 
 
 @pytest.mark.asyncio
@@ -1962,6 +1975,19 @@ async def test_codex_stream_summary_and_plan_deltas(monkeypatch, tmp_path):
     assert [c["index"] for c in chunks[:2]] == [0, 1]  # 摘要段位真实承载(index 跳变=新段)
     assert [c["text"] for c in chunks] == ["深", "思", "先查", "再写", "兜底", "回答"]
     assert [c["index"] for c in chunks[2:4]] == [0, 0]  # plan 无段位字段,恒定单文档
+    # 块式契约:每个 reasoning 项定型 message(thinking)(全文拼接),content 消息分型
+    msgs = [g for g in got if g["type"] == "assistant/message"]
+    think_msgs = [m for m in msgs
+                  if m["data"]["message"]["content"][0].get("type") == "thinking"]
+    assert [m["data"]["message"]["content"][0]["text"] for m in think_msgs] == ["深思", "兜底"]
+    assert think_msgs[0]["data"]["sourceSeqs"] == \
+        [g["seq"] for g in got if g["type"] == "assistant/chunk"
+         and g["data"]["chunk"].get("type") == "thinking"][:2]
+    content_msg = next(m for m in msgs
+                       if m["data"]["message"]["content"][0].get("type") == "content")
+    assert content_msg["data"]["sourceSeqs"] == \
+        [g["seq"] for g in got if g["type"] == "assistant/chunk"
+         and g["data"]["chunk"].get("type") == "content"]
 
 
 @pytest.mark.asyncio
@@ -2253,6 +2279,402 @@ def test_codex_home_setup_config_toml_and_auth(tmp_path, monkeypatch):
                                                 "env_vars": ["GRAPHIFY_OUT"]}])
     assert (home / "config.toml").stat().st_mtime_ns == before
     assert auth.is_symlink() and auth.resolve() == (user_home / ".codex" / "auth.json")
+
+
+# ---------------------------------------------------------------------------
+# opencode 适配器(CLI run --format json):假可执行脚本喂 JSONL(零网络/token)
+# ---------------------------------------------------------------------------
+
+
+def _oc_part(kind: str, **fields) -> dict:
+    """opencode 事件 part 构造(默认信封字段 + 追加字段)。"""
+    return {"id": "prt_x", "sessionID": "ses_x", "messageID": "msg_x", "type": kind, **fields}
+
+
+def _oc_line(kind: str, *, part=None, error=None) -> dict:
+    """opencode JSONL 行构造(信封只取 type/part/error 三个被解析的键)。"""
+    evt = {"type": kind}
+    if part is not None:
+        evt["part"] = part
+    if error is not None:
+        evt["error"] = error
+    return evt
+
+
+def _opencode_bin(tmp_path, events, *, exit_code=0, stderr=""):
+    """假 opencode CLI 可执行脚本:stdout 逐行打印注入事件 JSON,stderr 写文本,exit_code 退出。
+
+    events = 预构造的事件 dict 列表(真机捕获 schema 见 tests/test_agent_real.py 注记);
+    config["opencode_bin"] 指向它 —— 单测驱动完整子进程管线(虚假命令零网络)。
+    """
+    payload = tmp_path / "fake-opencode-events.jsonl"
+    payload.write_text("\n".join(json.dumps(e, ensure_ascii=False) for e in events) + "\n",
+                       encoding="utf-8")
+    path = tmp_path / "fake-opencode"
+    path.write_text(
+        "#!/usr/bin/env python3\n"
+        "import sys\n"
+        f"with open({str(payload)!r}, encoding='utf-8') as fh:\n"
+        "    lines = fh.read().splitlines()\n"
+        "for line in lines:\n"
+        "    print(line)\n"
+        f"if {stderr!r}:\n"
+        f"    sys.stderr.write({stderr!r})\n"
+        f"sys.exit({exit_code})\n",
+        encoding="utf-8",
+    )
+    path.chmod(0o755)
+    return str(path)
+
+
+def test_opencode_argv_and_config_content_assembly(tmp_path):
+    """纯函数装配:argv(--pure/--auto/旗标拼装)、env(OPENCODE_CONFIG)、注入段(instructions+mcp)。"""
+    from gh_puller.agent.generators.opencode import (
+        _opencode_argv, _opencode_config_content, _opencode_env,
+    )
+
+    cfg = {"model": "deepseek/deepseek-chat", "agent": "build", "variant": "high",
+           "auto": True, "session": "ses_1",
+           "config_path": str(tmp_path / "opencode.json"),
+           "system_prompt": "sys", "env": {"GRAPHIFY_OUT": "/g"},
+           "mcp_servers": [{"id": "graphify", "command": "python3",
+                            "args": ["-m", "graphify.serve"], "env_vars": ["GRAPHIFY_OUT"]}]}
+    argv = _opencode_argv(cfg, "你好")
+    assert argv == ["opencode", "--pure", "run", "--model", "deepseek/deepseek-chat",
+                    "--agent", "build", "--variant", "high", "--session", "ses_1",
+                    "--auto", "--format", "json", "你好"]
+    assert "--thinking" not in argv  # 缺省关(不恒传;经 config.thinking 显式打开)
+    assert "--thinking" in _opencode_argv({**cfg, "thinking": True}, "x")
+    env = _opencode_env(cfg)
+    assert env["OPENCODE_CONFIG"] == str(tmp_path / "opencode.json")
+    assert env["OPENCODE_DISABLE_CLAUDE_CODE_SKILLS"] == "1"  # 缺省隔离本机 claude 技能面
+    content = _opencode_config_content(cfg, "/tmp/i.md", env)
+    assert content["instructions"] == ["/tmp/i.md"]
+    assert content["mcp"] == {"graphify": {"type": "local",
+                                           "command": ["python3", "-m", "graphify.serve"],
+                                           "enabled": True,
+                                           "environment": {"GRAPHIFY_OUT": "/g"}}}
+    # 无注入面:system_prompt/mcp_servers 均缺省 → 零注入段
+    assert _opencode_config_content({}, None, {}) == {}
+    # auto 缺省 True;显式 False 不落 --auto
+    assert "--auto" in _opencode_argv({}, "x")
+    assert "--auto" not in _opencode_argv({"auto": False}, "x")
+
+
+@pytest.mark.asyncio
+async def test_opencode_stream_synthesizes_taxonomy(monkeypatch, tmp_path):
+    """假 bin:JSONL → TAXONOMY 全序列(text 累积快照差分/工具合成/step 边界/tokens 归一/终局)。
+
+    事件序列镜像真机捕获(见 tests/test_agent_real.py 注记):step_start → text(累积) →
+    tool_use(completed)→ step_finish(tool-calls)→ step_start → text → step_finish(stop)。
+    """
+    agent.configure(ws_urls=[], otel_urls=[])
+    got = []
+    sinks.ensure_bus().add(_recv(got))
+    binpath = _opencode_bin(tmp_path, [
+        _oc_line("step_start", part=_oc_part("step-start")),
+        _oc_line("text", part=_oc_part("text", id="p1", text="你好")),
+        _oc_line("text", part=_oc_part("text", id="p1", text="你好世界")),  # 同 part.id 累积快照 → 差分
+        _oc_line("tool_use", part=_oc_part("tool",
+                                           callID="c1", tool="mcp__graphify__query_graph",
+                                           state={"status": "completed", "input": {"q": "x"},
+                                                  "output": "结果", "title": "t",
+                                                  "metadata": {"exit": 0}})),
+        _oc_line("step_finish", part=_oc_part("step-finish", reason="tool-calls",
+                                              tokens={"total": 10, "input": 11, "output": 3,
+                                                      "reasoning": 1,
+                                                      "cache": {"read": 2, "write": 0}},
+                                              cost=0.01)),
+        _oc_line("step_start", part=_oc_part("step-start")),
+        _oc_line("text", part=_oc_part("text", id="p3", text="答案")),
+        _oc_line("step_finish", part=_oc_part("step-finish", reason="stop",
+                                              tokens={"total": 20, "input": 30, "output": 4,
+                                                      "reasoning": 0,
+                                                      "cache": {"read": 5, "write": 0}},
+                                              cost=0.02)),
+    ])
+    gen = agent.OpenCode({"opencode_bin": binpath})
+    async with gen.session(session_name="x", run_id="r1"):
+        chunks = [c async for c in gen.stream("prompt")]
+    assert "".join(chunks) == "你好世界答案"
+    await asyncio.sleep(0.05)
+    types_ = [g["type"] for g in got]
+    assert types_[:5] == ["config/init", "session/start", "turn/start", "step/start", "user/message"]
+    assert got[1]["data"]["run_id"] == "r1"  # session/start(索引 1)携带身份
+    assert [g["seq"] for g in got] == list(range(len(got)))  # 合成流 seq 稠密
+    steps = [g["data"]["step"] for g in got if g["type"] in ("step/start", "step/end")]
+    assert steps == [1, 1, 2, 2]  # 首 step_start 与 prologue 重合;第二次 step_start 开新 step
+    call = next(g for g in got if g["type"] == "tool/call")
+    assert call["data"] == {"turn": 1, "step": 1, "callId": "c1",
+                            "name": "mcp__graphify__query_graph", "arguments": '{"q": "x"}'}
+    res = next(g for g in got if g["type"] == "tool/result")
+    assert res["data"]["is_error"] is False
+    assert res["data"]["name"] == "mcp__graphify__query_graph"
+    assert res["data"]["sourceSeqs"] == [call["seq"]]
+    assert res["data"]["message"]["content"][0]["content"] == "结果"
+    msgs = [g for g in got if g["type"] == "assistant/message"]
+    assert [m["data"]["message"]["content"] for m in msgs] == [
+        [{"type": "content", "text": "你好世界"}],  # step1 文字(工具轮开头)→ 本步全量
+        [{"type": "content", "text": "答案"}],
+    ]
+    # 文件面顺序:每步文字 surface 先于同 step 的工具(修复前 msg 锚 step_finish,
+    # 整份 jsonl 表现为 text 落后于工具调用 —— 本轮在首个 tool_use 前发射)
+    assert msgs[0]["seq"] < next(g for g in got if g["type"] == "tool/call")["seq"] < msgs[1]["seq"]
+    assert msgs[0]["data"]["sourceSeqs"] == \
+        [g["seq"] for g in got if g["type"] == "assistant/chunk"][:2]  # 本步文本 chunk seq
+    end = got[-1]
+    assert end["type"] == "session/end" and end["data"]["state"] == "completed"
+    assert end["data"]["usage"] == {"input_tokens": 30, "output_tokens": 4,
+                                    "cache_read_input_tokens": 5}  # 末条 step_finish 为准
+    assert end["data"]["total_cost_usd"] == 0.02
+    assert end["data"]["stop_reason"] == "stop"
+
+
+@pytest.mark.asyncio
+async def test_opencode_stream_text_after_tools_still_head_of_step(monkeypatch, tmp_path):
+    """真机回合形态:text 事件晚于本回合已完成工具到达(CLI 工具回调穿插)——
+
+    按到达序直发将得"工具结果在前、语言在后"(初始实现缺陷);回合缓冲后
+    assistant/message 恒置顶于同 step 工具,工具按 CLI 到达序成对回补。
+    """
+    agent.configure(ws_urls=[], otel_urls=[])
+    got = []
+    sinks.ensure_bus().add(_recv(got))
+    binpath = _opencode_bin(tmp_path, [
+        _oc_line("step_start", part=_oc_part("step-start")),
+        _oc_line("tool_use", part=_oc_part("tool",
+                                           callID="c1", tool="bash",
+                                           state={"status": "completed",
+                                                  "input": {"command": "ls"}, "output": "out1",
+                                                  "title": "t", "metadata": {"exit": 0}})),
+        _oc_line("text", part=_oc_part("text", id="p1", text="我先查一下")),  # 文本后到
+        _oc_line("tool_use", part=_oc_part("tool",
+                                           callID="c2", tool="grep",
+                                           state={"status": "completed",
+                                                  "input": {"command": "grep x"}, "output": "out2",
+                                                  "title": "t", "metadata": {"exit": 0}})),
+        _oc_line("step_finish", part=_oc_part("step-finish", reason="tool-calls", tokens={}, cost=0)),
+        _oc_line("step_start", part=_oc_part("step-start")),
+        _oc_line("text", part=_oc_part("text", id="p2", text="答案")),
+        _oc_line("step_finish", part=_oc_part("step-finish", reason="stop", tokens={}, cost=0)),
+    ])
+    gen = agent.OpenCode({"opencode_bin": binpath})
+    async with gen.session(session_name="x"):
+        chunks = [c async for c in gen.stream("q")]
+    assert "".join(chunks) == "我先查一下答案"  # 流式产出不受缓冲影响(增量实时)
+    await asyncio.sleep(0.05)
+    msg = next(g for g in got if g["type"] == "assistant/message")
+    calls = [g for g in got if g["type"] == "tool/call"]
+    results = [g for g in got if g["type"] == "tool/result"]
+    # 回合语义序:文本置顶 → 工具成对(call+result)按 CLI 到达序
+    assert msg["seq"] < calls[0]["seq"] < results[0]["seq"] < calls[1]["seq"] < results[1]["seq"]
+    assert [c["data"]["name"] for c in calls] == ["bash", "grep"]
+    assert msg["data"]["message"]["content"] == [{"type": "content", "text": "我先查一下"}]
+    assert results[0]["data"]["sourceSeqs"] == [calls[0]["seq"]]  # 延迟回补不影响 sourceSeqs
+    assert [g["data"]["step"] for g in got if g["type"] == "step/start"] == [1, 2]  # step 边界不变
+
+
+@pytest.mark.asyncio
+async def test_opencode_stream_tool_exit_failure_is_error(monkeypatch, tmp_path):
+    """工具 metadata.exit 非 0 → tool/result is_error(不投文本增量)。"""
+    agent.configure(ws_urls=[], otel_urls=[])
+    got = []
+    sinks.ensure_bus().add(_recv(got))
+    binpath = _opencode_bin(tmp_path, [
+        _oc_line("step_start", part=_oc_part("step-start")),
+        _oc_line("tool_use", part=_oc_part("tool",
+                                           callID="c1", tool="bash",
+                                           state={"status": "completed",
+                                                  "input": {"command": "false"},
+                                                  "output": "", "title": "t",
+                                                  "metadata": {"exit": 1}})),
+        _oc_line("step_finish", part=_oc_part("step-finish", reason="stop", tokens={}, cost=0)),
+    ])
+    gen = agent.OpenCode({"opencode_bin": binpath})
+    async with gen.session(session_name="x"):
+        async for _ in gen.stream("q"):
+            pass
+    await asyncio.sleep(0.05)
+    res = next(g for g in got if g["type"] == "tool/result")
+    assert res["data"]["is_error"] is True
+
+
+@pytest.mark.asyncio
+async def test_opencode_stream_reasoning_to_thinking_chunk(monkeypatch, tmp_path):
+    """reasoning 事件(config.thinking 打开后入流)→ 块式设计(think 批先于 content 批)。
+
+    按 part.id 整段快照差分(与 text 同规则):
+    chunk(thinking)× m → message(thinking)× 1(m 个 chunk 拼接,think 批完成即定型);
+    chunk(content)× n → message(content)× 1(n 个 chunk 拼接);不产面向用户的文本。
+    """
+    agent.configure(ws_urls=[], otel_urls=[])
+    got = []
+    sinks.ensure_bus().add(_recv(got))
+    binpath = _opencode_bin(tmp_path, [
+        _oc_line("step_start", part=_oc_part("step-start")),
+        _oc_line("reasoning", part=_oc_part("reasoning", id="r1", text="先思考")),
+        _oc_line("reasoning", part=_oc_part("reasoning", id="r1", text="先思考再作答")),  # 累积快照 → 差分
+        _oc_line("text", part=_oc_part("text", id="p1", text="回答")),
+        _oc_line("step_finish", part=_oc_part("step-finish", reason="stop", tokens={}, cost=0)),
+    ])
+    gen = agent.OpenCode({"opencode_bin": binpath, "thinking": True})  # config 字段显式打开
+    async with gen.session(session_name="x"):
+        chunks = [c async for c in gen.stream("q")]
+    assert "".join(chunks) == "回答"  # 思考不构成产出
+    await asyncio.sleep(0.05)
+    kinds = [g["data"]["chunk"].get("type") for g in got if g["type"] == "assistant/chunk"]
+    assert kinds == ["thinking", "thinking", "content"]
+    think_texts = [g["data"]["chunk"]["text"] for g in got
+                   if g["type"] == "assistant/chunk" and g["data"]["chunk"].get("type") == "thinking"]
+    assert think_texts == ["先思考", "再作答"]  # 累积快照差分:第二条仅增量
+    msgs = [g for g in got if g["type"] == "assistant/message"]
+    # 块式设计:thinking 与 content 各成一条 assistant/message,批序 think 先、content 后;
+    # message 文本 = 对应 chunk 拼接(全文),sourceSeqs = 对应 chunk 的 seqs
+    assert len(msgs) == 2
+    assert msgs[0]["data"]["message"]["content"] == [{"type": "thinking", "text": "先思考再作答"}]
+    assert msgs[1]["data"]["message"]["content"] == [{"type": "content", "text": "回答"}]
+    assert msgs[0]["seq"] < msgs[1]["seq"]
+    think_chunk_seqs = [g["seq"] for g in got if g["type"] == "assistant/chunk"
+                        and g["data"]["chunk"].get("type") == "thinking"]
+    content_chunk_seqs = [g["seq"] for g in got if g["type"] == "assistant/chunk"
+                          and g["data"]["chunk"].get("type") == "content"]
+    assert msgs[0]["data"]["sourceSeqs"] == think_chunk_seqs
+    assert msgs[1]["data"]["sourceSeqs"] == content_chunk_seqs
+
+
+@pytest.mark.asyncio
+async def test_opencode_stream_invalid_tool_intercepted_is_error(monkeypatch, tmp_path):
+    """不可用工具被拦截:opencode 合成 tool="invalid" 的 completed 事件,input.error 含错误全文。
+
+    实测(run7):模型先调裸名 list_projects → 被拦,status=completed、input={"tool",
+    "error": "Model tried to call unavailable tool..."} —— is_error 必须 True(信息在
+    input.error 面,不靠 output 文本匹配)。
+    """
+    agent.configure(ws_urls=[], otel_urls=[])
+    got = []
+    sinks.ensure_bus().add(_recv(got))
+    binpath = _opencode_bin(tmp_path, [
+        _oc_line("step_start", part=_oc_part("step-start")),
+        _oc_line("tool_use", part=_oc_part("tool",
+                                           callID="c1", tool="invalid",
+                                           state={"status": "completed",
+                                                  "input": {"tool": "list_projects",
+                                                            "error": "Model tried to call unavailable tool 'list_projects'"},
+                                                  "output": "The arguments provided to the tool are invalid: Model tried to call unavailable tool 'list_projects'."})),
+        _oc_line("step_finish", part=_oc_part("step-finish", reason="stop", tokens={}, cost=0)),
+    ])
+    gen = agent.OpenCode({"opencode_bin": binpath})
+    async with gen.session(session_name="x"):
+        async for _ in gen.stream("q"):
+            pass
+    await asyncio.sleep(0.05)
+    calls = [g for g in got if g["type"] == "tool/call"]
+    res = next(g for g in got if g["type"] == "tool/result")
+    assert len(calls) == 1 and calls[0]["data"]["name"] == "invalid"
+    assert res["data"]["is_error"] is True
+    assert "unavailable tool" in res["data"]["message"]["content"][0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_opencode_stream_tool_error_status_completes(monkeypatch, tmp_path):
+    """工具 error 态(status=error,state.error 文本,无 output)→ tool/call+tool/result 合成。
+
+    实测(gh-puller-mcp 工具失败)会发 status="error" 的 tool_use —— 与 completed 同权,
+    不得跳过丢弃(否则监控缺该调用且 is_error 信息丢失)。
+    """
+    agent.configure(ws_urls=[], otel_urls=[])
+    got = []
+    sinks.ensure_bus().add(_recv(got))
+    binpath = _opencode_bin(tmp_path, [
+        _oc_line("step_start", part=_oc_part("step-start")),
+        _oc_line("tool_use", part=_oc_part("tool",
+                                           callID="c1", tool="gh_puller_search_code",
+                                           state={"status": "error",
+                                                  "input": {"pattern": "x"},
+                                                  "error": "path or file_pattern contains invalid characters"})),
+        _oc_line("step_finish", part=_oc_part("step-finish", reason="stop", tokens={}, cost=0)),
+    ])
+    gen = agent.OpenCode({"opencode_bin": binpath})
+    async with gen.session(session_name="x"):
+        async for _ in gen.stream("q"):
+            pass
+    await asyncio.sleep(0.05)
+    calls = [g for g in got if g["type"] == "tool/call"]
+    res = next(g for g in got if g["type"] == "tool/result")
+    assert len(calls) == 1 and calls[0]["data"]["name"] == "gh_puller_search_code"
+    assert res["data"]["is_error"] is True
+    assert "invalid characters" in res["data"]["message"]["content"][0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_opencode_stream_error_event_raises(monkeypatch, tmp_path):
+    """error 事件(APIError 家族)→ RequestFailedError(data.message);stage=run。"""
+    agent.configure(ws_urls=[], otel_urls=[])
+    got = []
+    sinks.ensure_bus().add(_recv(got))
+    binpath = _opencode_bin(tmp_path, [
+        _oc_line("error", error={"name": "APIError", "data": {"message": "boom"}}),
+    ])
+    gen = agent.OpenCode({"opencode_bin": binpath})
+    with pytest.raises(agent.RequestFailedError, match="boom"):
+        async with gen.session(session_name="x"):
+            async for _ in gen.stream("q"):
+                pass
+    await asyncio.sleep(0.05)
+    err = next(g for g in got if g["type"] == "error")
+    assert err["data"]["stage"] == "run"
+
+
+@pytest.mark.asyncio
+async def test_opencode_stream_nonzero_exit_raises(monkeypatch, tmp_path):
+    """进程退出码非 0 → RequestFailedError(含 stderr 尾部诊断)。"""
+    agent.configure(ws_urls=[], otel_urls=[])
+    binpath = _opencode_bin(tmp_path, [
+        _oc_line("text", part=_oc_part("text", text="hi")),
+    ], exit_code=1, stderr="bad creds\n")
+    gen = agent.OpenCode({"opencode_bin": binpath})
+    with pytest.raises(agent.RequestFailedError, match="退出码 1"):
+        async with gen.session(session_name="x"):
+            async for _ in gen.stream("q"):
+                pass
+
+
+@pytest.mark.asyncio
+async def test_opencode_stream_missing_stop_raises(monkeypatch, tmp_path):
+    """无 step_finish(stop)且退出 0 → 未收到完成事件(不静默返回)。"""
+    agent.configure(ws_urls=[], otel_urls=[])
+    binpath = _opencode_bin(tmp_path, [
+        _oc_line("step_start", part=_oc_part("step-start")),
+        _oc_line("text", part=_oc_part("text", text="hi")),
+    ])
+    gen = agent.OpenCode({"opencode_bin": binpath})
+    with pytest.raises(agent.RequestFailedError, match="turn 未收到完成事件"):
+        async with gen.session(session_name="x"):
+            async for _ in gen.stream("q"):
+                pass
+
+
+@pytest.mark.asyncio
+async def test_opencode_result_semantics(monkeypatch, tmp_path):
+    """result 与 stream 同构:末条 text 整段;无产出 → 未产出最终结果。"""
+    agent.configure(ws_urls=[], otel_urls=[])
+    binpath = _opencode_bin(tmp_path, [
+        _oc_line("step_start", part=_oc_part("step-start")),
+        _oc_line("text", part=_oc_part("text", id="p1", text="你好")),
+        _oc_line("text", part=_oc_part("text", id="p1", text="你好世界")),
+        _oc_line("step_finish", part=_oc_part("step-finish", reason="stop", tokens={}, cost=0)),
+    ])
+    gen = agent.OpenCode({"opencode_bin": binpath})
+    async with gen.session(session_name="x"):
+        assert await gen.result("q") == "你好世界"
+    empty = _opencode_bin(tmp_path, [
+        _oc_line("step_start", part=_oc_part("step-start")),
+        _oc_line("step_finish", part=_oc_part("step-finish", reason="stop", tokens={}, cost=0)),
+    ])
+    gen = agent.OpenCode({"opencode_bin": empty})
+    with pytest.raises(agent.RequestFailedError, match="未产出最终结果"):
+        async with gen.session(session_name="x"):
+            await gen.result("q")
 
 
 # ---------------------------------------------------------------------------
