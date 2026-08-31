@@ -9,7 +9,7 @@ dependencies = [
     "claude-agent-sdk>=0.2.142",
     "dash>=4.4.0",
     "dash-cytoscape>=1.0.2",
-    "deepseek-harness-sdk",
+    # "deepseek-harness-sdk",
     "fastapi>=0.139.0",
     "flask",
     "httpx",
@@ -69,8 +69,8 @@ convention = "google"
 "tests/**" = ["S101", "S108", "INP001", "D100", "D104"]
 
 [tool.uv.sources]
-deepseek-harness-sdk = { path = "../deepseek-harness/python/sdk", editable = true }
-deepseek-harness-runtime-bin = { path = "../deepseek-harness/python/sdk-runtime", editable = true }
+# deepseek-harness-sdk = { path = "../deepseek-harness/python/sdk", editable = true }
+# deepseek-harness-runtime-bin = { path = "../deepseek-harness/python/sdk-runtime", editable = true }
 
 [dependency-groups]
 dev = [

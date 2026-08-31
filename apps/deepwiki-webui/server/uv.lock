@@ -392,29 +392,6 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/ea/b7/0d511af853024241dc3192bea77e4753ea606187bd2dd777a8209a5b01bb/dash_cytoscape-1.0.2.tar.gz", hash = "sha256:a61019d2184d63a2b3b5c06d056d3b867a04223a674cc3c7cf900a561a9a59aa", size = 3992593, upload-time = "2024-07-15T11:39:06.185Z" }
 
 [[package]]
-name = "deepseek-harness-runtime-bin"
-version = "0.0.0.dev0"
-source = { editable = "../../../../deepseek-harness/python/sdk-runtime" }
-
-[[package]]
-name = "deepseek-harness-sdk"
-version = "0.0.0.dev0"
-source = { editable = "../../../../deepseek-harness/python/sdk" }
-dependencies = [
-    { name = "deepseek-harness-runtime-bin" },
-    { name = "pydantic" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "deepseek-harness-runtime-bin", editable = "../../../../deepseek-harness/python/sdk-runtime" },
-    { name = "pydantic", specifier = ">=2.12,<3" },
-]
-
-[package.metadata.requires-dev]
-test = [{ name = "pytest", specifier = ">=8.0" }]
-
-[[package]]
 name = "fastapi"
 version = "0.141.1"
 source = { registry = "https://pypi.org/simple" }
@@ -456,7 +433,6 @@ dependencies = [
     { name = "claude-agent-sdk" },
     { name = "dash" },
     { name = "dash-cytoscape" },
-    { name = "deepseek-harness-sdk" },
     { name = "fastapi" },
     { name = "flask" },
     { name = "httpx" },
@@ -480,7 +456,6 @@ requires-dist = [
     { name = "claude-agent-sdk", specifier = ">=0.2.142" },
     { name = "dash", specifier = ">=4.4.0" },
     { name = "dash-cytoscape", specifier = ">=1.0.2" },
-    { name = "deepseek-harness-sdk", editable = "../../../../deepseek-harness/python/sdk" },
     { name = "fastapi", specifier = ">=0.139.0" },
     { name = "flask" },
     { name = "httpx" },
