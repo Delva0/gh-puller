@@ -350,7 +350,7 @@ async def test_agent_dispatch_by_generator(monkeypatch):
 
     (wire target 拆包)经 GENERATORS[gid](config) 收敛构造;空选型 = 引擎内建 cc。
     """
-    for gid in ("cc", "dsh", "codex"):
+    for gid in ("cc", "dsh", "codex", "opencode"):
         monkeypatch.setitem(GENERATORS, gid, _FakeGenerator)
         monkeypatch.setattr(_FakeGenerator, "generator", gid)
         inst = adapter(**_gen_kwargs({"generator": gid}), system_prompt="s")
@@ -395,9 +395,47 @@ def test_dsh_options_config(monkeypatch, tmp_path):
     assert adapter(**_gen_kwargs({"generator": "dsh"})).config["config_path"] == str(cordis)
 
 
+def test_opencode_options_config(monkeypatch, tmp_path):
+    """经 adapter 的 opencode 装配:cwd 固定仓库根,auto 恒 True(generator_config 无此轴),
+
+    system_prompt 概念键透传(→ 生成器临时 instructions 文件),mcp_servers/env 白名单
+    透传(app 经 generator_config 注入图工具桌);repo 空不注入。
+    """
+    repo = Repo(str(tmp_path), "local")
+    monkeypatch.setitem(GENERATORS, "opencode", _FakeGenerator)
+    monkeypatch.setattr(_FakeGenerator, "generator", "opencode")
+    fake_mcp = [{"id": "fake", "command": "x"}]
+    cfg = adapter(
+        **_gen_kwargs({"generator": "opencode",
+                       "generator_config": {"mcp_servers": fake_mcp,
+                                            "env": {"GRAPHIFY_OUT": "/g"},
+                                            "model": "deepseek/deepseek-chat"}}),
+        system_prompt="sys", repo=repo,
+    ).config
+    assert cfg["cwd"] == str(tmp_path)  # 仓库根固定
+    assert cfg["auto"] is True  # 无头缺省(引擎置位;与 generator_config 传入无关)
+    assert cfg["system_prompt"] == "sys"
+    assert cfg["mcp_servers"] == fake_mcp
+    assert cfg["env"] == {"GRAPHIFY_OUT": "/g"}
+    assert cfg["model"] == "deepseek/deepseek-chat"  # 白名单透传
+    assert "config_path" not in cfg  # 默认不传 → 生成器缺省(合并用户配置)
+    cfg2 = adapter(**_gen_kwargs({"generator": "opencode"}), system_prompt="sys").config
+    assert "cwd" not in cfg2 and "mcp_servers" not in cfg2  # repo 空:不固定 cwd/不注入工具桌
+    # file 类契约:config_path(经 resolve 解析;env DEEPWIKI_OPENCODE_CONFIG 为 env 缺省)
+    oc_cfg = tmp_path / "opencode.json"
+    oc_cfg.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(deepwiki.envs, "DEEPWIKI_OPENCODE_CONFIG", str(oc_cfg))
+    assert adapter(**_gen_kwargs({"generator": "opencode"})).config["config_path"] == str(oc_cfg)
+
+
 def test_wiki_pipeline_dsh_uses_agent():
     """分派:dsh 与 cc 同为 agent 路(AgentWikiPipeline);llm 路不受扰。"""
     assert isinstance(_wiki_pipeline("dsh"), deepwiki.AgentWikiPipeline)
+
+
+def test_wiki_pipeline_opencode_uses_agent():
+    """分派:opencode 与 cc 同为 agent 路(AgentWikiPipeline);llm 路不受扰。"""
+    assert isinstance(_wiki_pipeline("opencode"), deepwiki.AgentWikiPipeline)
 
 
 def test_agent_options_cc_setting_sources_isolated(monkeypatch):

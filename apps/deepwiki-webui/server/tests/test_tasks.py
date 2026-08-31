@@ -10,7 +10,8 @@ patch 约定:tasks 自身模块全局(tasks.generate_repo_wiki / tasks._WIKI_TAS
 tasks._generate_page_with_retry / tasks._WIKI_PAGE_CONCURRENCY)与 tasks.registry.* 直指
 server;引擎 patch 位点为其属主子模块(AgentWikiPipeline._deliver 类方法 /
 deepwiki.utils.llm_stream(llm 路直呼)、管线类方法;图服务的 patch 位点在
-generators 模块(generators.graphify.query —— 图服务属本 app 组装层,经
+generators 模块(generators._search_hits / generators._run_index —— 图服务属
+本 app 组装层,经
 generator_config["graph"] 注入);空选型分派 = 引擎内建 cc(缺省生成器已迁
 webui 边界,不读 env)。
 """
@@ -612,11 +613,11 @@ async def test_generate_repo_wiki_cc_assemble_and_resume(tmp_path, monkeypatch):
         "repo": "demo", "language": "en", "target": {}, "token": None,
         "comprehensive": True,
     }
-    # 预置假索引(与 generators.graph_dir 命名对齐)
+    # 预置假索引(与 generators._cbm_cache_dir/project_name 命名对齐:索引 db 即 ready)
     fake_repo = Repo(str(repo_dir), "local")
-    gd = generators.graph_dir(fake_repo)
-    gd.mkdir(parents=True, exist_ok=True)
-    (gd / "graph.json").write_text("{}", encoding="utf-8")
+    cdir = generators._cbm_cache_dir()
+    cdir.mkdir(parents=True, exist_ok=True)
+    (cdir / f"{generators.project_name(fake_repo)}.db").touch()
     # 预置结构 + 全部页面交付文件
     pipeline = deepwiki.AgentWikiPipeline()
     struct_path = pipeline._agent_cache_structure_path(

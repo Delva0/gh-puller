@@ -2,7 +2,7 @@
 
 不调 Claude agent(不依赖 API key / CLI):
 - 环境变量要求:ANTHROPIC_API_KEY 不设;DEEPWIKI_ROOT 指向临时目录(见文件头)。
-- 覆盖:契约端点 smoke(prepare 走真实 graphify.extract,code_only 纯本地)、
+- 覆盖:契约端点 smoke(prepare 走 _run_index 假面,断言入参与就绪翻转)、
   未索引的错误语义(chat 425 / codemap NDJSON error)。
 """
 
@@ -17,9 +17,9 @@ os.environ.setdefault("DEEPWIKI_ROOT", tempfile.mkdtemp(prefix="deepwiki-app-tes
 from fastapi.testclient import TestClient
 from gh_puller.utils import Repo, TaskStatus
 
+import generators
 import tasks
 from app import app as server_app
-from generators import graph_path
 
 
 def _write_corpus(root) -> str:
@@ -66,22 +66,27 @@ def test_models_config():
 def test_generators_config():
     """统一 target 配置:注册表直出(generators/providers/default target);凭证不出现。
 
-    generator → generator_config 契约:configKind 分 file(cc/dsh/codex,configDefault/
-    configPathEnv)/object(llm,providers 列表);defaultTarget.generator_config 按默认
-    generator 的 kind 给出(cc = config_path)。
+    generator → generator_config 契约:configKind 分 file(cc/dsh/codex/opencode,
+    configDefault/configPathEnv)/object(llm,providers 列表);defaultTarget.generator_config
+    按默认 generator 的 kind 给出(cc = config_path)。
     """
     cfg = _client().get("/generators/config").json()
-    assert [g["id"] for g in cfg["generators"]] == ["cc", "dsh", "codex", "llm"]
+    assert [g["id"] for g in cfg["generators"]] == ["cc", "dsh", "codex", "opencode", "llm"]
     by_id = {g["id"]: g for g in cfg["generators"]}
     assert by_id["cc"]["configKind"] == "file"
     assert by_id["dsh"]["configKind"] == "file"
     assert by_id["codex"]["configKind"] == "file"
+    assert by_id["opencode"]["configKind"] == "file"
     assert by_id["llm"]["configKind"] == "object"
     assert by_id["cc"]["configDefault"] is not None  # ~/.claude/settings.json
     assert by_id["cc"]["configPathEnv"] == "DEEPWIKI_CC_CONFIG"
     assert by_id["cc"]["providers"] == []  # file 类不再暴露 provider 选择
     assert by_id["llm"]["providers"] == ["openai"]
     assert by_id["codex"]["capability"] == "responses"
+    assert by_id["opencode"]["capability"] == "opencode-cli"
+    assert by_id["opencode"]["configPathEnv"] == "DEEPWIKI_OPENCODE_CONFIG"
+    assert by_id["opencode"]["configDefault"] is None
+    assert by_id["opencode"]["providers"] == []
     prov = {p["id"]: p for p in cfg["providers"]}
     assert prov["openai"]["apiKeyEnv"] == "OPENAI_API_KEY"
     assert prov["openai"]["baseUrlDefault"] == "https://api.openai.com/v1"
@@ -192,18 +197,28 @@ def test_chat_validation_400():
 
 
 # ---------------------------------------------------------------------------
-# /repo/prepare:本地小仓库真实建图(SSE 事件流 + graph.json 落盘)
+# /repo/prepare:本地小仓库索引保障(SSE 事件流 + 索引 db 落盘;建图面经 _run_index 假面)
 # ---------------------------------------------------------------------------
 
 
-def test_prepare_local_repo(tmp_path):
+def test_prepare_local_repo(tmp_path, monkeypatch):
+    """prepare → ensure_index._run_index(index_repository 参数面)→ db 落盘 → ready 翻转。"""
     raw = _write_corpus(tmp_path)
+    repo = Repo(raw, "local")
+    seen = {}
+
+    async def fake_run_index(repo):
+        seen["repo"] = repo
+        (generators._cbm_cache_dir() / f"{generators.project_name(repo)}.db").touch()
+
+    monkeypatch.setattr(generators, "_run_index", fake_run_index)
     r = _client().post("/repo/prepare", json={"repo_url": raw, "type": "local"})
     assert r.status_code == 200
     assert "event: done" in r.text
     assert "data: ok" in r.text
-    # 图产物在 DEEPWIKI_ROOT/graphify/<repo_key>/graph.json,源目录零残留
-    assert graph_path(Repo(raw, "local")).exists()
+    # 建图入参 = 仓库克隆路径(fast 建图经 index_repository;源目录零残留)
+    assert str(seen["repo"].save_path) == os.path.abspath(raw)
+    assert (generators._cbm_cache_dir() / f"{generators.project_name(repo)}.db").exists()
     assert not os.path.exists(os.path.join(raw, "graphify-out"))
     # 索引后就绪探针翻转
     assert _client().get(
@@ -211,10 +226,15 @@ def test_prepare_local_repo(tmp_path):
     ).json() == {"ready": True}
 
 
-def test_prepare_idempotent(tmp_path):
-    """已索引再次 prepare → ready 事件短路,不重跑 extract。"""
+def test_prepare_idempotent(tmp_path, monkeypatch):
+    """已索引再次 prepare → ready 事件短路,不重跑 _run_index。"""
     raw = _write_corpus(tmp_path)
     c = _client()
+
+    async def fake_run_index(repo):
+        (generators._cbm_cache_dir() / f"{generators.project_name(repo)}.db").touch()
+
+    monkeypatch.setattr(generators, "_run_index", fake_run_index)
     c.post("/repo/prepare", json={"repo_url": raw, "type": "local"})
     r2 = c.post("/repo/prepare", json={"repo_url": raw, "type": "local"})
     assert "event: ready" in r2.text

@@ -2,8 +2,8 @@
 
 契约与 deepwiki-open 一致(前端见 apps/deepwiki-webui/web/);chat/codemap 生成
 器与 wiki 任务管理由 gh_puller.deepwiki 提供,本模块只负责 HTTP/WS 端点适配
-(SSE 心跳、错误语义、模型配置契约)。graphify/agent SDK 组装全部经本模块的
-generators(图服务/建图/MCP 工具桌装配 + runtime_config 覆盖构造参数注入);
+(SSE 心跳、错误语义、模型配置契约)。gh-puller-mcp/agent SDK 组装全部经本模块的
+generators(图服务/索引保障/MCP 工具桌装配 + runtime_config 覆盖构造参数注入);
 引擎零 graphify 依赖。
 
 启动:`cd apps/deepwiki-webui/server && uv run uvicorn app:app --port 8001`(或 python app.py)。
@@ -40,8 +40,8 @@ from gh_puller.deepwiki.utils import generator_digest, log  # noqa: E402 - 须�
 # 生成器运行时装配(图/建图/MCP 工具桌):graphify 知识唯一收容点
 from generators import ensure_index, index_ready, runtime_config  # noqa: E402 - 须后于 load_dotenv
 
-# ---- 服务端专属 env 快照(自 gh_puller.envs 迁入:仅本 app 消费,不属包契约) ----
-# load_dotenv()(21 行)先于本块执行,导入时单点快照同 envs.py 原语义。
+# ---- 服务端专属 env 快照(仅本 app 消费,不属包契约) ----
+# load_dotenv()(21 行)先于本块执行,导入时单点快照。
 _WIKI_AUTH_MODE = os.environ.get("DEEPWIKI_AUTH_MODE", "False").lower() in ["true", "1", "t"]
 _WIKI_AUTH_CODE = os.environ.get("DEEPWIKI_AUTH_CODE", "")
 _PORT = int(os.environ.get("PORT", "8001"))
@@ -84,11 +84,9 @@ from tasks import WikiTask, WikiTaskSubmitResult, registry  # noqa: E402 - 须�
 # 语言与模型契约(仅 HTTP 层展示用;_LANGUAGE_NAMES 为引擎侧映射)
 _LANG_CONFIG = {"supported_languages": dict(_LANGUAGE_NAMES), "default": "en"}
 
-# target 契约:唯一真源 = agent.GENERATORS(极简 id → 生成器类映射;生成器类零 config
-# 元数据 —— configKind 经引擎 utils.config_kind 判别,展示/缺省元数据由本层自持(同
-# _LANGUAGE_NAMES 的「仅 HTTP 层展示用」哲学;值沿旧生成器类属性契约,见 test_app.py)。
-# generator → generator_config(dict,按 generator 包装):file 类(cc/dsh/codex)
-# = {"config_path"};object 类(llm)= {"provider","model","base_url","api_key"}。
+# target 契约:唯一真源 = agent.GENERATORS(id → 类;config 形态分类与键集见
+# agent/generators/__init__.py config 概念契约)。configKind 经引擎 utils.config_kind
+# 判别,展示/缺省元数据由本层自持(同 _LANGUAGE_NAMES 的「仅 HTTP 层展示用」哲学)。
 # /models/config 为 deepwiki-open 旧契约的投影(标注 deprecated);/generators/config
 # 为当前契约(前端唯一真源)。
 from gh_puller.agent import GENERATORS as AGENT_GENERATORS  # noqa: E402 - 须后于 load_dotenv
@@ -104,6 +102,8 @@ _GENERATOR_META: dict[str, dict] = {
             "configPathEnv": "DEEPWIKI_DSH_CORDIS", "configDefault": None},
     "codex": {"name": "Codex", "capability": "responses",
               "configPathEnv": "DEEPWIKI_CODEX_CONFIG", "configDefault": None},
+    "opencode": {"name": "OpenCode", "capability": "opencode-cli",
+                 "configPathEnv": "DEEPWIKI_OPENCODE_CONFIG", "configDefault": None},
     "llm": {"name": "LLM", "capability": "chat-completions", "provider": "openai",
             "modelEnv": "LLM_MODEL", "apiKeyEnv": "OPENAI_API_KEY",
             "baseUrlEnv": "OPENAI_BASE_URL", "baseUrlDefault": "https://api.openai.com/v1",
@@ -267,7 +267,7 @@ async def prepare_repo_index(request: RepoPrepareRequest):
 async def _prepare_index(request: RepoRequestBase) -> dict:
     """索引保障(克隆 + 建图,与 wiki 任务流共用 ensure_index);失败抛异常供 SSE 上报。"""
     repo = Repo(request.repo_url, request.type, access_token=request.token)
-    await ensure_index(repo, extra_excludes=_extra_excludes(request))
+    await ensure_index(repo)
     return {}
 
 
@@ -307,14 +307,6 @@ def _send_if_connect(websocket: WebSocket, msg: str) -> None:
         task = asyncio.create_task(websocket.send_text(msg))
         _pending_sends.add(task)
         task.add_done_callback(_pending_sends.discard)
-
-
-# 经调研:query 失败时 chat 的 WebSocket 端点会向客户端多发送一条错误文本;原后端也是直接发文本 chunk
-def _extra_excludes(request: RepoRequestBase) -> list[str] | None:
-    """请求的排除目录/文件 → graphify extra_excludes(散装参数形态的边界拼装)。"""
-    if request.excluded_dirs or request.excluded_files:
-        return [*request.excluded_dirs, *request.excluded_files]
-    return None
 
 
 @app.websocket("/ws/chat")
@@ -506,7 +498,7 @@ async def read_wiki(
     repo: Annotated[str, Query(description="Repository name")],
     repo_type: Annotated[str, Query(description="Repository type (e.g. github, gitlab)")],
     language: Annotated[str, Query(description="Language of the wiki content")],
-    generator: Annotated[str, Query(description="Generator id (cc/dsh/codex/llm) — public target")] = "",
+    generator: Annotated[str, Query(description="Generator id (cc/dsh/codex/opencode/llm) — public target")] = "",
     config_path: Annotated[str, Query(description="Config file path (file kind) — public target")] = "",
     provider: Annotated[str, Query(description="Provider id (object kind) — public target")] = "",
     model: Annotated[str, Query(description="Model id (object kind) — public target")] = "",
@@ -524,7 +516,7 @@ async def delete_wiki(
     repo_type: Annotated[str, Query(description="Repository type (e.g. github, gitlab)")],
     language: Annotated[str, Query(description="Language of the wiki content")],
     authorization_code: Annotated[str | None, Query(description="Authorization code")] = None,
-    generator: Annotated[str, Query(description="Generator id (cc/dsh/codex/llm) — public target")] = "",
+    generator: Annotated[str, Query(description="Generator id (cc/dsh/codex/opencode/llm) — public target")] = "",
     config_path: Annotated[str, Query(description="Config file path (file kind) — public target")] = "",
     provider: Annotated[str, Query(description="Provider id (object kind) — public target")] = "",
     model: Annotated[str, Query(description="Model id (object kind) — public target")] = "",

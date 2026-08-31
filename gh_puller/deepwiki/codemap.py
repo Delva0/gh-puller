@@ -2,12 +2,11 @@
 
 语义与原相同(骨架失败 error 事件;指南/图失败退化为骨架)。
 
-入口 generate_codemap 按 generator 内联分派(cc/dsh/codex →
-_agent_codemap;llm → _llm_codemap,分派规则与 wiki._wiki_pipeline 同);本主线
-专用 helper:骨架/富化提示词(带 JSON 输出格式与引用接地规则)、codemap 引用
-接地(_ground_citations/_locate_snippet —— snippet 为权威,LLM 给的行号不可靠)。
-跨功能通用 helper(四路装配/检索簇/提示词共性常量)在 utils,经本模块属性
-调用(utils.xxx 调用时取 —— monkeypatch 活性)。
+入口 generate_codemap 按 generator 内联分派(agent 路 → _agent_codemap;
+llm 路 → _llm_codemap,分派规则与 wiki._wiki_pipeline 同);本主线专用
+helper:骨架/富化提示词、codemap 引用接地(snippet 权威见 _locate_snippet)。
+跨功能通用 helper 在 utils,经本模块属性调用(utils.xxx 调用时取 ——
+monkeypatch 活性)。
 """
 
 from __future__ import annotations
@@ -376,7 +375,7 @@ async def generate_codemap(
 ):
     """两阶段 codemap 生成(骨架 → 指南/图),NDJSON 事件流;阶段失败语义与原相同;按 generator 分派双路。"""
     gen = utils.resolve_generator(generator, generator_config)[0]
-    impl = _agent_codemap if gen in ("cc", "dsh", "codex") else _llm_codemap
+    impl = _agent_codemap if gen in ("cc", "dsh", "codex", "opencode") else _llm_codemap
     async for ev in impl(
         generator=generator, generator_config=generator_config,
         repo=repo, question=question, language=language,

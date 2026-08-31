@@ -1,25 +1,18 @@
-"""deepwiki 引擎共用 helper(generator 选型/判等/凭证规则簇 + 域内日志 + repo 键
-
-+ 跨功能通用收编:四路装配、llm 传输、llm 路补全协议、提示词共性常量)。
+"""deepwiki 引擎共用 helper(generator 选型/判等/凭证规则簇 + 域内日志 + repo 键)。
 
 规划格局(按功能为主线):wiki/chat/codemap 三个功能模块各自收编本功能专用
-helper;跨功能通用 helper 归本模块,由功能模块经本模块**属性调用**
-(utils.xxx 调用时取 —— llm_stream/llm_complete 等 monkeypatch 位点打在本模块,
-不得 from-import 后裸名调用,测试 patch 活性依赖)。
+helper;跨功能通用 helper 归本模块,由功能模块经本模块**属性调用**(调用时取;
+monkeypatch 位点打在本模块,不得 from-import 后裸名调用)。
 
-本模块 sdk-free / 零工具假设:生成器构造(adapter)只做 GENERATORS[id](options)
-四路收敛 + 白名单透传;工具配置(mcp_servers/env/工具名)、工具指引文本
-(tool_note/codemap_note)与图服务(generator_config["graph"]:ready/context)全部
-由上层经覆盖构造参数注入,本层不假设任何工具由上层提供。装配在
-apps/deepwiki-webui/server/generators.py。agent 契约类型(GENERATORS/
-RequestFailedError)保留(生成器依赖的定义来源)。
+本模块 sdk-free / 零工具假设:生成器装配只做选型收敛 + 白名单透传,工具配置/
+工具指引文本/图服务全部由上层经 generator_config 覆盖构造参数注入,本层不假设
+任何工具由上层提供(图知识在 webui 组装层,见包 docstring)。agent 契约类型
+(GENERATORS/RequestFailedError)保留(生成器依赖的定义来源)。
 
-术语:引擎内部一律说 generator(选型 dict = {generator, generator_config} 已
-**拆除**:函数签名统一为 generator + generator_config 两个散装参数,wire 字段
-"target" 只在 app 层存在,由 apps/deepwiki-webui 拆包传入;解析/判等经
-resolve_generator 唯一知识源)。envs 保持模块对象绑定 + 属性调用
-(调用时取;测试 monkeypatch/强刷活性)。对外函数无下划线前缀(常数与
-纯内部 helper 除外)。
+术语:引擎内部一律说 generator;函数签名统一为 generator + generator_config
+两个散装参数;wire 字段 "target" 只在 app 层,拆分/解析经 resolve_generator
+唯一知识源。envs 保持模块对象绑定 + 属性调用(调用时取;测试 monkeypatch/
+强刷活性)。对外函数无下划线前缀(常数与纯内部 helper 除外)。
 """
 
 import hashlib
@@ -48,17 +41,20 @@ def _default_get_env(key: str) -> str:
 
 # file 类生成器(它们的 config 是一条配置文件路径)→ config_path 的 env 缺省键;
 # 这是本层的契约知识(agent 包不提供任何缺省/元数据假设,上层自验哲学见 generators/ 各文件 config 契约)。
+# opencode 同式:config_path = opencode.json 经 OPENCODE_CONFIG 生效(仍合并用户全局
+# 配置,tier 合并注入面赢 —— 与 cc 读用户 settings 同式风险,见 generator 文档)。
 _FILE_CONFIG_PATH_ENV = {"cc": "DEEPWIKI_CC_CONFIG", "dsh": "DEEPWIKI_DSH_CORDIS",
-                         "codex": "DEEPWIKI_CODEX_CONFIG"}
+                         "codex": "DEEPWIKI_CODEX_CONFIG",
+                         "opencode": "DEEPWIKI_OPENCODE_CONFIG"}
 
 
 def resolve_generator(generator: str | None = None, generator_config: dict | None = None,
                       get_env=None) -> tuple[str, dict]:
     """generator 选型 → (generator id, 规范化配置);空选型 = 引擎内建缺省 cc。
 
-    选型 dict({generator, generator_config})在引擎内已拆除为两个散装参数;
-    未知 id 报错;file 类(cc/dsh/codex)config_path = 显式 > env 缺省(> 空),
-    ~ 展开并绝对化 —— 对象类(llm)透传(api_key/base_url 等由调用方自管)。
+    函数签名统一为 generator + generator_config 两个散装参数;
+    未知 id 报错;file 类 config_path = 显式 > env 缺省
+    (> 空),~ 展开并绝对化 —— 对象类(llm)透传(api_key/base_url 等由调用方自管)。
     "缺省生成器"是上层(webui)政策:由 apps/deepwiki-webui/server/app.py 边界注入
     (DEEPWIKI_GENERATOR),引擎本身不读 env 选型;get_env 仅服务 file 类
     config_path 的 env 缺省,走模块对象 getattr(测试 monkeypatch 与
@@ -119,7 +115,7 @@ def repo_key_of(repo_type: str, owner: str, repo: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# 判等摘要族(原 cache.py;digest 是选型判等身份的 8-hex 摘要,
+# 判等摘要族(digest 是选型判等身份的 8-hex 摘要,
 # 任务 id / 续跑状态 / 成品缓存路径共用同一判等。图产物路径与索引就绪
 # 属图知识 — 在 apps/deepwiki-webui/server/generators.py)
 # ---------------------------------------------------------------------------
@@ -236,7 +232,7 @@ def prompt_fmt(repo: Repo, *, language: str = "en") -> dict:
 
 
 # ---------------------------------------------------------------------------
-# 四路装配(适配器构造入口 adapter;上层经 generator_config 注入工具配置,
+# 装配(适配器构造入口 adapter;上层经 generator_config 注入工具配置,
 # 本层零 SDK/零工具假设)
 # ---------------------------------------------------------------------------
 
@@ -259,6 +255,11 @@ _CODEX_PASSTHROUGH: tuple[str, ...] = ("model", "config_path", "token", "timeout
                                        "config_overrides", "launch_args_override",
                                        "base_instructions", "service_tier", "summary",
                                        "web_search")
+# auto 不入白名单:引擎恒置 True(无头无人值守,权限未明拒即自动批准 —— 与 codex
+# sandbox/approval_mode 缺省同位);generator_config 里的 auto 不落 SDK,防 False 静默关。
+_OPENCODE_PASSTHROUGH: tuple[str, ...] = ("model", "config_path", "opencode_bin",
+                                          "agent", "variant", "session", "thinking",
+                                          "timeout_seconds")
 
 
 def _merge(dest: dict, src: dict, keys: tuple[str, ...]) -> None:
@@ -274,20 +275,18 @@ def _merge(dest: dict, src: dict, keys: tuple[str, ...]) -> None:
 def adapter(generator: str | None = None, *, generator_config: dict | None = None,
             system_prompt: str = "", repo: Repo | None = None,
             agent_output_dir: str | None = None, agent_write_mode: bool = False):
-    """generator → 适配器实例(四路收敛构造入口;≈ GENERATORS[gid](config) 一行)。
+    """generator → 适配器实例(收敛构造入口;≈ GENERATORS[gid](config) 一行)。
 
     gid 经 resolve_generator(file 类 config_path 规范化);llm 路 resolved 即
-    OpenAIConfig(概念键透传)。cc/dsh/codex 按 agent/generators/ 各文件 TypedDict 键集
-    组装 config dict —— 引擎基座与阶段专属键在本层,sdk 映射全在 agent 侧:
-    - cc:工具隔离(setting_sources=[]),repo 非空时 cwd 固定仓库根(SDK 缺省 =
-      进程 cwd,曾导致 agent 串到 gh-puller 把 docs 写入其中);agent_write_mode
-      (交付件落盘,wiki 结构/页面)追加 Write/add_dirs/acceptEdits,默认模式只开放
-      Read/Grep/Glob(chat/codemap 的 agent 自读代码,无落盘);
+    OpenAIConfig(概念键透传)。file 类键集组装规则见 agent/generators/ 各文件
+    TypedDict —— 引擎基座与阶段专属键在本层,sdk 映射全在 agent 侧;引擎层
+    注入与陷阱如下:
+    - cc:repo 非空时 cwd 固定仓库根(SDK 缺省 = 进程 cwd,曾导致 agent 串到
+      gh-puller 把 docs 写入其中);agent_write_mode(交付件落盘,wiki 结构/页面)
+      追加 Write/add_dirs/acceptEdits,默认模式只开放 Read/Grep/Glob(chat/codemap
+      的 agent 自读代码,无落盘);
     - dsh:provider/session_root/runtime_cwd + system_prompt → 组合 persona
-      (非空才注入,空回退缺省);
-    - codex:system_prompt → thread_start.base_instructions;config_path 纯透传
-      (home config.toml 符号链接);sandbox 缺省 full_access,镜像 dsh
-      danger-full-access,可覆写。
+      (非空才注入,空回退缺省)。
 
     上层注入的工具配置(mcp_servers/env/工具名)经 generator_config 覆盖构造参数
     白名单透传(见 _CC_PASSTHROUGH 等;_ENGINE_KEYS 剥离,工具指引文本
@@ -324,6 +323,18 @@ def adapter(generator: str | None = None, *, generator_config: dict | None = Non
                 options["env"] = resolved["env"]  # app 注入环境(隔离 home 工具桌)
             if resolved.get("mcp_servers"):
                 options["mcp_servers"] = resolved["mcp_servers"]  # app 注入工具桌(隔离 config.toml 装载)
+    elif gid == "opencode":
+        options = {
+            "system_prompt": system_prompt,
+            "auto": True,  # 无头缺省:权限未明拒即自动批准(见 _OPENCODE_PASSTHROUGH 注)
+        }
+        _merge(options, resolved, _OPENCODE_PASSTHROUGH)
+        if repo is not None:
+            options["cwd"] = os.path.abspath(repo.save_path)
+            if resolved.get("env"):
+                options["env"] = resolved["env"]  # app 注入环境(GRAPHIFY_OUT 等)
+            if resolved.get("mcp_servers"):
+                options["mcp_servers"] = resolved["mcp_servers"]  # app 注入工具桌(渲染 opencode mcp 段)
     else:  # cc
         options = {
             "system_prompt": system_prompt,
@@ -381,7 +392,7 @@ def failure(exc: Exception) -> Exception:
 
 
 # ---------------------------------------------------------------------------
-# llm 路补全协议(原 chat.py 收编;chat/wiki 的 llm 路单次补全复用)+ 图服务接入
+# llm 路补全协议(chat/wiki 的 llm 路单次补全复用)+ 图服务接入
 # (检索工具簇属 app 侧组装层 generators.py,引擎经 graph_service 取用;
 # llm 路专用,失败即 raise,不许"带病继续")
 # ---------------------------------------------------------------------------

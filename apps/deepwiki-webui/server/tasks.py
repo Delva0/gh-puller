@@ -8,7 +8,7 @@
 
 职责边界(与包的边界):
 - 生成协议/提示词/交付件、契约模型、内容渲染与引用后处理(render)、缓存与状态文件 IO、
-  判等摘要族属引擎(gh_puller.deepwiki,本模块白名单直连);索引服务与 graphify 组装
+  判等摘要族属引擎(gh_puller.deepwiki,本模块白名单直连);索引服务与 gh-puller-mcp 组装
   属本 app 的 generators 模块(runtime_config 注入覆盖构造参数集);cache/pipeline/
   render 保持各自职责的纯化,任务 runtime 语义(状态机/去重/续跑合并/进度投影)都在本模块。
 - **零内容业务**:本模块不拼链接、不剥围栏、不做引用后处理、不组装缓存模型
@@ -17,7 +17,7 @@
   模块自身符号(如 _WIKI_TASK_TTL_SECONDS、generate_repo_wiki、_persist_state)在内部
   一律**调用时经模块全局解析**(测试 monkeypatch 位点,不得实例捕获或模块级快照)。
 
-导入副作用(都在本模块;引擎导入零副作用):调度 env 快照(自 gh_puller.envs 迁入)、
+导入副作用(都在本模块;引擎导入零副作用):调度 env 快照、
 状态写锁、成品缓存目录创建、registry 单例。
 """
 
@@ -170,8 +170,7 @@ class WikiTask(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# 通用异步任务注册表(原 utils.TaskRegistry 与 TaskSubmitResult 内迁:全仓唯一
-# 消费者即本模块,不再留底层抽象;类型钉为 WikiTask)。
+# 通用异步任务注册表(全仓唯一消费者即本模块,不再留底层抽象;类型钉为 WikiTask)。
 # 提交语义:按 key 去重并入(join)/缓存胜/落盘续跑/并发信号量/TTL 迟移除。
 # ---------------------------------------------------------------------------
 
@@ -353,8 +352,8 @@ registry = WikiTaskRegistry(
 
 
 # ---------------------------------------------------------------------------
-# 进度落盘投影(原 cache.py _persist_state 迁入:引擎持久化层只留 IO 原语,
-# 从 live 任务组装快照 + 锁串行属任务 runtime 语义)
+# 进度落盘投影(引擎持久化层只留 IO 原语,从 live 任务组装快照 +
+# 锁串行属任务 runtime 语义)
 # ---------------------------------------------------------------------------
 
 
@@ -431,11 +430,7 @@ async def generate_repo_wiki(task: WikiTask) -> None:
         if not index_ready(repo):
             task.status = TaskStatus.INDEXING
             log(f"索引中: {task.repo_key}")
-            extra_excludes = (
-                [*r["excluded_dirs"], *r["excluded_files"]]
-                if (r["excluded_dirs"] or r["excluded_files"]) else None
-            )
-            await ensure_index(repo, extra_excludes=extra_excludes)
+            await ensure_index(repo)
         # 仓库态(分支/文件树):结构确定与页面生成共用同一次准备
         prepared = await _prepare_repo(r, repo)
 

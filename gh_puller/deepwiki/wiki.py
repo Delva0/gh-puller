@@ -1,13 +1,9 @@
-"""wiki 主线(wiki 结构/页面生成协议):双路包装类(WikiPipeline/AgentWikiPipeline/
+"""wiki 主线(wiki 结构/页面生成协议):双路包装类经 _wiki_pipeline 按 generator 挑选。
 
-LlmWikiPipeline)经 _wiki_pipeline 按 generator 挑选(见文件尾),加
-本主线专用 helper:wiki 结构确定的提示词(_COMPREHENSIVE/_CONCISE_STRUCTURE)与
-页面提示词(_build_page_prompt)、模型产出 XML 解析(parse_wiki_structure 容错链)、
-交付内容引用渲染(RepoUrlContext 族 + post_process_wiki_content)与终态格式化
-(_finalize_page_content)。
+双路包装类与分派见文件尾;本主线专用 helper 同文件——结构/页面提示词、模型
+产出 XML 解析、交付内容引用渲染与终态格式化。
 
-边界(按功能为主线):跨功能通用 helper(四路装配 adapter/llm 传输/检索簇/
-research 协议/提示词共性常量/索引保障)在 utils,经本模块属性调用
+边界(按功能为主线):跨功能通用 helper 在 utils,经本模块属性调用
 (utils.xxx 调用时取 —— monkeypatch 活性);chat/codemap 属各自主线文件
 (chat.py / codemap.py),本文件不含其入口。
 """
@@ -564,7 +560,7 @@ def _finalize_page_content(content: str, page: WikiPage, ctx: RepoUrlContext) ->
 
 
 # ---------------------------------------------------------------------------
-# wiki 产物持久化(cache.py 消除后的 wiki 主线侧):成品缓存(cache_*)、
+# wiki 产物持久化(wiki 主线侧):成品缓存(cache_*)、
 # 续跑状态(resume_*)、processed 列表与导出;数据形态为纯 dict。
 # 布局:deepwiki 根下 wiki/ 缓存容器,其内按项目分文件夹(<repo_key>/ 下 json +
 # agent_cache/);与 repos/(克隆)、图产物根(索引)在根下互不污染。根经
@@ -661,10 +657,9 @@ async def save_generated_wiki(
 ) -> bool:
     """把一次完整生成结果落成品缓存(缓存层职责:判等身份 + 组装 + 写盘)。
 
-    从选型解析判等身份(file 类 config_path / object 类 provider|model),
-    digest 与任务 id/续跑状态共用同一判等;与旧 `_save` 逐字段等价 —— 组装为纯 dict
-    (键集逐字保留),公开身份入缓存、凭证不进(**token=None**);file 类不落
-    provider/model(provider=None/model="")。
+    判等身份经 utils.generator_identity/digest(共用同一判等,见 utils 判等摘要);
+    组装为纯 dict(键集逐字保留),公开身份入缓存、凭证不进(**token=None**);
+    file 类不落 provider/model(provider=None/model="")。
     """
     generator_id, resolved = utils.resolve_generator(generator, generator_config)
     identity = utils.generator_identity(generator_id, resolved)  # file 类:config_path;object:"provider|model"
@@ -885,8 +880,7 @@ def export_wiki(
 # codemap 同开关(generator 缺省走 env 默认),分派各在自己的功能模块内联 2 行。
 # 边界:语义属于本主线的 helper(提示词组装/agent 交付件路径/交付内容终态
 # 格式化)收进本文件(调用经 utils.xxx —— 测试 monkeypatch/即时解析)。
-# 跨功能通用(四路装配/llm 传输/检索簇/research 协议/提示词共性常量/索引保障)
-# 在 utils,一律 utils.xxx 属性调用;envs 同理(调用时取)。
+# 跨功能通用 helper 在 utils,一律 utils.xxx 属性调用;envs 同理(调用时取)。
 
 
 class WikiPipeline:
@@ -1262,9 +1256,9 @@ IMPORTANT:
 def _wiki_pipeline(generator: str | None = None, generator_config: dict | None = None) -> WikiPipeline:
     """按解析后的 generator 选路;调用时解析(测试 monkeypatch envs 生效)。
 
-    agent 类后段(cc/dsh/codex)共用 AgentWikiPipeline —— 适配器构造统一经
-    utils.adapter,管线逻辑(结构/页面/缓存)后端无关;llm 走 LlmWikiPipeline
+    agent 路后段共用 AgentWikiPipeline —— 适配器构造统一经
+    utils.adapter,管线逻辑(结构/页面/缓存)后端无关;llm 路走 LlmWikiPipeline
     (原式单次补全)。chat/codemap 服务入口同开关共用本规则(分派在各自模块)。
     """
     gen = utils.resolve_generator(generator, generator_config)[0]
-    return AgentWikiPipeline() if gen in ("cc", "dsh", "codex") else LlmWikiPipeline()
+    return AgentWikiPipeline() if gen in ("cc", "dsh", "codex", "opencode") else LlmWikiPipeline()

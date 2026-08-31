@@ -1,14 +1,6 @@
-// Generator → generator_config 统一 target 契约(前端侧)。
-//
-// 语义与 gh_puller.agent.adapters 注册表一一对应,generator 决定生成器配置形态
-// (configKind):
-// - "file"(cc/dsh/codex):生成器配置 = 各 CLI 原生配置文件的本地路径(config_path)。
-//   模型/凭证/服务端点全在文件内 —— 服务端原样透传给 agent SDK(cc: --settings;
-//   codex: CODEX_HOME.config.toml;dsh: cordis),前端不解释文件内容;
-// - "object"(llm):provider / model / base_url / api_key 字段。openai-compatible
-//   只是 openai + 自定义 base_url 的部署形态,不单列 provider。
-//
-// 持久化与提交规则(与后端 _strip_creds 落盘形态一致):
+// Generator → generator_config 统一 target 契约(前端侧)。配置形态分类
+// (file/object,configKind)见 gh_puller/agent/generators/__init__.py config 概念
+// 契约;本文件只写前端特有的持久化与提交规则(与后端 _strip_creds 落盘形态一致):
 // - URL/localStorage:公开部分(strippedTarget)—— file 类 = generator + config_path
 //   (路径非凭证);object 类 = generator + provider/model;
 // - api_key/base_url 仅当前标签页 sessionStorage(见 saveCreds/loadCreds),绝不进

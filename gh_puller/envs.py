@@ -1,31 +1,28 @@
 """全局运行参数(统一入口):gh_puller 包内环境变量单点在读,deepwiki/agent/graphify/benchmark 共用。
 
 deepwiki 引擎(以及其调用的子流程)的 env 缺省不直接读 os.environ,一律从本模块
-import 常量;子进程注入/直读类变量(GRAPHIFY_OUT、GRAPHIFY_MCP_PYTHON、
-FALKORDB_PASSWORD 等)与凭证类进程环境由各自消费方直读,不在本模块。
+import 常量;子进程注入/直读类变量(FALKORDB_PASSWORD 等)与凭证类进程环境由
+各自消费方直读,不在本模块。
 benchmark 评测相关 key 见文末分节。
 
-仅各 app 消费的 env 不在本模块(归属各自的 app 模块):
-- apps/deepwiki-webui/server/app.py(服务端快照):DEEPWIKI_AUTH_MODE / DEEPWIKI_AUTH_CODE / PORT /
-  DEEPWIKI_GENERATOR(空选型缺省生成器,app 边界注入;引擎空选型 = 内建 cc);
-- apps/deepwiki-webui/server/tasks.py(调度快照):DEEPWIKI_MAX_CONCURRENT_WIKI_TASKS、
-  DEEPWIKI_WIKI_PAGE_CONCURRENCY / DEEPWIKI_WIKI_PAGE_RETRIES、DEEPWIKI_WIKI_TASK_TTL_SECONDS;
-- apps/agent-monitor/server/hub.py:AGENT_MONITOR_LEASE_SECS(_DEFAULT_LEASE_SECS)。
+仅各 app 消费的 env 不在本模块(归属各自的 app 模块,app 侧自行快照)。
 
 已删除的历史快照(常量无消费方;env 变量名仍有效):
 - 凭证/模型名组 ANTHROPIC_API_KEY / ANTHROPIC_BASE_URL、OPENAI_API_KEY / OPENAI_BASE_URL、
   DEEPSEEK_API_KEY / DEEPSEEK_BASE_URL、CC_MODEL / DSH_MODEL / CODEX_MODEL / LLM_MODEL ——
   由 agent SDK/生成器直读进程环境(app 侧 load_dotenv 兜底),说明见 apps/deepwiki-webui/web/README.md;
-- 死名 DEEPWIKI_PROVIDER、GRAPHIFY_OUT(缺省在 webui 图封装层)、AGENT_MONITOR_PORT(退役)。
+- 死名 DEEPWIKI_PROVIDER、GRAPHIFY_OUT、GRAPHIFY_MCP_PYTHON(webui 图封装层退役:
+  消费方 apps/deepwiki-webui/server/generators.py 已迁 gh-puller-mcp)、AGENT_MONITOR_PORT(退役)。
 """
 
 import os
 
 # ---- 生成器配置文件(file 类契约:generator_config.config_path 的 env 缺省) ----
 # 显式 config_path > 下列 env > generator 类属性缺省(cc= ~/.claude/settings.json;
-# dsh/codex 无缺省 → 生成器内置隔离组合)。
+# dsh/codex/opencode 无缺省 → 生成器内置隔离组合)。
 DEEPWIKI_CC_CONFIG = os.environ.get("DEEPWIKI_CC_CONFIG", "")  # cc:Claude settings JSON 路径
 DEEPWIKI_CODEX_CONFIG = os.environ.get("DEEPWIKI_CODEX_CONFIG", "")  # codex:config.toml 路径
+DEEPWIKI_OPENCODE_CONFIG = os.environ.get("DEEPWIKI_OPENCODE_CONFIG", "")  # opencode:opencode.json 路径
 
 # ---- dsh 运行隔离(非凭证) ----
 DSH_SESSION_ROOT = os.path.expanduser(os.environ.get("DSH_SESSION_ROOT", "~/.gh-puller/dsh-sessions"))
@@ -53,9 +50,9 @@ AGENT_MONITOR_DIR = os.path.expanduser(os.environ.get("AGENT_MONITOR_DIR", "~/.g
 AGENT_MONITOR_FILE_RAW = os.environ.get("AGENT_MONITOR_FILE_RAW", "0") == "1"
 # 默认 = 内部 agent-monitor hub(apps/agent-monitor;hub 端口经 uvicorn CLI --port 指定,默认 8765)
 AGENT_MONITOR_WEBUI_URL = os.environ.get("AGENT_MONITOR_WEBUI_URL", "ws://localhost:8765/ws")
-# 会话心跳:静默超时(无落盘事件)的补发间隔;hub 租约按"文件 mtime 静止 > LEASE"判孤儿
-# (租约缺省在 hub 侧 AGENT_MONITOR_LEASE_SECS;LEASE 需 ≥ 3~5×HEARTBEAT,HEARTBEAT=0
-# 可退化为纯事件 mtime 语义)。
+# 会话心跳:静默超时(无落盘事件)的补发间隔。租约判态见 gh_puller/agent/events.py 会话
+# 保活;LEASE 缺省在 hub 侧 AGENT_MONITOR_LEASE_SECS,需 ≥ 3~5×HEARTBEAT,HEARTBEAT=0
+# 可退化为纯事件 mtime 语义。
 AGENT_MONITOR_HEARTBEAT_SECS = int(os.environ.get("AGENT_MONITOR_HEARTBEAT_SECS", "30"))
 # 启用条件:端点可达(ensure_bus 构建时 TCP 探活)+ opentelemetry 可导入
 AGENT_MONITOR_PHOENIX_URL = os.environ.get("AGENT_MONITOR_PHOENIX_URL", "http://localhost:6006/")

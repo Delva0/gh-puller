@@ -1,14 +1,9 @@
-"""chat 主线:一次 chat 问答的流式应答(纯文本 chunk 序列,前后端协议同原
+"""chat 主线:一次 chat 问答的流式应答(纯文本 chunk 序列,协议同 deepwiki-open research_chat)。
 
-research_chat)。
-
-入口 chat_stream 按 generator 内联分派(cc/dsh/codex → _agent_chat 现代
-agent 模式:一次提问 agent 内部多轮工具调用;llm → _llm_chat 原式单次补全,
-分派规则与 wiki._wiki_pipeline 同);本主线专用 helper:历史转写
-(_render_natural_history / _build_turn_history)、continuation 回退
-(_resolve_chat_continuation)、深研究模板常量(标题字符串必须逐字匹配前端
-Ask.tsx 的提取/完成判定正则,见常量注释)。跨功能通用 helper(四路装配/
-检索簇/research 协议/提示词共性常量)在 utils,经本模块属性调用
+入口 chat_stream 按 generator 内联分派(agent 路 → _agent_chat;llm 路 →
+_llm_chat —— 双路定义见 __init__.py,分派规则与 wiki._wiki_pipeline 同);
+本主线专用 helper:历史转写、continuation 回退、深研究模板常量(前端匹配
+契约见本文件常量注释)。跨功能通用 helper 在 utils,经本模块属性调用
 (utils.xxx 调用时取 —— monkeypatch 活性)。
 """
 
@@ -286,7 +281,7 @@ async def chat_stream(
 ):
     """一次 chat 问答的流式应答(纯文本 chunk 序列,前后端协议同原 research_chat);按 generator 分派双路。"""
     gen = utils.resolve_generator(generator, generator_config)[0]
-    impl = _agent_chat if gen in ("cc", "dsh", "codex") else _llm_chat
+    impl = _agent_chat if gen in ("cc", "dsh", "codex", "opencode") else _llm_chat
     async for chunk in impl(
         generator=generator, generator_config=generator_config, repo=repo, messages=messages,
         language=language, research_iteration=research_iteration,

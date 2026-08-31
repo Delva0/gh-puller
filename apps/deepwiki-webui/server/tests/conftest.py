@@ -20,6 +20,8 @@ _cc_file = _cc_dir / "claude-settings.json"
 _cc_file.write_text("{}", encoding="utf-8")
 os.environ["DEEPWIKI_CC_CONFIG"] = str(_cc_file)
 os.environ["DEEPWIKI_ROOT"] = tempfile.mkdtemp(prefix="deepwiki-webui-test-")
+os.environ["CBM_CACHE_DIR"] = tempfile.mkdtemp(prefix="cbm-cache-test-")
+os.environ["CBM_RUNTIME_DIR"] = tempfile.mkdtemp(prefix="cbm-runtime-test-")
 sys.modules.pop("gh_puller.envs", None)
 with contextlib.suppress(AttributeError, KeyError):
     delattr(sys.modules["gh_puller"], "envs")

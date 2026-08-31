@@ -1,18 +1,20 @@
 """webui 组装层 server/generators.py 的本地测试。
 
-本体 = 原 gh_puller.deepwiki.utils 的 graphify 部分整体上移:图产物路径
-(graph_dir/graph_path/index_ready)、graphify MCP 工具桌描述(_graphify_mcp /
-_graphify_server)、图查询 + 子图解析检索簇(GraphService.context/subgraph_hits/
-subgraph_src_blocks)、索引保障(ensure_index)、覆盖构造参数注入(runtime_config)。
-引擎侧(deepwiki.utils)已零 graphify/零 claude_agent_sdk —— 装配契约在此验证。
+本体 = 原 gh_puller.deepwiki.utils 的 graphify 部分整体上移后改接 gh-puller-mcp:
+索引就绪(db 文件)、MCP 工具桌描述(_gh_puller_mcp)、检索簇(GraphService.context /
+rows_to_hits / subgraph_src_blocks)、索引保障(ensure_index)、覆盖构造参数注入
+(runtime_config)。引擎侧(deepwiki.utils)已零 graphify/零 claude_agent_sdk ——
+装配契约在此验证。
 
 不调 Claude agent:generator 经 GENERATORS[gid] → _FakeGenerator 替换(零 SDK
-构造副作用);graphify.query/extract 全部 fake 或纯本地(envs 由 conftest 钉临时根)。
+构造副作用);MCP 调用面(_search_hits/_run_index)全部 fake(envs 由 conftest
+钉临时根,CBM_CACHE_DIR 同为 tmp —— index_ready 的 fs 判定确定性)。
 """
 
 from pathlib import Path
 
 import pytest
+from gh_puller import envs
 from gh_puller.agent import GENERATORS
 from gh_puller.agent.generators.codex import codex_home_setup
 from gh_puller.agent.generators.dsh import dsh_cordis_path
@@ -39,30 +41,54 @@ class _FakeGenerator:
 # ---------------------------------------------------------------------------
 
 
-def test_runtime_config_injects_graphify_by_backend(tmp_path):
-    """图知识按后端注入:所有路得 graph 服务;cc/dsh/codex 得 mcp_servers
+def test_runtime_config_injects_graphify_by_backend(tmp_path, monkeypatch):
+    """图知识按后端注入:所有路得 graph 服务;cc/dsh/codex/opencode 得 mcp_servers
 
-    (+ codex env.GRAPHIFY_OUT / cc allowed_tools 图工具名);llm 无 mcp 位。
+    (cc McpStdioServerConfig + 图工具名 / dsh 子进程描述 / codex/opencode 子进程描述 +
+    env 条件透传 CBM_*);llm 无 mcp 位。
     """
+    monkeypatch.setenv("CBM_CACHE_DIR", "/tmp/cbm-cache")
+    monkeypatch.setenv("CBM_RUNTIME_DIR", "/tmp/cbm-runtime")
     repo = Repo(str(tmp_path), "local")
 
     cc_gc = generators.runtime_config("cc", {"config_path": "/tmp/settings.json"}, repo=repo)
     assert cc_gc["config_path"] == "/tmp/settings.json"  # 用户键保留
     assert isinstance(cc_gc["graph"], generators.GraphService)
-    assert cc_gc["mcp_servers"] and "graphify" in cc_gc["mcp_servers"]
-    assert cc_gc["allowed_tools"] == ["graphify_query", "mcp__graphify__graphify_query"]
+    assert "gh_puller" in cc_gc["mcp_servers"]
+    cfg = cc_gc["mcp_servers"]["gh_puller"]  # TypedDict:运行时为 dict(SDK 按 stdio 子进程启动)
+    assert cfg["command"] == "uv" and "gh_puller_mcp" in cfg["args"]
+    assert cc_gc["allowed_tools"] == [
+        *generators._SCOUT_TOOLS, *[f"mcp__gh_puller__{n}" for n in generators._SCOUT_TOOLS],
+    ]
     assert cc_gc["tool_note"] == generators.agent_note("cc")
     assert cc_gc["codemap_note"] == generators.codemap_note()
 
     dsh_gc = generators.runtime_config("dsh", {}, repo=repo)
-    assert dsh_gc["mcp_servers"] == generators._graphify_mcp("dsh")
+    assert dsh_gc["mcp_servers"] == generators._gh_puller_mcp("dsh")
     assert "env" not in dsh_gc
     assert dsh_gc["tool_note"] == generators.agent_note("dsh")
 
     codex_gc = generators.runtime_config("codex", {}, repo=repo)
-    assert codex_gc["mcp_servers"] == generators._graphify_mcp("codex")
-    assert codex_gc["env"]["GRAPHIFY_OUT"] == str(generators.graph_dir(repo))
+    assert codex_gc["mcp_servers"] == generators._gh_puller_mcp("codex")
+    assert codex_gc["env"] == {"CBM_CACHE_DIR": "/tmp/cbm-cache",
+                               "CBM_RUNTIME_DIR": "/tmp/cbm-runtime"}  # 环境已设才透传(索引根一致)
     assert codex_gc["tool_note"] == generators.agent_note("codex")
+
+    opencode_gc = generators.runtime_config("opencode", {}, repo=repo)
+    assert opencode_gc["mcp_servers"] == generators._gh_puller_mcp("opencode")  # 子进程形态与 codex 同式
+    assert opencode_gc["env"] == {"CBM_CACHE_DIR": "/tmp/cbm-cache",
+                                  "CBM_RUNTIME_DIR": "/tmp/cbm-runtime"}
+    assert opencode_gc["tool_note"] == generators.agent_note("opencode")
+    assert opencode_gc["codemap_note"] == generators.codemap_note("opencode")
+    assert isinstance(opencode_gc["graph"], generators.GraphService)
+
+    monkeypatch.delenv("CBM_CACHE_DIR", raising=False)
+    monkeypatch.delenv("CBM_RUNTIME_DIR", raising=False)
+    codex_gc = generators.runtime_config("codex", {}, repo=repo)
+    assert "env" not in codex_gc  # 未设 CBM_*:两侧同用缺省根,不注入 env 键
+
+    dsh_gc = generators.runtime_config("dsh", {}, repo=repo)
+    assert "env" not in dsh_gc  # dsh 无 env 注入位(子进程环境继承)
 
     llm_gc = generators.runtime_config("llm", {"model": "m1"}, repo=repo)
     assert llm_gc["model"] == "m1"
@@ -81,7 +107,7 @@ def test_adapter_chain_gets_injected_graphify_config(tmp_path, monkeypatch):
     monkeypatch.setattr(_FakeGenerator, "generator", "dsh")
     gc = generators.runtime_config("dsh", {}, repo=repo)
     cfg = adapter("dsh", generator_config=gc, system_prompt="sys", repo=repo).config
-    assert cfg["mcp_servers"] == generators._graphify_mcp("dsh")
+    assert cfg["mcp_servers"] == generators._gh_puller_mcp("dsh")
     assert "graph" not in cfg and "tool_note" not in cfg and "codemap_note" not in cfg  # 引擎私有键剥离,不落 SDK 配置
 
 
@@ -91,33 +117,36 @@ def test_adapter_chain_gets_injected_graphify_config(tmp_path, monkeypatch):
 
 
 def test_agent_note_tool_name_by_generator():
-    """图工具指引按后端切换(cc 的 graphify_query / dsh/codex 的 mcp__graphify__query_graph)。"""
-    assert "graphify_query" in generators.agent_note("cc")
-    assert "mcp__graphify__query_graph" not in generators.agent_note("cc")
-    assert "mcp__graphify__query_graph" in generators.agent_note("dsh")
-    assert "graphify_query" not in generators.agent_note("dsh")
-    assert "mcp__graphify__query_graph" in generators.agent_note("codex")
-    assert "graphify_query" not in generators.agent_note("codex")
+    """图工具指引按后端前缀:cc/dsh/codex = mcp__gh_puller__;opencode = servername_(非 mcp__)。"""
+    for generator in ("cc", "dsh", "codex"):
+        note = generators.agent_note(generator)
+        assert "mcp__gh_puller__search_graph" in note
+        assert "graphify" not in note
+    opencode_note = generators.agent_note("opencode")
+    assert "gh_puller_search_graph" in opencode_note
+    assert "mcp__" not in opencode_note
 
 
 def test_codemap_note_content():
-    """codemap 指引(仅 cc/agent 路用):先查图谱再构造,引用行号取自 Source 标记。"""
-    note = generators.codemap_note()
-    assert "Before answering" in note and "graphify_query" in note
+    """codemap 指引(仅 agent 路用):先查图谱再构造,引用行号取自 search_graph 的 file/lines。"""
+    note = generators.codemap_note("cc")
+    assert "Before answering" in note and "mcp__gh_puller__search_graph" in note
+    assert "'file'" in note and "'lines'" in note
     assert "<note>" in note
+    assert "gh_puller_search_graph" in generators.codemap_note("opencode")
 
 
 # ---------------------------------------------------------------------------
-# graphify MCP 工具桌隔离(agent 侧组合文件/隔离 home)
+# gh-puller-mcp 工具桌隔离(agent 侧组合文件/隔离 home)
 # ---------------------------------------------------------------------------
 
 
 def test_dsh_cordis_isolation_and_graphify():
-    """内置组合 = 完全隔离(逐项关断本地/用户级配置);图工具桌由本层 _graphify_mcp 注入。
+    """内置组合 = 完全隔离(逐项关断本地/用户级配置);工具桌由本层 _gh_puller_mcp 注入。
 
     与 cc 的 setting_sources=[] 同语义:workspaceContext(本地 AGENTS.md 链)/
     skills(用户/项目/捆绑技能)关断;默认组合(无 mcp_servers)不含任何工具服务器,
-    mcp 段仅经 _graphify_mcp 显式注入(适配层零工具名)。
+    mcp 段仅经 _gh_puller_mcp 显式注入(适配层零工具名)。
     """
     text = Path(dsh_cordis_path()).read_text(encoding="utf-8")
     assert "workspaceContext: false" in text
@@ -125,23 +154,24 @@ def test_dsh_cordis_isolation_and_graphify():
     assert "includeRuntimeContext: false" in text
     assert "toolBash: false" in text and "toolJobs: false" in text
     assert "goals: false" in text
-    assert "mcp-graphify" not in text  # 默认组合无图工具(经 runtime_config 注入)
-    with_mcp = Path(dsh_cordis_path(generators._graphify_mcp("dsh"))).read_text(encoding="utf-8")
-    assert "- id: mcp-graphify" in with_mcp
-    assert "serverName: graphify" in with_mcp
-    assert "graphify.serve" in with_mcp
+    assert "mcp-gh-puller" not in text  # 默认组合无工具桌(经 runtime_config 注入)
+    with_mcp = Path(dsh_cordis_path(generators._gh_puller_mcp("dsh"))).read_text(encoding="utf-8")
+    assert "- id: mcp-gh-puller" in with_mcp
+    assert "serverName: gh_puller" in with_mcp
+    assert "gh_puller_mcp" in with_mcp and "--tool-profile" in with_mcp
 
 
 def test_codex_home_isolation_and_graphify(tmp_path):
-    """codex 隔离 home:config.toml 仅 graphify 单服务器 + env_vars 白名单,无用户配置面
+    """codex 隔离 home:config.toml 仅 gh-puller 单服务器 + env_vars 白名单,无用户配置面
 
     (与 cc setting_sources=[] / dsh 内置 cordis 同语义)。
     """
     home = codex_home_setup(str(tmp_path / "graph"), auth_src=False,
-                            mcp_servers=generators._graphify_mcp("codex"))
+                            mcp_servers=generators._gh_puller_mcp("codex"))
     text = Path(home, "config.toml").read_text(encoding="utf-8")
-    assert text.startswith("[mcp_servers.graphify]")
-    assert "graphify.serve" in text and 'env_vars = ["GRAPHIFY_OUT"]' in text
+    assert text.startswith("[mcp_servers.gh_puller]")
+    assert "gh_puller_mcp" in text
+    assert 'env_vars = ["CBM_CACHE_DIR", "CBM_RUNTIME_DIR"]' in text
     assert text.count("[mcp_servers.") == 1  # 无第三方服务器/无设置节(隔离边界)
     assert not (Path(home) / "auth.json").exists()  # auth_src=False:纯隔离无凭证态
 
@@ -150,25 +180,27 @@ def test_codex_home_isolation_and_graphify(tmp_path):
 # 子图 → 真实代码上下文(GraphService.context 检索簇)
 # ---------------------------------------------------------------------------
 
-_SUBGRAPH_ANSWER = """Graph: /tmp/g.json (10 nodes) | Traversal: BFS depth=2 | Start: ['x'] | 4 nodes found
+_ROWS_DATA = {
+    "total": 3,
+    "cols": ["qn", "label", "file", "lines", "rank"],
+    "rows": [
+        ["p.a.f", "Function", "src/a.py", "5-10", -1.0],
+        ["p.a.g", "Method", "src/a.py", "40", -2.0],
+        ["p.b.h", "Function", "src/b.py", "12-33", -3.0],
+    ],
+    "has_more": False,
+}
 
-NODE a [src=src/a.py loc=L5 community=c1]
-NODE long label [src=src/a.py loc=L40 community=c2]
-EDGE a --calls [EXTRACTED]--> b at=src/a.py:L12
-[!] TRUNCATED: showing 3 of 10 nodes (~500-token budget)...
-... (truncated - remaining nodes omitted)
-[i] Complete answer over budget: 2200 tokens (budget 2000)
-NODE c [src=src/b.py loc= community=c1]
-NODE d [src=src/c.py community=c1]
-"""
 
-
-def test_subgraph_hits_parse():
-    """解析 NODE(src/loc)/EDGE(at=) 标注:容忍截断前缀行,空 loc 或无 loc 跳过。"""
-    hits = generators.subgraph_hits(_SUBGRAPH_ANSWER)
-    assert hits == {"src/a.py": [5, 12, 40]}
-    assert "src/b.py" not in hits and "src/c.py" not in hits
-    assert generators.subgraph_hits("no matches here\n") == {}
+def test_rows_to_hits_parse():
+    """rows → {file: [行号...]}:行范围整段展开、单点即自身、缺列/空行/file 缺失行跳过。"""
+    assert generators.rows_to_hits(_ROWS_DATA) == {
+        "src/a.py": [*range(5, 11), 40],
+        "src/b.py": [*range(12, 34)],
+    }
+    assert generators.rows_to_hits({"cols": ["qn"], "rows": []}) == {}  # 缺 file/lines 列
+    assert generators.rows_to_hits({"cols": _ROWS_DATA["cols"], "rows": []}) == {}
+    assert generators.rows_to_hits({"cols": _ROWS_DATA["cols"], "rows": [["q", "F", None, "1-2", 0]]}) == {}
 
 
 @pytest.mark.asyncio
@@ -213,44 +245,62 @@ def test_subgraph_src_blocks_per_file_cap_and_budget(tmp_path):
 
 @pytest.mark.asyncio
 async def test_graph_service_context(monkeypatch, tmp_path):
-    """GraphService.context:query → hits/块;无命中 → 空块;查询失败 → "代码图谱不可用" raise。"""
+    """GraphService.context:_search_hits → hits/块;无命中 → 空块;检索失败 → "代码图谱不可用" raise。"""
     (tmp_path / "src").mkdir()
     (tmp_path / "src" / "a.py").write_text("x = 1\n", encoding="utf-8")
     repo = Repo(str(tmp_path), "local")
     service = generators.GraphService(repo)
 
-    def fake_query(question, graph_path=None):
-        assert graph_path == str(generators.graph_path(repo))
-        return {"answer": "NODE f [src=src/a.py loc=L1 community=c0]\n"}
+    async def fake_search(project, question):
+        assert project == generators.project_name(repo)
+        return {"src/a.py": [1]}
 
-    monkeypatch.setattr(generators.graphify, "query", fake_query)
+    monkeypatch.setattr(generators, "_search_hits", fake_search)
     ctx = await service.context(repo, "how does it work?")
     assert ctx["hits"] == {"src/a.py": [1]}
     assert ctx["blocks"][0]["path"] == "src/a.py"
     assert ctx["blocks"][0]["start_line"] == 1
 
-    def empty_query(question, graph_path=None):
-        return {"answer": ""}
+    async def empty_search(project, question):
+        return {}
 
-    monkeypatch.setattr(generators.graphify, "query", empty_query)
+    monkeypatch.setattr(generators, "_search_hits", empty_search)
     assert await service.context(repo, "q") == {"hits": {}, "blocks": []}
 
-    def boom(question, graph_path=None):
+    async def boom(project, question):
         raise RuntimeError("graph is gone")
 
-    monkeypatch.setattr(generators.graphify, "query", boom)
+    monkeypatch.setattr(generators, "_search_hits", boom)
     with pytest.raises(RuntimeError, match="代码图谱不可用"):
         await service.context(repo, "q")
 
 
-def test_graph_service_ready_by_graph_json(tmp_path):
-    """就绪判定 = graph.json 存在(路径稳定,复用 graphify 存在性语义)。"""
+@pytest.mark.asyncio
+async def test_graph_service_context_degraded(monkeypatch, tmp_path):
+    """全局超预算 → degraded raise(检索上下文超出预算;与旧子图预算语义一致)。"""
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "a.py").write_text("\n".join(f"line {i}" for i in range(1, 101)), encoding="utf-8")
+    repo = Repo(str(tmp_path), "local")
+    service = generators.GraphService(repo)
+
+    async def fake_search(project, question):
+        return {"src/a.py": [25]}
+
+    monkeypatch.setattr(generators, "_search_hits", fake_search)
+    monkeypatch.setattr(envs, "CHAT_TOKEN_LIMIT_ESTIMATE", 3)  # 预算压到小值:窗文本必超
+    with pytest.raises(RuntimeError, match="检索上下文超出预算"):
+        await service.context(repo, "q")
+
+
+def test_graph_service_ready_by_db_file(tmp_path, monkeypatch):
+    """就绪判定 = 索引 db 存在(<CBM_CACHE_DIR>/<project>.db;同步 fs 检查)。"""
+    monkeypatch.setenv("CBM_CACHE_DIR", str(tmp_path / "cache"))
     repo = Repo(str(tmp_path), "local")
     service = generators.GraphService(repo)
     assert service.ready(repo) is False
-    gd = generators.graph_dir(repo)
-    gd.mkdir(parents=True, exist_ok=True)
-    (gd / "graph.json").write_text("{}", encoding="utf-8")
+    cdir = generators._cbm_cache_dir()
+    cdir.mkdir(parents=True, exist_ok=True)
+    (cdir / f"{generators.project_name(repo)}.db").touch()
     assert service.ready(repo) is True
 
 
@@ -260,23 +310,43 @@ def test_graph_service_ready_by_graph_json(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_ensure_index_skips_when_ready(tmp_path):
-    """已 ready 直接返回(不调 extract);图产物根/路径按单仓库稳定布局。"""
+async def test_ensure_index_skips_when_ready(tmp_path, monkeypatch):
+    """已 ready 直接返回(不调 _run_index)。"""
+    monkeypatch.setenv("CBM_CACHE_DIR", str(tmp_path / "cache"))
     repo = Repo(str(tmp_path), "local")
-    gd = generators.graph_dir(repo)
-    gd.mkdir(parents=True, exist_ok=True)
-    (gd / "graph.json").write_text("{}", encoding="utf-8")
-    await generators.ensure_index(repo)  # 无异常 = 通过(extract 未被调用,无 key 也可跑)
+    cdir = generators._cbm_cache_dir()
+    cdir.mkdir(parents=True, exist_ok=True)
+    (cdir / f"{generators.project_name(repo)}.db").touch()
+
+    async def boom(repo):
+        raise AssertionError("index_ready 已 True,不得调用 _run_index")
+
+    monkeypatch.setattr(generators, "_run_index", boom)
+    await generators.ensure_index(repo)  # 无异常 = 通过(_run_index 未被调用)
 
 
 @pytest.mark.asyncio
-async def test_ensure_index_raises_on_extract_error(tmp_path, monkeypatch):
-    """建图失败(extract 错误态)→ RuntimeError 上抛,由调用方决定上报/置任务 FAILED。"""
+async def test_ensure_index_calls_index_repository(tmp_path, monkeypatch):
+    """未 ready → _run_index(index_repository:repo_path/mode='fast'/name=project_name)。"""
+    repo = Repo(str(tmp_path), "local")
+    calls = []
+
+    async def fake_run_index(repo):
+        calls.append(repo)
+
+    monkeypatch.setattr(generators, "_run_index", fake_run_index)
+    await generators.ensure_index(repo)
+    assert calls == [repo]
+
+
+@pytest.mark.asyncio
+async def test_ensure_index_raises_on_index_error(tmp_path, monkeypatch):
+    """建图失败(isError → RuntimeError)→ 上抛,由调用方决定上报/置任务 FAILED。"""
     repo = Repo(str(tmp_path), "local")
 
-    async def fake_extract(*args, **kwargs):
-        return {"error": "extract exploded"}
+    async def fake_run_index(repo):
+        raise RuntimeError("index exploded")
 
-    monkeypatch.setattr(generators, "_run_extract", fake_extract)
-    with pytest.raises(RuntimeError, match="extract exploded"):
+    monkeypatch.setattr(generators, "_run_index", fake_run_index)
+    with pytest.raises(RuntimeError, match="index exploded"):
         await generators.ensure_index(repo)
