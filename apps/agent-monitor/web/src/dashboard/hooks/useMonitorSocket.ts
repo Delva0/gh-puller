@@ -2,7 +2,7 @@
 
 // 监控 hub 连接核心(协议 v2):连接/2s 退避重连/帧分发;
 // 订阅窗:subscribe → evt_ready{lastSeq} → history 尾页(loading 期间 live 帧入缓冲)→
-// applyBatch 合并;loading 外 live 经 seq 守卫入 fold,间隙(早/漏帧)→ history(beforeSeq) 补片。
+// applyBatch 合并;loading 外 live 按 animation frame 入增量 fold;旧历史由 UI 显式翻页。
 // 注:依赖 window.location(monitorWsUrl),仅限浏览器宿主使用(勿在 SSR 端导入)。
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { monitorWsUrl } from '../utils/monitorWs';
@@ -22,6 +22,10 @@ export function useMonitorSocket() {
   const currentRef = useRef<string | null>(null);
   const loadingRef = useRef(false); // history 尾页加载中:live 帧入缓冲
   const pendingRef = useRef<EventEnvelope[]>([]);
+  const liveRef = useRef<EventEnvelope[]>([]);
+  const rafRef = useRef<number | null>(null);
+  const olderBeforeRef = useRef<number | null>(null);
+  const olderLoadingRef = useRef(false);
 
   const send = useCallback((obj: unknown) => {
     const ws = wsRef.current;
@@ -46,7 +50,10 @@ export function useMonitorSocket() {
   const select = useCallback((session: string) => {
     currentRef.current = session;
     pendingRef.current = [];
+    liveRef.current = [];
     loadingRef.current = true;
+    olderBeforeRef.current = null;
+    olderLoadingRef.current = false;
     // 清空旧会话折叠与快照(事实来自会话列表行)
     const row = sessionsRef.current.find((s) => s.session === session);
     sessionStore.reset({
@@ -68,6 +75,26 @@ export function useMonitorSocket() {
   useEffect(() => {
     let disposed = false;
 
+    const flushLive = () => {
+      rafRef.current = null;
+      const session = currentRef.current;
+      const events = liveRef.current.filter((evt) => evt.session === session);
+      liveRef.current = [];
+      if (events.length) sessionStore.ingestBatch(events);
+    };
+
+    const queueLive = (events: EventEnvelope[]) => {
+      const current = currentRef.current;
+      const selected = events.filter((evt) => evt.session === current);
+      if (!selected.length) return;
+      if (loadingRef.current) {
+        pendingRef.current.push(...selected);
+        return;
+      }
+      liveRef.current.push(...selected);
+      if (rafRef.current === null) rafRef.current = window.requestAnimationFrame(flushLive);
+    };
+
     const handleFrame = (frame: HubFrame) => {
       if (frame.type === 'index') {
         sessionsRef.current = frame.sessions;
@@ -76,41 +103,42 @@ export function useMonitorSocket() {
         if (currentRef.current !== null
             && !frame.sessions.some((s) => s.session === currentRef.current)) {
           currentRef.current = null;
+          pendingRef.current = [];
+          liveRef.current = [];
           setCurrent(null);
           sessionStore.reset(null);
         }
       } else if (frame.type === 'evt_ready') {
+        if (frame.session !== currentRef.current) return;
         sessionStore.ready(frame.lastSeq);
         requestHistory();
       } else if (frame.type === 'history') {
-        const events = mergeEvents(frame.events, pendingRef.current);
-        pendingRef.current = [];
-        loadingRef.current = false;
-        sessionStore.applyBatch(events);
-        sessionStore.getBridge().setHasMore(frame.hasMore);
+        if (frame.session !== currentRef.current) return;
+        const initial = loadingRef.current;
+        const events = initial ? mergeEvents(frame.events, pendingRef.current) : frame.events;
+        if (initial) {
+          pendingRef.current = [];
+          loadingRef.current = false;
+        }
+        olderBeforeRef.current = frame.nextBeforeSeq;
+        olderLoadingRef.current = false;
+        sessionStore.applyBatch(events, frame.hasMore);
+        sessionStore.getBridge().setLoadingOlder(false);
         if (!loadOlderRegistered.current) {
           loadOlderRegistered.current = true;
           sessionStore.getBridge().setLoadOlder(async () => {
-            // 旧页翻页:以最新尾部空白为止,返回是否有变化(简化:翻到哪算哪)
-            const before = sessionStore.snapshot().lastSeq;
-            requestHistory(before ?? undefined);
+            const before = olderBeforeRef.current;
+            if (before === null || olderLoadingRef.current) return false;
+            olderLoadingRef.current = true;
+            sessionStore.getBridge().setLoadingOlder(true);
+            requestHistory(before);
             return true;
           });
         }
-        // 余量预告:漏页继续翻(单页 200 上限,超长会话翻旧)
-        if (frame.hasMore && frame.nextBeforeSeq !== null) {
-          requestHistory(frame.nextBeforeSeq);
-        }
       } else if (frame.type === 'evt') {
-        if (loadingRef.current) {
-          pendingRef.current.push(frame.event);
-          return;
-        }
-        const r = sessionStore.ingest(frame.event);
-        if (r === 'gap') {
-          const from = sessionStore.snapshot().gapFrom;
-          if (from !== null) requestHistory(from);
-        }
+        queueLive([frame.event]);
+      } else if (frame.type === 'evts') {
+        queueLive(frame.events);
       }
     };
 
@@ -146,6 +174,7 @@ export function useMonitorSocket() {
     return () => {
       disposed = true;
       if (timerRef.current !== null) window.clearTimeout(timerRef.current);
+      if (rafRef.current !== null) window.cancelAnimationFrame(rafRef.current);
       wsRef.current?.close();
     };
     // 只跑一次:send/select 经 ref 取当前 ws,闭包稳定

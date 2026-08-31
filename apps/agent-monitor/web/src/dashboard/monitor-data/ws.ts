@@ -30,6 +30,7 @@ export type HubFrame =
   | { type: 'history'; session: string; events: EventEnvelope[]; hasMore: boolean; nextBeforeSeq: number | null }
   | { type: 'evt_ready'; session: string; lastSeq: number | null }
   | { type: 'evt'; event: EventEnvelope }
+  | { type: 'evts'; events: EventEnvelope[] }
   | { type: 'pong' };
 
 /** 事件按 seq 升序(与 fold 的期待一致);帧解析后先调用。 */
@@ -37,7 +38,7 @@ export function sortedEvents(events: EventEnvelope[]): EventEnvelope[] {
   return [...events].sort((a, b) => a.seq - b.seq);
 }
 
-/** 合并两段(历史页 + live 缓冲)按 seq 去重;gap 检测由 RunFold.ingest 完成。 */
+/** 合并两段(历史页 + live 缓冲)按 seq 去重;gap 检测由 RunFold.ingestBatch 完成。 */
 export function mergeEvents(a: EventEnvelope[], b: EventEnvelope[]): EventEnvelope[] {
   const map = new Map<number, EventEnvelope>();
   for (const e of a) map.set(e.seq, e);

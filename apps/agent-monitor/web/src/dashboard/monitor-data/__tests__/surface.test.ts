@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { RunFold } from '../fold';
 import { applyEvent, deriveMessage, foldEvents, messagesAt, newSurface } from '../surface';
 import type { EventEnvelope } from '../types';
 
@@ -60,5 +61,27 @@ describe('surface 折叠(与 Python 契约同语义)', () => {
     applyEvent(s, evt('session/start', 0));
     applyEvent(s, evt('request/header', 1, { header: { config: {} }, reason: 'initial' }));
     expect(s.nodes).toEqual([]);
+  });
+});
+
+describe('RunFold live 增量', () => {
+  it('历史高水位允许 chunk 洞,批内增量累计 partial 且消息定型后清空', () => {
+    const fold = new RunFold();
+    fold.applyBatch([user(0, 'q')], 10);
+    expect(fold.requestedFrom()).toBe(10);
+
+    expect(fold.ingestBatch([
+      evt('assistant/chunk', 10, { chunk: { type: 'content', text: '你' } }),
+      evt('assistant/chunk', 11, { chunk: { type: 'content', text: '好' } }),
+    ])).toBe('ok');
+    expect(fold.partial).toBe('你好');
+    expect(fold.ingestBatch([evt('assistant/chunk', 13, {
+      chunk: { type: 'content', text: '!' },
+    })])).toBe('gap');
+    expect(fold.requestedFrom()).toBe(14);
+
+    fold.ingestBatch([asst(14, '你好!')]);
+    expect(fold.partial).toBe('');
+    expect(fold.all().map((event) => event.seq)).toEqual([0, 10, 11, 13, 14]);
   });
 });

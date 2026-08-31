@@ -130,9 +130,8 @@ def test_subscribe_missing_session_and_ping(client):
 def test_history_pagination_tail_and_older(client):
     with client.websocket_connect("/ws") as producer:
         for i in range(10):
-            producer.send_text(json.dumps({"type": "evt", "event": _evt(
-                "assistant/chunk", "page1", seq=i, turn=1, step=1,
-                chunk={"type": "text", "index": 0, "text": str(i)})}, ensure_ascii=False))
+            producer.send_text(json.dumps(
+                {"type": "evt", "event": _user_evt("page1", i, str(i))}, ensure_ascii=False))
     with client.websocket_connect("/ws") as v:
         # 尾部页:最近 5 条(seq 5..9),翻旧分界 nextBeforeSeq=5
         v.send_text(json.dumps({"type": "history", "session": "page1", "max": 5}, ensure_ascii=False))
@@ -519,5 +518,32 @@ def test_feed_nonterminal_event_tolerance(monkeypatch):
     asyncio.run(hub.feed(hb))
     assert len(frames) == 1  # 心跳不广播(index 只由 新会话/终态 触发)
     assert got and got[-1]["event"]["type"] == "assistant/chunk"
+    assert list(hub.sessions["chat:hb"].events) == [0]
     s = hub.index()[0]
     assert s["state"] == "running" and s["num_events"] == 2 and s["last_ts"] == hb["ts"]
+
+
+def test_feed_batch_forwards_once_and_keeps_chunks_out_of_history(monkeypatch):
+    """批帧保持事件顺序,raw chunk 只实时转发且原始流高水位继续推进。"""
+    hub = _Hub()
+
+    async def _no_index():
+        return None
+
+    monkeypatch.setattr(hub, "_broadcast_index", _no_index)
+    asyncio.run(hub.feed(_evt("session/start", "batch", seq=0)))
+    got: list[dict] = []
+
+    class _FakeWs:
+        async def send_text(self, payload):
+            got.append(json.loads(payload))
+
+    hub.sessions["batch"].subscribers.add(_FakeWs())
+    chunk = _evt("assistant/chunk", "batch", seq=1,
+                 chunk={"type": "content", "index": 0, "text": "x"})
+    message = _user_evt("batch", 2, "done")
+    asyncio.run(hub.feed_batch([chunk, message]))
+
+    assert got == [{"type": "evts", "events": [chunk, message]}]
+    assert list(hub.sessions["batch"].events) == [0, 2]
+    assert hub.sessions["batch"].last_seq == 2

@@ -206,6 +206,8 @@ export function deriveTrajectoryLayout(input: TrajectoryLayoutInput): readonly T
   for (const node of nodes) {
     if (node.kind === 'assistant' && node.step > 0) {
       representedRequests.add(`${node.turn}\u0000${node.step}`)
+    } else if (node.kind === 'tool-result' && (node.step ?? 0) > 0) {
+      representedRequests.add(`${node.turn ?? 0}\u0000${node.step}`)
     }
   }
   if (partial !== null && partial.step > 0) {

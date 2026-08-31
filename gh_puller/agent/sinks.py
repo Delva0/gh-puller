@@ -87,8 +87,8 @@ class WsSink:
 
     Internal bounded queue (5000, drop-oldest) absorbs backlog during disconnect;
     push failures never bubble (monitoring must not drag callers). Events only deliver
-    after connect (reconnect resumes from the break point). Forwards raw event frames
-    only — aggregation (LlmAggregator) happens at the consumer side (FileSink / hub).
+    after connect (reconnect resumes from the break point). Raw events keep their own
+    envelopes and seqs but travel in short batches to amortize token-stream framing.
     """
 
     def __init__(self, url: str):
@@ -113,11 +113,12 @@ class WsSink:
                 async with websockets.connect(self.url, ping_interval=20) as ws:
                     wait = 1
                     while True:
-                        if not self._q.empty():
-                            evt = self._q.get_nowait()
-                        else:
-                            evt = await self._q.get()
-                        await ws.send(json.dumps({"type": "evt", "event": evt}, ensure_ascii=False))
+                        first = await self._q.get()
+                        await asyncio.sleep(0.016)
+                        events = [first]
+                        while len(events) < 256 and not self._q.empty():
+                            events.append(self._q.get_nowait())
+                        await ws.send(json.dumps({"type": "evts", "events": events}, ensure_ascii=False))
             except Exception as exc:  # 握手/断连:保留缓冲,退避重连
                 _log(f"ws sink 未连接({wait}s 后重试): {exc}")
                 await asyncio.sleep(wait)

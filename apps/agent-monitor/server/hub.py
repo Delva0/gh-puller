@@ -1,9 +1,9 @@
 """Agent 监控 Web/WS hub(FastAPI 端点层)。
 
 生产端是 gh_puller.agent 的 WsSink(经 AGENT_MONITOR_WEBUI_URL 接入,主动向 /ws 推
-{"type":"evt","event":...});浏览器查看端经同一端点订阅会话。GET / 与 /viewer
+{"type":"evts","events":[...]});浏览器查看端经同一端点订阅会话。GET / 与 /viewer
 直接出构建好的单文件 viewer(agent_monitor_viewer.html);hub 只持内存状态
-(每会话事件按 seq 索引;完备真源是 FileSink 磁盘 JSONL —— 启动种子加载后,
+(每会话非流式历史按 seq 索引,raw chunk 只实时转发;完备真源是 FileSink 磁盘 JSONL —— 启动种子加载后,
 历史查看不再为空),写盘是 FileSink 的事,重启 hub 列表与历史均在。
 
 磁盘布局扁平(<uuid>.jsonl,根 = AGENT_MONITOR_DIR,见 gh_puller.agent.sinks.FileSink):
@@ -14,15 +14,16 @@ gh_puller/agent/events.py 会话保活 —— 只内存态不写盘,文件复活
 index 时对 running 会话按需重判(文件 mtime 变化才重读尾部找终态);
 租约扫描(scan + lifespan 循环)周期把过期 running 翻转为 aborted 并向在线查看端广播。
 
-协议:一连接一角色,首帧定角色(evt → 生产端,其余 → 查看端);查看端帧:
+协议:一连接一角色,首帧定角色(evts/evt → 生产端,其余 → 查看端);查看端帧:
 - index → {type:"index", sessions:[{session, run_id, label, provider, model, state,
   ts, last_ts, num_events}]}(last_ts 降序);
 - history {session, beforeSeq?, max?} → {type:"history", session, events, hasMore,
   nextBeforeSeq}:磁盘+内存合并的 seq 升序页(beforeSeq 缺省读尾部;nextBeforeSeq
-  为 oldest in-page,客户端以此翻旧页)。文件 seq 允许洞(洞=被跳过的
+  为 oldest in-page,客户端以此翻旧页),只含非流式投影。文件 seq 允许洞(洞=被跳过的
   assistant/chunk),客户端只按 seq 排序/比较,不作稠密假设;
 - subscribe {session} → {type:"evt_ready", session, lastSeq} 后实时
-  {type:"evt","event":...} 推送(单订阅视图:一连接只盯一会话);
+  {type:"evts","events":[...]} 批量推送(单订阅视图:一连接只盯一会话;
+  兼容旧生产端的单事件帧);
 - delete {session} → 内存移除 + 磁盘 JSONL 删除,随后向全部查看端广播
   新 {type:"index"}(复用既有帧型,请求端在其中;幽灵删除同样广播,客户端
   以索引回响推进列表,无需 ack 帧);
@@ -41,6 +42,7 @@ from pathlib import Path
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response
 from gh_puller import envs
+from gh_puller.agent.events import NON_STREAM_TYPES
 
 # 租约缺省(仅 hub 消费);LEASE 须 ≥ 3~5×HEARTBEAT ——
 # AGENT_MONITOR_HEARTBEAT_SECS 在 gh_puller.envs(生产端 sinks 消费,包内契约)。
@@ -60,7 +62,7 @@ def _file_stem(session: str) -> str:
 
 
 class _Session:
-    """hub 内存中的单会话状态:seq 索引事件(完备真源在磁盘 JSONL)。"""
+    """hub 内存中的单会话状态:非流式历史索引与原始流高水位。"""
 
     def __init__(self, session: str, label: str = "", provider: str = "", model: str = "",
                  run_id: str | None = None, generator: str = ""):
@@ -73,9 +75,11 @@ class _Session:
         self.state = "running"
         self.ts = time.time()
         self.last_ts = self.ts
-        self.events: dict[int, dict] = {}  # seq → 事件(feed 实时写入;种子时载入)
+        self.events: dict[int, dict] = {}  # seq → 非流式历史事件(feed 实时写入;种子时载入)
+        self.last_seq: int | None = None  # 原始事件流高水位(chunk 不进入 events)
         self.subscribers: set = set()  # live evt 订阅(查看端;单视图语义)
         self.disk_mtime: float = 0.0  # 最近一次重判时文件的 mtime(0 = 未查)
+        self.history_mtime: float = 0.0  # 最近一次历史缓存同步时的文件 mtime
 
 
 class _Hub:
@@ -112,6 +116,7 @@ class _Hub:
                 _log(f"hub 种子跳过 {path.name}: 读取失败 {exc}")
                 continue
             events: dict[int, dict] = {}
+            last_seq: int | None = None
             head: dict | None = None
             end_state: str | None = None
             for line in lines:
@@ -128,7 +133,10 @@ class _Hub:
                     end_state = (evt.get("data") or {}).get("state", "completed")
                 if "seq" not in evt or "type" not in evt:
                     continue  # 旧 v1 聚合行:无 seq/type,整体不可折叠
-                events[int(evt["seq"])] = evt
+                seq = int(evt["seq"])
+                last_seq = seq if last_seq is None else max(last_seq, seq)
+                if evt.get("type") in NON_STREAM_TYPES:
+                    events[seq] = evt
             if head is None or not events:
                 _log(f"hub 种子跳过 {path.name}: 非事件溯源格式")
                 continue
@@ -143,8 +151,10 @@ class _Hub:
             sess.ts = head.get("ts") or sess.ts
             sess.last_ts = max((e.get("ts") or sess.ts) for e in events.values())
             sess.events = events
+            sess.last_seq = last_seq
             try:
                 sess.disk_mtime = path.stat().st_mtime
+                sess.history_mtime = sess.disk_mtime
             except OSError:
                 sess.disk_mtime = 0.0
             if (end_state is None and sess.disk_mtime
@@ -233,7 +243,7 @@ class _Hub:
                 {"session": s.session, "run_id": s.run_id, "label": s.label,
                  "generator": s.generator, "provider": s.provider, "model": s.model,
                  "state": s.state, "ts": s.ts, "last_ts": s.last_ts,
-                 "num_events": len(s.events)}
+                 "num_events": (s.last_seq + 1) if s.last_seq is not None else 0}
                 for s in self.sessions.values()
             ),
             key=lambda x: x["last_ts"],
@@ -270,14 +280,20 @@ class _Hub:
             {"type": "index", "sessions": self.index()}, ensure_ascii=False))
 
     def _session_events(self, sess: _Session) -> dict[int, dict]:
-        """磁盘 + 内存合并事件(seq 键;内存更新,覆盖磁盘同 seq —— live 优先)。
+        """同步磁盘的非流式投影并返回缓存(seq 键;live 内存优先)。
 
         文件为扁平布局(<uuid>.jsonl);seq 允许洞(洞=被跳过的
         assistant/chunk),按键合并天然兼容。
         """
-        merged: dict[int, dict] = {}
         cand = self._file_for(sess.session)
         if cand is not None and cand.exists():
+            try:
+                mtime = cand.stat().st_mtime
+            except OSError:
+                return sess.events
+            if mtime == sess.history_mtime:
+                return sess.events
+            disk: dict[int, dict] = {}
             for line in cand.read_text(encoding="utf-8", errors="replace").splitlines():
                 if not line.strip():
                     continue
@@ -287,9 +303,12 @@ class _Hub:
                     continue
                 if "seq" not in evt:
                     continue  # 旧格式行跳过
-                merged[int(evt["seq"])] = evt
-        merged.update(sess.events)
-        return merged
+                if evt.get("type") in NON_STREAM_TYPES:
+                    disk[int(evt["seq"])] = evt
+            disk.update(sess.events)
+            sess.events = disk
+            sess.history_mtime = mtime
+        return sess.events
 
     def _history_page(self, sess: _Session, before: int | None, max_n: int):
         """seq 升序分页:取 beforeSeq(缺省无限)之下最近 max_n 条;翻旧页用 nextBeforeSeq。"""
@@ -300,11 +319,11 @@ class _Hub:
         next_before = page[0] if (has_more and page) else None
         return [merged[k] for k in page], has_more, next_before
 
-    async def feed(self, evt: dict) -> None:
-        """生产端事件:入会话(惰性建)→ seq 索引 → 订阅端 live 推送;终态更新 state。"""
+    def _record(self, evt: dict) -> tuple[_Session | None, bool]:
+        """Record one event and return its session plus whether index metadata changed."""
         sid = evt.get("session") or ""
         if not sid:
-            return
+            return None, False
         created = self.sessions.get(sid) is None
         sess = self.sessions.get(sid)
         if sess is None:
@@ -317,7 +336,10 @@ class _Hub:
             self.sessions[sid] = sess
         seq = evt.get("seq")
         if seq is not None:
-            sess.events[int(seq)] = evt
+            seq = int(seq)
+            sess.last_seq = seq if sess.last_seq is None else max(sess.last_seq, seq)
+            if evt.get("type") in NON_STREAM_TYPES:
+                sess.events[seq] = evt
         sess.last_ts = evt.get("ts") or time.time()
         if evt.get("type") == "session/start":
             d = evt.get("data") or {}
@@ -328,9 +350,34 @@ class _Hub:
             sess.run_id = evt.get("run_id") or d.get("run_id") or sess.run_id
         elif evt.get("type") == "session/end":
             sess.state = (evt.get("data") or {}).get("state", "completed")
-        await self._push(sess.subscribers, json.dumps({"type": "evt", "event": evt}, ensure_ascii=False))
-        # 新会话 / 终态翻转:让所有查看端(含未订阅侧栏)无需刷新即更新列表;每次 run 至多 2 帧
-        if created or evt.get("type") == "session/end":
+        return sess, created or evt.get("type") == "session/end"
+
+    async def feed_batch(self, events: list[dict]) -> None:
+        """Record a producer batch and forward one batch per subscribed session."""
+        live: dict[str, list[dict]] = {}
+        index_changed = False
+        for evt in events:
+            sess, changed = self._record(evt)
+            if sess is None:
+                continue
+            index_changed = index_changed or changed
+            if sess.subscribers:
+                live.setdefault(sess.session, []).append(evt)
+        for sid, batch in live.items():
+            await self._push(self.sessions[sid].subscribers, json.dumps(
+                {"type": "evts", "events": batch}, ensure_ascii=False))
+        if index_changed:
+            await self._broadcast_index()
+
+    async def feed(self, evt: dict) -> None:
+        """Backward-compatible single-event producer entry."""
+        sess, index_changed = self._record(evt)
+        if sess is None:
+            return
+        if sess.subscribers:
+            await self._push(sess.subscribers, json.dumps(
+                {"type": "evt", "event": evt}, ensure_ascii=False))
+        if index_changed:
             await self._broadcast_index()
 
 
@@ -345,17 +392,24 @@ def _viewer_html(static_root: Path) -> bytes:
 
 async def _producer_loop(ws: WebSocket, hub: _Hub, first: dict) -> None:
     """生产端(gh_puller WsSink):feed 事件/应答 ping。"""
-    await hub.feed(first.get("event") or {})
+    if first.get("type") == "evts":
+        await hub.feed_batch(first.get("events") or [])
+    else:
+        await hub.feed(first.get("event") or {})
     try:
         while True:
             frame = json.loads(await ws.receive_text())
             data = frame.get("type")
             if data == "evt":
                 await hub.feed(frame.get("event") or {})
+            elif data == "evts":
+                await hub.feed_batch(frame.get("events") or [])
             elif data == "ping":
                 await ws.send_text(json.dumps({"type": "pong"}))
     except WebSocketDisconnect:
         pass
+    except Exception as exc:
+        _log(f"hub 生产端帧处理失败: {type(exc).__name__}: {exc}")
 
 
 async def _viewer_frame(ws: WebSocket, hub: _Hub, frame: dict) -> None:
@@ -383,8 +437,7 @@ async def _viewer_frame(ws: WebSocket, hub: _Hub, frame: dict) -> None:
         last_seq = None
         if sess is not None:
             sess.subscribers.add(ws)  # 先登记再应答:live 推送无缝隙
-            if sess.events:
-                last_seq = max(sess.events)
+            last_seq = sess.last_seq
         await ws.send_text(json.dumps(
             {"type": "evt_ready", "session": sid, "lastSeq": last_seq}, ensure_ascii=False))
     elif kind == "delete":
@@ -447,7 +500,7 @@ def create_app(hub: _Hub | None = None, *, static_root: Path | None = None) -> F
             first = json.loads(await asyncio.wait_for(ws.receive_text(), timeout=10))
         except Exception:  # 超时/断开/非 JSON:静默释放
             return
-        if first.get("type") == "evt":
+        if first.get("type") in {"evt", "evts"}:
             await _producer_loop(ws, h, first)
         else:  # index/history/subscribe/ping:一律按查看端处理
             h.viewers.add(ws)  # 广播 index 的受众(离开时 _viewer_loop finally 剔除)

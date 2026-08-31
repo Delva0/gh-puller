@@ -50,8 +50,9 @@ export interface SessionListShape {
 export interface DshSessionStore {
   reset(facts: SessionFacts | null): void
   /** 已在连接层通过 seq 守卫的事件注入(全窗由连接层交付)。 */
-  seed(events: EventEnvelope[]): void
+  seed(events: EventEnvelope[], hasMore?: boolean): void
   append(evt: EventEnvelope): void
+  appendBatch(events: EventEnvelope[]): void
   updateFacts(patch: Partial<SessionFacts>): void
   snapshot(): ConversationSnapshot | null
   /** 裸源(host 面)。 */
@@ -73,7 +74,7 @@ export interface DshSessionStore {
   attach(eventsRegistry: ConversationEventDefinitions, viewsRegistry: ConversationViewDefinitions): void
 }
 
-/** 组装会话源:适配器每次全窗折叠(O(n),窗 = history 200/页 + live)。
+/** 组装会话源:历史窗口重放,live 尾部走 assembler 增量追加。
  *
  * 注册表(events/views)由 installDsh 在装配时提供 → attach();attach 前
  * rebuild() 为空转(实例在 socket select 前创建,装配时机在面板 render)。
@@ -81,6 +82,8 @@ export interface DshSessionStore {
 export function createDshSession(): DshSessionStore {
   const adapter = new GhToDshEvents()
   let assembler: ConversationNodeAssembler | null = null
+  let assembledLastSeq: number | null = null
+  let rebuildPending = false
 
   let folded = new Map<number, EventEnvelope>()
   let facts: SessionFacts | null = null
@@ -152,10 +155,48 @@ export function createDshSession(): DshSessionStore {
     try {
       assembler.replaceWindow(entries, hasMoreValue)
       assembler.flush() // flush() 才是视图物化入口(dsh Session 的发布节奏);replace 仅登记
+      assembledLastSeq = entries.length === 0 ? null : Math.max(...entries.map(entry => entry.event.seq))
+      rebuildPending = false
     } catch (error) {
+      rebuildPending = true
       console.error('[gh-puller/dsh] assemble 失败(事件窗不稳,等待下批):', error)
     }
     conversation.set(snapshot())
+  }
+
+  function publishFacts(): void {
+    if (facts === null) return
+    list.set({
+      byId: { [facts.sessionId]: {
+        id: facts.sessionId,
+        displayTitle: facts.label || facts.sessionId,
+        cwd: '',
+        state: facts.state,
+        run_id: facts.runId ?? null,
+        provider: facts.provider ?? '',
+        model: facts.model ?? '',
+      } },
+      phase: 'ready',
+    })
+  }
+
+  function applyFacts(evt: EventEnvelope): void {
+    if (facts === null) return
+    if (evt.type === 'session/start') {
+      const data = evt.data as Record<string, unknown>
+      facts = {
+        ...facts,
+        label: (evt as EventEnvelope & { label?: string }).label
+          ?? (typeof data.label === 'string' ? data.label : facts.label),
+        runId: (evt as EventEnvelope & { run_id?: string | null }).run_id
+          ?? (typeof data.run_id === 'string' ? data.run_id : facts.runId),
+      }
+      publishFacts()
+    } else if (evt.type === 'session/end') {
+      const state = (evt.data as { state?: string }).state ?? 'completed'
+      facts = { ...facts, state: state === 'aborted' ? 'aborted' : 'completed' }
+      publishFacts()
+    }
   }
 
   const store: DshSessionStore = {
@@ -165,6 +206,8 @@ export function createDshSession(): DshSessionStore {
       hasMoreValue = false
       loadingOlderValue = false
       adapter.reset()
+      assembledLastSeq = null
+      rebuildPending = false
       provideInfo.set(next === null
         ? { sessionId: undefined, hooks: {}, props: {} }
         : { sessionId: next.sessionId, hooks: { session: conversation, input }, props: {} })
@@ -184,33 +227,57 @@ export function createDshSession(): DshSessionStore {
         })
       rebuild()
     },
-    seed(events) {
+    seed(events, hasMore) {
       for (const evt of events) folded.set(evt.seq, evt)
+      if (hasMore !== undefined) hasMoreValue = hasMore
       rebuild()
     },
     append(evt) {
-      folded.set(evt.seq, evt)
-      if (evt.type === 'session/start' && facts !== null) {
-        const data = evt.data as Record<string, unknown>
-        store.updateFacts({
-          label: (evt as EventEnvelope & { label?: string }).label
-            ?? (typeof data.label === 'string' ? data.label : undefined)
-            ?? facts.label,
-          runId: (evt as EventEnvelope & { run_id?: string | null }).run_id
-            ?? (typeof data.run_id === 'string' ? data.run_id : null)
-            ?? facts.runId,
-        })
+      store.appendBatch([evt])
+    },
+    appendBatch(events) {
+      const fresh = [...events]
+        .filter(evt => !folded.has(evt.seq))
+        .sort((a, b) => a.seq - b.seq)
+      if (fresh.length === 0) return
+      const entries: ConversationEventInput[] = []
+      for (const evt of fresh) {
+        folded.set(evt.seq, evt)
+        applyFacts(evt)
+        if (assembler !== null) {
+          for (const event of adapter.translate(evt)) entries.push({ event, view: undefined })
+        }
       }
-      if (evt.type === 'session/end' && facts !== null) {
-        const state = (evt.data as { state?: string }).state ?? 'completed'
-        store.updateFacts({ state: state === 'aborted' ? 'aborted' : 'completed' })
+      if (assembler === null) return
+      if (rebuildPending) {
+        rebuild()
+        return
       }
-      rebuild()
+      let cursor = assembledLastSeq
+      let monotonic = true
+      for (const entry of entries) {
+        if (cursor !== null && entry.event.seq <= cursor) monotonic = false
+        cursor = entry.event.seq
+      }
+      if (!monotonic) {
+        // Step-level message merging can emit an older anchor only when its boundary lands.
+        rebuild()
+        return
+      }
+      cursor = assembledLastSeq
+      for (const entry of entries) {
+        assembler.append(entry)
+        cursor = entry.event.seq
+      }
+      assembledLastSeq = cursor
+      assembler.flush()
+      conversation.set(snapshot())
     },
     updateFacts(patch) {
       if (facts === null) return
       facts = { ...facts, ...patch }
-      rebuild()
+      publishFacts()
+      conversation.set(snapshot())
     },
     snapshot: () => conversation.getSnapshot(),
     conversation,

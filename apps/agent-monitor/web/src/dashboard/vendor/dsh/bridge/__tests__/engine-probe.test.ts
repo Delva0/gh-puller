@@ -7,6 +7,8 @@ import {
   type ConversationEventInput,
 } from '../../runtime/src/client';
 import { registerConversationNodes } from '../../ui-conversation/src/client/conversation-nodes/register';
+import { apply as applyTrajectory } from '../../ui-trajectory/src/client';
+import { deriveTrajectoryLayout } from '../../ui-trajectory/src/client/layout';
 import { GhToDshEvents } from '../dsh-events';
 import type { EventEnvelope } from '../../../../monitor-data/types';
 
@@ -119,5 +121,49 @@ describe('engine assemble', () => {
     const firstAssistant = chat!.nodes.get(chat!.order[kinds.indexOf('assistant-step')]);
     const data = firstAssistant?.data as { blocks: Array<{ type: string }> };
     expect(data.blocks.length).toBeGreaterThan(0);
+  });
+
+  it('纯工具步骤仍按原始事件顺序把用户输入放在首个工具前', () => {
+    const events = new ConversationEventRegistry();
+    const views = new ConversationViewRegistry();
+    const registration = face(events, views);
+    registerConversationNodes(registration);
+    applyTrajectory(registration);
+    const trajectory = assemble(events, views, [
+      evt('turn/start', 2, { turn: 1 }),
+      evt('step/start', 3, { turn: 1, step: 1 }),
+      evt('user/message', 4, {
+        turn: 1, step: 1,
+        message: { role: 'user', content: [{ type: 'text', text: 'prompt' }] },
+        source: { kind: 'user' }, surfaceOp: 'append',
+      }),
+      evt('tool/call', 5, { turn: 1, step: 1, callId: 'c1', name: 'bash', arguments: '{}' }),
+      evt('tool/result', 6, {
+        turn: 1, step: 1, callId: 'c1', is_error: false,
+        message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'c1', content: 'ok' }] },
+        surfaceOp: 'append',
+      }),
+      evt('step/end', 7, { turn: 1, step: 1 }),
+      evt('step/start', 8, { turn: 1, step: 2 }),
+      evt('tool/call', 9, { turn: 1, step: 2, callId: 'c2', name: 'bash', arguments: '{}' }),
+      evt('tool/result', 10, {
+        turn: 1, step: 2, callId: 'c2', is_error: false,
+        message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'c2', content: 'ok' }] },
+        surfaceOp: 'append',
+      }),
+      evt('step/end', 11, { turn: 1, step: 2 }),
+      evt('turn/end', 12, { turn: 1, reason: 'aborted' }),
+    ]).get('trajectory');
+
+    const turns = deriveTrajectoryLayout({
+      nodes: trajectory?.eventNodes ?? [],
+      eventLocations: trajectory?.eventLocations,
+      partial: trajectory?.partial ?? null,
+      runningCalls: trajectory?.runningCalls ?? [],
+      requests: trajectory?.requests,
+      callSchemas: trajectory?.callSchemas,
+    });
+    expect(turns.flatMap(turn => turn.groups.flatMap(group => group.cells.map(cell => cell.kind))))
+      .toEqual(['user', 'tool', 'tool']);
   });
 });

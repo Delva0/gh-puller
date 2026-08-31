@@ -1369,13 +1369,13 @@ async def test_dsh_stream_user_message_fallback(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# WsSink 跨进程契约(仅转发原始事件;聚合只发生在消费端)
+# WsSink 跨进程契约(原始事件短批传输;聚合只发生在消费端)
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
 async def test_ws_sink_forwards_raw_events_only(monkeypatch):
-    """WsSink 只发原始事件帧(不聚合、无 llm 流字段);跨进程契约:聚合发生在消费端。"""
+    """WsSink 批量发送原始事件(不聚合、无 llm 流字段);跨进程契约:聚合发生在消费端。"""
     sent = []
     connects = []
 
@@ -1408,12 +1408,12 @@ async def test_ws_sink_forwards_raw_events_only(monkeypatch):
         await sink.consume(e)
     await asyncio.sleep(0.05)  # 排空 ws worker
     try:
-        # 原始事件原样转发:类型/全字段/顺序逐帧精确一致  # noqa: ERA001 - 中文说明注释,非被注释代码
-        assert sent == [{"type": "evt", "event": e} for e in evts]
+        # 批帧只摊薄传输开销,事件类型/字段/顺序精确不变。
+        assert sent == [{"type": "evts", "events": evts}]
         # 无聚合产物泄漏(无 llm 行帧),delta 只携本块文本
         assert not any(f.get("line") for f in sent)
-        delta_texts = [f["event"]["data"]["chunk"]["text"] for f in sent
-                       if f["event"]["type"] == "assistant/chunk"]
+        delta_texts = [e["data"]["chunk"]["text"] for f in sent for e in f["events"]
+                       if e["type"] == "assistant/chunk"]
         assert delta_texts == ["你好", "世界"]
         assert "你好世界" not in delta_texts
         assert connects == ["ws://preview/ws"]  # 单连接,无重连抖动

@@ -1,7 +1,7 @@
 'use client';
 
 // 单会话响应式 store(useSyncExternalStore,不引 zustand):
-// history 页/live evt → RunFold(seq 守卫 + 间隙可补片)+ dsh 推导桥(vendor 面板数据面)。
+// history 页/live 批次 → RunFold(seq 守卫)+ dsh 推导桥(vendor 面板数据面)。
 // 旧读接口(events/chat/partial)保留兼容;面板改吃 dsh(桥)快照。
 import { useSyncExternalStore } from 'react';
 import { RunFold } from '../monitor-data';
@@ -66,19 +66,19 @@ class MonitorSessionStore {
     this.bump();
   }
 
-  applyBatch(batch: EventEnvelope[]): void {
-    if (!batch.length) return;
-    this.fold.applyBatch(batch);
+  applyBatch(batch: EventEnvelope[], hasMore?: boolean): void {
+    const cursor = this.lastSeq === null ? undefined : this.lastSeq + 1;
+    this.fold.applyBatch(batch, cursor);
     this.gap_ = false;
-    this.dsh.seed(batch);
+    this.dsh.seed(batch, hasMore);
     this.bump();
   }
 
-  /** live 单条;返回 'gap' 时以 gapFrom 补片。 */
-  ingest(evt: EventEnvelope): 'ok' | 'dup' | 'gap' {
-    const r = this.fold.ingest(evt);
+  /** live 批次;一帧内只发布一次 UI 快照。 */
+  ingestBatch(events: EventEnvelope[]): 'ok' | 'dup' | 'gap' {
+    const r = this.fold.ingestBatch(events);
     if (r === 'gap') this.gap_ = true;
-    this.dsh.append(evt);
+    this.dsh.appendBatch(events);
     this.bump();
     return r;
   }
