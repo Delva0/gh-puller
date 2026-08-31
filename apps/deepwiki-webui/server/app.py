@@ -2,8 +2,8 @@
 
 契约与 deepwiki-open 一致(前端见 apps/deepwiki-webui/web/);chat/codemap 生成
 器与 wiki 任务管理由 gh_puller.deepwiki 提供,本模块只负责 HTTP/WS 端点适配
-(SSE 心跳、错误语义、模型配置契约)。gh-puller-mcp/agent SDK 组装全部经本模块的
-generators(图服务/索引保障/MCP 工具桌装配 + runtime_config 覆盖构造参数注入);
+(SSE 心跳、错误语义、生成器配置契约)。gh-puller-mcp/生成器 SDK 组装全部经本模块的
+generators(索引保障/MCP 工具桌装配 + runtime_config 覆盖构造参数注入);
 引擎零 graphify 依赖。
 
 启动:`cd apps/deepwiki-webui/server && uv run uvicorn app:app --port 8001`(或 python app.py)。
@@ -66,10 +66,7 @@ from schemas import (  # noqa: E402 - 须后于 load_dotenv
     AuthorizationConfig,
     ChatCompletionRequest,
     CodeMapRequest,
-    Model,
-    ModelConfig,
     ProcessedProjectEntry,
-    Provider,
     RepoPrepareRequest,
     RepoRequestBase,
     WikiExportRequest,
@@ -104,34 +101,7 @@ _GENERATOR_META: dict[str, dict] = {
               "configPathEnv": "DEEPWIKI_CODEX_CONFIG", "configDefault": None},
     "opencode": {"name": "OpenCode", "capability": "opencode-cli",
                  "configPathEnv": "DEEPWIKI_OPENCODE_CONFIG", "configDefault": None},
-    "llm": {"name": "LLM", "capability": "chat-completions", "provider": "openai",
-            "modelEnv": "LLM_MODEL", "apiKeyEnv": "OPENAI_API_KEY",
-            "baseUrlEnv": "OPENAI_BASE_URL", "baseUrlDefault": "https://api.openai.com/v1",
-            "models": ("gpt-5.6-luna", "gpt-5.3-codex", "gpt-5.1-codex"),
-            "supportsCustomModel": True},
 }
-
-
-def _models_config() -> ModelConfig:
-    """旧 /models/config 契约(object-only 投影,标注 deprecated)。
-
-    file 类的 provider 由所选配置文件决定(请求无此轴),故只出 object 类(openai)入口。
-    defaultProvider = 默认 generator 的"provider"展示值(cc 无此轴 → 空串)。
-    """
-    providers = []
-    for gid in AGENT_GENERATORS:
-        meta = _GENERATOR_META[gid]
-        if "provider" not in meta:  # file 类:provider 随所选配置文件,不设请求轴
-            continue
-        providers.append(Provider(
-            id=meta["provider"], name=meta["provider"].title(),
-            supportsCustomModel=meta["supportsCustomModel"],
-            models=[Model(id=mid, name=mid) for mid in meta["models"]],
-        ))
-    return ModelConfig(
-        providers=providers,
-        defaultProvider=_GENERATOR_META[_DEEPWIKI_GENERATOR].get("provider", ""),
-    )
 
 
 def _generators_config() -> dict:
@@ -148,7 +118,9 @@ def _generators_config() -> dict:
                           "model": ""}
     generators, providers = [], []
     for gid in AGENT_GENERATORS:
-        meta = _GENERATOR_META[gid]
+        meta = _GENERATOR_META.get(gid)
+        if meta is None:  # 注册表含未配置元数据的后端(如 llm)→ 不展示
+            continue
         kind = config_kind(gid)
         generators.append({
             "id": gid, "name": meta["name"], "configKind": kind,
@@ -201,11 +173,6 @@ async def health_check():
 @app.get("/lang/config")
 async def lang_config():
     return _LANG_CONFIG
-
-
-@app.get("/models/config", response_model=ModelConfig)
-async def get_model_config():
-    return _models_config()
 
 
 @app.get("/generators/config")
@@ -285,9 +252,9 @@ class RepoNotIndexedError(ValueError):
 
 
 def _require_indexed(repo: Repo) -> None:
-    """chat 前置校验:仓库必须已建图,失败在进生成器前即抛。
+    """chat/codemap 前置校验:仓库必须已建图,失败在进生成器前即抛。
 
-    (WS 发错误文本、HTTP 映射 425,见两处调用点)。
+    (WS 发错误事件、HTTP 映射 425,见各处调用点)。
     """
     if not index_ready(repo):
         raise RepoNotIndexedError(
@@ -379,6 +346,11 @@ async def handle_websocket_codemap(websocket: WebSocket):
     try:
         request = CodeMapRequest(**await websocket.receive_json())
         repo = Repo(request.repo_url, request.type, access_token=request.token)
+        try:
+            _require_indexed(repo)
+        except RepoNotIndexedError as e:
+            await websocket.send_text(_event(type="error", stage="analyzing", message=str(e)))
+            return
         async for event in generate_codemap(
             generator=request.target.get("generator") or _DEEPWIKI_GENERATOR,
             generator_config=runtime_config(
@@ -403,8 +375,12 @@ async def handle_websocket_codemap(websocket: WebSocket):
 
 @app.post("/codemap/stream")
 async def codemap_stream(request: CodeMapRequest):
+    repo = Repo(request.repo_url, request.type, access_token=request.token)
     try:
-        repo = Repo(request.repo_url, request.type, access_token=request.token)
+        _require_indexed(repo)
+    except RepoNotIndexedError as e:
+        raise HTTPException(status_code=425, detail=str(e)) from e
+    try:
         stream = generate_codemap(
             generator=request.target.get("generator") or _DEEPWIKI_GENERATOR,
             generator_config=runtime_config(
@@ -498,7 +474,7 @@ async def read_wiki(
     repo: Annotated[str, Query(description="Repository name")],
     repo_type: Annotated[str, Query(description="Repository type (e.g. github, gitlab)")],
     language: Annotated[str, Query(description="Language of the wiki content")],
-    generator: Annotated[str, Query(description="Generator id (cc/dsh/codex/opencode/llm) — public target")] = "",
+    generator: Annotated[str, Query(description="Generator id (cc/dsh/codex/opencode) — public target")] = "",
     config_path: Annotated[str, Query(description="Config file path (file kind) — public target")] = "",
     provider: Annotated[str, Query(description="Provider id (object kind) — public target")] = "",
     model: Annotated[str, Query(description="Model id (object kind) — public target")] = "",
@@ -516,7 +492,7 @@ async def delete_wiki(
     repo_type: Annotated[str, Query(description="Repository type (e.g. github, gitlab)")],
     language: Annotated[str, Query(description="Language of the wiki content")],
     authorization_code: Annotated[str | None, Query(description="Authorization code")] = None,
-    generator: Annotated[str, Query(description="Generator id (cc/dsh/codex/opencode/llm) — public target")] = "",
+    generator: Annotated[str, Query(description="Generator id (cc/dsh/codex/opencode) — public target")] = "",
     config_path: Annotated[str, Query(description="Config file path (file kind) — public target")] = "",
     provider: Annotated[str, Query(description="Provider id (object kind) — public target")] = "",
     model: Annotated[str, Query(description="Model id (object kind) — public target")] = "",

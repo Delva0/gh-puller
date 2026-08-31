@@ -1,4 +1,4 @@
-"""四路适配器真机测试(烧真实 token,默认跳过,显式 opt-in)。
+"""五路适配器真机测试(烧真实 token,默认跳过,显式 opt-in)。
 
 与 test_agent.py(mock 离线)互补:本文件实时走真实后端 —— cc spawn 本地
 claude CLI(凭证走本地 ~/.claude 配置,同 "apikey 在配置文件中" 约定)、
@@ -6,7 +6,8 @@ llm 经 httpx 直连 OpenAI 兼容端(照生成器 env 面:OPENAI_API_KEY /
 OPENAI_BASE_URL / LLM_MODEL;缺省端点 DeepSeek 兼容端,仅环境变量,不读任何
 组件私有文件)、dsh 走 DeepSeek Harness SDK(凭证 SDK 自足)、codex 走
 openai_codex SDK(隔离 home 符号链接引用真实 ~/.codex/auth.json,与 cc 同形
-——验证通道不隔离,隔离只管设置面)。
+——验证通道不隔离,隔离只管设置面)、opencode 走 CLI 子进程(模型路由/凭证
+随 opencode 自身配置,同 cc 的 CLI 自持凭证约定)。
 
 每路经 agent.configure(file_dir=tmp_path, ws_urls=[], otel_urls=[]) 把
 FileSink 根目录注入临时目录,并断言非流式事件流落盘契约正确
@@ -21,6 +22,7 @@ codex 常量直写 gpt-5.6-sol(chatgpt OAuth 凭据只认 models_cache 内的 5.
 import asyncio
 import json
 import os
+import shutil
 
 import httpx
 import pytest
@@ -205,3 +207,29 @@ async def test_codex_stream_real(tmp_path):
     print("codex 回复:", "".join(parts))  # pytest -s 查看真机回显
     assert "".join(parts) != "", "codex 后端应有文本增量"
     _assert_flow(await _read_single_session(tmp_path), "openai", MODEL_CODEX, generator="codex")
+
+
+@pytest.mark.asyncio
+async def test_opencode_stream_real(tmp_path):
+    """opencode 真机:CLI run --format json 子进程;模型路由/凭证随 opencode 自身配置。
+
+    凭证通道不隔离:凭据由 opencode CLI 自持(~/.local/share/opencode/auth.json,
+    同 cc 的 CLI 自持凭证约定);隔离只管注入面(--pure/--auto/config_path)。
+    model 不传 —— 引擎无该轴快照时 model=None(模型由 opencode 配置决定)。
+    """
+    binpath = shutil.which("opencode")
+    if not binpath:
+        pytest.skip("opencode 可执行文件缺失(which;见 opencode 官网安装)")
+    agent.configure(file_dir=str(tmp_path), ws_urls=[], otel_urls=[])
+    config = {
+        "opencode_bin": binpath,
+        "cwd": str(tmp_path),
+        "auto": True,  # 无头自动批准(生产缺省由引擎 adapter 恒置)
+        "timeout_seconds": 300,  # 兜底防止权限等待挂流
+    }
+    gen = agent.OpenCode(config)
+    async with gen.session(session_name="real:opencode", run_id="r-opencode"):
+        parts = await _collect(gen.stream("你好"))
+    print("opencode 回复:", "".join(parts))  # pytest -s 查看真机回显
+    assert "".join(parts) != "", "opencode 后端应有文本增量"
+    _assert_flow(await _read_single_session(tmp_path), "opencode", None, generator="opencode")

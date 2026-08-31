@@ -103,23 +103,6 @@ class AuthorizationConfig(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-class Model(BaseModel):
-    id: str
-    name: str
-
-
-class Provider(BaseModel):
-    id: str
-    name: str
-    models: list[Model] = Field(default_factory=list)
-    supportsCustomModel: bool = Field(False, description="Whether this provider supports custom models")
-
-
-class ModelConfig(BaseModel):
-    providers: list[Provider] = Field(..., description="Available model providers")
-    defaultProvider: str = Field(..., description="ID of the default provider")
-
-
 class RepoInfo(BaseModel):
     owner: str
     repo: str

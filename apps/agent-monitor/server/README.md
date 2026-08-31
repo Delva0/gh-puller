@@ -23,8 +23,9 @@ hub 只持内存状态(每会话全量事件,seq 索引),写盘是 FileSink 的�
 - 会话运行期,生产端静默超过 `AGENT_MONITOR_HEARTBEAT_SECS`(默认 30s,无落盘
   事件时)就补发一条 `session/heartbeat` —— 活会话的 JSONL mtime 至多每间隔动一次;
 - hub 的租约扫描(生命周期任务,每 `LEASE/4` 一拍):无终态行 **且** mtime 静止
-  超过 `AGENT_MONITOR_LEASE_SECS`(默认 150s)的 running 会话 → 判定孤儿,
-  状态派生为 `aborted`(纯内存态,**不写盘**;派生规则无状态,重启后自动重推);
+  超过 `AGENT_MONITOR_LEASE_SECS`(默认 150s,缺省在 hub.py `_DEFAULT_LEASE_SECS`)的
+  running 会话 → 判定孤儿,状态派生为 `aborted`(纯内存态,**不写盘**;派生规则无状态,
+  重启后自动重推);
 - 自愈:文件若再移动(新事件/终态行补写)→ 状态自动回 `running` / `completed`;
   翻转为 aborted 时向在线查看端广播一次 index(幂等,每拍至多一次)。
 
@@ -35,7 +36,7 @@ hub 只持内存状态(每会话全量事件,seq 索引),写盘是 FileSink 的�
 ## 启动
 
 ```bash
-uv run uvicorn hub:app --host 0.0.0.0 --port 8765   # 端口默认与 envs.AGENT_MONITOR_PORT 一致
+uv run uvicorn hub:app --host 0.0.0.0 --port 8765   # 默认端口 8765,由 uvicorn CLI --port 指定
 ```
 
 ## 生产端接入

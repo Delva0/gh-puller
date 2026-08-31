@@ -19,6 +19,7 @@ envs.py 在导入时单点快照 os.environ —— 因此必须在 conftest 导�
 import os
 import sys
 import tempfile
+from contextlib import suppress
 from pathlib import Path
 
 _cc_dir = Path(tempfile.mkdtemp(prefix="gh-puller-cc-config-"))
@@ -28,10 +29,9 @@ os.environ["DEEPWIKI_CC_CONFIG"] = str(_cc_file)
 os.environ["DEEPWIKI_ROOT"] = tempfile.mkdtemp(prefix="deepwiki-test-")
 os.environ["AGENT_MONITOR_DIR"] = tempfile.mkdtemp(prefix="gh-puller-agent-monitor-test-")
 sys.modules.pop("gh_puller.envs", None)
-try:
+# 包属性可能未被 from-import 缓存(AttributeError),包条目也可能不在 sys.modules(KeyError)
+with suppress(AttributeError, KeyError):
     delattr(sys.modules["gh_puller"], "envs")
-except (AttributeError, KeyError):
-    pass
 import pytest  # noqa: E402
 
 

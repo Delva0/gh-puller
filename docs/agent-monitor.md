@@ -14,7 +14,7 @@ The following files were used as context for generating this wiki page:
 
 # Agent Streaming Monitor: Event-Sourced Log + Web/WS Hub
 
-Every LLM call in this repository — Claude Code agent calls (`cc_stream` / `cc_text` / `cc_result`, the single streaming funnel that `deepwiki` and the claude judge previously drilled directly into the SDK) and plain OpenAI-compatible calls (`llm_complete` / `llm_stream`) — flows through the wrappers in `gh_puller/agent/`. Callers keep their exact signature and semantics (same `RuntimeError` wording, same fallback order, same text chunks); the monitor is invisible to them. In exchange, every call is observed on **three channels**: a **file sink** (on by default), the internal **Web/WS hub** (agent-monitor; on when its endpoint is reachable), and an **OTel trace export** (Phoenix-compatible backends; on when endpoint reachable + opentelemetry importable). Sources: [gh_puller/agent/generators/:cc_stream/cc_result/llm_stream]()
+Every LLM call in this repository — Claude Code generator calls (the single streaming funnel that `deepwiki` and the claude judge previously drilled directly into the SDK) and OpenAI-compatible calls (the `OpenAI` adapter, used by the benchmark evaluator) — flows through the wrappers in `gh_puller/agent/`. Callers keep their exact signature and semantics (same `RuntimeError` wording, same fallback order, same text chunks); the monitor is invisible to them. In exchange, every call is observed on **three channels**: a **file sink** (on by default), the internal **Web/WS hub** (agent-monitor; on when its endpoint is reachable), and an **OTel trace export** (Phoenix-compatible backends; on when endpoint reachable + opentelemetry importable). Sources: [gh_puller/agent/generators/]()
 
 The observation model is **event-sourcing**: a single lossless append-only event log per run, aligned with the deepseek-harness invariant — the LLM `messages` context is *derived* by a surface fold, not snapshotted. The event log splits into two granularities:
 
@@ -26,7 +26,7 @@ The observation model is **event-sourcing**: a single lossless append-only event
 
 ```mermaid
 graph LR
-    A[deepwiki / benchmark evaluators] -->|cc_* / llm_* wrappers| B[gh_puller.agent]
+    A[deepwiki / benchmark evaluators] -->|generator wrappers| B[gh_puller.agent]
     B --> C[EventBus]
     C --> D[FileSink: ~/.gh-puller/agent-monitor]
     C -->|AGENT_MONITOR_WEBUI_URL| E[WsSink]
@@ -75,7 +75,7 @@ Each JSONL line is one raw event (full content — no truncation anywhere in the
 ### Run
 
 ```bash
-uv --directory apps/agent-monitor/server run uvicorn hub:app --port 8765   # AGENT_MONITOR_PORT default 8765
+uv --directory apps/agent-monitor/server run uvicorn hub:app --port 8765   # 默认端口 8765,由 uvicorn CLI --port 指定
 # in another terminal, run any LLM work (ws sink auto-enables when hub reachable;
 # override the default target with AGENT_MONITOR_WEBUI_URL, comma-separated for multiple hubs):
 AGENT_MONITOR_WEBUI_URL=ws://localhost:8765/ws uv run benchmark ...
@@ -118,16 +118,15 @@ docker run --rm -p 6006:6006 -i ghcr.io/axiomhq/phoenix:latest  # 或 Axiom Phoe
 
 ## 5. Configuration
 
-Runtime override via `agent.configure(file_dir=..., ws_urls=..., otel_urls=..., raw=...)`(file sink **恒开**,无开关;`file_dir` 为测试/嵌入的隔离/重定向手段);`ws_urls`/`otel_urls` 接受 URL 列表或逗号分隔字符串,`None` → 重读 env 常量;`raw` 为文件 sink 的原始事件流开关(`None` → 重读 `AGENT_MONITOR_FILE_RAW`);defaults come from env at import time ([gh_puller/envs.py:38-46](gh_puller/envs.py:38-46)). `ensure_bus()` 为惰性构建总线的公开入口(每 URL 一个 sink 实例):
+Runtime override via `agent.configure(file_dir=..., ws_urls=..., otel_urls=..., raw=...)`(file sink **恒开**,无开关;`file_dir` 为测试/嵌入的隔离/重定向手段);`ws_urls`/`otel_urls` 接受 URL 列表或逗号分隔字符串,`None` → 重读 env 常量;`raw` 为文件 sink 的原始事件流开关(`None` → 重读 `AGENT_MONITOR_FILE_RAW`);defaults come from env at import time ([gh_puller/envs.py](gh_puller/envs.py)). `ensure_bus()` 为惰性构建总线的公开入口(每 URL 一个 sink 实例):
 
 | Variable | Default | Meaning |
 |---|---|---|
 | `AGENT_MONITOR_DIR` | `~/.gh-puller/agent-sessions` | file sink root,即会话 jsonl 落盘根(无 sessions 子层) |
 | `AGENT_MONITOR_FILE_RAW` | `0` | file sink granularity: `0` = non-stream projection only (default, `assistant/chunk` skipped); `1` = full raw event flow incl. `assistant/chunk` (dense seq) |
 | `AGENT_MONITOR_WEBUI_URL` | `ws://localhost:8765/ws` | ws sink targets, comma-separated (one WsSink each); empty → ws sink off |
-| `AGENT_MONITOR_PORT` | `8765` | hub listen port |
 | `AGENT_MONITOR_HEARTBEAT_SECS` | `30` | producer heartbeat interval: silence (no non-chunk event) ≥ this gets one `session/heartbeat` filler row (activity periods get none) |
-| `AGENT_MONITOR_LEASE_SECS` | `150` | hub orphan lease: no `session/end` + file mtime still > this → session derived `aborted`; keep ≥ 3–5× HEARTBEAT (0 heartbeat = pure event-mtime semantics) |
+| `AGENT_MONITOR_LEASE_SECS` | `150` | hub orphan lease (hub 侧消费,缺省在 apps/agent-monitor/server/hub.py `_DEFAULT_LEASE_SECS`): no `session/end` + file mtime still > this → session derived `aborted`; keep ≥ 3–5× HEARTBEAT (0 heartbeat = pure event-mtime semantics) |
 | `AGENT_MONITOR_PHOENIX_URL` | `http://localhost:6006/` | OTLP backend base URL (auto appends `/v1/traces` when path empty); empty → off; only registered when reachable + opentelemetry importable |
 
 File sink is **always on** — the `AGENT_MONITOR_FILE` env and the runtime `configure(file=...)` switch have both been removed (convention code-enforced); tests/embedding isolate only via the `configure(file_dir=...)` redirect.

@@ -4,7 +4,7 @@
 
 ## 功能
 
-- **DeepWiki 兼容问答**：`gh_puller/deepwiki/`（引擎）+ `apps/deepwiki-webui`（FastAPI 后端 + Next.js 前端）。前端契约沿用 deepwiki-open，引擎替换为 Claude Code agent + graphify；生成双路（cc/llm），wiki 生成中途落盘、重启可续跑
+- **DeepWiki 兼容问答**：`gh_puller/deepwiki/`（引擎）+ `apps/deepwiki-webui`（FastAPI 后端 + Next.js 前端）。前端契约沿用 deepwiki-open，引擎替换为 Claude Code + 代码图谱；生成单一管道（cc/dsh/codex/opencode），wiki 生成中途落盘、重启可续跑
 - **graphify 库索引**：`gh_puller/graphify.py` 封装 graphify CLI（extract/export/query）——纯本地 AST 建图，无 embedding/RAG；检索由 agent 按需调用 `graphify_query` 工具完成
 - **agent 统一入口 + 流式监控**：`gh_puller/agent/` 事件溯源式事件模型 + 文件/WS/OTel 观测通道；`apps/agent-monitor` 实时查看 CC 与 LLM 调用过程
 - **benchmark 评测框架**：`gh_puller/benchmark/` 按 REST 协议 v1 单点评测——一个题库 + 一个参赛方 endpoint，题库（`JUDGE`）自治

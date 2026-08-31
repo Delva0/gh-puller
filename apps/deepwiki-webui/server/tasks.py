@@ -7,12 +7,12 @@
   _persist_state(模块级写锁,与页生成并发串行化)。
 
 职责边界(与包的边界):
-- 生成协议/提示词/交付件、契约模型、内容渲染与引用后处理(render)、缓存与状态文件 IO、
+- 生成协议/提示词/生成器缓存、契约模型、内容渲染与引用后处理(render)、缓存与状态文件 IO、
   判等摘要族属引擎(gh_puller.deepwiki,本模块白名单直连);索引服务与 gh-puller-mcp 组装
-  属本 app 的 generators 模块(runtime_config 注入覆盖构造参数集);cache/pipeline/
+  属本 app 的 generators 模块(runtime_config 注入覆盖构造参数集);cache/主流程函数/
   render 保持各自职责的纯化,任务 runtime 语义(状态机/去重/续跑合并/进度投影)都在本模块。
 - **零内容业务**:本模块不拼链接、不剥围栏、不做引用后处理、不组装缓存模型
-  (save_generated_wiki 在引擎缓存层)—— 编排只做"取 pipeline 实例 → 调用 → 回写进度"。
+  (save_generated_wiki 在引擎缓存层)—— 编排只做"调主流程函数 → 回写进度"。
 - 本模块是外部消费者而非包内模块:引擎符号顶部绑名 import(同 app.py 现状);
   模块自身符号(如 _WIKI_TASK_TTL_SECONDS、generate_repo_wiki、_persist_state)在内部
   一律**调用时经模块全局解析**(测试 monkeypatch 位点,不得实例捕获或模块级快照)。
@@ -36,9 +36,14 @@ from gh_puller.deepwiki import (
     WikiPage,
     WikiStructureModel,
     delete_resume_state,
+    determine_structure,
+    generate_page,
+    hydrate_pages,
+    needs_structure_regenerate,
     read_resume_state,
     read_wiki_cache,
     save_generated_wiki,
+    write_error_page,
     write_resume_state,
 )
 from gh_puller.deepwiki.utils import (
@@ -50,7 +55,7 @@ from gh_puller.deepwiki.utils import (
     resolve_generator,
     strip_creds,
 )
-from gh_puller.deepwiki.wiki import _wiki_pipeline, wiki_cache_dir
+from gh_puller.deepwiki.wiki import wiki_cache_dir
 from gh_puller.utils import (
     Repo,
     TaskStatus,
@@ -60,9 +65,6 @@ from gh_puller.utils import (
 from pydantic import BaseModel, ConfigDict, Field, computed_field, field_validator
 
 from generators import ensure_index, index_ready, runtime_config
-
-if TYPE_CHECKING:
-    from gh_puller.deepwiki import WikiPipeline
 
 # ---------------------------------------------------------------------------
 # 任务调度常量(本 app 专属 env,导入期快照,同 gh_puller.envs 原式;monkeypatch 模块全局)
@@ -383,14 +385,13 @@ async def _persist_state(task: WikiTask) -> None:
 
 
 # ---------------------------------------------------------------------------
-# wiki 主流程(驱动一个任务走完状态机:索引 → 结构 → 页面 → 成品缓存;
-# 唯一分派:pipeline 实例在入口取一次,全流程共用)
+# wiki 主流程(驱动一个任务走完状态机:索引 → 结构 → 页面 → 成品缓存)
 # ---------------------------------------------------------------------------
 
 
 @dataclass
 class PreparedRepo:
-    """一次生成所需的仓库态上下文(单源:分支/文件树/readme 只准备一次,流水线共用)。"""
+    """一次生成所需的仓库态上下文(单源:分支/文件树/readme 只准备一次,主流程共用)。"""
 
     repo: Repo
     default_branch: str
@@ -422,10 +423,8 @@ async def generate_repo_wiki(task: WikiTask) -> None:
     try:
         await _persist_state(task)  # 入口即落盘:中断于索引/结构阶段的也能续跑
         repo = Repo(r["repo_url"], r["type"], access_token=r.get("token"))
-        # 覆盖构造参数集:图服务 + graphify MCP 配置原 generator_config 基础上注入
+        # 覆盖构造参数集:gh-puller-mcp 工具桌配置原 generator_config 基础上注入
         gc = runtime_config(r["target"].get("generator"), r["target"].get("generator_config"), repo=repo)
-        # 唯一分派:全流程共用一个实例。
-        pipeline = _wiki_pipeline(r["target"].get("generator"), gc)
         # 索引:只建一次(v1 无增量;已存在即跳过)
         if not index_ready(repo):
             task.status = TaskStatus.INDEXING
@@ -434,25 +433,25 @@ async def generate_repo_wiki(task: WikiTask) -> None:
         # 仓库态(分支/文件树):结构确定与页面生成共用同一次准备
         prepared = await _prepare_repo(r, repo)
 
-        if task.wiki_structure is None or pipeline.needs_structure_regenerate(
+        if task.wiki_structure is None or needs_structure_regenerate(
             project_key=task.repo_key,
             generator=r["target"].get("generator"), generator_config=gc,
         ):
-            # 续跑:结构已落盘(cc 下以交付文件为准,被删则强制重生成)则跳过 agent 调用
+            # 续跑:结构已落盘(以缓存文件为准,被删则强制重生成)则跳过生成器调用
             task.status = TaskStatus.DETERMINING_STRUCTURE
-            task.wiki_structure = await _determine_structure(task, pipeline, prepared, gc)
+            task.wiki_structure = await _determine_structure(task, prepared, gc)
             await _persist_state(task)
 
         task.status = TaskStatus.GENERATING
         task.generated_pages.update(
-            await pipeline.hydrate_pages(
+            await hydrate_pages(
                 project_key=task.repo_key,
                 generator=r["target"].get("generator"), generator_config=gc,
                 repo=prepared.repo,
                 structure=task.wiki_structure, default_branch=prepared.default_branch,
             ),
-        )  # cc 以文件为权威覆盖落盘 state 旧文本;llm no-op(返回空快照)
-        pages = await _generate_pages(task, pipeline, prepared, gc)
+        )  # 以文件为权威覆盖落盘 state 旧文本
+        pages = await _generate_pages(task, prepared, gc)
 
         if not await save_generated_wiki(
             r["owner"], r["repo"], r["type"], r["repo_url"],
@@ -480,12 +479,12 @@ async def generate_repo_wiki(task: WikiTask) -> None:
 
 
 async def _determine_structure(
-    task: WikiTask, pipeline: WikiPipeline, prepared: PreparedRepo, gc: dict,
+    task: WikiTask, prepared: PreparedRepo, gc: dict,
 ) -> WikiStructureModel:
-    """确定 wiki 结构(按 target.generator 分派 cc/dsh/codex/llm);失败上抛使任务 FAILED。"""
+    """确定 wiki 结构(单一生成器管道);失败上抛使任务 FAILED。"""
     r = task.request
     task.default_branch = prepared.default_branch  # 记录(进度/展示;URL 单源见 PreparedRepo)
-    return await pipeline.determine_structure(
+    return await determine_structure(
         generator=r["target"].get("generator"), generator_config=gc,
         repo=prepared.repo, owner=r["owner"], repo_name=r["repo"],
         file_tree=prepared.file_tree, readme=prepared.readme,
@@ -494,11 +493,11 @@ async def _determine_structure(
 
 
 async def _generate_page(
-    task: WikiTask, page: WikiPage, pipeline: WikiPipeline, prepared: PreparedRepo, gc: dict,
+    task: WikiTask, page: WikiPage, prepared: PreparedRepo, gc: dict,
 ) -> WikiPage:
-    """生成单个页面(编排:取流水线实例与仓库上下文;内容与终态格式化收在 pipeline 内)。"""
+    """生成单个页面(编排:取仓库上下文;内容与终态格式化收在主流程函数内)。"""
     r = task.request
-    content = await pipeline.generate_page(
+    content = await generate_page(
         generator=r["target"].get("generator"), generator_config=gc,
         repo=prepared.repo, page=page,
         language=r["language"], default_branch=prepared.default_branch, run_id=task.repo_key,
@@ -507,19 +506,19 @@ async def _generate_page(
 
 
 async def _generate_page_with_retry(
-    task: WikiTask, page: WikiPage, pipeline: WikiPipeline, prepared: PreparedRepo, gc: dict,
+    task: WikiTask, page: WikiPage, prepared: PreparedRepo, gc: dict,
 ) -> WikiPage:
     last_error: Exception | None = None
     for attempt in range(_WIKI_PAGE_RETRIES + 1):
         try:
-            return await _generate_page(task, page, pipeline, prepared, gc)
+            return await _generate_page(task, page, prepared, gc)
         except Exception as e:
             last_error = e
             log(f"页面 {page.id} 生成失败(尝试 {attempt + 1}/{_WIKI_PAGE_RETRIES + 1}): {e}")
     # 重试耗尽:回退错误占位页,保证整个 wiki 仍能完成
     content = f"Error generating content: {last_error}"
     r = task.request
-    pipeline.write_error_page(
+    write_error_page(
         project_key=task.repo_key,
         generator=r["target"].get("generator"), generator_config=gc,
         page=page, content=content,
@@ -533,7 +532,7 @@ def _pending_pages(structure: WikiStructureModel, done: dict[str, WikiPage]) -> 
 
 
 async def _generate_pages(
-    task: WikiTask, pipeline: WikiPipeline, prepared: PreparedRepo, gc: dict,
+    task: WikiTask, prepared: PreparedRepo, gc: dict,
 ) -> dict[str, WikiPage]:
     """有界并发 + 每页重试地生成所有页面;续跑跳过已落盘的页,每页完成后立即落盘。"""
     structure = task.wiki_structure
@@ -547,7 +546,7 @@ async def _generate_pages(
             task.current_page_ids.append(page.id)
             try:
                 task.generated_pages[page.id] = await _generate_page_with_retry(
-                    task, page, pipeline, prepared, gc,
+                    task, page, prepared, gc,
                 )
             finally:
                 with contextlib.suppress(ValueError):
@@ -557,3 +556,4 @@ async def _generate_pages(
 
     await asyncio.gather(*(one(page) for page in pending))
     return task.generated_pages
+

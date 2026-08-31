@@ -9,8 +9,8 @@
 磁盘布局扁平(<uuid>.jsonl,根 = AGENT_MONITOR_DIR,见 gh_puller.agent.sinks.FileSink):
 分类学隐式化 —— 会话键 = 文件内 session/start 的 session 字段(<ns>/<uuid4>),
 状态 = 有无 session/end(有:按 data.state 分 completed/aborted;无:running;
-若文件 mtime 静止超过租约(AGENT_MONITOR_LEASE_SECS)则派生 aborted —— 崩溃残留
-孤儿判定,只内存态不写盘,文件复活自愈回 running)。
+超租约(AGENT_MONITOR_LEASE_SECS)派生 aborted 的判态依据见
+gh_puller/agent/events.py 会话保活 —— 只内存态不写盘,文件复活自愈回 running)。
 index 时对 running 会话按需重判(文件 mtime 变化才重读尾部找终态);
 租约扫描(scan + lifespan 循环)周期把过期 running 翻转为 aborted 并向在线查看端广播。
 
@@ -32,6 +32,7 @@ live 帧与生产端同构(带 seq),客户端按 seq 去重/接缝。
 
 import asyncio
 import json
+import os
 import sys
 import time
 from contextlib import asynccontextmanager
@@ -40,6 +41,10 @@ from pathlib import Path
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response
 from gh_puller import envs
+
+# 租约缺省(仅 hub 消费);LEASE 须 ≥ 3~5×HEARTBEAT ——
+# AGENT_MONITOR_HEARTBEAT_SECS 在 gh_puller.envs(生产端 sinks 消费,包内契约)。
+_DEFAULT_LEASE_SECS = int(os.environ.get("AGENT_MONITOR_LEASE_SECS", "150"))
 
 
 def _log(msg: str) -> None:
@@ -80,7 +85,7 @@ class _Hub:
         self.sessions: dict[str, _Session] = {}
         self.viewers: set = set()  # 所有查看端连接(新会话/终态时广播 index;不同于 per-session subscribers)
         self.root: str | None = None  # AGENT_MONITOR_DIR(history 合并磁盘用)
-        self.lease_secs = envs.AGENT_MONITOR_LEASE_SECS if lease_secs is None else lease_secs
+        self.lease_secs = _DEFAULT_LEASE_SECS if lease_secs is None else lease_secs
 
     def _file_for(self, session: str) -> Path | None:
         """会话 → 磁盘文件路径(扁平布局);root 未设 → None。"""
@@ -181,8 +186,8 @@ class _Hub:
                 continue
             try:
                 evt = json.loads(line)
-            except Exception:
-                continue  # 半行/坏行:继续看更早的行
+            except Exception:  # noqa: S112 - 半行/坏行静默跳过(协议层容错,继续看更早的行)
+                continue
             if evt.get("type") == "session/end":
                 sess.state = (evt.get("data") or {}).get("state", "completed")
                 sess.last_ts = max(sess.last_ts, evt.get("ts") or 0)
@@ -278,7 +283,7 @@ class _Hub:
                     continue
                 try:
                     evt = json.loads(line)
-                except Exception:
+                except Exception:  # noqa: S112 - 坏行静默跳过(旧文件尾部半行/截断行,协议层容错)
                     continue
                 if "seq" not in evt:
                     continue  # 旧格式行跳过

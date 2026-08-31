@@ -1,11 +1,10 @@
-// 监控事件溯源模型的 TS 类型(与 gh_puller/agent/events.py 的规范同构;纯数据,零依赖)
-// 折叠恢复规范:surface 节点(带 surfaceOp 的用户/助手/工具结果消息)按 seq 升序重放,
-// 任意时刻的 messages = 折叠 seq<x 的前缀并派生(见 surface.ts)。
+// 监控事件溯源模型的 TS 类型(协议/词表/语义见 gh_puller/agent/events.py;
+// 本文件只定形状,纯数据零依赖)。
+// 折叠恢复语义(带 surfaceOp 的消息按 seq 重放派生)见 gh_puller/agent/events.py
+// 与 surface.ts 实现。
 
-/** 消息块(与 gh_puller/agent/generators.py 协议词表同形)。
- * text 为 user 消息块、content 为 assistant 可见文本、thinking{text} 为思考、
- * tool_call{id,name,input} 为工具调用(input 为 dict 或 JSON 字符串);
- * `text`(assistant 侧)与 `tool_use` 为历史 legacy,保留兼容。 */
+/** 消息块:事件协议字面量(词表与 legacy 兼容见 gh_puller/agent/events.py 与
+ * gh_puller/agent/generators/__init__.py);本文件只定 TS 形状。 */
 export type Block =
   | { type: 'text'; text: string }
   | { type: 'content'; text: string }

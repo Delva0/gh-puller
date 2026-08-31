@@ -55,9 +55,9 @@ async def test_call_tool_search_graph_shim(tmp_path, monkeypatch):
         pytest.skip("uv 不可用(gh-puller-mcp 经 uv 启动)")
     monkeypatch.setenv("GH_PULLER_MCP_BINARY", _shim(tmp_path))
     data = await generators._call_tool("search_graph", {"project": "p", "query": "f"})
-    # 信封 structuredContent 解析 → search_graph 形状(供 rows_to_hits)
+    # 信封 structuredContent 解析 → 工具形状(dict 直出)
     assert data["cols"] == ["qn", "label", "file", "lines", "rank"]
-    assert generators.rows_to_hits(data) == {"demo.py": [3, 4, 5, 6, 7]}
+    assert data["rows"][0][2] == "demo.py" and data["rows"][0][3] == "3-7"
 
 
 @pytest.mark.asyncio

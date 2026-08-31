@@ -55,41 +55,29 @@ def test_lang_config():
     assert lang["default"] == "en"
 
 
-def test_models_config():
-    """旧契约 = object 类投影(deprecated):file 类 provider 随配置文件,不设请求轴。"""
-    cfg = _client().get("/models/config").json()
-    assert cfg["defaultProvider"] == ""  # 默认 generator(cc)为 file 类,无 provider 轴
-    assert [p["id"] for p in cfg["providers"]] == ["openai"]  # 仅 object 类入口
-    assert all(p["supportsCustomModel"] for p in cfg["providers"])
-
-
 def test_generators_config():
-    """统一 target 配置:注册表直出(generators/providers/default target);凭证不出现。
+    """统一 target 配置:注册表直出(generators/default target);凭证不出现。
 
     generator → generator_config 契约:configKind 分 file(cc/dsh/codex/opencode,
-    configDefault/configPathEnv)/object(llm,providers 列表);defaultTarget.generator_config
-    按默认 generator 的 kind 给出(cc = config_path)。
+    configDefault/configPathEnv);defaultTarget.generator_config 按默认 generator
+    的 kind 给出(cc = config_path)。
     """
     cfg = _client().get("/generators/config").json()
-    assert [g["id"] for g in cfg["generators"]] == ["cc", "dsh", "codex", "opencode", "llm"]
+    assert [g["id"] for g in cfg["generators"]] == ["cc", "dsh", "codex", "opencode"]
     by_id = {g["id"]: g for g in cfg["generators"]}
     assert by_id["cc"]["configKind"] == "file"
     assert by_id["dsh"]["configKind"] == "file"
     assert by_id["codex"]["configKind"] == "file"
     assert by_id["opencode"]["configKind"] == "file"
-    assert by_id["llm"]["configKind"] == "object"
     assert by_id["cc"]["configDefault"] is not None  # ~/.claude/settings.json
     assert by_id["cc"]["configPathEnv"] == "DEEPWIKI_CC_CONFIG"
     assert by_id["cc"]["providers"] == []  # file 类不再暴露 provider 选择
-    assert by_id["llm"]["providers"] == ["openai"]
     assert by_id["codex"]["capability"] == "responses"
     assert by_id["opencode"]["capability"] == "opencode-cli"
     assert by_id["opencode"]["configPathEnv"] == "DEEPWIKI_OPENCODE_CONFIG"
     assert by_id["opencode"]["configDefault"] is None
     assert by_id["opencode"]["providers"] == []
-    prov = {p["id"]: p for p in cfg["providers"]}
-    assert prov["openai"]["apiKeyEnv"] == "OPENAI_API_KEY"
-    assert prov["openai"]["baseUrlDefault"] == "https://api.openai.com/v1"
+    assert cfg["providers"] == []
     assert cfg["defaultGenerator"] == "cc"
     assert cfg["defaultTarget"]["generator"] == "cc"
     # file 类默认 generator → generator_config = {"config_path": ...}
@@ -194,6 +182,18 @@ def test_chat_validation_400():
         ).status_code
         == 400
     )
+
+
+def test_codemap_not_indexed_425(tmp_path):
+    """codemap 端点同式守卫(决策:补 _require_indexed;与 chat 425 对称)。"""
+    raw = str(tmp_path / "empty_src")
+    os.makedirs(raw)
+    r = _client().post(
+        "/codemap/stream",
+        json={"repo_url": raw, "type": "local", "question": "how do I X?"},
+    )
+    assert r.status_code == 425
+    assert "尚未索引" in r.json()["detail"]
 
 
 # ---------------------------------------------------------------------------

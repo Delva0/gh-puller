@@ -3,17 +3,14 @@
 不调 Claude agent(不依赖 API key / CLI):
 - 环境变量要求:ANTHROPIC_API_KEY 不设;DEEPWIKI_ROOT 指向临时目录(见 tests/conftest.py)。
 - 覆盖:调度机(join 去重/缓存胜/续跑恢复/按 target 隔离)、主流程(索引→结构→页面→
-  成品缓存,离线:生成函数全部 monkeypatch 或交付文件预置)、页级并发与错误占位。
+  成品缓存,离线:生成函数全部 monkeypatch 或缓存文件预置)、页级并发与错误占位。
 - 引擎契约/纯函数/生成协议测试仍在根 tests/test_deepwiki.py。
 
 patch 约定:tasks 自身模块全局(tasks.generate_repo_wiki / tasks._WIKI_TASK_TTL_SECONDS /
-tasks._generate_page_with_retry / tasks._WIKI_PAGE_CONCURRENCY)与 tasks.registry.* 直指
-server;引擎 patch 位点为其属主子模块(AgentWikiPipeline._deliver 类方法 /
-deepwiki.utils.llm_stream(llm 路直呼)、管线类方法;图服务的 patch 位点在
-generators 模块(generators._search_hits / generators._run_index —— 图服务属
-本 app 组装层,经
-generator_config["graph"] 注入);空选型分派 = 引擎内建 cc(缺省生成器已迁
-webui 边界,不读 env)。
+tasks._generate_page_with_retry / tasks._WIKI_PAGE_CONCURRENCY / tasks.determine_structure
+等经门面 import 的引擎函数)与 tasks.registry.* 直指 server;引擎 patch 位点为其
+属主子模块(deepwiki.wiki._produce_file / 主流程函数);建图 patch 位点在 generators 模块
+(generators._run_index);空选型 = 引擎内建 cc(缺省生成器已迁 webui 边界,不读 env)。
 """
 
 import asyncio
@@ -32,9 +29,13 @@ from gh_puller.deepwiki import (
     save_wiki_cache,
     write_resume_state,
 )
-from gh_puller.deepwiki import utils as deepwiki_utils
 from gh_puller.deepwiki.utils import generator_digest
-from gh_puller.deepwiki.wiki import resume_state_path, wiki_cache_dir
+from gh_puller.deepwiki.wiki import (
+    _generator_cache_page_path,
+    _generator_cache_structure_path,
+    resume_state_path,
+    wiki_cache_dir,
+)
 from gh_puller.utils import Repo, TaskStatus
 
 import generators
@@ -93,30 +94,6 @@ _STRUCT_XML = """<wiki_structure>
 </wiki_structure>"""
 
 
-class _FakeGraph:
-    """图服务假类(注入 generator_config['graph']);解析/窗口属 generators 模块,假件只回块。
-
-    ready 可钉(未索引路径);context 记录 question(替代旧 deepwiki.graphify.query 捕获),
-    可钉 blocks(行窗块,供 format_subgraph_context / chunk_count)或 error(→
-    "代码图谱不可用: ..." 同式包装,检索失败须 raise 语义)。
-    """
-
-    def __init__(self, *, ready: bool = True, blocks=None, error: str = ""):
-        self.ready_value = ready
-        self.blocks = list(blocks or [])
-        self.error = error
-        self.questions: list[str] = []
-
-    def ready(self, repo) -> bool:
-        return self.ready_value
-
-    async def context(self, repo, question) -> dict:
-        self.questions.append(question)
-        if self.error:
-            raise RuntimeError(f"代码图谱不可用: {self.error}")
-        return {"hits": {}, "blocks": self.blocks}
-
-
 # ---------------------------------------------------------------------------
 # 主流程编排(离线)。
 # ---------------------------------------------------------------------------
@@ -136,7 +113,7 @@ async def test_generate_pages_concurrency_bounded(monkeypatch):
     active = 0
     max_active = 0
 
-    async def fake_generate(task, page, pipeline, prepared, gc=None):
+    async def fake_generate(task, page, prepared, gc=None):
         nonlocal active, max_active
         active += 1
         max_active = max(max_active, active)
@@ -148,15 +125,7 @@ async def test_generate_pages_concurrency_bounded(monkeypatch):
     monkeypatch.setattr(tasks, "_WIKI_PAGE_CONCURRENCY", 4)
     task = tasks.WikiTask(request=_make_request("conc-io", "demo"))
     task.wiki_structure = _make_structure([f"p{i}" for i in range(8)])
-    pages = await tasks._generate_pages(
-        task,
-        tasks._wiki_pipeline(
-            task.request["target"].get("generator"),
-            task.request["target"].get("generator_config"),
-        ),
-        _prepared(),
-        None,
-    )
+    pages = await tasks._generate_pages(task, _prepared(), None)
     assert max_active == 4
     assert len(pages) == 8 and len(task.generated_pages) == 8
     assert task.pages_done == 8
@@ -358,53 +327,44 @@ async def test_cache_hit_respects_target(monkeypatch, tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# cc/llm 双路径(离线:交付文件预置 / agent 与 llm_stream 全部 monkeypatch)
+# 生成器管道(离线:缓存文件预置 / 执行全 monkeypatch)
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_dispatch_structure_by_generator(monkeypatch):
-    """生成器分派:同一 _determine_structure 按显式选型经 _wiki_pipeline 选路(空选型=内建 cc)。"""
+async def test_determine_structure_single_pipeline(monkeypatch):
+    """结构确定 = 单一主流程函数(tasks 经门面 import 的绑定;失败上抛使任务 FAILED)。"""
     calls = []
 
-    async def fake_llm(**kwargs):
-        calls.append("llm")
+    async def fake_determine(**kwargs):
+        calls.append("determine")
         return _make_structure(["p1"])
 
-    async def fake_cc(**kwargs):
-        calls.append("cc")
-        return _make_structure(["p1"])
-
-    monkeypatch.setattr(deepwiki.LlmWikiPipeline, "determine_structure", staticmethod(fake_llm))
-    monkeypatch.setattr(deepwiki.AgentWikiPipeline, "determine_structure", staticmethod(fake_cc))
+    monkeypatch.setattr(tasks, "determine_structure", fake_determine)
     request = _make_request("dispatch-io", "demo")
     task = tasks.WikiTask(request=request)
 
-    await tasks._determine_structure(task, tasks._wiki_pipeline("cc", None), _prepared(), None)
-    assert calls == ["cc"]
+    await tasks._determine_structure(task, _prepared(), None)
+    assert calls == ["determine"]
     assert task.default_branch == "main"  # 结构确定时记录分支
-
-    calls.clear()
-    await tasks._determine_structure(task, tasks._wiki_pipeline("llm", None), _prepared(), None)
-    assert calls == ["llm"]
 
 
 @pytest.mark.asyncio
-async def test_determine_structure_cc_skips_when_file_exists(monkeypatch):
-    """cc 结构续跑:structure.md 已存在则直接解析,不启动 agent。"""
+async def test_determine_structure_skips_when_file_exists(monkeypatch):
+    """结构续跑:structure.md 已存在则直接解析,不启动生成器。"""
     request = _make_request("cc-struct", "demo")
-    struct_path = deepwiki.AgentWikiPipeline()._agent_cache_structure_path(
+    struct_path = _generator_cache_structure_path(
         _proj(request), request["target"].get("generator"), request["target"].get("generator_config"),
     )
     struct_path.parent.mkdir(parents=True, exist_ok=True)
     struct_path.write_text(_STRUCT_XML, encoding="utf-8")
 
     async def boom(*args, **kwargs):
-        raise AssertionError("agent must not be called")
+        raise AssertionError("generator must not be called")
 
-    monkeypatch.setattr(deepwiki.AgentWikiPipeline, "_deliver", boom)
+    monkeypatch.setattr(deepwiki.wiki, "_produce_file", boom)
     repo = Repo("/tmp/gh-puller-test-repo", "local")
-    s = await deepwiki.AgentWikiPipeline().determine_structure(
+    s = await deepwiki.determine_structure(
         generator=request["target"].get("generator"), generator_config=request["target"].get("generator_config"),
         repo=repo, owner=request["owner"], repo_name=request["repo"],
         file_tree=["src/a.py"], readme="", comprehensive=request["comprehensive"],
@@ -414,8 +374,8 @@ async def test_determine_structure_cc_skips_when_file_exists(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_determine_structure_cc_calls_agent_no_inline(tmp_path, monkeypatch):
-    """cc 结构走 agent 并读回文件;提示词只有文件树路径,不内联任何文件内容。"""
+async def test_determine_structure_calls_generator_no_inline(tmp_path, monkeypatch):
+    """结构走生成器并读回文件;提示词只有文件树路径,不内联任何文件内容。"""
     (tmp_path / "src").mkdir()
     (tmp_path / "src" / "a.py").write_text("SECRET_CODE_BODY", encoding="utf-8")
     (tmp_path / "README.md").write_text("SECRET_README_BODY", encoding="utf-8")
@@ -426,16 +386,16 @@ async def test_determine_structure_cc_calls_agent_no_inline(tmp_path, monkeypatc
     }
     captured = {}
 
-    async def fake_deliver(self, adapter, prompt, out_path, label=None, run_id=None):
+    async def fake_produce(adapter, prompt, out_path, label=None, run_id=None):
         captured["prompt"] = prompt
         captured["run_id"] = run_id
         Path(out_path).parent.mkdir(parents=True, exist_ok=True)
         Path(out_path).write_text(_STRUCT_XML, encoding="utf-8")  # noqa: ASYNC240 - 测试桩内同步盘操作,开销极小
         return _STRUCT_XML
 
-    monkeypatch.setattr(deepwiki.AgentWikiPipeline, "_deliver", fake_deliver)
+    monkeypatch.setattr(deepwiki.wiki, "_produce_file", fake_produce)
     repo = Repo(str(tmp_path), "local")
-    s = await deepwiki.AgentWikiPipeline().determine_structure(
+    s = await deepwiki.determine_structure(
         generator=request["target"].get("generator"), generator_config=request["target"].get("generator_config"),
         repo=repo, owner=request["owner"], repo_name=request["repo"],
         file_tree=["src/a.py"], readme="", comprehensive=request["comprehensive"],
@@ -450,47 +410,41 @@ async def test_determine_structure_cc_calls_agent_no_inline(tmp_path, monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_page_cc_skips_when_file_exists(monkeypatch):
-    """cc 页续跑:page_<id>.md 已存在则直接读回(文件为权威),不启动 agent。"""
+async def test_page_skips_when_file_exists(monkeypatch):
+    """页续跑:page_<id>.md 已存在则直接读回(文件为权威),不启动生成器。"""
     request = _make_request("cc-page", "demo")
-    out = deepwiki.AgentWikiPipeline()._agent_cache_page_path(
+    out = _generator_cache_page_path(
         _proj(request), "p1", request["target"].get("generator"), request["target"].get("generator_config"),
     )
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text("## PA-REAL\n\nbody\n", encoding="utf-8")
 
     async def boom(*args, **kwargs):
-        raise AssertionError("agent must not be called")
+        raise AssertionError("generator must not be called")
 
-    monkeypatch.setattr(deepwiki.AgentWikiPipeline, "_deliver", boom)
+    monkeypatch.setattr(deepwiki.wiki, "_produce_file", boom)
     task = tasks.WikiTask(request=request)
-    pipeline = tasks._wiki_pipeline(
-        request["target"].get("generator"), request["target"].get("generator_config"),
-    )
-    got = await tasks._generate_page(task, _make_page("p1"), pipeline, _prepared(), None)
+    got = await tasks._generate_page(task, _make_page("p1"), _prepared(), None)
     assert "PA-REAL" in got.content
     assert got.id == "p1"
 
 
 @pytest.mark.asyncio
-async def test_page_cc_calls_agent_and_reads_file(monkeypatch):
-    """cc 页走 agent 落盘后读回;提示词只给路径并含交付指令,不内联文件内容。"""
+async def test_page_calls_generator_and_reads_file(monkeypatch):
+    """页走生成器落盘后读回;提示词只给路径并含写盘指令,不内联文件内容。"""
     request = _make_request("cc-page2", "demo")
     captured = {}
 
-    async def fake_deliver(self, adapter, prompt, out_path, label=None, run_id=None):
+    async def fake_produce(adapter, prompt, out_path, label=None, run_id=None):
         captured["prompt"] = prompt
         captured["run_id"] = run_id
         Path(out_path).parent.mkdir(parents=True, exist_ok=True)
         Path(out_path).write_text("## PB-REAL\n\ncontent\n", encoding="utf-8")  # noqa: ASYNC240 - 测试桩内同步盘操作,开销极小
         return "## PB-REAL\n\ncontent\n"
 
-    monkeypatch.setattr(deepwiki.AgentWikiPipeline, "_deliver", fake_deliver)
+    monkeypatch.setattr(deepwiki.wiki, "_produce_file", fake_produce)
     task = tasks.WikiTask(request=request)
-    pipeline = tasks._wiki_pipeline(
-        request["target"].get("generator"), request["target"].get("generator_config"),
-    )
-    got = await tasks._generate_page(task, _make_page("p2"), pipeline, _prepared(), None)
+    got = await tasks._generate_page(task, _make_page("p2"), _prepared(), None)
     assert "PB-REAL" in got.content
     assert "- [src/main.py](src/main.py)" in captured["prompt"]
     assert "DELIVERABLE" in captured["prompt"]
@@ -499,19 +453,18 @@ async def test_page_cc_calls_agent_and_reads_file(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_generate_page_with_retry_exhausted_writes_placeholder(tmp_path, monkeypatch):
-    """重试耗尽:返回错误占位页且 cc 交付文件落盘(占位文本不经格式化,续跑可跳过)。"""
+    """重试耗尽:返回错误占位页且缓存文件落盘(占位文本不经格式化,续跑可跳过)。"""
     request = _make_request("retry-io", "demo")
 
     async def boom(*args, **kwargs):
         raise RuntimeError("boom")
 
-    pipeline = deepwiki.AgentWikiPipeline()
-    monkeypatch.setattr(pipeline, "generate_page", boom)
+    monkeypatch.setattr(tasks, "generate_page", boom)
     task = tasks.WikiTask(request=request)
     monkeypatch.setattr(tasks, "_WIKI_PAGE_RETRIES", 1)
-    got = await tasks._generate_page_with_retry(task, _make_page("p1"), pipeline, _prepared(), None)
+    got = await tasks._generate_page_with_retry(task, _make_page("p1"), _prepared(), None)
     assert got.content.startswith("Error generating content:")
-    out = pipeline._agent_cache_page_path(
+    out = _generator_cache_page_path(
         _proj(request), "p1", request["target"].get("generator"), request["target"].get("generator_config"),
     )
     assert out.exists()
@@ -519,88 +472,8 @@ async def test_generate_page_with_retry_exhausted_writes_placeholder(tmp_path, m
 
 
 @pytest.mark.asyncio
-async def test_page_llm_through_research_chat(tmp_path, monkeypatch):
-    """llm 页(原版同式):页面提示词(仅链接,不内联内容)作为查询经 research_chat 等价流。
-
-    SIMPLE 角色 + /no_think + 检索上下文 <START_OF_CONTEXT> 注入。
-    """
-    (tmp_path / "src").mkdir()
-    (tmp_path / "src" / "a.py").write_text("x = 1\n", encoding="utf-8")
-    captured = {}
-    graph = _FakeGraph(blocks=[{"path": "src/a.py", "text": "x = 1", "start_line": 1, "end_line": 1}])
-
-    async def fake_llm_stream(prompt, *, generator=None, generator_config=None, session_name=None, run_id=None,
-                              **kw):
-        captured["session"] = session_name
-        captured["prompt"] = prompt
-        captured["generator"] = generator
-        yield "LLM-CONTENT"
-
-    monkeypatch.setattr(deepwiki_utils, "llm_stream", fake_llm_stream)
-    request = {**_make_request("llm-page", "demo"), "target": {"generator": "llm"}}
-    page = WikiPage(
-        id="p1", title="Page p1", content="", filePaths=["src/a.py"],
-        importance="medium", relatedPages=[],
-    )
-    repo = Repo(str(tmp_path), "local")
-    content = await deepwiki.LlmWikiPipeline().generate_page(
-        generator=request["target"].get("generator"),
-        generator_config={"graph": graph}, repo=repo,
-        page=page, language=request["language"],
-        default_branch="main", run_id=_proj(request),
-    )
-    # 终态格式化收进 pipeline:引用详情块注入、链接按规范式生成
-    assert "LLM-CONTENT" in content
-    assert content.startswith("<details>")
-    assert "- [src/a.py](src/a.py)" in content
-    assert captured["session"] == "wiki:page:p1"
-    assert captured["generator"] == "llm"  # model/url/api_key 由选型经 adapter 注入
-    user_msg = captured["prompt"]  # 模块级 llm_stream 只收单条 user 消息(payload 内部形态)
-    assert "/no_think " in user_msg and "expert code analyst" in user_msg  # SIMPLE 角色模板
-    assert "<START_OF_CONTEXT>" in user_msg and "<END_OF_CONTEXT>" in user_msg
-    assert "## File Path: src/a.py" in user_msg and "[lines 1-1]" in user_msg
-    assert "<details>" in user_msg and "Page p1" in user_msg  # 页面提示词为查询
-    assert '<file path="' not in user_msg  # 不再内联内容(原版由检索上下文提供)
-    assert "<query>\n" in user_msg and "\nAssistant: " in user_msg
-    assert graph.questions[0].startswith("You are an expert technical writer")
-
-
-@pytest.mark.asyncio
-async def test_page_llm_input_too_large_skips_retrieval(tmp_path, monkeypatch):
-    """llm 页(原版 MAX_INPUT_TOKENS 语义):查询估算超限 → 跳过检索,注入 note。
-
-    note 文本为 "Answering without retrieval augmentation.";历史/页提示词照常。
-    """
-    captured = {}
-    graph = _FakeGraph(blocks=[])
-
-    async def fake_llm_stream(prompt, *, generator=None, generator_config=None, session_name=None, run_id=None,
-                              **kw):
-        captured["prompt"] = prompt
-        yield "HUGE"
-
-    monkeypatch.setattr(deepwiki_utils, "llm_stream", fake_llm_stream)
-    request = {**_make_request("llm-huge", "demo"), "target": {"generator": "llm"}}
-    page = WikiPage(
-        id="p1", title="x" * 40000, content="", filePaths=[],
-        importance="medium", relatedPages=[],
-    )
-    repo = Repo(str(tmp_path), "local")
-    assert await deepwiki.LlmWikiPipeline().generate_page(
-        generator=request["target"].get("generator"),
-        generator_config={"graph": graph}, repo=repo,
-        page=page, language=request["language"],
-        default_branch="main", run_id=_proj(request),
-    ) == "HUGE"
-    assert graph.questions == []  # 检索未被调用(输入过大跳过)
-    user_msg = captured["prompt"]
-    assert "Answering without retrieval augmentation." in user_msg
-    assert "\nAssistant: " in user_msg
-
-
-@pytest.mark.asyncio
-async def test_generate_repo_wiki_cc_assemble_and_resume(tmp_path, monkeypatch):
-    """cc 端到端(离线):structure/全部页文件预落盘 → 零 agent 调用完成。
+async def test_generate_repo_wiki_assemble_and_resume(tmp_path, monkeypatch):
+    """端到端(离线):structure/全部页文件预落盘 → 零生成器调用完成。
 
     JSON 正文与文件一致、taskstate 清理、页面完成数按文件水合。
     """
@@ -618,23 +491,22 @@ async def test_generate_repo_wiki_cc_assemble_and_resume(tmp_path, monkeypatch):
     cdir = generators._cbm_cache_dir()
     cdir.mkdir(parents=True, exist_ok=True)
     (cdir / f"{generators.project_name(fake_repo)}.db").touch()
-    # 预置结构 + 全部页面交付文件
-    pipeline = deepwiki.AgentWikiPipeline()
-    struct_path = pipeline._agent_cache_structure_path(
+    # 预置结构 + 全部页面缓存文件
+    struct_path = _generator_cache_structure_path(
         _proj(request), request["target"].get("generator"), request["target"].get("generator_config"),
     )
     struct_path.parent.mkdir(parents=True, exist_ok=True)
     struct_path.write_text(_STRUCT_XML, encoding="utf-8")
     for pid in ("p1", "p2", "p3"):
-        page_path = pipeline._agent_cache_page_path(
+        page_path = _generator_cache_page_path(
             _proj(request), pid, request["target"].get("generator"), request["target"].get("generator_config"),
         )
         page_path.write_text(f"## {pid}-REAL\n\nbody\n", encoding="utf-8")
 
     async def boom(*args, **kwargs):
-        raise AssertionError("agent must not be called")
+        raise AssertionError("generator must not be called")
 
-    monkeypatch.setattr(deepwiki.AgentWikiPipeline, "_deliver", boom)
+    monkeypatch.setattr(deepwiki.wiki, "_produce_file", boom)
     task = tasks.WikiTask(request=request)
     await tasks.generate_repo_wiki(task)
     assert task.status == TaskStatus.COMPLETED
@@ -654,38 +526,3 @@ async def test_generate_repo_wiki_cc_assemble_and_resume(tmp_path, monkeypatch):
     resume_path = Path(resume_state_path("local", "demo", "local", "en", digest=digest))
     assert not resume_path.exists()  # noqa: ASYNC240 - 测试内同步盘操作,开销极小
     assert task.pages_done == 3
-
-
-@pytest.mark.asyncio
-async def test_determine_structure_llm_streams(monkeypatch):
-    """llm 路结构(原版同式):结构提示词作为查询经 research_chat 等价流。
-
-    /no_think + SIMPLE 角色 + 无命中时"无检索增强"note,解析 XML。
-    """
-    captured = {}
-    graph = _FakeGraph(blocks=[])
-
-    async def fake_llm_stream(prompt, *, generator=None, generator_config=None, session_name=None, run_id=None,
-                              **kw):
-        captured["session"] = session_name
-        captured["prompt"] = prompt
-        yield _STRUCT_XML
-
-    monkeypatch.setattr(deepwiki_utils, "llm_stream", fake_llm_stream)
-    request = {**_make_request("llm-struct", "demo"), "target": {"generator": "llm"}}
-    repo = Repo("/tmp/gh-puller-test-repo", "local")
-    s = await deepwiki.LlmWikiPipeline().determine_structure(
-        generator=request["target"].get("generator"), generator_config={"graph": graph},
-        repo=repo, owner=request["owner"], repo_name=request["repo"],
-        file_tree=["app.py"], readme="", comprehensive=request["comprehensive"],
-        language=request["language"], run_id=_proj(request),
-    )
-    assert [p.id for p in s.pages] == ["p1", "p2", "p3"]
-    assert captured["session"] == "wiki:structure"
-    user_msg = captured["prompt"]
-    assert "/no_think " in user_msg and "expert code analyst" in user_msg
-    assert "Answering without retrieval augmentation." in user_msg
-    assert graph.questions[0].startswith("Analyze this GitHub repository llm-struct/demo")
-    # 输入仅文件树路径(含 <file_tree> 标签),无任何文件内容内联。
-    assert "<file_tree>" in user_msg
-    assert "app.py" in user_msg

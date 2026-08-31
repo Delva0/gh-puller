@@ -1,5 +1,6 @@
-// 事件溯源 surface 折叠(与 dsh packages/core/session/src/surface.ts 同语义;
-// gh-puller 单份规范实现,Python 侧契约测试见 tests/test_event_taxonomy.py)。
+// 事件溯源 surface 折叠:规范定义在 gh_puller/agent/events.py(与 dsh
+// packages/core/session/src/surface.ts 同语义);本文件为 gh-puller 侧实现,
+// 契约测试见 tests/test_event_taxonomy.py。
 
 import type { EventEnvelope, Message, SurfaceOp } from './types';
 

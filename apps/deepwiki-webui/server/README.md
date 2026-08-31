@@ -14,7 +14,7 @@ uv --directory apps/deepwiki-webui/server run uvicorn app:app --port 8001
 - 引擎（纯数据 dataclass/dict + 纯函数式生成协议、缓存与状态 IO，**零 pydantic、零 Request 概念、零
   graphify/claude_agent_sdk 依赖**）由 `gh_puller` 包提供（`gh_puller/deepwiki/`）;wiki 任务调度与执行
   (注册表、主流程、进度落盘投影)在本目录 `tasks.py`;HTTP 端点与 wire 契约（请求/响应 pydantic 校验,唯一验证面）
-  在本目录 `app.py` / `schemas.py`;gh-puller-mcp 组装（图服务/索引保障/MCP 工具桌 + runtime_config 覆盖构造参数注入）
+  在本目录 `app.py` / `schemas.py`;gh-puller-mcp 组装（索引保障/MCP 工具桌 + runtime_config 覆盖构造参数注入）
   唯一收容点在本目录 `generators.py`。图后端 = `apps/gh-puller-mcp/`（MCP 服务器,后端透传 C 二进制
   `codebase-memory-mcp`;运行前提:`uv` 在 PATH、二进制按 GH_PULLER_MCP_BINARY/PATH/`~/.local/bin`
   解析）;索引 db 落 `<CBM_CACHE_DIR>/<project>.db`（缺省 `~/.cache/codebase-memory-mcp`）
@@ -28,8 +28,8 @@ uv --directory apps/deepwiki-webui/server run uvicorn app:app --port 8001
   自 cwd 向上找仓库根 `.env`,先于任何 gh_puller 导入与本模块快照；仓库根 `.env` 已 gitignore,
   可放 `ANTHROPIC_API_KEY`/`ANTHROPIC_BASE_URL` 等进程级兜底凭证（由 agent SDK 直读进程环境）
 - target 契约:generator + generator_config(cc/dsh/codex/opencode = 本地配置文件路径 `config_path`,
-  服务端纯透传给 agent 生成器;llm = provider/model/凭证 dict),见 `gh_puller/agent/generators:GENERATORS`;
-  gh-puller-mcp 工具桌与图服务由本目录 `generators.py` 经 `runtime_config` 注入 generator_config
+  服务端纯透传给生成器),见 `gh_puller/agent/generators:GENERATORS`;
+  gh-puller-mcp 工具桌由本目录 `generators.py` 经 `runtime_config` 注入 generator_config
   (引擎 adapter 只做白名单透传);工具桌档位 scout(只读正查面),变更面(index_repository 等)
   仅服务器进程内建图使用
 - 契约测试：`uv run pytest`（`tests/test_app.py`，不调用 Claude agent）

@@ -10,7 +10,7 @@
   旧 v1 聚合行/坏行文件跳过不崩;
 - 租约(孤儿判定):无终态行 + 文件 mtime 静止超租约 → 派生 aborted(seed 与 scan
   均生效,纯内存态不写盘);文件复活(新事件/新 mtime)自愈回 running,终态行 → completed;
-  scan 翻转广播一次 index(幂等);session/heartbeat 走通用分支(不广播 index);
+  scan 翻转广播一次 index(幂等);非终态事件走通用分支(不广播 index);
 - 查看端广播 index:feed 新建会话/终态翻转时向全部查看端推 {type:'index'}
   (每 run ≤2 帧;既有会话内事件不广播),断连端剔除不异常;
 - delete:内存+磁盘一体删,向全部查看端广播新 index(请求端在内),
@@ -68,7 +68,9 @@ def client(tmp_path):
 
 def test_index_subscribe_live_and_finalize(client):
     """生产端全流程 → 两个查看端:索引含 run_id/num_events;subscribe evt_ready(lastSeq)
-    → live 广播;终态 completed 进索引。"""
+
+    → live 广播;终态 completed 进索引。
+    """
     with client.websocket_connect("/ws") as producer:
         producer.send_text(json.dumps({"type": "evt", "event": _evt(
             "session/start", "s1", seq=0, run_id="chat:demo", label="chat:demo",
@@ -361,7 +363,8 @@ def test_delete_removes_memory_and_disk_and_broadcasts(tmp_path):
     """delete 帧:内存+磁盘一体删;广播新 index(请求端在内);幽灵删除幂等。
 
     磁盘会话(种子)与内存会话(生产端 live)同删一留;磁盘文件同步删除
-    (只删内存则重启后复活)。"""
+    (只删内存则重启后复活)。
+    """
     tmp_path.mkdir(parents=True, exist_ok=True)  # 扁平根:jsonl 直放 tmp_path(无 sessions 子层)
     disk = [_evt("session/start", "gh-puller/dsk", seq=0, run_id="r", label="l"),
             _user_evt("gh-puller/dsk", 1, "hi")]
@@ -370,24 +373,23 @@ def test_delete_removes_memory_and_disk_and_broadcasts(tmp_path):
     hub = _Hub()
     hub.seed(str(tmp_path))
     app = create_app(hub)
-    with TestClient(app) as c:
-        with c.websocket_connect("/ws") as producer:
-            producer.send_text(json.dumps({"type": "evt", "event": _evt(
-                "session/start", "live1", seq=0, run_id="chat:x", label="chat:x")},
-                ensure_ascii=False))
-            with c.websocket_connect("/ws") as v:
-                v.send_text(json.dumps({"type": "delete", "session": "gh-puller/dsk"},
-                                       ensure_ascii=False))
-                idx = json.loads(v.receive_text())
-                assert idx["type"] == "index"
-                assert {s["session"] for s in idx["sessions"]} == {"live1"}
-                assert "gh-puller/dsk" not in hub.sessions
-                assert not (tmp_path /"dsk.jsonl").exists()
-                # 幽灵删除:不动状态,仍回 index 帧(客户端以索引回响推进列表)
-                v.send_text(json.dumps({"type": "delete", "session": "ghost"},
-                                       ensure_ascii=False))
-                assert json.loads(v.receive_text())["type"] == "index"
-                assert {s["session"] for s in hub.index()} == {"live1"}
+    with TestClient(app) as c, c.websocket_connect("/ws") as producer:
+        producer.send_text(json.dumps({"type": "evt", "event": _evt(
+            "session/start", "live1", seq=0, run_id="chat:x", label="chat:x")},
+            ensure_ascii=False))
+        with c.websocket_connect("/ws") as v:
+            v.send_text(json.dumps({"type": "delete", "session": "gh-puller/dsk"},
+                                   ensure_ascii=False))
+            idx = json.loads(v.receive_text())
+            assert idx["type"] == "index"
+            assert {s["session"] for s in idx["sessions"]} == {"live1"}
+            assert "gh-puller/dsk" not in hub.sessions
+            assert not (tmp_path /"dsk.jsonl").exists()
+            # 幽灵删除:不动状态,仍回 index 帧(客户端以索引回响推进列表)
+            v.send_text(json.dumps({"type": "delete", "session": "ghost"},
+                                   ensure_ascii=False))
+            assert json.loads(v.receive_text())["type"] == "index"
+            assert {s["session"] for s in hub.index()} == {"live1"}
 
 
 def test_no_index_spam_on_same_session_events(client):
@@ -433,10 +435,10 @@ def test_lease_seed_flips_stale_crash_residue(tmp_path):
 
 
 def test_lease_keeps_fresh_running_sessions(tmp_path):
-    """活动会话(含心跳行,mtime 新鲜):seed/scan 均保持 running。"""
+    """活动会话(含流式行,mtime 新鲜):seed/scan 均保持 running。"""
     tmp_path.mkdir(parents=True, exist_ok=True)  # 扁平根:jsonl 直放 tmp_path(无 sessions 子层)
     rows = [_evt("session/start", "chat:live", seq=0, run_id="chat:demo", label="chat:demo"),
-            _evt("session/heartbeat", "chat:live", seq=1)]
+            _evt("assistant/chunk", "chat:live", seq=1)]
     (tmp_path /"chat-live.jsonl").write_text(
         "".join(json.dumps(x, ensure_ascii=False) + "\n" for x in rows), encoding="utf-8")
     hub = _Hub(lease_secs=150)
@@ -453,7 +455,7 @@ def test_lease_recovery_after_aborted(tmp_path):
     hub.seed(str(tmp_path))
     assert hub.index()[0]["state"] == "aborted"
     with open(path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(_evt("session/heartbeat", "chat:revive", seq=1),
+        f.write(json.dumps(_evt("assistant/chunk", "chat:revive", seq=1),
                            ensure_ascii=False) + "\n")
     os.utime(path, (time.time(), time.time()))
     asyncio.run(hub.scan())
@@ -494,8 +496,8 @@ def test_scan_skips_missing_or_fileless_sessions():
     assert hub.index()[0]["state"] == "running"
 
 
-def test_feed_heartbeat_tolerance(monkeypatch):
-    """session/heartbeat:走通用分支 —— state 仍 running、last_ts 更新、零 index 广播、订阅端收 live。"""
+def test_feed_nonterminal_event_tolerance(monkeypatch):
+    """非终态事件(assistant/chunk):走通用分支 —— state 仍 running、last_ts 更新、零 index 广播、订阅端收 live。"""
     hub = _Hub()
     frames: list[bool] = []
 
@@ -513,9 +515,9 @@ def test_feed_heartbeat_tolerance(monkeypatch):
             got.append(json.loads(payload))
 
     hub.sessions["chat:hb"].subscribers.add(_FakeWs())
-    hb = _evt("session/heartbeat", "chat:hb", seq=1)
+    hb = _evt("assistant/chunk", "chat:hb", seq=1, text="x")
     asyncio.run(hub.feed(hb))
     assert len(frames) == 1  # 心跳不广播(index 只由 新会话/终态 触发)
-    assert got and got[-1]["event"]["type"] == "session/heartbeat"
+    assert got and got[-1]["event"]["type"] == "assistant/chunk"
     s = hub.index()[0]
     assert s["state"] == "running" and s["num_events"] == 2 and s["last_ts"] == hb["ts"]
