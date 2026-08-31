@@ -29,7 +29,7 @@ import dataclasses
 import os
 import time
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from gh_puller import deepwiki
 from gh_puller.deepwiki import (
@@ -212,6 +212,15 @@ class TaskRegistry:
     async def remove(self, task_id: str) -> WikiTask | None:
         async with self._lock:
             return self._tasks.pop(task_id, None)
+
+    async def shutdown(self) -> None:
+        """Cancel and join every task owned by the registry."""
+        async with self._lock:
+            running = [task.task for task in self._tasks.values()
+                       if task.task is not None and not task.task.done()]
+        for task in running:
+            task.cancel()
+        await asyncio.gather(*running, return_exceptions=True)
 
     async def submit(self, task: WikiTask) -> TaskSubmitResult:
         key = task.key
@@ -522,6 +531,8 @@ async def _generate_page_with_retry(
         try:
             return await _generate_page(task, page, prepared, gc)
         except Exception as e:
+            if asyncio.current_task().cancelling():
+                raise asyncio.CancelledError from e
             last_error = e
             log(f"页面 {page.id} 生成失败(尝试 {attempt + 1}/{_WIKI_PAGE_RETRIES + 1}): {e}")
     # 重试耗尽:回退错误占位页,保证整个 wiki 仍能完成
@@ -565,4 +576,3 @@ async def _generate_pages(
 
     await asyncio.gather(*(one(page) for page in pending))
     return task.generated_pages
-

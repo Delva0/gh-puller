@@ -10,6 +10,7 @@ generators(索引保障/MCP 工具桌装配 + runtime_config 覆盖构造参数�
 """
 
 import asyncio
+import contextlib
 import json
 import os
 from datetime import datetime
@@ -141,7 +142,20 @@ def _generators_config() -> dict:
     }
 
 
-app = FastAPI(title="Streaming API", description="DeepWiki 兼容后端 (gh-puller)", version="0.1.0")
+@contextlib.asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    try:
+        yield
+    finally:
+        await registry.shutdown()
+
+
+app = FastAPI(
+    title="Streaming API",
+    description="DeepWiki 兼容后端 (gh-puller)",
+    version="0.1.0",
+    lifespan=_lifespan,
+)
 
 app.add_middleware(
     CORSMiddleware,

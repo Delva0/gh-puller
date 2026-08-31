@@ -372,6 +372,23 @@ async def test_determine_structure_skips_when_file_exists(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_registry_shutdown_cancels_owned_tasks():
+    started = asyncio.Event()
+
+    class BlockingRegistry(tasks.TaskRegistry):
+        async def run(self, task):
+            started.set()
+            await asyncio.Event().wait()
+
+    registry = BlockingRegistry()
+    task = tasks.WikiTask(request=_make_request("shutdown", "demo"))
+    await registry.submit(task)
+    await started.wait()
+    await registry.shutdown()
+    assert task.task is not None and task.task.cancelled()
+
+
+@pytest.mark.asyncio
 async def test_determine_structure_calls_generator_no_inline(tmp_path, monkeypatch):
     """结构走生成器并读回文件;提示词不内联任何文件内容,仓库由生成器自读。"""
     (tmp_path / "src").mkdir()
@@ -466,6 +483,32 @@ async def test_generate_page_with_retry_exhausted_writes_placeholder(tmp_path, m
     )
     assert out.exists()
     assert out.read_text(encoding="utf-8").startswith("Error generating content:")
+
+
+@pytest.mark.asyncio
+async def test_generate_page_with_retry_does_not_restart_after_cancellation(monkeypatch):
+    """A wrapped cancellation must not open another generator session."""
+    calls = 0
+
+    async def wrapped_cancel(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        current = asyncio.current_task()
+        assert current is not None
+        current.cancel()
+        try:
+            await asyncio.sleep(0)
+        except asyncio.CancelledError:
+            raise RuntimeError("wrapped cancellation") from None
+
+    monkeypatch.setattr(tasks, "_generate_page", wrapped_cancel)
+    task = tasks.WikiTask(request=_make_request("cancel-retry", "demo"))
+    runner = asyncio.create_task(
+        tasks._generate_page_with_retry(task, _make_page("p1"), _prepared(), None),
+    )
+    with pytest.raises(asyncio.CancelledError):
+        await runner
+    assert calls == 1
 
 
 @pytest.mark.asyncio
