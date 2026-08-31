@@ -2,12 +2,10 @@
 
     uv run python apps/gh-puller-mcp/examples/cc_mcp_vllm.py
 
-展示的 gh_puller.agent API(契约见 gh_puller/agent/__init__.py):
-- ClaudeCode(config):构造期注入 config,键集白名单见 ClaudeConfig
-  —— mcp_servers 经 ClaudeAgentOptions 透传(SDK 子进程启动 stdio MCP 服务器);
-- async with cc.session(...):一次上游对话(客户端 spawn 与监控装配同寿);
-- stream(prompt):流式产出 assistant 文本增量(thinking/工具调用只进监控事件流,
-  不构成产出);result(prompt) 则只取最后一轮终结答案。
+展示的 gh_puller.agent API(契约一律见 gh_puller/agent/generators/__init__.py 包
+docstring):ClaudeCode(config) 构造期注入 config,键集白名单见 ClaudeConfig ——
+mcp_servers 经 ClaudeAgentOptions 透传(SDK 子进程启动 stdio MCP 服务器);
+`async with cc.session(...)` 一次上游对话;stream/result 契约见包 docstring。
 
 注:无交互主机须放行工具许可(permission_mode=bypassPermissions);allowed_tools
 仍白名单只读面(index/建图/删项目等变更工具不在列)。

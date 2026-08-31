@@ -32,35 +32,23 @@ pythonpath = ["."]
 line-length = 120
 target-version = "py313"
 
-# 全量启用 + 定向豁免:豁免规则=与本项目有意风格冲突的误报,理由逐条注释。
-# 与根 pyproject.toml 保持一致(注释规范见 AGENTS.md「Python 注释规范」;两处须同改)。
 [tool.ruff.lint]
 select = ["ALL"]
 ignore = [
-    # 中文文本误报:全角标点/中文句读被误判为"歧义 Unicode"
     "RUF001", "RUF002", "RUF003",
-    # 英文句号/首词大写对中文 docstring 不适用(D400/D401 已由 google convention 排除)
     "D415", "D403",
-    # 函数/方法 docstring 按契约增补不强制(签名即文档);模块/包级仍强制(D100/D104)
     "D101", "D102", "D103", "D105", "D107",
-    # 类型标注不强制全量(研究型代码,部分标注是有意的)
     "ANN",
-    # 有意风格:接口形参按契约保留/跨模块访问内部属性/宽捕获/lazy import/相对导入/os.path/布尔位置传参
     "ARG", "SLF001", "BLE001", "PLC0415", "TID252", "PTH", "FBT",
-    # 有意风格:异常消息直接字符串;print 是 CLI/脚本合法输出;raise 后由上游统一降级是有意控制流
     "EM", "TRY003", "T201", "TRY301",
-    # 有意设计:模块态单例(configs/sinks「唯一模块态」层级纪律);git CLI 固定命令列表传参(隔离链设计)
     "PLW0602", "PLW0603", "S603", "S607",
-    # 有意风格:camelCase 字段名即 wire/落盘键(wiki/codemap 契约)、数学/上游命名
     "N803", "N806", "N815",
-    # 规模指标(复杂度/参数量/魔法数)不是本仓质量门槛
     "C901", "PLR0911", "PLR0912", "PLR0913", "PLR0915", "PLR0917", "PLR2004",
-    # 版权头;TODO 格式由注释规范约定;测试组合断言
     "CPY001", "TD", "FIX", "PT018",
 ]
 
 [tool.ruff.lint.pydocstyle]
-convention = "google" # 取其对中文 docstring 友好的排除集(英文句号/祈使语气等不适用)
+convention = "google"
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["S101", "S108", "INP001", "D100", "D104"]
