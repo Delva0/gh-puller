@@ -54,7 +54,7 @@ async def test_call_tool_search_graph_shim(tmp_path, monkeypatch):
     if shutil.which("uv") is None:
         pytest.skip("uv 不可用(gh-puller-mcp 经 uv 启动)")
     monkeypatch.setenv("GH_PULLER_MCP_BINARY", _shim(tmp_path))
-    data = await generators._call_tool("search_graph", {"project": "p", "query": "f"})
+    data = await generators._call_mcp_tool("search_graph", {"project": "p", "query": "f"})
     # 信封 structuredContent 解析 → 工具形状(dict 直出)
     assert data["cols"] == ["qn", "label", "file", "lines", "rank"]
     assert data["rows"][0][2] == "demo.py" and data["rows"][0][3] == "3-7"
@@ -66,4 +66,4 @@ async def test_call_tool_is_error_raises(tmp_path, monkeypatch):
         pytest.skip("uv 不可用(gh-puller-mcp 经 uv 启动)")
     monkeypatch.setenv("GH_PULLER_MCP_BINARY", _shim(tmp_path, raise_on="index_repository"))
     with pytest.raises(RuntimeError, match="backend error"):
-        await generators._call_tool("index_repository", {"repo_path": "/x"})
+        await generators._call_mcp_tool("index_repository", {"repo_path": "/x"})

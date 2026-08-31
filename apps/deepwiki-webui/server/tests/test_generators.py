@@ -16,7 +16,7 @@ import pytest
 from gh_puller.agent import GENERATORS
 from gh_puller.agent.generators.codex import codex_home_setup
 from gh_puller.agent.generators.dsh import dsh_cordis_path
-from gh_puller.deepwiki.utils import adapter
+from gh_puller.deepwiki.utils import adapt_generator
 from gh_puller.utils import Repo
 
 import generators
@@ -43,40 +43,35 @@ def test_runtime_config_injects_tooltable_by_backend(tmp_path, monkeypatch):
     """工具桌按后端注入:cc/dsh/codex/opencode 得 mcp_servers
 
     (cc McpStdioServerConfig + 图工具名 / dsh 子进程描述 / codex/opencode 子进程描述 +
-    env 条件透传 CBM_*)+ 工具指引文本;llm 无工具桌位(直连 HTTP)。
+    env 条件透传 CBM_*);llm 无工具桌位(直连 HTTP)。
     """
     monkeypatch.setenv("CBM_CACHE_DIR", "/tmp/cbm-cache")
     monkeypatch.setenv("CBM_RUNTIME_DIR", "/tmp/cbm-runtime")
     repo = Repo(str(tmp_path), "local")
 
     cc_gc = generators.runtime_config("cc", {"config_path": "/tmp/settings.json"}, repo=repo)
-    assert cc_gc["config_path"] == "/tmp/settings.json"  # 用户键保留
+    assert cc_gc["settings"] == "/tmp/settings.json"  # 公开 config_path → 原生 settings
     assert "gh_puller" in cc_gc["mcp_servers"]
     cfg = cc_gc["mcp_servers"]["gh_puller"]  # TypedDict:运行时为 dict(SDK 按 stdio 子进程启动)
     assert cfg["command"] == "uv" and "gh_puller_mcp" in cfg["args"]
     assert cc_gc["allowed_tools"] == [
         *generators._SCOUT_TOOLS, *[f"mcp__gh_puller__{n}" for n in generators._SCOUT_TOOLS],
     ]
-    assert cc_gc["tool_note"] == generators.agent_note("cc")
-    assert cc_gc["codemap_note"] == generators.codemap_note()
+    assert "tool_note" not in cc_gc and "codemap_note" not in cc_gc  # 工具指引机制已删
 
     dsh_gc = generators.runtime_config("dsh", {}, repo=repo)
     assert dsh_gc["mcp_servers"] == generators._gh_puller_mcp("dsh")
     assert "env" not in dsh_gc
-    assert dsh_gc["tool_note"] == generators.agent_note("dsh")
 
     codex_gc = generators.runtime_config("codex", {}, repo=repo)
     assert codex_gc["mcp_servers"] == generators._gh_puller_mcp("codex")
     assert codex_gc["env"] == {"CBM_CACHE_DIR": "/tmp/cbm-cache",
                                "CBM_RUNTIME_DIR": "/tmp/cbm-runtime"}  # 环境已设才透传(索引根一致)
-    assert codex_gc["tool_note"] == generators.agent_note("codex")
 
     opencode_gc = generators.runtime_config("opencode", {}, repo=repo)
     assert opencode_gc["mcp_servers"] == generators._gh_puller_mcp("opencode")  # 子进程形态与 codex 同式
     assert opencode_gc["env"] == {"CBM_CACHE_DIR": "/tmp/cbm-cache",
                                   "CBM_RUNTIME_DIR": "/tmp/cbm-runtime"}
-    assert opencode_gc["tool_note"] == generators.agent_note("opencode")
-    assert opencode_gc["codemap_note"] == generators.codemap_note("opencode")
 
     monkeypatch.delenv("CBM_CACHE_DIR", raising=False)
     monkeypatch.delenv("CBM_RUNTIME_DIR", raising=False)
@@ -89,7 +84,7 @@ def test_runtime_config_injects_tooltable_by_backend(tmp_path, monkeypatch):
     llm_gc = generators.runtime_config("llm", {"model": "m1"}, repo=repo)
     assert llm_gc["model"] == "m1"
     assert "mcp_servers" not in llm_gc and "env" not in llm_gc
-    assert "tool_note" not in llm_gc and "codemap_note" not in llm_gc  # llm 无工具指引
+    assert "tool_note" not in llm_gc and "codemap_note" not in llm_gc  # 工具指引机制已删
 
     bare = generators.runtime_config("cc", {}, repo=None)
     assert "mcp_servers" not in bare  # 无 repo:不注入工具桌位(同"repo 非空才落 mcp")
@@ -101,34 +96,9 @@ def test_adapter_chain_gets_injected_graphify_config(tmp_path, monkeypatch):
     monkeypatch.setitem(GENERATORS, "dsh", _FakeGenerator)
     monkeypatch.setattr(_FakeGenerator, "generator", "dsh")
     gc = generators.runtime_config("dsh", {}, repo=repo)
-    cfg = adapter("dsh", generator_config=gc, system_prompt="sys", repo=repo).config
+    cfg = adapt_generator("dsh", generator_config=gc, system_prompt="sys", repo=repo).config
     assert cfg["mcp_servers"] == generators._gh_puller_mcp("dsh")
-    assert "tool_note" not in cfg and "codemap_note" not in cfg  # 引擎私有键剥离,不落 SDK 配置
-
-
-# ---------------------------------------------------------------------------
-# 工具指引文本(原 deepwiki 内嵌提示词 → 本层持;引擎零工具假设)
-# ---------------------------------------------------------------------------
-
-
-def test_agent_note_tool_name_by_generator():
-    """图工具指引按后端前缀:cc/dsh/codex = mcp__gh_puller__;opencode = servername_(非 mcp__)。"""
-    for generator in ("cc", "dsh", "codex"):
-        note = generators.agent_note(generator)
-        assert "mcp__gh_puller__search_graph" in note
-        assert "graphify" not in note
-    opencode_note = generators.agent_note("opencode")
-    assert "gh_puller_search_graph" in opencode_note
-    assert "mcp__" not in opencode_note
-
-
-def test_codemap_note_content():
-    """codemap 指引(仅 agent 路用):先查图谱再构造,引用行号取自 search_graph 的 file/lines。"""
-    note = generators.codemap_note("cc")
-    assert "Before answering" in note and "mcp__gh_puller__search_graph" in note
-    assert "'file'" in note and "'lines'" in note
-    assert "<note>" in note
-    assert "gh_puller_search_graph" in generators.codemap_note("opencode")
+    assert "tool_note" not in cfg and "codemap_note" not in cfg  # 工具指引机制已删,不落 SDK 配置
 
 
 # ---------------------------------------------------------------------------

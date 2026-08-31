@@ -105,13 +105,11 @@ async def _chat(
 
     # 对话历史自然转写(无 <turn> 伪标签);输入过大时省略历史。引擎不传
     # context 类"假日志"事件(监控事件由适配器内 EventRecorder 发布)。
-    # 工具指引(tool_note)由上层经 generator_config 注入 —— 引擎零工具假设。
-    adapter = utils.adapter(generator, generator_config=generator_config, system_prompt=system, repo=repo)
+    adapter = utils.adapt_generator(generator, generator_config=generator_config, system_prompt=system, repo=repo)
     history = _render_natural_history(messages)
 
     prompt = (
-        history + (generator_config or {}).get("tool_note", "")
-        + f"<query>\n{last.get('content', '')}\n</query>\n\nAssistant: "
+        history + f"<query>\n{last.get('content', '')}\n</query>\n\nAssistant: "
     )
     try:
         async with adapter.session(session_name=f"chat:{repo.name}", run_id=f"chat:{repo.name}"):

@@ -51,7 +51,7 @@ One `session` = one adapter call (one JSONL), id = `<ns>/<uuid4>` — `ns` (业�
 ## 2. File Sink (default on, flat layout + implicit classification)
 
 ```
-~/.gh-puller/agent-sessions/           # AGENT_MONITOR_DIR
+$AGENT_MONITOR_DIR/      # 会话 jsonl 落盘根(扁平,无 sessions 子层)
 └── <uuid>.jsonl                       # one flat file per session (uuid part of session id),
                                        # 只含非流式事件流(taxonomy − assistant/chunk)
 ```
@@ -60,15 +60,15 @@ One `session` = one adapter call (one JSONL), id = `<ns>/<uuid4>` — `ns` (业�
 
 ```bash
 # 查终态(completed / aborted 由 data.state 区分)
-grep '"type":"session/end"' ~/.gh-puller/agent-sessions/*.jsonl
+grep '"type":"session/end"' "$AGENT_MONITOR_DIR"/*.jsonl
 # 查错误
-grep '"type":"error"' ~/.gh-puller/agent-sessions/*.jsonl
+grep '"type":"error"' "$AGENT_MONITOR_DIR"/*.jsonl
 # 查会话来源(业务命名空间),watch 实时
-grep '"type":"session/start"' ~/.gh-puller/agent-sessions/*.jsonl
-tail -f ~/.gh-puller/agent-sessions/*.jsonl
+grep '"type":"session/start"' "$AGENT_MONITOR_DIR"/*.jsonl
+tail -f "$AGENT_MONITOR_DIR"/*.jsonl
 ```
 
-Each JSONL line is one raw event (full content — no truncation anywhere in the log; only OTel previews truncate). By default `assistant/chunk` is **skipped** (non-stream projection, log inflation), so the file `seq` has holes (hole == skipped chunk); the fold contract only compares `seq` — readers never assume density. With `AGENT_MONITOR_FILE_RAW=1` the file carries the **full raw event flow** incl. `assistant/chunk` (seq dense — the same stream the WS/OTel channels carry). Writes happen in the sink worker (queue drain), bounded at 5000 events drop-oldest; a slow or full disk never blocks the LLM call. A crash leaves a file **without** `session/end` (residue; hub 按"无终态行 + mtime 静止超租约"派生为 aborted,见 §3 —— 运行期静默补发的 `session/heartbeat` 行同样落盘,活会话的 mtime 不会停,读者以租约区分"活但静默"与"进程已死";残留文件即排查素材)。 **v1 迁移**:旧格式(LLM 聚合行)与本格式互不兼容,首次升级请在 hub 未启动/可停止时清理旧的 `~/.gh-puller/agent-sessions/**`(hub 会把无 `seq` 的文件整件跳过并日志)。Sources: [gh_puller/agent/sinks.py:FileSink]()
+Each JSONL line is one raw event (full content — no truncation anywhere in the log; only OTel previews truncate). By default `assistant/chunk` is **skipped** (non-stream projection, log inflation), so the file `seq` has holes (hole == skipped chunk); the fold contract only compares `seq` — readers never assume density. With `AGENT_MONITOR_FILE_RAW=1` the file carries the **full raw event flow** incl. `assistant/chunk` (seq dense — the same stream the WS/OTel channels carry). Writes happen in the sink worker (queue drain), bounded at 5000 events drop-oldest; a slow or full disk never blocks the LLM call. A crash leaves a file **without** `session/end` (residue; hub 按"无终态行 + mtime 静止超租约"派生为 aborted,见 §3 —— 运行期静默补发的 `session/heartbeat` 行同样落盘,活会话的 mtime 不会停,读者以租约区分"活但静默"与"进程已死";残留文件即排查素材)。 **v1 迁移**:旧格式(LLM 聚合行)与本格式互不兼容,首次升级请在 hub 未启动/可停止时清理旧格式文件(即 `$AGENT_MONITOR_DIR` 下无 `seq` 的 `*.jsonl`,hub 会把它们整件跳过并日志)。Sources: [gh_puller/agent/sinks.py:FileSink]()
 
 ## 3. Web/WS Hub (opt-in via monitor)
 
@@ -122,7 +122,7 @@ Runtime override via `agent.configure(file_dir=..., ws_urls=..., otel_urls=..., 
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `AGENT_MONITOR_DIR` | `~/.gh-puller/agent-sessions` | file sink root,即会话 jsonl 落盘根(无 sessions 子层) |
+| `AGENT_MONITOR_DIR` | envs.py 缺省 | file sink root,即会话 jsonl 落盘根(无 sessions 子层) |
 | `AGENT_MONITOR_FILE_RAW` | `0` | file sink granularity: `0` = non-stream projection only (default, `assistant/chunk` skipped); `1` = full raw event flow incl. `assistant/chunk` (dense seq) |
 | `AGENT_MONITOR_WEBUI_URL` | `ws://localhost:8765/ws` | ws sink targets, comma-separated (one WsSink each); empty → ws sink off |
 | `AGENT_MONITOR_HEARTBEAT_SECS` | `30` | producer heartbeat interval: silence (no non-chunk event) ≥ this gets one `session/heartbeat` filler row (activity periods get none) |

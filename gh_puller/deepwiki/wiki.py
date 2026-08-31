@@ -26,7 +26,7 @@ from typing import Any, Literal
 
 from .. import envs  # 模块对象绑定:属性一律调用时取(patch/强刷活性)
 from ..agent import RequestFailedError
-from ..utils import Repo, TaskStatus, _find_readme_path, _sanitize_path_seg, _strip_markdown_fences
+from ..utils import Repo, TaskStatus, _sanitize_path_seg, _strip_markdown_fences
 from . import (
     utils,  # 模块对象绑定:跨功能 helper 属性调用(monkeypatch 位点活性)
 )
@@ -655,15 +655,16 @@ async def save_generated_wiki(
     structure: WikiStructureModel, pages: dict[str, WikiPage], language: str = "en",
     generator: str | None = None, generator_config: dict | None = None,
 ) -> bool:
-    """把一次完整生成结果落成品缓存(缓存层职责:判等身份 + 组装 + 写盘)。
+    """Persist one complete generation into the finished-wiki cache (cache-layer duty: identity + assembly + write).
 
-    判等身份经 utils.generator_identity/digest(共用同一判等,见 utils 判等摘要);
-    组装为纯 dict(键集逐字保留),公开身份入缓存、凭证不进(**token=None**);
-    file 类不落 provider/model(provider=None/model="")。
+    Identity via utils.generator_identity/digest (same equality, see utils);
+    assembled as a plain dict (key set kept verbatim), public identity recorded,
+    credentials never written (**token=None**). generator and generator_config
+    are recorded as-given (whole dict; field layout is a read-side/wire concern —
+    no type judgment / field splitting here), cache hit validated via
+    cache_generator_matches.
     """
     generator_id, resolved = utils.resolve_generator(generator, generator_config)
-    identity = utils.generator_identity(generator_id, resolved)  # file 类:config_path;object:"provider|model"
-    object_parts = identity.split("|", 1)
     cache_record = {
         "wiki_structure": dataclasses.asdict(structure),
         "generated_pages": {pid: dataclasses.asdict(pg) for pid, pg in pages.items()},
@@ -676,10 +677,8 @@ async def save_generated_wiki(
             "localPath": None,
             "repoUrl": repo_url,
         },
-        "provider": object_parts[0] if len(object_parts) > 1 else None,  # object 类才落
-        "model": object_parts[1] if len(object_parts) > 1 else "",  # 旧缓存兼容字段
         "generator": generator_id,  # 成品缓存记判等身份,cache 命中时校验(见 cache_generator_matches)
-        "config_path": identity if utils.config_kind(generator_id) == "file" else None,
+        "generator_config": resolved,
     }
     return await save_wiki_cache(
         owner=owner,
@@ -714,7 +713,7 @@ async def write_resume_state(
     """原子写续跑状态(先写 .tmp 再 os.replace,崩溃不产生半截文件)。
 
     纯 dict 进出(json.dumps);路径带公开选型摘要(与成品缓存同规则):
-    不同选型的续跑状态并存。状态内 request.target 恒为 strip_creds 落盘形态
+    不同选型的续跑状态并存。状态内 request.target 恒为凭证剥离落盘形态
     (凭证已剥离),组装由 app 侧 _persist_state 负责。
     """
     path = resume_state_path(owner, repo, repo_type, language, digest)
@@ -963,21 +962,19 @@ def needs_structure_regenerate(
 async def determine_structure(
     *, repo: Repo, owner: str, repo_name: str,
     generator: str | None = None, generator_config: dict | None = None,
-    file_tree: list[str], readme: str, comprehensive: bool, language: str, run_id: str,
+    comprehensive: bool, language: str, run_id: str,
 ) -> WikiStructureModel:
     """结构生成:缓存文件已存在即跳过(续跑);否则生成器落盘 structure.md 后读回解析。"""
     struct_path = _generator_cache_structure_path(run_id, generator, generator_config)
     if struct_path.exists():
         content = await asyncio.to_thread(struct_path.read_text, encoding="utf-8")
     else:
-        adapter = utils.adapter(generator, generator_config=generator_config, repo=repo,
+        adapter = utils.adapt_generator(generator, generator_config=generator_config, repo=repo,
                                 generator_cache_dir=str(struct_path.parent),
                                 generator_cache_write_mode=True)
-        readme_path = _find_readme_path(file_tree)
         prompt = _build_structure_prompt(
-            owner, repo_name, "\n".join(file_tree), readme_path,
-            os.path.abspath(repo.save_path), comprehensive, language,  # noqa: ASYNC240 - 轻量路径派生
-            str(struct_path), tool_note=(generator_config or {}).get("tool_note", ""),
+            owner, repo_name, os.path.abspath(repo.save_path), comprehensive, language,  # noqa: ASYNC240 - 轻量路径派生
+            str(struct_path),
         )
         content = await _produce_file(adapter, prompt, struct_path,
                                       label="wiki:structure", run_id=run_id)
@@ -985,36 +982,22 @@ async def determine_structure(
 
 
 def _build_structure_prompt(
-    owner: str, repo_name: str, file_tree: str, readme_path: str | None,
-    repo_root: str, comprehensive: bool, language: str, out_path: str,
-    tool_note: str = "",
+    owner: str, repo_name: str, repo_root: str,
+    comprehensive: bool, language: str, out_path: str,
 ) -> str:
-    """结构提示词(现代风格):输入只给路径(文件树+README 路径),不内联内容;
+    """结构提示词(现代风格):不内联任何内容,仓库与文件由生成器自读;
 
-    成品 XML 由生成器用 Write 工具直接落盘 out_path;工具指引(tool_note)由上层经
-    generator_config 注入(引擎不假设任何工具)。
+    成品 XML 由生成器用 Write 工具直接落盘 out_path。
     """
     structure_format = _COMPREHENSIVE_STRUCTURE if comprehensive else _CONCISE_STRUCTURE
     page_count = "8-12" if comprehensive else "4-6"
     kind = "comprehensive" if comprehensive else "concise"
-    readme_line = (
-        f"2. The README file of the project is at: {repo_root}/{readme_path}\n"
-        "   Read it yourself with the Read tool.\n"
-        if readme_path
-        else "2. No README file was found in this repository; skip it.\n"
-    )
     return f"""IMPORTANT: you are working INSIDE the repository (cwd = repository root at {repo_root}).
-The file contents are NOT inlined in this prompt — read source files yourself with the
-Read/Grep/Glob tools. All paths below are relative to the repository root.
+The file contents are NOT inlined in this prompt — explore and read source files yourself
+with the Read/Grep/Glob tools.
 
 Analyze this repository {owner}/{repo_name} and create a wiki structure for it.
 
-1. The complete relative file tree of the project:
-<file_tree>
-{file_tree}
-</file_tree>
-
-{readme_line}
 I want to create a wiki for this repository. Determine the most logical structure for a wiki based on the repository's content.
 
 IMPORTANT: The wiki content will be generated in {language_name(language)} language.
@@ -1042,7 +1025,7 @@ IMPORTANT:
 2. Each page should focus on a specific aspect of the codebase (e.g., architecture, key features, setup)
 3. The relevant_files should be actual files from the repository that would be used to generate that page
 4. Do not inline file contents into this prompt — use your tools to read the files.
-{tool_note}"""  # noqa: E501 - prompt 原文移植,单行语义不拆
+"""  # noqa: E501 - prompt 原文移植,单行语义不拆
 
 def _generator_cache_page_prompt(title: str, file_paths: list[str], out_path: str, language: str) -> str:
     """页面提示词(现代风格):只给相关文件相对路径,内容由生成器自读;产物经 Write 落盘 out_path。"""
@@ -1070,10 +1053,10 @@ async def generate_page(
     if out_path.exists():
         content = await asyncio.to_thread(out_path.read_text, encoding="utf-8")
     else:
-        adapter = utils.adapter(generator, generator_config=generator_config, repo=repo,
+        adapter = utils.adapt_generator(generator, generator_config=generator_config, repo=repo,
                                 generator_cache_dir=str(out_path.parent),
                                 generator_cache_write_mode=True)
-        prompt = (generator_config or {}).get("tool_note", "") + _generator_cache_page_prompt(
+        prompt = _generator_cache_page_prompt(
             page.title, list(page.filePaths), str(out_path), language,
         )
         content = await _produce_file(adapter, prompt, out_path,

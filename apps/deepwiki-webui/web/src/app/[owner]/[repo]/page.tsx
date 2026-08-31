@@ -313,12 +313,13 @@ export default function RepoWikiPage() {
       }
 
       console.log('Using server-cached wiki data');
+      const cachedGc = cachedData.generator_config || {};
       setTargetConfig(prev => ({
         ...prev,
         generator: cachedData.generator || prev.generator,
-        config_path: cachedData.config_path || prev.config_path,
-        provider: cachedData.provider || prev.provider,
-        model: cachedData.model || prev.model,
+        config_path: cachedGc.config_path || prev.config_path,
+        provider: cachedGc.provider || prev.provider,
+        model: cachedGc.model || prev.model,
       }));
 
       // Update repoInfo

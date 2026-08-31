@@ -1,11 +1,13 @@
 """dsh:DeepSeek Harness(SDK)包装 —— 配置世界(DshConfig/挂载映射/内置隔离组合)+ 投影适配器。
 
-本文件 = dsh 的独立扩展点(双权威投影 = 对齐器;why 见 _DshProj docstring);
-DshConfig → DeepSeekHarness kwargs(dsh_fields:config_path → cordis、system_prompt
-→ env.DSH_SYSTEM_PROMPT;未提供 cordis 时回退内置隔离组合),模型/凭证随组合配置
-(SDK 读进程环境兜底)。隔离组合装配(dsh_cordis_path,镜像官方 minimal.cordis.yml,
-零用户级补丁)同文件 —— 组合即隔离边界;SDK 类型仅函数内懒导入(测试经假模块
-注入),模块 import 面零 SDK。
+Second-authority dsh file (dual-authority projection = aligner; why in _DshProj
+docstring); DshConfig → DeepSeekHarness kwargs with SDK-native key names
+(see __init__.py): cordis passes straight through; no cordis → built-in isolated
+composition. Model/credentials ride the composition (SDK reads the process env as
+fallback). The isolated-composition assembly (dsh_cordis_path, mirroring the
+official minimal.cordis.yml, zero user-level patches) lives here — the composition
+is the isolation boundary; SDK types lazily imported inside functions (tests inject
+fake modules); the module import surface is SDK-free.
 """
 
 import asyncio
@@ -25,7 +27,7 @@ from .utils import RequestFailedError, _stage_of
 
 
 class DshConfig(TypedDict, total=False):
-    """dsh 运行时 config:映射 DeepSeekHarness kwargs(config_path → cordis,system_prompt → env.DSH_SYSTEM_PROMPT)。"""
+    """dsh runtime config: keys are DeepSeekHarness kwargs names (see __init__.py)."""
 
     provider: str
     model: str
@@ -34,7 +36,7 @@ class DshConfig(TypedDict, total=False):
     runtime_cwd: str
     session_root: str
     env: dict
-    config_path: str
+    cordis: str  # composition file path (missing → built-in isolated composition)
     mcp_servers: list[dict]
     base_url: str
     api_key: str
@@ -50,20 +52,19 @@ class DshConfig(TypedDict, total=False):
 
 
 def dsh_fields(config: dict) -> dict:
-    """DshConfig → DeepSeekHarness 构造 kwargs(概念键映射 + 缺省隔离组合)。
+    """DshConfig → DeepSeekHarness constructor kwargs (key names passthrough).
 
-    DeepSeekHarnessConfig 是 dataclass 而非 pydantic(无 model_dump),且
-    DeepSeekHarness.__init__(config=None, **kwargs) 同时传 config 与 kwargs 会
-    TypeError —— 恒走 kwargs;调用方自组装 config(键集见 DshConfig)。
-    config_path → SDK cordis;system_prompt → env.DSH_SYSTEM_PROMPT(已有 env 键
-    优先);未提供 cordis 时经 mcp_servers 描述回退内置隔离组合(见 dsh_cordis_path)。
+    DeepSeekHarnessConfig is a dataclass (no model_dump) and
+    DeepSeekHarness.__init__(config=None, **kwargs) type-errors when both are
+    passed — kwargs only; system_prompt is the single key-aware mapping
+    (→ env.DSH_SYSTEM_PROMPT, existing env key wins); no cordis → built-in
+    isolated composition (see dsh_cordis_path).
     """
     names = ("provider", "model", "max_tokens", "cwd", "runtime_cwd", "session_root",
              "env", "runtime_bin", "launch_args_override",
-             "request_timeout_seconds", "shutdown_timeout_seconds", "base_url", "api_key")
+             "request_timeout_seconds", "shutdown_timeout_seconds", "base_url", "api_key",
+             "cordis")
     fields = {k: v for k, v in ((k, config.get(k)) for k in names) if v is not None}
-    if config.get("config_path"):
-        fields["cordis"] = config["config_path"]
     if config.get("system_prompt"):
         env = dict(fields.get("env") or {})
         env.setdefault("DSH_SYSTEM_PROMPT", config["system_prompt"])
@@ -495,10 +496,10 @@ def _dsh_worker(harness, prompt: str, session_id: str, pump):
 
 
 class Dsh(BaseGenerator):
-    """dsh: DeepSeek Harness composition. Config shape: file-class — config_path points at a cordis file.
+    """dsh: DeepSeek Harness composition. Config shape: file-class — cordis points at the composition file.
 
-    DshConfig → DeepSeekHarness kwargs (dsh_fields: config_path → cordis,
-    system_prompt → env.DSH_SYSTEM_PROMPT; no cordis → built-in isolated composition);
+    DshConfig → DeepSeekHarness kwargs (dsh_fields: keys are SDK kwargs names,
+    see __init__.py; no cordis → built-in isolated composition);
     model/credentials ride the composition (SDK reads the process env as fallback). The
     event vocabulary is same-sourced but dsh is the second authority → _DshProj
     projection alignment (why in _DshProj docstring). Harness object built at

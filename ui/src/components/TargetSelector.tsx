@@ -299,7 +299,7 @@ tsconfig.spec.json
               type="text"
               value={value.config_path || ''}
               onChange={(e) => update({ config_path: e.target.value })}
-              placeholder={selectedGenerator.configDefault || selectedGenerator.configPathEnv || t("form.configFilePathPlaceholder")}
+              placeholder={selectedGenerator.configDefault || t("form.configFilePathPlaceholder")}
               className="input-japanese block w-full px-2.5 py-1.5 text-sm rounded-md bg-transparent text-[var(--foreground)] focus:outline-none focus:border-[var(--accent-primary)]"
             />
             <p className="text-[10px] text-[var(--muted)] mt-1">

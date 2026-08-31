@@ -59,8 +59,7 @@ def test_generators_config():
     """统一 target 配置:注册表直出(generators/default target);凭证不出现。
 
     generator → generator_config 契约:configKind 分 file(cc/dsh/codex/opencode,
-    configDefault/configPathEnv);defaultTarget.generator_config 按默认 generator
-    的 kind 给出(cc = config_path)。
+    configDefault);defaultTarget.generator_config 按默认 generator 的 kind 给出(cc = config_path)。
     """
     cfg = _client().get("/generators/config").json()
     assert [g["id"] for g in cfg["generators"]] == ["cc", "dsh", "codex", "opencode"]
@@ -70,11 +69,9 @@ def test_generators_config():
     assert by_id["codex"]["configKind"] == "file"
     assert by_id["opencode"]["configKind"] == "file"
     assert by_id["cc"]["configDefault"] is not None  # ~/.claude/settings.json
-    assert by_id["cc"]["configPathEnv"] == "DEEPWIKI_CC_CONFIG"
     assert by_id["cc"]["providers"] == []  # file 类不再暴露 provider 选择
     assert by_id["codex"]["capability"] == "responses"
     assert by_id["opencode"]["capability"] == "opencode-cli"
-    assert by_id["opencode"]["configPathEnv"] == "DEEPWIKI_OPENCODE_CONFIG"
     assert by_id["opencode"]["configDefault"] is None
     assert by_id["opencode"]["providers"] == []
     assert cfg["providers"] == []

@@ -230,7 +230,7 @@ async def _codemap(
         last_error: Exception | None = None
         for attempt in range(1, attempts + 1):
             try:
-                adapter = utils.adapter(
+                adapter = utils.adapt_generator(
                     generator, generator_config=generator_config, repo=repo,
                     system_prompt=_CODEMAP_SKELETON_PROMPT.format(**fmt),
                 )
@@ -245,9 +245,9 @@ async def _codemap(
                 log(f"codemap JSON 解析尝试 {attempt}/{attempts} 失败: {last_error}")
         raise ValueError(f"Model did not return valid JSON after {attempts} attempts: {last_error}")
 
-    # 阶段 1:骨架;工具指引(codemap_note)由上层经 generator_config 注入 —— 引擎零工具假设
+    # 阶段 1:骨架
     yield _phase("initial_codemap", "start")
-    skeleton_prompt = (generator_config or {}).get("codemap_note", "") + f"<query>\n{question}\n</query>\n\nAssistant: "
+    skeleton_prompt = f"<query>\n{question}\n</query>\n\nAssistant: "
     try:
         skeleton = codemap_of(await _run_json(skeleton_prompt))
     except Exception as e:
@@ -261,13 +261,10 @@ async def _codemap(
     enrich_query = (
         f"{question}\n\n<SKELETON>\n{json.dumps(dataclasses.asdict(skeleton))}\n</SKELETON>"
     )
-    enrich_prompt = (
-        (generator_config or {}).get("codemap_note", "")
-        + f"<query>\n{enrich_query}\n</query>\n\nAssistant: "
-    )
+    enrich_prompt = f"<query>\n{enrich_query}\n</query>\n\nAssistant: "
     final = skeleton
     try:
-        adapter = utils.adapter(
+        adapter = utils.adapt_generator(
             generator, generator_config=generator_config, system_prompt=_CODEMAP_ENRICH_PROMPT.format(**fmt), repo=repo,
         )
         async with adapter.session(session_name="codemap:enrich", run_id=f"codemap:{repo.name}"):

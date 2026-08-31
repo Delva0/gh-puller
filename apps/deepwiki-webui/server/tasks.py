@@ -51,17 +51,10 @@ from gh_puller.deepwiki.utils import (
     cache_identity,
     generator_digest,
     log,
-    merge_creds,
     resolve_generator,
-    strip_creds,
 )
 from gh_puller.deepwiki.wiki import wiki_cache_dir
-from gh_puller.utils import (
-    Repo,
-    TaskStatus,
-    detect_default_branch,
-    read_repo_file_tree,
-)
+from gh_puller.utils import Repo, TaskStatus, detect_default_branch
 from pydantic import BaseModel, ConfigDict, Field, computed_field, field_validator
 
 from generators import ensure_index, index_ready, runtime_config
@@ -132,8 +125,8 @@ class WikiTask(BaseModel):
 
         同一仓库/语言下不同 target 的任务可并发并存(隔离生成产物与续跑状态)。
         """
-        target = self.request["target"]
-        return f"{self.repo_key}@{generator_digest(target.get('generator'), target.get('generator_config'))}"
+        t = strip_creds(self.request["target"])
+        return f"{self.repo_key}@{generator_digest(t.get('generator'), t.get('generator_config'))}"
 
     def to_status(self) -> dict:
         r = self.request
@@ -287,16 +280,17 @@ class WikiTaskRegistry(TaskRegistry):
 
     async def is_cached(self, task: WikiTask) -> bool:
         r = task.request
+        t = strip_creds(r["target"])
         cache = await read_wiki_cache(
             r["owner"], r["repo"], r["type"], r["language"],
             digest=generator_digest(
-                r["target"].get("generator"), r["target"].get("generator_config"),
+                t.get("generator"), t.get("generator_config"),
             ),
         )
         if cache is None:
             return False
         # 判等身份与缓存内记录对齐(旧缓存字段缺失/旧契约 → 判不匹配,重新生成)
-        if cache_generator_matches(cache, r["target"].get("generator"), r["target"].get("generator_config")):
+        if cache_generator_matches(cache, t.get("generator"), t.get("generator_config")):
             return True
         log(
             f"成品缓存 target 不匹配({cache_identity(cache)!r} vs "
@@ -306,19 +300,21 @@ class WikiTaskRegistry(TaskRegistry):
 
     async def on_cache_hit(self, task: WikiTask) -> None:
         r = task.request
+        t = strip_creds(r["target"])
         await delete_resume_state(
             r["owner"], r["repo"], r["type"], r["language"],
             digest=generator_digest(
-                r["target"].get("generator"), r["target"].get("generator_config"),
+                t.get("generator"), t.get("generator_config"),
             ),
         )
 
     async def load_resume(self, task: WikiTask) -> WikiTask | None:
         r = task.request
+        t = strip_creds(r["target"])
         state = await read_resume_state(
             r["owner"], r["repo"], r["type"], r["language"],
             digest=generator_digest(
-                r["target"].get("generator"), r["target"].get("generator_config"),
+                t.get("generator"), t.get("generator_config"),
             ),
         )
         if state is None:
@@ -359,6 +355,28 @@ registry = WikiTaskRegistry(
 # ---------------------------------------------------------------------------
 
 
+def strip_creds(config: dict) -> dict:
+    """Disk form: copy and strip api_key/base_url out of generator_config (config path is not a credential, kept)."""
+    out = dict(config)
+    gc = dict(out.get("generator_config") or {})
+    gc.pop("api_key", None)
+    gc.pop("base_url", None)
+    out["generator_config"] = gc
+    return out
+
+
+def merge_creds(base: dict, other: dict | None) -> dict:
+    """Disk form keeps itself; credentials (api_key/base_url inside generator_config) come from other."""
+    out = dict(base)
+    oc = dict((other or {}).get("generator_config") or {})
+    merged = dict(out.get("generator_config") or {})
+    for key in ("base_url", "api_key"):
+        if oc.get(key):
+            merged[key] = oc[key]
+    out["generator_config"] = merged
+    return out
+
+
 async def _persist_state(task: WikiTask) -> None:
     """把任务当前进度落盘(结构/已完成页/状态);并发写由模块锁串行。
 
@@ -391,26 +409,16 @@ async def _persist_state(task: WikiTask) -> None:
 
 @dataclass
 class PreparedRepo:
-    """一次生成所需的仓库态上下文(单源:分支/文件树/readme 只准备一次,主流程共用)。"""
+    """一次生成所需的仓库态上下文(单源:默认分支只准备一次,主流程共用)。"""
 
     repo: Repo
     default_branch: str
-    file_tree: list[str]
-    readme: str | None
 
 
-async def _prepare_repo(request: dict, repo: Repo) -> PreparedRepo:
-    """仓库态运行时准备(默认分支 + 文件树/README 路径);克隆由 ensure_index 承担。"""
+async def _prepare_repo(repo: Repo) -> PreparedRepo:
+    """仓库态运行时准备(默认分支);克隆与索引由 ensure_index 承担。"""
     default_branch = await asyncio.to_thread(detect_default_branch, repo.save_path)
-    file_tree, readme = await asyncio.to_thread(
-        read_repo_file_tree,
-        repo.save_path,
-        request.get("included_files") or [],
-        request.get("included_dirs") or [],
-        request.get("excluded_files") or [],
-        request.get("excluded_dirs") or [],
-    )
-    return PreparedRepo(repo=repo, default_branch=default_branch, file_tree=file_tree, readme=readme)
+    return PreparedRepo(repo=repo, default_branch=default_branch)
 
 
 async def generate_repo_wiki(task: WikiTask) -> None:
@@ -430,8 +438,8 @@ async def generate_repo_wiki(task: WikiTask) -> None:
             task.status = TaskStatus.INDEXING
             log(f"索引中: {task.repo_key}")
             await ensure_index(repo)
-        # 仓库态(分支/文件树):结构确定与页面生成共用同一次准备
-        prepared = await _prepare_repo(r, repo)
+        # 仓库态(分支):结构确定与页面生成共用同一次准备
+        prepared = await _prepare_repo(repo)
 
         if task.wiki_structure is None or needs_structure_regenerate(
             project_key=task.repo_key,
@@ -457,13 +465,15 @@ async def generate_repo_wiki(task: WikiTask) -> None:
             r["owner"], r["repo"], r["type"], r["repo_url"],
             task.wiki_structure, pages, language=r["language"],
             generator=r["target"].get("generator"),
-            generator_config=gc,
+            # 成品身份字段取自公开形态(strip 后与提交侧同源;运行形态 gc 只服务 SDK 装配)
+            generator_config=strip_creds(r["target"]).get("generator_config"),
         ):
             raise RuntimeError("写 wiki 缓存失败")  # 不删状态:再提交仅重试写缓存
+        t = strip_creds(r["target"])
         await delete_resume_state(
             r["owner"], r["repo"], r["type"], r["language"],
             digest=generator_digest(
-                r["target"].get("generator"), r["target"].get("generator_config"),
+                t.get("generator"), t.get("generator_config"),
             ),
         )
         task.status = TaskStatus.COMPLETED
@@ -487,7 +497,6 @@ async def _determine_structure(
     return await determine_structure(
         generator=r["target"].get("generator"), generator_config=gc,
         repo=prepared.repo, owner=r["owner"], repo_name=r["repo"],
-        file_tree=prepared.file_tree, readme=prepared.readme,
         comprehensive=r["comprehensive"], language=r["language"], run_id=task.repo_key,
     )
 

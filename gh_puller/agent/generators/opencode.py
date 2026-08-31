@@ -2,7 +2,7 @@
 
 本文件 = opencode 的独立扩展点(镜像 codex:合成器无投影层;why 见 _OpencodeSynth
 docstring);OpenCodeConfig → CLI 装配(opencode run argv / OPENCODE_CONFIG_CONTENT
-注入段 / 子进程环境),config_path 纯透传(OPENCODE_CONFIG env,file 类契约 ——
+注入段 / 子进程环境),config 纯透传(OPENCODE_CONFIG env,file 类契约 ——
 opencode 仍合并用户全局配置,引擎注入面经 config_content 覆盖冲突键),
 mcp_servers 通用注入工具桌(渲染为 opencode mcp 配置段:command 数组 +
 environment 内联 map),system_prompt → 临时 instructions 文件(CLI 无系统提示词
@@ -49,7 +49,7 @@ class OpenCodeConfig(TypedDict, total=False):
     system_prompt: str    # → 临时 instructions 文件(CLI 无系统提示词旗标,唯一注入点)
     cwd: str              # 子进程工作目录(仓库根固定,cc/codex 同位)
     opencode_bin: str     # 可执行路径(缺省 "opencode";测试喂假脚本)
-    config_path: str      # OPENCODE_CONFIG(opencode.json 路径;file 类契约纯透传)
+    config: str           # → OPENCODE_CONFIG (opencode.json path; file-class pure passthrough)
     agent: str            # --agent 预定义 agent 名
     variant: str          # --variant 推理预算(provider 特定)
     auto: bool            # --auto 权限未明拒即自动批准(引擎缺省 True,见 adapter)
@@ -97,8 +97,8 @@ def _opencode_env(config: dict) -> dict:
     env = dict(os.environ)
     env.setdefault("OPENCODE_DISABLE_CLAUDE_CODE_SKILLS", "1")
     env.update(config.get("env") or {})
-    if config_path := config.get("config_path"):
-        env["OPENCODE_CONFIG"] = config_path
+    if cfg := config.get("config"):
+        env["OPENCODE_CONFIG"] = cfg
     return env
 
 
@@ -432,12 +432,12 @@ async def _opencode_drain(proc, event_recorder: EventRecorder, st: _OpencodeSynt
 
 
 class OpenCode(BaseGenerator):
-    """opencode: OpenCode CLI (headless run --format json). Config: file-class, config_path → opencode.json.
+    """opencode: OpenCode CLI (headless run --format json). Config: file-class, config → opencode.json.
 
     CLI child process → local synthesis (single authority, no projection layer; why in
     _OpencodeSynth docstring); OpenCodeConfig → CLI assembly (argv/env/config_content):
     system_prompt → temporary instructions file, mcp_servers generic tool-desk injection
-    (--pure always passed, mirroring cc's isolation philosophy), config_path pure
+    (--pure always passed, mirroring cc's isolation philosophy), config pure
     passthrough (OPENCODE_CONFIG env). The credential channel is not isolated: opencode
     holds its own credentials (~/.local/share/opencode/auth.json); this layer is only
     the config injection surface. No client binding at construction (the child spawns

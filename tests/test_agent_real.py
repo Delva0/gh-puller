@@ -214,7 +214,7 @@ async def test_opencode_stream_real(tmp_path):
     """opencode 真机:CLI run --format json 子进程;模型路由/凭证随 opencode 自身配置。
 
     凭证通道不隔离:凭据由 opencode CLI 自持(~/.local/share/opencode/auth.json,
-    同 cc 的 CLI 自持凭证约定);隔离只管注入面(--pure/--auto/config_path)。
+    同 cc 的 CLI 自持凭证约定);隔离只管注入面(--pure/--auto/config)。
     model 不传 —— 引擎无该轴快照时 model=None(模型由 opencode 配置决定)。
     """
     binpath = shutil.which("opencode")

@@ -134,7 +134,7 @@ async def test_init_config_folds_sdk_objects():
         run = EventRecorder("s1", label="t")
         run.init_config({
             "system_prompt": "sp",
-            "config_path": "/tmp/dw-settings.json",
+            "settings": "/tmp/dw-settings.json",
             "api_key": "sk-secret",  # 凭证剥离:不入流
             "mcp_servers": {"graphify": {"type": "sdk", "name": "graphify",
                                          "instance": Server()}},
@@ -147,7 +147,7 @@ async def test_init_config_folds_sdk_objects():
     assert got[0]["type"] == "config/init"
     cfg = got[0]["data"]["config"]
     assert cfg["system_prompt"] == "sp"
-    assert cfg["config_path"] == "/tmp/dw-settings.json"
+    assert cfg["settings"] == "/tmp/dw-settings.json"
     assert "api_key" not in cfg  # 凭证剥离
     assert cfg["mcp_servers"]["graphify"] == {"type": "sdk", "name": "graphify",
                                               "instance": "<Server>"}
@@ -2335,7 +2335,7 @@ def test_opencode_argv_and_config_content_assembly(tmp_path):
 
     cfg = {"model": "deepseek/deepseek-chat", "agent": "build", "variant": "high",
            "auto": True, "session": "ses_1",
-           "config_path": str(tmp_path / "opencode.json"),
+           "config": str(tmp_path / "opencode.json"),
            "system_prompt": "sys", "env": {"GRAPHIFY_OUT": "/g"},
            "mcp_servers": [{"id": "graphify", "command": "python3",
                             "args": ["-m", "graphify.serve"], "env_vars": ["GRAPHIFY_OUT"]}]}

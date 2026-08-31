@@ -81,37 +81,31 @@ from tasks import WikiTask, WikiTaskSubmitResult, registry  # noqa: E402 - 须�
 # 语言与模型契约(仅 HTTP 层展示用;_LANGUAGE_NAMES 为引擎侧映射)
 _LANG_CONFIG = {"supported_languages": dict(_LANGUAGE_NAMES), "default": "en"}
 
-# target 契约:唯一真源 = agent.GENERATORS(id → 类;config 形态分类与键集见
-# agent/generators/__init__.py config 概念契约)。configKind 经引擎 utils.config_kind
-# 判别,展示/缺省元数据由本层自持(同 _LANGUAGE_NAMES 的「仅 HTTP 层展示用」哲学)。
-# /models/config 为 deepwiki-open 旧契约的投影(标注 deprecated);/generators/config
-# 为当前契约(前端唯一真源)。
 from gh_puller.agent import GENERATORS as AGENT_GENERATORS  # noqa: E402 - 须后于 load_dotenv
-from gh_puller.deepwiki.utils import config_kind, resolve_generator  # noqa: E402 - 须后于 load_dotenv
+from gh_puller.deepwiki.utils import resolve_generator  # noqa: E402 - 须后于 load_dotenv
 
 # /generators/config 前端元数据表(键 = GENERATORS id;file 类无 provider 键,object 类
 # 无 configPath 键 —— 键集互斥即类别;configDefault = 配置路径 UI 占位/缺省展示)。
 _GENERATOR_META: dict[str, dict] = {
     "cc": {"name": "Claude Code", "capability": "anthropic-agent-api",
-           "configPathEnv": "DEEPWIKI_CC_CONFIG",
            "configDefault": str(Path.home() / ".claude" / "settings.json")},
     "dsh": {"name": "DeepSeek Harness", "capability": "deepseek-route",
-            "configPathEnv": "DEEPWIKI_DSH_CORDIS", "configDefault": None},
+            "configDefault": None},
     "codex": {"name": "Codex", "capability": "responses",
-              "configPathEnv": "DEEPWIKI_CODEX_CONFIG", "configDefault": None},
+              "configDefault": None},
     "opencode": {"name": "OpenCode", "capability": "opencode-cli",
-                 "configPathEnv": "DEEPWIKI_OPENCODE_CONFIG", "configDefault": None},
+                 "configDefault": None},
 }
 
 
 def _generators_config() -> dict:
     """GET /generators/config:注册表直出(前端唯一真源)。
 
-    configKind = "file"(generator_config 只填 config_path;占位取 configPathEnv/
-    configDefault)或 "object"(providers 列表 + provider/model 字段)。
+    configKind = "file"(generator_config 只填 config_path;占位取 configDefault)或
+    "object"(providers 列表 + provider/model 字段)。
     """
     default_gid, default_gc = resolve_generator(_DEEPWIKI_GENERATOR)  # 注入 app 缺省生成器(引擎已不读 env)
-    if config_kind(default_gid) == "file":
+    if "configDefault" in _GENERATOR_META[default_gid]:
         default_config: dict = {"config_path": default_gc.get("config_path", "")}
     else:
         default_config = {"provider": _GENERATOR_META[default_gid].get("provider", ""),
@@ -121,14 +115,13 @@ def _generators_config() -> dict:
         meta = _GENERATOR_META.get(gid)
         if meta is None:  # 注册表含未配置元数据的后端(如 llm)→ 不展示
             continue
-        kind = config_kind(gid)
+        kind = "file" if "configDefault" in meta else "object"
         generators.append({
             "id": gid, "name": meta["name"], "configKind": kind,
             "capability": meta["capability"],
             "defaultProvider": meta.get("provider", "") if kind == "object" else "",
             "providers": [meta["provider"]] if kind == "object" else [],
             "defaultModelEnv": meta.get("modelEnv"),
-            "configPathEnv": meta.get("configPathEnv"),
             "configDefault": meta.get("configDefault"),
         })
         if "provider" in meta:  # object 类入口(providers 注册表)

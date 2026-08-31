@@ -6,7 +6,7 @@
   (<DEEPWIKI_ROOT>/图产物根/<repo>/graph.json);检索 = 图查询封装为生成器的
   图工具 —— 图谱知识(建图/查询/检索/MCP 装配)在 webui 组装层
   apps/deepwiki-webui/server/generators.py,经 generator_config(覆盖构造参数集)
-  注入:mcp_servers/env/工具名与工具指引文本(tool_note/codemap_note);
+  注入:mcp_servers/env/工具名;
   本包零生成器 SDK 依赖且不做任何工具假设。
 - 单一生成器管道(选型 = 上层 webui 在边界注入的 DEEPWIKI_GENERATOR;引擎空选型内建
   cc):Claude Code 或同类 harness 自读代码 + 图工具,wiki 结构/页面

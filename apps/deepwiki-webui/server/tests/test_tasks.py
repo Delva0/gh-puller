@@ -83,7 +83,7 @@ def _proj(request) -> str:
 
 
 def _prepared() -> tasks.PreparedRepo:
-    return tasks.PreparedRepo(Repo("/tmp/gh-puller-test-repo", "local"), "main", [], "")
+    return tasks.PreparedRepo(Repo("/tmp/gh-puller-test-repo", "local"), "main")
 
 
 _STRUCT_XML = """<wiki_structure>
@@ -258,7 +258,7 @@ async def test_resume_isolated_by_target(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_cache_hit_respects_target(monkeypatch, tmp_path):
-    """成品缓存按公开 target 身份校验:同轨(generator + file:config_path / object:provider|model)才命中。
+    """成品缓存按公开 target 身份校验:同轨(generator + generator_config 整体)才命中。
 
     换 generator(同 repo)即另一份缓存,不否定旧成品、全新重新生成。
     """
@@ -274,9 +274,7 @@ async def test_cache_hit_respects_target(monkeypatch, tmp_path):
             "token": None, "localPath": None, "repoUrl": "/tmp/gh-puller-test-repo",
         },
         "generator": "cc",
-        "config_path": str(cfg),
-        "provider": None,
-        "model": None,
+        "generator_config": {"config_path": str(cfg)},
     }
     digest_cc = generator_digest((cc_target or {}).get("generator"), (cc_target or {}).get("generator_config"))
     assert await save_wiki_cache("gen-cache", "demo", "local", "en", cache, digest=digest_cc) is True
@@ -367,7 +365,7 @@ async def test_determine_structure_skips_when_file_exists(monkeypatch):
     s = await deepwiki.determine_structure(
         generator=request["target"].get("generator"), generator_config=request["target"].get("generator_config"),
         repo=repo, owner=request["owner"], repo_name=request["repo"],
-        file_tree=["src/a.py"], readme="", comprehensive=request["comprehensive"],
+        comprehensive=request["comprehensive"],
         language=request["language"], run_id=_proj(request),
     )
     assert [p.id for p in s.pages] == ["p1", "p2", "p3"]
@@ -375,7 +373,7 @@ async def test_determine_structure_skips_when_file_exists(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_determine_structure_calls_generator_no_inline(tmp_path, monkeypatch):
-    """结构走生成器并读回文件;提示词只有文件树路径,不内联任何文件内容。"""
+    """结构走生成器并读回文件;提示词不内联任何文件内容,仓库由生成器自读。"""
     (tmp_path / "src").mkdir()
     (tmp_path / "src" / "a.py").write_text("SECRET_CODE_BODY", encoding="utf-8")
     (tmp_path / "README.md").write_text("SECRET_README_BODY", encoding="utf-8")
@@ -398,12 +396,11 @@ async def test_determine_structure_calls_generator_no_inline(tmp_path, monkeypat
     s = await deepwiki.determine_structure(
         generator=request["target"].get("generator"), generator_config=request["target"].get("generator_config"),
         repo=repo, owner=request["owner"], repo_name=request["repo"],
-        file_tree=["src/a.py"], readme="", comprehensive=request["comprehensive"],
+        comprehensive=request["comprehensive"],
         language=request["language"], run_id=_proj(request),
     )
     assert [p.id for p in s.pages] == ["p1", "p2", "p3"]
-    assert "<file_tree>" in captured["prompt"]
-    assert "src/a.py" in captured["prompt"]
+    assert "<file_tree>" not in captured["prompt"]  # 文件树/README 不再内联进提示词
     assert "SECRET_CODE_BODY" not in captured["prompt"]
     assert "SECRET_README_BODY" not in captured["prompt"]
     assert captured["run_id"] == _proj(request)  # 任务级会话组关联
@@ -491,15 +488,18 @@ async def test_generate_repo_wiki_assemble_and_resume(tmp_path, monkeypatch):
     cdir = generators._cbm_cache_dir()
     cdir.mkdir(parents=True, exist_ok=True)
     (cdir / f"{generators.project_name(fake_repo)}.db").touch()
-    # 预置结构 + 全部页面缓存文件
+    # 预置结构 + 全部页面缓存文件(路径指纹按运行形态:runtime_config 注入面;同循环内一致)
+    gc = generators.runtime_config(
+        request["target"].get("generator"), request["target"].get("generator_config"), repo=fake_repo,
+    )
     struct_path = _generator_cache_structure_path(
-        _proj(request), request["target"].get("generator"), request["target"].get("generator_config"),
+        _proj(request), request["target"].get("generator"), gc,
     )
     struct_path.parent.mkdir(parents=True, exist_ok=True)
     struct_path.write_text(_STRUCT_XML, encoding="utf-8")
     for pid in ("p1", "p2", "p3"):
         page_path = _generator_cache_page_path(
-            _proj(request), pid, request["target"].get("generator"), request["target"].get("generator_config"),
+            _proj(request), pid, request["target"].get("generator"), gc,
         )
         page_path.write_text(f"## {pid}-REAL\n\nbody\n", encoding="utf-8")
 
@@ -516,10 +516,7 @@ async def test_generate_repo_wiki_assemble_and_resume(tmp_path, monkeypatch):
     data = json.loads(cache_path.read_text(encoding="utf-8"))
     assert set(data["generated_pages"]) == {"p1", "p2", "p3"}
     assert data["generator"] == "cc"  # 成品缓存只记公开 target,无凭证字段
-    assert data.get("provider") is None and data.get("model") == ""  # file 类不落 provider/model
-    from gh_puller import envs as _envs
-
-    assert data["config_path"] == _envs.DEEPWIKI_CC_CONFIG  # 身份 = config_path(非凭证)
+    assert data["generator_config"] == {}  # 身份 = generator_config 原样(公开形态;无凭证)
     assert "api_key" not in json.dumps(data) and "base_url" not in json.dumps(data)
     for pid in ("p1", "p2", "p3"):
         assert f"{pid}-REAL" in data["generated_pages"][pid]["content"]

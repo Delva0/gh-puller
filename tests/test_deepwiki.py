@@ -30,7 +30,7 @@ from gh_puller.deepwiki import (
 )
 from gh_puller.deepwiki import utils as deepwiki_utils
 from gh_puller.deepwiki.codemap import _locate_snippet
-from gh_puller.deepwiki.utils import adapter, generator_digest
+from gh_puller.deepwiki.utils import adapt_generator, generator_digest
 from gh_puller.deepwiki.wiki import (
     RepoUrlContext,
     _generator_cache_dir,
@@ -206,22 +206,16 @@ def _repo_of(req: dict) -> Repo:
     return Repo(req["repo_url"], req["type"], access_token=req.get("token"))
 
 
-def _gen_kwargs(choice: dict | None, *, note: str = "") -> dict:
-    """散装参数测试辅助:选型 dict(wire target)→ generator/generator_config 拆分 kwargs。
-
-    note = 上层注入的工具指引文本(引擎零工具假设,指引由上层传)。
-    """
+def _gen_kwargs(choice: dict | None) -> dict:
+    """散装参数测试辅助:选型 dict(wire target)→ generator/generator_config 拆分 kwargs。"""
     c = choice or {}
-    gc = dict(c.get("generator_config") or {})
-    if note:
-        gc["tool_note"] = note
-    return {"generator": c.get("generator"), "generator_config": gc}
+    return {"generator": c.get("generator"), "generator_config": dict(c.get("generator_config") or {})}
 
 
-async def _chat(req: dict, note: str = "") -> list[str]:
+async def _chat(req: dict) -> list[str]:
     """散装参数测试辅助:调用模块级 chat_stream(请求为 dict;单一生成器管道随 target)。"""
     return [c async for c in deepwiki.chat_stream(
-        **_gen_kwargs(req["target"], note=note), repo=_repo_of(req), messages=req["messages"],
+        **_gen_kwargs(req["target"]), repo=_repo_of(req), messages=req["messages"],
         language=req.get("language", "en"),
         research_iteration=req.get("research_iteration", 1),
     )]
@@ -329,14 +323,12 @@ async def test_agent_dispatch_by_generator(monkeypatch):
     for gid in ("cc", "dsh", "codex", "opencode"):
         monkeypatch.setitem(GENERATORS, gid, _FakeGenerator)
         monkeypatch.setattr(_FakeGenerator, "generator", gid)
-        inst = adapter(**_gen_kwargs({"generator": gid}), system_prompt="s")
+        inst = adapt_generator(**_gen_kwargs({"generator": gid}), system_prompt="s")
         assert inst.generator == gid and isinstance(inst, _FakeGenerator)
         assert inst.config["system_prompt"] == "s"  # 构造期注入(config 整体)
     monkeypatch.setattr(_FakeGenerator, "generator", "cc")
-    monkeypatch.setattr(deepwiki.envs, "DEEPWIKI_CC_CONFIG", "")  # conftest 钉了 tmp,清掉以测"无配置"
-    inst = adapter(**_gen_kwargs({}))  # 空选型 = 内建缺省 cc(缺省政策在 webui,引擎不读 env)
+    inst = adapt_generator(**_gen_kwargs({}))  # 空选型 = 内建缺省 cc(缺省政策在 webui,引擎不读 env)
     assert inst.generator == "cc" and isinstance(inst, _FakeGenerator)
-    assert "config_path" not in inst.config  # 无配置:概念键缺失 → SDK 缺省隔离
 
 
 def test_dsh_options_config(monkeypatch, tmp_path):
@@ -349,7 +341,7 @@ def test_dsh_options_config(monkeypatch, tmp_path):
     monkeypatch.setitem(GENERATORS, "dsh", _FakeGenerator)
     monkeypatch.setattr(_FakeGenerator, "generator", "dsh")
     fake_mcp = [{"id": "fake", "command": "x"}]
-    cfg = adapter(
+    cfg = adapt_generator(
         **_gen_kwargs({"generator": "dsh", "generator_config": {"mcp_servers": fake_mcp}}),
         system_prompt="sys", repo=repo,
     ).config
@@ -360,15 +352,9 @@ def test_dsh_options_config(monkeypatch, tmp_path):
     assert "dsh-runtime" in cfg["runtime_cwd"]  # 与任务 checkout 隔离(见 envs.DSH_RUNTIME_CWD)
     assert cfg["system_prompt"] == "sys"  # 契约键(agent dsh_fields 映射 DSH_SYSTEM_PROMPT)
     assert cfg["mcp_servers"] == fake_mcp
-    assert "config_path" not in cfg  # 默认不传 → agent 缺省隔离组合
-    cfg2 = adapter(**_gen_kwargs({"generator": "dsh"}), system_prompt="sys").config
+    cfg2 = adapt_generator(**_gen_kwargs({"generator": "dsh"}), system_prompt="sys").config
     assert "cwd" not in cfg2  # repo 空:不固定 cwd(走进程缺省)
     assert "mcp_servers" not in cfg2  # repo 空:不注入图工具桌(同"repo 非空才落 mcp")
-    # file 类契约:config_path(经 resolve 解析;env DEEPWIKI_DSH_CORDIS 为 env 缺省)即 cordis
-    cordis = tmp_path / "cordis.yml"
-    cordis.write_text("{}", encoding="utf-8")
-    monkeypatch.setattr(deepwiki.envs, "DEEPWIKI_DSH_CORDIS", str(cordis))
-    assert adapter(**_gen_kwargs({"generator": "dsh"})).config["config_path"] == str(cordis)
 
 
 def test_opencode_options_config(monkeypatch, tmp_path):
@@ -381,7 +367,7 @@ def test_opencode_options_config(monkeypatch, tmp_path):
     monkeypatch.setitem(GENERATORS, "opencode", _FakeGenerator)
     monkeypatch.setattr(_FakeGenerator, "generator", "opencode")
     fake_mcp = [{"id": "fake", "command": "x"}]
-    cfg = adapter(
+    cfg = adapt_generator(
         **_gen_kwargs({"generator": "opencode",
                        "generator_config": {"mcp_servers": fake_mcp,
                                             "env": {"GRAPHIFY_OUT": "/g"},
@@ -393,32 +379,19 @@ def test_opencode_options_config(monkeypatch, tmp_path):
     assert cfg["system_prompt"] == "sys"
     assert cfg["mcp_servers"] == fake_mcp
     assert cfg["env"] == {"GRAPHIFY_OUT": "/g"}
-    assert cfg["model"] == "deepseek/deepseek-chat"  # 白名单透传
-    assert "config_path" not in cfg  # 默认不传 → 生成器缺省(合并用户配置)
-    cfg2 = adapter(**_gen_kwargs({"generator": "opencode"}), system_prompt="sys").config
+    assert cfg["model"] == "deepseek/deepseek-chat"  # 原样随传
+    cfg2 = adapt_generator(**_gen_kwargs({"generator": "opencode"}), system_prompt="sys").config
     assert "cwd" not in cfg2 and "mcp_servers" not in cfg2  # repo 空:不固定 cwd/不注入工具桌
-    # file 类契约:config_path(经 resolve 解析;env DEEPWIKI_OPENCODE_CONFIG 为 env 缺省)
-    oc_cfg = tmp_path / "opencode.json"
-    oc_cfg.write_text("{}", encoding="utf-8")
-    monkeypatch.setattr(deepwiki.envs, "DEEPWIKI_OPENCODE_CONFIG", str(oc_cfg))
-    assert adapter(**_gen_kwargs({"generator": "opencode"})).config["config_path"] == str(oc_cfg)
 
 
 def test_agent_options_cc_setting_sources_isolated(monkeypatch):
-    """cc 完全隔离本地 claude 配置(setting_sources=[]):用户级 MCP/skills/hooks 不掺入 agent;
+    """cc 完全隔离本地 claude 配置(setting_sources=[]):用户级 MCP/skills/hooks 不掺入 agent。
 
-    config_path 概念键纯透传(路径直传 SDK,不读文件)。
     """
     monkeypatch.setitem(GENERATORS, "cc", _FakeGenerator)
-    cfg = adapter(**_gen_kwargs({}), system_prompt="sys").config
+    cfg = adapt_generator(**_gen_kwargs({}), system_prompt="sys").config
     assert cfg["setting_sources"] == []
-    assert cfg["config_path"] == os.path.abspath(deepwiki.envs.DEEPWIKI_CC_CONFIG)  # env 缺省
-    cfg2 = adapter(
-        **_gen_kwargs({"generator": "cc", "generator_config": {"config_path": "/tmp/dw-test-settings.json"}}),
-        system_prompt="sys",
-    ).config
-    assert cfg2["setting_sources"] == []
-    assert cfg2["config_path"] == "/tmp/dw-test-settings.json"  # 显式 > env;纯透传(无任何文件读取)
+    assert cfg["system_prompt"] == "sys"
 
 
 @pytest.mark.asyncio
@@ -448,13 +421,12 @@ async def test_chat_stream_history_trim_no_context(monkeypatch):
                      {"role": "assistant", "content": "a1"},
                      {"role": "user", "content": "q2"}],
     }
-    got = await _chat(request, note="<note>tool hint</note>\n\n")
+    got = await _chat(request)
     assert "".join(got) == "hi"
     assert captured["run_id"] == captured["session"]  # 会话组名与监控名同一来源(chat:<repo>)
     assert captured["run_id"].startswith("chat:")
     assert "context" not in captured  # 引擎不再传 context
-    # 工具指引文本经 generator_config 注入(引擎零工具假设;未注入 → 无 note)
-    assert "<note>tool hint</note>" in captured["prompt"] and "<query>\nq2\n</query>" in captured["prompt"]
+    assert "<query>\nq2\n</query>" in captured["prompt"]
     assert "Previous conversation:" not in captured["prompt"]  # 被裁剪
     assert "<conversation_history>" not in captured["prompt"]
 
@@ -494,7 +466,7 @@ def test_options_cc_cache_write_mode(monkeypatch, tmp_path):
     repo = Repo(str(tmp_path), "local")
     monkeypatch.setitem(GENERATORS, "cc", _FakeGenerator)
     graph_tools = ["graphify_query", "mcp__graphify__graphify_query"]
-    cfg = adapter(
+    cfg = adapt_generator(
         **_gen_kwargs({"generator_config": {"allowed_tools": graph_tools}}),
         system_prompt="", repo=repo,
         generator_cache_dir=str(tmp_path / "out"), generator_cache_write_mode=True,
@@ -503,10 +475,9 @@ def test_options_cc_cache_write_mode(monkeypatch, tmp_path):
     assert cfg["add_dirs"] == [str(tmp_path / "out")]
     assert cfg["permission_mode"] == "acceptEdits"
     assert "model" not in cfg  # model 随配置文件(file 类不在装配层注入)
-    assert cfg["config_path"] == os.path.abspath(deepwiki.envs.DEEPWIKI_CC_CONFIG)  # env 缺省
     for t in ("Read", "Grep", "Glob", "Write", *graph_tools):
         assert t in cfg["allowed_tools"], t
-    cfg2 = adapter(
+    cfg2 = adapt_generator(
         **_gen_kwargs({"generator_config": {"allowed_tools": graph_tools}}),
         system_prompt="", repo=repo,
     ).config
@@ -684,16 +655,16 @@ async def test_agent_chat_wraps_request_failure_in_degrade(monkeypatch):
 
 
 def test_codex_options_config(monkeypatch, tmp_path):
-    """经 _adapter 的 codex 装配:file 类配置随 config_path(纯透传,不读文件);
+    """经 _adapter 的 codex 装配:config 原样随传(不读文件);
 
     cwd 固定仓库根;env.GRAPHIFY_OUT / mcp_servers 图工具桌经 generator_config
-    白名单透传(app 侧 runtime_config 注入;repo 空时无 cwd/图位)。
+    原样透传(app 侧 runtime_config 注入;repo 空时无 cwd/图位)。
     """
     repo = Repo(str(tmp_path), "local")
     monkeypatch.setitem(GENERATORS, "codex", _FakeGenerator)
     monkeypatch.setattr(_FakeGenerator, "generator", "codex")
     fake_mcp = [{"id": "fake", "command": "x"}]
-    cfg = adapter(
+    cfg = adapt_generator(
         **_gen_kwargs({"generator": "codex", "generator_config": {
             "mcp_servers": fake_mcp, "env": {"GRAPHIFY_OUT": "/tmp/g"}}}),
         system_prompt="sys", repo=repo,
@@ -702,7 +673,7 @@ def test_codex_options_config(monkeypatch, tmp_path):
     assert cfg["env"] == {"GRAPHIFY_OUT": "/tmp/g"}
     assert cfg["mcp_servers"] == fake_mcp
     assert cfg["sandbox"] == "full_access" and cfg["approval_mode"] == "auto_review"
-    cfg2 = adapter(**_gen_kwargs({"generator": "codex"}), system_prompt="sys").config
+    cfg2 = adapt_generator(**_gen_kwargs({"generator": "codex"}), system_prompt="sys").config
     assert "cwd" not in cfg2 and "env" not in cfg2 and "mcp_servers" not in cfg2  # repo 空:不固定 cwd/图
     assert "model" not in cfg2  # 缺省交给 SDK 缺省模型
     # 学 cc 凭证面:envs 无 CODEX_* 常量(防误引入"看起来必须配置"的 env 骨架)

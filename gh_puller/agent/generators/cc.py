@@ -1,10 +1,10 @@
-"""cc:Claude Code(SDK)包装 —— 配置世界(ClaudeConfig + claude_options)+ 适配器本体。
+"""cc: Claude Code SDK wrapper — config world (ClaudeConfig + claude_options) + adapter.
 
-本文件 = cc 的独立扩展点(唯一权威合成器,cc 是唯一权威 → 适配器只维护一套自造编号);
-config 契约/字段映射与适配器同文件:ClaudeConfig → ClaudeAgentOptions(**config),
-config_path → settings(SDK 传 --settings,只装载所选文件);凭证随所选 settings
-文件(SDK CLI 侧登录)。SDK 类型仅函数内懒导入(测试经假模块注入),模块 import
-面零 SDK。
+Single-authority cc file: the adapter owns cc's event numbering (no second authority);
+ClaudeConfig → ClaudeAgentOptions(**config) with SDK-native keys — config contract
+sourced in the package docstring (see __init__.py). Credentials ride the chosen
+settings file (SDK CLI-side login). SDK types lazily imported inside functions
+(tests inject fake modules); the module import surface is SDK-free.
 """
 
 import json
@@ -16,14 +16,14 @@ from .utils import RequestFailedError
 
 
 class ClaudeConfig(TypedDict, total=False):
-    """cc 运行时 config:整体作为 ClaudeAgentOptions(**config);config_path → settings。"""
+    """cc runtime config: keys are ClaudeAgentOptions field names (see __init__.py)."""
 
     model: str
     system_prompt: str
     allowed_tools: list[str]
     mcp_servers: dict
     cwd: str
-    config_path: str
+    settings: str  # --settings load (only that file; credentials ride the file)
     add_dirs: list[str]
     permission_mode: str
     setting_sources: list[str]
@@ -33,19 +33,19 @@ class ClaudeConfig(TypedDict, total=False):
 
 
 def claude_options(config: dict):
-    """ClaudeConfig → ClaudeAgentOptions 实例(config_path → settings 装载)。
+    """ClaudeConfig → ClaudeAgentOptions instance (keys passthrough, see __init__.py).
 
-    本层只做键映射(config 原样透传 + config_path → settings),不关心 SDK 运行细节。
-    默认隔离:strict_mcp_config 未显式给定时取 True —— 无头 cc 只认 mcp_servers
-    注入的工具桌,忽略本机用户级 MCP 配置(防本机全局服务器与装配工具桌混用)。
+    Non-obvious behavior: an empty settings value is dropped (SDK default
+    isolation); strict_mcp_config defaults to True — headless cc recognizes only
+    the injected tool desk (mcp_servers), ignoring machine-level MCP config.
     """
-    from claude_agent_sdk import ClaudeAgentOptions  # lazy:测试可喂假模块
+    from claude_agent_sdk import ClaudeAgentOptions  # lazy: fake module in tests
 
-    sdk_options = {k: v for k, v in config.items() if k != "config_path"}  # 概念键不得透传
-    if config.get("config_path"):  # 统一概念键 → SDK settings(--settings 装载)
-        sdk_options["settings"] = config["config_path"]
-    sdk_options.setdefault("strict_mcp_config", True)  # 本层默认隔离
-    sdk_options.setdefault("include_partial_messages", True)  # StreamEvent 路径:thinking/text chunk 流(监控重建+增量必备;SDK 缺省 False)
+    sdk_options = dict(config)
+    if not sdk_options.get("settings"):  # empty → SDK default isolation
+        sdk_options.pop("settings", None)
+    sdk_options.setdefault("strict_mcp_config", True)  # default isolation (see above)
+    sdk_options.setdefault("include_partial_messages", True)  # StreamEvent path: thinking/text chunk stream (monitor rebuild + incremental; SDK default False)
     return ClaudeAgentOptions(**sdk_options)
 
 
@@ -242,13 +242,13 @@ def _handle_user_message(event_recorder: EventRecorder, msg) -> None:
 
 
 class ClaudeCode(BaseGenerator):
-    """cc: Claude Code command. Config shape: file-class — config_path points at a settings JSON.
+    """cc: Claude Code command. Config shape: file-class (see __init__.py).
 
-    ClaudeConfig → ClaudeAgentOptions(**config), config_path → settings (SDK passes
-    --settings, loading only that file); credentials ride the chosen settings file
-    (SDK CLI-side login). Client binding is built at construction (claude_options
-    binding + ClaudeSDKClient object): one instance = one client wrapper; connection
-    enter (child spawn) at session startup (`async with cc.session(...)`), exit reaps.
+    ClaudeConfig → ClaudeAgentOptions(**config); credentials ride the chosen
+    settings file (SDK CLI-side login). Client binding is built at construction
+    (claude_options binding + ClaudeSDKClient object): one instance = one client
+    wrapper; connection enter (child spawn) at session startup
+    (`async with cc.session(...)`), exit reaps.
     """
 
     generator = "cc"
@@ -271,8 +271,7 @@ class ClaudeCode(BaseGenerator):
 
         Yielded text: StreamEvent text_delta first, AssistantMessage whole-text fallback,
         ResultMessage.is_error → RequestFailedError(detail); thinking/tool increments
-        go to the event stream only. config passes through as ClaudeAgentOptions
-        (config_path → settings).
+        go to the event stream only. config passes through as ClaudeAgentOptions.
         """
         from claude_agent_sdk import AssistantMessage, ResultMessage, StreamEvent, UserMessage
 

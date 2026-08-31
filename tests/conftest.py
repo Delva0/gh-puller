@@ -1,9 +1,7 @@
-"""测试级默认:file 类(cc)的 env 缺省配置路径钉到 tmp,产物根隔离到临时目录。
+"""测试级默认:产物根与监控目录隔离到临时目录。
 
 envs.py 在导入时单点快照 os.environ —— 因此必须在 conftest 导入时(先于任何
 测试模块导入)写入:
-- DEEPWIKI_CC_CONFIG(tmp 配置文件):空 target(默认 cc)不依赖真实
-  ~/.claude/settings.json 是否存在;
 - DEEPWIKI_ROOT(tmp,强制赋值而非 setdefault):即使外层环境已设,本套件也不落
   用户真实目录;且全量套件下其它测试可能已先 import gh_puller.agent → 模块级
   `from .. import envs` 已把真实根快照进 sys.modules —— 必须 pop + 清除包属性
@@ -20,22 +18,10 @@ import os
 import sys
 import tempfile
 from contextlib import suppress
-from pathlib import Path
 
-_cc_dir = Path(tempfile.mkdtemp(prefix="gh-puller-cc-config-"))
-_cc_file = _cc_dir / "claude-settings.json"
-_cc_file.write_text("{}", encoding="utf-8")
-os.environ["DEEPWIKI_CC_CONFIG"] = str(_cc_file)
 os.environ["DEEPWIKI_ROOT"] = tempfile.mkdtemp(prefix="deepwiki-test-")
 os.environ["AGENT_MONITOR_DIR"] = tempfile.mkdtemp(prefix="gh-puller-agent-monitor-test-")
 sys.modules.pop("gh_puller.envs", None)
 # 包属性可能未被 from-import 缓存(AttributeError),包条目也可能不在 sys.modules(KeyError)
 with suppress(AttributeError, KeyError):
     delattr(sys.modules["gh_puller"], "envs")
-import pytest  # noqa: E402
-
-
-@pytest.fixture(autouse=True)
-def _cc_config_default():
-    """cc 的 env 缺省配置路径(= conftest 设置的 tmp 文件;见模块 docstring)。"""
-    return str(_cc_file)

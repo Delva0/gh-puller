@@ -15,7 +15,6 @@ export interface GeneratorConfigItem {
   defaultProvider: string; // object 类有效(file 类仅旧投影展示)
   providers: string[]; // object 类选择列表(file 类为空)
   defaultModelEnv: string | null; // object 类
-  configPathEnv: string | null; // file 类(占位提示:环境变量名)
   configDefault: string | null; // file 类(默认路径提示)
 }
 

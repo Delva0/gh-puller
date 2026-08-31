@@ -86,7 +86,7 @@ def _gh_puller_mcp(backend: str):
     return McpStdioServerConfig(command="uv", args=args)
 
 
-async def _call_tool(tool: str, arguments: dict, *, timeout: float | None = None) -> dict:  # noqa: ASYNC109 - 透传服务器级 --timeout 墙钟,非本函数超时
+async def _call_mcp_tool(tool: str, arguments: dict, *, timeout: float | None = None) -> dict:  # noqa: ASYNC109 - 透传服务器级 --timeout 墙钟,非本函数超时
     """一次工具调用 = 一次 stdio 短连接(服务器收 EOF 退出);失败(含 isError)→ RuntimeError。
 
     成功 → 信封 content 解析后的 dict(服务器侧无 outputSchema:structuredContent 命中,
@@ -130,7 +130,7 @@ async def _call_tool(tool: str, arguments: dict, *, timeout: float | None = None
 
 async def _run_index(repo: Repo) -> None:
     """index_repository 建图(mode=fast:纯结构分析,无 key 可跑);isError → RuntimeError。"""
-    await _call_tool(
+    await _call_mcp_tool(
         "index_repository",
         {"repo_path": repo.save_path, "mode": "fast", "name": project_name(repo)},
         timeout=_INDEX_TIMEOUT_SEC,
@@ -153,63 +153,35 @@ async def ensure_index(repo: Repo) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 工具指引文本(原 deepwiki 内嵌提示词 → 本层持;引擎只插入不假设任何工具)
+# 覆盖构造参数注入(生成器选型 + 工具桌 → generator_config)
 # ---------------------------------------------------------------------------
-
-
-def agent_note(generator: str) -> str:
-    """注入到 agent 路 user 消息的指引段(图工具名;runtime_config 注入 tool_note)。
-
-    工具标签前缀随后端:opencode = servername_(如 gh_puller_search_graph);
-    cc/dsh/codex = mcp__。引擎零工具假设,文本在此自持。
-    """
-    tool = _graph_tool_name(generator)
-    return (
-        f"<note>You may use the {tool} tool to inspect this repository's "
-        "code graph (symbols with file paths and line ranges) whenever you need code context or "
-        "exact file/line references for citations.</note>\n\n"
-    )
-
-
-def _graph_tool_name(generator: str) -> str:
-    """search_graph 在该后端的工具标签前缀:opencode = servername_(非 mcp__)。"""
-    return "gh_puller_search_graph" if generator == "opencode" else "mcp__gh_puller__search_graph"
-
-
-def codemap_note(generator: str = "cc") -> str:
-    """codemap 指引(仅 agent 路用:先查图谱再构造,引用行号取自 search_graph 的 file/lines)。
-
-    (原 gh_puller.deepwiki.codemap._codemap_note 上移;runtime_config 注入 codemap_note)
-    """
-    tool = _graph_tool_name(generator)
-    return (
-        f"<note>Before answering, use the {tool} tool (format='json') "
-        "to inspect the repository code graph; its rows carry the relative 'file' path and a "
-        "'lines' range (e.g. 12-33) per matched symbol. When filling "
-        "citation.file_path / start_line / end_line, use those paths and line numbers, and make "
-        "the 'snippet' a verbatim substring of the code at those lines.</note>\n\n"
-    )
-
-
-# ---------------------------------------------------------------------------
-# 覆盖构造参数注入(生成器选型 + 工具桌/工具指引 → generator_config)
-# ---------------------------------------------------------------------------
-
 
 def runtime_config(generator: str | None = None, generator_config: dict | None = None,
-                   *, repo: Repo | None = None, get_env=None) -> dict:
-    """选型 → 覆盖构造参数集(generator_config 基础上注入工具桌)。
+                   *, repo: Repo | None = None) -> dict:
+    """Selection → runtime config (public config_path adapted per generator + tool-desk injection).
 
-    gh-puller-mcp 工具桌按后端注入:cc 得 McpStdioServerConfig(scout 档)+ 图工具名;
-    dsh/codex/opencode 得子进程描述(+ codex/opencode env 条件透传 CBM_* 保证索引根
-    一致);llm 不注入(直连 HTTP,无工具桌);再注入工具指引文本(tool_note/
-    codemap_note,引擎外置文本);repo 为 None 时跳过注入(与原 adapter
-    "repo 非空才落 mcp" 同语义)。引擎侧 adapter 白名单透传。
+    The wire form (frontend/HTTP) carries config_path; per-generator adaptation:
+    cc → settings; opencode → config; codex keeps config_path (no SDK-native
+    parameter, the generator layer converts it into the home config.toml symlink);
+    dsh → no adaptation (no such concept, the isolated composition covers it).
+    Empty values drop (SDK default isolation). gh-puller-mcp tool desk injected
+    per backend: cc gets McpStdioServerConfig (scout tier) + graph tool names;
+    dsh/codex/opencode get child-process descriptions (+ codex/opencode env
+    passthrough of CBM_* for a consistent index root); llm gets no tool desk
+    (direct HTTP). repo=None skips the injection (same semantics as the original
+    adapter "no mcp without repo").
     """
     result = dict(generator_config or {})
+    gid, _ = resolve_generator(generator, generator_config)
+    if gid == "cc":
+        if cfg := result.pop("config_path", None):
+            result["settings"] = cfg
+    elif gid == "opencode":
+        if cfg := result.pop("config_path", None):
+            result["config"] = cfg
+    # codex keeps config_path; dsh has no config_path concept — nothing to adapt.
     if repo is None:
         return result
-    gid, _ = resolve_generator(generator, generator_config, get_env)
     if gid == "dsh":
         result["mcp_servers"] = _gh_puller_mcp("dsh")
     elif gid in ("codex", "opencode"):
@@ -222,7 +194,4 @@ def runtime_config(generator: str | None = None, generator_config: dict | None =
     else:  # cc
         result["mcp_servers"] = {"gh_puller": _gh_puller_mcp("cc")}
         result["allowed_tools"] = [*_SCOUT_TOOLS, *[f"mcp__gh_puller__{n}" for n in _SCOUT_TOOLS]]
-    if gid != "llm":  # 工具指引注入(引擎零工具假设,文本在上层)
-        result["tool_note"] = agent_note(gid)
-        result["codemap_note"] = codemap_note(gid)
     return result

@@ -17,21 +17,12 @@ benchmark 评测相关 key 见文末分节。
 
 import os
 
-# ---- 生成器配置文件(file 类契约:generator_config.config_path 的 env 缺省) ----
-# 显式 config_path > 下列 env > generator 类属性缺省(cc= ~/.claude/settings.json;
-# dsh/codex/opencode 无缺省 → 生成器内置隔离组合)。
-DEEPWIKI_CC_CONFIG = os.environ.get("DEEPWIKI_CC_CONFIG", "")  # cc:Claude settings JSON 路径
-DEEPWIKI_CODEX_CONFIG = os.environ.get("DEEPWIKI_CODEX_CONFIG", "")  # codex:config.toml 路径
-DEEPWIKI_OPENCODE_CONFIG = os.environ.get("DEEPWIKI_OPENCODE_CONFIG", "")  # opencode:opencode.json 路径
-
 # ---- dsh 运行隔离(非凭证) ----
 DSH_SESSION_ROOT = os.path.expanduser(os.environ.get("DSH_SESSION_ROOT", "~/.gh-puller/dsh-sessions"))
 # runtime 进程 cwd(也是它读取 .env 的加载点):必须远离任务 checkout —— 仓库自带
 # .env(可含 DEEPSEEK_*/其它字面键)会注入子进程(隔离链上唯一真实泄漏口,runtime_cwd
 # 缺省 = 任务仓库 cwd)。cc 路径无此面(SDK 不做 cwd .env 加载)。
 DSH_RUNTIME_CWD = os.path.expanduser(os.environ.get("DSH_RUNTIME_CWD", "~/.gh-puller/dsh-runtime"))
-# dsh 的文件类 config 缺省 env(承接旧"自定义组合文件"语义;经 resolve 解析为 config_path)
-DEEPWIKI_DSH_CORDIS = os.environ.get("DEEPWIKI_DSH_CORDIS", "")
 
 # ---- 产物根目录:repos/ 克隆目录、图产物索引根、wiki/ 缓存容器(内部按项目分 <repo_key>/ 文件夹) ----
 DEEPWIKI_ROOT = os.path.expanduser(os.environ.get("DEEPWIKI_ROOT", "~/.gh-puller/deepwiki"))
@@ -42,9 +33,9 @@ CHAT_TOKEN_LIMIT_ESTIMATE = int(os.environ.get("DEEPWIKI_CHAT_TOKEN_LIMIT", "750
 # ---- agent 流式监控(文件观测默认恒开;Web/WS 经 AGENT_MONITOR_WEBUI_URL,OTel 经 AGENT_MONITOR_PHOENIX_URL) ----
 # 两 URL 均逗号分隔多地址(每地址一个 sink 实例,预留);空 → 不启用该类 sink。
 # 新 OTel 后端(如 AGENT_MONITOR_LANGFUSE_URL,默认 "")= 此处一个常量 + sinks._OTEL_BACKENDS 表一条。
-# 该目录即会话 jsonl 落盘根(无 sessions 子层):~/.gh-puller/agent-sessions/<uuid>.jsonl;
+# 该目录即会话 jsonl 落盘根(无 sessions 子层):~/.gh-puller/generator-sessions/<uuid>.jsonl;
 # hub(apps/agent-monitor/server/hub.py)为同一目录的读端(共享契约,单点在本模块)。
-AGENT_MONITOR_DIR = os.path.expanduser(os.environ.get("AGENT_MONITOR_DIR", "~/.gh-puller/agent-sessions"))
+AGENT_MONITOR_DIR = os.path.expanduser(os.environ.get("AGENT_MONITOR_DIR", "~/.gh-puller/generator-sessions"))
 # 文件 sink 事件粒度开关:0(缺省)→ 非流式事件流投影(逐行跳过 assistant/chunk,
 # 防日志膨胀;文件 seq 允许洞);1 → 原始事件流(全量 taxonomy 逐行落盘,seq 稠密)
 AGENT_MONITOR_FILE_RAW = os.environ.get("AGENT_MONITOR_FILE_RAW", "0") == "1"
