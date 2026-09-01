@@ -14,6 +14,7 @@ codebase-memory-mcp cli --json <tool>          # args on stdin as JSON
 
 ```bash
 uv --directory apps/gh-puller-mcp run python -m gh_puller_mcp [--tool-profile analysis|scout] [--binary PATH] [--debug] [--timeout SEC]
+# 跨机暴露:加 --http [--host HOST] [--port PORT] [--path PATH](见下节)
 ```
 
 * 默认档位 `all` 暴露 15 个工具;`analysis`(11)/`scout`(7)收紧工具面并切换 `initialize` 指令,与 C 服务器的 `--tool-profile` 完全一致。
@@ -21,6 +22,25 @@ uv --directory apps/gh-puller-mcp run python -m gh_puller_mcp [--tool-profile an
 * 环境继承(`CBM_CACHE_DIR`、`CBM_RUNTIME_DIR` 决定缓存根与 CLI 所附着的守护进程)。
 * 干净 EOF / framing 停止退出码 0(对应 C 服务器);bad flags 退出码 2。
 * 每次工具调用花费约 1.9 s(C 二进制自身启动)加上它的结果;无缓存、无重试。
+* `--http` 切到 Streamable HTTP 传输(stdio 仍是缺省;`--tool-profile` 等旗标组合照常生效),语义见下节。
+
+## HTTP 传输(Streamable HTTP,跨机暴露)
+
+```bash
+uv --directory apps/gh-puller-mcp run python -m gh_puller_mcp --http --host 0.0.0.0 --port 8787 --path /gh-puller/graph
+```
+
+* 形态是**单端点 MCP JSON-RPC**(`tools/list`、`tools/call`、`prompts/*`…),不是每工具一个 URL;`json_response`(每次 POST 回纯 JSON,无 SSE 流)与 `stateless_http`(无会话、免 `initialize` 握手,每个 POST 独立)由实现定死,不暴露开关。
+* 任意 HTTP 客户端可直接 POST;MCP 客户端(streamable http)连同一端点:
+
+```bash
+curl -s localhost:8787/gh-puller/graph -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_projects","arguments":{"limit":1}}}'
+```
+
+* host 语义:`--host` 同时决定 uvicorn 绑定与传输层防护——`127.0.0.1`/`localhost`/`[::1]` 绑定自动启用 DNS rebinding 防护(Host 头须落在白名单且**带端口**,如 `localhost:8787`;跨机 Host 得 421),其余绑定(如 `0.0.0.0`)不启用防护,跨机直接可达。
+* 服务机要求与 stdio 模式相同:cbm 二进制解析序与 `CBM_CACHE_DIR`/`CBM_RUNTIME_DIR` 继承不变,无新增 env。
+* 退出语义:SIGINT/SIGTERM 走优雅关停,但 uvicorn ≥0.52 关停后会重发收到的信号,进程按该信号状态退出(143/130),不是 0。
 
 ## mcp surface (1:1 with the C server)
 
@@ -41,7 +61,7 @@ No tool declares `outputSchema` (deliberate: the C server omits it to keep `stru
 * `initialize` capabilities carry the SDK's `experimental` key (and would advertise `resources`/`logging`/`completions` if their handlers were registered).
 * `tools/call` with a *missing* `name` is rejected by the SDK with `-32602 Invalid request parameters` (the C server returned an `isError` envelope "missing tool name").
 * `resources/list` / `resources/templates/list` are not served (-32601; the C server returned empty arrays) and not advertised.
-* No background auto-index / watcher registration on `initialize` (a C-only side effect invisible in any response); no HTTP UI / daemon mode (`--port` 9749 UI out of scope); the SDK stdio loop is serial too and `notifications/cancelled` is a no-op.
+* No background auto-index / watcher registration on `initialize` (a C-only side effect invisible in any response); no C-style HTTP UI / daemon mode (`--port` 9749 UI out of scope — the `--http` transport serves the MCP protocol itself over Streamable HTTP instead, see Run); the SDK stdio loop is serial too and `notifications/cancelled` is a no-op.
 * On a subprocess failure the server synthesizes an envelope with `"backend error: …"` (the C server never fails this way locally).
 
 ## Tests

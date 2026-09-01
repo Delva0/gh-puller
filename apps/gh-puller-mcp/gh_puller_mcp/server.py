@@ -29,6 +29,7 @@ from typing import Any
 
 import anyio
 import mcp_types as types
+import uvicorn
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.shared.exceptions import MCPError
@@ -255,3 +256,21 @@ def run_server(config: ServerConfig | None = None) -> None:
             await build_server(config).run(read_stream, write_stream, initialization_options=None)
 
     anyio.run(serve)
+
+
+def run_server_http(
+    config: ServerConfig | None = None, *, host: str = "127.0.0.1", port: int = 8787, path: str = "/mcp",
+) -> None:
+    """Serve MCP over Streamable HTTP until interrupted (stateless, plain-JSON responses).
+
+    Stateless mode needs no initialize handshake and keeps no session: every
+    POST is an independent JSON-RPC exchange. `host` must be forwarded to
+    streamable_http_app as well — for localhost binds the SDK auto-enables DNS
+    rebinding protection (localhost-only Host headers, cross-machine gets 421);
+    for any other bind it stays off so remote hosts are accepted.
+    """
+    config = config or ServerConfig()
+    app = build_server(config).streamable_http_app(
+        streamable_http_path=path, json_response=True, stateless_http=True, host=host,
+    )
+    uvicorn.run(app, host=host, port=port)

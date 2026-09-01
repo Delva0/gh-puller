@@ -5,6 +5,7 @@ description = "gh-puller 的 MCP 服务器(代码库知识图谱工具桌)"
 requires-python = ">=3.13"
 dependencies = [
     "mcp>=2.1.1",
+    "uvicorn>=0.31.1",
 ]
 
 [build-system]
@@ -51,4 +52,4 @@ ignore = [
 convention = "google"
 
 [tool.ruff.lint.per-file-ignores]
-"tests/**" = ["S101", "S108", "INP001", "D100", "D104"]
+"tests/**" = ["S101", "S104", "S108", "S310", "INP001", "D100", "D104"]
