@@ -81,13 +81,13 @@ surface 事件携带全量消息与 surfaceOp(append 或 {op:'replace',start,end
 surface 事件 user/message / assistant/message / tool/result 是折叠集合
 (messages(X) 派生见下);config/init 在 session/start 之前打印;context/modify
 折叠正确性与它无关 —— 丢弃也只是少了解释,不会误解消息历史。
-- **会话保活不再走事件**:session 活着但静默时的"保鲜"由 generators.base.session 的
+- **会话保活**:session 活着但静默时的"保鲜"由 generators.base.session 的
   keep-warm 定时器调 sinks.touch(session) 直触文件 mtime(只动时间、不加行),
   监测端(agent-monitor hub)借"无终态行且 mtime 静止超租约"判定会话已死 ——
-  本文件不再有 session/heartbeat 事件(已从模型的静默补发事件里移除)。
+  事件 taxonomy 不含 session/heartbeat。
 
-折叠恢复规范(与 ui/src/monitor/surface.ts 同份语义,本模块不落 Python 实现,
-契约测试见 tests/test_event_taxonomy.py):
+折叠恢复规范(与 apps/agent-monitor/web/src/dashboard/monitor-data/surface.ts 同份语义,
+本模块不落 Python 实现;实现测试归前端 surface.test.ts):
     messages(X) = [derive(evt) for node in surface_nodes if node.seq < X and derive 非空]
     derive: user/message→data.message; assistant/message→content 非空 ? message : None;
             tool/result→data.message; 其余→None
@@ -137,24 +137,11 @@ SURFACE_TYPES = frozenset({"user/message", "assistant/message", "tool/result"})
 # 与非流式事件流(逐行跳 chunk,message 粒度,可还原任意时刻消息上下文)。
 # filesink 缺省只落非流式事件流(NON_STREAM_TYPES;AGENT_MONITOR_FILE_RAW=1 落全量);
 # WS/OTel 通道承载完整流式事件流。
-STREAM_TYPES = TAXONOMY
 NON_STREAM_TYPES = TAXONOMY - {"assistant/chunk"}
 
 # ignorable 日志型事件:读者可安全跳过(不影响消息派生/请求重建);缺失 ignorable
 # 标记的未知类型 → 必须可解析(读者应报错,防静默丢消息)
 LOG_TYPES = frozenset({"config/init", "context/modify"})
-
-
-def type_of(evt: dict) -> str:
-    """Return the event type; unknown type raises ValueError.
-
-    Args:
-        evt: Event envelope dict carrying a `type` key.
-    """
-    t = evt.get("type")
-    if t not in TAXONOMY:
-        raise ValueError(f"未知事件 type: {t!r}")
-    return t
 
 
 def new_event(evt_type: str, **data) -> dict:
@@ -369,7 +356,7 @@ class EventRecorder:
     # ------------------------------------------------------------------
     # 会话保活(fs touch 保鲜;会话记录器原生能力):agent 静默期不动事件流,只触文件
     # mtime —— 供监控端(hub)按"mtime 静止超租约"区分"活着但静默"与"进程已死"。
-    # 不再发 heartbeat 事件;cadence 由调用方注入(零 env 依赖);触达经 sinks.touch
+    # cadence 由调用方注入(零 env 依赖);触达经 sinks.touch,事件流保持不变
     # (touch 是 FileSink 的职责,见 sinks.py)。
     # ------------------------------------------------------------------
 

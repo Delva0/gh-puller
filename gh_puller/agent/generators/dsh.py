@@ -483,9 +483,8 @@ def _project_dsh_event(event_recorder: EventRecorder, proj: _DshProj, notif) -> 
 def _dsh_worker(harness, prompt: str, session_id: str, pump):
     """同步线程体:在生成器 __aenter__ 已进入的 harness 上阻塞 run() 至 idle。
 
-    整个体在 executor 线程执行;即使外层 asyncio task 被取消(消费者提前退场),
-    线程仍会自然跑完 —— 回收经 Dsh._exit(提前退场时 detach 到后台任务等待线程
-    跑完再退出 harness;见 _wait_and_exit),不泄漏也不与 run 竞态。
+    整个体在 executor 线程执行;外层 async generator 关闭后线程仍会自然跑完,
+    会话退出等待它结束再关闭 harness,避免 run/exit 竞态。
     """
     return harness.run(prompt, session_id=session_id, on_notification=pump)
 
@@ -506,8 +505,7 @@ class Dsh(BaseGenerator):
     construction (dsh_harness bound to config): one instance = one harness = one dsh
     session; child spawn/initialize at session enter (_enter hook). dsh's client is a
     synchronous context manager and run() blocks → enter/reap bridged via
-    asyncio.to_thread (harness used on an executor thread; premature consumer exit
-    detaches reaping to the background, see _wait_and_exit).
+    asyncio.to_thread; session exit waits for an in-flight run before closing the harness.
     """
 
     generator = "dsh"
@@ -517,7 +515,6 @@ class Dsh(BaseGenerator):
         super().__init__(config)
         self._harness = dsh_harness(config)
         self._run_task: asyncio.Task | None = None  # 在飞 run(asyncio.to_thread);_exit 回收依据
-        self._teardown: asyncio.Task | None = None  # 提前退场时的后台收尸任务(持引用防 GC)
         self._proj: _DshProj | None = None  # 最近一次运行的投影状态(会话 epilogue 读 turn/end)
 
     async def _enter(self):
@@ -526,15 +523,6 @@ class Dsh(BaseGenerator):
     async def _exit(self, exc):
         task, self._run_task = self._run_task, None
         if task is not None and not task.done():
-            # 消费者提前退场:run 仍在 executor 线程(自然跑完)。收尸交给后台任务:
-            # 等线程结束再 __exit__ —— 不绊住消费者,也不与 run 竞态。
-            self._teardown = asyncio.create_task(self._wait_and_exit(task, exc))
-            return
-        await asyncio.to_thread(self._harness.__exit__, *exc)
-
-    async def _wait_and_exit(self, task: asyncio.Task, exc):
-        """Reap the harness after the thread-side run ends naturally (background; waits even on cancel)."""
-        with contextlib.suppress(asyncio.CancelledError):
             await task
         await asyncio.to_thread(self._harness.__exit__, *exc)
 

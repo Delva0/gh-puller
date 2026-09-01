@@ -40,13 +40,10 @@ config 概念契约(与上层 API 契约互补,人类开发者正式定义):
   生成器文件(各文件 docstring 自述)。
 """
 
-import asyncio
-import os
-
 from .base import BaseGenerator
 from .cc import ClaudeCode, ClaudeConfig
-from .codex import Codex, CodexConfig, codex_home_path
-from .dsh import Dsh, DshConfig, dsh_cordis_path
+from .codex import Codex, CodexConfig
+from .dsh import Dsh, DshConfig
 from .openai import OpenAI, OpenAIConfig
 from .opencode import OpenCode, OpenCodeConfig
 from .utils import RequestFailedError
@@ -65,8 +62,6 @@ __all__ = [
     "OpenCode",
     "OpenCodeConfig",
     "RequestFailedError",
-    "codex_home_path",
-    "dsh_cordis_path",
 ]
 
 # ---------------------------------------------------------------------------
@@ -76,64 +71,3 @@ __all__ = [
 GENERATORS: dict[str, type[BaseGenerator]] = {"cc": ClaudeCode, "dsh": Dsh,
                                              "codex": Codex, "opencode": OpenCode,
                                              "llm": OpenAI}
-
-
-# ---------------------------------------------------------------------------
-# 直白 API 用法演示:各生成器真实任务(stream/result 上层 API 参考)
-# `python -m gh_puller.agent.generators`
-# ---------------------------------------------------------------------------
-
-
-if __name__ == "__main__":
-    # 各生成器 stream/result 演示(真实任务):访问 GitHub 仓库并一句话介绍 ——
-    # result() 最后一轮语义(多轮工具用后只取终稿)在真实任务下可验;附加配置
-    # 与缺省隔离见 _demo 内联分支与各生成器文件。
-    # 会话语义:一次 `async with cc.session(...)` = 一次上游对话(监控装配/客户端
-    # spawn → 收尾/回收);stream/result 只收 prompt(元数据全在 session)。
-    # 注:dsh 不在此演示(载体未构建,循环跳过)。
-
-    QUESTION = "请访问 https://github.com/yankils/hello-world 并写一句话介绍这个仓库。"
-
-    async def _demo(gid: str) -> None:
-        config: dict = {}
-        if gid == "cc":
-            # 访问类任务:开放 WebFetch/WebSearch,多轮预算放宽(工具轮次 + 终局)
-            config = {"allowed_tools": ["WebFetch", "WebSearch"], "max_turns": 6}
-        elif gid == "codex":
-            config = {"web_search": True,  # Codex 内置网络搜索:默认安全关闭,须显式启用
-                      "sandbox": "full_access", "approval_mode": "auto_review"}
-        elif gid == "opencode":
-            config = {}  # opencode 自持模型路由/凭据(--pure/--auto 由生成器恒置)
-        else:  # llm
-            config = {
-                "base_url": os.environ.get("OPENAI_BASE_URL") or "https://api.openai.com/v1",
-                "model": os.environ.get("LLM_MODEL") or "gpt-5.6-luna",
-                "api_key": os.environ.get("OPENAI_API_KEY"),
-            }
-        cc = GENERATORS[gid](config)  # 构造期注入 config = 拿到客户端包装
-        prompt = (
-            {"messages": [{"role": "user", "content": QUESTION}], "max_tokens": 256}
-            if gid == "llm" else QUESTION
-        )
-
-        print(f"[{gid}] 流式(stream):")
-        async with cc.session(session_name=f"demo:{gid}"):  # 一次会话(监控与客户端同寿)
-            parts = [c async for c in cc.stream(prompt)]
-        print("".join(parts) or "(无产出)")
-
-        print(f"[{gid}] 终局(result):")
-        async with cc.session(session_name=f"demo-result:{gid}"):
-            final = await cc.result(prompt)
-        print(final or "(空)")
-
-    async def _main() -> None:
-        for gid in GENERATORS:
-            if gid == "dsh":
-                continue  # 载体未构建,见 dsh 真机测试 TODO(不阻塞演示)
-            try:
-                await _demo(gid)
-            except Exception as e:
-                print(f"[{gid}] 失败: {type(e).__name__}: {e}")
-        print("演示结束")
-
-    asyncio.run(_main())

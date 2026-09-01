@@ -5,7 +5,6 @@ export {
   applyEvent,
   deriveMessage,
   foldEvents,
-  latestHeader,
   messagesAt,
   newSurface,
 } from './surface';

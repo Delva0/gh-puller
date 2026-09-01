@@ -210,7 +210,7 @@ class OtelSink:
                 self._on_tool_result(state, evt)
             elif t == "error":
                 self._on_error(state, evt)
-            else:  # turn/user/request/context 信息事件:根 span 属性
+            else:  # lifecycle/context information stays on the root span
                 self._on_info(state, evt)
         except Exception as exc:  # 隔离:监控失败绝不冒泡(每次会话只报一次)
             if session not in self._failed:
@@ -439,9 +439,7 @@ def _default_otel_urls() -> list[str]:
 
 
 _cfg = {
-    # 文件 sink 恒开(系统约定:监控真源恒在盘;AGENT_MONITOR_FILE env 与运行时
-    # configure(file=...) 开关均已移除,隔离/嵌入/测试只经 file_dir 重定向);
-    # 事件粒度经 AGENT_MONITOR_FILE_RAW 切换:False=非流式投影,True=原始事件流(含 chunk)
+    # FileSink is always on; file_dir redirects its output for isolation and embedding.
     "file_dir": envs.AGENT_MONITOR_DIR,
     "raw": envs.AGENT_MONITOR_FILE_RAW,
     "ws_urls": _split_urls(envs.AGENT_MONITOR_WEBUI_URL),

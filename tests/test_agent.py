@@ -11,7 +11,6 @@
 import asyncio
 import json
 import sys
-import time
 import types
 from enum import StrEnum
 from typing import ClassVar
@@ -24,10 +23,19 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanE
 from opentelemetry.trace import StatusCode
 
 from gh_puller import agent, envs
-from gh_puller.agent import EventBus, FileSink, new_event, sinks
-from gh_puller.agent.events import EventRecorder, _normalize_usage, _session_id, set_active_bus
+from gh_puller.agent import sinks
+from gh_puller.agent.events import (
+    TAXONOMY,
+    EventBus,
+    EventRecorder,
+    _normalize_usage,
+    _session_id,
+    new_event,
+    set_active_bus,
+)
 from gh_puller.agent.generators.cc import _handle_assistant_message, _handle_stream_event
-from gh_puller.agent.sinks import OtelSink
+from gh_puller.agent.generators.dsh import dsh_cordis_path
+from gh_puller.agent.sinks import FileSink, OtelSink, WsSink
 
 
 @pytest_asyncio.fixture(autouse=True)
@@ -1062,7 +1070,7 @@ async def test_dsh_stream_skips_non_taxonomy_events(monkeypatch):
     _fake_dsh(monkeypatch, notes, session_id=sid)
     assert await _call(agent.Dsh, _dsh_options(), "q", session=f"deepwiki:wiki/{sid}") == "ok"
     await asyncio.sleep(0.05)
-    assert {g["type"] for g in got} <= set(agent.TAXONOMY)  # 无 ValueError,只出 TAXONOMY
+    assert {g["type"] for g in got} <= TAXONOMY  # 无 ValueError,只出 TAXONOMY
     texts = [g["data"]["chunk"].get("text") for g in got
              if g["type"] == "assistant/chunk" and g["data"]["chunk"].get("type") == "content"]
     assert texts == ["ok"]
@@ -1237,7 +1245,7 @@ async def test_dsh_harness_fields_and_session_id(monkeypatch):
     kwargs, prompt, session_id = _FakeHarness.calls[0]
     assert kwargs == {"provider": "deepseek-official", "model": "m1", "cwd": "/repo",
                       "session_root": "/dsh-sessions", "env": {"A": "1"},
-                      "cordis": agent.dsh_cordis_path()}  # None 跳过;cordis 未设 → 缺省隔离组合
+                      "cordis": dsh_cordis_path()}  # None 跳过;cordis 未设 → 缺省隔离组合
     assert session_id == sid and prompt == "job"
 
 
@@ -1272,45 +1280,6 @@ async def test_generator_with_dsh_bridges_sync_harness(monkeypatch):
         assert await _fold(gen.stream("q")) == "好"
         assert _FakeHarness.enters == 1  # stream 只驱动循环:不再进 harness
     assert _FakeHarness.enters == 1 and _FakeHarness.exits == 1
-
-
-class _SlowHarness(_FakeHarness):
-    """慢 run:回放通知后再滞留 0.25s —— 给"消费者提前退场时 run 在飞"留时间窗。"""
-
-    def run(self, prompt, *, session_id=None, on_notification=None):
-        result = super().run(prompt, session_id=session_id, on_notification=on_notification)
-        time.sleep(0.25)
-        return result
-
-
-@pytest.mark.asyncio
-async def test_dsh_stream_consumer_close_teardown_detached(monkeypatch):
-    """消费者提前退场(run 在飞,真线程桥):_exit 不绊住消费者 —— 回收 detach
-
-    后台(等线程自然跑完再退出 harness):不早收(不与 run 竞态)、不泄漏。
-    旧语义:线程 with 块负责回收;新语义:生成器 with 收尸,提前退场走后台。
-    """
-    agent.configure(ws_urls=[], otel_urls=[])
-    sid = "detach"
-    notes = [
-        _dsh_note("turn/start", seq=0, session_id=sid, data={"turn": 1}),
-        _dsh_note("step/start", seq=1, session_id=sid, data={"turn": 1, "step": 1}),
-        _dsh_note("user/message", seq=2, session_id=sid, surface_op="append",
-                  data={"content": [{"type": "text", "text": "q"}], "source": {"kind": "user"},
-                        "role": "user", "id": sid}),
-        _dsh_note("assistant/chunk", seq=3, session_id=sid,
-                  data={"turn": 1, "step": 1, "chunk": _dsh_chunk("text-delta", index=0, text="好")}),
-    ]
-    _fake_dsh(monkeypatch, notes, sync_to_thread=False, harness_cls=_SlowHarness, session_id=sid)
-    t0 = time.monotonic()
-    gen = agent.Dsh(_dsh_options())
-    async with gen.session(session=f"deepwiki:wiki/{sid}"):
-        async for _ in gen.stream("q"):
-            break  # 首个产出即退场:run 线程仍滞留(slow harness 尾部 0.25s)
-    assert time.monotonic() - t0 < 0.2  # 会话退场不阻塞等 run(回收走后台收尸)
-    await asyncio.sleep(0.4)  # 等后台收尸(线程跑完 → harness.__exit__)
-    # 计数在 _SlowHarness(自身类的类属性遮蔽 _FakeHarness 同名计数)
-    assert _SlowHarness.enters == 1 and _SlowHarness.exits == 1
 
 
 @pytest.mark.asyncio
@@ -1398,7 +1367,7 @@ async def test_ws_sink_forwards_raw_events_only(monkeypatch):
     mod.connect = _connect
     monkeypatch.setitem(sys.modules, "websockets", mod)
 
-    sink = agent.WsSink("ws://preview/ws")
+    sink = WsSink("ws://preview/ws")
     evts = [
         _evt("session/start", seq=0, run_id=None, label="wiki:structure", provider="anthropic", model=""),
         _evt("assistant/chunk", seq=1, chunk={"type": "content", "index": 0, "text": "你好"}),
@@ -2330,7 +2299,9 @@ def _opencode_bin(tmp_path, events, *, exit_code=0, stderr=""):
 def test_opencode_argv_and_config_content_assembly(tmp_path):
     """纯函数装配:argv(--pure/--auto/旗标拼装)、env(OPENCODE_CONFIG)、注入段(instructions+mcp)。"""
     from gh_puller.agent.generators.opencode import (
-        _opencode_argv, _opencode_config_content, _opencode_env,
+        _opencode_argv,
+        _opencode_config_content,
+        _opencode_env,
     )
 
     cfg = {"model": "deepseek/deepseek-chat", "agent": "build", "variant": "high",
@@ -2557,10 +2528,17 @@ async def test_opencode_stream_invalid_tool_intercepted_is_error(monkeypatch, tm
         _oc_line("step_start", part=_oc_part("step-start")),
         _oc_line("tool_use", part=_oc_part("tool",
                                            callID="c1", tool="invalid",
-                                           state={"status": "completed",
-                                                  "input": {"tool": "list_projects",
-                                                            "error": "Model tried to call unavailable tool 'list_projects'"},
-                                                  "output": "The arguments provided to the tool are invalid: Model tried to call unavailable tool 'list_projects'."})),
+                                           state={
+                                               "status": "completed",
+                                               "input": {
+                                                   "tool": "list_projects",
+                                                   "error": "Model tried to call unavailable tool 'list_projects'",
+                                               },
+                                               "output": (
+                                                   "The arguments provided to the tool are invalid: "
+                                                   "Model tried to call unavailable tool 'list_projects'."
+                                               ),
+                                           })),
         _oc_line("step_finish", part=_oc_part("step-finish", reason="stop", tokens={}, cost=0)),
     ])
     gen = agent.OpenCode({"opencode_bin": binpath})
@@ -2615,11 +2593,8 @@ async def test_opencode_stream_error_event_raises(monkeypatch, tmp_path):
     binpath = _opencode_bin(tmp_path, [
         _oc_line("error", error={"name": "APIError", "data": {"message": "boom"}}),
     ])
-    gen = agent.OpenCode({"opencode_bin": binpath})
     with pytest.raises(agent.RequestFailedError, match="boom"):
-        async with gen.session(session_name="x"):
-            async for _ in gen.stream("q"):
-                pass
+        await _call(agent.OpenCode, {"opencode_bin": binpath}, "q", session_name="x")
     await asyncio.sleep(0.05)
     err = next(g for g in got if g["type"] == "error")
     assert err["data"]["stage"] == "run"
@@ -2632,11 +2607,8 @@ async def test_opencode_stream_nonzero_exit_raises(monkeypatch, tmp_path):
     binpath = _opencode_bin(tmp_path, [
         _oc_line("text", part=_oc_part("text", text="hi")),
     ], exit_code=1, stderr="bad creds\n")
-    gen = agent.OpenCode({"opencode_bin": binpath})
     with pytest.raises(agent.RequestFailedError, match="退出码 1"):
-        async with gen.session(session_name="x"):
-            async for _ in gen.stream("q"):
-                pass
+        await _call(agent.OpenCode, {"opencode_bin": binpath}, "q", session_name="x")
 
 
 @pytest.mark.asyncio
@@ -2647,11 +2619,8 @@ async def test_opencode_stream_missing_stop_raises(monkeypatch, tmp_path):
         _oc_line("step_start", part=_oc_part("step-start")),
         _oc_line("text", part=_oc_part("text", text="hi")),
     ])
-    gen = agent.OpenCode({"opencode_bin": binpath})
     with pytest.raises(agent.RequestFailedError, match="turn 未收到完成事件"):
-        async with gen.session(session_name="x"):
-            async for _ in gen.stream("q"):
-                pass
+        await _call(agent.OpenCode, {"opencode_bin": binpath}, "q", session_name="x")
 
 
 @pytest.mark.asyncio

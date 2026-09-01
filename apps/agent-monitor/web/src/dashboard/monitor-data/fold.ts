@@ -6,7 +6,6 @@ import {
   applyEvent,
   deriveMessage,
   foldEvents,
-  latestHeader,
   messagesAt as messagesAtImpl,
   newSurface,
 } from './surface';
@@ -87,11 +86,6 @@ export class RunFold {
   /** 任意时刻 x(seq 排他)的消息上下文(来自已接收窗口)。 */
   messagesAt(x: number): Message[] {
     return this.events.length ? messagesAtImpl(this.events, x) : [];
-  }
-
-  /** 最新请求头快照(seq < x;x 缺省取全量尾部)。 */
-  headerAt(x = Infinity): EventEnvelope | null {
-    return this.events.length ? latestHeader(this.events, x) : null;
   }
 
   get length(): number {

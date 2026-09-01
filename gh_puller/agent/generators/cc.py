@@ -45,7 +45,8 @@ def claude_options(config: dict):
     if not sdk_options.get("settings"):  # empty → SDK default isolation
         sdk_options.pop("settings", None)
     sdk_options.setdefault("strict_mcp_config", True)  # default isolation (see above)
-    sdk_options.setdefault("include_partial_messages", True)  # StreamEvent path: thinking/text chunk stream (monitor rebuild + incremental; SDK default False)
+    # Partial messages are the only source of monitor text/thinking increments.
+    sdk_options.setdefault("include_partial_messages", True)
     return ClaudeAgentOptions(**sdk_options)
 
 

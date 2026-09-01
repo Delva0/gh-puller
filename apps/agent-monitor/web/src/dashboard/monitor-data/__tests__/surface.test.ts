@@ -59,7 +59,7 @@ describe('surface 折叠(与 Python 契约同语义)', () => {
   it('非 surface 事件不影响面', () => {
     const s = newSurface();
     applyEvent(s, evt('session/start', 0));
-    applyEvent(s, evt('request/header', 1, { header: { config: {} }, reason: 'initial' }));
+    applyEvent(s, evt('turn/start', 1, { turn: 1 }));
     expect(s.nodes).toEqual([]);
   });
 });

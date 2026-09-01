@@ -1,6 +1,5 @@
 // 事件溯源 surface 折叠:规范定义在 gh_puller/agent/events.py(与 dsh
-// packages/core/session/src/surface.ts 同语义);本文件为 gh-puller 侧实现,
-// 契约测试见 tests/test_event_taxonomy.py。
+// packages/core/session/src/surface.ts 同语义);本文件为 gh-puller 侧实现。
 
 import type { EventEnvelope, Message, SurfaceOp } from './types';
 
@@ -28,7 +27,7 @@ function surfaceOpOf(evt: EventEnvelope): SurfaceOp | null {
 /**
  * 单条事件应用进 surface;返回该面是否变化。
  * replace 引用不存在/倒置的节点 → 抛错(调用方先以 history 补片再重放,
- * 与 Python 侧 oracle 的"交换序升序重放"同一约束)。
+ * 历史补齐后再按 seq 升序重放)。
  */
 export function applyEvent(s: Surface, evt: EventEnvelope): boolean {
   if (!SURFACE_TYPES.has(evt.type)) return false;
@@ -76,14 +75,4 @@ export function messagesAt(events: EventEnvelope[], x: number): Message[] {
     if (m) out.push(m);
   }
   return out;
-}
-
-/** 最新(seq < x)的 request/header 快照;无则 null。 */
-export function latestHeader(events: EventEnvelope[], x: number): EventEnvelope | null {
-  let best: EventEnvelope | null = null;
-  for (const e of events) {
-    if (e.type !== 'request/header' || e.seq >= x) continue;
-    if (best === null || e.seq > best.seq) best = e;
-  }
-  return best;
 }
