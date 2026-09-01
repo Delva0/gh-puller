@@ -1,0 +1,3 @@
+interface:
+  display_name: "Documentation Style Constraints"
+  short_description: "Generate durable, source-grounded project docs"
