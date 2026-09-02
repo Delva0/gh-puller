@@ -541,7 +541,7 @@ async def test_openai_is_multi_turn(monkeypatch, tmp_path) -> None:
     })
     async with subject.session(session="openai/s"):
         assert await subject.result("q1") == "a1"
-        assert await subject.result("q2") == "a2"
+        assert await _collect(subject.stream("q2")) == "a2"
     await _settle()
     assert not [event for event in events if event["type"] == "context/set"]
     assert next(event for event in events if event["type"] == "agent/set")["data"][
@@ -738,7 +738,7 @@ async def test_codex_is_multi_turn(monkeypatch, tmp_path) -> None:
     })
     async with subject.session(session="codex/s"):
         assert await _collect(subject.stream("q1")) == "a1"
-        assert await _collect(subject.stream("q2")) == "a2"
+        assert await subject.result("q2") == "a2"
     assert _CodexClient.starts == 1
     await _settle()
     assert [event["data"]["requestId"] for event in events
@@ -885,7 +885,7 @@ async def test_opencode_is_multi_turn(tmp_path) -> None:
     })
     async with subject.session(session="opencode/s"):
         assert await _collect(subject.stream("q1")) == "answer"
-        assert await _collect(subject.stream("q2")) == "answer"
+        assert await subject.result("q2") == "answer"
     argv = args_path.read_text(encoding="utf-8").splitlines()
     assert argv.count("--session") == 1
     assert "native-session" in argv
@@ -1031,7 +1031,7 @@ async def test_dsh_is_retained_as_multi_turn_adapter(monkeypatch, tmp_path) -> N
     })
     async with subject.session(session="dsh/s"):
         assert await _collect(subject.stream("q1")) == "a1"
-        assert await _collect(subject.stream("q2")) == "a2"
+        assert await subject.result("q2") == "answer"
     await _settle()
     assert [event["data"]["requestId"] for event in events
             if event["type"] == "model/request"] == ["r1", "r2"]

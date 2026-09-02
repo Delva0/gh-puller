@@ -119,7 +119,8 @@ preparation, inference, and related tool work. Adapters may place them different
 the observed Agent uses another control flow.
 
 `BaseAgent` owns session lifetime. Concrete adapters translate only the facts their
-backends expose, and each supports repeated `stream` and `result` calls in one session.
+backends expose. Sequential `stream` and `result` calls may be repeated and mixed inside
+one session; every call appends one user-level turn to the same native conversation.
 
 ```python
 from gh_puller.agent import AGENTS
