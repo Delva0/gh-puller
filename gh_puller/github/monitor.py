@@ -50,11 +50,11 @@ class ProgressState:
     run_id: int | None  # Durable run identity, if allocated.
     catalog_seen: int  # Catalog rows scanned in the active pass.
     catalog_total: int | None  # Certified current Issue + PR count.
-    bundles_completed: int  # Bundles staged in the active pass.
-    bundles_total: int | None  # Selected bundles in the active pass.
-    issues_completed: int  # Issue bundles staged in the active pass.
-    pulls_completed: int  # Pull-request bundles staged in the active pass.
-    tombstones: int  # Certified absences staged in the active pass.
+    bundles_completed: int  # Durable bundles completed for the current run plan.
+    bundles_total: int | None  # Durable bundles plus remaining plan candidates.
+    issues_completed: int  # Issue bundles in bundles_completed.
+    pulls_completed: int  # Pull-request bundles in bundles_completed.
+    tombstones: int  # Durable absences compatible with the current run plan.
     latest_number: int | None  # Latest durably staged parent number.
     latest_kind: str | None  # Kind of latest_number.
     wait_seconds: float | None  # Current target, retry, or rate-limit wait.

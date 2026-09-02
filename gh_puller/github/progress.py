@@ -35,11 +35,11 @@ class PullProgress:
     pass_at: datetime | None = None  # Cutoff of the active closure pass.
     catalog_seen: int = 0  # Root rows scanned, then certified current objects.
     catalog_total: int | None = None  # Certified current object count when known.
-    bundles_completed: int = 0  # Bundles durably staged in the active pass.
-    bundles_total: int | None = None  # Bundles selected in the active pass.
-    issues_completed: int = 0  # Durably staged Issue bundles.
-    pulls_completed: int = 0  # Durably staged pull-request bundles.
-    tombstones: int = 0  # Absences durably staged in the active pass.
+    bundles_completed: int = 0  # Durable bundles completed for the current run plan.
+    bundles_total: int | None = None  # Durable bundles plus remaining plan candidates.
+    issues_completed: int = 0  # Completed Issue bundles in bundles_completed.
+    pulls_completed: int = 0  # Completed pull-request bundles in bundles_completed.
+    tombstones: int = 0  # Durable absences compatible with the current run plan.
     latest_number: int | None = None  # Latest durably staged parent number.
     latest_kind: str | None = None  # issue or pull for latest_number.
     requests: int = 0  # Attempts accumulated by this run.
@@ -126,17 +126,56 @@ class _PullProgressTracker:
     def catalog_complete(self, count: int) -> None:
         self._emit(catalog_seen=count, catalog_total=count)
 
-    def start_bundles(self, name: str, total: int, request_count: int) -> None:
+    def restore_staged(self, resources: Iterable[tuple[int, str, bool]]) -> None:
+        """将 pending run 的最新 durable stage 恢复到进度快照。
+
+        Args:
+            resources: number、kind 与当前存在状态组成的 durable stage。
+        """
+        staged = list(resources)
+        completed = [(number, kind) for number, kind, present in staged if present]
+        issue_count = sum(kind == "issue" for _, kind in completed)
+        latest_number, latest_kind = completed[-1] if completed else (None, None)
+        self._emit(
+            bundles_completed=len(completed),
+            bundles_total=None,
+            issues_completed=issue_count,
+            pulls_completed=len(completed) - issue_count,
+            tombstones=sum(not present for _, _, present in staged),
+            latest_number=latest_number,
+            latest_kind=latest_kind,
+        )
+
+    def start_bundles(
+        self,
+        name: str,
+        remaining: int,
+        carried: Iterable[tuple[int, str]],
+        tombstones: int,
+        request_count: int,
+    ) -> None:
+        """绑定当前目录计划，同时保留兼容的 durable stage 进度。
+
+        Args:
+            name: 当前 closure pass 名称。
+            remaining: 本计划尚需物化的 parent bundle 数量。
+            carried: 可直接复用的 durable parent number 与 kind。
+            tombstones: 与本计划一致的 durable absence 数量。
+            request_count: 当前进程的 HTTP 尝试数。
+        """
+        completed = list(carried)
+        issue_count = sum(kind == "issue" for _, kind in completed)
+        latest_number, latest_kind = completed[-1] if completed else (None, None)
         self._work_phase = f"{name}_bundles"
         self._emit(
             phase=self._work_phase,
-            bundles_completed=0,
-            bundles_total=total,
-            issues_completed=0,
-            pulls_completed=0,
-            tombstones=0,
-            latest_number=None,
-            latest_kind=None,
+            bundles_completed=len(completed),
+            bundles_total=len(completed) + remaining,
+            issues_completed=issue_count,
+            pulls_completed=len(completed) - issue_count,
+            tombstones=tombstones,
+            latest_number=latest_number,
+            latest_kind=latest_kind,
             requests=self._run_requests(request_count),
             wait_seconds=None,
             detail=None,

@@ -204,22 +204,26 @@ emitted immediately. The one committed `PullResult` remains JSON on stdout, so a
 supervisor can route progress and results independently. `--no-progress` disables
 stderr progress.
 
-The counters describe the active pass, not unrelated row counts:
+The catalog counters describe the active closure pass. Bundle counters describe the
+current run's materialization plan. While the run is pending, they are restored from
+its latest durable SQLite stage when the writer process starts. The observer and
+`status` command remain out of band: only the writer performs that local read, then
+emits the resulting snapshot through the same progress stream.
 
 | Field | Definition | Relationship to Issue/PR count |
 | --- | --- | --- |
 | `catalog_seen / catalog_total` | Root rows read during a scan; once certified, both become the current visible catalog size N. | N counts ordinary Issues and PRs because GitHub's Issues catalog contains both. |
-| `bundles_completed / bundles_total` | Parent bundles durably staged in this pass, divided by the selected parent set K. | K is a subset of N: normally `K << N`, a quiet increment has `K = 0`, and a cold pull or exhaustive oracle has `K = N`. |
-| `issues_completed`, `pulls_completed` | Kind split of durably staged bundles. | Their sum equals `bundles_completed`. |
-| `tombstones` | Previously present parents whose certified absence was durably staged in this pass. | They are reported separately from K and are excluded from the resulting visible N. |
-| `latest_number`, `latest_kind` | Last parent in the most recently durable completed batch. | Candidate results are consumed by number, so it advances within a pass; gaps represent unselected or previously staged parents, not missing data. |
+| `bundles_completed / bundles_total` | Parent bundles already durable and compatible with the current catalog plan, divided by that carried set plus the remaining candidates K. | K is normally much smaller than N. A cold pull has total N, and a cold restart resumes from its durable numerator instead of restarting at zero. |
+| `issues_completed`, `pulls_completed` | Kind split of durable completed bundles in the current plan. | Their sum equals `bundles_completed`. |
+| `tombstones` | Durable absences that agree with the current certified catalog plan. | They are reported separately from bundle progress and are excluded from the resulting visible N. |
+| `latest_number`, `latest_kind` | Last compatible parent in durable insertion order, followed by the most recently completed batch. | Gaps represent parents outside the current plan or work that still needs fetching, not missing facts. |
 | `requests`, `quota_*` | Attempts accumulated by the run and the latest GitHub quota headers. | They measure API work, not objects; one bundle can require many paginated requests. |
 
-A future-T operation has separate `prefetch_*` and `closing_*` phases. Pass-local
-catalog, bundle, kind, tombstone, and latest-object counters reset between them, while
-the run identity and accumulated request count continue. A `rate_limit` event reports
-the wait duration and any known quota reset time without pretending that object
-progress moved.
+A future-T operation has separate `prefetch_*` and `closing_*` phases. Each phase
+recomputes its catalog plan, carries forward compatible durable stage, and reclassifies
+objects that must be fetched again. The run identity and accumulated request count
+continue. A `rate_limit` event reports the wait duration and any known quota reset time
+without pretending that object progress moved.
 
 Sources: [gh_puller/github/](../gh_puller/github/); [tests/test_github_puller.py](../tests/test_github_puller.py); [tests/test_github_cli.py](../tests/test_github_cli.py)
 

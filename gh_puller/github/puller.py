@@ -356,9 +356,10 @@ class GitHubPuller:
         progress: _PullProgressTracker,
     ) -> datetime | None:
         progress.start_pass(pass_name, cutoff)
+        heads, staged = await archive.load_head_state(run_id)
+        progress.restore_staged((head.number, head.kind, head.present) for head in staged.values())
         if observed is not None and cutoff <= observed:
             return observed
-        heads = await archive.load_heads(run_id)
         plan = await self._catalog_plan(api, heads, cutoff, observed, progress)
         candidates = (
             set(plan.present)
@@ -367,8 +368,20 @@ class GitHubPuller:
         )
         candidates.update(plan.signals)
         candidates.intersection_update(plan.present)
+        carried = [
+            (head.number, head.kind)
+            for number, head in staged.items()
+            if head.present and number in plan.present and number not in candidates
+        ]
+        carried_tombstones = sum(not head.present and number not in plan.present for number, head in staged.items())
         progress.catalog_complete(len(plan.present))
-        progress.start_bundles(pass_name, len(candidates), api.request_count)
+        progress.start_bundles(
+            pass_name,
+            len(candidates),
+            carried,
+            carried_tombstones,
+            api.request_count,
+        )
 
         feeds = await self._bundle_feeds(api, heads, plan.items, candidates, cutoff)
 

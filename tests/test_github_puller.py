@@ -1700,8 +1700,15 @@ async def test_default_target_is_frozen_before_first_await(tmp_path: Path) -> No
 async def test_interrupted_cold_pull_resumes_staged_bundles_without_publication(tmp_path: Path) -> None:
     api = FakeAPI()
     api.add_issue(1)
-    api.add_issue(2)
-    api.fail_once.add(f"{_BASE}/issues/2")
+    api.add_issue(2, pull=True)
+    api.json[f"{_BASE}/pulls/2"] = {
+        "id": 20,
+        "changed_files": 0,
+        "commits": 0,
+        "review_comments": 0,
+    }
+    api.add_issue(3)
+    api.fail_once.add(f"{_BASE}/issues/3")
     archive = tmp_path / "archive"
     puller = GitHubPuller(_config(archive, concurrency=1), api=api, now=lambda: _T0)
 
@@ -1720,15 +1727,71 @@ async def test_interrupted_cold_pull_resumes_staged_bundles_without_publication(
         WHERE r.status = 'pending'
         """,
     )
-    assert len(staged) == 1
+    assert {row["number"] for row in staged} == {1, 2}
     assert sum(call[1] == f"{_BASE}/issues/1" for call in api.calls) == 1
+    assert sum(call[1] == f"{_BASE}/issues/2" for call in api.calls) == 1
 
-    result = await puller.pull(_T0)
+    events: list[PullProgress] = []
+    result = await GitHubPuller(
+        _config(archive, concurrency=1),
+        api=api,
+        now=lambda: _T0,
+        observer=events.append,
+    ).pull(_T0)
 
-    assert result.changed_items == 2
+    assert result.changed_items == 3
     assert sum(call[1] == f"{_BASE}/issues/1" for call in api.calls) == 1
-    assert set(await _current(archive)) == {1, 2}
+    assert sum(call[1] == f"{_BASE}/issues/2" for call in api.calls) == 1
+    assert set(await _current(archive)) == {1, 2, 3}
     assert len(await _runs(archive)) == 1
+    restored = next(event for event in events if event.phase == "closing_catalog" and event.bundles_completed == 2)
+    planned = next(event for event in events if event.phase == "closing_bundles")
+    assert restored.bundles_total is None
+    assert (restored.issues_completed, restored.pulls_completed) == (1, 1)
+    assert (restored.latest_number, restored.latest_kind) == (2, "pull")
+    assert (planned.bundles_completed, planned.bundles_total) == (2, 3)
+    assert events[-1].bundles_completed == events[-1].bundles_total == 3
+
+
+@pytest.mark.asyncio
+async def test_resumed_plan_reclassifies_a_staged_parent_deleted_before_target(tmp_path: Path) -> None:
+    api = FakeAPI()
+    api.add_issue(1)
+    archive = tmp_path / "archive"
+    clock = Clock(_T0)
+    target = _T0 + timedelta(hours=1)
+
+    async def interrupt_wait(_: float) -> None:
+        raise RuntimeError("interrupt before target")
+
+    with pytest.raises(RuntimeError, match="interrupt before target"):
+        await GitHubPuller(
+            _config(archive),
+            api=api,
+            now=clock,
+            sleep=interrupt_wait,
+        ).pull(target)
+
+    api.catalog.clear()
+    clock.current = target
+    events: list[PullProgress] = []
+    result = await GitHubPuller(
+        _config(archive),
+        api=api,
+        now=clock,
+        sleep=clock.sleep,
+        observer=events.append,
+    ).pull(target)
+
+    restored = next(event for event in events if event.phase == "closing_catalog" and event.bundles_completed == 1)
+    planned = next(event for event in events if event.phase == "closing_bundles")
+    assert (restored.latest_number, restored.latest_kind) == (1, "issue")
+    assert (planned.bundles_completed, planned.bundles_total) == (0, 0)
+    assert (planned.issues_completed, planned.pulls_completed) == (0, 0)
+    assert (planned.latest_number, planned.latest_kind) == (None, None)
+    assert events[-1].tombstones == 1
+    assert result.catalog_items == 0
+    assert (await _current(archive))[1].present is False
 
 
 @pytest.mark.asyncio

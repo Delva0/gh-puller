@@ -281,18 +281,22 @@ class SQLiteArchive:
         )
         return None if row is None else _archived_run(row)
 
-    async def load_heads(self, run_id: int) -> dict[int, StoredHead]:
-        """读取 committed heads，并叠加指定 run 的 durable stage。
+    async def load_head_state(
+        self,
+        run_id: int,
+    ) -> tuple[dict[int, StoredHead], dict[int, StoredHead]]:
+        """读取 committed heads 与指定 run 的最新 durable stage。
 
         Args:
             run_id: 当前 pending run。
 
         Returns:
-            按 Issue/PR number 索引的逻辑当前状态。
+            叠加 stage 后的逻辑当前状态，以及仅含该 run 最新 stage 的状态；
+            两者均按 Issue/PR number 索引。
         """
         rows = await _fetchall(self._connection, "SELECT * FROM resource_heads")
         heads = {int(row["number"]): _head(row) for row in rows}
-        staged = await _fetchall(
+        rows = await _fetchall(
             self._connection,
             """
             SELECT v.*
@@ -303,11 +307,13 @@ class SQLiteArchive:
                 WHERE run_id = ?
                 GROUP BY number
             ) AS latest ON latest.id = v.id
+            ORDER BY v.id
             """,
             (run_id,),
         )
-        heads.update({int(row["number"]): _head(row) for row in staged})
-        return heads
+        staged = {int(row["number"]): _head(row) for row in rows}
+        heads.update(staged)
+        return heads, staged
 
     async def load_bundle_state(
         self,

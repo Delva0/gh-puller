@@ -124,7 +124,7 @@ def test_detail_uses_honest_unknown_catalog_denominator(tmp_path: Path) -> None:
     assert str((tmp_path / "facts.sqlite3").resolve()) in output
 
 
-def test_detail_shows_process_and_pass_local_object_progress(tmp_path: Path) -> None:
+def test_detail_shows_process_and_durable_run_progress(tmp_path: Path) -> None:
     output = monitor._render_detail(
         _status(tmp_path / "facts.sqlite3"),
         now=_EVENT_AT + timedelta(seconds=3),
