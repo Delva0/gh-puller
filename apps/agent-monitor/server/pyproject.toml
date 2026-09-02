@@ -1,7 +1,7 @@
 [project]
 name = "gh-puller-agent-monitor"
 version = "0.1.0"
-description = "Agent 监控 Web/WS hub(FastAPI 端点层);事件模型与配置复用 gh_puller"
+description = "Agent monitor local history projection and WebSocket viewer"
 requires-python = ">=3.13"
 dependencies = [
     "fastapi>=0.139.0",

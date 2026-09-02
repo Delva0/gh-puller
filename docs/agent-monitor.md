@@ -82,18 +82,30 @@ Sources: [gh_puller/agent/](../gh_puller/agent/)
 
 ```mermaid
 flowchart TD
-    Producer[Generator or custom agent] --> Stream[Canonical event stream]
-    Stream --> Hub[Persistence and WebSocket hub]
-    Hub --> Fold[RunFold]
+    Producer[Generator or custom agent] --> Bus[Canonical event bus]
+    Bus --> FileSink[FileSink]
+    FileSink --> History[Compact JSONL]
+    History --> Hub[Hub projection]
+    Bus --> WsSink[WsSink]
+    WsSink --> App[FastAPI transport]
+    App --> Hub
+    App --> Browser[Browser]
+    Browser --> Fold[RunFold]
     Fold --> Context[Context view]
     Fold --> Events[Events view]
 ```
 
-The hub persists compact JSONL history and forwards live events. Compact history omits
-only stream deltas, which cannot change replayable state. On session selection the
-browser loads every compact history page, buffers concurrent live events, and publishes
-one merged sequence to `RunFold`. That fold is the sole owner of current Model, Context,
-model activity, and tool activity.
+`FileSink` writes the durable compact history; the local server never persists received
+WebSocket frames. `Hub` scans the shared `AGENT_MONITOR_DIR`, derives session metadata
+and leases, and keeps a disposable history projection. `WsSink` supplies raw live events
+through the FastAPI transport, which merges them into that projection and forwards them
+to subscribed browsers. The producer and server therefore share the same local directory
+or filesystem mount; WebSocket delivery alone is not a durable remote-monitor contract.
+
+Compact history omits only stream deltas, which cannot change replayable state. On
+session selection the browser loads every compact history page, buffers concurrent live
+events, and publishes one merged sequence to `RunFold`. That fold is the sole owner of
+current Model, Context, model activity, and tool activity.
 
 The Context view renders the current Model and every current Context message. Open model
 activity is displayed separately until its `model/response`; only context operations
@@ -125,7 +137,7 @@ Sources: [gh_puller/agent/](../gh_puller/agent/); [tests/](../tests/)
 ```bash
 pnpm install
 pnpm --dir apps/agent-monitor/web build
-uv --directory apps/agent-monitor/server run uvicorn hub:app --port 8765
+uv --directory apps/agent-monitor/server run uvicorn app:app --port 8765
 ```
 
 ```bash

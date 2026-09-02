@@ -43,6 +43,6 @@ uv run benchmark gh_puller/benchmark/judges/vllm_mechanism/bank.py --url http://
 **agent 可观测（可选）**
 
 ```bash
-uv --directory apps/agent-monitor/server run uvicorn hub:app --port 8765
+uv --directory apps/agent-monitor/server run uvicorn app:app --port 8765
 # 浏览器 :8765；LLM 调用默认自动对接（AGENT_MONITOR_WEBUI_URL 默认 ws://localhost:8765/ws）
 ```
