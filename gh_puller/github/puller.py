@@ -10,7 +10,6 @@ import asyncio
 import fcntl
 import os
 import re
-from collections import deque
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -36,7 +35,6 @@ if TYPE_CHECKING:
 _NUMBER_AT_END = re.compile(r"/(\d+)$")
 _CATALOG_MODES = {"certified", "exhaustive"}
 _BUNDLE_MODES = {"optimized", "exhaustive"}
-_STAGE_BATCH_SIZE = 32
 
 
 class IncompleteGitHubDataError(RuntimeError):
@@ -588,49 +586,39 @@ class GitHubPuller:
             return number, bundle, stored_summary, http_cache
 
         numbers = iter(sorted(candidates))
-        pending = deque(asyncio.create_task(fetch(number)) for number in islice(numbers, self.config.concurrency))
-        staged: list[StagedResource] = []
+        completed: asyncio.Queue[asyncio.Task[Any]] = asyncio.Queue()
+        pending: set[asyncio.Task[Any]] = set()
+
+        def start(number: int) -> None:
+            task = asyncio.create_task(fetch(number))
+            task.add_done_callback(completed.put_nowait)
+            pending.add(task)
+
+        for number in islice(numbers, self.config.concurrency):
+            start(number)
         try:
             while pending:
-                number, bundle, summary, http_cache = await pending.popleft()
+                task = await completed.get()
+                pending.remove(task)
+                number, bundle, summary, http_cache = task.result()
                 old = heads.get(number)
                 head = _candidate_head(summary, old, bundle)
-                staged.append(
-                    StagedResource(
-                        head=head,
-                        observed_at=observed_at,
-                        summary=summary,
-                        bundle=bundle,
-                        http_cache=http_cache,
-                    ),
+                resource = StagedResource(
+                    head=head,
+                    observed_at=observed_at,
+                    summary=summary,
+                    bundle=bundle,
+                    http_cache=http_cache,
                 )
+                await archive.stage(run_id, (resource,))
+                progress.bundles_staged(((head.number, head.kind),), api.request_count)
                 next_number = next(numbers, None)
                 if next_number is not None:
-                    pending.append(asyncio.create_task(fetch(next_number)))
-                if len(staged) >= _STAGE_BATCH_SIZE:
-                    batch, staged = staged, []
-                    await archive.stage(run_id, batch)
-                    progress.bundles_staged(
-                        ((resource.head.number, resource.head.kind) for resource in batch),
-                        api.request_count,
-                    )
-            if staged:
-                batch, staged = staged, []
-                await archive.stage(run_id, batch)
-                progress.bundles_staged(
-                    ((resource.head.number, resource.head.kind) for resource in batch),
-                    api.request_count,
-                )
+                    start(next_number)
         except BaseException:
             for task in pending:
                 task.cancel()
             await asyncio.gather(*pending, return_exceptions=True)
-            if staged:
-                await archive.stage(run_id, staged)
-                progress.bundles_staged(
-                    ((resource.head.number, resource.head.kind) for resource in staged),
-                    api.request_count,
-                )
             raise
 
     async def _fetch_bundle(

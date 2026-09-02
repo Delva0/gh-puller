@@ -645,7 +645,7 @@ async def iter_versions(path: Path) -> AsyncIterator[ArchivedVersion]:
             JOIN pull_runs AS r ON r.id = v.run_id AND r.status = 'committed'
             JOIN payload_blobs AS s ON s.digest = v.summary_digest
             LEFT JOIN payload_blobs AS b ON b.digest = v.bundle_digest
-            ORDER BY v.id
+            ORDER BY v.run_id, v.number, v.id
             """,
         )
         async for row in cursor:

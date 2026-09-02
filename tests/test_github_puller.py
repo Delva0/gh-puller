@@ -1774,6 +1774,56 @@ async def test_candidate_executor_keeps_only_a_concurrency_sized_task_window(tmp
 
 
 @pytest.mark.asyncio
+async def test_slow_oldest_candidate_does_not_block_newer_durable_bundles(tmp_path: Path) -> None:
+    class SlowOldestAPI(FakeAPI):
+        def __init__(self) -> None:
+            super().__init__()
+            self.oldest_started = asyncio.Event()
+            self.release_oldest = asyncio.Event()
+
+        async def paginate(
+            self,
+            path: str,
+            *,
+            params: dict[str, Any] | None = None,
+            page_observer: Any = None,
+        ) -> list[dict[str, Any]]:
+            if path == f"{_BASE}/issues/1/timeline":
+                self.oldest_started.set()
+                await self.release_oldest.wait()
+            return await super().paginate(path, params=params, page_observer=page_observer)
+
+    api = SlowOldestAPI()
+    for number in range(1, 4):
+        api.add_issue(number)
+    durable_newer = asyncio.Event()
+
+    def observe(progress: PullProgress) -> None:
+        if progress.phase == "closing_bundles" and progress.bundles_completed == 2:
+            durable_newer.set()
+
+    archive = tmp_path / "archive"
+    pull = asyncio.create_task(
+        GitHubPuller(
+            _config(archive, concurrency=2),
+            api=api,
+            now=lambda: _T0,
+            observer=observe,
+        ).pull(_T0),
+    )
+    await asyncio.wait_for(api.oldest_started.wait(), timeout=1)
+    await asyncio.wait_for(durable_newer.wait(), timeout=1)
+
+    staged = await _rows(archive, "SELECT number FROM resource_versions ORDER BY number")
+    assert staged == [{"number": 2}, {"number": 3}]
+    assert not pull.done()
+
+    api.release_oldest.set()
+    await pull
+    assert set(await _current(archive)) == {1, 2, 3}
+
+
+@pytest.mark.asyncio
 async def test_missing_catalog_item_becomes_tombstone_without_losing_bundle(tmp_path: Path) -> None:
     api = FakeAPI()
     api.add_issue(1)
