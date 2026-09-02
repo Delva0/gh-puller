@@ -13,6 +13,8 @@ usage() {
 Usage:
   github-puller-daemon.sh install OWNER/REPO DATABASE [PULLER_OPTIONS...]
   github-puller-daemon.sh uninstall DATABASE
+  github-puller-daemon.sh start DATABASE
+  github-puller-daemon.sh stop DATABASE
   github-puller-daemon.sh restart DATABASE
   github-puller-daemon.sh status [DATABASE]
   github-puller-daemon.sh logs DATABASE
@@ -301,14 +303,16 @@ case "$action" in
         printf 'Uninstalled %s\n' "$unit"
         printf 'SQLite archives, .env, environments, and source files were preserved.\n'
         ;;
-    restart)
-        [[ $# -eq 2 ]] || fail "restart accepts only DATABASE"
+    start|stop|restart)
+        [[ $# -eq 2 ]] || fail "$action accepts only DATABASE"
         require_system_access
         destination="$(absolute_destination "$2")"
         unit="$(unit_name "$destination")"
-        require_managed_writer restart "$2" "$destination" "$SYSTEMD_DIR/$unit"
-        "$SYSTEMCTL" restart "$unit"
-        "$SYSTEMCTL" is-active --quiet "$unit"
+        require_managed_writer "$action" "$2" "$destination" "$SYSTEMD_DIR/$unit"
+        "$SYSTEMCTL" "$action" "$unit"
+        if [[ "$action" != "stop" ]]; then
+            "$SYSTEMCTL" is-active --quiet "$unit"
+        fi
         ;;
     status)
         [[ $# -le 2 ]] || fail "status accepts at most one DATABASE"

@@ -253,7 +253,7 @@ def test_uninstall_refuses_unmanaged_identity_collision(tmp_path: Path) -> None:
     assert not log.exists()
 
 
-@pytest.mark.parametrize("action", ["status", "restart", "logs"])
+@pytest.mark.parametrize("action", ["status", "start", "stop", "restart", "logs"])
 def test_daemon_control_actions_address_database_writer(
     tmp_path: Path,
     action: str,
@@ -270,8 +270,10 @@ def test_daemon_control_actions_address_database_writer(
         assert f"DATABASE    {database.resolve()}" in result.stdout
         assert calls[0].startswith(f"show {unit_name} --property=ActiveState")
         assert calls[1] == f"--unit {unit_name} --output=cat --lines=512 --no-pager"
-    elif action == "restart":
-        assert calls == [f"restart {unit_name}", f"is-active --quiet {unit_name}"]
+    elif action in {"start", "restart"}:
+        assert calls == [f"{action} {unit_name}", f"is-active --quiet {unit_name}"]
+    elif action == "stop":
+        assert calls == [f"stop {unit_name}"]
     else:
         assert calls == [f"--unit {unit_name} --output=cat --lines=100 --follow"]
 
@@ -293,7 +295,7 @@ def test_status_without_database_lists_all_managed_writers(tmp_path: Path) -> No
     assert "acme/other" in result.stdout
 
 
-@pytest.mark.parametrize("action", ["status", "restart", "logs"])
+@pytest.mark.parametrize("action", ["status", "start", "stop", "restart", "logs"])
 def test_control_action_rejects_repository_in_database_position(
     tmp_path: Path,
     action: str,

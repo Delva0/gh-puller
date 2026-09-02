@@ -431,12 +431,18 @@ the most recent 100 raw messages and follows new output until interrupted:
 
 ```bash
 scripts/github-puller-daemon.sh logs archives/vllm.sqlite3
+sudo scripts/github-puller-daemon.sh stop archives/vllm.sqlite3
+sudo scripts/github-puller-daemon.sh start archives/vllm.sqlite3
 sudo scripts/github-puller-daemon.sh restart archives/vllm.sqlite3
 ```
 
-Read-only observation normally needs no `sudo`; mutating operations still do.
+`stop` ends the current process but leaves the installed unit enabled; `start` resumes
+the same database-bound scheduler, including any pending durable run. `restart` is the
+corresponding single operation. Read-only observation normally needs no `sudo`;
+mutating operations still do.
 Supplying an `OWNER/REPO` or a database without a managed unit to `status`, `logs`,
-or `restart` fails immediately instead of following an unrelated hash unit.
+`start`, `stop`, or `restart` fails immediately instead of following an unrelated
+hash unit.
 
 Sources: [scripts/github-puller-daemon.sh](../scripts/github-puller-daemon.sh); [gh_puller/github/](../gh_puller/github/); [tests/test_github_monitor.py](../tests/test_github_monitor.py)
 
