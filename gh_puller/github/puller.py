@@ -141,7 +141,7 @@ class PullResult:
 
 @dataclass(frozen=True, slots=True)
 class _CatalogPlan:
-    items: dict[int, dict[str, Any]]  # REST summaries or compact GraphQL hints.
+    items: dict[int, dict[str, Any]]  # Raw REST catalog objects available in this pass.
     present: set[int]  # Certified membership through the cutoff.
     signals: set[int]  # Parents dirtied by repository-wide child feeds.
     force_all: bool  # Whether every surviving bundle must be fetched.
@@ -465,9 +465,8 @@ class GitHubPuller:
         progress: _PullProgressTracker,
     ) -> list[dict[str, Any]]:
         progress.catalog_scan()
-        catalog, current_count = await self._catalog_scan(api, progress)
-        if current_count is None:
-            current_count = await self._repository_item_count(api, progress)
+        catalog = await self._catalog_scan(api, progress)
+        current_count = await self._repository_item_count(api, progress)
         certified = _certified_full_catalog(catalog, current_count, cutoff)
         if certified is not None:
             return certified
@@ -484,7 +483,7 @@ class GitHubPuller:
         previous = _catalog_signature(previous_catalog, cutoff) if previous_catalog is not None else None
         while True:
             progress.catalog_scan()
-            catalog, _ = await self._catalog_scan(api, progress)
+            catalog = await self._catalog_scan(api, progress)
             signature = _catalog_signature(catalog, cutoff)
             if signature is None:
                 previous = None
@@ -497,13 +496,12 @@ class GitHubPuller:
         self,
         api: _API,
         progress: _PullProgressTracker,
-    ) -> tuple[list[dict[str, Any]], int | None]:
-        items = await api.paginate(
+    ) -> list[dict[str, Any]]:
+        return await api.paginate(
             f"{self._base}/issues",
             params={"state": "all", "sort": "created", "direction": "desc"},
             page_observer=progress.catalog_page,
         )
-        return items, None
 
     async def _repository_item_count(
         self,
@@ -1085,46 +1083,6 @@ def _certified_head_merge(
     return set(previous) | set(visible), visible
 
 
-def _certified_merge(
-    previous: list[dict[str, Any]],
-    delta: list[dict[str, Any]],
-    current_count: int | None,
-    cutoff: datetime,
-) -> list[dict[str, Any]] | None:
-    if type(current_count) is not int or current_count < 0:
-        return None
-    try:
-        old = _unique_catalog(previous)
-        changed = _unique_catalog(delta)
-        if old is None or changed is None:
-            return None
-        visible: dict[int, dict[str, Any]] = {}
-        future: set[int] = set()
-        for number, item in changed.items():
-            created_at = _item_time(item, "created_at")
-            _item_time(item, "updated_at")
-            prior = old.get(number)
-            if prior is not None and not _same_item(prior, item):
-                return None
-            if created_at <= cutoff:
-                visible[number] = item
-            elif prior is not None:
-                return None
-            else:
-                future.add(number)
-        for item in old.values():
-            if _item_time(item, "created_at") > cutoff:
-                return None
-            _item_time(item, "updated_at")
-    except (IncompleteGitHubDataError, TypeError, ValueError):
-        return None
-
-    additions = set(visible) - set(old)
-    if current_count - len(future) != len(old) + len(additions):
-        return None
-    return _sort_catalog(list((old | visible).values()))
-
-
 def _certified_full_catalog(
     catalog: list[dict[str, Any]],
     current_count: int | None,
@@ -1354,14 +1312,6 @@ def _minimal_summary(head: StoredHead | None) -> dict[str, Any]:
 
 def _same_head(head: StoredHead, item: dict[str, Any]) -> bool:
     return head.github_id == item.get("id") and head.created_at == item.get("created_at") and head.kind == _kind(item)
-
-
-def _same_item(left: dict[str, Any], right: dict[str, Any]) -> bool:
-    return (
-        left.get("id") == right.get("id")
-        and left.get("created_at") == right.get("created_at")
-        and _kind(left) == _kind(right)
-    )
 
 
 def _kind(item: dict[str, Any]) -> str:

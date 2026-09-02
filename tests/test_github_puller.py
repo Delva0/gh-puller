@@ -33,7 +33,8 @@ from gh_puller.github import (
     iter_runs,
     iter_versions,
 )
-from gh_puller.github.puller import _certified_merge
+from gh_puller.github.puller import _certified_head_merge
+from gh_puller.github.store import StoredHead, json_digest
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -301,6 +302,23 @@ def _summary(number: int, created_at: datetime, updated_at: datetime, *, title: 
     }
 
 
+def _stored_heads(items: list[dict[str, Any]]) -> dict[int, StoredHead]:
+    return {
+        item["number"]: StoredHead(
+            number=item["number"],
+            github_id=item["id"],
+            kind="pull" if "pull_request" in item else "issue",
+            created_at=item["created_at"],
+            updated_at=item["updated_at"],
+            summary_digest=json_digest(item),
+            bundle_digest="bundle",
+            present=True,
+            missing_since=None,
+        )
+        for item in items
+    }
+
+
 def _seed_differential_api(api: FakeAPI) -> None:
     api.add_issue(1)
     api.add_issue(2, pull=True)
@@ -463,10 +481,12 @@ def test_cardinality_certificate_equals_exhaustive_catalog_for_all_small_transit
                     current.append(candidate)
                     delta.append(candidate)
 
-                certified = _certified_merge(previous, delta, len(current), cutoff)
+                certified = _certified_head_merge(_stored_heads(previous), delta, len(current), cutoff)
                 if survivors == set(previous_ids):
-                    expected = sorted(current, key=lambda item: (item["created_at"], item["number"]))
-                    assert certified == expected
+                    assert certified == (
+                        {item["number"] for item in current},
+                        {item["number"]: item for item in delta},
+                    )
                 else:
                     assert certified is None
 
@@ -477,8 +497,9 @@ def test_cardinality_certificate_excludes_items_created_after_target() -> None:
     visible = _summary(2, cutoff, cutoff, title="visible")
     future = _summary(3, cutoff + timedelta(seconds=1), cutoff + timedelta(seconds=1), title="future")
 
-    assert _certified_merge(previous, [visible, future], 3, cutoff) == [previous[0], visible]
-    assert _certified_merge(previous, [visible, future], 2, cutoff) is None
+    heads = _stored_heads(previous)
+    assert _certified_head_merge(heads, [visible, future], 3, cutoff) == ({1, 2}, {2: visible})
+    assert _certified_head_merge(heads, [visible, future], 2, cutoff) is None
 
 
 def test_cardinality_certificate_matches_large_random_catalog_churn() -> None:
@@ -511,12 +532,15 @@ def test_cardinality_certificate_matches_large_random_catalog_churn() -> None:
             current.append(item)
             delta.append(item)
 
-        certified = _certified_merge(previous, delta, len(current), cutoff)
+        certified = _certified_head_merge(_stored_heads(previous), delta, len(current), cutoff)
         if deleted:
             assert certified is None
             rejected += 1
         else:
-            assert certified == current
+            assert certified == (
+                {item["number"] for item in current},
+                {item["number"]: item for item in delta},
+            )
             accepted += 1
         previous = current
 
