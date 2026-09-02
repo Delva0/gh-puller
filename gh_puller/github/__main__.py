@@ -19,12 +19,13 @@ from typing import TYPE_CHECKING, Any
 from dotenv import load_dotenv
 
 from .puller import GitHubPullConfig, GitHubPuller, PullResult
+from .store import schedule_state
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator, Sequence
 
-_STATE_NAME = ".gh-puller-state.json"
 _HOUR = timedelta(hours=1)
+_HOURLY_SERIES = "hourly"
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -42,7 +43,7 @@ def _parser() -> argparse.ArgumentParser:
 
 def _add_common_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("repository", help="GitHub owner/repo")
-    parser.add_argument("destination", type=Path, help="dedicated archive Git worktree")
+    parser.add_argument("destination", type=Path, help="SQLite raw-fact database")
     parser.add_argument("--api-url", default="https://api.github.com")
     parser.add_argument("--graphql-url")
     parser.add_argument("--api-version", default="2022-11-28")
@@ -99,58 +100,19 @@ async def _run_hourly(
     sink = _emit if emit is None else emit
     runs = 0
     while max_runs is None or runs < max_runs:
-        result = await puller.pull(target)
+        result = await puller.pull(target, series=_HOURLY_SERIES)
         sink(result)
         target = _next_hour(target)
         runs += 1
 
 
 async def _hourly_start(destination: Path, now: datetime) -> datetime:
-    committed = await _latest_committed_target(destination)
-    pending = _pending_target(destination)
-    if pending is not None and (committed is None or pending > committed):
-        return pending
-    if committed is not None:
-        return _next_hour(committed)
+    committed_value, pending_value = await schedule_state(destination, _HOURLY_SERIES)
+    if pending_value is not None:
+        return _parse_time(pending_value)
+    if committed_value is not None:
+        return _next_hour(_parse_time(committed_value))
     return _floor_hour(now)
-
-
-async def _latest_committed_target(destination: Path) -> datetime | None:
-    if not (destination / ".git").exists():
-        return None
-    process = await asyncio.create_subprocess_exec(
-        "git",
-        "-C",
-        str(destination),
-        "log",
-        "-1",
-        "--format=%s",
-        "--",
-        _STATE_NAME,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    stdout, _ = await process.communicate()
-    if process.returncode:
-        return None
-    subject = stdout.decode().strip()
-    if not subject:
-        return None
-    try:
-        return _parse_time(subject)
-    except argparse.ArgumentTypeError:
-        return None
-
-
-def _pending_target(destination: Path) -> datetime | None:
-    path = destination / _STATE_NAME
-    if not path.exists():
-        return None
-    state = json.loads(path.read_text(encoding="utf-8"))
-    last_pull = state.get("last_pull")
-    if not isinstance(last_pull, dict) or not isinstance(last_pull.get("target_at"), str):
-        return None
-    return _parse_time(last_pull["target_at"])
 
 
 @contextmanager
@@ -187,10 +149,10 @@ def _emit(result: PullResult) -> None:
     payload: dict[str, Any] = {
         "catalog_items": result.catalog_items,
         "changed_items": result.changed_items,
-        "commit": result.commit,
         "completed_at": result.completed_at.isoformat().replace("+00:00", "Z"),
         "lag_seconds": result.lag_seconds,
         "requests": result.requests,
+        "run_id": result.run_id,
         "target_at": result.target_at.isoformat().replace("+00:00", "Z"),
     }
     print(json.dumps(payload, ensure_ascii=False, sort_keys=True), flush=True)

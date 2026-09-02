@@ -1,4 +1,4 @@
-"""GitHub 拉取器的时间水位、原始数据完整性、恢复与 Git 提交测试。"""
+"""GitHub 拉取器的水位、原始事实完整性、恢复与 SQLite 发布测试。"""
 
 from __future__ import annotations
 
@@ -7,20 +7,24 @@ import itertools
 import json
 import math
 import random
-import subprocess
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
+import aiosqlite
 import httpx
 import pytest
 
 from gh_puller.github import (
+    ArchivedRun,
+    ArchivedVersion,
     GitHubAPI,
     GitHubPullConfig,
     GitHubPuller,
     IncompleteGitHubDataError,
+    iter_runs,
+    iter_versions,
 )
 from gh_puller.github.puller import _certified_merge
 
@@ -166,18 +170,33 @@ def _config(path: Path, **kwargs: Any) -> GitHubPullConfig:
     return GitHubPullConfig(repository="acme/widgets", destination=path, **kwargs)
 
 
-def _git(path: Path, *args: str, check: bool = True) -> str:
-    result = subprocess.run(
-        ["git", "-C", str(path), *args],
-        check=check,
-        capture_output=True,
-        text=True,
-    )
-    return result.stdout.strip()
+async def _versions(path: Path) -> list[ArchivedVersion]:
+    return [version async for version in iter_versions(path)]
 
 
-def _state(path: Path) -> dict[str, Any]:
-    return json.loads((path / ".gh-puller-state.json").read_text(encoding="utf-8"))
+async def _runs(path: Path) -> list[ArchivedRun]:
+    return [run async for run in iter_runs(path)]
+
+
+async def _current(path: Path) -> dict[int, ArchivedVersion]:
+    return {version.number: version for version in await _versions(path)}
+
+
+async def _rows(
+    path: Path,
+    sql: str,
+    parameters: tuple[Any, ...] = (),
+) -> list[dict[str, Any]]:
+    db = await aiosqlite.connect(path)
+    db.row_factory = aiosqlite.Row
+    try:
+        cursor = await db.execute(sql, parameters)
+        try:
+            return [dict(row) for row in await cursor.fetchall()]
+        finally:
+            await cursor.close()
+    finally:
+        await db.close()
 
 
 def _subsets(values: tuple[int, ...]) -> Any:
@@ -254,9 +273,23 @@ def _mutate_active_interval(api: FakeAPI, changed_at: datetime) -> None:
     ]
 
 
-def _managed_snapshot(path: Path) -> dict[str, bytes]:
-    paths = [path / ".gh-puller-state.json", *(path / "data").rglob("*.json")]
-    return {item.relative_to(path).as_posix(): item.read_bytes() for item in paths}
+async def _managed_snapshot(path: Path) -> list[tuple[Any, ...]]:
+    return [
+        (
+            version.target_at,
+            version.observed_at,
+            version.number,
+            version.github_id,
+            version.kind,
+            version.created_at,
+            version.updated_at,
+            version.present,
+            version.missing_since,
+            version.summary,
+            version.bundle,
+        )
+        for version in await _versions(path)
+    ]
 
 
 def _seed_churn_api(api: FakeAPI, size: int) -> None:
@@ -422,7 +455,7 @@ async def test_default_token_prefers_gh_token(monkeypatch, tmp_path: Path) -> No
 
 
 @pytest.mark.asyncio
-async def test_cold_pull_preserves_raw_fields_and_commits_target(tmp_path: Path) -> None:
+async def test_cold_pull_preserves_raw_fields_and_publishes_target(tmp_path: Path) -> None:
     api = FakeAPI()
     api.add_issue(1)
     issue_path = f"{_BASE}/issues/1"
@@ -445,21 +478,25 @@ async def test_cold_pull_preserves_raw_fields_and_commits_target(tmp_path: Path)
     result = await GitHubPuller(_config(tmp_path / "archive"), api=api, now=clock, sleep=clock.sleep).pull(_T0)
 
     archive = tmp_path / "archive"
-    bundle = json.loads((archive / "data/issues/1.json").read_text(encoding="utf-8"))
-    catalog = json.loads((archive / "data/catalog.json").read_text(encoding="utf-8"))
+    current = await _current(archive)
+    bundle = current[1].bundle
+    catalog = current[1].summary
+    assert bundle is not None
     assert bundle["issue"]["unknown_detail_field"] == [1, {"raw": "yes"}]
     assert bundle["issue_comments"][0]["future_field"] == {"kept": 1}
     assert bundle["timeline"][0]["rename"] == {"from": "a", "to": "b"}
     assert bundle["events"][0]["label"]["name"] == "bug"
     assert bundle["reactions"][0]["content"] == "heart"
     assert bundle["issue_comment_reactions"] == {"101": []}
-    assert catalog[0]["unknown_summary_field"] == {"preserved": True}
-    assert _git(archive, "log", "-1", "--format=%s") == _iso(_T0)
-    assert _git(archive, "rev-list", "--count", "HEAD") == "1"
-    assert result.commit == _git(archive, "rev-parse", "HEAD")
+    assert catalog["unknown_summary_field"] == {"preserved": True}
+    runs = await _runs(archive)
+    assert len(runs) == 1
+    assert runs[0].target_at == _iso(_T0)
+    assert runs[0].completed_at == _iso(_T0)
+    assert result.run_id == runs[0].id
     assert result.changed_items == 1
     assert result.catalog_items == 1
-    assert _state(archive)["covered_until"] == _iso(_T0)
+    assert runs[0].observed_until == _iso(_T0)
 
 
 @pytest.mark.asyncio
@@ -482,7 +519,8 @@ async def test_pull_request_bundle_preserves_all_discussion_and_diff_data(tmp_pa
 
     await GitHubPuller(_config(tmp_path / "archive"), api=api, now=lambda: _T0).pull(_T0)
 
-    bundle = json.loads((tmp_path / "archive/data/pulls/7.json").read_text(encoding="utf-8"))
+    bundle = (await _current(tmp_path / "archive"))[7].bundle
+    assert bundle is not None
     pull = bundle["pull_request"]
     assert pull["detail"]["mergeable_state"] == "clean"
     assert pull["reviews"][0]["state"] == "APPROVED"
@@ -493,13 +531,12 @@ async def test_pull_request_bundle_preserves_all_discussion_and_diff_data(tmp_pa
     assert pull["requested_reviewers"]["users"][0]["login"] == "alice"
     assert pull["diff"].startswith("diff --git")
     assert pull["patch"].startswith("From abc")
-    assert not (tmp_path / "archive/data/issues/7.json").exists()
-    assert not (tmp_path / "archive/data/prs/7.json").exists()
+    assert (await _current(tmp_path / "archive"))[7].kind == "pull"
     assert any(call[1] == f"{issue_path}/comments" for call in api.calls)
 
 
 @pytest.mark.asyncio
-async def test_incremental_refreshes_existing_item_and_always_commits(tmp_path: Path) -> None:
+async def test_incremental_refreshes_existing_item_and_always_publishes(tmp_path: Path) -> None:
     api = FakeAPI()
     summary = api.add_issue(1)
     archive = tmp_path / "archive"
@@ -518,12 +555,15 @@ async def test_incremental_refreshes_existing_item_and_always_commits(tmp_path: 
     clock.current += timedelta(minutes=1)
     third = await puller.pull(clock.current)
 
-    bundle = json.loads((archive / "data/issues/1.json").read_text(encoding="utf-8"))
+    bundle = (await _current(archive))[1].bundle
+    assert bundle is not None
     assert bundle["issue"]["body"] == "edited"
     assert first.changed_items == second.changed_items == 1
     assert third.changed_items == 0
-    assert _git(archive, "rev-list", "--count", "HEAD") == "3"
-    assert _git(archive, "log", "-1", "--format=%s") == _iso(clock.current)
+    runs = await _runs(archive)
+    assert len(runs) == 3
+    assert runs[-1].target_at == _iso(clock.current)
+    assert [run.changed_items for run in runs] == [1, 1, 0]
 
 
 @pytest.mark.asyncio
@@ -551,7 +591,7 @@ async def test_certified_puller_stays_byte_equal_to_exhaustive_oracle(tmp_path: 
 
     await certified.pull(_T0)
     await exhaustive.pull(_T0)
-    assert _managed_snapshot(certified_path) == _managed_snapshot(exhaustive_path)
+    assert await _managed_snapshot(certified_path) == await _managed_snapshot(exhaustive_path)
 
     active_target = _T0 + timedelta(hours=1)
     changed_at = active_target - timedelta(minutes=1)
@@ -561,7 +601,7 @@ async def test_certified_puller_stays_byte_equal_to_exhaustive_oracle(tmp_path: 
     exhaustive_clock.current = active_target
     await certified.pull(active_target)
     await exhaustive.pull(active_target)
-    assert _managed_snapshot(certified_path) == _managed_snapshot(exhaustive_path)
+    assert await _managed_snapshot(certified_path) == await _managed_snapshot(exhaustive_path)
 
     quiet_target = active_target + timedelta(hours=1)
     certified_clock.current = quiet_target
@@ -569,7 +609,7 @@ async def test_certified_puller_stays_byte_equal_to_exhaustive_oracle(tmp_path: 
     quiet = await certified.pull(quiet_target)
     await exhaustive.pull(quiet_target)
     assert quiet.requests == 4
-    assert _managed_snapshot(certified_path) == _managed_snapshot(exhaustive_path)
+    assert await _managed_snapshot(certified_path) == await _managed_snapshot(exhaustive_path)
 
     replacement_target = quiet_target + timedelta(hours=1)
     replacement_at = replacement_target - timedelta(minutes=1)
@@ -585,8 +625,8 @@ async def test_certified_puller_stays_byte_equal_to_exhaustive_oracle(tmp_path: 
         call for call in certified_api.calls[catalog_call_start:] if call[0] == "page" and call[1] == f"{_BASE}/issues"
     ]
     assert len(catalog_calls) == 3
-    assert _state(certified_path)["objects"]["1"]["present"] is False
-    assert _managed_snapshot(certified_path) == _managed_snapshot(exhaustive_path)
+    assert (await _current(certified_path))[1].present is False
+    assert await _managed_snapshot(certified_path) == await _managed_snapshot(exhaustive_path)
 
     same_second_target = replacement_target + timedelta(microseconds=1)
     for api in (certified_api, exhaustive_api):
@@ -599,7 +639,7 @@ async def test_certified_puller_stays_byte_equal_to_exhaustive_oracle(tmp_path: 
     exhaustive_clock.current = same_second_target
     await certified.pull(same_second_target)
     await exhaustive.pull(same_second_target)
-    assert _managed_snapshot(certified_path) == _managed_snapshot(exhaustive_path)
+    assert await _managed_snapshot(certified_path) == await _managed_snapshot(exhaustive_path)
 
 
 @pytest.mark.asyncio
@@ -627,7 +667,7 @@ async def test_large_random_issue_and_comment_churn_matches_exhaustive_oracle(tm
     )
     await certified.pull(_T0)
     await exhaustive.pull(_T0)
-    assert _managed_snapshot(certified_path) == _managed_snapshot(exhaustive_path)
+    assert await _managed_snapshot(certified_path) == await _managed_snapshot(exhaustive_path)
 
     next_number = 97
     next_comment = 1_000_000
@@ -682,7 +722,7 @@ async def test_large_random_issue_and_comment_churn_matches_exhaustive_oracle(tm
         else:
             assert root_scans == 1
             fast_epochs += 1
-        assert _managed_snapshot(certified_path) == _managed_snapshot(exhaustive_path)
+        assert await _managed_snapshot(certified_path) == await _managed_snapshot(exhaustive_path)
 
     assert (added_total, deleted_total) == (60, 20)
     assert comment_additions + comment_deletions == 240
@@ -690,8 +730,8 @@ async def test_large_random_issue_and_comment_churn_matches_exhaustive_oracle(tm
     assert comment_deletions > 0
     assert (fast_epochs, fallback_epochs) == (10, 10)
     assert len(certified_api.catalog) == 136
-    assert _git(certified_path, "rev-list", "--count", "HEAD") == "21"
-    assert _git(exhaustive_path, "rev-list", "--count", "HEAD") == "21"
+    assert len(await _runs(certified_path)) == 21
+    assert len(await _runs(exhaustive_path)) == 21
 
 
 @pytest.mark.parametrize("catalog_size", [1, 250])
@@ -734,33 +774,94 @@ async def test_same_second_catalog_change_is_not_lost(tmp_path: Path) -> None:
     api = FakeAPI()
     api.add_issue(1, updated_at=_T0)
     archive = tmp_path / "archive"
-    puller = GitHubPuller(_config(archive), api=api, now=lambda: _T0)
+    clock = Clock(_T0)
+    puller = GitHubPuller(_config(archive), api=api, now=clock, sleep=clock.sleep)
     await puller.pull(_T0)
     api.catalog[0]["title"] = "same-second edit"
     api.json[f"{_BASE}/issues/1"]["title"] = "same-second edit"
 
     result = await puller.pull(_T0 + timedelta(microseconds=1))
 
-    bundle = json.loads((archive / "data/issues/1.json").read_text(encoding="utf-8"))
+    bundle = (await _current(archive))[1].bundle
+    assert bundle is not None
     assert result.changed_items == 1
     assert bundle["issue"]["title"] == "same-second edit"
 
 
 @pytest.mark.asyncio
-async def test_repeated_target_creates_an_empty_commit_without_api_calls(tmp_path: Path) -> None:
+async def test_repeated_idempotency_key_returns_the_committed_run(tmp_path: Path) -> None:
     api = FakeAPI()
     api.add_issue(1)
     archive = tmp_path / "archive"
     puller = GitHubPuller(_config(archive), api=api, now=lambda: _T0)
-    await puller.pull(_T0)
+    first = await puller.pull(_T0)
+    calls = len(api.calls)
 
-    result = await puller.pull(_T0)
+    repeated = await puller.pull(_T0)
 
-    assert result.changed_items == 0
-    assert result.requests == 0
-    assert _git(archive, "rev-list", "--count", "HEAD") == "2"
-    assert _git(archive, "log", "-2", "--format=%s").splitlines() == [_iso(_T0), _iso(_T0)]
-    assert _git(archive, "diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD") == ""
+    assert repeated == first
+    assert len(api.calls) == calls
+    runs = await _runs(archive)
+    assert [run.target_at for run in runs] == [_iso(_T0)]
+    assert [run.changed_items for run in runs] == [1]
+    assert len(await _versions(archive)) == 1
+
+
+@pytest.mark.asyncio
+async def test_idempotent_hit_does_not_construct_an_api_client(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    api = FakeAPI()
+    api.add_issue(1)
+    constructions = 0
+
+    def make_api(**_: Any) -> FakeAPI:
+        nonlocal constructions
+        constructions += 1
+        return api
+
+    monkeypatch.setattr("gh_puller.github.puller.GitHubAPI", make_api)
+    puller = GitHubPuller(_config(tmp_path / "archive"), now=lambda: _T0)
+
+    first = await puller.pull(_T0)
+    repeated = await puller.pull(_T0)
+
+    assert repeated == first
+    assert constructions == 1
+
+
+@pytest.mark.asyncio
+async def test_idempotency_key_is_scoped_by_series(tmp_path: Path) -> None:
+    api = FakeAPI()
+    api.add_issue(1)
+    archive = tmp_path / "archive"
+    puller = GitHubPuller(_config(archive), api=api, now=lambda: _T0)
+
+    unlabeled = await puller.pull(_T0)
+    hourly = await puller.pull(_T0, series="hourly")
+    repeated = await puller.pull(_T0, series="hourly")
+
+    assert unlabeled.run_id != hourly.run_id
+    assert repeated == hourly
+    assert [(run.target_at, run.series) for run in await _runs(archive)] == [
+        (_iso(_T0), None),
+        (_iso(_T0), "hourly"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_concurrent_duplicate_pulls_publish_one_run(tmp_path: Path) -> None:
+    api = FakeAPI()
+    api.add_issue(1)
+    archive = tmp_path / "archive"
+    puller = GitHubPuller(_config(archive), api=api, now=lambda: _T0)
+
+    left, right = await asyncio.gather(puller.pull(_T0), puller.pull(_T0))
+
+    assert left == right
+    assert len(await _runs(archive)) == 1
+    assert len(await _versions(archive)) == 1
 
 
 @pytest.mark.asyncio
@@ -789,7 +890,8 @@ async def test_comment_signal_refreshes_parent_when_summary_is_unchanged(tmp_pat
 
     result = await puller.pull(clock.current)
 
-    bundle = json.loads((archive / "data/issues/3.json").read_text(encoding="utf-8"))
+    bundle = (await _current(archive))[3].bundle
+    assert bundle is not None
     assert result.changed_items == 1
     assert bundle["issue_comments"][0]["body"] == "late comment"
     signal_call = next(call for call in api.calls if call[1] == f"{_BASE}/issues/comments")
@@ -797,13 +899,16 @@ async def test_comment_signal_refreshes_parent_when_summary_is_unchanged(tmp_pat
 
 
 @pytest.mark.asyncio
-async def test_future_target_prefetches_then_closes_with_one_target_commit(tmp_path: Path) -> None:
+async def test_future_target_prefetches_then_closes_with_one_target_run(tmp_path: Path) -> None:
     api = FakeAPI()
     api.add_issue(1, created_at=_T0 - timedelta(days=1))
     target = _T0 + timedelta(minutes=10)
     clock = Clock(_T0)
 
     def add_late_issue() -> None:
+        api.catalog[0]["updated_at"] = _iso(target)
+        api.json[f"{_BASE}/issues/1"]["updated_at"] = _iso(target)
+        api.json[f"{_BASE}/issues/1"]["body"] = "changed after prefetch"
         api.add_issue(2, created_at=target, updated_at=target)
 
     clock.on_sleep = add_late_issue
@@ -812,16 +917,22 @@ async def test_future_target_prefetches_then_closes_with_one_target_commit(tmp_p
 
     assert clock.sleeps == [600]
     assert result.target_at == target
-    assert result.changed_items == 2
-    assert (archive / "data/issues/1.json").exists()
-    assert (archive / "data/issues/2.json").exists()
-    assert sum(call[1] == f"{_BASE}/issues/1" for call in api.calls) == 1
-    assert _git(archive, "rev-list", "--count", "HEAD") == "1"
-    assert _git(archive, "log", "-1", "--format=%s") == _iso(target)
+    assert result.changed_items == 3
+    assert set(await _current(archive)) == {1, 2}
+    assert sum(call[1] == f"{_BASE}/issues/1" for call in api.calls) == 2
+    issue_versions = [version for version in await _versions(archive) if version.number == 1]
+    assert len(issue_versions) == 2
+    assert issue_versions[0].bundle is not None
+    assert issue_versions[1].bundle is not None
+    assert issue_versions[0].bundle["issue"]["body"] == "body"
+    assert issue_versions[1].bundle["issue"]["body"] == "changed after prefetch"
+    runs = await _runs(archive)
+    assert len(runs) == 1
+    assert runs[0].target_at == _iso(target)
 
 
 @pytest.mark.asyncio
-async def test_future_wait_does_not_lock_out_an_immediate_pull(tmp_path: Path) -> None:
+async def test_future_wait_serializes_the_single_archive_writer(tmp_path: Path) -> None:
     class PausingClock:
         def __init__(self) -> None:
             self.current = _T0
@@ -845,14 +956,16 @@ async def test_future_wait_does_not_lock_out_an_immediate_pull(tmp_path: Path) -
     future = asyncio.create_task(puller.pull(future_target))
     await asyncio.wait_for(clock.sleeping.wait(), timeout=1)
 
-    immediate = await asyncio.wait_for(puller.pull(_T0), timeout=1)
+    immediate_task = asyncio.create_task(puller.pull(_T0))
+    await asyncio.sleep(0)
+    assert not immediate_task.done()
     clock.resume.set()
     scheduled = await asyncio.wait_for(future, timeout=1)
+    immediate = await asyncio.wait_for(immediate_task, timeout=1)
 
     assert immediate.target_at == _T0
     assert scheduled.target_at == future_target
-    assert _git(archive, "rev-list", "--count", "HEAD") == "2"
-    assert _git(archive, "log", "-2", "--format=%s").splitlines() == [
+    assert [run.target_at for run in await _runs(archive)] == [
         _iso(future_target),
         _iso(_T0),
     ]
@@ -875,13 +988,13 @@ async def test_default_target_is_frozen_before_first_await(tmp_path: Path) -> No
     assert result.target_at == _T0
     assert result.completed_at == _T0 + timedelta(minutes=5)
     assert result.lag_seconds == 300
-    assert _git(archive, "log", "-1", "--format=%s") == _iso(_T0)
-    commit_dates = _git(archive, "log", "-1", "--format=%at %ct").split()
-    assert commit_dates == [str(int(result.completed_at.timestamp()))] * 2
+    run = (await _runs(archive))[0]
+    assert run.target_at == _iso(_T0)
+    assert run.completed_at == _iso(result.completed_at)
 
 
 @pytest.mark.asyncio
-async def test_interrupted_cold_pull_resumes_completed_bundles_without_commit(tmp_path: Path) -> None:
+async def test_interrupted_cold_pull_resumes_staged_bundles_without_publication(tmp_path: Path) -> None:
     api = FakeAPI()
     api.add_issue(1)
     api.add_issue(2)
@@ -892,20 +1005,30 @@ async def test_interrupted_cold_pull_resumes_completed_bundles_without_commit(tm
     with pytest.raises(RuntimeError, match="injected failure"):
         await puller.pull(_T0)
 
-    assert (archive / "data/issues/1.json").exists()
-    assert _git(archive, "rev-parse", "--verify", "HEAD", check=False) == ""
+    assert await _runs(archive) == []
+    assert await _versions(archive) == []
+    staged = await _rows(
+        archive,
+        """
+        SELECT v.number
+        FROM resource_versions AS v
+        JOIN pull_runs AS r ON r.id = v.run_id
+        WHERE r.status = 'pending'
+        """,
+    )
+    assert len(staged) == 1
     assert sum(call[1] == f"{_BASE}/issues/1" for call in api.calls) == 1
 
     result = await puller.pull(_T0)
 
-    assert result.changed_items == 1
+    assert result.changed_items == 2
     assert sum(call[1] == f"{_BASE}/issues/1" for call in api.calls) == 1
-    assert (archive / "data/issues/2.json").exists()
-    assert _git(archive, "rev-list", "--count", "HEAD") == "1"
+    assert set(await _current(archive)) == {1, 2}
+    assert len(await _runs(archive)) == 1
 
 
 @pytest.mark.asyncio
-async def test_cancellation_aborts_work_and_does_not_commit(tmp_path: Path) -> None:
+async def test_cancellation_aborts_work_and_does_not_publish(tmp_path: Path) -> None:
     class BlockingAPI(FakeAPI):
         def __init__(self) -> None:
             super().__init__()
@@ -934,7 +1057,9 @@ async def test_cancellation_aborts_work_and_does_not_commit(tmp_path: Path) -> N
     with pytest.raises(asyncio.CancelledError):
         await task
 
-    assert _git(archive, "rev-parse", "--verify", "HEAD", check=False) == ""
+    assert await _runs(archive) == []
+    pending = await _rows(archive, "SELECT status FROM pull_runs")
+    assert pending == [{"status": "pending"}]
 
 
 @pytest.mark.asyncio
@@ -945,20 +1070,21 @@ async def test_missing_catalog_item_becomes_tombstone_without_losing_bundle(tmp_
     clock = Clock(_T0)
     puller = GitHubPuller(_config(archive), api=api, now=clock, sleep=clock.sleep)
     await puller.pull(_T0)
+    original = (await _current(archive))[1].bundle
     api.catalog.clear()
     clock.current += timedelta(minutes=1)
 
     result = await puller.pull(clock.current)
 
-    record = _state(archive)["objects"]["1"]
-    assert record["present"] is False
-    assert record["missing_since"] == _iso(clock.current)
+    record = (await _current(archive))[1]
+    assert record.present is False
+    assert record.missing_since == _iso(clock.current)
+    assert record.bundle == original
     assert result.catalog_items == 0
-    assert (archive / "data/issues/1.json").exists()
 
 
 @pytest.mark.asyncio
-async def test_detectable_pull_file_truncation_aborts_without_commit(tmp_path: Path) -> None:
+async def test_detectable_pull_file_truncation_aborts_without_publication(tmp_path: Path) -> None:
     api = FakeAPI()
     api.add_issue(9, pull=True)
     pull_path = f"{_BASE}/pulls/9"
@@ -969,8 +1095,8 @@ async def test_detectable_pull_file_truncation_aborts_without_commit(tmp_path: P
     with pytest.raises(IncompleteGitHubDataError, match="advertised 2 files, got 1"):
         await GitHubPuller(_config(archive), api=api, now=lambda: _T0).pull(_T0)
 
-    assert _git(archive, "rev-parse", "--verify", "HEAD", check=False) == ""
-    assert not (archive / "data/pulls/9.json").exists()
+    assert await _runs(archive) == []
+    assert await _versions(archive) == []
 
 
 @pytest.mark.asyncio
@@ -1167,20 +1293,25 @@ async def test_rest_pagination_follows_link_header_and_preserves_fields() -> Non
 
 
 @pytest.mark.asyncio
-async def test_commit_only_contains_managed_archive_paths(tmp_path: Path) -> None:
+async def test_payload_blobs_are_compressed_and_content_addressed(tmp_path: Path) -> None:
     api = FakeAPI()
     api.add_issue(1)
     archive = tmp_path / "archive"
     clock = Clock(_T0)
     puller = GitHubPuller(_config(archive), api=api, now=clock, sleep=clock.sleep)
     await puller.pull(_T0)
-    note = archive / "manual-note.txt"
-    note.write_text("user data\n", encoding="utf-8")
-    _git(archive, "add", "manual-note.txt")
     clock.current += timedelta(minutes=1)
 
     await puller.pull(clock.current)
 
-    committed = _git(archive, "show", "--pretty=", "--name-only", "HEAD").splitlines()
-    assert "manual-note.txt" not in committed
-    assert _git(archive, "status", "--short", "manual-note.txt") == "A  manual-note.txt"
+    blobs = await _rows(
+        archive,
+        "SELECT digest, codec, raw_size, length(payload) AS stored_size FROM payload_blobs",
+    )
+    versions = await _rows(archive, "SELECT id FROM resource_versions")
+    assert len(blobs) == 2
+    assert len(versions) == 1
+    assert {row["codec"] for row in blobs} == {"zlib-json-v1"}
+    assert all(len(row["digest"]) == 64 for row in blobs)
+    assert any(row["stored_size"] < row["raw_size"] for row in blobs)
+    assert await _rows(archive, "PRAGMA integrity_check") == [{"integrity_check": "ok"}]

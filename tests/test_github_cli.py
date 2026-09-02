@@ -6,7 +6,6 @@ import argparse
 import asyncio
 import json
 import signal
-import subprocess
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
@@ -15,6 +14,7 @@ import pytest
 
 from gh_puller.github import PullResult
 from gh_puller.github import __main__ as cli
+from gh_puller.github.store import SQLiteArchive
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -25,14 +25,21 @@ _T0 = datetime(2026, 9, 2, 12, tzinfo=UTC)
 @dataclass
 class StubPuller:
     targets: list[datetime] = field(default_factory=list)
+    series: list[str | None] = field(default_factory=list)
 
-    async def pull(self, target: datetime | None = None) -> PullResult:
+    async def pull(
+        self,
+        target: datetime | None = None,
+        *,
+        series: str | None = None,
+    ) -> PullResult:
         assert target is not None
         self.targets.append(target)
+        self.series.append(series)
         return PullResult(
             target_at=target,
             completed_at=target,
-            commit=f"commit-{len(self.targets)}",
+            run_id=len(self.targets),
             changed_items=0,
             catalog_items=10,
             requests=4,
@@ -44,34 +51,18 @@ def _iso(value: datetime) -> str:
     return value.astimezone(UTC).isoformat(timespec=timespec).replace("+00:00", "Z")
 
 
-def _git(path: Path, *args: str) -> str:
-    return subprocess.run(
-        ["git", "-C", str(path), *args],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
-
-
-def _commit_state(path: Path, target: datetime) -> None:
-    path.mkdir()
-    _git(path, "init", "--quiet")
-    state = {"last_pull": {"target_at": _iso(target)}}
-    (path / ".gh-puller-state.json").write_text(json.dumps(state), encoding="utf-8")
-    _git(path, "add", ".gh-puller-state.json")
-    _git(
-        path,
-        "-c",
-        "user.name=test",
-        "-c",
-        "user.email=test@example.com",
-        "-c",
-        "commit.gpgsign=false",
-        "commit",
-        "--quiet",
-        "--message",
-        _iso(target),
-    )
+async def _seed_run(
+    path: Path,
+    target: datetime,
+    *,
+    series: str | None = "hourly",
+    committed: bool,
+) -> None:
+    async with SQLiteArchive(path, "acme/widgets") as archive:
+        run = await archive.start_run(_iso(target), _iso(target), series)
+        if committed:
+            await archive.update_observed(run.id, _iso(target))
+            await archive.finalize(run.id, _iso(target))
 
 
 def test_parser_builds_once_config_and_normalizes_target() -> None:
@@ -117,19 +108,19 @@ async def test_hourly_starts_at_latest_due_hour_and_never_skips(tmp_path: Path) 
     )
 
     assert puller.targets == [_T0 + timedelta(hours=offset) for offset in range(4)]
+    assert puller.series == ["hourly"] * 4
     assert [result.target_at for result in emitted] == puller.targets
 
 
 @pytest.mark.asyncio
-async def test_hourly_restart_uses_committed_title_then_retries_pending_state(tmp_path: Path) -> None:
+async def test_hourly_restart_uses_committed_then_retries_pending_run(tmp_path: Path) -> None:
     archive = tmp_path / "archive"
-    _commit_state(archive, _T0)
+    await _seed_run(archive, _T0, committed=True)
 
     assert await cli._hourly_start(archive, _T0 + timedelta(minutes=37)) == _T0 + timedelta(hours=1)
 
-    pending = _T0 + timedelta(minutes=45)
-    state = {"last_pull": {"target_at": _iso(pending)}}
-    (archive / ".gh-puller-state.json").write_text(json.dumps(state), encoding="utf-8")
+    pending = _T0 + timedelta(hours=1)
+    await _seed_run(archive, pending, committed=False)
     assert await cli._hourly_start(archive, _T0 + timedelta(hours=2)) == pending
 
     puller = StubPuller()
@@ -140,14 +131,24 @@ async def test_hourly_restart_uses_committed_title_then_retries_pending_state(tm
         emit=lambda _: None,
         max_runs=2,
     )
-    assert puller.targets == [pending, _T0 + timedelta(hours=1)]
+    assert puller.targets == [pending, _T0 + timedelta(hours=2)]
+    assert puller.series == ["hourly", "hourly"]
+
+
+@pytest.mark.asyncio
+async def test_hourly_refuses_a_pending_run_from_another_series(tmp_path: Path) -> None:
+    archive = tmp_path / "archive"
+    await _seed_run(archive, _T0, series=None, committed=False)
+
+    with pytest.raises(RuntimeError, match="belongs to series"):
+        await cli._hourly_start(archive, _T0)
 
 
 def test_emit_writes_machine_readable_result(capsys: pytest.CaptureFixture[str]) -> None:
     result = PullResult(
         target_at=_T0,
         completed_at=_T0 + timedelta(seconds=3),
-        commit="abc",
+        run_id=42,
         changed_items=2,
         catalog_items=11,
         requests=7,
@@ -158,10 +159,10 @@ def test_emit_writes_machine_readable_result(capsys: pytest.CaptureFixture[str])
     assert json.loads(capsys.readouterr().out) == {
         "catalog_items": 11,
         "changed_items": 2,
-        "commit": "abc",
         "completed_at": "2026-09-02T12:00:03Z",
         "lag_seconds": 3.0,
         "requests": 7,
+        "run_id": 42,
         "target_at": "2026-09-02T12:00:00Z",
     }
 

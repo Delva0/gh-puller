@@ -1,18 +1,15 @@
-"""编排 GitHub 原始数据归档、覆盖水位和单次 Git 提交。
+"""编排 GitHub 原始事实拉取、覆盖水位与 SQLite 原子发布。
 
-协议边界与时间语义见 ``gh_puller.github``；本模块不把归档解释为派生知识，也不
-下载正文中链接的站外附件。
+协议边界与时间语义见 gh_puller.github；持久化细节由 store 负责。本模块不把
+归档解释为派生知识，也不下载正文中链接的站外附件。
 """
 
 from __future__ import annotations
 
 import asyncio
 import fcntl
-import hashlib
-import json
 import os
 import re
-import tempfile
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -20,14 +17,20 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
 from .client import GitHubAPI
+from .store import (
+    ArchivedRun,
+    SQLiteArchive,
+    StagedResource,
+    StoredHead,
+    json_digest,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
 
-_SCHEMA_VERSION = 1
-_STATE_NAME = ".gh-puller-state.json"
 _NUMBER_AT_END = re.compile(r"/(\d+)$")
 _CATALOG_MODES = {"certified", "exhaustive"}
+_STAGE_BATCH_SIZE = 32
 
 
 class IncompleteGitHubDataError(RuntimeError):
@@ -59,8 +62,8 @@ class _API(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class GitHubPullConfig:
-    repository: str  # GitHub ``owner/repo`` identity.
-    destination: Path  # Dedicated Git worktree for the raw archive.
+    repository: str  # GitHub owner/repo identity.
+    destination: Path  # SQLite raw-fact database.
     token: str | None = None  # None reads GH_TOKEN, then GITHUB_TOKEN, at call time.
     api_url: str = "https://api.github.com"  # REST root, including Enterprise roots.
     graphql_url: str | None = None  # None derives GitHub's GraphQL endpoint from api_url.
@@ -69,7 +72,7 @@ class GitHubPullConfig:
     request_timeout: float = 30.0  # Per-request timeout in seconds.
     transient_retries: int = 5  # Network/5xx retry budget; rate limits wait separately.
     overlap_seconds: int = 2  # Replayed boundary for second-resolution GitHub timestamps.
-    catalog_mode: str = "certified"  # ``exhaustive`` is the correctness oracle.
+    catalog_mode: str = "certified"  # exhaustive is the correctness oracle.
 
     def __post_init__(self) -> None:
         parts = self.repository.split("/")
@@ -86,12 +89,12 @@ class GitHubPullConfig:
 
 @dataclass(frozen=True, slots=True)
 class PullResult:
-    target_at: datetime  # Requested coverage watermark and commit title.
-    completed_at: datetime  # Actual completion time represented by Git metadata.
-    commit: str  # Commit object id created for this invocation.
-    changed_items: int  # Item bundles whose raw JSON changed.
-    catalog_items: int  # Issues and PRs present at the requested watermark.
-    requests: int  # HTTP attempts, including retries.
+    target_at: datetime  # Requested coverage watermark.
+    completed_at: datetime  # Actual completion time C.
+    run_id: int  # Committed SQLite pull-run identity.
+    changed_items: int  # Object versions or tombstones published by this run.
+    catalog_items: int  # Issues and PRs currently present.
+    requests: int  # HTTP attempts accumulated across run recovery.
 
     @property
     def lag_seconds(self) -> float:
@@ -101,8 +104,9 @@ class PullResult:
 
 @dataclass(frozen=True, slots=True)
 class _CatalogPlan:
-    catalog: list[dict[str, Any]]  # Certified current root objects.
-    signals: set[str]  # Parents dirtied by repository-wide child feeds.
+    items: dict[int, dict[str, Any]]  # Full summaries observed in this pass.
+    present: set[int]  # Certified membership through the cutoff.
+    signals: set[int]  # Parents dirtied by repository-wide child feeds.
     force_all: bool  # Whether every surviving bundle must be fetched.
 
 
@@ -110,7 +114,7 @@ class GitHubPuller:
     """可复用的 GitHub 增量拉取操作。
 
     Args:
-        config: 仓库、数据目录和请求策略。
+        config: 仓库、SQLite 事实库和请求策略。
         api: 测试或宿主提供的 GitHub API 读取对象。
         now: 在函数入口冻结默认目标及记录完成时刻的 UTC 时钟。
         sleep: 等待未来目标使用的异步等待函数。
@@ -131,16 +135,23 @@ class GitHubPuller:
         self._owner, self._repo = config.repository.split("/", 1)
         self._base = f"/repos/{self._owner}/{self._repo}"
 
-    async def pull(self, target: datetime | None = None) -> PullResult:
-        """完成一次增量拉取并创建一个 Git 提交。
+    async def pull(
+        self,
+        target: datetime | None = None,
+        *,
+        series: str | None = None,
+    ) -> PullResult:
+        """完成一次增量拉取并原子发布一个事实库 run。
 
         Args:
-            target: 需要覆盖到的时刻；None 在进入本函数、任何 ``await`` 之前取当前
-                UTC 时刻。显式值必须带时区。未来值会先预拉已有数据，再异步等待并
+            target: 需要覆盖到的时刻；None 在进入本函数、任何 await 之前取当前
+                UTC 时刻。显式值必须带时区。未来值会先预拉已有数据，再等待并
                 做最终闭合。
+            series: 调度器提供的可选稳定标签；拉取协议不解释其含义。
 
         Returns:
-            本次水位、实际完成时刻、唯一提交和数据规模。
+            本次水位、实际完成时刻、run identity 和数据规模。同一 ``(series, T)``
+            已 committed 时返回原 run，不执行 HTTP 请求。
 
         Raises:
             ValueError: target 不带时区。
@@ -148,43 +159,79 @@ class GitHubPuller:
         """
         started_at = _as_utc(self._now())
         target_at = started_at if target is None else _as_utc(target)
+        async with (
+            _archive_lock(self.config.destination),
+            SQLiteArchive(
+                self.config.destination,
+                self.config.repository,
+            ) as archive,
+        ):
+            existing = await archive.committed_run(_iso(target_at), series)
+            if existing is not None:
+                return _pull_result(existing)
+            return await self._pull_new(archive, started_at, target_at, series)
+
+    async def _pull_new(
+        self,
+        archive: SQLiteArchive,
+        started_at: datetime,
+        target_at: datetime,
+        series: str | None,
+    ) -> PullResult:
         api, owned = self._make_api()
         request_start = api.request_count
-        changed = 0
+        accounted = False
         try:
-            now = _as_utc(self._now())
-            if now < target_at:
-                async with _archive_lock(self.config.destination):
-                    await _ensure_git(self.config.destination)
-                    state = self._load_state()
-                    changed += await self._sync_pass(api, state, now)
-                wait = (target_at - _as_utc(self._now())).total_seconds()
-                if wait > 0:
-                    await self._sleep(wait)
-            async with _archive_lock(self.config.destination):
-                await _ensure_git(self.config.destination)
-                state = self._load_state()
-                changed += await self._sync_pass(api, state, target_at)
+            run = await archive.start_run(
+                _iso(target_at),
+                _iso(started_at),
+                series,
+            )
+            observed = _parse_time(run.observed_until)
+            try:
+                now = _as_utc(self._now())
+                if now < target_at:
+                    observed = await self._sync_pass(
+                        api,
+                        archive,
+                        run.id,
+                        now,
+                        observed,
+                    )
+                    wait = (target_at - _as_utc(self._now())).total_seconds()
+                    while wait > 0:
+                        await self._sleep(wait)
+                        wait = (target_at - _as_utc(self._now())).total_seconds()
+                await self._sync_pass(
+                    api,
+                    archive,
+                    run.id,
+                    target_at,
+                    observed,
+                )
+                attempt_requests = api.request_count - request_start
+                await archive.add_requests(run.id, attempt_requests)
+                accounted = True
                 completed_at = _as_utc(self._now())
-                covered = _parse_time(state.get("covered_until"))
-                if covered is None or target_at > covered:
-                    state["covered_until"] = _iso(target_at)
-                state["last_pull"] = {
-                    "target_at": _iso(target_at),
-                    "started_at": _iso(started_at),
-                    "completed_at": _iso(completed_at),
-                    "lag_seconds": max((completed_at - target_at).total_seconds(), 0.0),
-                }
-                self._save_state(state)
-                commit = await _commit(self.config.destination, _iso(target_at), completed_at)
+                changed, catalog, requests = await archive.finalize(
+                    run.id,
+                    _iso(completed_at),
+                )
                 return PullResult(
                     target_at=target_at,
                     completed_at=completed_at,
-                    commit=commit,
+                    run_id=run.id,
                     changed_items=changed,
-                    catalog_items=state["catalog_count"],
-                    requests=api.request_count - request_start,
+                    catalog_items=catalog,
+                    requests=requests,
                 )
+            except BaseException:
+                if not accounted:
+                    await archive.add_requests(
+                        run.id,
+                        api.request_count - request_start,
+                    )
+                raise
         finally:
             if owned:
                 await api.close()
@@ -204,52 +251,76 @@ class GitHubPuller:
             transient_retries=self.config.transient_retries,
         ), True
 
-    async def _sync_pass(self, api: _API, state: dict[str, Any], cutoff: datetime) -> int:
-        observed = _parse_time(state.get("observed_until"))
+    async def _sync_pass(
+        self,
+        api: _API,
+        archive: SQLiteArchive,
+        run_id: int,
+        cutoff: datetime,
+        observed: datetime | None,
+    ) -> datetime | None:
         if observed is not None and cutoff <= observed:
-            return 0
-        plan = await self._catalog_plan(api, state, cutoff, observed)
-        catalog = plan.catalog
-        summaries = {str(item["number"]): item for item in catalog}
+            return observed
+        heads = await archive.load_heads(run_id)
+        plan = await self._catalog_plan(api, heads, cutoff, observed)
         candidates = (
-            set(summaries)
+            set(plan.present)
             if plan.force_all
-            else {number for number, item in summaries.items() if self._needs_refresh(state, number, item)}
+            else {number for number, item in plan.items.items() if _needs_refresh(heads.get(number), item)}
         )
         candidates.update(plan.signals)
-        candidates.intersection_update(summaries)
+        candidates.intersection_update(plan.present)
 
-        changed = await self._fetch_candidates(api, state, summaries, candidates)
-        present = set(summaries)
-        for number, record in state["objects"].items():
-            if number in present:
-                record.pop("missing_since", None)
-                record["present"] = True
-            elif record.get("present", True):
-                record["present"] = False
-                record["missing_since"] = _iso(cutoff)
-        _write_json(self.config.destination / "data" / "catalog.json", catalog)
-        state["catalog_count"] = len(catalog)
-        state["catalog_digest"] = _json_digest(catalog)
-        state["observed_until"] = _iso(cutoff)
-        self._save_state(state)
-        return changed
+        await self._fetch_candidates(
+            api,
+            archive,
+            run_id,
+            heads,
+            plan.items,
+            candidates,
+            _iso(cutoff),
+        )
+        tombstones = [
+            StagedResource(
+                head=StoredHead(
+                    number=head.number,
+                    github_id=head.github_id,
+                    kind=head.kind,
+                    created_at=head.created_at,
+                    updated_at=head.updated_at,
+                    summary_digest=head.summary_digest,
+                    bundle_digest=head.bundle_digest,
+                    present=False,
+                    missing_since=_iso(cutoff),
+                ),
+                observed_at=_iso(cutoff),
+                summary=None,
+                bundle=None,
+            )
+            for number, head in heads.items()
+            if head.present and number not in plan.present
+        ]
+        if tombstones:
+            await archive.stage(run_id, tombstones)
+        await archive.update_observed(run_id, _iso(cutoff))
+        return cutoff
 
     async def _catalog_plan(
         self,
         api: _API,
-        state: dict[str, Any],
+        heads: dict[int, StoredHead],
         cutoff: datetime,
         observed: datetime | None,
     ) -> _CatalogPlan:
         if self.config.catalog_mode == "exhaustive":
-            return _CatalogPlan(await self._stable_catalog(api, cutoff), set(), observed is not None)
+            catalog = await self._stable_catalog(api, cutoff)
+            return _full_plan(catalog, force_all=observed is not None)
         if observed is None:
-            return _CatalogPlan(await self._counted_catalog(api, cutoff), set(), False)
+            return _full_plan(await self._counted_catalog(api, cutoff), force_all=False)
 
-        previous = self._load_catalog(state)
-        if previous is None:
-            return _CatalogPlan(await self._stable_catalog(api, cutoff), set(), True)
+        previous = {number: head for number, head in heads.items() if head.present}
+        if not previous:
+            return _full_plan(await self._stable_catalog(api, cutoff), force_all=True)
 
         since = _iso_seconds(observed - timedelta(seconds=self.config.overlap_seconds))
         catalog_task = asyncio.create_task(
@@ -279,10 +350,16 @@ class GitHubPuller:
             await asyncio.gather(*tasks, return_exceptions=True)
             raise
 
-        catalog = _certified_merge(previous, delta, current_count, cutoff)
-        if catalog is None:
-            return _CatalogPlan(await self._stable_catalog(api, cutoff), set(), True)
-        return _CatalogPlan(catalog, issue_signals | review_signals, False)
+        certified = _certified_head_merge(previous, delta, current_count, cutoff)
+        if certified is None:
+            return _full_plan(await self._stable_catalog(api, cutoff), force_all=True)
+        present, items = certified
+        return _CatalogPlan(
+            items=items,
+            present=present,
+            signals=issue_signals | review_signals,
+            force_all=False,
+        )
 
     async def _counted_catalog(
         self,
@@ -328,73 +405,75 @@ class GitHubPuller:
             params={"state": "all", "sort": "created", "direction": "asc"},
         )
 
-    def _load_catalog(self, state: dict[str, Any]) -> list[dict[str, Any]] | None:
-        path = self.config.destination / "data" / "catalog.json"
-        if not path.exists():
-            return None
-        try:
-            catalog = json.loads(path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
-            return None
-        if not isinstance(catalog, list) or any(not isinstance(item, dict) for item in catalog):
-            return None
-        if state.get("catalog_count") != len(catalog):
-            return None
-        if state.get("catalog_digest") != _json_digest(catalog):
-            return None
-        return catalog
-
     async def _signal_numbers(
         self,
         api: _API,
         endpoint: str,
         url_field: str,
         since: str,
-    ) -> set[str]:
+    ) -> set[int]:
         items = await api.paginate(
             f"{self._base}/{endpoint}",
             params={"sort": "created", "direction": "asc", "since": since},
         )
-        numbers: set[str] = set()
+        numbers: set[int] = set()
         for item in items:
             match = _NUMBER_AT_END.search(item.get(url_field, ""))
             if match:
-                numbers.add(match.group(1))
+                numbers.add(int(match.group(1)))
         return numbers
 
     async def _fetch_candidates(
         self,
         api: _API,
-        state: dict[str, Any],
-        summaries: dict[str, dict[str, Any]],
-        candidates: set[str],
-    ) -> int:
+        archive: SQLiteArchive,
+        run_id: int,
+        heads: dict[int, StoredHead],
+        summaries: dict[int, dict[str, Any]],
+        candidates: set[int],
+        observed_at: str,
+    ) -> None:
         semaphore = asyncio.Semaphore(self.config.concurrency)
 
-        async def fetch(number: str) -> tuple[str, dict[str, Any]]:
+        async def fetch(number: int) -> tuple[int, dict[str, Any], dict[str, Any] | None]:
+            summary = summaries.get(number)
+            if summary is None:
+                summary = _minimal_summary(heads[number])
+                stored_summary = None
+            else:
+                stored_summary = summary
             async with semaphore:
-                return number, await self._fetch_bundle(api, summaries[number])
+                bundle = await self._fetch_bundle(api, summary)
+            return number, bundle, stored_summary
 
-        tasks = [asyncio.create_task(fetch(number)) for number in sorted(candidates, key=int)]
-        changed = 0
+        tasks = [asyncio.create_task(fetch(number)) for number in sorted(candidates)]
+        staged: list[StagedResource] = []
         try:
             for task in asyncio.as_completed(tasks):
-                number, bundle = await task
-                path = self._bundle_path(bundle["kind"], int(number))
-                changed += _write_json(path, bundle)
-                state["objects"][number] = {
-                    "kind": bundle["kind"],
-                    "updated_at": bundle["issue"].get("updated_at"),
-                    "catalog_digest": _json_digest(summaries[number]),
-                    "present": True,
-                }
-                self._save_state(state)
+                number, bundle, summary = await task
+                old = heads.get(number)
+                head = _candidate_head(summary, old, bundle)
+                staged.append(
+                    StagedResource(
+                        head=head,
+                        observed_at=observed_at,
+                        summary=summary,
+                        bundle=bundle,
+                    ),
+                )
+                if len(staged) >= _STAGE_BATCH_SIZE:
+                    batch, staged = staged, []
+                    await archive.stage(run_id, batch)
+            if staged:
+                batch, staged = staged, []
+                await archive.stage(run_id, batch)
         except BaseException:
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
+            if staged:
+                await archive.stage(run_id, staged)
             raise
-        return changed
 
     async def _fetch_bundle(self, api: _API, summary: dict[str, Any]) -> dict[str, Any]:
         number = int(summary["number"])
@@ -418,7 +497,7 @@ class GitHubPuller:
             )
         _check_count(number, "issue reactions", issue.get("reactions"), reactions)
         bundle: dict[str, Any] = {
-            "schema_version": _SCHEMA_VERSION,
+            "schema_version": 1,
             "repository": self.config.repository,
             "number": number,
             "kind": "pull" if "pull_request" in issue else "issue",
@@ -488,66 +567,75 @@ class GitHubPuller:
             _check_count(comment_id, "comment reactions", reaction_summary, result[str(comment_id)])
         return result
 
-    def _needs_refresh(self, state: dict[str, Any], number: str, summary: dict[str, Any]) -> bool:
-        record = state["objects"].get(number)
-        if record is None or not record.get("present", True):
-            return True
-        if record.get("kind") != ("pull" if "pull_request" in summary else "issue"):
-            return True
-        path = self._bundle_path(record["kind"], int(number))
-        return (
-            not path.exists()
-            or record.get("updated_at") != summary.get("updated_at")
-            or record.get("catalog_digest") != _json_digest(summary)
-        )
-
-    def _bundle_path(self, kind: str, number: int) -> Path:
-        return self.config.destination / "data" / f"{kind}s" / f"{number}.json"
-
-    def _load_state(self) -> dict[str, Any]:
-        path = self.config.destination / _STATE_NAME
-        if path.exists():
-            state = json.loads(path.read_text(encoding="utf-8"))
-            if state.get("schema_version") != _SCHEMA_VERSION:
-                raise ValueError("unsupported GitHub archive schema")
-            if state.get("repository") != self.config.repository:
-                raise ValueError("archive belongs to a different GitHub repository")
-            state.setdefault(
-                "catalog_count",
-                sum(record.get("present", True) for record in state["objects"].values()),
-            )
-            state.setdefault("catalog_digest", None)
-            return state
-        return {
-            "schema_version": _SCHEMA_VERSION,
-            "repository": self.config.repository,
-            "api_url": self.config.api_url.rstrip("/"),
-            "covered_until": None,
-            "observed_until": None,
-            "catalog_count": 0,
-            "catalog_digest": None,
-            "objects": {},
-        }
-
-    def _save_state(self, state: dict[str, Any]) -> None:
-        _write_json(self.config.destination / _STATE_NAME, state)
-
 
 async def incremental_pull(
     config: GitHubPullConfig,
     target: datetime | None = None,
+    *,
+    series: str | None = None,
 ) -> PullResult:
     """执行一次完整的增量拉取。
 
     Args:
-        config: 仓库、归档 Git worktree 与请求策略。
+        config: 仓库、SQLite 事实库与请求策略。
         target: 覆盖目标；None 在函数入口冻结为当前 UTC 时刻。
+        series: 调度器提供的可选稳定标签。
 
     Returns:
-        成功提交的水位、实际完成时刻和统计信息。
+        成功发布或由幂等键复用的水位、实际完成时刻和统计信息。
     """
     target_at = datetime.now(UTC) if target is None else target
-    return await GitHubPuller(config).pull(target_at)
+    return await GitHubPuller(config).pull(target_at, series=series)
+
+
+def _pull_result(run: ArchivedRun) -> PullResult:
+    return PullResult(
+        target_at=_parse_required_time(run.target_at),
+        completed_at=_parse_required_time(run.completed_at),
+        run_id=run.id,
+        changed_items=run.changed_items,
+        catalog_items=run.catalog_items,
+        requests=run.request_count,
+    )
+
+
+def _certified_head_merge(
+    previous: dict[int, StoredHead],
+    delta: list[dict[str, Any]],
+    current_count: int | None,
+    cutoff: datetime,
+) -> tuple[set[int], dict[int, dict[str, Any]]] | None:
+    if type(current_count) is not int or current_count < 0:
+        return None
+    changed = _unique_catalog(delta)
+    if changed is None:
+        return None
+    visible: dict[int, dict[str, Any]] = {}
+    future: set[int] = set()
+    try:
+        for number, item in changed.items():
+            created_at = _item_time(item, "created_at")
+            _item_time(item, "updated_at")
+            prior = previous.get(number)
+            if prior is not None and not _same_head(prior, item):
+                return None
+            if created_at <= cutoff:
+                visible[number] = item
+            elif prior is not None:
+                return None
+            else:
+                future.add(number)
+        for head in previous.values():
+            if _parse_required_time(head.created_at) > cutoff:
+                return None
+            _parse_required_time(head.updated_at)
+    except (IncompleteGitHubDataError, TypeError, ValueError):
+        return None
+
+    additions = set(visible) - set(previous)
+    if current_count - len(future) != len(previous) + len(additions):
+        return None
+    return set(previous) | set(visible), visible
 
 
 def _certified_merge(
@@ -563,8 +651,8 @@ def _certified_merge(
         changed = _unique_catalog(delta)
         if old is None or changed is None:
             return None
-        visible: dict[str, dict[str, Any]] = {}
-        future: set[str] = set()
+        visible: dict[int, dict[str, Any]] = {}
+        future: set[int] = set()
         for number, item in changed.items():
             created_at = _item_time(item, "created_at")
             _item_time(item, "updated_at")
@@ -585,11 +673,9 @@ def _certified_merge(
         return None
 
     additions = set(visible) - set(old)
-    visible_count = current_count - len(future)
-    if visible_count != len(old) + len(additions):
+    if current_count - len(future) != len(old) + len(additions):
         return None
-    merged = old | visible
-    return _sort_catalog(list(merged.values()))
+    return _sort_catalog(list((old | visible).values()))
 
 
 def _certified_full_catalog(
@@ -609,10 +695,10 @@ def _certified_full_catalog(
 
 
 def _catalog_signature(
-    catalog: list[dict[str, Any]],
+    catalog: list[dict[str, Any]] | None,
     cutoff: datetime,
 ) -> list[tuple[int, str]] | None:
-    if _unique_catalog(catalog) is None:
+    if catalog is None or _unique_catalog(catalog) is None:
         return None
     try:
         visible = _visible_catalog(catalog, cutoff)
@@ -634,22 +720,122 @@ def _visible_catalog(
     return _sort_catalog(visible)
 
 
-def _unique_catalog(items: list[dict[str, Any]]) -> dict[str, dict[str, Any]] | None:
-    result: dict[str, dict[str, Any]] = {}
+def _unique_catalog(items: list[dict[str, Any]]) -> dict[int, dict[str, Any]] | None:
+    result: dict[int, dict[str, Any]] = {}
     for item in items:
         number = item.get("number")
-        if type(number) is not int or number < 1 or str(number) in result:
+        if type(number) is not int or number < 1 or number in result:
             return None
-        result[str(number)] = item
+        result[number] = item
     return result
+
+
+def _full_plan(catalog: list[dict[str, Any]], *, force_all: bool) -> _CatalogPlan:
+    indexed = _unique_catalog(catalog)
+    if indexed is None:
+        raise IncompleteGitHubDataError("GitHub catalog contains duplicate or invalid numbers")
+    return _CatalogPlan(
+        items=indexed,
+        present=set(indexed),
+        signals=set(),
+        force_all=force_all,
+    )
+
+
+def _needs_refresh(head: StoredHead | None, summary: dict[str, Any]) -> bool:
+    if head is None or not head.present or head.bundle_digest is None:
+        return True
+    return (
+        head.kind != _kind(summary)
+        or head.updated_at != summary.get("updated_at")
+        or head.summary_digest != json_digest(summary)
+    )
+
+
+def _head_from_summary(
+    summary: dict[str, Any],
+    bundle: dict[str, Any],
+) -> StoredHead:
+    number = summary.get("number")
+    github_id = summary.get("id")
+    created_at = summary.get("created_at")
+    updated_at = summary.get("updated_at")
+    if type(number) is not int or type(github_id) is not int:
+        raise IncompleteGitHubDataError("GitHub catalog item has invalid identity")
+    if not isinstance(created_at, str) or not isinstance(updated_at, str):
+        raise IncompleteGitHubDataError(f"GitHub item #{number} has invalid timestamps")
+    _parse_required_time(created_at)
+    _parse_required_time(updated_at)
+    kind = _kind(summary)
+    if bundle.get("kind") != kind:
+        raise IncompleteGitHubDataError(f"GitHub item #{number} changed kind while fetching")
+    return StoredHead(
+        number=number,
+        github_id=github_id,
+        kind=kind,
+        created_at=created_at,
+        updated_at=updated_at,
+        summary_digest=json_digest(summary),
+        bundle_digest=json_digest(bundle),
+        present=True,
+        missing_since=None,
+    )
+
+
+def _candidate_head(
+    summary: dict[str, Any] | None,
+    previous: StoredHead | None,
+    bundle: dict[str, Any],
+) -> StoredHead:
+    if summary is not None:
+        return _head_from_summary(summary, bundle)
+    if previous is None:
+        raise IncompleteGitHubDataError("dirty parent is absent from the certified catalog")
+    if bundle.get("kind") != previous.kind:
+        raise IncompleteGitHubDataError(
+            f"GitHub item #{previous.number} changed kind while fetching",
+        )
+    return StoredHead(
+        number=previous.number,
+        github_id=previous.github_id,
+        kind=previous.kind,
+        created_at=previous.created_at,
+        updated_at=previous.updated_at,
+        summary_digest=previous.summary_digest,
+        bundle_digest=json_digest(bundle),
+        present=True,
+        missing_since=None,
+    )
+
+
+def _minimal_summary(head: StoredHead | None) -> dict[str, Any]:
+    if head is None:
+        raise IncompleteGitHubDataError("dirty parent is absent from the certified catalog")
+    summary: dict[str, Any] = {
+        "id": head.github_id,
+        "number": head.number,
+        "created_at": head.created_at,
+        "updated_at": head.updated_at,
+    }
+    if head.kind == "pull":
+        summary["pull_request"] = {}
+    return summary
+
+
+def _same_head(head: StoredHead, item: dict[str, Any]) -> bool:
+    return head.github_id == item.get("id") and head.created_at == item.get("created_at") and head.kind == _kind(item)
 
 
 def _same_item(left: dict[str, Any], right: dict[str, Any]) -> bool:
     return (
         left.get("id") == right.get("id")
         and left.get("created_at") == right.get("created_at")
-        and ("pull_request" in left) == ("pull_request" in right)
+        and _kind(left) == _kind(right)
     )
+
+
+def _kind(item: dict[str, Any]) -> str:
+    return "pull" if "pull_request" in item else "issue"
 
 
 def _sort_catalog(catalog: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -665,14 +851,18 @@ def _as_utc(value: datetime) -> datetime:
 def _parse_time(value: str | None) -> datetime | None:
     if not value:
         return None
-    return datetime.fromisoformat(value).astimezone(UTC)
+    return _as_utc(datetime.fromisoformat(value))
+
+
+def _parse_required_time(value: str) -> datetime:
+    return _as_utc(datetime.fromisoformat(value))
 
 
 def _item_time(item: dict[str, Any], field: str) -> datetime:
-    value = _parse_time(item.get(field))
-    if value is None:
+    value = item.get(field)
+    if not isinstance(value, str):
         raise IncompleteGitHubDataError(f"GitHub item has no {field}: {item.get('url')}")
-    return value
+    return _parse_required_time(value)
 
 
 def _check_count(
@@ -688,11 +878,6 @@ def _check_count(
         )
 
 
-def _json_digest(value: Any) -> str:
-    payload = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(payload.encode()).hexdigest()
-
-
 def _iso(value: datetime) -> str:
     timespec = "microseconds" if value.microsecond else "seconds"
     return value.astimezone(UTC).isoformat(timespec=timespec).replace("+00:00", "Z")
@@ -702,28 +887,10 @@ def _iso_seconds(value: datetime) -> str:
     return value.astimezone(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
-def _write_json(path: Path, value: Any) -> int:
-    data = f"{json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True)}\n".encode()
-    if path.exists() and path.read_bytes() == data:
-        return 0
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
-    try:
-        with os.fdopen(fd, "wb") as file:
-            file.write(data)
-            file.flush()
-            os.fsync(file.fileno())
-        os.replace(tmp_name, path)
-    finally:
-        if os.path.exists(tmp_name):
-            os.unlink(tmp_name)
-    return 1
-
-
 @asynccontextmanager
 async def _archive_lock(destination: Path):
     destination.parent.mkdir(parents=True, exist_ok=True)
-    lock_path = destination.parent / f".{destination.name}.gh-puller.lock"
+    lock_path = destination.parent / f".{destination.name}.lock"
     file = lock_path.open("a+")
     try:
         while True:
@@ -736,58 +903,3 @@ async def _archive_lock(destination: Path):
     finally:
         fcntl.flock(file.fileno(), fcntl.LOCK_UN)
         file.close()
-
-
-async def _git(
-    destination: Path,
-    *args: str,
-    environment: dict[str, str] | None = None,
-) -> str:
-    process = await asyncio.create_subprocess_exec(
-        "git",
-        "-C",
-        str(destination),
-        *args,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        env=None if environment is None else os.environ | environment,
-    )
-    stdout, stderr = await process.communicate()
-    if process.returncode:
-        detail = stderr.decode(errors="replace").strip()
-        raise RuntimeError(f"git {' '.join(args)} failed: {detail}")
-    return stdout.decode().strip()
-
-
-async def _ensure_git(destination: Path) -> None:
-    _mkdir(destination)
-    if not (destination / ".git").exists():
-        await _git(destination, "init", "--quiet")
-
-
-def _mkdir(path: Path) -> None:
-    path.mkdir(parents=True, exist_ok=True)
-
-
-async def _commit(destination: Path, title: str, completed_at: datetime) -> str:
-    await _git(destination, "add", "--all", "--", "data", _STATE_NAME)
-    git_date = f"@{int(completed_at.timestamp())} +0000"
-    await _git(
-        destination,
-        "-c",
-        "user.name=gh-puller",
-        "-c",
-        "user.email=gh-puller@localhost",
-        "-c",
-        "commit.gpgsign=false",
-        "commit",
-        "--allow-empty",
-        "--only",
-        "--message",
-        title,
-        "--",
-        "data",
-        _STATE_NAME,
-        environment={"GIT_AUTHOR_DATE": git_date, "GIT_COMMITTER_DATE": git_date},
-    )
-    return await _git(destination, "rev-parse", "HEAD")
