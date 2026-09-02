@@ -40,6 +40,10 @@ class PullProgress:
     issues_completed: int = 0  # Completed Issue bundles in bundles_completed.
     pulls_completed: int = 0  # Completed pull-request bundles in bundles_completed.
     tombstones: int = 0  # Durable absences compatible with the current run plan.
+    feed_name: str | None = None  # Repository comment feed under certification.
+    feed_scan: int = 0  # One-based full-feed scan, or zero during its size probe.
+    feed_pages_seen: int = 0  # Verified pages in the active feed scan.
+    feed_pages_total: int | None = None  # Estimated pages from the latest size proof.
     latest_number: int | None = None  # Latest durably staged parent number.
     latest_kind: str | None = None  # issue or pull for latest_number.
     requests: int = 0  # Attempts accumulated by this run.
@@ -107,6 +111,10 @@ class _PullProgressTracker:
             issues_completed=0,
             pulls_completed=0,
             tombstones=0,
+            feed_name=None,
+            feed_scan=0,
+            feed_pages_seen=0,
+            feed_pages_total=None,
             latest_number=None,
             latest_kind=None,
             wait_seconds=None,
@@ -176,6 +184,48 @@ class _PullProgressTracker:
             tombstones=tombstones,
             latest_number=latest_number,
             latest_kind=latest_kind,
+            requests=self._run_requests(request_count),
+            wait_seconds=None,
+            detail=None,
+        )
+
+    def start_feed(
+        self,
+        name: str,
+        feed_name: str,
+        scan: int,
+        pages_total: int | None,
+        request_count: int,
+    ) -> None:
+        self._work_phase = f"{name}_feeds"
+        self._emit(
+            phase=self._work_phase,
+            feed_name=feed_name,
+            feed_scan=scan,
+            feed_pages_seen=0,
+            feed_pages_total=pages_total,
+            requests=self._run_requests(request_count),
+            wait_seconds=None,
+            detail=None,
+        )
+
+    def feed_page(self, _: int) -> None:
+        self._emit(feed_pages_seen=self._state.feed_pages_seen + 1)
+
+    def feed_fallback(self, feed_name: str, request_count: int) -> None:
+        self._emit(
+            requests=self._run_requests(request_count),
+            detail=f"{feed_name.replace('/', '_')}_per_parent_fallback",
+        )
+
+    def resume_bundles(self, name: str, request_count: int) -> None:
+        self._work_phase = f"{name}_bundles"
+        self._emit(
+            phase=self._work_phase,
+            feed_name=None,
+            feed_scan=0,
+            feed_pages_seen=0,
+            feed_pages_total=None,
             requests=self._run_requests(request_count),
             wait_seconds=None,
             detail=None,
@@ -322,6 +372,12 @@ def _tty_line(progress: PullProgress) -> str:
         width = 20
         filled = width if total == 0 else min(width, int(width * completed / total))
         bar = f"[{'#' * filled}{'-' * (width - filled)}] {completed}/{total}"
+    if progress.feed_name is not None:
+        feed_total = "?" if progress.feed_pages_total is None else f"~{progress.feed_pages_total}"
+        bar = (
+            f"feed={progress.feed_name} scan={progress.feed_scan} "
+            f"pages={progress.feed_pages_seen}/{feed_total}"
+        )
     catalog_total = "?" if progress.catalog_total is None else str(progress.catalog_total)
     catalog = f"{progress.catalog_seen}/{catalog_total}"
     latest = "-"

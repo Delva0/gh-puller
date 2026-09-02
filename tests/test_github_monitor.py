@@ -41,6 +41,10 @@ def _progress(**changes: object) -> monitor.ProgressState:
         issues_completed=117,
         pulls_completed=107,
         tombstones=0,
+        feed_name=None,
+        feed_scan=0,
+        feed_pages_seen=0,
+        feed_pages_total=None,
         latest_number=2886,
         latest_kind="pull",
         wait_seconds=None,
@@ -139,6 +143,25 @@ def test_detail_shows_process_and_durable_run_progress(tmp_path: Path) -> None:
     assert "UPDATED     3s ago" in output
     assert "PASS" not in output
     assert "SERIES" not in output
+
+
+def test_detail_shows_repository_feed_scan_progress(tmp_path: Path) -> None:
+    progress = _progress(
+        phase="closing_feeds",
+        feed_name="issues/comments",
+        feed_scan=2,
+        feed_pages_seen=191,
+        feed_pages_total=503,
+    )
+
+    output = monitor._render_detail(
+        _status(tmp_path / "facts.sqlite3", progress),
+        now=_EVENT_AT,
+    )
+
+    assert "PHASE       closing_feeds" in output
+    assert "feed issues/comments scan=2" in output
+    assert "191/~503 pages" in output
 
 
 def test_latest_progress_ignores_raw_logs_and_request_fields() -> None:

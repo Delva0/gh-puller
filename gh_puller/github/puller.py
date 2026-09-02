@@ -383,7 +383,16 @@ class GitHubPuller:
             api.request_count,
         )
 
-        feeds = await self._bundle_feeds(api, heads, plan.items, candidates, cutoff)
+        feeds = await self._bundle_feeds(
+            api,
+            heads,
+            plan.items,
+            candidates,
+            cutoff,
+            pass_name,
+            progress,
+        )
+        progress.resume_bundles(pass_name, api.request_count)
 
         await self._fetch_candidates(
             api,
@@ -680,25 +689,55 @@ class GitHubPuller:
         summaries: dict[int, dict[str, Any]],
         candidates: set[int],
         cutoff: datetime,
+        pass_name: str,
+        progress: _PullProgressTracker,
     ) -> _BundleFeeds:
         if self.config.bundle_mode == "exhaustive":
             return _BundleFeeds(None, None)
         pulls = {number for number in candidates if _candidate_kind(number, heads, summaries) == "pull"}
-        issue_comments = await self._pooled_feed(
+        issue_comments = await self._safe_pooled_feed(
             api,
             "issues/comments",
             "issue_url",
             candidates,
             cutoff,
+            pass_name,
+            progress,
         )
-        review_comments = await self._pooled_feed(
+        review_comments = await self._safe_pooled_feed(
             api,
             "pulls/comments",
             "pull_request_url",
             pulls,
             cutoff,
+            pass_name,
+            progress,
         )
         return _BundleFeeds(issue_comments, review_comments)
+
+    async def _safe_pooled_feed(
+        self,
+        api: _API,
+        endpoint: str,
+        url_field: str,
+        parents: set[int],
+        cutoff: datetime,
+        pass_name: str,
+        progress: _PullProgressTracker,
+    ) -> dict[int, list[dict[str, Any]]] | None:
+        try:
+            return await self._pooled_feed(
+                api,
+                endpoint,
+                url_field,
+                parents,
+                cutoff,
+                pass_name,
+                progress,
+            )
+        except GitHubAPIError:
+            progress.feed_fallback(endpoint, api.request_count)
+            return None
 
     async def _pooled_feed(
         self,
@@ -707,12 +746,15 @@ class GitHubPuller:
         url_field: str,
         parents: set[int],
         cutoff: datetime,
+        pass_name: str,
+        progress: _PullProgressTracker,
     ) -> dict[int, list[dict[str, Any]]] | None:
         # A certified feed needs at least two requests, so tiny candidate sets win per parent.
         if len(parents) <= 2:
             return None
         path = f"{self._base}/{endpoint}"
         params = {"sort": "created", "direction": "asc"}
+        progress.start_feed(pass_name, endpoint, 0, None, api.request_count)
         count = self._feed_counts.get(endpoint)
         if count is None:
             count = await api.collection_size(path, params=params)
@@ -723,11 +765,13 @@ class GitHubPuller:
         if 2 * expected_pages >= len(parents):
             return None
 
+        progress.start_feed(pass_name, endpoint, 1, expected_pages, api.request_count)
         previous, validator = await api.paginate_cached(
             path,
             previous=None,
             cache=None,
             params=params,
+            page_observer=progress.feed_page,
         )
         self._feed_counts[endpoint] = len(previous)
         expected_pages = max(1, math.ceil(len(previous) / 100))
@@ -737,12 +781,16 @@ class GitHubPuller:
             _canonical_feed(previous, url_field),
             cutoff,
         )
+        scan = 1
         while True:
+            scan += 1
+            progress.start_feed(pass_name, endpoint, scan, expected_pages, api.request_count)
             current, validator = await api.paginate_cached(
                 path,
                 previous=previous,
                 cache=validator,
                 params=params,
+                page_observer=progress.feed_page,
             )
             canonical = _canonical_feed(current, url_field)
             current_digest = _feed_prefix_digest(canonical, cutoff)
@@ -751,6 +799,7 @@ class GitHubPuller:
                 return _group_feed(canonical, url_field, parents)
             previous = current
             previous_digest = current_digest
+            expected_pages = max(1, math.ceil(len(current) / 100))
 
     async def _fetch_bundle(
         self,

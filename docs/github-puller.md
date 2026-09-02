@@ -130,8 +130,8 @@ is the transport oracle used by differential tests:
 
 | Resource | Optimized transport | Completeness certificate |
 | --- | --- | --- |
-| Issue comments | One repository feed, grouped by `issue_url` | A one-item request reads the `last` page as a cost hint. Pooling proceeds only when two full feed scans cost fewer than K per-parent requests; the probe therefore does not make the normal path more expensive than K. Scans use ascending creation order and repeat until their complete `created_at <= T` prefixes are byte-identical. Appends after T cannot prevent closure; detectable edits, deletions, duplicate IDs, or malformed parent links cannot publish an uncertified prefix. |
-| PR review comments | One repository feed, grouped by `pull_request_url` | The same cost and stable-prefix proof, compared with the number of selected PR parents. |
+| Issue comments | One repository feed, grouped by `issue_url` | A one-item request reads the `last` page as a cost hint. Pooling proceeds only when two full feed scans cost fewer than K per-parent requests; the probe therefore does not make the normal path more expensive than K. Scans use ascending creation order and repeat until their complete `created_at <= T` prefixes are byte-identical. Appends after T cannot prevent closure; detectable edits, deletions, duplicate IDs, or malformed parent links cannot publish an uncertified prefix. A persistent feed transport failure falls back to complete per-parent reads in the same run. |
+| PR review comments | One repository feed, grouped by `pull_request_url` | The same cost, stable-prefix proof, and exact per-parent fallback, compared with the number of selected PR parents. |
 | Issue reactions | No collection request when detail reports `total_count == 0` | Zero is itself the complete collection; every nonzero or absent count still paginates and is checked against the aggregate. |
 | PR commits and files | No collection request when PR detail reports an exact zero | Nonzero and absent counts still paginate; a returned collection shorter than `commits` or `changed_files` aborts publication. |
 | Per-parent JSON, certified paginated lists, diff, and patch | Conditional GET with the prior ETag | Validators are keyed by API root, API version, media type, path, and parameters, and are stored atomically with the exact bundle digest whose body they validate. A paginated list is reusable only when every page has an ETag and the terminal page has fewer than 100 entries. Every page must return `304 Not Modified`; any changed page restarts complete pagination. A terminal full page has no cache, so 100→101 growth cannot hide on a new page. |
@@ -177,7 +177,8 @@ empty reactions and exact zero PR commits/files, the remaining parent-local floo
 `3N + 5P`: Issue detail, timeline, and events for all parents, plus PR detail,
 reviews, requested reviewers, diff, and patch. Non-empty reactions, commits, files,
 reviews, media fallbacks, and pagination add their actual pages. If a pooled feed is
-not cheaper, each selected parent uses the exhaustive endpoint instead. Primary and
+not cheaper or persistently fails after its configured retries, each selected parent
+uses the exhaustive endpoint instead. Primary and
 secondary limits cause asynchronous waits outside the transient retry budget, so a
 cold start can span multiple quota windows and still completes the same invocation.
 
@@ -216,14 +217,16 @@ emits the resulting snapshot through the same progress stream.
 | `bundles_completed / bundles_total` | Parent bundles already durable and compatible with the current catalog plan, divided by that carried set plus the remaining candidates K. | K is normally much smaller than N. A cold pull has total N, and a cold restart resumes from its durable numerator instead of restarting at zero. |
 | `issues_completed`, `pulls_completed` | Kind split of durable completed bundles in the current plan. | Their sum equals `bundles_completed`. |
 | `tombstones` | Durable absences that agree with the current certified catalog plan. | They are reported separately from bundle progress and are excluded from the resulting visible N. |
+| `feed_name`, `feed_scan`, `feed_pages_*` | Repository comment feed, repeated certification scan, and verified pages in that scan. The page total is a size estimate and is displayed with `~`. | Feed work replaces many parent-local comment requests but does not advance `bundles_completed`; after a failed optimization the same parents are read exactly and bundle progress resumes. |
 | `latest_number`, `latest_kind` | Last compatible parent in durable insertion order, followed by the most recently completed batch. | Gaps represent parents outside the current plan or work that still needs fetching, not missing facts. |
 | `requests`, `quota_*` | Attempts accumulated by the run and the latest GitHub quota headers. | They measure API work, not objects; one bundle can require many paginated requests. |
 
-A future-T operation has separate `prefetch_*` and `closing_*` phases. Each phase
-recomputes its catalog plan, carries forward compatible durable stage, and reclassifies
-objects that must be fetched again. The run identity and accumulated request count
-continue. A `rate_limit` event reports the wait duration and any known quota reset time
-without pretending that object progress moved.
+A future-T operation has separate `prefetch_*` and `closing_*` phases. Each pass moves
+through catalog proof, optional repository-feed certification, and parent-bundle
+materialization. It recomputes its catalog plan, carries forward compatible durable
+stage, and reclassifies objects that must be fetched again. The run identity and
+accumulated request count continue. A `rate_limit` event reports the wait duration and
+any known quota reset time without pretending that object progress moved.
 
 Sources: [gh_puller/github/](../gh_puller/github/); [tests/test_github_puller.py](../tests/test_github_puller.py); [tests/test_github_cli.py](../tests/test_github_cli.py)
 

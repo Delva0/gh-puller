@@ -1151,6 +1151,85 @@ async def test_pooled_bundle_transport_matches_per_parent_oracle_and_saves_reque
 
 
 @pytest.mark.asyncio
+async def test_failed_pooled_feed_falls_back_to_equivalent_per_parent_reads(
+    tmp_path: Path,
+) -> None:
+    class FailingPooledFeedAPI(FakeAPI):
+        async def paginate_cached(
+            self,
+            path: str,
+            *,
+            previous: list[dict[str, Any]] | None,
+            cache: dict[str, Any] | None,
+            params: dict[str, Any] | None = None,
+            page_observer: Any = None,
+        ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+            if path == f"{_BASE}/issues/comments" and not (params and params.get("since")):
+                self._called("page", path, params, requests=3)
+                if page_observer is not None:
+                    page_observer(100)
+                    page_observer(100)
+                raise GitHubAPIError("persistent repository feed failure")
+            return await super().paginate_cached(
+                path,
+                previous=previous,
+                cache=cache,
+                params=params,
+                page_observer=page_observer,
+            )
+
+    optimized_api = FailingPooledFeedAPI()
+    oracle_api = FakeAPI()
+    for api in (optimized_api, oracle_api):
+        for number in range(1, 11):
+            api.add_issue(number)
+            issue_path = f"{_BASE}/issues/{number}"
+            comments = [
+                {
+                    "id": number * 100 + offset,
+                    "body": f"comment {number}:{offset}",
+                    "created_at": _iso(_T0 - timedelta(seconds=offset)),
+                    "updated_at": _iso(_T0 - timedelta(seconds=offset)),
+                    "reactions": {"total_count": 0},
+                }
+                for offset in range(25)
+            ]
+            api.pages[f"{issue_path}/comments"] = comments
+            api.json[issue_path]["comments"] = len(comments)
+
+    events: list[PullProgress] = []
+    optimized_path = tmp_path / "optimized"
+    oracle_path = tmp_path / "oracle"
+    await GitHubPuller(
+        _config(optimized_path, bundle_mode="optimized"),
+        api=optimized_api,
+        now=lambda: _T0,
+        observer=events.append,
+    ).pull(_T0)
+    await GitHubPuller(
+        _config(oracle_path, bundle_mode="exhaustive"),
+        api=oracle_api,
+        now=lambda: _T0,
+    ).pull(_T0)
+
+    assert await _managed_snapshot(optimized_path) == await _managed_snapshot(oracle_path)
+    assert any(
+        event.phase == "closing_feeds"
+        and event.feed_name == "issues/comments"
+        and event.feed_scan == 1
+        and event.feed_pages_seen == 2
+        for event in events
+    )
+    assert any(event.detail == "issues_comments_per_parent_fallback" for event in events)
+    assert sum(
+        call[0] == "page"
+        and re.fullmatch(rf"{re.escape(_BASE)}/issues/\d+/comments", call[1]) is not None
+        for call in optimized_api.calls
+    ) == 10
+    assert events[-1].phase == "done"
+
+
+@pytest.mark.asyncio
 async def test_pooled_feed_repeats_until_concurrent_mutation_is_stable(tmp_path: Path) -> None:
     class MutatingFeedAPI(FakeAPI):
         def __init__(self) -> None:

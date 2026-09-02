@@ -55,6 +55,10 @@ class ProgressState:
     issues_completed: int  # Issue bundles in bundles_completed.
     pulls_completed: int  # Pull-request bundles in bundles_completed.
     tombstones: int  # Durable absences compatible with the current run plan.
+    feed_name: str | None  # Repository comment feed under certification.
+    feed_scan: int  # One-based scan, or zero during the size probe.
+    feed_pages_seen: int  # Verified pages in the active scan.
+    feed_pages_total: int | None  # Estimated pages from the latest size proof.
     latest_number: int | None  # Latest durably staged parent number.
     latest_kind: str | None  # Kind of latest_number.
     wait_seconds: float | None  # Current target, retry, or rate-limit wait.
@@ -193,6 +197,10 @@ def _latest_progress(output: str) -> ProgressState | None:
             issues_completed=_int(payload.get("issues_completed")) or 0,
             pulls_completed=_int(payload.get("pulls_completed")) or 0,
             tombstones=_int(payload.get("tombstones")) or 0,
+            feed_name=_text(payload.get("feed_name")),
+            feed_scan=_int(payload.get("feed_scan")) or 0,
+            feed_pages_seen=_int(payload.get("feed_pages_seen")) or 0,
+            feed_pages_total=_int(payload.get("feed_pages_total")),
             latest_number=_int(payload.get("latest_number")),
             latest_kind=_text(payload.get("latest_kind")),
             wait_seconds=_float(payload.get("wait_seconds")),
@@ -289,6 +297,8 @@ def _items(progress: ProgressState | None) -> str:
 def _progress(progress: ProgressState | None, width: int) -> str:
     if progress is None:
         return "-"
+    if progress.feed_name is not None:
+        return _feed_meter(progress, width)
     if progress.bundles_total is not None:
         return _meter("bundles", progress.bundles_completed, progress.bundles_total, width)
     if progress.catalog_seen or "catalog" in progress.phase or progress.phase == "done":
@@ -296,6 +306,18 @@ def _progress(progress: ProgressState | None, width: int) -> str:
     if progress.wait_seconds is not None:
         return f"wait {progress.wait_seconds:.1f}s"
     return "-"
+
+
+def _feed_meter(progress: ProgressState, width: int) -> str:
+    label = f"feed {progress.feed_name} scan={progress.feed_scan}"
+    total = progress.feed_pages_total
+    if total is None:
+        return f"{label} pages {progress.feed_pages_seen:,}/?"
+    filled = width if total == 0 else min(width, int(width * progress.feed_pages_seen / total))
+    return (
+        f"{label} [{'#' * filled}{'-' * (width - filled)}] "
+        f"{progress.feed_pages_seen:,}/~{total:,} pages"
+    )
 
 
 def _meter(label: str, completed: int, total: int | None, width: int) -> str:
