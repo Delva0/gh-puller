@@ -1,7 +1,8 @@
 """Define the canonical Agent observation language and its in-process bus.
 
-``agent/*`` records opaque control state, while ``context/*`` folds an ordered
-Responses-style Item sequence asserted by an adapter. A model inference produces
+``agent/*`` records opaque control state, while ``context/*`` folds an ordered Item
+sequence asserted by an adapter. System-input semantics are defined in ``context``.
+A model inference produces
 ``reasoning? -> message? -> function_call*`` in one ``model/response``; committing
 that output is a separate Context fact. Lifecycle, turn, and step events are semantic
 markers and never affect the fold.

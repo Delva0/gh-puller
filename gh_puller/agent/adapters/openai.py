@@ -1,4 +1,4 @@
-"""Adapt OpenAI-compatible streaming calls to canonical Agent events."""
+"""Adapt one stateful OpenAI-compatible chat session to canonical Agent events."""
 
 import json
 from typing import TypedDict
@@ -6,22 +6,24 @@ from typing import TypedDict
 import httpx
 
 from ..base import BaseAgent
+from ..context import instruction, system_message, tool_defs
 from ..events import (
     function_call_item,
-    function_output_item,
-    message_item,
     reasoning_item,
     text_message,
 )
 
 
 class OpenAIConfig(TypedDict, total=False):
-    """Construction-time connection and default model configuration."""
+    """Construction-time connection, Context, and request configuration."""
 
     model: str
     base_url: str
     api_key: str
     provider: str
+    system_prompt: str
+    tools: list[dict]
+    parameters: dict
 
 
 def _headers(headers: dict | None, api_key: str | None) -> dict:
@@ -32,110 +34,91 @@ def _headers(headers: dict | None, api_key: str | None) -> dict:
     return result
 
 
-def _message_content(content, *, output: bool) -> list[dict]:
-    if isinstance(content, list):
-        parts = []
-        for value in content:
-            part = dict(value)
-            if part.get("type") == "text":
-                part["type"] = "output_text" if output else "input_text"
-            parts.append(part)
-        return parts
-    part_type = "output_text" if output else "input_text"
-    return [{"type": part_type, "text": content or ""}]
-
-
-def _message_items(message: dict) -> list[dict]:
-    role = message.get("role") or "user"
-    if role == "tool":
-        return [function_output_item(
-            message.get("tool_call_id") or message.get("call_id") or "",
-            message.get("content") or "",
-        )]
-    result = []
-    if reasoning := message.get("reasoning_content"):
-        result.append(reasoning_item(reasoning))
-    content = _message_content(message.get("content"), output=role == "assistant")
-    if content and any(part.get("text") or part.get("type") != "output_text" for part in content):
-        result.append(message_item(role, content))
-    calls = message.get("tool_calls") or []
-    for call in calls:
-        function = call.get("function") or {}
-        result.append(function_call_item(
-            call.get("id") or "", function.get("name") or "",
-            function.get("arguments") or "",
-        ))
-    return result
-
-
-def _tool_blocks(tools: list[dict]) -> list[dict]:
-    result = []
-    for tool in tools:
-        function = tool.get("function") or tool
-        result.append({
-            "type": "tool_definition", "name": function.get("name") or "",
-            "description": function.get("description") or "",
-            "inputSchema": function.get("parameters") or function.get("inputSchema") or {},
-        })
-    return result
-
-
-def _request_context(messages: list[dict], tools: list[dict]) -> list[dict]:
-    """Normalize the complete model-visible context of one request."""
-    context = [item for message in messages for item in _message_items(message)]
-    definitions = _tool_blocks(tools)
-    if not definitions:
-        return context
-    leading = 0
-    while leading < len(context) and context[leading].get("role") in {"system", "developer"}:
-        leading += 1
-    context.insert(leading, message_item("system", definitions))
-    return context
+def _system_item(config: dict) -> dict | None:
+    content = []
+    if prompt := config.get("system_prompt"):
+        content.append(instruction(prompt))
+    if "tools" in config:
+        content.append(tool_defs(config.get("tools") or []))
+    return system_message(content) if content else None
 
 
 class OpenAI(BaseAgent):
-    """Direct ``chat/completions`` client; one session may carry multiple requests."""
+    """Run sequential chat-completion turns with session-owned native history."""
 
     agent = "llm"
 
     def __init__(self, config: dict):
         super().__init__(config)
         self._client = httpx.AsyncClient(timeout=None)  # noqa: S113 - requests set timeout
+        self._messages: list[dict] = []
 
     async def _enter(self):
         await self._client.__aenter__()
+        self._messages = []
+        if prompt := self.config.get("system_prompt"):
+            self._messages.append({"role": "system", "content": prompt})
+        if item := _system_item(self.config):
+            self._require_event_recorder().append_context(item, role="system")
 
     async def _exit(self, exc):
         await self._client.__aexit__(*exc)
 
-    async def result(self, payload: dict, *, timeout: httpx.Timeout | None = None,  # noqa: ASYNC109
-                     headers: dict | None = None) -> str:
-        """Return the final text produced by one streaming request.
+    async def result(
+        self,
+        prompt: str,
+        *,
+        timeout: httpx.Timeout | None = None,  # noqa: ASYNC109
+        headers: dict | None = None,
+    ) -> str:
+        """Return the visible text from one turn.
 
         Args:
-            payload: OpenAI-compatible request body.
+            prompt: User text appended to the session Context.
             timeout: Request-local HTTP timeout.
             headers: Request-local headers merged over connection defaults.
 
         Returns:
             Concatenated assistant text deltas.
         """
-        return "".join([part async for part in self.stream(
-            payload, timeout=timeout, headers=headers)])
+        return "".join([
+            part async for part in self.stream(prompt, timeout=timeout, headers=headers)
+        ])
 
-    async def stream(self, payload: dict, *, timeout: httpx.Timeout | None = None,  # noqa: ASYNC109
-                     headers: dict | None = None):
-        """Yield assistant text while recording the effective request and output."""
-        body = dict(payload)
-        body["model"] = payload.get("model") or self.config.get("model") or ""
-        body["stream"] = True
-        messages = list(body.get("messages") or [])
+    async def stream(
+        self,
+        prompt: str,
+        *,
+        timeout: httpx.Timeout | None = None,  # noqa: ASYNC109
+        headers: dict | None = None,
+    ):
+        """Yield visible text from one turn and retain its complete native message.
+
+        Args:
+            prompt: User text appended to the session Context.
+            timeout: Request-local HTTP timeout.
+            headers: Request-local headers merged over connection defaults.
+        """
         recorder = self._require_event_recorder()
         recorder.begin_turn()
-        parameters = {key: value for key, value in body.items()
-                      if key not in {"model", "messages", "tools", "stream"}}
-        recorder.set_context(_request_context(messages, list(body.get("tools") or [])))
+        user = {"role": "user", "content": prompt}
+        self._messages.append(user)
+        recorder.append_context(text_message("user", prompt))
         recorder.begin_step()
+
+        parameters = {
+            key: value for key, value in (self.config.get("parameters") or {}).items()
+            if key not in {"messages", "model", "stream", "tools"}
+        }
+        body = {
+            **parameters,
+            "model": self.config.get("model") or "",
+            "messages": list(self._messages),
+            "stream": True,
+        }
+        tools = list(self.config.get("tools") or [])
+        if tools:
+            body["tools"] = tools
         request = {"model": body["model"], "parameters": parameters}
         if provider := self.config.get("provider"):
             request["provider"] = provider
@@ -149,8 +132,11 @@ class OpenAI(BaseAgent):
         response_model = None
         url = self.config.get("base_url") or ""
         async with self._client.stream(
-            "POST", f"{url}/chat/completions", json=body,
-            headers=_headers(headers, self.config.get("api_key")), timeout=timeout,
+            "POST",
+            f"{url}/chat/completions",
+            json=body,
+            headers=_headers(headers, self.config.get("api_key")),
+            timeout=timeout,
         ) as response:
             response.raise_for_status()
             async for line in response.aiter_lines():
@@ -186,23 +172,41 @@ class OpenAI(BaseAgent):
                     fragment = function.get("arguments") or ""
                     slot["parts"].append(fragment)
                     recorder.tool_call_delta(
-                        request_id=request_id, index=index,
-                        call_id=slot["callId"], name=slot["name"],
-                        arguments_delta=fragment)
+                        request_id=request_id,
+                        index=index,
+                        call_id=slot["callId"],
+                        name=slot["name"],
+                        arguments_delta=fragment,
+                    )
 
         output = []
         if reasoning:
             output.append(reasoning_item(reasoning))
         if text:
             output.append(text_message("assistant", text))
-        for slot in calls.values():
-            raw_arguments = "".join(slot["parts"])
-            output.append(function_call_item(
-                slot["callId"], slot["name"], raw_arguments,
-            ))
+        native_calls = []
+        for _, slot in sorted(calls.items()):
+            arguments = "".join(slot["parts"])
+            output.append(function_call_item(slot["callId"], slot["name"], arguments))
+            native_calls.append({
+                "id": slot["callId"],
+                "type": "function",
+                "function": {"name": slot["name"], "arguments": arguments},
+            })
+        assistant = {"role": "assistant", "content": text or None}
+        if reasoning:
+            assistant["reasoning_content"] = reasoning
+        if native_calls:
+            assistant["tool_calls"] = native_calls
+        self._messages.append(assistant)
+
         recorder.model_response(
-            output, request_id=request_id, model=response_model,
-            stop_reason=stop_reason, usage=usage)
+            output,
+            request_id=request_id,
+            model=response_model,
+            stop_reason=stop_reason,
+            usage=usage,
+        )
         recorder.append_context(output, role="assistant")
         recorder.end_step()
         recorder.end_turn(reason="final_response")

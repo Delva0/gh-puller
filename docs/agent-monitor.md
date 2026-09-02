@@ -36,17 +36,51 @@ The role-specialized append routes make common producers easy to identify. The g
 route accepts Items with any role or no role. Context compression and other rewrites
 are ordinary `context/set` operations.
 
-Agent configuration is recorded as supplied and is never opened to infer Context. An
-adapter may therefore record `system_prompt` in `agent/set.config`, then separately
-append a system message when it observes that instruction taking effect. Tools exposed
-to a model are likewise Context content, not a separate state axis. Credential-shaped
+Agent configuration is recorded as supplied and is never interpreted by the recorder.
+Each adapter separately projects the system inputs it knows took effect. Credential-shaped
 configuration fields are replaced with `<redacted>` before any sink receives them.
 
 Sources: [gh_puller/agent/](../gh_puller/agent/); [tests/test_event_taxonomy.py](../tests/test_event_taxonomy.py)
 
-## Items and inference
+## System semantics
 
-Items use the vocabulary of the [OpenAI Responses API](https://developers.openai.com/api/reference/cli/resources/responses/methods/create), while remaining an observation format rather than a provider wire format. Typical Items are:
+A system message contains an ordered, open sequence of content parts. The shared types
+are conventions rather than a whitelist:
+
+```json
+{
+  "type": "message",
+  "role": "system",
+  "content": [
+    {"type": "instruction", "text": "Work inside the repository."},
+    {
+      "type": "tool_defs",
+      "tools": [{"name": "Read"}]
+    },
+    {"type": "mcp", "name": "graph"},
+    {"type": "skill_list", "skills": ["review"]}
+  ]
+}
+```
+
+`instruction` carries text at the granularity asserted by the adapter. A transparent
+Agent may expose its complete rendered instruction, preserve structured parts, or define
+its own content types for finer prompt behavior. The fold preserves every type, payload,
+and position without parsing it; the monitor renders unknown types as structured data.
+
+`tool_defs.tools` is the observable tool collection. A missing `tools` field and
+`tools: []` both mean an observed empty collection. An Agent with unenumerable built-in
+tools uses `tools: [{"name": "opaque"}]`. Within a known tool, an omitted schema means
+unavailable schema and `{}` means an observed empty schema. `mcp` keeps one MCP
+contribution atomic, and `skill_list` records the catalog exposed to the Agent. Transport
+commands, credentials, and other launch configuration remain Agent configuration rather
+than Context.
+
+Sources: [gh_puller/agent/](../gh_puller/agent/); [tests/test_event_taxonomy.py](../tests/test_event_taxonomy.py); [tests/test_agent.py](../tests/test_agent.py)
+
+## Inference Items
+
+Model input and output Items follow the vocabulary of the [OpenAI Responses API](https://developers.openai.com/api/reference/cli/resources/responses/methods/create), while remaining an observation format rather than a provider wire format:
 
 ```json
 {"type":"message","role":"user","content":[{"type":"input_text","text":"Read a.py"}]}
@@ -91,9 +125,15 @@ backends expose, and each supports repeated `stream` and `result` calls in one s
 from gh_puller.agent import AGENTS
 
 
-agent = AGENTS["codex"]({"cwd": "/workspace/project"})
+agent = AGENTS["llm"]({
+    "model": "example-model",
+    "base_url": "https://api.example.com/v1",
+    "api_key": "example-key",
+    "system_prompt": "Answer concisely.",
+})
 async with agent.session(session_name="example"):
-    answer = await agent.result("Explain this repository.")
+    first = await agent.result("Remember the word bluebird.")
+    second = await agent.result("Which word did I ask you to remember?")
 ```
 
 Sources: [gh_puller/agent/](../gh_puller/agent/); [tests/test_agent.py](../tests/test_agent.py); [tests/test_agent_real.py](../tests/test_agent_real.py)

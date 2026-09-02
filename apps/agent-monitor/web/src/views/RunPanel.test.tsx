@@ -56,8 +56,14 @@ describe('native canonical run view', () => {
         type: 'message',
         role: 'system',
         content: [
-          { type: 'input_text', text: 'system instruction' },
-          { type: 'tool_definition', name: 'read', inputSchema: { type: 'object' } },
+          { type: 'instruction', text: 'system instruction' },
+          { type: 'tool_defs', tools: [
+            { name: 'read', inputSchema: { type: 'object' } },
+            { name: 'Grep' },
+          ] },
+          { type: 'mcp', name: 'graph' },
+          { type: 'skill_list', skills: ['review'] },
+          { type: 'prompt_template', strategy: 'replace' },
         ],
       }] }),
       evt('context/append/user', 2, { items: [{
@@ -89,7 +95,14 @@ describe('native canonical run view', () => {
 
     expect(container.querySelector('[data-agent-name]')?.textContent).toBe('custom');
     expect(container.textContent).toContain('system instruction');
-    expect(container.textContent).toContain('tool_definition · read');
+    expect(container.textContent).toContain('tool_defs · 2');
+    expect(container.querySelector('[data-tool-name="read"]')).not.toBeNull();
+    expect(container.querySelector('[data-tool-name="Grep"]')).not.toBeNull();
+    expect(container.querySelectorAll('[data-tool-schema]')).toHaveLength(1);
+    expect(container.querySelector('[data-system-part="mcp"]')?.textContent).toContain('graph');
+    expect(container.querySelector('[data-system-part="skill_list"]')).not.toBeNull();
+    expect(container.textContent).toContain('prompt_template');
+    expect(container.textContent).toContain('replace');
     expect(container.textContent).toContain('question');
     expect(container.textContent).toContain('file body');
     expect(container.querySelector('[data-tool-call-id="c1"]')).not.toBeNull();

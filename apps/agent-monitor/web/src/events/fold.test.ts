@@ -27,8 +27,8 @@ describe('canonical state fold', () => {
         type: 'message',
         role: 'system',
         content: [
-          { type: 'input_text', text: 'system' },
-          { type: 'tool_definition', name: 'read', inputSchema: {} },
+          { type: 'instruction', text: 'system' },
+          { type: 'tool_defs', tools: [{ name: 'read', inputSchema: {} }] },
         ],
       }] }),
       append('user', 2, 'q'),
@@ -41,7 +41,10 @@ describe('canonical state fold', () => {
       .toEqual(['system', 'user'])
     const state = foldState(events)
     expect(state.agent).toEqual({ agent: 'custom', config: { mode: 'plan', cwd: '/x' } })
-    expect(state.context[0]?.content?.[1]).toMatchObject({ type: 'tool_definition', name: 'read' })
+    expect(state.context[0]?.content?.[1]).toMatchObject({
+      type: 'tool_defs',
+      tools: [{ name: 'read' }],
+    })
     expect(state.context.map(item => item.role)).toEqual(['system', 'user', 'assistant'])
 
     const request = new RunFold()

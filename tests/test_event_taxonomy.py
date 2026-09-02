@@ -5,6 +5,13 @@ import json
 
 import pytest
 
+from gh_puller.agent.context import (
+    instruction,
+    mcp,
+    skill_list,
+    system_message,
+    tool_defs,
+)
 from gh_puller.agent.events import (
     DELTA_TYPES,
     EVENT_TYPES,
@@ -45,8 +52,8 @@ def test_event_families_keep_state_and_activity_independent() -> None:
     assert is_compact_event("agent/set/custom")
 
 
-def test_context_appends_atomic_responses_style_item_batches() -> None:
-    system_item = text_message("system", "instructions")
+def test_context_appends_atomic_canonical_item_batches() -> None:
+    system_item = system_message([instruction("instructions")])
     assistant_items = [
         reasoning_item("why"),
         text_message("assistant", "done"),
@@ -64,6 +71,40 @@ def test_context_appends_atomic_responses_style_item_batches() -> None:
     assert assistant["data"]["items"] == assistant_items
     assert json.loads(assistant_items[-1]["arguments"]) == {"path": "a.py"}
     assert custom["data"] == {"items": [custom_item]}
+
+
+def test_system_parts_preserve_tool_collection_semantics() -> None:
+    item = system_message([
+        instruction(),
+        tool_defs(["Read", {"name": "empty", "inputSchema": {}}]),
+        mcp("graph"),
+        skill_list(["review"]),
+    ])
+    assert item["content"] == [
+        {"type": "instruction"},
+        {"type": "tool_defs", "tools": [
+            {"name": "Read"},
+            {"name": "empty", "inputSchema": {}},
+        ]},
+        {"type": "mcp", "name": "graph"},
+        {"type": "skill_list", "skills": ["review"]},
+    ]
+    assert tool_defs() == {"type": "tool_defs", "tools": []}
+    assert tool_defs([]) == {"type": "tool_defs", "tools": []}
+    assert tool_defs(["opaque"]) == {
+        "type": "tool_defs", "tools": [{"name": "opaque"}],
+    }
+
+
+def test_system_content_vocabulary_is_open() -> None:
+    custom = {
+        "type": "prompt_template",
+        "strategy": "replace",
+        "fragments": ["base", "project"],
+    }
+    item = system_message([instruction("exact"), custom])
+    event = new_event("context/append/system", items=[item])
+    assert event["data"]["items"][0]["content"][1] == custom
 
 
 def test_model_response_enforces_one_inference_order() -> None:
@@ -101,9 +142,9 @@ def test_usage_normalization_omits_empty_reports_and_maps_codex_fields() -> None
 
 
 def test_fold_restores_agent_and_item_context_at_every_prefix() -> None:
-    rules = text_message("system", "rules")
+    rules = system_message([instruction("rules")])
     old = text_message("user", "old")
-    summary = text_message("system", "summary")
+    summary = system_message([instruction("summary")])
     note = {
         "type": "message",
         "role": "critic",

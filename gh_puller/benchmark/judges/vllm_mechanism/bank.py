@@ -34,15 +34,16 @@ class VllmMechEvalMixin:
 
 
 class VllmMechLLMEvaluator(VllmMechEvalMixin, LLMEvaluator):
-    """题库特化扩展点:chat/completions 请求体组装(评分规则 + 单题请求)。"""
+    """题库特化扩展点:评分规则、单题请求与推理参数。"""
 
-    def make_payload(self, question: str, ref: str, answer: str) -> dict:
+    def system_prompt(self, question: str, ref: str, answer: str) -> str:
+        return auto_system_prompt()
+
+    def user_prompt(self, question: str, ref: str, answer: str) -> str:
+        return auto_user_prompt(question, ref, answer)
+
+    def request_parameters(self, question: str, ref: str, answer: str) -> dict:
         return {
-            "model": self.model,
-            "messages": [
-                {"role": "system", "content": auto_system_prompt()},
-                {"role": "user", "content": auto_user_prompt(question, ref, answer)},
-            ],
             "response_format": {"type": "json_object"},
             "temperature": 0,
         }

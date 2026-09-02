@@ -17,6 +17,7 @@ from opentelemetry.trace import StatusCode
 
 from gh_puller import agent
 from gh_puller.agent import sinks
+from gh_puller.agent.context import instruction, mcp, skill_list, tool_defs
 from gh_puller.agent.events import (
     EventBus,
     EventRecorder,
@@ -366,7 +367,9 @@ async def test_claude_code_is_multi_turn(monkeypatch, tmp_path) -> None:
     events = await _capture(tmp_path)
     subject = agent.ClaudeCode({
         "model": "m", "system_prompt": "system", "cwd": str(tmp_path),
-        "allowed_tools": ["Read"],
+        "allowed_tools": ["Read", "mcp__graph__query"],
+        "mcp_servers": {"graph": {"command": "serve"}},
+        "skills": ["review"],
     })
     async with subject.session(session="cc/s", session_name="cc"):
         assert await _collect(subject.stream("q1")) == "a1"
@@ -377,7 +380,11 @@ async def test_claude_code_is_multi_turn(monkeypatch, tmp_path) -> None:
             if event["type"] == "model/request"] == ["r1", "r2", "r3"]
     assert next(event for event in events if event["type"] == "agent/set")["data"][
         "config"]["model"] == "m"
-    assert len([event for event in events if event["type"] == "context/append/system"]) == 1
+    system = next(event for event in events if event["type"] == "context/append/system")
+    assert system["data"]["items"][0]["content"] == [
+        instruction("system"), tool_defs(["Read", "opaque"]),
+        mcp("graph"), skill_list(["review"]),
+    ]
     assert _context_labels(fold_state(events)["context"]) == [
         "system", "user", "assistant", "user", "assistant", "user", "assistant",
     ]
@@ -431,7 +438,7 @@ async def test_claude_fragments_share_one_model_response(monkeypatch, tmp_path) 
         "stopReason": "end_turn",
     }
     assert _context_labels(fold_state(events)["context"]) == [
-        "user", "reasoning", "assistant",
+        "system", "user", "reasoning", "assistant",
     ]
 
 
@@ -459,7 +466,8 @@ async def test_claude_tool_result_is_activity_then_context(monkeypatch, tmp_path
     result = types_.index("context/append/tool")
     assert assistant < start < end < result
     assert _context_at_requests(events) == [
-        ["user"], ["user", "function_call", "function_call_output"],
+        ["system", "user"],
+        ["system", "user", "function_call", "function_call_output"],
     ]
     _assert_inferences(events)
 
@@ -482,6 +490,7 @@ class _HttpResponse:
 
 class _HttpClient:
     scripts: ClassVar[list[list[dict]]] = []
+    requests: ClassVar[list[dict]] = []
 
     def __init__(self, **_kwargs):
         self.index = 0
@@ -492,7 +501,8 @@ class _HttpClient:
     async def __aexit__(self, *_exc):
         return False
 
-    def stream(self, *_args, **_kwargs):
+    def stream(self, *_args, **kwargs):
+        type(self).requests.append(kwargs["json"])
         response = _HttpResponse(type(self).scripts[self.index])
         self.index += 1
 
@@ -511,53 +521,84 @@ async def test_openai_is_multi_turn(monkeypatch, tmp_path) -> None:
     from gh_puller.agent.adapters import openai
 
     _HttpClient.scripts = [
-        [{"choices": [{"delta": {"content": "a1"}, "finish_reason": "stop"}]}],
+        [
+            {"choices": [{"delta": {"reasoning_content": "why"}}]},
+            {"choices": [{"delta": {"content": "a1"}, "finish_reason": "stop"}]},
+        ],
         [{"choices": [{"delta": {"content": "a2"}, "finish_reason": "stop"}]}],
     ]
+    _HttpClient.requests = []
     monkeypatch.setattr(openai.httpx, "AsyncClient", _HttpClient)
     events = await _capture(tmp_path)
-    subject = agent.OpenAI({"model": "m", "base_url": "http://fake", "provider": "p"})
+    tools = [{"type": "function", "function": {
+        "name": "read", "description": "Read a file",
+        "parameters": {"type": "object"},
+    }}]
+    subject = agent.OpenAI({
+        "model": "m", "base_url": "http://fake", "provider": "p",
+        "system_prompt": "system", "tools": tools,
+        "parameters": {"temperature": 0},
+    })
     async with subject.session(session="openai/s"):
-        assert await subject.result({
-            "messages": [
-                {"role": "system", "content": "system"},
-                {"role": "user", "content": "q1"},
-            ],
-            "tools": [{"type": "function", "function": {
-                "name": "read", "description": "Read a file",
-                "parameters": {"type": "object"},
-            }}],
-        }) == "a1"
-        assert await subject.result({"messages": [{"role": "user", "content": "q2"}]}) == "a2"
+        assert await subject.result("q1") == "a1"
+        assert await subject.result("q2") == "a2"
     await _settle()
-    contexts = [event["data"]["items"] for event in events
-                if event["type"] == "context/set"]
-    assert len(contexts) == 2
+    assert not [event for event in events if event["type"] == "context/set"]
     assert next(event for event in events if event["type"] == "agent/set")["data"][
-        "config"] == {"model": "m", "base_url": "http://fake", "provider": "p"}
+        "config"] == {
+            "model": "m", "base_url": "http://fake", "provider": "p",
+            "system_prompt": "system", "tools": tools, "parameters": {"temperature": 0},
+        }
     assert [
         {key: value for key, value in event["data"].items() if key != "requestId"}
         for event in events if event["type"] == "model/request"
     ] == [
-        {"model": "m", "parameters": {}, "provider": "p"},
-        {"model": "m", "parameters": {}, "provider": "p"},
+        {"model": "m", "parameters": {"temperature": 0}, "provider": "p"},
+        {"model": "m", "parameters": {"temperature": 0}, "provider": "p"},
     ]
-    assert contexts[0][0] == {
+    context = fold_state(events)["context"]
+    assert context[0] == {
         "type": "message", "role": "system",
-        "content": [{"type": "input_text", "text": "system"}],
-    }
-    assert contexts[0][1] == {
-        "type": "message", "role": "system", "content": [
-            {"type": "tool_definition", "name": "read", "description": "Read a file",
-             "inputSchema": {"type": "object"}},
+        "content": [
+            instruction("system"),
+            tool_defs([{
+                "name": "read", "description": "Read a file",
+                "inputSchema": {"type": "object"},
+            }]),
         ],
     }
-    assert _context_labels(contexts[0]) == ["system", "system", "user"]
-    assert _context_labels(contexts[1]) == ["user"]
+    assert _context_labels(context) == [
+        "system", "user", "reasoning", "assistant", "user", "assistant",
+    ]
     assert [event["data"]["requestId"] for event in events
             if event["type"] == "model/request"] == ["r1", "r2"]
     assert _context_at_requests(events) == [
-        ["system", "system", "user"], ["user"],
+        ["system", "user"],
+        ["system", "user", "reasoning", "assistant", "user"],
+    ]
+    assert _HttpClient.requests == [
+        {
+            "temperature": 0,
+            "model": "m",
+            "messages": [
+                {"role": "system", "content": "system"},
+                {"role": "user", "content": "q1"},
+            ],
+            "stream": True,
+            "tools": tools,
+        },
+        {
+            "temperature": 0,
+            "model": "m",
+            "messages": [
+                {"role": "system", "content": "system"},
+                {"role": "user", "content": "q1"},
+                {"role": "assistant", "content": "a1", "reasoning_content": "why"},
+                {"role": "user", "content": "q2"},
+            ],
+            "stream": True,
+            "tools": tools,
+        },
     ]
     _assert_inferences(events)
 
@@ -583,9 +624,7 @@ async def test_openai_normalizes_one_complete_inference(monkeypatch, tmp_path) -
         "model": "configured", "base_url": "http://fake", "api_key": "secret",
     })
     async with subject.session(session="openai/output"):
-        assert await subject.result({
-            "messages": [{"role": "user", "content": "question"}],
-        }) == "answer"
+        assert await subject.result("question") == "answer"
     await _settle()
     response = next(event for event in events if event["type"] == "model/response")
     assert response["data"] == {
@@ -695,6 +734,7 @@ async def test_codex_is_multi_turn(monkeypatch, tmp_path) -> None:
     subject = agent.Codex({
         "model": "m", "codex_home": str(tmp_path / "codex"),
         "base_instructions": "system", "developer_instructions": "developer",
+        "mcp_servers": [{"id": "graph", "command": "serve"}],
     })
     async with subject.session(session="codex/s"):
         assert await _collect(subject.stream("q1")) == "a1"
@@ -705,8 +745,16 @@ async def test_codex_is_multi_turn(monkeypatch, tmp_path) -> None:
             if event["type"] == "model/request"] == ["r1", "r2"]
     assert next(event for event in events if event["type"] == "agent/set")["data"][
         "config"]["model"] == "m"
-    assert len([event for event in events if event["type"] == "context/append/system"]) == 1
-    assert len([event for event in events if event["type"] == "context/append"]) == 1
+    system = next(event for event in events if event["type"] == "context/append/system")
+    assert system["data"]["items"] == [
+        {"type": "message", "role": "system", "content": [
+            instruction("system"), tool_defs(["opaque"]), mcp("graph"),
+        ]},
+        {"type": "message", "role": "developer", "content": [
+            instruction("developer"),
+        ]},
+    ]
+    assert not [event for event in events if event["type"] == "context/append"]
     assert _context_labels(fold_state(events)["context"]) == [
         "system", "developer", "user", "assistant", "user", "assistant",
     ]
@@ -797,7 +845,8 @@ async def test_codex_batches_model_tool_calls_before_execution(monkeypatch, tmp_
         function_call_item("c1", "shell", {"command": "ls", "cwd": "/tmp"}),
     ]
     assert _context_at_requests(events) == [
-        ["user"], ["user", "reasoning", "function_call", "function_call_output"],
+        ["system", "user"],
+        ["system", "user", "reasoning", "function_call", "function_call_output"],
     ]
     _assert_inferences(events)
 
@@ -832,6 +881,7 @@ async def test_opencode_is_multi_turn(tmp_path) -> None:
     binary = _opencode_script(tmp_path, _opencode_events("answer"), args_path)
     subject = agent.OpenCode({
         "model": "m", "opencode_bin": binary, "system_prompt": "system",
+        "mcp_servers": [{"id": "graph", "command": "serve"}],
     })
     async with subject.session(session="opencode/s"):
         assert await _collect(subject.stream("q1")) == "answer"
@@ -844,7 +894,10 @@ async def test_opencode_is_multi_turn(tmp_path) -> None:
             if event["type"] == "model/request"] == ["r1", "r2"]
     assert next(event for event in events if event["type"] == "agent/set")["data"][
         "config"]["model"] == "m"
-    assert len([event for event in events if event["type"] == "context/append/system"]) == 1
+    system = next(event for event in events if event["type"] == "context/append/system")
+    assert system["data"]["items"][0]["content"] == [
+        instruction("system"), tool_defs(["opaque"]), mcp("graph"),
+    ]
     assert len([event for event in events if event["type"] == "context/append/assistant"]) == 2
     assert _context_labels(fold_state(events)["context"]) == [
         "system", "user", "assistant", "user", "assistant",
@@ -893,8 +946,9 @@ async def test_opencode_normalizes_reasoning_message_and_tool(tmp_path) -> None:
         "stopReason": "tool-calls",
     }
     assert _context_at_requests(events) == [
-        ["user"],
-        ["user", "reasoning", "assistant", "function_call", "function_call_output"],
+        ["system", "user"],
+        ["system", "user", "reasoning", "assistant", "function_call",
+         "function_call_output"],
     ]
     _assert_inferences(events)
 
@@ -1057,9 +1111,11 @@ async def test_dsh_normalizes_model_tools_before_local_activity(monkeypatch, tmp
     state = fold_state(events)
     assert state["context"][0] == {
         "type": "message", "role": "system", "content": [
-            {"type": "input_text", "text": "system"},
-            {"type": "tool_definition", "name": "read", "description": "Read a file",
-             "inputSchema": {"type": "object"}},
+            instruction("system"),
+            tool_defs([{
+                "name": "read", "description": "Read a file",
+                "inputSchema": {"type": "object"},
+            }]),
         ],
     }
     _assert_inferences(events)

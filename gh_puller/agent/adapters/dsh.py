@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import TypedDict
 
 from ..base import BaseAgent, RequestFailedError
+from ..context import instruction, system_message, tool_defs
 from ..events import (
     EventRecorder,
     _normalize_usage,
@@ -248,7 +249,9 @@ def _dsh_input_items(message: dict) -> list[dict]:
     for raw in message.get("content") or []:
         block = dict(raw)
         if block.get("type") == "text":
-            block["type"] = "input_text"
+            block = (instruction(block.get("text") or "")
+                     if role in {"system", "developer"}
+                     else {**block, "type": "input_text"})
         content.append(block)
     return [message_item(role, content)]
 
@@ -286,15 +289,10 @@ def _dsh_header_items(header: dict) -> list[dict]:
     """Project one DSH request header into a model-visible system message."""
     content = []
     if system := header.get("system"):
-        content.append({"type": "input_text", "text": system})
-    for tool in header.get("tools") or []:
-        function = tool.get("function") or tool
-        content.append({
-            "type": "tool_definition", "name": function.get("name") or "",
-            "description": function.get("description") or "",
-            "inputSchema": function.get("parameters") or function.get("inputSchema") or {},
-        })
-    return [message_item("system", content)] if content else []
+        content.append(instruction(system))
+    if "tools" in header:
+        content.append(tool_defs(header.get("tools") or []))
+    return [system_message(content)] if content else []
 
 
 def _project_dsh_chunk(event_recorder: EventRecorder, proj: _DshProj, chunk: dict) -> list[str]:

@@ -320,7 +320,7 @@ async def test_agent_dispatch_by_generator(monkeypatch):
 
     (wire target 拆包)经 AGENTS[gid](config) 收敛构造;空选型 = 引擎内建 cc。
     """
-    for gid in ("cc", "dsh", "codex", "opencode"):
+    for gid in ("cc", "dsh", "codex", "opencode", "llm"):
         monkeypatch.setitem(AGENTS, gid, _FakeGenerator)
         monkeypatch.setattr(_FakeGenerator, "generator", gid)
         inst = adapt_generator(**_gen_kwargs({"generator": gid}), system_prompt="s")

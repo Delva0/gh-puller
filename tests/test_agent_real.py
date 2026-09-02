@@ -116,9 +116,11 @@ async def test_cc_stream_real(tmp_path):
         config["model"] = model
     subject = agent.ClaudeCode(config)
     async with subject.session(session_name="real:cc", run_id="r-cc"):
-        parts = await _collect(subject.stream("你好"))
-    print("cc response:", "".join(parts))
-    assert "".join(parts) != "", "cc should emit text deltas"
+        first = await _collect(subject.stream("你好，请记住代号“蓝鲸”。"))
+        second = await _collect(subject.stream("刚才让你记住的代号是什么？"))
+    print("cc responses:", "".join(first), "|", "".join(second))
+    assert "".join(first) != "", "cc should emit text deltas"
+    assert "蓝鲸" in "".join(second), "cc should retain the native conversation"
     _assert_flow(await _read_single_session(tmp_path), "cc")
 
 
@@ -130,15 +132,21 @@ async def test_llm_stream_real(tmp_path):
         pytest.skip("OPENAI_API_KEY is not configured")
 
     agent.configure(file_dir=str(tmp_path), ws_urls=[], otel_urls=[])
-    config = {"model": LLM_MODEL, "base_url": LLM_BASE_URL, "api_key": key}
-    payload = {"messages": [{"role": "user", "content": "你好"}],
-               "max_tokens": 256, "temperature": 0}
+    config = {
+        "model": LLM_MODEL,
+        "base_url": LLM_BASE_URL,
+        "api_key": key,
+        "system_prompt": "简短回答用户。",
+        "parameters": {"max_tokens": 256, "temperature": 0},
+    }
+    timeout = httpx.Timeout(connect=10.0, read=180.0, write=10.0, pool=10.0)
     subject = agent.OpenAI(config)
     async with subject.session(session_name="real:llm", run_id="r-llm"):
-        parts = await _collect(subject.stream(
-            payload, timeout=httpx.Timeout(connect=10.0, read=180.0, write=10.0, pool=10.0)))
-    assert "".join(parts) != "", "OpenAI-compatible backend should emit text deltas"
-    print("llm response:", "".join(parts))
+        first = await _collect(subject.stream("你好，请记住代号“蓝鲸”。", timeout=timeout))
+        second = await _collect(subject.stream("刚才让你记住的代号是什么？", timeout=timeout))
+    assert "".join(first) != "", "OpenAI-compatible backend should emit text deltas"
+    assert "蓝鲸" in "".join(second), "OpenAI-compatible history should reach the backend"
+    print("llm responses:", "".join(first), "|", "".join(second))
     _assert_flow(await _read_single_session(tmp_path), "llm")
 
 
@@ -182,9 +190,11 @@ async def test_codex_stream_real(tmp_path):
     }
     subject = agent.Codex(config)
     async with subject.session(session_name="real:codex", run_id="r-codex"):
-        parts = await _collect(subject.stream("你好"))
-    print("codex response:", "".join(parts))
-    assert "".join(parts) != "", "Codex should emit text deltas"
+        first = await _collect(subject.stream("你好，请记住代号“蓝鲸”。"))
+        second = await _collect(subject.stream("刚才让你记住的代号是什么？"))
+    print("codex responses:", "".join(first), "|", "".join(second))
+    assert "".join(first) != "", "Codex should emit text deltas"
+    assert "蓝鲸" in "".join(second), "Codex should retain the native thread"
     _assert_flow(await _read_single_session(tmp_path), "codex")
 
 
@@ -203,7 +213,9 @@ async def test_opencode_stream_real(tmp_path):
     }
     subject = agent.OpenCode(config)
     async with subject.session(session_name="real:opencode", run_id="r-opencode"):
-        parts = await _collect(subject.stream("你好"))
-    print("opencode response:", "".join(parts))
-    assert "".join(parts) != "", "OpenCode should emit text deltas"
+        first = await _collect(subject.stream("你好，请记住代号“蓝鲸”。"))
+        second = await _collect(subject.stream("刚才让你记住的代号是什么？"))
+    print("opencode responses:", "".join(first), "|", "".join(second))
+    assert "".join(first) != "", "OpenCode should emit text deltas"
+    assert "蓝鲸" in "".join(second), "OpenCode should retain the native session"
     _assert_flow(await _read_single_session(tmp_path), "opencode")

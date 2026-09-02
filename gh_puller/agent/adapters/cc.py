@@ -3,6 +3,7 @@
 from typing import TypedDict
 
 from ..base import BaseAgent, RequestFailedError
+from ..context import instruction, mcps, skill_list, system_message, tool_defs
 from ..events import (
     EventRecorder,
     _normalize_usage,
@@ -16,9 +17,11 @@ class ClaudeConfig(TypedDict, total=False):
     """cc runtime config: keys are ClaudeAgentOptions field names (see __init__.py)."""
 
     model: str
-    system_prompt: str
+    system_prompt: str | dict
+    tools: list[str] | dict
     allowed_tools: list[str]
     mcp_servers: dict
+    skills: list[str] | str
     cwd: str
     settings: str  # --settings load (only that file; credentials ride the file)
     add_dirs: list[str]
@@ -45,6 +48,43 @@ def claude_options(config: dict):
     # Partial messages are the only source of monitor text/thinking increments.
     sdk_options.setdefault("include_partial_messages", True)
     return ClaudeAgentOptions(**sdk_options)
+
+
+def _cc_tool_name(value: str) -> str:
+    """Reduce an allow rule to the model-visible tool name."""
+    return value.partition("(")[0]
+
+
+def _cc_system_parts(config: dict) -> list[dict]:
+    """Project the system semantics explicitly selected for one Claude client."""
+    parts = []
+    prompt = config.get("system_prompt")
+    if isinstance(prompt, str):
+        parts.append(instruction(prompt))
+    elif isinstance(prompt, dict) and prompt.get("type") == "text" \
+            and isinstance(prompt.get("text"), str):
+        parts.append(instruction(prompt["text"]))
+    elif isinstance(prompt, dict) and prompt.get("type") == "preset":
+        parts.append(instruction())
+        if isinstance(prompt.get("append"), str):
+            parts.append(instruction(prompt["append"]))
+    else:
+        parts.append(instruction())
+
+    configured_tools = config.get("tools")
+    names = list(configured_tools) if isinstance(configured_tools, list) else []
+    if not isinstance(configured_tools, list):
+        names.extend(name for name in config.get("allowed_tools") or []
+                     if not name.startswith("mcp__"))
+    names = list(dict.fromkeys(_cc_tool_name(name) for name in names))
+    if not isinstance(configured_tools, list) and "opaque" not in names:
+        names.append("opaque")
+    parts.append(tool_defs(names))
+
+    parts.extend(mcps(config.get("mcp_servers")))
+    if skills := config.get("skills"):
+        parts.append(skill_list(skills))
+    return parts
 
 
 def _block_kind(block) -> str:
@@ -289,8 +329,8 @@ class ClaudeCode(BaseAgent):
 
     async def _enter(self):
         await self._client.__aenter__()
-        if prompt := self.config.get("system_prompt"):
-            self._require_event_recorder().append_context(text_message("system", prompt))
+        self._require_event_recorder().append_context(
+            system_message(_cc_system_parts(self.config)), role="system")
 
     async def _exit(self, exc):
         await self._client.__aexit__(*exc)

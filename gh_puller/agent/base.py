@@ -89,7 +89,7 @@ class BaseAgent:
         """Stream the assistant text increments (subclasses implement); only callable inside a session block.
 
         Args:
-            prompt: Runtime payload (prompt string; llm: payload dict + request-level timeout/headers).
+            prompt: User text for the next session turn.
 
         Returns:
             Async iterator of assistant text deltas.
@@ -100,6 +100,6 @@ class BaseAgent:
         """Return the final round's assistant output (subclasses implement); only callable inside a session block.
 
         Args:
-            prompt: Runtime payload (see `stream`).
+            prompt: User text for the next session turn.
         """
         raise NotImplementedError

@@ -40,8 +40,8 @@ class _MiniClaude(ClaudeEvaluator):
 
 
 class _MiniLLM(LLMEvaluator):
-    def make_payload(self, question, ref, answer):
-        return {"model": self.model, "messages": [{"role": "user", "content": question}]}
+    def user_prompt(self, question, ref, answer):
+        return question
 
     def coerce(self, data):
         return {"dims": data.get("dimensions", {}), "overall": data.get("overall")}
@@ -198,7 +198,9 @@ async def test_llm_judge_retry_nudge_then_success(monkeypatch):
     r = await judge.evaluate("q", "ref", "ans")
     assert r["overall"] == 7
     assert len(posts) == 2
-    assert posts[1][1]["messages"][-1] == {"role": "user", "content": judge.retry_nudge}
+    assert posts[1][1]["messages"][-1] == {
+        "role": "user", "content": f"q\n\n{judge.retry_nudge}",
+    }
 
 
 @pytest.mark.asyncio

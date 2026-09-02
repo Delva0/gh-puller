@@ -4,7 +4,7 @@
 三种评测器(LLM/Claude/Human)结构兼容即可,无需继承(见 Evaluator)。
 入参/输出约定由各实现自定(question/ref/answer 均为 Any),统一见各类 docstring:
 - LLMEvaluator(半抽象基类):机制(HTTP 调用、解析失败重试、降级输出)由基类提供,
-  请求体(payload)与判定解析是扩展点,由应用层题库以子类挂接,
+  system/user prompt、请求参数与判定解析是扩展点,由应用层题库以子类挂接,
   如 judges/vllm_mechanism/utils.py 的 auto_* 提示词与 coerce_verdict。
   模型地址与型号可用环境变量 LLM_JUDGE_URL / LLM_JUDGE_MODEL 覆盖,或由题库构造时传参。
 - ClaudeEvaluator(半抽象基类):机制(SDK 会话、无状态逐题)由基类提供,
@@ -57,34 +57,49 @@ class LLMEvaluator:
 
     name = "llm"
 
-    # 扩展点:解析失败重试时向 payload["messages"] 追加的提示(机制默认,题库可覆盖)
+    # Extension point for the second attempt after invalid JSON.
     retry_nudge: str = "只输出 JSON,不要任何其他内容。"
 
     def __init__(self, url: str = "", model: str = ""):
         self.url = url or LLM_JUDGE_URL
         self.model = model or LLM_JUDGE_MODEL
 
-    def make_payload(self, question: str, ref: str, answer: str) -> dict:
-        """chat/completions 请求体组装(OpenAI 兼容契约:须含可追加的 messages 键);题库子类必须提供。"""
+    def system_prompt(self, question: str, ref: str, answer: str) -> str:
+        """Return the evaluator instruction, or no instruction by default."""
+        return ""
+
+    def user_prompt(self, question: str, ref: str, answer: str) -> str:
+        """Build one evaluation turn; problem-specific subclasses must provide it."""
         raise NotImplementedError
+
+    def request_parameters(self, question: str, ref: str, answer: str) -> dict:
+        """Return OpenAI-compatible inference parameters outside messages and tools."""
+        return {}
 
     def coerce(self, data) -> dict:
         """判定规范化(维度补齐/限幅);题库子类必须提供。"""
         raise NotImplementedError
 
     async def evaluate(self, question: str, ref: str, answer: str) -> dict:
-        payload = self.make_payload(question, ref, answer)
+        prompt = self.user_prompt(question, ref, answer)
+        system_prompt = self.system_prompt(question, ref, answer)
+        parameters = self.request_parameters(question, ref, answer)
         headers = {"Authorization": f"Bearer {LLM_JUDGE_API_KEY}"} if LLM_JUDGE_API_KEY else None
         last_err: Exception | None = None
         for nudge in (False, True):  # 解析失败重试 1 次(第二次追加"只输出 JSON"提示)
-            if nudge:
-                payload["messages"].append({"role": "user", "content": self.retry_nudge})
+            turn = f"{prompt}\n\n{self.retry_nudge}" if nudge else prompt
             try:
                 llm = OpenAI(
-                    {"model": self.model, "base_url": self.url, "api_key": LLM_JUDGE_API_KEY},
+                    {
+                        "model": self.model,
+                        "base_url": self.url,
+                        "api_key": LLM_JUDGE_API_KEY,
+                        "system_prompt": system_prompt,
+                        "parameters": parameters,
+                    },
                 )
                 async with llm.session(session_name="judge:llm"):
-                    content = await llm.result(payload, timeout=TIMEOUT, headers=headers)
+                    content = await llm.result(turn, timeout=TIMEOUT, headers=headers)
                 return self.coerce(json.loads(content))
             except Exception as e:  # 网络/HTTP/解析失败:继续下一轮,耗尽后降级
                 last_err = e

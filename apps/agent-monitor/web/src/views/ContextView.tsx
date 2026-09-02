@@ -91,18 +91,68 @@ function FunctionOutput({ item, tool }: { item: Item; tool?: ToolActivity }) {
   );
 }
 
-function ToolDefinition({ part }: { part: ContentPart }) {
+function ToolDefinition({ value, index }: { value: unknown; index: number }) {
+  const tool = typeof value === 'object' && value !== null
+    ? value as Record<string, unknown>
+    : {};
+  const name = String(tool.name ?? `tool ${index + 1}`);
   return (
-    <details className="my-2 rounded border border-[var(--border-color)] px-3 py-2 text-xs">
-      <summary className="cursor-pointer font-mono">
-        tool_definition · {String(part.name ?? '')}
-      </summary>
-      {typeof part.description === 'string' && (
-        <p className="my-2 text-[var(--muted)]">{part.description}</p>
+    <section
+      className="rounded border border-[var(--border-color)] px-3 py-2"
+      data-tool-definition
+      data-tool-name={name}
+    >
+      <div className="font-mono">{name}</div>
+      {typeof tool.description === 'string' && (
+        <p className="my-2 text-[var(--muted)]">{tool.description}</p>
       )}
-      <div className="overflow-hidden rounded border border-[var(--border-color)]">
-        {jsonValue(part.inputSchema ?? {})}
+      {'inputSchema' in tool && (
+        <div
+          className="overflow-hidden rounded border border-[var(--border-color)]"
+          data-tool-schema
+        >
+          {jsonValue(tool.inputSchema)}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function ToolDefinitions({ part }: { part: ContentPart }) {
+  const tools = Array.isArray(part.tools) ? part.tools : [];
+  return (
+    <details
+      className="my-2 rounded border border-[var(--border-color)] px-3 py-2 text-xs"
+      data-system-part="tool_defs"
+    >
+      <summary className="cursor-pointer font-mono">
+        tool_defs · {tools.length}
+      </summary>
+      <div className="mt-2 space-y-2">
+        {tools.map((tool, index) => (
+          <ToolDefinition key={index} value={tool} index={index} />
+        ))}
       </div>
+    </details>
+  );
+}
+
+function SemanticSystemPart({ part }: { part: ContentPart }) {
+  const label = part.type === 'mcp'
+    ? `mcp${part.name === undefined ? '' : ` · ${String(part.name)}`}`
+    : 'skill_list';
+  const value = part.type === 'skill_list' ? part.skills : undefined;
+  return (
+    <details
+      className="my-2 rounded border border-[var(--border-color)] px-3 py-2 text-xs"
+      data-system-part={part.type}
+    >
+      <summary className="cursor-pointer font-mono">{label}</summary>
+      {value !== undefined && (
+        <div className="mt-2 overflow-hidden rounded border border-[var(--border-color)]">
+          {jsonValue(value)}
+        </div>
+      )}
     </details>
   );
 }
@@ -117,7 +167,19 @@ function ContentPartView({ part, streaming = false }: {
   if (part.type === 'refusal' && typeof part.refusal === 'string') {
     return <MarkdownText text={part.refusal} streaming={streaming} />;
   }
-  if (part.type === 'tool_definition') return <ToolDefinition part={part} />;
+  if (part.type === 'instruction') {
+    return typeof part.text === 'string'
+      ? <MarkdownText text={part.text} streaming={streaming} />
+      : (
+          <p className="text-xs italic text-[var(--muted)]" data-system-part="instruction">
+            instruction · content unavailable
+          </p>
+        );
+  }
+  if (part.type === 'tool_defs') return <ToolDefinitions part={part} />;
+  if (part.type === 'mcp' || part.type === 'skill_list') {
+    return <SemanticSystemPart part={part} />;
+  }
   return (
     <details className="my-2 rounded border border-[var(--border-color)] px-3 py-2 text-xs">
       <summary className="cursor-pointer font-mono">{part.type}</summary>

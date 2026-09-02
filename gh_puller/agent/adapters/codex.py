@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, TypedDict
 
 from ..base import BaseAgent, RequestFailedError
+from ..context import instruction, mcps, system_message, tool_defs
 from ..events import (
     EventRecorder,
     _normalize_usage,
@@ -32,7 +33,6 @@ class CodexConfig(TypedDict, total=False):
     env: dict
     timeout_seconds: float
     mcp_servers: list[dict]
-    allowed_tools: list[str]
     effort: str
     output_schema: dict
     config_overrides: dict
@@ -65,6 +65,17 @@ def codex_turn_fields(config: dict) -> dict:
     """Select non-null turn fields."""
     names = ("cwd", "effort", "output_schema", "personality", "service_tier", "summary")
     return {k: v for k, v in ((k, config.get(k)) for k in names) if v is not None}
+
+
+def _codex_system_items(config: dict) -> list[dict]:
+    """Project system inputs whose contents the Codex boundary exposes."""
+    prompt = config.get("base_instructions") or config.get("system_prompt")
+    content = [instruction(prompt) if prompt else instruction(), tool_defs(["opaque"])]
+    content.extend(mcps(config.get("mcp_servers")))
+    items = [system_message(content)]
+    if developer := config.get("developer_instructions"):
+        items.append(message_item("developer", [instruction(developer)]))
+    return items
 
 
 def codex_config(config: dict):
@@ -493,10 +504,7 @@ class Codex(BaseAgent):
             await self._codex.login_api_key(token)
         self._thread = await self._codex.thread_start(**codex_thread(config))
         recorder = self._require_event_recorder()
-        if prompt := config.get("base_instructions") or config.get("system_prompt"):
-            recorder.append_context(text_message("system", prompt))
-        if prompt := config.get("developer_instructions"):
-            recorder.append_context(text_message("developer", prompt))
+        recorder.append_context(_codex_system_items(config), role="system")
 
     async def _exit(self, exc):
         self._thread = None
