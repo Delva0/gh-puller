@@ -1,23 +1,7 @@
-"""五路适配器真机测试(烧真实 token,默认跳过,显式 opt-in)。
+"""Opt-in real-backend tests for every generator and its persisted event flow.
 
-与 test_agent.py(mock 离线)互补:本文件实时走真实后端 —— cc spawn 本地
-claude CLI(凭证走本地 ~/.claude 配置,同 "apikey 在配置文件中" 约定)、
-llm 经 httpx 直连 OpenAI 兼容端(照生成器 env 面:OPENAI_API_KEY /
-OPENAI_BASE_URL / LLM_MODEL;缺省端点 DeepSeek 兼容端,仅环境变量,不读任何
-组件私有文件)、dsh 走 DeepSeek Harness SDK(凭证 SDK 自足)、codex 走
-openai_codex SDK(隔离 home 符号链接引用真实 ~/.codex/auth.json,与 cc 同形
-——验证通道不隔离,隔离只管设置面)、opencode 走 CLI 子进程(模型路由/凭证
-随 opencode 自身配置,同 cc 的 CLI 自持凭证约定)。
-
-每路经 agent.configure(file_dir=tmp_path, ws_urls=[], otel_urls=[]) 把
-FileSink 根目录注入临时目录,并断言非流式事件流落盘契约正确
-(即"filesink 允许注入临时输出路径供测试"的验证)。
-
-全体 opt-in:GH_PULLER_REAL_TESTS=1 才运行;默认 uv run pytest 全量套件整
-文件 skip(不烧 token、不 spawn 子进程,见 memory: llm-no-token-tests)。
-模型:DeepSeek 三路统一 deepseek-v4-flash(env GH_PULLER_MODEL 可覆写);
-codex 常量直写 gpt-5.6-sol(chatgpt OAuth 凭据只认 models_cache 内的 5.x
-模型;绝不引入 codex 环境变量——与代码同形)。
+Set ``GH_PULLER_REAL_TESTS=1`` to run tests that may spawn local agents or consume
+provider tokens. Each test writes monitor data only under its pytest temporary path.
 """
 import asyncio
 import json
@@ -91,32 +75,26 @@ async def _read_single_session(tmp_path) -> list[dict]:
     return [json.loads(line) for line in files[0].read_text(encoding="utf-8").splitlines()]
 
 
-def _assert_flow(events: list[dict], provider: str, model: str, generator: str = "") -> None:
-    """断言 FileSink 落盘的会话流符合契约(非流式投影,终态 completed)。
-
-    文本产物契约双路取强:折叠 assistant/message 带文本块(非流式后端 +
-    整块合成),或完全流式后端(如 DeepSeek anthropic 兼容端:文本全走
-    chunk,折叠消息 content 可为空)下由 session/end.text_chars 证明。
-    """
+def _assert_flow(events: list[dict], provider: str, model: str | None, generator: str = "") -> None:
+    """Assert compact persistence and replayable model context."""
     assert events, "根下应有事件落盘"
     assert events[0]["type"] == "session/start", events[0]
-    snapshot = events[0]["data"]  # 快照随 session/start 的 data 落地(契约见 events.py start())
-    assert snapshot["provider"] == provider, events[0]
-    assert snapshot["model"] == model, events[0]
     if generator:
-        assert snapshot["generator"] == generator, events[0]
+        assert events[0]["data"]["generator"] == generator, events[0]
     types = [e["type"] for e in events]
-    assert "assistant/chunk" not in types, "文件只落非流式事件流(chunk 应被投影剔除)"
-    user = next(e for e in events if e["type"] == "user/message")
-    assert "你好" in _text_of(user["data"]["message"]["content"]), user
-    assts = [e for e in events if e["type"] == "assistant/message"]
-    assert assts, "应有 assistant/message"
+    assert not {"model/delta/text", "model/delta/reasoning", "model/delta/tool-call"} & set(types)
+    model_events = [event for event in events if event["type"] == "model/set"]
+    if model is not None:
+        assert model_events[-1]["data"]["model"] == model
+        assert model_events[-1]["data"].get("provider") == provider
+    user = next(e for e in events if e["type"] == "context/append/user")
+    assert "你好" in _text_of(user["data"]["content"]), user
+    assistants = [e for e in events if e["type"] == "context/append/assistant"]
+    assert assistants
     end = events[-1]
     assert end["type"] == "session/end", end
-    assert end["data"]["state"] == "completed", end
-    assert end["data"]["ok"] is True, end
-    folded = any(_text_of(e["data"]["message"]["content"]).strip() for e in assts)
-    assert folded or end["data"].get("text_chars", 0) > 0, "文本产物缺失(折叠空且无 text_chars)"
+    assert end["data"]["outcome"] == "completed", end
+    assert any(_text_of(e["data"]["content"]).strip() for e in assistants)
 
 
 @pytest.mark.asyncio

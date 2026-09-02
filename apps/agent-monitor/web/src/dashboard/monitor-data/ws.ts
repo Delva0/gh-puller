@@ -1,5 +1,4 @@
-// hub 线协议帧的 TS 类型与客户端补片助手(仿 dsh apiproxy/api/events.ts 的帧形态;
-// gh-puller 为下行 WS + HTTP fallback 同构,帧由 hub.py 定义)。
+/** WebSocket frames and sequence helpers for the monitor hub protocol. */
 
 import type { EventEnvelope } from './types';
 
@@ -16,7 +15,7 @@ export interface SessionMeta {
   num_events: number;
 }
 
-// 查看端(→ hub)
+// Viewer to hub.
 export type ViewerFrame =
   | { type: 'index' }
   | { type: 'history'; session: string; beforeSeq?: number; max?: number }
@@ -24,7 +23,7 @@ export type ViewerFrame =
   | { type: 'delete'; session: string }
   | { type: 'ping' };
 
-// hub(→ 查看端)
+// Hub to viewer.
 export type HubFrame =
   | { type: 'index'; sessions: SessionMeta[] }
   | { type: 'history'; session: string; events: EventEnvelope[]; hasMore: boolean; nextBeforeSeq: number | null }
@@ -33,12 +32,12 @@ export type HubFrame =
   | { type: 'evts'; events: EventEnvelope[] }
   | { type: 'pong' };
 
-/** 事件按 seq 升序(与 fold 的期待一致);帧解析后先调用。 */
+/** Return events in session sequence order. */
 export function sortedEvents(events: EventEnvelope[]): EventEnvelope[] {
   return [...events].sort((a, b) => a.seq - b.seq);
 }
 
-/** 合并两段(历史页 + live 缓冲)按 seq 去重;gap 检测由 RunFold.ingestBatch 完成。 */
+/** Merge history and live windows by sequence number. */
 export function mergeEvents(a: EventEnvelope[], b: EventEnvelope[]): EventEnvelope[] {
   const map = new Map<number, EventEnvelope>();
   for (const e of a) map.set(e.seq, e);

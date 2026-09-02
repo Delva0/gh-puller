@@ -1,8 +1,6 @@
 'use client';
 
-// 单会话响应式 store(useSyncExternalStore,不引 zustand):
-// history 页/live 批次 → RunFold(seq 守卫)+ dsh 推导桥(vendor 面板数据面)。
-// 旧读接口(events/chat/partial)保留兼容;面板改吃 dsh(桥)快照。
+// One selected session: canonical folds plus a thin DSH presentation adapter.
 import { useSyncExternalStore } from 'react';
 import { RunFold } from '../monitor-data';
 import type { EventEnvelope } from '../monitor-data';
@@ -15,9 +13,9 @@ import {
 interface SessionSnapshot {
   events: EventEnvelope[];
   dsh: DshSessionStore | null;
-  lastSeq: number | null; // evt_ready 时 hub 报告的当前末 seq
-  ready: boolean; // 收到 evt_ready(订阅窗口已登记)
-  gapFrom: number | null; // 最近缺口起点(hook 据此发 history 补片)
+  lastSeq: number | null;
+  ready: boolean;
+  gapFrom: number | null;
 }
 
 class MonitorSessionStore {
@@ -38,15 +36,15 @@ class MonitorSessionStore {
     return () => this.listeners.delete(cb);
   };
 
-  /** useSyncExternalStore 的快照指纹:任一变更 → 版本+1 → 重渲(数据字段渲染期直读)。 */
+  /** Version used as the useSyncExternalStore snapshot. */
   getVersion = (): number => this.version;
 
-  /** 面板宿主取桥源(装配后由 installDsh attach)。 */
+  /** Return the presentation adapter consumed by the existing panels. */
   getBridge(): DshSessionStore {
     return this.dsh;
   }
 
-  /** 装配(installDsh 内部回调):把推导注册表接入桥。 */
+  /** Attach DSH presentation registries. */
   wire(events: unknown, views: unknown): void {
     this.dsh.attach(events as never, views as never);
   }
@@ -74,7 +72,7 @@ class MonitorSessionStore {
     this.bump();
   }
 
-  /** live 批次;一帧内只发布一次 UI 快照。 */
+  /** Apply one live batch and publish one UI version. */
   ingestBatch(events: EventEnvelope[]): 'ok' | 'dup' | 'gap' {
     const r = this.fold.ingestBatch(events);
     if (r === 'gap') this.gap_ = true;
@@ -99,10 +97,10 @@ class MonitorSessionStore {
   }
 }
 
-// 单例:一次只关注一个会话(与 hub 单订阅视图语义一致)
+// The hub exposes one selected-session subscription per viewer connection.
 export const sessionStore = new MonitorSessionStore();
 
-/** 订阅并返回当前快照(渲染期直读 store 数据)。 */
+/** Subscribe to and return the current selected-session snapshot. */
 export function useMonitorSession(): SessionSnapshot {
   useSyncExternalStore(sessionStore.subscribe, sessionStore.getVersion);
   return sessionStore.snapshot();

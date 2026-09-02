@@ -1,8 +1,4 @@
-/**
- * 会话桥:gh 事件窗(seq 守卫由连接层负责)→ dsh 推导(assembler + 视图定义)→
- * ConversationSnapshot/HostObservable 面。被 useMonitorSession(既有连接层)
- * 与 install/DshPanels 共用。
- */
+/** Feed canonical session windows into the existing DSH presentation assembler. */
 import type { EventEnvelope } from '../../../monitor-data/types'
 import type { ConversationSnapshot } from '@dsh/runtime'
 import {
@@ -25,7 +21,7 @@ export interface SessionFacts {
   state: 'running' | 'completed' | 'aborted'
 }
 
-/** 会话行(面包屑/状态栏用)。 */
+/** Session row consumed by breadcrumbs and status presentation. */
 export interface SessionRow {
   id: string
   displayTitle: string
@@ -49,13 +45,13 @@ export interface SessionListShape {
 
 export interface DshSessionStore {
   reset(facts: SessionFacts | null): void
-  /** 已在连接层通过 seq 守卫的事件注入(全窗由连接层交付)。 */
+  /** Seed a sequence-guarded canonical event window. */
   seed(events: EventEnvelope[], hasMore?: boolean): void
   append(evt: EventEnvelope): void
   appendBatch(events: EventEnvelope[]): void
   updateFacts(patch: Partial<SessionFacts>): void
   snapshot(): ConversationSnapshot | null
-  /** 裸源(host 面)。 */
+  /** Observable surfaces consumed by the DSH host. */
   conversation: HostObservable<ConversationSnapshot | null>
   provideInfo: HostObservable<{
     sessionId: string | undefined
@@ -70,15 +66,11 @@ export interface DshSessionStore {
   loadOlder(sessionId: string): Promise<boolean>
   lastSeq(): number | null
   eventCount(): number
-  /** 注册表就绪时装配(installDsh 调用;幂等)。 */
+  /** Attach presentation registries once they are installed. */
   attach(eventsRegistry: ConversationEventDefinitions, viewsRegistry: ConversationViewDefinitions): void
 }
 
-/** 组装会话源:历史窗口重放,live 尾部走 assembler 增量追加。
- *
- * 注册表(events/views)由 installDsh 在装配时提供 → attach();attach 前
- * rebuild() 为空转(实例在 socket select 前创建,装配时机在面板 render)。
- */
+/** Build a presentation source from replayed history and incremental live events. */
 export function createDshSession(): DshSessionStore {
   const adapter = new GhToDshEvents()
   let assembler: ConversationNodeAssembler | null = null
@@ -92,8 +84,7 @@ export function createDshSession(): DshSessionStore {
   let loadOlderFn: (() => Promise<boolean>) | null = null
 
   const conversation = createObservable<ConversationSnapshot | null>(null)
-  // 惰性输入面(无 composer):ConversationSession 等标准钩子读 useInput——
-  // 提供静态源以稳定回归(字段按会话方消费面最低形状)。
+  // The read-only monitor provides the minimum static composer shape expected by DSH.
   const input = createObservable<Record<string, unknown>>({
     draft: '',
     images: [],
@@ -145,21 +136,31 @@ export function createDshSession(): DshSessionStore {
     }
   }
 
+  function presentationWindow(): EventEnvelope[] {
+    const ordered = [...folded.values()].sort((a, b) => a.seq - b.seq)
+    const reset = ordered.findLastIndex(evt => evt.type === 'context/set')
+    if (reset < 0) return ordered
+    const prefix = ordered.slice(0, reset)
+    const model = prefix.findLast(evt => evt.type === 'model/set')
+    const header = prefix.findLast(evt => evt.type === 'header/set')
+    return [...[model, header].filter(evt => evt !== undefined), ...ordered.slice(reset)]
+  }
+
   function rebuild(): void {
     if (assembler === null) return
     adapter.reset()
     const entries: ConversationEventInput[] = []
-    for (const evt of [...folded.values()].sort((a, b) => a.seq - b.seq)) {
+    for (const evt of presentationWindow()) {
       for (const event of adapter.translate(evt)) entries.push({ event, view: undefined })
     }
     try {
       assembler.replaceWindow(entries, hasMoreValue)
-      assembler.flush() // flush() 才是视图物化入口(dsh Session 的发布节奏);replace 仅登记
+      assembler.flush()
       assembledLastSeq = entries.length === 0 ? null : Math.max(...entries.map(entry => entry.event.seq))
       rebuildPending = false
     } catch (error) {
       rebuildPending = true
-      console.error('[gh-puller/dsh] assemble 失败(事件窗不稳,等待下批):', error)
+      console.error('[gh-puller/dsh] deferred unstable event window:', error)
     }
     conversation.set(snapshot())
   }
@@ -188,13 +189,20 @@ export function createDshSession(): DshSessionStore {
         ...facts,
         label: (evt as EventEnvelope & { label?: string }).label
           ?? (typeof data.label === 'string' ? data.label : facts.label),
-        runId: (evt as EventEnvelope & { run_id?: string | null }).run_id
-          ?? (typeof data.run_id === 'string' ? data.run_id : facts.runId),
+        runId: typeof data.runId === 'string' ? data.runId : facts.runId,
+      }
+      publishFacts()
+    } else if (evt.type === 'model/set') {
+      const data = evt.data as Record<string, unknown>
+      facts = {
+        ...facts,
+        provider: typeof data.provider === 'string' ? data.provider : facts.provider,
+        model: typeof data.model === 'string' ? data.model : facts.model,
       }
       publishFacts()
     } else if (evt.type === 'session/end') {
-      const state = (evt.data as { state?: string }).state ?? 'completed'
-      facts = { ...facts, state: state === 'aborted' ? 'aborted' : 'completed' }
+      const outcome = (evt.data as { outcome?: string }).outcome
+      facts = { ...facts, state: outcome === 'completed' ? 'completed' : 'aborted' }
       publishFacts()
     }
   }
@@ -240,15 +248,20 @@ export function createDshSession(): DshSessionStore {
         .filter(evt => !folded.has(evt.seq))
         .sort((a, b) => a.seq - b.seq)
       if (fresh.length === 0) return
+      const resetsContext = fresh.some(evt => evt.type === 'context/set')
       const entries: ConversationEventInput[] = []
       for (const evt of fresh) {
         folded.set(evt.seq, evt)
         applyFacts(evt)
-        if (assembler !== null) {
+        if (assembler !== null && !resetsContext) {
           for (const event of adapter.translate(evt)) entries.push({ event, view: undefined })
         }
       }
       if (assembler === null) return
+      if (resetsContext) {
+        rebuild()
+        return
+      }
       if (rebuildPending) {
         rebuild()
         return
@@ -260,7 +273,7 @@ export function createDshSession(): DshSessionStore {
         cursor = entry.event.seq
       }
       if (!monotonic) {
-        // Step-level message merging can emit an older anchor only when its boundary lands.
+        // Rebuild when presentation expansion cannot preserve strict sequence order.
         rebuild()
         return
       }

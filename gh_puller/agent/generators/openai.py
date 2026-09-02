@@ -1,9 +1,4 @@
-"""llm:OpenAI 兼容端点(httpx)包装 —— 配置世界(OpenAIConfig)+ 适配器本体。
-
-本文件 = llm 的独立扩展点(直连 HTTP,无 SDK);config 只有 OpenAIConfig
-{model, base_url, api_key},请求体(payload = OpenAI 兼容 chat/completions
-请求体)独立于 config 运行时传入;字段映射与适配器同文件,模块 import 面零 SDK。
-"""
+"""OpenAI-compatible streaming adapter with canonical request-state observation."""
 
 import contextlib
 import json
@@ -11,13 +6,11 @@ from typing import TypedDict
 
 import httpx
 
-from ..events import EventRecorder, _normalize_usage
 from .base import BaseGenerator
-from .utils import _stage_of
 
 
 class OpenAIConfig(TypedDict, total=False):
-    """llm runtime config (model/base_url/api_key); the request body (payload) is passed separately."""
+    """Construction-time connection and default model configuration."""
 
     model: str
     base_url: str
@@ -25,192 +18,172 @@ class OpenAIConfig(TypedDict, total=False):
     provider: str
 
 
-# ---------------------------------------------------------------------------
-# 适配器:请求体/头部 → 事件 dict(纯 dict 可单测)
-# ---------------------------------------------------------------------------
-
-
-def _llm_emit_messages(event_recorder: EventRecorder, payload: dict) -> None:
-    """Emit payload messages as surface events (only user/assistant fold; system stays out of the fold)."""
-    for m in payload.get("messages", []):
-        role = m.get("role")
-        content = m.get("content")
-        if role not in ("user", "assistant"):
-            continue
-        blocks = content if isinstance(content, list) else [{"type": "text", "text": content or ""}]
-        message = {"role": role, "content": blocks}
-        if role == "user":
-            event_recorder.user_message(message)
-        else:  # 历史 assistant 消息:无 usage/停止原因,仅内容折叠
-            event_recorder.event("assistant/message", turn=event_recorder.turn,
-                                 step=event_recorder.step, message=message,
-                                 surfaceOp="append")
-
-
-def _llm_headers(headers: dict | None, api_key: str | None) -> dict:
-    hdrs = {"Content-Type": "application/json"}
-    if headers:
-        hdrs.update(headers)
+def _headers(headers: dict | None, api_key: str | None) -> dict:
+    result = {"Content-Type": "application/json"}
+    result.update(headers or {})
     if api_key:
-        hdrs.setdefault("Authorization", f"Bearer {api_key}")
-    return hdrs
+        result.setdefault("Authorization", f"Bearer {api_key}")
+    return result
 
 
-# ---------------------------------------------------------------------------
-# OpenAI 兼容(httpx)包装
-# ---------------------------------------------------------------------------
+def _blocks(content) -> list[dict]:
+    if isinstance(content, list):
+        return content
+    return [{"type": "text", "text": content or ""}]
+
+
+def _message(message: dict) -> dict:
+    result = {"role": message.get("role") or "user", "content": _blocks(message.get("content"))}
+    if message.get("tool_call_id"):
+        result["callId"] = message["tool_call_id"]
+    calls = message.get("tool_calls") or []
+    for call in calls:
+        function = call.get("function") or {}
+        arguments = function.get("arguments") or ""
+        with contextlib.suppress(json.JSONDecodeError):
+            arguments = json.loads(arguments)
+        result["content"].append({
+            "type": "tool_call", "callId": call.get("id") or "",
+            "name": function.get("name") or "", "arguments": arguments,
+        })
+    return result
+
+
+def _instructions(messages: list[dict]) -> list[dict]:
+    result = []
+    for message in messages:
+        if message.get("role") not in {"system", "developer"}:
+            continue
+        result.extend(_blocks(message.get("content")))
+    return result
+
+
+def _tools(tools: list[dict]) -> list[dict]:
+    result = []
+    for tool in tools:
+        function = tool.get("function") or tool
+        result.append({
+            "name": function.get("name") or "",
+            "description": function.get("description") or "",
+            "inputSchema": function.get("parameters") or function.get("inputSchema") or {},
+        })
+    return result
 
 
 class OpenAI(BaseGenerator):
-    """llm: OpenAI-compatible endpoint (httpx direct). Config shape: object-class (OpenAIConfig).
-
-    HTTP client built at construction (one instance one client = connection pool);
-    the client lifetime follows one session (`async with gen.session(...)`: pool
-    enter/exit). Per-call timeout/headers/body (payload) still override at the call
-    level (request-level params live in stream/result).
-    """
+    """Direct ``chat/completions`` client; one session may carry multiple requests."""
 
     generator = "llm"
     provider = "openai"
 
     def __init__(self, config: dict):
         super().__init__(config)
-        # 流式长连接不设全局超时,由请求级 timeout 覆盖
-        self._client = httpx.AsyncClient(timeout=None)  # noqa: S113 - 流式长连接不设全局超时,由请求级覆盖
+        self._client = httpx.AsyncClient(timeout=None)  # noqa: S113 - requests set timeout
 
     async def _enter(self):
-        await self._client.__aenter__()  # 连接池进入
+        await self._client.__aenter__()
 
     async def _exit(self, exc):
-        await self._client.__aexit__(*exc)  # 连接池关闭
+        await self._client.__aexit__(*exc)
 
-    @contextlib.asynccontextmanager
-    async def session(self, **kw):
-        """llm session: error stage hooks http/parse (_stage_of); rest follows base orchestration."""
-        async with super().session(error_stage=_stage_of, **kw):
-            yield
-
-    async def result(
-        self, payload: dict, *,
-        timeout: httpx.Timeout | None = None, headers: dict | None = None,  # noqa: ASYNC109 - httpx.Timeout 请求级形参,非 asyncio 超时模式
-    ) -> str:
-        """Return the final text from an OpenAI-compatible completion (exceptions propagate; retry left to the caller).
-
-        config = OpenAIConfig(model/base_url/api_key) injected at construction; payload
-        is the chat/completions body (messages; model optional — injected from config;
-        other keys pass through, e.g. response_format/temperature/max_tokens). Events:
-        the body's full message list → surface (foldable request input); the response
-        text + assistant/message + one tool/call per tool_call (raw arguments string).
-
-        Implementation drains the streaming endpoint (stream() to the end) — the event
-        surface matches stream: per-delta chunks, same granularity as cc/codex.
+    async def result(self, payload: dict, *, timeout: httpx.Timeout | None = None,  # noqa: ASYNC109
+                     headers: dict | None = None) -> str:
+        """Return the final text produced by one streaming request.
 
         Args:
-            payload: chat/completions request body (model injected from config when omitted).
-            timeout: Request-level HTTP timeout (None = no per-request timeout).
-            headers: Request headers (merged over the bearer/Content-Type defaults).
+            payload: OpenAI-compatible request body.
+            timeout: Request-local HTTP timeout.
+            headers: Request-local headers merged over connection defaults.
 
         Returns:
-            Final assistant text of the final round.
+            Concatenated assistant text deltas.
         """
-        parts = [part async for part in self.stream(payload, timeout=timeout, headers=headers)]
-        return "".join(parts)
+        return "".join([part async for part in self.stream(
+            payload, timeout=timeout, headers=headers)])
 
-    async def stream(
-        self, payload: dict, *,
-        timeout: httpx.Timeout | None = None, headers: dict | None = None,  # noqa: ASYNC109 - httpx.Timeout 请求级形参,非 asyncio 超时模式
-    ):
-        """Stream an OpenAI-compatible completion (SSE per delta); body gets stream=True, config split as result.
-
-        delta.tool_calls fragments merge into the tool/call + tool_use blocks (the
-        legacy implementation knew only text deltas — streaming tool calls unobservable).
-
-        Args:
-            payload: chat/completions request body (see `result`).
-            timeout: Request-level HTTP timeout.
-            headers: Request headers.
-
-        Returns:
-            Async iterator of text deltas.
-        """
-        config = self.config
+    async def stream(self, payload: dict, *, timeout: httpx.Timeout | None = None,  # noqa: ASYNC109
+                     headers: dict | None = None):
+        """Yield assistant text while recording the effective request and output."""
         body = dict(payload)
-        body["model"] = payload.get("model") or config.get("model") or ""
+        body["model"] = payload.get("model") or self.config.get("model") or ""
         body["stream"] = True
-        event_recorder = self._require_event_recorder()
-        _llm_emit_messages(event_recorder, body)
-        full = ""
-        full_reasoning = ""
-        tools: dict[int, dict] = {}  # index → {id, name, pieces}(delta.tool_calls 分片归并)
-        seg = None  # 当前段:thinking|content|tool_call;段完成即发该段的 assistant/message 聚合
+        messages = list(body.get("messages") or [])
+        recorder = self._require_event_recorder()
+        recorder.begin_turn()
+        parameters = {key: value for key, value in body.items()
+                      if key not in {"model", "messages", "tools", "stream"}}
+        recorder.set_model(body["model"], provider=self.config.get("provider") or self.provider,
+                           parameters=parameters)
+        recorder.set_header(instructions=_instructions(messages),
+                            tools=_tools(list(body.get("tools") or [])))
+        recorder.set_context([_message(message) for message in messages
+                              if message.get("role") not in {"system", "developer"}])
+        recorder.begin_step()
+        recorder.model_request()
 
-        def _close_seg():
-            """Segment done → one assistant/message (full segment aggregation; segment shape = glue boundary)."""
-            nonlocal seg
-            if seg is None:
-                return
-            if seg == "thinking":
-                blocks = [{"type": "thinking", "text": full_reasoning}]
-            elif seg == "content":
-                blocks = [{"type": "content", "text": full}]
-            else:  # tool_call:工具调用只经 tool/call 事件,不入 assistant/message 消息块
-                blocks = []
-                for slot in tools.values():
-                    args = "".join(slot["pieces"])
-                    event_recorder.tool_call(slot["id"], slot["name"], args)
-            seg = None
-            event_recorder.event(
-                "assistant/message", turn=event_recorder.turn, step=event_recorder.step,
-                message={"role": "assistant", "content": blocks},
-                surfaceOp="append", sourceSeqs=list(event_recorder._chunk_seqs),
-            )
-
-        url = config.get("base_url")
-        api_key = config.get("api_key")
-        async with self._client.stream("POST", f"{url}/chat/completions", json=body,
-                                       headers=_llm_headers(headers, api_key),
-                                       timeout=timeout) as resp:
-            resp.raise_for_status()
-            async for line in resp.aiter_lines():
+        text = ""
+        reasoning = ""
+        calls: dict[int, dict] = {}
+        usage = None
+        stop_reason = None
+        url = self.config.get("base_url") or ""
+        async with self._client.stream(
+            "POST", f"{url}/chat/completions", json=body,
+            headers=_headers(headers, self.config.get("api_key")), timeout=timeout,
+        ) as response:
+            response.raise_for_status()
+            async for line in response.aiter_lines():
                 if not line.startswith("data:"):
                     continue
-                chunk = line[len("data:"):].strip()
-                if not chunk or chunk == "[DONE]":
+                raw = line.removeprefix("data:").strip()
+                if not raw or raw == "[DONE]":
                     break
-                data = json.loads(chunk)
-                choices = data.get("choices") or []
-                delta = (choices[0].get("delta") or {}) if choices else {}
-                if data.get("usage"):
-                    event_recorder.result_usage = _normalize_usage(data["usage"])  # 末块 usage(可选扩展)
-                fin = choices[0].get("finish_reason") if choices else None
-                if fin:
-                    event_recorder.result_stop_reason = fin  # 末块 finish_reason → session/end
-                thinking = delta.get("reasoning_content") or ""
-                text = delta.get("content") or ""
-                if thinking:  # 思考增量 → thinking chunk(段序 0;与各 agent 生成器同位语义)
-                    if seg in ("content", "tool_call"):
-                        _close_seg()
-                    full_reasoning += thinking
-                    event_recorder.chunk({"type": "thinking", "index": 0, "text": thinking})
-                    seg = "thinking"
-                if text:
-                    if seg in ("thinking", "tool_call"):
-                        _close_seg()  # 段边界:thinking 段完成先聚合(→ 本行后才出 content 段)
-                    full += text
-                    event_recorder.text(text, index=1 if full_reasoning else 0)  # 段序:thinking 之后 → 1
-                    seg = "content"
-                    yield text
-                for tc in delta.get("tool_calls") or []:
-                    if seg in ("thinking", "content"):
-                        _close_seg()
-                    seg = "tool_call"
-                    slot = tools.setdefault(tc.get("index", 0),
-                                            {"id": "", "name": "", "pieces": []})
-                    fn = tc.get("function") or {}
-                    if tc.get("id"):
-                        slot["id"] = tc["id"]
-                    if fn.get("name"):
-                        slot["name"] = fn["name"]
-                    if fn.get("arguments"):
-                        slot["pieces"].append(fn["arguments"])
-            _close_seg()  # 流末:收尾当前段(纯 thinking/无后续段也保证聚合)
+                packet = json.loads(raw)
+                usage = packet.get("usage") or usage
+                choices = packet.get("choices") or []
+                if not choices:
+                    continue
+                choice = choices[0]
+                stop_reason = choice.get("finish_reason") or stop_reason
+                delta = choice.get("delta") or {}
+                thought = delta.get("reasoning_content") or ""
+                if thought:
+                    reasoning += thought
+                    recorder.reasoning(thought)
+                part = delta.get("content") or ""
+                if part:
+                    text += part
+                    recorder.text(part, index=1 if reasoning else 0)
+                    yield part
+                for tool_call in delta.get("tool_calls") or []:
+                    index = tool_call.get("index", 0)
+                    slot = calls.setdefault(index, {"callId": "", "name": "", "parts": []})
+                    function = tool_call.get("function") or {}
+                    slot["callId"] = tool_call.get("id") or slot["callId"]
+                    slot["name"] = function.get("name") or slot["name"]
+                    fragment = function.get("arguments") or ""
+                    slot["parts"].append(fragment)
+                    recorder.tool_call_delta(
+                        index=index, call_id=slot["callId"], name=slot["name"],
+                        arguments_delta=fragment)
+
+        content = []
+        if reasoning:
+            content.append({"type": "reasoning", "text": reasoning})
+        if text:
+            content.append({"type": "text", "text": text})
+        for slot in calls.values():
+            raw_arguments = "".join(slot["parts"])
+            try:
+                arguments = json.loads(raw_arguments)
+            except json.JSONDecodeError:
+                arguments = raw_arguments
+            content.append({
+                "type": "tool_call", "callId": slot["callId"],
+                "name": slot["name"], "arguments": arguments,
+            })
+        message = {"role": "assistant", "content": content}
+        recorder.model_response(message, stop_reason=stop_reason, usage=usage)
+        recorder.append_context(message)
+        recorder.end_step()
+        recorder.end_turn(reason="final_response")

@@ -1,9 +1,4 @@
-"""监控观测通道:sink 基础设施(文件/WS/OTel 三通道 + 事件总线)与运行时配置;无控制台通道。
-
-通道角色与细项(默认恒开/逗号分隔多地址/TCP 探活注册/多后端扩展 = env 常量 +
-_OTEL_BACKENDS 一条)见实现与 envs.py;事件流语义(TAXONOMY 粒度、折叠恢复
-、message 粒度防膨胀)与 publish/线程模型(有界队列、loop-affine)见 events.py EventBus。
-"""
+"""Deliver canonical agent events to files, WebSockets, and OpenTelemetry."""
 
 import asyncio
 import json
@@ -26,44 +21,30 @@ def _log(msg: str) -> None:
     _utils_log(msg, prefix="agent-monitor")
 
 
-# ---------------------------------------------------------------------------
-# EventBus(进程内单例;publish 非阻塞)
-# ---------------------------------------------------------------------------
-
-
 class FileSink:
-    """File channel: one flat JSONL per session (root = AGENT_MONITOR_DIR, no sessions sublayer).
+    """Write one flat JSONL log per session.
 
-    Granularity switch: raw=False (default) writes only the non-stream event flow
-    (assistant/chunk skipped — file seqs may have holes; folding only compares seq);
-    raw=True writes the full raw event flow incl. assistant/chunk (dense seqs, the same
-    stream the WS/OTel channels carry; opt-in via AGENT_MONITOR_FILE_RAW=1 to avoid log
-    inflation by default). One event per line. Taxonomy is implicit:
-    state lives in the events (grep '"type":"session/end"' for the final state data.state,
-    '"type":"error"' for errors, 'session/start' for the session origin). Linux-friendly
-    monitoring: tail -f <root>/*.jsonl, jq with the folding spec (gh_puller.agent.events).
-    session/end stays the dirty last line; keep-warm touches mtime via `touch`, never
-    writes (lease judgment in events.py). Crash residue = files without a terminal line
-    (running until the lease expires). Events without a session/start origin are dropped.
+    Compact logs omit only model deltas, so replayed request state is identical to the
+    raw stream. Events before ``session/start`` are ignored.
     """
 
     def __init__(self, root: str, *, raw: bool = False):
         self.root = Path(root)
         self.raw = raw
-        self._files: dict[str, Path] = {}  # session → 当前文件(注册用;终态不移走)
+        self._files: dict[str, Path] = {}
         self.root.mkdir(parents=True, exist_ok=True)
 
     async def consume(self, evt: dict) -> None:
         """Append one event line to the session file; non-stream only unless raw."""
         if not self.raw and evt["type"] not in NON_STREAM_TYPES:
-            return  # 流式事件(chunk):文件缺省只落非流式事件流,防日志膨胀;raw=True 落全量
+            return
         session = evt.get("session", "")
         if evt["type"] == "session/start":
             self._open(session)
         path = self._files.get(session)
         if path is None:
             return
-        with open(path, "a", encoding="utf-8") as f:  # noqa: ASYNC230 - 文件 sink 本就同步落盘(逐事件追加即返回)
+        with open(path, "a", encoding="utf-8") as f:  # noqa: ASYNC230 - Ordered append is synchronous.
             f.write(json.dumps(evt, ensure_ascii=False) + "\n")
             f.flush()
 
@@ -101,11 +82,11 @@ class WsSink:
         try:
             self._q.put_nowait(evt)
         except asyncio.QueueFull:
-            self._q.get_nowait()  # 先丢旧:最近的进度优先
+            self._q.get_nowait()
             self._q.put_nowait(evt)
 
     async def _run(self) -> None:
-        import websockets  # 惰性导入:仅实际部署 WS sink 时才要求 websockets 依赖
+        import websockets  # Lazy optional sink dependency.
 
         wait = 1
         while True:
@@ -119,7 +100,7 @@ class WsSink:
                         while len(events) < 256 and not self._q.empty():
                             events.append(self._q.get_nowait())
                         await ws.send(json.dumps({"type": "evts", "events": events}, ensure_ascii=False))
-            except Exception as exc:  # 握手/断连:保留缓冲,退避重连
+            except Exception as exc:  # Preserve the queue while reconnecting.
                 _log(f"ws sink 未连接({wait}s 后重试): {exc}")
                 await asyncio.sleep(wait)
                 wait = min(wait * 2, 30)
@@ -151,23 +132,11 @@ def _otel():
 
 
 class OtelSink:
-    """Event-stream consumer: OTel span tree per session, OTLP export (event contract same as FileSink).
+    """Project activity events into an OTel span tree.
 
-    Consumes only event dicts from gh_puller.agent.events (ignored without a
-    session/start origin), zero SDK dependency. Granularity: one root span per agent
-    run (session/start → session/end); one step span per LLM request (deltas accumulate
-    into step attributes, previews truncated to 300 chars); tool/call–tool/result child
-    spans (is_error → ERROR); usage/stop_reason/error/context attributes hang on the
-    root span — gen_ai.* so Phoenix-typed backends auto-detect.
-
-    opentelemetry is optional (lazy import in __init__; missing → ImportError, downgraded
-    by ensure_bus). Tracer injection targets tests (InMemorySpanExporter); the default
-    lazily builds TracerProvider (SimpleSpanProcessor + OTLPSpanExporter), endpoint must
-    be a full OTLP traces URL (e.g. http://localhost:6006/v1/traces).
-
-    Robustness: parent context passes explicitly (set_span_in_context; consume crosses
-    awaits in the EventBus worker so active-span nesting would misnest); failures log
-    to stderr once per session, never bubble.
+    A session is the root, each ``model/request`` opens a model span correlated by
+    ``requestId``, and each ``tool/start`` opens a tool span correlated by ``callId``.
+    Semantic markers are annotations only. Sink failures never reach the agent.
     """
 
     def __init__(self, endpoint: str, *, tracer=None):
@@ -179,10 +148,8 @@ class OtelSink:
             )
             tp.add_span_processor(SimpleSpanProcessor(otel_exporter(endpoint=endpoint)))
             self.tracer = tp.get_tracer("gh-puller.agent-monitor")
-        self._spans: dict[str, dict] = {}  # session → {root, step, buf…}
-        self._failed: set[str] = set()  # 已报过错的 session(每会话只报一次)
-
-    # ---- 事件分发 ----
+        self._spans: dict[str, dict] = {}
+        self._failed: set[str] = set()
 
     async def consume(self, evt: dict) -> None:
         """Dispatch one event against the span tree of its session; per-session failures logged once."""
@@ -193,153 +160,150 @@ class OtelSink:
             if t == "session/start":
                 self._on_session_start(session, evt)
             elif state is None:
-                return  # 无 session/start 起点:事件不可分组,丢弃(同 FileSink)
+                return
             elif t == "session/end":
                 self._on_session_end(session, evt)
-            elif t == "step/start":
-                self._on_step_start(state, evt)
-            elif t == "step/end":
-                self._on_step_end(state, evt)
-            elif t == "assistant/chunk":
-                self._on_chunk(state, evt)
-            elif t == "assistant/message":
-                self._on_message(state, evt)
-            elif t == "tool/call":
-                self._on_tool_call(state, evt)
-            elif t == "tool/result":
-                self._on_tool_result(state, evt)
-            elif t == "error":
+            elif t == "model/set":
+                self._on_model_set(state, evt)
+            elif t == "model/request":
+                self._on_model_request(state, evt)
+            elif t.startswith("model/delta/"):
+                self._on_model_delta(state, evt)
+            elif t == "model/response":
+                self._on_model_response(state, evt)
+            elif t == "tool/start":
+                self._on_tool_start(state, evt)
+            elif t == "tool/end":
+                self._on_tool_end(state, evt)
+            elif t == "session/error":
                 self._on_error(state, evt)
             else:  # lifecycle/context information stays on the root span
                 self._on_info(state, evt)
-        except Exception as exc:  # 隔离:监控失败绝不冒泡(每次会话只报一次)
+        except Exception as exc:  # Observation failures must not reach the agent.
             if session not in self._failed:
                 self._failed.add(session)
                 _log(f"otel sink 消费失败({session}): {type(exc).__name__}: {exc}")
-
-    # ---- span 树构建 ----
 
     def _child(self, state: dict, name: str, ts=None) -> object:
         ctx = self._trace.set_span_in_context(state["root"])
         return self.tracer.start_span(name, context=ctx, start_time=_ns(ts))
 
     def _on_session_start(self, session: str, evt: dict) -> None:
-        stale = self._spans.pop(session, None)  # 同会话重入:旧根强制收尾
+        stale = self._spans.pop(session, None)
         if stale is not None:
             stale["root"].end(end_time=_ns(evt.get("ts")))
         d = evt.get("data") or {}
         label = d.get("label") or session
-        root = self.tracer.start_span(
-            f"{label} · {d.get('provider', '')}".strip(" ·"),
-            start_time=_ns(evt.get("ts")),
-        )
+        root = self.tracer.start_span(label, start_time=_ns(evt.get("ts")))
         self._spans[session] = {
             "root": root,
-            "step": None,
-            "step_n": 0,
-            "buf": "",
-            "thinking": "",
+            "requests": {},
+            "tools": {},
             "error": None,
-            "context_chars": 0,
-            "modifies": [],
+            "turns": 0,
+            "steps": 0,
         }
         _attrs(root, {
-            "gen_ai.provider.name": d.get("provider"),
-            "gen_ai.request.model": d.get("model"),
             "gh_puller.session": session,
             "gh_puller.label": label,
             "gh_puller.generator": d.get("generator") or "",
-            "gh_puller.run_id": d.get("run_id"),
-            "gh_puller.retry": d.get("retry"),
-            "gh_puller.meta": d.get("meta"),
+            "gh_puller.run_id": d.get("runId"),
         })
 
-    def _on_step_start(self, state: dict, evt: dict) -> None:
-        state["step_n"] += 1
-        state["buf"] = ""  # 每步独立累加:一步 = 一次 LLM 请求
-        state["thinking"] = ""
-        span = self._child(state, f"step.{state['step_n']}", evt.get("ts"))
-        _attrs(span, {"gh_puller.turn": evt["data"].get("turn"), "gh_puller.step": evt["data"].get("step")})
-        state["step"] = span
-
-    def _on_step_end(self, state: dict, evt: dict) -> None:
-        span = state["step"]
-        if span is None:
-            return
-        if state["thinking"]:
-            _, prev = truncate(state["thinking"], 300)
-            _attrs(span, {"gh_puller.thinking_chars": len(state["thinking"]), "gh_puller.thinking_preview": prev})
-        if state["buf"]:
-            chars, preview = truncate(state["buf"], 300)
-            _attrs(span, {"gh_puller.text_chars": chars, "gh_puller.text_preview": preview})
-        span.end(end_time=_ns(evt.get("ts")))
-        state["step"] = None
-
-    def _on_chunk(self, state: dict, evt: dict) -> None:
-        c = evt["data"]["chunk"]
-        if c.get("type") == "content":
-            state["buf"] += c.get("text") or ""
-        elif c.get("type") == "thinking":
-            state["thinking"] += c.get("text") or ""
-
-    def _on_message(self, state: dict, evt: dict) -> None:
+    def _on_model_set(self, state: dict, evt: dict) -> None:
         d = evt["data"]
-        usage = d.get("usage") or {}
         _attrs(state["root"], {
-            "gen_ai.usage.input_tokens": usage.get("input_tokens"),
-            "gen_ai.usage.output_tokens": usage.get("output_tokens"),
-            "gh_puller.cache_read_input_tokens": usage.get("cache_read_input_tokens"),
-            "gh_puller.stop_reason": d.get("stop_reason"),
+            "gen_ai.provider.name": d.get("provider"),
+            "gen_ai.request.model": d.get("model"),
+            "gen_ai.request.parameters": d.get("parameters"),
         })
-        if d.get("interrupted"):
-            state["root"].set_attribute("gh_puller.interrupted", True)
 
-    def _on_tool_call(self, state: dict, evt: dict) -> None:
+    def _on_model_request(self, state: dict, evt: dict) -> None:
+        request_id = evt["data"]["requestId"]
+        stale = state["requests"].pop(request_id, None)
+        if stale is not None:
+            stale["span"].end(end_time=_ns(evt.get("ts")))
+        state["requests"][request_id] = {
+            "span": self._child(state, f"model:{request_id}", evt.get("ts")),
+            "text": "",
+            "reasoning": "",
+        }
+
+    def _on_model_delta(self, state: dict, evt: dict) -> None:
+        request = state["requests"].get(evt["data"]["requestId"])
+        if request is None:
+            return
+        text = evt["data"].get("text") or ""
+        if evt["type"] == "model/delta/text":
+            request["text"] += text
+        elif evt["type"] == "model/delta/reasoning":
+            request["reasoning"] += text
+
+    def _on_model_response(self, state: dict, evt: dict) -> None:
         d = evt["data"]
-        args = d.get("arguments") or ""
-        span = self._child(state, f"tool.call:{d.get('name') or d.get('callId') or ''}", evt.get("ts"))
+        request = state["requests"].pop(d["requestId"], None)
+        span = request["span"] if request else self._child(
+            state, f"model:{d['requestId']}", evt.get("ts"))
+        usage = d.get("usage") or {}
+        text = request["text"] if request else ""
+        reasoning = request["reasoning"] if request else ""
         _attrs(span, {
-            "gh_puller.call_id": d.get("callId"),
-            "gh_puller.tool_name": d.get("name"),
-            "gh_puller.arguments_chars": len(args),
-            "gh_puller.arguments_preview": truncate(args, 300)[1],
-            "gh_puller.step": d.get("step"),
+            "gen_ai.usage.input_tokens": usage.get("input"),
+            "gen_ai.usage.output_tokens": usage.get("output"),
+            "gh_puller.cache_read_tokens": usage.get("cacheRead"),
+            "gh_puller.cache_write_tokens": usage.get("cacheWrite"),
+            "gh_puller.stop_reason": d.get("stopReason"),
+            "gh_puller.text_chars": len(text),
+            "gh_puller.text_preview": truncate(text, 300)[1],
+            "gh_puller.reasoning_chars": len(reasoning),
+            "gh_puller.reasoning_preview": truncate(reasoning, 300)[1],
         })
         span.end(end_time=_ns(evt.get("ts")))
 
-    def _on_tool_result(self, state: dict, evt: dict) -> None:
+    def _on_tool_start(self, state: dict, evt: dict) -> None:
         d = evt["data"]
-        blocks = (d.get("message") or {}).get("content") or []
-        first = blocks[0] if blocks else {}
-        tid = d.get("callId") or first.get("tool_use_id")
-        content = _tool_result_text(d.get("message") or {})
-        span = self._child(state, f"tool.result:{d.get('name') or tid or ''}", evt.get("ts"))
-        chars, preview = truncate(content, 300)
+        call_id = d["callId"]
+        span = self._child(state, f"tool:{d.get('name') or call_id}", evt.get("ts"))
         _attrs(span, {
-            "gh_puller.call_id": tid,
+            "gh_puller.call_id": call_id,
             "gh_puller.tool_name": d.get("name"),
-            "gh_puller.is_error": d.get("is_error") or bool(first.get("is_error")),
-            "gh_puller.content_chars": chars,
-            "gh_puller.content_preview": preview,
-            "gh_puller.step": d.get("step"),
+            "gh_puller.arguments": d.get("arguments"),
         })
-        if d.get("is_error"):
+        stale = state["tools"].pop(call_id, None)
+        if stale is not None:
+            stale.end(end_time=_ns(evt.get("ts")))
+        state["tools"][call_id] = span
+
+    def _on_tool_end(self, state: dict, evt: dict) -> None:
+        d = evt["data"]
+        call_id = d["callId"]
+        span = state["tools"].pop(call_id, None)
+        if span is None:
+            span = self._child(state, f"tool:{call_id}", evt.get("ts"))
+        _attrs(span, {
+            "gh_puller.result": d.get("result"),
+            "gh_puller.error": d.get("error"),
+        })
+        if d.get("error") is not None:
             span.set_status(self._trace.Status(self._trace.StatusCode.ERROR))
         span.end(end_time=_ns(evt.get("ts")))
 
     def _on_info(self, state: dict, evt: dict) -> None:
         t = evt.get("type")
         d = evt.get("data") or {}
-        if t == "context/modify":
-            state["modifies"].append(d.get("kind"))
+        if t == "turn/start":
+            state["turns"] += 1
+        elif t == "step/start":
+            state["steps"] += 1
         elif t == "turn/end":
             state["root"].set_attribute("gh_puller.turn_reason", d.get("reason"))
 
     def _on_error(self, state: dict, evt: dict) -> None:
         d = evt["data"]
-        detail = f"{d.get('exc_type', '')}: {d.get('message', '')}"
+        error = d.get("error") or {}
+        detail = f"{error.get('type', '')}: {error.get('message', '')}".strip(": ")
         state["error"] = detail
-        _attrs(state["root"], {"gh_puller.error": detail, "gh_puller.error_stage": d.get("stage")})
+        _attrs(state["root"], {"gh_puller.error": detail, "gh_puller.error_scope": d.get("scope")})
         state["root"].set_status(self._trace.Status(self._trace.StatusCode.ERROR, detail[:300]))
 
     def _on_session_end(self, session: str, evt: dict) -> None:
@@ -348,46 +312,25 @@ class OtelSink:
             return
         d = evt.get("data") or {}
         root = state["root"]
+        for request in state["requests"].values():
+            request["span"].end(end_time=_ns(evt.get("ts")))
+        for span in state["tools"].values():
+            span.end(end_time=_ns(evt.get("ts")))
         _attrs(root, {
-            "gh_puller.duration_ms": d.get("duration_ms"),
-            "gh_puller.text_chars": d.get("text_chars"),
-            "gh_puller.num_steps": d.get("num_steps"),
-            "gh_puller.state": d.get("state"),
-            "gh_puller.context_chars": state["context_chars"],
-            "gh_puller.context_modifies": state["modifies"],
+            "gh_puller.duration_ms": d.get("durationMs"),
+            "gh_puller.outcome": d.get("outcome"),
+            "gh_puller.turns": state["turns"],
+            "gh_puller.steps": state["steps"],
         })
-        if d.get("usage"):
-            _attrs(root, {
-                "gh_puller.final_usage": d["usage"],
-                "gh_puller.stop_reason": d.get("stop_reason"),
-            })
-        if d.get("ok"):
+        if d.get("outcome") == "completed":
             root.set_status(self._trace.Status(self._trace.StatusCode.OK))
         else:
-            reason = state["error"] or "agent 执行未成功完成"
+            reason = state["error"] or d.get("reason") or "agent did not complete"
             root.set_status(self._trace.Status(self._trace.StatusCode.ERROR, reason[:300]))
         root.end(end_time=_ns(evt.get("ts")))
 
 
-def _tool_result_text(message: dict) -> str:
-    """Flatten a tool/result message into result text (previews): concat block content."""
-    parts = []
-    for block in message.get("content") or []:
-        c = block.get("content")
-        if isinstance(c, list):
-            parts.extend(str(x.get("text") or "") for x in c if isinstance(x, dict))
-        elif c is not None:
-            parts.append(str(c))
-    return "".join(parts)
-
-
-# ---------------------------------------------------------------------------
-# 运行时配置(缺省取 envs 导入常量;运行时改走 configure)
-# ---------------------------------------------------------------------------
-
-_REACH_TIMEOUT_SECONDS = 1.0  # OTel/WS 端点可达性 TCP 探测超时(每进程 bus 构建时每 URL 一次)
-
-# OTel 后端表:新增后端 = envs.py 一个常量 + 此处一条 (env 常量名, 日志标签)
+_REACH_TIMEOUT_SECONDS = 1.0
 _OTEL_BACKENDS = (("AGENT_MONITOR_PHOENIX_URL", "phoenix"),)
 
 _DEF_SCHEME_PORTS = {"http": 80, "https": 443, "ws": 80, "wss": 443}
@@ -446,7 +389,6 @@ _cfg = {
     "otel_urls": _default_otel_urls(),
 }
 _bus: EventBus | None = None
-# 文件 sink 实例注册表(keep-warm 的 touch 直达;ensure_bus 建、configure 清)
 _file_sinks: list[FileSink] = []
 
 
@@ -462,8 +404,8 @@ def configure(*, file_dir=None, ws_urls=None, otel_urls=None, raw=None) -> None:
             empty deploys none (one sink instance per URL).
         otel_urls: URL list or comma-separated string; None re-reads the whole
             _OTEL_BACKENDS table; empty disables OTel sinks.
-        raw: True → FileSink writes the full raw event flow (incl. assistant/chunk);
-            None re-reads AGENT_MONITOR_FILE_RAW; False → non-stream projection (default).
+        raw: True writes model deltas; None re-reads AGENT_MONITOR_FILE_RAW;
+            False writes the compact replay-equivalent stream.
     """
     global _bus, _file_sinks
     _cfg["file_dir"] = envs.AGENT_MONITOR_DIR if file_dir is None else file_dir
@@ -494,7 +436,7 @@ def ensure_bus() -> EventBus:
     if _bus is None:
         b = EventBus()
         fs = FileSink(_cfg["file_dir"], raw=_cfg["raw"])
-        _file_sinks.append(fs)  # touch 扇出门(与事件通道同一实例)
+        _file_sinks.append(fs)
         b.add(fs.consume)
         for url in _cfg["ws_urls"]:
             if not _url_reachable(url):
@@ -508,7 +450,7 @@ def ensure_bus() -> EventBus:
                 continue
             try:
                 b.add(OtelSink(traces_url).consume)
-            except ImportError as exc:  # opentelemetry 缺失只降级,不拖垮调用
+            except ImportError as exc:
                 _log(f"otel sink 未启用(缺依赖): {exc}")
                 continue
             _log(f"otel sink 已启用: {traces_url}")

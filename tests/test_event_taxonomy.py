@@ -1,55 +1,77 @@
-"""Test event-envelope construction at the Python event-model boundary."""
+"""Contract tests for the canonical agent event algebra."""
 
 import pytest
 
-from gh_puller.agent.events import new_event, truncate
+from gh_puller.agent.events import DELTA_TYPES, NON_STREAM_TYPES, TAXONOMY, fold_request_state, new_event
 
 
-def test_new_event_envelope_and_jsonable():
-    event = new_event(
-        "user/message",
-        message={"role": "user", "content": [{"type": "text", "text": "hi"}]},
-        source={"kind": "user"},
-        surfaceOp="append",
+def _event(event_type: str, seq: int, **data) -> dict:
+    return {**new_event(event_type, **data), "seq": seq, "session": "s"}
+
+
+def test_taxonomy_separates_state_activity_and_markers() -> None:
+    assert {
+        "model/set", "header/set", "context/set", "context/append",
+        "context/append/user", "context/append/assistant", "context/append/tool",
+    } <= TAXONOMY
+    assert {
+        "model/request", "model/response", "tool/start", "tool/end",
+        "turn/start", "turn/end", "step/start", "step/end",
+    } <= TAXONOMY
+    assert NON_STREAM_TYPES == TAXONOMY - DELTA_TYPES
+
+
+def test_message_shapes_are_native_and_extensible() -> None:
+    specialized = new_event(
+        "context/append/assistant",
+        content=[{"type": "tool_call", "callId": "c1", "name": "read_file",
+                  "arguments": {"path": "a.py"}}],
     )
-    assert event["type"] == "user/message"
-    assert event["id"].startswith("e-")
-    assert isinstance(event["ts"], float)
-    assert event["data"]["message"]["role"] == "user"
-    assert "seq" not in event
-    with pytest.raises(ValueError, match="未知事件 type"):
-        new_event("nope")
-    with pytest.raises(TypeError):
-        new_event("session/start", meta={"bad": {1}})
-
-
-def test_new_event_surface_validation():
-    with pytest.raises(ValueError, match="缺 message 字段"):
-        new_event("user/message", source={"kind": "user"}, surfaceOp="append")
-    with pytest.raises(ValueError, match="缺合法 surfaceOp"):
-        new_event("assistant/message", message={"role": "assistant", "content": []})
-    with pytest.raises(ValueError, match="缺合法 surfaceOp"):
-        new_event(
-            "assistant/message",
-            message={"role": "assistant", "content": []},
-            surfaceOp="replace",
-        )
-
-
-def test_new_event_replace_op_and_ignorable():
-    event = new_event(
-        "user/message",
-        message={"role": "user", "content": [{"type": "text", "text": "新"}]},
-        source={"kind": "context", "label": "注记"},
-        surfaceOp={"op": "replace", "start": 3, "end": 3},
+    generic = new_event(
+        "context/append", role="critic",
+        content=[{"type": "annotation", "value": 1}],
     )
-    assert event["data"]["surfaceOp"] == {"op": "replace", "start": 3, "end": 3}
-    assert new_event("config/init", config={}).get("ignorable") is True
-    assert "ignorable" not in new_event("session/start", label="l")
+    assert specialized["data"]["content"][0]["arguments"] == {"path": "a.py"}
+    assert generic["data"]["role"] == "critic"
 
 
-def test_truncate():
-    assert truncate(None, 40) == (0, "")
-    assert truncate("", 40) == (0, "")
-    assert truncate("abc", 40) == (3, "abc")
-    assert truncate("abcdef", 3) == (6, "abc…")
+@pytest.mark.parametrize("event_type", [
+    "context/append/user", "context/append/assistant", "context/append/tool",
+])
+def test_specialized_append_derives_role(event_type: str) -> None:
+    with pytest.raises(ValueError, match="derives role"):
+        new_event(event_type, role="user", content=[])
+
+
+def test_state_fold_ignores_activity_and_marker_placement() -> None:
+    events = [
+        _event("turn/end", 0, outcome="unusual"),
+        _event("model/set", 1, model="m1", provider="p", parameters={}),
+        _event("header/set", 2, instructions=[], tools=[{"name": "read"}]),
+        _event("context/append/user", 3, content=[{"type": "text", "text": "old"}]),
+        _event("model/request", 4, requestId="r1"),
+        _event("model/delta/text", 5, requestId="r1", index=0, text="ignored"),
+        _event("context/set", 6, messages=[
+            {"role": "assistant", "content": [{"type": "text", "text": "summary"}]},
+        ]),
+        _event("context/append", 7, role="critic",
+               content=[{"type": "text", "text": "note"}]),
+        _event("model/set", 8, model="m2", parameters={"temperature": 0}),
+    ]
+    state = fold_request_state(events)
+    assert state["model"] == {"model": "m2", "parameters": {"temperature": 0}}
+    assert state["header"]["tools"] == [{"name": "read"}]
+    assert [message["role"] for message in state["context"]] == ["assistant", "critic"]
+
+
+def test_content_and_correlation_validation() -> None:
+    with pytest.raises(TypeError, match="list content"):
+        new_event("context/append/user", content="text")
+    with pytest.raises(ValueError, match="requestId"):
+        new_event("model/request")
+    with pytest.raises(ValueError, match="callId"):
+        new_event("tool/start", name="x", arguments={})
+    with pytest.raises(TypeError, match="message role"):
+        new_event("model/response", requestId="r1", message={"content": []})
+    with pytest.raises(ValueError, match="exactly one"):
+        new_event("tool/end", callId="c1", result="ok", error={"type": "error"})

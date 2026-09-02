@@ -1,34 +1,8 @@
-"""Agent 监控 Web/WS hub(FastAPI 端点层)。
+"""Serve persisted and live canonical agent events over HTTP and WebSocket.
 
-生产端是 gh_puller.agent 的 WsSink(经 AGENT_MONITOR_WEBUI_URL 接入,主动向 /ws 推
-{"type":"evts","events":[...]});浏览器查看端经同一端点订阅会话。GET / 与 /viewer
-直接出构建好的单文件 viewer(agent_monitor_viewer.html);hub 只持内存状态
-(每会话非流式历史按 seq 索引,raw chunk 只实时转发;完备真源是 FileSink 磁盘 JSONL —— 启动种子加载后,
-历史查看不再为空),写盘是 FileSink 的事,重启 hub 列表与历史均在。
-
-磁盘布局扁平(<uuid>.jsonl,根 = AGENT_MONITOR_DIR,见 gh_puller.agent.sinks.FileSink):
-分类学隐式化 —— 会话键 = 文件内 session/start 的 session 字段(<ns>/<uuid4>),
-状态 = 有无 session/end(有:按 data.state 分 completed/aborted;无:running;
-超租约(AGENT_MONITOR_LEASE_SECS)派生 aborted 的判态依据见
-gh_puller/agent/events.py 会话保活 —— 只内存态不写盘,文件复活自愈回 running)。
-index 时对 running 会话按需重判(文件 mtime 变化才重读尾部找终态);
-租约扫描(scan + lifespan 循环)周期把过期 running 翻转为 aborted 并向在线查看端广播。
-
-协议:一连接一角色,首帧定角色(evts/evt → 生产端,其余 → 查看端);查看端帧:
-- index → {type:"index", sessions:[{session, run_id, label, provider, model, state,
-  ts, last_ts, num_events}]}(last_ts 降序);
-- history {session, beforeSeq?, max?} → {type:"history", session, events, hasMore,
-  nextBeforeSeq}:磁盘+内存合并的 seq 升序页(beforeSeq 缺省读尾部;nextBeforeSeq
-  为 oldest in-page,客户端以此翻旧页),只含非流式投影。文件 seq 允许洞(洞=被跳过的
-  assistant/chunk),客户端只按 seq 排序/比较,不作稠密假设;
-- subscribe {session} → {type:"evt_ready", session, lastSeq} 后实时
-  {type:"evts","events":[...]} 批量推送(单订阅视图:一连接只盯一会话;
-  兼容旧生产端的单事件帧);
-- delete {session} → 内存移除 + 磁盘 JSONL 删除,随后向全部查看端广播
-  新 {type:"index"}(复用既有帧型,请求端在其中;幽灵删除同样广播,客户端
-  以索引回响推进列表,无需 ack 帧);
-- ping → pong。
-live 帧与生产端同构(带 seq),客户端按 seq 去重/接缝。
+The hub indexes compact JSONL histories, forwards raw live events, and derives a
+session lease state. It does not interpret replayable model context; clients fold the
+canonical stream. See ``gh_puller.agent.events`` for event semantics.
 """
 
 import asyncio
@@ -44,9 +18,13 @@ from fastapi.responses import Response
 from gh_puller import envs
 from gh_puller.agent.events import NON_STREAM_TYPES
 
-# 租约缺省(仅 hub 消费);LEASE 须 ≥ 3~5×HEARTBEAT ——
-# AGENT_MONITOR_HEARTBEAT_SECS 在 gh_puller.envs(生产端 sinks 消费,包内契约)。
+# The lease should remain several times longer than the producer heartbeat.
 _DEFAULT_LEASE_SECS = int(os.environ.get("AGENT_MONITOR_LEASE_SECS", "150"))
+
+
+def _session_state(outcome: str | None) -> str:
+    """Map a terminal protocol outcome to the monitor's coarse list state."""
+    return "completed" if outcome == "completed" else "aborted"
 
 
 def _log(msg: str) -> None:
@@ -54,15 +32,12 @@ def _log(msg: str) -> None:
 
 
 def _file_stem(session: str) -> str:
-    """会话 id → 文件名 stem(uuid 段):取最后一个 "/" 后段(与 FileSink 同映射)。
-
-    session id 形如 <ns>/<uuid4>(ns 由上层业务定);显式无斜杠 session 原样。
-    """
+    """Map a session id to the flat filename stem used by ``FileSink``."""
     return session.rsplit("/", 1)[-1]
 
 
 class _Session:
-    """hub 内存中的单会话状态:非流式历史索引与原始流高水位。"""
+    """Hold one compact history index and its raw-stream high-water mark."""
 
     def __init__(self, session: str, label: str = "", provider: str = "", model: str = "",
                  run_id: str | None = None, generator: str = ""):
@@ -75,36 +50,30 @@ class _Session:
         self.state = "running"
         self.ts = time.time()
         self.last_ts = self.ts
-        self.events: dict[int, dict] = {}  # seq → 非流式历史事件(feed 实时写入;种子时载入)
-        self.last_seq: int | None = None  # 原始事件流高水位(chunk 不进入 events)
-        self.subscribers: set = set()  # live evt 订阅(查看端;单视图语义)
-        self.disk_mtime: float = 0.0  # 最近一次重判时文件的 mtime(0 = 未查)
-        self.history_mtime: float = 0.0  # 最近一次历史缓存同步时的文件 mtime
+        self.events: dict[int, dict] = {}
+        self.last_seq: int | None = None
+        self.subscribers: set = set()
+        self.disk_mtime: float = 0.0
+        self.history_mtime: float = 0.0
 
 
 class _Hub:
-    """hub 内存状态:磁盘种子 + live 事件接收 + 按会话订阅广播。"""
+    """Merge disk seeds and live events, then serve per-session subscriptions."""
 
     def __init__(self, lease_secs: float | None = None):
         self.sessions: dict[str, _Session] = {}
-        self.viewers: set = set()  # 所有查看端连接(新会话/终态时广播 index;不同于 per-session subscribers)
-        self.root: str | None = None  # AGENT_MONITOR_DIR(history 合并磁盘用)
+        self.viewers: set = set()
+        self.root: str | None = None
         self.lease_secs = _DEFAULT_LEASE_SECS if lease_secs is None else lease_secs
 
     def _file_for(self, session: str) -> Path | None:
-        """会话 → 磁盘文件路径(扁平布局);root 未设 → None。"""
+        """Return the flat history path when disk history is configured."""
         if not self.root:
             return None
         return Path(self.root) / f"{_file_stem(session)}.jsonl"
 
     def seed(self, root: str | None) -> None:
-        """启动种子:扫描根目录下的 *.jsonl 扁平文件,载入事件溯源格式。
-
-        会话键取文件内 session/start 的 session 字段(文件名只是 stem,无状态目录);
-        状态隐式判定:文件含 session/end → 按 data.state 分 completed/aborted,
-        无 → running(崩溃残留/运行中)。旧(聚合 LLM 行)格式 / 坏行不可折叠 →
-        跳过并日志(不影响其余会话);live 续写经 feed(同 seq 覆盖,天然去重)。
-        """
+        """Load compact JSONL sessions and infer terminal or leased state."""
         if not root:
             return
         self.root = root
@@ -130,9 +99,9 @@ class _Hub:
                 if head is None and evt.get("type") == "session/start":
                     head = evt
                 if evt.get("type") == "session/end":
-                    end_state = (evt.get("data") or {}).get("state", "completed")
+                    end_state = _session_state((evt.get("data") or {}).get("outcome"))
                 if "seq" not in evt or "type" not in evt:
-                    continue  # 旧 v1 聚合行:无 seq/type,整体不可折叠
+                    continue
                 seq = int(evt["seq"])
                 last_seq = seq if last_seq is None else max(last_seq, seq)
                 if evt.get("type") in NON_STREAM_TYPES:
@@ -141,11 +110,13 @@ class _Hub:
                 _log(f"hub 种子跳过 {path.name}: 非事件溯源格式")
                 continue
             d = head.get("data") or {}
-            sid = head.get("session") or path.stem  # key = 事件内 session(文件名只是 stem)
-            sess = _Session(sid, head.get("label") or d.get("label"),
-                            head.get("provider") or d.get("provider"),
-                            head.get("model") or d.get("model"),
-                            run_id=head.get("run_id") or d.get("run_id"),
+            sid = head.get("session") or path.stem
+            model_event = next((event for event in reversed(events.values())
+                                if event.get("type") == "model/set"), None)
+            model_data = (model_event or {}).get("data") or {}
+            sess = _Session(sid, d.get("label"), model_data.get("provider") or "",
+                            model_data.get("model") or "",
+                            run_id=d.get("runId"),
                             generator=head.get("generator") or d.get("generator") or "")
             sess.state = end_state or "running"
             sess.ts = head.get("ts") or sess.ts
@@ -159,18 +130,11 @@ class _Hub:
                 sess.disk_mtime = 0.0
             if (end_state is None and sess.disk_mtime
                     and time.time() - sess.disk_mtime > self.lease_secs):
-                sess.state = "aborted"  # 崩溃残留:文件僵死超租约 → 孤儿(纯派生,不写盘;复活自愈见重判)
+                sess.state = "aborted"
             self.sessions[sid] = sess
 
     def _recheck_state(self, sess: _Session) -> None:
-        """按需重判(隐式分类学):running/aborted 会话的磁盘文件 mtime 变化 → 重读尾部找终态。
-
-        session/end 必为文件最后一条合法行(适配器 finish 的 finally 兜底);
-        文件尾部 64KB 内反向扫描即可。mtime 不变 → 不动(stat 与读盘分离,
-        全量跳过的会话零读盘)。自愈场景:seed 后文件继续被写(WS 漏帧/断接),
-        或崩溃残留文件被外部补写终态;孤儿(租约派生 aborted)文件复活 →
-        尾部无终态行 → 置回 running(生产端仍活着)。
-        """
+        """Recheck a changed file tail for terminal state or producer revival."""
         if sess.state == "completed":
             return
         path = self._file_for(sess.session)
@@ -196,22 +160,17 @@ class _Hub:
                 continue
             try:
                 evt = json.loads(line)
-            except Exception:  # noqa: S112 - 半行/坏行静默跳过(协议层容错,继续看更早的行)
+            except Exception:  # noqa: S112 - Continue past a partial trailing line.
                 continue
             if evt.get("type") == "session/end":
-                sess.state = (evt.get("data") or {}).get("state", "completed")
+                sess.state = _session_state((evt.get("data") or {}).get("outcome"))
                 sess.last_ts = max(sess.last_ts, evt.get("ts") or 0)
             elif was_aborted:
-                sess.state = "running"  # 复活自愈:文件前进但无终态行 → 生产端仍活着
-            break  # 只判最后一条合法文件行
+                sess.state = "running"
+            break
 
     async def scan(self) -> None:
-        """租约扫描:无终态行且文件 mtime 静止超租约 → 派生 aborted(内存态,不写盘)。
-
-        先按 _recheck_state 语义重判(mtime 变化 → 终态 / 复活自愈),再对仍 running
-        的会话套租约;任一会话真实翻转 → 广播一次 index(幂等:无翻转零广播)。
-        无 root / 文件缺失(delete 竞态)的会话跳过 —— 完成态不检查。
-        """
+        """Mark unterminated histories aborted after their file lease expires."""
         flipped = False
         for sess in self.sessions.values():
             if sess.state == "completed":
@@ -235,7 +194,7 @@ class _Hub:
             await self._broadcast_index()
 
     def index(self) -> list[dict]:
-        """会话索引(最近更新在前):供左列表渲染;先对 running 会话按需重判。"""
+        """Return session summaries ordered by latest activity."""
         for sess in self.sessions.values():
             self._recheck_state(sess)
         return sorted(
@@ -251,11 +210,7 @@ class _Hub:
         )
 
     async def delete(self, session: str) -> None:
-        """查看端删除会话:内存移除 + 磁盘文件删除 + 广播新索引。
-
-        磁盘与内存一体删(完备真源在磁盘;只删内存则重启后复活)。
-        运行中会话被删:生产端下一事件经 feed 惰性重建,列表与历史从头再来。
-        """
+        """Delete one in-memory and persisted session, then broadcast the index."""
         self.sessions.pop(session, None)
         path = self._file_for(session)
         if path is not None:
@@ -266,7 +221,7 @@ class _Hub:
         await self._broadcast_index()
 
     async def _push(self, subs: set, payload: str) -> None:
-        """向订阅集合逐端发一帧;发送失败记日志并剔除该端(不中断其余端)。"""
+        """Send one frame to subscribers, removing failed connections."""
         for sub in list(subs):
             try:
                 await sub.send_text(payload)
@@ -275,16 +230,12 @@ class _Hub:
                 subs.discard(sub)
 
     async def _broadcast_index(self) -> None:
-        """推送完整会话索引到所有查看端(新会话/终态变更时;协议不新增帧型)。"""
+        """Broadcast the complete session index to every viewer."""
         await self._push(self.viewers, json.dumps(
             {"type": "index", "sessions": self.index()}, ensure_ascii=False))
 
     def _session_events(self, sess: _Session) -> dict[int, dict]:
-        """同步磁盘的非流式投影并返回缓存(seq 键;live 内存优先)。
-
-        文件为扁平布局(<uuid>.jsonl);seq 允许洞(洞=被跳过的
-        assistant/chunk),按键合并天然兼容。
-        """
+        """Merge changed compact disk history into the live cache by sequence."""
         cand = self._file_for(sess.session)
         if cand is not None and cand.exists():
             try:
@@ -299,10 +250,10 @@ class _Hub:
                     continue
                 try:
                     evt = json.loads(line)
-                except Exception:  # noqa: S112 - 坏行静默跳过(旧文件尾部半行/截断行,协议层容错)
+                except Exception:  # noqa: S112 - Ignore partial or corrupt lines.
                     continue
                 if "seq" not in evt:
-                    continue  # 旧格式行跳过
+                    continue
                 if evt.get("type") in NON_STREAM_TYPES:
                     disk[int(evt["seq"])] = evt
             disk.update(sess.events)
@@ -311,7 +262,7 @@ class _Hub:
         return sess.events
 
     def _history_page(self, sess: _Session, before: int | None, max_n: int):
-        """seq 升序分页:取 beforeSeq(缺省无限)之下最近 max_n 条;翻旧页用 nextBeforeSeq。"""
+        """Return the latest sequence-ordered page below ``before``."""
         merged = self._session_events(sess)
         seqs = sorted(k for k in merged if before is None or k < before)
         page = seqs[-max_n:]
@@ -331,7 +282,7 @@ class _Hub:
             sess = _Session(sid, evt.get("label") or d.get("label"),
                             evt.get("provider") or d.get("provider"),
                             evt.get("model") or d.get("model"),
-                            run_id=evt.get("run_id") or d.get("run_id") or None,
+                            run_id=d.get("runId") or None,
                             generator=evt.get("generator") or d.get("generator") or "")
             self.sessions[sid] = sess
         seq = evt.get("seq")
@@ -343,14 +294,16 @@ class _Hub:
         sess.last_ts = evt.get("ts") or time.time()
         if evt.get("type") == "session/start":
             d = evt.get("data") or {}
-            sess.label = evt.get("label") or d.get("label") or sess.label
-            sess.provider = evt.get("provider") or d.get("provider") or sess.provider
-            sess.generator = evt.get("generator") or d.get("generator") or sess.generator
-            sess.model = evt.get("model") or d.get("model") or sess.model
-            sess.run_id = evt.get("run_id") or d.get("run_id") or sess.run_id
+            sess.label = d.get("label") or sess.label
+            sess.generator = d.get("generator") or sess.generator
+            sess.run_id = d.get("runId") or sess.run_id
+        elif evt.get("type") == "model/set":
+            d = evt.get("data") or {}
+            sess.provider = d.get("provider") or sess.provider
+            sess.model = d.get("model") or sess.model
         elif evt.get("type") == "session/end":
-            sess.state = (evt.get("data") or {}).get("state", "completed")
-        return sess, created or evt.get("type") == "session/end"
+            sess.state = _session_state((evt.get("data") or {}).get("outcome"))
+        return sess, created or evt.get("type") in {"model/set", "session/end"}
 
     async def feed_batch(self, events: list[dict]) -> None:
         """Record a producer batch and forward one batch per subscribed session."""
@@ -382,7 +335,7 @@ class _Hub:
 
 
 def _viewer_html(static_root: Path) -> bytes:
-    """读静态产物(static/agent_monitor_viewer.html);缺件回退文案。"""
+    """Read the built viewer, returning a diagnostic page when absent."""
     path = static_root / "agent_monitor_viewer.html"
     if path.exists():
         return path.read_bytes()
@@ -391,7 +344,7 @@ def _viewer_html(static_root: Path) -> bytes:
 
 
 async def _producer_loop(ws: WebSocket, hub: _Hub, first: dict) -> None:
-    """生产端(gh_puller WsSink):feed 事件/应答 ping。"""
+    """Receive producer batches and answer keepalive pings."""
     if first.get("type") == "evts":
         await hub.feed_batch(first.get("events") or [])
     else:
@@ -433,10 +386,10 @@ async def _viewer_frame(ws: WebSocket, hub: _Hub, frame: dict) -> None:
         sid = frame.get("session") or ""
         sess = hub.sessions.get(sid)
         for s in hub.sessions.values():
-            s.subscribers.discard(ws)  # 单视图:一条连接只盯一个会话
+            s.subscribers.discard(ws)
         last_seq = None
         if sess is not None:
-            sess.subscribers.add(ws)  # 先登记再应答:live 推送无缝隙
+            sess.subscribers.add(ws)
             last_seq = sess.last_seq
         await ws.send_text(json.dumps(
             {"type": "evt_ready", "session": sid, "lastSeq": last_seq}, ensure_ascii=False))
@@ -447,7 +400,7 @@ async def _viewer_frame(ws: WebSocket, hub: _Hub, frame: dict) -> None:
 
 
 async def _viewer_loop(ws: WebSocket, hub: _Hub, first: dict) -> None:
-    """查看端(浏览器/回环测试):页面帧应答;断连清理订阅。"""
+    """Serve viewer frames and remove subscriptions on disconnect."""
     try:
         await _viewer_frame(ws, hub, first)
         while True:
@@ -461,7 +414,7 @@ async def _viewer_loop(ws: WebSocket, hub: _Hub, first: dict) -> None:
 
 
 async def _lease_loop(h: _Hub) -> None:
-    """租约扫描循环:翻转孤儿会话并广播;异常只记日志不退出(监控不拖垮主服务)。"""
+    """Scan leases continuously without letting failures stop the service."""
     while True:
         try:
             await h.scan()
@@ -471,7 +424,7 @@ async def _lease_loop(h: _Hub) -> None:
 
 
 def create_app(hub: _Hub | None = None, *, static_root: Path | None = None) -> FastAPI:
-    """组装 FastAPI 应用(测试可注入空 hub / 静态目录);缺省 hub 启动时磁盘种子。"""
+    """Build the FastAPI app, seeding disk history for the default hub."""
     h = hub if hub is not None else _Hub()
     if hub is None:
         h.seed(envs.AGENT_MONITOR_DIR)
@@ -498,12 +451,12 @@ def create_app(hub: _Hub | None = None, *, static_root: Path | None = None) -> F
         await ws.accept()
         try:
             first = json.loads(await asyncio.wait_for(ws.receive_text(), timeout=10))
-        except Exception:  # 超时/断开/非 JSON:静默释放
+        except Exception:
             return
         if first.get("type") in {"evt", "evts"}:
             await _producer_loop(ws, h, first)
-        else:  # index/history/subscribe/ping:一律按查看端处理
-            h.viewers.add(ws)  # 广播 index 的受众(离开时 _viewer_loop finally 剔除)
+        else:
+            h.viewers.add(ws)
             await _viewer_loop(ws, h, first)
 
     return app
