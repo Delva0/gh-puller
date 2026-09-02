@@ -367,42 +367,6 @@ class GitHubAPI:
         }
         return json.dumps(payload, default=str, sort_keys=True, separators=(",", ":"))
 
-    async def collection_size(
-        self,
-        path: str,
-        *,
-        params: Mapping[str, Any] | None = None,
-    ) -> int | None:
-        """以一个列表条目请求估算页式 REST 集合的当前大小。
-
-        Args:
-            path: 分页 API 路径。
-            params: 决定集合成员与顺序的查询参数。
-
-        Returns:
-            ``per_page=1`` 下 ``last`` 链接证明的条目数；服务端不给出可解析
-            的末页时返回 None。该结果仅用于调用成本规划，不参与完整性认证。
-        """
-        query = dict(params or {})
-        query["per_page"] = 1
-        response = await self._request("GET", path, params=query)
-        try:
-            page = response.json()
-        except json.JSONDecodeError as exc:
-            raise GitHubAPIError(f"GitHub returned invalid JSON for {response.url}") from exc
-        if not isinstance(page, list) or any(not isinstance(item, dict) for item in page):
-            raise GitHubAPIError(f"GitHub returned a non-object page for {response.url}")
-        if "next" not in response.links:
-            return len(page)
-        last = response.links.get("last", {}).get("url")
-        if not isinstance(last, str):
-            return None
-        try:
-            count = int(httpx.URL(last).params["page"])
-        except (KeyError, ValueError):
-            return None
-        return count if count > 0 else None
-
     async def repository_item_count(self, owner: str, repo: str) -> int | None:
         """读取仓库当前 Issue 与 PR 的精确总数。
 

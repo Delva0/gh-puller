@@ -8,8 +8,6 @@ from __future__ import annotations
 
 import asyncio
 import fcntl
-import hashlib
-import math
 import os
 import re
 from collections import deque
@@ -95,13 +93,6 @@ class _API(Protocol):
         page_observer: Callable[[int], None] | None = None,
     ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]: ...
 
-    async def collection_size(
-        self,
-        path: str,
-        *,
-        params: dict[str, Any] | None = None,
-    ) -> int | None: ...
-
     async def repository_item_count(self, owner: str, repo: str) -> int | None: ...
 
 
@@ -158,12 +149,6 @@ class _CatalogPlan:
     force_all: bool  # Whether every surviving bundle must be fetched.
 
 
-@dataclass(frozen=True, slots=True)
-class _BundleFeeds:
-    issue_comments: dict[int, list[dict[str, Any]]] | None
-    review_comments: dict[int, list[dict[str, Any]]] | None
-
-
 class GitHubPuller:
     """可复用的 GitHub 增量拉取操作。
 
@@ -191,7 +176,6 @@ class GitHubPuller:
         self._observer = observer
         self._owner, self._repo = config.repository.split("/", 1)
         self._base = f"/repos/{self._owner}/{self._repo}"
-        self._feed_counts: dict[str, int] = {}
 
     async def pull(self, target: datetime | None = None) -> PullResult:
         """完成一次增量拉取并原子发布一个事实库 run。
@@ -375,17 +359,6 @@ class GitHubPuller:
             api.request_count,
         )
 
-        feeds = await self._bundle_feeds(
-            api,
-            heads,
-            plan.items,
-            candidates,
-            cutoff,
-            pass_name,
-            progress,
-        )
-        progress.resume_bundles(pass_name, api.request_count)
-
         await self._fetch_candidates(
             api,
             archive,
@@ -393,9 +366,9 @@ class GitHubPuller:
             heads,
             plan.items,
             candidates,
+            plan.signals,
             _iso(cutoff),
             progress,
-            feeds,
         )
         tombstones = [
             StagedResource(
@@ -569,9 +542,9 @@ class GitHubPuller:
         heads: dict[int, StoredHead],
         summaries: dict[int, dict[str, Any]],
         candidates: set[int],
+        comment_signals: set[int],
         observed_at: str,
         progress: _PullProgressTracker,
-        feeds: _BundleFeeds,
     ) -> None:
         async def fetch(
             number: int,
@@ -597,10 +570,14 @@ class GitHubPuller:
             bundle, http_cache = await self._fetch_bundle(
                 api,
                 summary,
-                feeds,
                 previous_bundle,
                 previous_cache,
-                catalog_issue=summary if stored_summary is not None else None,
+                catalog_issue=(
+                    summary
+                    if stored_summary is not None and self.config.bundle_mode == "optimized"
+                    else None
+                ),
+                force_comments=number in comment_signals,
             )
             if stored_summary is None:
                 detail = bundle.get("issue")
@@ -656,134 +633,15 @@ class GitHubPuller:
                 )
             raise
 
-    async def _bundle_feeds(
-        self,
-        api: _API,
-        heads: dict[int, StoredHead],
-        summaries: dict[int, dict[str, Any]],
-        candidates: set[int],
-        cutoff: datetime,
-        pass_name: str,
-        progress: _PullProgressTracker,
-    ) -> _BundleFeeds:
-        if self.config.bundle_mode == "exhaustive":
-            return _BundleFeeds(None, None)
-        pulls = {number for number in candidates if _candidate_kind(number, heads, summaries) == "pull"}
-        issue_comments = await self._safe_pooled_feed(
-            api,
-            "issues/comments",
-            "issue_url",
-            candidates,
-            cutoff,
-            pass_name,
-            progress,
-        )
-        review_comments = await self._safe_pooled_feed(
-            api,
-            "pulls/comments",
-            "pull_request_url",
-            pulls,
-            cutoff,
-            pass_name,
-            progress,
-        )
-        return _BundleFeeds(issue_comments, review_comments)
-
-    async def _safe_pooled_feed(
-        self,
-        api: _API,
-        endpoint: str,
-        url_field: str,
-        parents: set[int],
-        cutoff: datetime,
-        pass_name: str,
-        progress: _PullProgressTracker,
-    ) -> dict[int, list[dict[str, Any]]] | None:
-        try:
-            return await self._pooled_feed(
-                api,
-                endpoint,
-                url_field,
-                parents,
-                cutoff,
-                pass_name,
-                progress,
-            )
-        except GitHubAPIError:
-            progress.feed_fallback(endpoint, api.request_count)
-            return None
-
-    async def _pooled_feed(
-        self,
-        api: _API,
-        endpoint: str,
-        url_field: str,
-        parents: set[int],
-        cutoff: datetime,
-        pass_name: str,
-        progress: _PullProgressTracker,
-    ) -> dict[int, list[dict[str, Any]]] | None:
-        # A certified feed needs at least two requests, so tiny candidate sets win per parent.
-        if len(parents) <= 2:
-            return None
-        path = f"{self._base}/{endpoint}"
-        params = {"sort": "created", "direction": "asc"}
-        progress.start_feed(pass_name, endpoint, 0, None, api.request_count)
-        count = self._feed_counts.get(endpoint)
-        if count is None:
-            count = await api.collection_size(path, params=params)
-            if count is None:
-                return None
-            self._feed_counts[endpoint] = count
-        expected_pages = max(1, math.ceil(count / 100))
-        if 2 * expected_pages >= len(parents):
-            return None
-
-        progress.start_feed(pass_name, endpoint, 1, expected_pages, api.request_count)
-        previous, validator = await api.paginate_cached(
-            path,
-            previous=None,
-            cache=None,
-            params=params,
-            page_observer=progress.feed_page,
-        )
-        self._feed_counts[endpoint] = len(previous)
-        expected_pages = max(1, math.ceil(len(previous) / 100))
-        if expected_pages >= len(parents):
-            return None
-        previous_digest = _feed_prefix_digest(
-            _canonical_feed(previous, url_field),
-            cutoff,
-        )
-        scan = 1
-        while True:
-            scan += 1
-            progress.start_feed(pass_name, endpoint, scan, expected_pages, api.request_count)
-            current, validator = await api.paginate_cached(
-                path,
-                previous=previous,
-                cache=validator,
-                params=params,
-                page_observer=progress.feed_page,
-            )
-            canonical = _canonical_feed(current, url_field)
-            current_digest = _feed_prefix_digest(canonical, cutoff)
-            if current_digest == previous_digest:
-                self._feed_counts[endpoint] = len(current)
-                return _group_feed(canonical, url_field, parents)
-            previous = current
-            previous_digest = current_digest
-            expected_pages = max(1, math.ceil(len(current) / 100))
-
     async def _fetch_bundle(
         self,
         api: _API,
         summary: dict[str, Any],
-        feeds: _BundleFeeds,
         previous: dict[str, Any] | None,
         previous_cache: dict[str, Any] | None,
         *,
         catalog_issue: dict[str, Any] | None,
+        force_comments: bool,
     ) -> tuple[dict[str, Any], dict[str, Any] | None]:
         number = int(summary["number"])
         issue_path = f"{self._base}/issues/{number}"
@@ -798,7 +656,13 @@ class GitHubPuller:
             _set_cache(http_cache, "issue", cache)
         else:
             issue = catalog_issue
-        if feeds.issue_comments is None:
+        if (
+            self.config.bundle_mode == "optimized"
+            and not force_comments
+            and _is_zero_integer(issue.get("comments"))
+        ):
+            comments = []
+        else:
             comments, cache = await self._cached_page(
                 api,
                 f"{issue_path}/comments",
@@ -806,8 +670,6 @@ class GitHubPuller:
                 _dict_field(previous_cache, "issue_comments"),
             )
             _set_cache(http_cache, "issue_comments", cache)
-        else:
-            comments = feeds.issue_comments.get(number, [])
         comments = _canonical_comments(comments)
         timeline, cache = await self._cached_page(
             api,
@@ -864,9 +726,9 @@ class GitHubPuller:
             pull, cache = await self._fetch_pull(
                 api,
                 number,
-                feeds,
                 _dict_field(previous, "pull_request"),
                 _dict_field(previous_cache, "pull_request"),
+                force_comments=force_comments,
             )
             bundle["pull_request"] = pull
             _set_cache(http_cache, "pull_request", cache)
@@ -876,9 +738,10 @@ class GitHubPuller:
         self,
         api: _API,
         number: int,
-        feeds: _BundleFeeds,
         previous: dict[str, Any] | None,
         previous_cache: dict[str, Any] | None,
+        *,
+        force_comments: bool,
     ) -> tuple[dict[str, Any], dict[str, Any] | None]:
         path = f"{self._base}/pulls/{number}"
         http_cache: dict[str, Any] = {}
@@ -896,7 +759,13 @@ class GitHubPuller:
             _dict_field(previous_cache, "reviews"),
         )
         _set_cache(http_cache, "reviews", cache)
-        if feeds.review_comments is None:
+        if (
+            self.config.bundle_mode == "optimized"
+            and not force_comments
+            and _is_zero_integer(pull.get("review_comments"))
+        ):
+            review_comments = []
+        else:
             review_comments, cache = await self._cached_page(
                 api,
                 f"{path}/comments",
@@ -904,8 +773,6 @@ class GitHubPuller:
                 _dict_field(previous_cache, "review_comments"),
             )
             _set_cache(http_cache, "review_comments", cache)
-        else:
-            review_comments = feeds.review_comments.get(number, [])
         review_comments = _canonical_comments(review_comments)
         if self.config.bundle_mode == "optimized" and _is_zero_integer(pull.get("commits")):
             commits = []
@@ -929,13 +796,15 @@ class GitHubPuller:
                 _dict_field(previous_cache, "files"),
             )
             _set_cache(http_cache, "files", cache)
-        requested_reviewers, cache = await self._cached_json(
-            api,
-            f"{path}/requested_reviewers",
-            _dict_field(previous, "requested_reviewers"),
-            _dict_field(previous_cache, "requested_reviewers"),
-        )
-        _set_cache(http_cache, "requested_reviewers", cache)
+        requested_reviewers = _embedded_review_requests(pull) if self.config.bundle_mode == "optimized" else None
+        if requested_reviewers is None:
+            requested_reviewers, cache = await self._cached_json(
+                api,
+                f"{path}/requested_reviewers",
+                _dict_field(previous, "requested_reviewers"),
+                _dict_field(previous_cache, "requested_reviewers"),
+            )
+            _set_cache(http_cache, "requested_reviewers", cache)
         review_reactions, cache = await self._reactions(
             api,
             "pulls/comments",
@@ -1368,20 +1237,6 @@ def _needs_refresh(head: StoredHead | None, summary: dict[str, Any]) -> bool:
     )
 
 
-def _candidate_kind(
-    number: int,
-    heads: dict[int, StoredHead],
-    summaries: dict[int, dict[str, Any]],
-) -> str:
-    summary = summaries.get(number)
-    if summary is not None:
-        return _kind(summary)
-    head = heads.get(number)
-    if head is None:
-        raise IncompleteGitHubDataError(f"candidate #{number} has no catalog identity")
-    return head.kind
-
-
 def _dict_field(value: dict[str, Any] | None, key: str) -> dict[str, Any] | None:
     item = value.get(key) if isinstance(value, dict) else None
     return item if isinstance(item, dict) else None
@@ -1418,60 +1273,25 @@ def _canonical_comments(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return sorted(items, key=lambda item: int(item["id"]))
 
 
-def _canonical_feed(
-    items: list[dict[str, Any]],
-    url_field: str,
-) -> list[dict[str, Any]]:
-    canonical = _canonical_comments(items)
-    for item in canonical:
-        if _feed_number(item, url_field) is None:
-            raise IncompleteGitHubDataError(f"GitHub comment has no valid {url_field}")
-    return sorted(
-        canonical,
-        key=lambda item: (
-            _feed_number(item, url_field),
-            int(item["id"]),
-        ),
-    )
-
-
-def _group_feed(
-    items: list[dict[str, Any]],
-    url_field: str,
-    parents: set[int],
-) -> dict[int, list[dict[str, Any]]]:
-    grouped: dict[int, list[dict[str, Any]]] = {}
-    for item in items:
-        number = _feed_number(item, url_field)
-        if number in parents:
-            grouped.setdefault(number, []).append(item)
-    return grouped
-
-
-def _feed_prefix_digest(items: list[dict[str, Any]], cutoff: datetime) -> str:
-    digest = hashlib.sha256()
-    count = 0
-    for item in items:
-        if _item_time(item, "created_at") > cutoff:
-            continue
-        digest.update(bytes.fromhex(json_digest(item)))
-        count += 1
-    digest.update(count.to_bytes(8, "big"))
-    return digest.hexdigest()
-
-
-def _feed_number(item: dict[str, Any], url_field: str) -> int | None:
-    value = item.get(url_field)
-    match = _NUMBER_AT_END.search(value) if isinstance(value, str) else None
-    return int(match.group(1)) if match else None
-
-
 def _is_zero_count(value: Any) -> bool:
     return isinstance(value, dict) and _is_zero_integer(value.get("total_count"))
 
 
 def _is_zero_integer(value: Any) -> bool:
     return type(value) is int and value == 0
+
+
+def _embedded_review_requests(pull: dict[str, Any]) -> dict[str, Any] | None:
+    users = pull.get("requested_reviewers")
+    teams = pull.get("requested_teams")
+    if (
+        not isinstance(users, list)
+        or any(not isinstance(user, dict) for user in users)
+        or not isinstance(teams, list)
+        or teams
+    ):
+        return None
+    return {"users": users, "teams": []}
 
 
 def _head_from_summary(

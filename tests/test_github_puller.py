@@ -88,7 +88,11 @@ class FakeAPI:
             raise RuntimeError(f"injected failure: {path}")
         if path.endswith("/requested_reviewers"):
             return deepcopy(self.json.get(path, {"users": [], "teams": []}))
-        return deepcopy(self.json[path])
+        value = deepcopy(self.json[path])
+        if re.fullmatch(rf"{re.escape(_BASE)}/pulls/\d+", path):
+            value.setdefault("requested_reviewers", [])
+            value.setdefault("requested_teams", [])
+        return value
 
     async def get_text(self, path: str, *, accept: str) -> str:
         self._called("text", path, None)
@@ -134,16 +138,6 @@ class FakeAPI:
             else:
                 page_observer(0)
         return items
-
-    async def collection_size(
-        self,
-        path: str,
-        *,
-        params: dict[str, Any] | None = None,
-    ) -> int | None:
-        items = self._items(path, params)
-        self._called("size", path, params)
-        return len(items)
 
     async def paginate_cached(
         self,
@@ -645,6 +639,8 @@ async def test_pull_request_bundle_preserves_all_discussion_and_diff_data(tmp_pa
         "commits": 1,
         "mergeable_state": "clean",
         "review_comments": 2,
+        "requested_reviewers": [{"login": "alice"}],
+        "requested_teams": [],
     }
     api.json[f"{pull_path}/requested_reviewers"] = {"users": [{"login": "alice"}], "teams": []}
     api.pages[f"{pull_path}/reviews"] = [{"id": 71, "state": "APPROVED", "body": "ship it"}]
@@ -674,7 +670,7 @@ async def test_pull_request_bundle_preserves_all_discussion_and_diff_data(tmp_pa
     assert pull["diff"].startswith("diff --git")
     assert pull["patch"].startswith("From abc")
     assert (await _current(tmp_path / "archive"))[7].kind == "pull"
-    assert any(call[1] == f"{issue_path}/comments" for call in api.calls)
+    assert not any(call[1] == f"{issue_path}/comments" for call in api.calls)
 
 
 @pytest.mark.asyncio
@@ -899,7 +895,6 @@ async def test_bundle_validators_survive_puller_restart_and_reuse_only_paired_pa
     await GitHubPuller(_config(archive), api=second_api, now=lambda: changed_at).pull(changed_at)
 
     assert second_api.reused == {
-        f"{_BASE}/issues/1/comments",
         f"{_BASE}/issues/1/events",
         f"{_BASE}/issues/1/timeline",
     }
@@ -1042,7 +1037,7 @@ async def test_certified_puller_stays_byte_equal_to_exhaustive_oracle(tmp_path: 
 
 
 @pytest.mark.asyncio
-async def test_pooled_bundle_transport_matches_per_parent_oracle_and_saves_requests(
+async def test_per_bundle_transport_matches_exhaustive_oracle_and_saves_requests(
     tmp_path: Path,
 ) -> None:
     optimized_api = FakeAPI()
@@ -1053,45 +1048,47 @@ async def test_pooled_bundle_transport_matches_per_parent_oracle_and_saves_reque
             pull = number % 5 == 0
             api.add_issue(number, pull=pull)
             issue_path = f"{_BASE}/issues/{number}"
-            issue_comments = []
-            for offset in range(rng.randrange(5)):
-                comment_id = number * 100 + offset
-                issue_comments.append(
-                    {
-                        "id": comment_id,
-                        "body": f"issue comment {comment_id}",
-                        "issue_url": issue_path,
-                        "created_at": _iso(_T0 - timedelta(minutes=offset + 1)),
-                        "updated_at": _iso(_T0 - timedelta(minutes=offset + 1)),
-                        "reactions": {"total_count": 0},
-                    },
-                )
-            api.pages[f"{issue_path}/comments"] = issue_comments
-            api.json[issue_path]["comments"] = len(issue_comments)
+            comments = [
+                {
+                    "id": number * 100 + offset,
+                    "body": f"issue comment {number}:{offset}",
+                    "created_at": _iso(_T0 - timedelta(minutes=offset + 1)),
+                    "updated_at": _iso(_T0 - timedelta(minutes=offset + 1)),
+                    "reactions": {"total_count": 0},
+                }
+                for offset in range(rng.randrange(5))
+            ]
+            api.pages[f"{issue_path}/comments"] = comments
+            api.json[issue_path]["comments"] = len(comments)
+            api.pages[f"{issue_path}/timeline"] = [{"id": number * 1000, "event": "labeled"}]
+            api.pages[f"{issue_path}/events"] = [{"id": number * 1000 + 1, "event": "labeled"}]
+            if number % 7 == 0:
+                api.json[issue_path]["reactions"]["total_count"] = 1
+                api.pages[f"{issue_path}/reactions"] = [{"id": number * 1000 + 2, "content": "+1"}]
             if not pull:
                 continue
             pull_path = f"{_BASE}/pulls/{number}"
+            users = [{"id": number, "login": f"user-{number}"}] if number % 10 == 0 else []
+            review_comments = [
+                {
+                    "id": 1_000_000 + number * 100 + offset,
+                    "body": f"review comment {number}:{offset}",
+                    "created_at": _iso(_T0 - timedelta(minutes=offset + 1)),
+                    "updated_at": _iso(_T0 - timedelta(minutes=offset + 1)),
+                    "reactions": {"total_count": 0},
+                }
+                for offset in range(rng.randrange(4))
+            ]
             api.json[pull_path] = {
                 "id": number * 10,
                 "changed_files": 0,
                 "commits": 0,
-                "review_comments": 0,
+                "review_comments": len(review_comments),
+                "requested_reviewers": users,
+                "requested_teams": [],
             }
-            review_comments = []
-            for offset in range(rng.randrange(4)):
-                comment_id = 1_000_000 + number * 100 + offset
-                review_comments.append(
-                    {
-                        "id": comment_id,
-                        "body": f"review comment {comment_id}",
-                        "pull_request_url": pull_path,
-                        "created_at": _iso(_T0 - timedelta(minutes=offset + 1)),
-                        "updated_at": _iso(_T0 - timedelta(minutes=offset + 1)),
-                        "reactions": {"total_count": 0},
-                    },
-                )
+            api.json[f"{pull_path}/requested_reviewers"] = {"users": users, "teams": []}
             api.pages[f"{pull_path}/comments"] = review_comments
-            api.json[pull_path]["review_comments"] = len(review_comments)
 
     optimized_path = tmp_path / "optimized"
     oracle_path = tmp_path / "oracle"
@@ -1108,206 +1105,56 @@ async def test_pooled_bundle_transport_matches_per_parent_oracle_and_saves_reque
 
     assert await _managed_snapshot(optimized_path) == await _managed_snapshot(oracle_path)
     assert optimized.requests < oracle.requests * 0.7
-    assert sum(call[0] == "page" and call[1] == f"{_BASE}/issues/comments" for call in optimized_api.calls) == 2
-    assert sum(call[0] == "page" and call[1] == f"{_BASE}/pulls/comments" for call in optimized_api.calls) == 2
-    assert not any(
-        call[0] == "page" and re.fullmatch(rf"{re.escape(_BASE)}/issues/\d+/comments", call[1])
+    repository_feeds = {f"{_BASE}/issues/comments", f"{_BASE}/pulls/comments"}
+    assert not any(call[1] in repository_feeds for call in optimized_api.calls)
+    optimized_roots = [
+        call
+        for call in optimized_api.calls
+        if call[0] == "json" and re.fullmatch(rf"{re.escape(_BASE)}/issues/\d+", call[1])
+    ]
+    oracle_roots = [
+        call
+        for call in oracle_api.calls
+        if call[0] == "json" and re.fullmatch(rf"{re.escape(_BASE)}/issues/\d+", call[1])
+    ]
+    assert (len(optimized_roots), len(oracle_roots)) == (0, 360)
+    nonempty_comments = sum(bool(optimized_api.pages[f"{_BASE}/issues/{number}/comments"]) for number in range(1, 361))
+    optimized_comment_calls = sum(
+        call[0] == "page" and re.fullmatch(rf"{re.escape(_BASE)}/issues/\d+/comments", call[1]) is not None
         for call in optimized_api.calls
     )
-    assert any(
-        call[0] == "page" and re.fullmatch(rf"{re.escape(_BASE)}/issues/\d+/comments", call[1])
+    oracle_comment_calls = sum(
+        call[0] == "page" and re.fullmatch(rf"{re.escape(_BASE)}/issues/\d+/comments", call[1]) is not None
         for call in oracle_api.calls
     )
+    assert (optimized_comment_calls, oracle_comment_calls) == (nonempty_comments, 360)
+    assert not any(call[1].endswith("/requested_reviewers") for call in optimized_api.calls)
+    assert sum(call[1].endswith("/requested_reviewers") for call in oracle_api.calls) == 72
 
 
 @pytest.mark.asyncio
-async def test_failed_pooled_feed_falls_back_to_equivalent_per_parent_reads(
-    tmp_path: Path,
-) -> None:
-    class FailingPooledFeedAPI(FakeAPI):
-        async def paginate_cached(
-            self,
-            path: str,
-            *,
-            previous: list[dict[str, Any]] | None,
-            cache: dict[str, Any] | None,
-            params: dict[str, Any] | None = None,
-            page_observer: Any = None,
-        ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
-            if path == f"{_BASE}/issues/comments" and not (params and params.get("since")):
-                self._called("page", path, params, requests=3)
-                if page_observer is not None:
-                    page_observer(100)
-                    page_observer(100)
-                raise GitHubAPIError("persistent repository feed failure")
-            return await super().paginate_cached(
-                path,
-                previous=previous,
-                cache=cache,
-                params=params,
-                page_observer=page_observer,
-            )
-
-    optimized_api = FailingPooledFeedAPI()
-    oracle_api = FakeAPI()
-    for api in (optimized_api, oracle_api):
-        for number in range(1, 11):
-            api.add_issue(number)
-            issue_path = f"{_BASE}/issues/{number}"
-            comments = [
-                {
-                    "id": number * 100 + offset,
-                    "body": f"comment {number}:{offset}",
-                    "created_at": _iso(_T0 - timedelta(seconds=offset)),
-                    "updated_at": _iso(_T0 - timedelta(seconds=offset)),
-                    "reactions": {"total_count": 0},
-                }
-                for offset in range(25)
-            ]
-            api.pages[f"{issue_path}/comments"] = comments
-            api.json[issue_path]["comments"] = len(comments)
-
-    events: list[PullProgress] = []
-    optimized_path = tmp_path / "optimized"
-    oracle_path = tmp_path / "oracle"
-    await GitHubPuller(
-        _config(optimized_path, bundle_mode="optimized"),
-        api=optimized_api,
-        now=lambda: _T0,
-        observer=events.append,
-    ).pull(_T0)
-    await GitHubPuller(
-        _config(oracle_path, bundle_mode="exhaustive"),
-        api=oracle_api,
-        now=lambda: _T0,
-    ).pull(_T0)
-
-    assert await _managed_snapshot(optimized_path) == await _managed_snapshot(oracle_path)
-    assert any(
-        event.phase == "closing_feeds"
-        and event.feed_name == "issues/comments"
-        and event.feed_scan == 1
-        and event.feed_pages_seen == 2
-        for event in events
-    )
-    assert any(event.detail == "issues_comments_per_parent_fallback" for event in events)
-    assert sum(
-        call[0] == "page"
-        and re.fullmatch(rf"{re.escape(_BASE)}/issues/\d+/comments", call[1]) is not None
-        for call in optimized_api.calls
-    ) == 10
-    assert events[-1].phase == "done"
-
-
-@pytest.mark.asyncio
-async def test_pooled_feed_repeats_until_concurrent_mutation_is_stable(tmp_path: Path) -> None:
-    class MutatingFeedAPI(FakeAPI):
-        def __init__(self) -> None:
-            super().__init__()
-            self.feed_scans = 0
-
-        async def paginate(
-            self,
-            path: str,
-            *,
-            params: dict[str, Any] | None = None,
-            page_observer: Any = None,
-        ) -> list[dict[str, Any]]:
-            items = await super().paginate(path, params=params, page_observer=page_observer)
-            if path != f"{_BASE}/issues/comments" or (params and params.get("since")):
-                return items
-            self.feed_scans += 1
-            if self.feed_scans == 1:
-                issue_path = f"{_BASE}/issues/1"
-                late = {
-                    "id": 102,
-                    "body": "arrived between scans",
-                    "created_at": _iso(_T0 - timedelta(seconds=1)),
-                    "updated_at": _iso(_T0 - timedelta(seconds=1)),
-                    "reactions": {"total_count": 0},
-                }
-                self.pages[f"{issue_path}/comments"].append(late)
-                self.json[issue_path]["comments"] = 2
-            return items
-
-    api = MutatingFeedAPI()
-    for number in range(1, 11):
-        api.add_issue(number)
-    issue_path = f"{_BASE}/issues/1"
-    api.pages[f"{issue_path}/comments"] = [
-        {
-            "id": 101,
-            "body": "before scan",
-            "created_at": _iso(_T0 - timedelta(minutes=1)),
-            "updated_at": _iso(_T0 - timedelta(minutes=1)),
-            "reactions": {"total_count": 0},
-        },
-    ]
-    api.json[issue_path]["comments"] = 1
+async def test_requested_team_uses_richer_dedicated_response(tmp_path: Path) -> None:
+    api = FakeAPI()
+    api.add_issue(7, pull=True)
+    pull_path = f"{_BASE}/pulls/7"
+    simple_team = {"id": 1, "name": "core", "slug": "core"}
+    rich_team = simple_team | {"privacy": "closed", "permission": "push"}
+    api.json[pull_path] = {
+        "id": 70,
+        "changed_files": 0,
+        "commits": 0,
+        "review_comments": 0,
+        "requested_reviewers": [],
+        "requested_teams": [simple_team],
+    }
+    api.json[f"{pull_path}/requested_reviewers"] = {"users": [], "teams": [rich_team]}
 
     await GitHubPuller(_config(tmp_path / "archive"), api=api, now=lambda: _T0).pull(_T0)
 
-    bundle = (await _current(tmp_path / "archive"))[1].bundle
+    bundle = (await _current(tmp_path / "archive"))[7].bundle
     assert bundle is not None
-    assert [comment["id"] for comment in bundle["issue_comments"]] == [101, 102]
-    assert api.feed_scans == 3
-
-
-@pytest.mark.asyncio
-async def test_pooled_feed_closes_target_prefix_during_continuous_future_appends(
-    tmp_path: Path,
-) -> None:
-    class AppendingFeedAPI(FakeAPI):
-        def __init__(self) -> None:
-            super().__init__()
-            self.feed_scans = 0
-
-        async def paginate(
-            self,
-            path: str,
-            *,
-            params: dict[str, Any] | None = None,
-            page_observer: Any = None,
-        ) -> list[dict[str, Any]]:
-            items = await super().paginate(path, params=params, page_observer=page_observer)
-            if path != f"{_BASE}/issues/comments" or (params and params.get("since")):
-                return items
-            self.feed_scans += 1
-            issue_path = f"{_BASE}/issues/1"
-            comment_id = 101 + self.feed_scans
-            self.pages[f"{issue_path}/comments"].append(
-                {
-                    "id": comment_id,
-                    "body": "after target",
-                    "created_at": _iso(_T0 + timedelta(seconds=self.feed_scans)),
-                    "updated_at": _iso(_T0 + timedelta(seconds=self.feed_scans)),
-                    "reactions": {"total_count": 0},
-                },
-            )
-            self.json[issue_path]["comments"] += 1
-            return items
-
-    api = AppendingFeedAPI()
-    for number in range(1, 11):
-        api.add_issue(number)
-    issue_path = f"{_BASE}/issues/1"
-    api.pages[f"{issue_path}/comments"] = [
-        {
-            "id": 101,
-            "body": "at target",
-            "created_at": _iso(_T0),
-            "updated_at": _iso(_T0),
-            "reactions": {"total_count": 0},
-        },
-    ]
-    api.json[issue_path]["comments"] = 1
-
-    await GitHubPuller(_config(tmp_path / "archive"), api=api, now=lambda: _T0).pull(_T0)
-
-    bundle = (await _current(tmp_path / "archive"))[1].bundle
-    assert bundle is not None
-    assert [comment["id"] for comment in bundle["issue_comments"]] == [101, 102]
-    assert api.feed_scans == 2
+    assert bundle["pull_request"]["requested_reviewers"]["teams"] == [rich_team]
+    assert sum(call[1] == f"{pull_path}/requested_reviewers" for call in api.calls) == 1
 
 
 @pytest.mark.asyncio
@@ -1457,11 +1304,7 @@ async def test_quiet_increment_cost_is_four_requests_independent_of_catalog_size
     puller = GitHubPuller(_config(archive), api=api, now=clock, sleep=clock.sleep)
     cold = await puller.pull(_T0)
     baseline = math.ceil(catalog_size / 100) + 5 * catalog_size
-    expected = (
-        math.ceil(catalog_size / 100) + 1 + 3 * catalog_size
-        if catalog_size == 1
-        else math.ceil(catalog_size / 100) + 1 + 2 * catalog_size + 3
-    )
+    expected = math.ceil(catalog_size / 100) + 1 + 2 * catalog_size
     assert cold.requests == expected
     assert cold.requests < baseline
     assert sum(call[0] == "page" and call[1] == f"{_BASE}/issues" for call in api.calls) == 1
@@ -1621,7 +1464,6 @@ async def test_comment_signal_refreshes_parent_when_summary_is_unchanged(tmp_pat
             "updated_at": _iso(_T0 + timedelta(seconds=1)),
         },
     ]
-    api.json[issue_path]["comments"] = 1
     api.pages[f"{issue_path}/comments"] = [
         {"id": 31, "body": "late comment", "reactions": {"total_count": 0}},
     ]
@@ -2193,30 +2035,6 @@ async def test_rest_pagination_follows_link_header_and_preserves_fields() -> Non
     assert "per_page=100" in seen[0]
     assert seen[1] == "https://api.github.test/items?page=2"
     assert page_sizes == [1, 1]
-
-
-@pytest.mark.asyncio
-async def test_collection_size_uses_one_item_last_page_certificate() -> None:
-    seen: list[str] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        seen.append(str(request.url))
-        link = (
-            '<https://api.github.test/items?sort=created&per_page=1&page=2>; rel="next", '
-            '<https://api.github.test/items?sort=created&per_page=1&page=237>; rel="last"'
-        )
-        return httpx.Response(200, headers={"link": link}, json=[{"id": 1}], request=request)
-
-    client = httpx.AsyncClient(base_url="https://api.github.test", transport=httpx.MockTransport(handler))
-    api = GitHubAPI(client=client)
-    try:
-        size = await api.collection_size("/items", params={"sort": "created"})
-    finally:
-        await client.aclose()
-
-    assert size == 237
-    assert len(seen) == 1
-    assert "per_page=1" in seen[0]
 
 
 @pytest.mark.asyncio
