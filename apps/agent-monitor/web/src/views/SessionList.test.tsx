@@ -3,8 +3,8 @@ import { createRoot } from 'react-dom/client';
 import { act } from 'react';
 import { it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { LanguageProvider } from '@gh-puller/ui';
-import MonitorSessionList from '../MonitorSessionList';
-import type { SessionMeta } from '../../monitor-data';
+import type { SessionMeta } from '../monitor/protocol';
+import SessionList from './SessionList';
 
 const sessions: SessionMeta[] = [
   { session: 'ns/u1', run_id: 'chat:r1', label: 'chat:r1', provider: 'claude', model: 'm', state: 'running', ts: 1700000000, last_ts: 1700000001, num_events: 3 },
@@ -23,7 +23,7 @@ beforeEach(() => {
   act(() => {
     root.render(
       <LanguageProvider>
-        <MonitorSessionList sessions={sessions} current={null} onSelect={() => {}} onDelete={onDelete} query="" stateFilter="all" />
+        <SessionList sessions={sessions} current={null} onSelect={() => {}} onDelete={onDelete} query="" stateFilter="all" />
       </LanguageProvider>,
     );
   });

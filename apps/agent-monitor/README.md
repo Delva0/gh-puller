@@ -5,6 +5,9 @@ Agent 流式监控仪表盘(完整应用,`web/` + `server/` 两个子项目):
 - `server/` — FastAPI hub(WS `/ws` 对接 `gh_puller.agent` 客户端 WsSink 事件流,`GET /` 返回单文件 viewer HTML;独立 uv 项目,经 path 依赖吃根 `gh-puller` 包)
 - `web/` — React/Vite 查看端(单一 canonical fold 驱动原生 Context/Events 视图;单文件构建 → `server/static/agent_monitor_viewer.html`;根 pnpm 工作区成员,共享基础组件包 `@gh-puller/ui` 源码在 `ui/`)
 
+`web/src/` 中，`events/` 只包含事件状态与折叠，`monitor/` 负责 hub 同步，
+`views/` 直接渲染折叠结果，`vendor/dsh/` 只提供视觉原语。
+
 ## 启动
 
 ```bash

@@ -3,7 +3,7 @@
  * Semantic status colors and neutral effects keep their primitive defaults.
  */
 
-/* ---------- 字体:接入 @gh-puller/ui 的字形(Noto Sans JP / Geist Mono) ---------- */
+/* Shared @gh-puller/ui typefaces. */
 :root {
   --dsw-font-family: var(--font-sans, 'Noto Sans JP', sans-serif);
   --dsw-font-markdown-base: var(--font-sans, 'Noto Sans JP', sans-serif);
@@ -19,16 +19,16 @@
   --dsw-font-markdown-table-head: var(--font-sans, 'Noto Sans JP', sans-serif);
 }
 
-/* ---------- 浅色(和纸) ---------- */
+/* Light washi theme. */
 :root {
-  /* 画布与层 */
-  --dsw-alias-bg-base: #fffaf0;            /* card-bg 和纸 */
+  /* Canvas and layers. */
+  --dsw-alias-bg-base: #fffaf0;            /* card-bg */
   --dsw-alias-bg-layer-1: #fdf9ee;
   --dsw-alias-bg-layer-2: #f7f1e0;
   --dsw-alias-bg-mask-1: rgba(51, 51, 51, 0.55);
   --dsw-alias-bg-module-platform: #fffaf0;
 
-  /* 边框与分隔 */
+  /* Borders and dividers. */
   --dsw-alias-border-l1: #efe6d3;
   --dsw-alias-border-l2: #e6dcc6;
   --dsw-alias-border-l3: #dcd2ba;
@@ -37,7 +37,7 @@
   --dsw-alias-separator-primary: #e0d8c8;  /* border-color */
   --dsw-alias-line-secondary: #ebe2d0;
 
-  /* 文字(墨/鼠) */
+  /* Ink and muted text. */
   --dsw-alias-label-primary: #333333;      /* foreground */
   --dsw-alias-label-secondary: #57503f;
   --dsw-alias-label-tertiary: #807860;
@@ -47,13 +47,13 @@
   --dsw-alias-label-primary-foreground: #faf7ef;
   --dsw-alias-label-primary-inverted: #f6f0e2;
 
-  /* 品牌与交互(富士紫) */
+  /* Fuji-purple brand and interaction states. */
   --dsw-alias-brand-primary: #9b7cb9;      /* accent-primary */
   --dsw-alias-brand-primary-new-colorprimary-new-color: #9b7cb9;
   --dsw-alias-interactive-bg-hover: rgba(155, 124, 185, 0.10);
   --dsw-alias-interactive-bg-active: rgba(155, 124, 185, 0.16);
   --dsw-alias-interactive-bg-hover-solid: rgba(155, 124, 185, 0.22);
-  --dsw-alias-interactive-bg-hover-danger: rgba(232, 146, 124, 0.14); /* 珊瑚(highlight) */
+  --dsw-alias-interactive-bg-hover-danger: rgba(232, 146, 124, 0.14); /* coral highlight */
   --dsw-alias-button-primary-fill: #9b7cb9;
   --dsw-alias-button-primary-hover: #8a6bab;
   --dsw-alias-button-contrast-fill: #faf7ef;
@@ -64,13 +64,13 @@
   --dsw-alias-state-business-primary: #9370db;
   --dsw-alias-state-business-tertiary: #e7dcf5;
 
-  /* markdown 块(紫墨;代码块衬和纸) */
+  /* Purple-ink Markdown surfaces. */
   --dsw-alias-markdown-code-block: #efe7d6;
   --dsw-alias-markdown-code-block-banner: #e6dcc6;
   --dsw-alias-markdown-inline-code: rgba(155, 124, 185, 0.12);
   --dsw-alias-markdown-citation: #7c5aa0;  /* link-color */
 
-  /* static(蓝/深蓝系 → 紫阶;其余 static 保持) */
+  /* Map the source blue scale onto the purple scale. */
   --dsw-static-blue-400: #b7a4d9;
   --dsw-static-blue-500: #9370db;
   --dsw-static-deepseek-200: #dccff0;
@@ -80,7 +80,7 @@
   --dsw-static-neutral-bluish-1000: #333333;
 }
 
-/* ---------- 深色(和墨) ---------- */
+/* Dark sumi theme. */
 html[data-theme='dark'] {
   --dsw-alias-bg-base: #222222;            /* card-bg dark */
   --dsw-alias-bg-layer-1: #262626;
@@ -121,7 +121,7 @@ html[data-theme='dark'] {
   --dsw-alias-state-business-primary: #9370db;
   --dsw-alias-state-business-tertiary: #3a2f52;
 
-  --dsw-alias-markdown-code-block: #2b2631;   /* 紫墨 */
+  --dsw-alias-markdown-code-block: #2b2631;   /* purple ink */
   --dsw-alias-markdown-code-block-banner: #383243;
   --dsw-alias-markdown-inline-code: rgba(147, 112, 219, 0.16);
   --dsw-alias-markdown-citation: #b19cd9;

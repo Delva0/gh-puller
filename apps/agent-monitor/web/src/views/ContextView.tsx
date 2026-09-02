@@ -1,21 +1,15 @@
 /** Render the canonical Model, Context, and correlated activity directly. */
 
-import { useMemo, useState } from 'react';
+import { useMemo } from 'react';
 import { useLanguage } from '@gh-puller/ui';
-import { JsonTree } from '../vendor/dsh/ui-primitives/src/JsonTree.tsx';
-import { MarkdownText } from '../vendor/dsh/ui-primitives/src/markdown/MarkdownText.tsx';
-import { Pill } from '../vendor/dsh/ui-primitives/src/Pill.tsx';
+import { JsonTree, MarkdownText } from '../vendor/dsh';
 import type {
   Block,
-  EventEnvelope,
   Message,
   ModelActivity,
   RequestState,
   ToolActivity,
-} from '../monitor-data';
-import AgentEvents from './AgentEvents';
-
-type View = 'context' | 'events';
+} from '../events/types';
 
 function jsonValue(value: unknown) {
   if (typeof value === 'object' && value !== null) {
@@ -215,7 +209,7 @@ function LiveAssistant({ activity, tools, committedCalls }: {
   );
 }
 
-function ContextView({ state, tools, activeModel }: {
+export default function ContextView({ state, tools, activeModel }: {
   state: RequestState;
   tools: ToolActivity[];
   activeModel: ModelActivity | null;
@@ -271,48 +265,5 @@ function ContextView({ state, tools, activeModel }: {
         </div>
       )}
     </div>
-  );
-}
-
-export interface AgentRunPanelProps {
-  loaded: boolean;
-  state: RequestState;
-  events: EventEnvelope[];
-  requests: ModelActivity[];
-  tools: ToolActivity[];
-  activeModel: ModelActivity | null;
-}
-
-export default function AgentRunPanel({
-  loaded,
-  state,
-  events,
-  requests,
-  tools,
-  activeModel,
-}: AgentRunPanelProps) {
-  const { t } = useLanguage();
-  const [view, setView] = useState<View>('context');
-
-  return (
-    <section className="flex h-full min-h-0 flex-col" data-agent-run-panel>
-      <header className="flex h-11 shrink-0 items-center gap-2 border-b border-[var(--border-color)] px-4">
-        <Pill active={view === 'context'} onClick={() => setView('context')}>
-          {t('view.context')}
-        </Pill>
-        <Pill active={view === 'events'} onClick={() => setView('events')}>
-          {t('view.events')}
-        </Pill>
-      </header>
-      <div className="min-h-0 flex-1 overflow-y-auto">
-        {!loaded ? (
-          <div className="p-6 text-sm text-[var(--muted)]">{t('view.loading')}</div>
-        ) : view === 'context' ? (
-          <ContextView state={state} tools={tools} activeModel={activeModel} />
-        ) : (
-          <AgentEvents events={events} requests={requests} />
-        )}
-      </div>
-    </section>
   );
 }

@@ -2,8 +2,8 @@
 
 /** Render connection state and canonical run counters. */
 import { StateBadge, useLanguage } from '@gh-puller/ui';
-import type { ConnStatus } from '../hooks/useMonitorSocket';
-import type { SessionMeta } from '../monitor-data';
+import type { SessionMeta } from '../monitor/protocol';
+import type { ConnStatus } from '../monitor/useMonitorSocket';
 
 interface Props {
   status: ConnStatus;
@@ -21,7 +21,7 @@ const DOT: Record<ConnStatus, string> = {
   closed: 'bg-red-500',
 };
 
-export default function MonitorStatusBar({ status, current, events, meta, duration, steps, usage }: Props) {
+export default function StatusBar({ status, current, events, meta, duration, steps, usage }: Props) {
   const { t } = useLanguage();
   return (
     <div className="flex items-center gap-3 border-t border-[var(--border-color)] px-3 py-1.5 text-xs text-[var(--muted)]">

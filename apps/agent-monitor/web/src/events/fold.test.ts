@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
-import { RunFold } from '../fold'
-import { foldRequestState, requestStateAt } from '../context'
-import type { EventEnvelope } from '../types'
+import { RunFold } from './fold'
+import { foldRequestState, requestStateAt } from './state'
+import type { EventEnvelope } from './types'
 
 function evt(type: string, seq: number, data: Record<string, unknown> = {}): EventEnvelope {
   return { seq, ts: 1, session: 's1', type, data }

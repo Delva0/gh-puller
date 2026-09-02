@@ -2,12 +2,12 @@
 /* Shared theme tokens must pass through the same Tailwind pipeline. */
 @import "../../../../ui/src/styles/theme.css";
 /* Vendored visual primitives keep their original design tokens. */
-@import "./dashboard/vendor/dsh/ui-theme/styles/design-platform.css";
-@import "./dashboard/vendor/dsh/ui-theme/styles/base.css";
-@import "./dashboard/vendor/dsh/ui-theme/styles/scrollbar.css";
-@import "./dashboard/vendor/dsh/ui-theme/styles/shiki.css";
+@import "./vendor/dsh/ui-theme/styles/design-platform.css";
+@import "./vendor/dsh/ui-theme/styles/base.css";
+@import "./vendor/dsh/ui-theme/styles/scrollbar.css";
+@import "./vendor/dsh/ui-theme/styles/shiki.css";
 /* The final layer maps those tokens to the shared theme. */
-@import "./dashboard/vendor/dsh/ui-theme/styles/theme-adaptation.css";
+@import "./theme/dsh.css";
 /* Workspace source needs an explicit Tailwind scan root. */
 @source "../../../../ui/src";
 @plugin "@tailwindcss/typography";

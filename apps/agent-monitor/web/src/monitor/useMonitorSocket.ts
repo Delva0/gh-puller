@@ -2,12 +2,20 @@
 
 /** Connect the viewer, load complete compact histories, and feed the selected fold. */
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { mergeEvents } from '../monitor-data';
-import type { EventEnvelope, HubFrame, SessionMeta } from '../monitor-data';
-import { monitorWsUrl } from '../utils/monitorWs';
+import type { EventEnvelope } from '../events/types';
+import { mergeEvents } from './protocol';
+import type { HubFrame, SessionMeta } from './protocol';
 import { sessionStore } from './useMonitorSession';
 
 export type ConnStatus = 'connecting' | 'connected' | 'closed';
+
+function monitorWsUrl(): string {
+  const explicit = (import.meta as { env?: Record<string, string | undefined> })
+    .env?.VITE_MONITOR_WS_URL;
+  if (explicit) return explicit.replace(/\/+$/, '').replace(/^http/, 'ws');
+  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+  return `${protocol}//${window.location.host}/ws`;
+}
 
 export function useMonitorSocket() {
   const [status, setStatus] = useState<ConnStatus>('connecting');

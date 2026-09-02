@@ -4,10 +4,8 @@
 
 import { useMemo, useState } from 'react';
 import { StateBadge, useLanguage } from '@gh-puller/ui';
-import type { SessionMeta } from '../monitor-data';
-import { Menu } from '../vendor/dsh/ui-primitives/src/Menu.tsx';
-import { RiskConfirmation } from '../vendor/dsh/ui-primitives/src/RiskConfirmation.tsx';
-import { IconEllipsisOutline16 } from '../vendor/dsh/ui-primitives/src/icons/index.tsx';
+import type { SessionMeta } from '../monitor/protocol';
+import { IconEllipsisOutline16, Menu, RiskConfirmation } from '../vendor/dsh';
 
 interface Props {
   sessions: SessionMeta[];
@@ -23,7 +21,7 @@ const fmt = (ts: number) =>
     ? new Date(ts * 1000).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' })
     : '';
 
-export default function MonitorSessionList({ sessions, current, onSelect, onDelete, query, stateFilter }: Props) {
+export default function SessionList({ sessions, current, onSelect, onDelete, query, stateFilter }: Props) {
   const { t } = useLanguage();
   const [menuFor, setMenuFor] = useState<string | null>(null);
   const [confirmFor, setConfirmFor] = useState<string | null>(null);

@@ -1,14 +1,12 @@
 /** Compose the session sidebar, canonical run view, and status bar. */
 import { useMemo, useState, type PointerEvent as ReactPointerEvent } from 'react';
 import { ThemeToggle, useLanguage } from '@gh-puller/ui';
-import {
-  AgentRunPanel,
-  MonitorSessionList,
-  MonitorStatusBar,
-  useMonitorSession,
-  useMonitorSocket,
-} from './dashboard';
-import type { ModelActivity } from './dashboard/monitor-data';
+import type { ModelActivity } from './events/types';
+import { useMonitorSession } from './monitor/useMonitorSession';
+import { useMonitorSocket } from './monitor/useMonitorSocket';
+import RunPanel from './views/RunPanel';
+import SessionList from './views/SessionList';
+import StatusBar from './views/StatusBar';
 
 function usageOf(requests: ModelActivity[]): { input: number; output: number } | null {
   let inp = 0;
@@ -103,7 +101,7 @@ export default function App() {
           <option value="aborted">{t('session.state.aborted')}</option>
         </select>
         <div className="mt-2 flex-1 overflow-y-auto">
-          <MonitorSessionList
+          <SessionList
             sessions={m.sessions}
             current={m.current}
             query={query}
@@ -125,7 +123,7 @@ export default function App() {
           {m.current === null ? (
             <div className="p-6 text-xs text-[var(--muted)]">{t('view.empty')}</div>
           ) : (
-            <AgentRunPanel
+            <RunPanel
               loaded={session.loaded}
               state={session.state}
               events={session.events}
@@ -136,7 +134,7 @@ export default function App() {
           )}
         </div>
 
-        <MonitorStatusBar
+        <StatusBar
           status={m.status}
           current={m.current}
           events={session.events.length}

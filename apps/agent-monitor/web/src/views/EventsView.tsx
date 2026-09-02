@@ -2,8 +2,8 @@
 
 import { useState } from 'react';
 import { useLanguage } from '@gh-puller/ui';
-import { JsonTree } from '../vendor/dsh/ui-primitives/src/JsonTree.tsx';
-import type { EventEnvelope, ModelActivity } from '../monitor-data';
+import type { EventEnvelope, ModelActivity } from '../events/types';
+import { JsonTree } from '../vendor/dsh';
 
 function jsonValue(value: unknown) {
   if (typeof value === 'object' && value !== null) {
@@ -89,7 +89,7 @@ function StreamDeltas({ events }: { events: EventEnvelope[] }) {
   );
 }
 
-export default function AgentEvents({ events, requests }: {
+export default function EventsView({ events, requests }: {
   events: EventEnvelope[];
   requests: ModelActivity[];
 }) {

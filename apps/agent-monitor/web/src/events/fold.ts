@@ -4,7 +4,7 @@ import {
   applyStateEvent,
   emptyRequestState,
   foldRequestState,
-} from './context'
+} from './state'
 import type { EventEnvelope, Message, ModelActivity, RequestState, ToolActivity } from './types'
 
 export type IngestResult = 'ok' | 'dup' | 'gap'

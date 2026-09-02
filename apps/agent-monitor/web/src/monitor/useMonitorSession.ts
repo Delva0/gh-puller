@@ -2,13 +2,13 @@
 
 /** Own the selected session's sole canonical fold. */
 import { useSyncExternalStore } from 'react';
-import { RunFold } from '../monitor-data';
+import { RunFold } from '../events/fold';
 import type {
   EventEnvelope,
   ModelActivity,
   RequestState,
   ToolActivity,
-} from '../monitor-data';
+} from '../events/types';
 
 export interface SessionSnapshot {
   loaded: boolean;

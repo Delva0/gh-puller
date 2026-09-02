@@ -1,6 +1,6 @@
 /** WebSocket frames and sequence helpers for the monitor hub protocol. */
 
-import type { EventEnvelope } from './types';
+import type { EventEnvelope } from '../events/types';
 
 export interface SessionMeta {
   session: string;

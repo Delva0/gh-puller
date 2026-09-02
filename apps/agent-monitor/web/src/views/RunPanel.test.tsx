@@ -3,10 +3,10 @@ import { act } from 'react';
 import { createRoot } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { LanguageProvider } from '@gh-puller/ui';
-import { monitorMessages } from '../../../messages';
-import { RunFold } from '../../monitor-data';
-import type { EventEnvelope } from '../../monitor-data';
-import AgentRunPanel from '../AgentRunPanel';
+import { RunFold } from '../events/fold';
+import type { EventEnvelope } from '../events/types';
+import { monitorMessages } from '../messages';
+import RunPanel from './RunPanel';
 
 function evt(type: string, seq: number, data: Record<string, unknown> = {}): EventEnvelope {
   return { seq, ts: 1700000000 + seq, session: 's1', type, data };
@@ -41,7 +41,7 @@ function render(fold: RunFold) {
   act(() => {
     root.render(
       <LanguageProvider extraMessages={monitorMessages}>
-        <AgentRunPanel {...props(fold)} />
+        <RunPanel {...props(fold)} />
       </LanguageProvider>,
     );
   });
