@@ -3,30 +3,6 @@
     "target": "ES2022",
     "module": "ESNext",
     "moduleResolution": "bundler",
-    "baseUrl": ".",
-    "paths": {
-      "@dsh/ui-slots": [
-        "./src/dashboard/vendor/dsh/ui-slots/src/index.ts"
-      ],
-      "@dsh/ui-conversation": [
-        "./src/dashboard/vendor/dsh/ui-conversation/src/client/index.ts"
-      ],
-      "@dsh/runtime": [
-        "./src/dashboard/vendor/dsh/runtime/src/client/index.ts"
-      ],
-      "@dsh/cordis": [
-        "./src/dashboard/vendor/dsh/shims/cordis.ts"
-      ],
-      "@dsh/session": [
-        "./src/dashboard/vendor/dsh/session/types.ts"
-      ],
-      "@dsh/session-projection": [
-        "./src/dashboard/vendor/dsh/session-projection.ts"
-      ],
-      "@dsh/ui-tool": [
-        "./src/dashboard/vendor/dsh/ui-tool/src/client/index.ts"
-      ]
-    },
     "lib": [
       "ES2022",
       "ES2023",

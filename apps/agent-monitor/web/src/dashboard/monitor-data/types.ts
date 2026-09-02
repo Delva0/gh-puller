@@ -1,4 +1,4 @@
-/** Canonical agent event shapes shared by the monitor folds and UI adapter. */
+/** Canonical agent event shapes consumed by the monitor fold and native UI. */
 
 export interface Block {
   type: string
@@ -41,9 +41,11 @@ export interface EventEnvelope {
 export interface ModelActivity {
   requestId: string
   requestSeq: number
+  requestState: RequestState
   responseSeq?: number
   text: string
   reasoning: string
+  deltaCount: number
   toolCalls: Map<number, { callId: string; name?: string; arguments: string }>
   message?: Message
   usage?: Usage

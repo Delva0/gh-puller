@@ -1,6 +1,4 @@
 // @vitest-environment jsdom
-// 侧栏会话列表 ··· 菜单两步删除:危险项 → RiskConfirmation 弹框(勾选确认)→
-// onDelete(session)。纯 DOM 冒烟(同 panel-render 风格);菜单/弹框均 portal 挂 body。
 import { createRoot } from 'react-dom/client';
 import { act } from 'react';
 import { it, expect, beforeEach, afterEach, vi } from 'vitest';
@@ -36,19 +34,18 @@ afterEach(() => {
   document.body.removeChild(container);
 });
 
-it('··· 菜单 → 删除 → 弹框勾选确认 → onDelete(该行 session)', () => {
+it('requires explicit confirmation before deleting one session', () => {
   const row = container.querySelectorAll('li')[0];
   const more = row.querySelector('button[aria-haspopup="menu"]')!;
   act(() => {
     more.dispatchEvent(new MouseEvent('click', { bubbles: true }));
   });
   const del = [...document.body.querySelectorAll('button[role="menuitem"]')][0];
-  expect(del.textContent).toBe('Delete'); // jsdom 语言缺省 en
+  expect(del.textContent).toBe('Delete');
   act(() => {
     del.dispatchEvent(new MouseEvent('click', { bubbles: true }));
   });
 
-  // 弹框(portal):确认按钮在勾选前禁用
   const dialog = document.body.querySelector('[role="dialog"]')!;
   expect(dialog.textContent).toContain('Delete session');
   const confirm = [...dialog.querySelectorAll('button')].find((b) => b.textContent === 'Delete')!;
@@ -64,5 +61,5 @@ it('··· 菜单 → 删除 → 弹框勾选确认 → onDelete(该行 session)
 
   expect(onDelete).toHaveBeenCalledTimes(1);
   expect(onDelete).toHaveBeenCalledWith('ns/u1');
-  expect(document.body.querySelector('[role="dialog"]')).toBeNull(); // 确认后弹框关闭
+  expect(document.body.querySelector('[role="dialog"]')).toBeNull();
 });

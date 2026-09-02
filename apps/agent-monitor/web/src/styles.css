@@ -1,15 +1,14 @@
 @import "tailwindcss";
-/* 主题真源 @gh-puller/ui(令牌/暗色变体/风格类/字体);必须与 "tailwindcss" 同一条 Tailwind 处理链 */
+/* Shared theme tokens must pass through the same Tailwind pipeline. */
 @import "../../../../ui/src/styles/theme.css";
-/* 面板 1:1 的 dsh 设计令牌(随 dashboard 迁出 ui;选择器已变换至 :root / [data-theme='dark']);
-   必须与 tailwindcss 同链,否则 CSS 变量级联与 Tailwind 扫描错位 */
+/* Vendored visual primitives keep their original design tokens. */
 @import "./dashboard/vendor/dsh/ui-theme/styles/design-platform.css";
 @import "./dashboard/vendor/dsh/ui-theme/styles/base.css";
 @import "./dashboard/vendor/dsh/ui-theme/styles/scrollbar.css";
 @import "./dashboard/vendor/dsh/ui-theme/styles/shiki.css";
-/* 和风适配层(最后 import 取胜;结构与令牌保持 dsh 原样,颜色映射到和纸/富士紫) */
+/* The final layer maps those tokens to the shared theme. */
 @import "./dashboard/vendor/dsh/ui-theme/styles/theme-adaptation.css";
-/* @gh-puller/ui 源码参与扫描(workspace 符号链接默认不被自动检测,须显式 @source) */
+/* Workspace source needs an explicit Tailwind scan root. */
 @source "../../../../ui/src";
 @plugin "@tailwindcss/typography";
 
@@ -21,14 +20,7 @@ body {
   margin: 0;
 }
 
-/* 宿主侧 dsh 面板修正:本宿主无浮动 composer,清零其高度变量,让「回到底部」按钮
-   与轨迹底边距紧贴底边(dsh 占位 152px 会把它顶到距底 168px 处)。 */
-.ghp-dsh-host {
-  --dsh-composer-height: 0px;
-}
-
-/* 侧栏控件统一:ThemeToggle 内联 p-2(36px 盒)+ 20px icon,收窄为固定 28px、
-   icon 16px 居中;与 ··· 菜单锚点、语言切换钮三者同尺寸(小一圈)。 */
+/* Match the theme toggle to the sidebar's other compact controls. */
 .theme-toggle-button {
   display: inline-flex;
   align-items: center;
@@ -37,7 +29,6 @@ body {
   height: 28px;
   padding: 0;
 }
-/* 图标随盒收窄并与 28px 盒同心(组件内残存 w-5/inset-0 会把 svg 往外撑)。 */
 .theme-toggle-button > div {
   width: 16px;
   height: 16px;

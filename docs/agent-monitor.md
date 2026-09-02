@@ -5,60 +5,39 @@ The following source packages were used as context for this document:
 
 - [gh_puller/agent/](../gh_puller/agent/)
 - [apps/agent-monitor/server/](../apps/agent-monitor/server/)
-- [apps/agent-monitor/web/src/dashboard/monitor-data/](../apps/agent-monitor/web/src/dashboard/monitor-data/)
-- [apps/agent-monitor/web/src/dashboard/vendor/dsh/bridge/](../apps/agent-monitor/web/src/dashboard/vendor/dsh/bridge/)
+- [apps/agent-monitor/web/](../apps/agent-monitor/web/)
 - [tests/](../tests/)
 
 </details>
 
 # Agent events and monitor
 
-An ordered prefix of the canonical event stream recovers the state the agent has
-established at that point:
+The agent subsystem exposes one ordered event language. A complete prefix recovers the
+model request state at that point, while separate activity events describe generation
+and local execution. The monitor reads that language directly through one canonical
+fold.
+
+## State algebra
+
+The replayable state is:
 
 `State = Model × Context`
 
-The same fold applies to streaming and non-streaming producers. Activity events expose
-generation and local execution without mutating state.
+Only the following operations change it:
 
-```mermaid
-flowchart TD
-    Producer[Agent producer] --> Events[Canonical event log]
-    Events --> State[Model × Context fold]
-    Events --> Activity[Model and tool activity fold]
-    Events --> Persistence[JSONL and WebSocket transport]
-    State --> Monitor[Monitor data]
-    Activity --> Monitor
-    Events --> Bridge[Thin DSH presentation bridge]
-    Bridge --> UI[Conversation and trajectory UI]
-```
+| Operation | Effect |
+| --- | --- |
+| `model/set` | Replace Model with `{model, provider?, parameters}` |
+| `context/set` | Replace the complete ordered Context |
+| `context/append` | Append a message carrying its own role |
+| `context/append/<role>` | Append a message whose role is named by the event type |
 
-Every envelope contains `session`, a session-local `seq`, `ts`, `type`, and `data`.
-The agent package owns the validator and reference fold.
+The specialized roles are `user`, `assistant`, and `tool`. Other roles use generic
+`context/append`. A message contains a role and an ordered array of open content blocks,
+so producers can preserve provider-native information without selecting a provider API
+as the canonical format.
 
-Sources: [gh_puller/agent/](../gh_puller/agent/);
-[apps/agent-monitor/web/src/dashboard/monitor-data/](../apps/agent-monitor/web/src/dashboard/monitor-data/)
-
-## Replayable state
-
-State changes use two replacement operations and ordered context appends:
-
-| Event | Payload | Fold |
-| --- | --- | --- |
-| `model/set` | `{model, provider?, parameters}` | Replace Model |
-| `context/set` | `{messages}` | Replace Context |
-| `context/append` | `{role, content, ...}` | Append a generic-role message |
-| `context/append/user` | `{content, ...}` | Append with role `user` |
-| `context/append/assistant` | `{content, ...}` | Append with role `assistant` |
-| `context/append/tool` | `{content, ...}` | Append with role `tool` |
-
-A message has a string `role`, an ordered `content` array, and optional producer fields.
-Every content block has a string `type`; the remaining shape is open. Specialized append
-types make common roles visible without changing this message algebra. Custom roles use
-`context/append`.
-
-Instructions are system or developer messages. Observable tool schemas use
-`tool_definition` blocks in the same context:
+Instructions and observable tool definitions are ordinary Context:
 
 ```json
 {
@@ -69,104 +48,77 @@ Instructions are system or developer messages. Observable tool schemas use
       "type": "tool_definition",
       "name": "read_file",
       "description": "Read one workspace file.",
-      "inputSchema": {
-        "type": "object",
-        "properties": {"path": {"type": "string"}},
-        "required": ["path"]
-      }
+      "inputSchema": {"type": "object"}
     }
   ]
 }
 ```
 
-Agents use `context/set` when compression, replacement, or another non-append change
-establishes a new complete context. A fold needs no provenance links to apply that
-operation.
-
-Model-produced tool calls keep their native structure inside an assistant append:
-
-```json
-{
-  "type": "context/append/assistant",
-  "data": {
-    "content": [{
-      "type": "tool_call",
-      "callId": "c1",
-      "name": "read_file",
-      "arguments": {"path": "a.py"}
-    }]
-  }
-}
-```
+Compression or any other non-append context change emits `context/set` with the new
+complete Context. Applying events in sequence therefore needs neither provenance links
+nor presentation operations.
 
 Sources: [gh_puller/agent/](../gh_puller/agent/); [tests/](../tests/)
 
-## Model and tool activity
+## Activity and semantic markers
 
-Model activity is correlated by `requestId`:
+`model/request`, `model/delta/*`, and `model/response` describe one model invocation and
+share a `requestId`. `tool/start` and `tool/end` describe local execution and share a
+`callId`. Activity does not mutate Model or Context.
 
-- `model/request`: `{requestId}`
-- `model/delta/text`: `{requestId, index, text}`
-- `model/delta/reasoning`: `{requestId, index, text}`
-- `model/delta/tool-call`: `{requestId, index, callId, name?, argumentsDelta}`
-- `model/response`: `{requestId, message, usage?, stopReason?}`
+A model-produced tool call enters Context as an assistant `tool_call` block. Its
+model-visible result enters Context as a tool message. The corresponding tool activity
+can start earlier and finish independently, allowing the monitor to distinguish a
+running local call from the state prepared for the next request.
 
-Tool execution is correlated independently by `callId`:
-
-- `tool/start`: `{callId, name, arguments}`
-- `tool/end`: `{callId, result}` or `{callId, error}`
-
-An assistant `tool_call` block is model output and becomes context through an assistant
-append. Local execution produces `tool/start` and `tool/end`; the model-visible result is
-then committed with `context/append/tool`. This separates observed activity from the
-state used by the next request.
-
-`turn/start`, `turn/end`, `step/start`, and `step/end` are optional semantic markers. The
-expected convention treats a turn as one agent-level user interaction and a step as one
-context preparation, model generation, and related tool work. Producers may choose other
-boundaries; folding and correlation do not depend on them.
-
-Sources: [gh_puller/agent/](../gh_puller/agent/);
-[apps/agent-monitor/web/src/dashboard/monitor-data/](../apps/agent-monitor/web/src/dashboard/monitor-data/)
-
-## Producer boundaries
-
-One generator session supports repeated `stream` and `result` calls. Each producer emits
-only model-visible state it can observe:
-
-| Producer | Context projection |
-| --- | --- |
-| Claude Code | Configured system prompt plus observed user, assistant, and tool messages |
-| Codex | Configured base and developer instructions plus observed thread messages |
-| OpenCode | Configured instruction plus observed CLI messages and tool results |
-| OpenAI-compatible HTTP | Complete request messages and supplied tool schemas |
-| DSH | Native request header and surface operations folded into context |
-
-Provider-hidden prompts and tool schemas are not inferred. HTTP headers, credentials,
-timeouts, process settings, and other transport inputs stay outside Context. DSH
-`request/header`, `surfaceOp`, and `sourceEventSeqs` are vendor-boundary terms. DSH
-header and surface changes become canonical state operations; provenance stays inside
-the DSH boundary.
+`turn/*` and `step/*` are optional semantic markers. The expected convention uses a turn
+for one agent-level interaction and a step for one context preparation, model invocation,
+and related tool work. State recovery and activity correlation do not depend on their
+placement.
 
 Sources: [gh_puller/agent/](../gh_puller/agent/)
 
-## Persistence and presentation
+## Monitor data flow
 
-The file sink stores one JSONL file per session. Compact files omit only
-`model/delta/*`; compact and raw logs therefore fold to identical state. The hub combines
-persisted history with live raw events and derives session lease status without owning a
-second context model.
+```mermaid
+flowchart TD
+    Producer[Generator or custom agent] --> Stream[Canonical event stream]
+    Stream --> Hub[Persistence and WebSocket hub]
+    Hub --> Fold[RunFold]
+    Fold --> Context[Context view]
+    Fold --> Events[Events view]
+```
 
-The browser folds canonical Model and Context directly. At each `model/request`, the DSH
-presentation bridge derives request inspection from current model state and
-system/developer context, then maps messages and activity into the existing conversation
-UI. DSH surface metadata exists only inside that bridge and its vendored presentation
-code.
+The hub persists compact JSONL history and forwards live events. Compact history omits
+only stream deltas, which cannot change replayable state. On session selection the
+browser loads every compact history page, buffers concurrent live events, and publishes
+one merged sequence to `RunFold`. That fold is the sole owner of current Model, Context,
+model activity, and tool activity.
 
-Sources: [gh_puller/agent/](../gh_puller/agent/);
-[apps/agent-monitor/server/](../apps/agent-monitor/server/);
-[apps/agent-monitor/web/src/dashboard/monitor-data/](../apps/agent-monitor/web/src/dashboard/monitor-data/);
-[apps/agent-monitor/web/src/dashboard/vendor/dsh/bridge/](../apps/agent-monitor/web/src/dashboard/vendor/dsh/bridge/)
+The Context view renders the current Model and every current Context message. Open model
+activity is displayed separately until its `model/response`; only context operations
+change the visible Context. Tool cards join Context blocks and activity by `callId`;
+unknown roles and blocks retain a JSON fallback.
+
+The Events view displays canonical state changes, activity boundaries, lifecycle events,
+and semantic markers in sequence order. Token-level deltas are grouped under their
+`model/request` row and remain individually inspectable. Each row exposes its raw payload,
+and each request exposes the exact Model and Context captured when it began.
+
+The browser owns these projections directly. Vendored visual primitives supply Markdown,
+JSON inspection, menus, and theme tokens without owning event or session semantics.
+
+Sources: [apps/agent-monitor/server/](../apps/agent-monitor/server/);
+[apps/agent-monitor/web/](../apps/agent-monitor/web/)
+
+## Producers
+
+Every generator session supports repeated `stream` and `result` calls. Provider adapters
+emit only state and activity they can observe; hidden prompts, HTTP credentials, process
+settings, and transport metadata are not inferred as Context. Custom agents use the same
+event recorder and fold contract.
+
+Sources: [gh_puller/agent/](../gh_puller/agent/); [tests/](../tests/)
 
 ## Run and verify
 
@@ -183,8 +135,9 @@ pnpm --dir apps/agent-monitor/web typecheck
 pnpm --dir apps/agent-monitor/web test
 ```
 
-Real-provider tests are selected with `GH_PULLER_REAL_TESTS=1`. Event logs contain prompts,
-model output, and tool data, so the file directory and WebSocket endpoint are sensitive
-boundaries.
+Real-provider tests are selected with `GH_PULLER_REAL_TESTS=1`. Event logs contain
+prompts, model output, and tool data, so both the history directory and WebSocket endpoint
+are sensitive boundaries.
 
-Sources: [tests/](../tests/); [apps/agent-monitor/server/](../apps/agent-monitor/server/)
+Sources: [tests/](../tests/); [apps/agent-monitor/server/](../apps/agent-monitor/server/);
+[apps/agent-monitor/web/](../apps/agent-monitor/web/)

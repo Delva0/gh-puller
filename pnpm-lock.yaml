@@ -19,9 +19,6 @@ importers:
       '@shikijs/langs':
         specifier: ^4.3.1
         version: 4.4.3
-      '@tanstack/react-virtual':
-        specifier: ^3.14.9
-        version: 3.14.10(react-dom@19.2.8(react@19.2.8))(react@19.2.8)
       '@types/mdast':
         specifier: ^4.0.4
         version: 4.0.4
@@ -31,12 +28,6 @@ importers:
       clsx:
         specifier: ^2.0.0
         version: 2.1.1
-      diff:
-        specifier: ^9.0.0
-        version: 9.0.0
-      immer:
-        specifier: ^10.1.1
-        version: 10.1.1
       katex:
         specifier: ^0.16.47
         version: 0.16.47
@@ -88,12 +79,6 @@ importers:
       shiki:
         specifier: ^4.3.1
         version: 4.4.3
-      use-sync-external-store:
-        specifier: 1.2.0
-        version: 1.2.0(react@19.2.8)
-      zustand:
-        specifier: ~4.4.7
-        version: 4.4.7(@types/react@19.2.18)(immer@10.1.1)(react@19.2.8)
     devDependencies:
       '@tailwindcss/typography':
         specifier: ^0.5.10
@@ -1146,15 +1131,6 @@ packages:
     peerDependencies:
       vite: ^5.2.0 || ^6 || ^7 || ^8
 
-  '@tanstack/react-virtual@3.14.10':
-    resolution: {integrity: sha512-SRyoUbdFMRHuYXMijV5H4ZarQWpXkj3iANq8OFre+pybeVap8ZJjZ3Nz9bVjx4d8PfobVUQUdKyyyHYk3E+djw==}
-    peerDependencies:
-      react: ^16.8.0 || ^17.0.0 || ^18.0.0 || ^19.0.0
-      react-dom: ^16.8.0 || ^17.0.0 || ^18.0.0 || ^19.0.0
-
-  '@tanstack/virtual-core@3.17.8':
-    resolution: {integrity: sha512-BfEvehNpOT75r5Ksc5xW6NZuXujTfb7nlSEyVu4XHG3gdxNg1KqXruWbDewXOUaUYIo4oRbSfkjIajz4MAT8tA==}
-
   '@types/chai@5.2.3':
     resolution: {integrity: sha512-Mw558oeA9fFbv65/y4mHtXDs9bPnFMZAL/jxdPFUpOHHIXX91mcgEHbS5Lahr+pwZFR8A7GQleRWeI6cGFC2UA==}
 
@@ -1882,10 +1858,6 @@ packages:
   devlop@1.1.0:
     resolution: {integrity: sha512-RWmIqhcFf1lRYBvNmr7qTNuyCt/7/ns2jbpp1+PalgE/rDQcBT0fioSMUpJ93irlUhC5hrg4cYqe6U+0ImW0rA==}
 
-  diff@9.0.0:
-    resolution: {integrity: sha512-svtcdpS8CgJyqAjEQIXdb3OjhFVVYjzGAPO8WGCmRbrml64SPw/jJD4GoE98aR7r25A0XcgrK3F02yw9R/vhQw==}
-    engines: {node: '>=0.3.1'}
-
   dir-glob@3.0.1:
     resolution: {integrity: sha512-WkrWp9GR4KXfKGYzOLmTuGVi1UWFfws377n9cc55/tb6DuqyF6pcQ5AbiHEshaDpY9v6oaSr2XCDidGmMwdzIA==}
     engines: {node: '>=8'}
@@ -2371,9 +2343,6 @@ packages:
   ignore@7.0.6:
     resolution: {integrity: sha512-BAg6QkE8W+TuQLrrw0Ugr7HegXduRuuj8/ti2kSOc+jz1dmx8/WNcjr6XGnq5YpDWxFwwaavqD0+jIUOKelTsw==}
     engines: {node: '>= 4'}
-
-  immer@10.1.1:
-    resolution: {integrity: sha512-s2MPrmjovJcoMaHtx6K11Ra7oD05NT97w1IC5zpMkT6Atjr7H8LjaDd81iIxUYpMKSRRNMJE703M1Fhr/TctHw==}
 
   import-fresh@3.2.1:
     resolution: {integrity: sha512-6e1q1cnWP2RXD9/keSkxHScg508CdXqXWgWBaETNhyuBFz+kUZlKboh+ISK+bU++DmbHimVBrOz/zzPe0sZ3sQ==}
@@ -3589,11 +3558,6 @@ packages:
   uri-js@4.4.1:
     resolution: {integrity: sha512-7rKUyy33Q1yc98pQ1DAmLtwX109F7TIfWlW1Ydo8Wl1ii1SeHieeh0HHfPeL2fMXK6z0s8ecKs9frCuLJvndBg==}
 
-  use-sync-external-store@1.2.0:
-    resolution: {integrity: sha512-eEgnFxGQ1Ife9bzYs6VLi8/4X6CObHMw9Qr9tPY43iKwsPw8xE8+EFsf/2cFZ5S3esXgpWgtSCtLNS41F+sKPA==}
-    peerDependencies:
-      react: ^16.8.0 || ^17.0.0 || ^18.0.0
-
   util-deprecate@1.0.2:
     resolution: {integrity: sha512-EPD5q1uXyFxJpCrLnCc1nHnq3gOa6DZBocAIiI2TaSCA7VCJ1UJDMagCzIkXNsUYfD1daK//LTEQ8xiIbrHtcw==}
 
@@ -3785,21 +3749,6 @@ packages:
 
   zod@4.4.3:
     resolution: {integrity: sha512-ytENFjIJFl2UwYglde2jchW2Hwm4GJFLDiSXWdTrJQBIN9Fcyp7n4DhxJEiWNAJMV1/BqWfW/kkg71UDcHJyTQ==}
-
-  zustand@4.4.7:
-    resolution: {integrity: sha512-QFJWJMdlETcI69paJwhSMJz7PPWjVP8Sjhclxmxmxv/RYI7ZOvR5BHX+ktH0we9gTWQMxcne8q1OY8xxz604gw==}
-    engines: {node: '>=12.7.0'}
-    peerDependencies:
-      '@types/react': '>=16.8'
-      immer: '>=9.0'
-      react: '>=16.8'
-    peerDependenciesMeta:
-      '@types/react':
-        optional: true
-      immer:
-        optional: true
-      react:
-        optional: true
 
   zwitch@2.0.4:
     resolution: {integrity: sha512-bXE4cR/kVZhKZX/RjPEflHaKVhUVl85noU3v6b8apfQEc1x4A+zBxjZ4lN8LqGd6WZ3dl98pY4o717VFmoPp+A==}
@@ -4519,14 +4468,6 @@ snapshots:
       '@tailwindcss/oxide': 4.3.3
       tailwindcss: 4.3.3
       vite: 7.3.6(@types/node@20.19.43)(jiti@2.7.0)(lightningcss@1.32.0)
-
-  '@tanstack/react-virtual@3.14.10(react-dom@19.2.8(react@19.2.8))(react@19.2.8)':
-    dependencies:
-      '@tanstack/virtual-core': 3.17.8
-      react: 19.2.8
-      react-dom: 19.2.8(react@19.2.8)
-
-  '@tanstack/virtual-core@3.17.8': {}
 
   '@types/chai@5.2.3':
     dependencies:
@@ -5353,8 +5294,6 @@ snapshots:
     dependencies:
       dequal: 2.0.3
 
-  diff@9.0.0: {}
-
   dir-glob@3.0.1:
     dependencies:
       path-type: 4.0.0
@@ -6105,8 +6044,6 @@ snapshots:
   ignore@5.2.0: {}
 
   ignore@7.0.6: {}
-
-  immer@10.1.1: {}
 
   import-fresh@3.2.1:
     dependencies:
@@ -7743,10 +7680,6 @@ snapshots:
     dependencies:
       punycode: 2.3.1
 
-  use-sync-external-store@1.2.0(react@19.2.8):
-    dependencies:
-      react: 19.2.8
-
   util-deprecate@1.0.2: {}
 
   uuid@14.0.2: {}
@@ -7947,13 +7880,5 @@ snapshots:
       zod: 4.4.3
 
   zod@4.4.3: {}
-
-  zustand@4.4.7(@types/react@19.2.18)(immer@10.1.1)(react@19.2.8):
-    dependencies:
-      use-sync-external-store: 1.2.0(react@19.2.8)
-    optionalDependencies:
-      '@types/react': 19.2.18
-      immer: 10.1.1
-      react: 19.2.8
 
   zwitch@2.0.4: {}

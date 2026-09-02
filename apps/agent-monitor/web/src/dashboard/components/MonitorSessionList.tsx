@@ -1,15 +1,13 @@
 'use client';
 
-// 监控侧栏会话列表:搜索/状态筛选 + run_id 分组头(任务级会话组,组头带条数)
-// + 逐项右端 ··· 菜单(dsh Menu 原语,portal 免裁切):删除会话走两步 —
-// 菜单(危险项)→ RiskConfirmation 弹框(勾选确认)→ onDelete(hub delete 帧)。
-// 后端删除是内存+磁盘一体删,不可恢复,故确认弹框不可跳过。
+/** Render searchable sessions and guard destructive deletion. */
 
 import { useMemo, useState } from 'react';
-import { StateBadge } from '@gh-puller/ui';
-import { useLanguage } from '@gh-puller/ui';
+import { StateBadge, useLanguage } from '@gh-puller/ui';
 import type { SessionMeta } from '../monitor-data';
-import { IconEllipsisOutline16, Menu, RiskConfirmation } from '../vendor/dsh/ui-primitives/src/index.ts';
+import { Menu } from '../vendor/dsh/ui-primitives/src/Menu.tsx';
+import { RiskConfirmation } from '../vendor/dsh/ui-primitives/src/RiskConfirmation.tsx';
+import { IconEllipsisOutline16 } from '../vendor/dsh/ui-primitives/src/icons/index.tsx';
 
 interface Props {
   sessions: SessionMeta[];
@@ -59,7 +57,6 @@ export default function MonitorSessionList({ sessions, current, onSelect, onDele
               </span>
             </div>
           )}
-          {/* 行拆两段:选择区(button)+ 菜单锚点;避免嵌套 button 的非法 DOM */}
           <div className="flex items-center pr-2">
             <button
               type="button"
@@ -106,7 +103,7 @@ export default function MonitorSessionList({ sessions, current, onSelect, onDele
           </div>
         </li>
       ))}
-      {/* 删除确认:后端删文件不可恢复,勾选后才允许确认 */}
+      {/* The hub deletes the persisted file, so confirmation cannot be skipped. */}
       <RiskConfirmation
         open={confirmFor !== null}
         title={t('delete.title')}

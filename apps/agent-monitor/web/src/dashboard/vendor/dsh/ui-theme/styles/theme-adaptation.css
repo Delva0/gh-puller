@@ -1,10 +1,6 @@
 /*
- * gh-puller 和风主题适配层(唯一配色映射;用户拍板:面板结构/布局 1:1 dsh,
- * 配色走 ui 和风主题——和纸/富士紫)。vendored dsh 设计令牌不删不改,
- * 本文件按语义角色覆盖:画布/分支层(Washi 阶)、文字(墨/鼠色)、边框
- * (浅茶)、品牌/交互(富士紫)、markdown 块(紫墨);语义色(绿/琥珀/红)
- * 与中性滚动条/阴影/工具提示等保留 dsh 原值。
- * 浅色覆盖写在 :root,深色写 html[data-theme='dark'](后导入取胜)。
+ * Map vendored visual tokens onto the shared washi and Fuji-purple theme.
+ * Semantic status colors and neutral effects keep their primitive defaults.
  */
 
 /* ---------- 字体:接入 @gh-puller/ui 的字形(Noto Sans JP / Geist Mono) ---------- */

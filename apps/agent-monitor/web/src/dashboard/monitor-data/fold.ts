@@ -1,6 +1,10 @@
 /** Incrementally fold a session while keeping request state and activity separate. */
 
-import { foldRequestState, requestStateAt } from './context'
+import {
+  applyStateEvent,
+  emptyRequestState,
+  foldRequestState,
+} from './context'
 import type { EventEnvelope, Message, ModelActivity, RequestState, ToolActivity } from './types'
 
 export type IngestResult = 'ok' | 'dup' | 'gap'
@@ -19,52 +23,49 @@ export class RunFold {
   }
 
   ingestBatch(batch: EventEnvelope[]): IngestResult {
-    let result: IngestResult = 'dup'
+    let cursor = this.nextSeq
+    const fresh: EventEnvelope[] = []
     for (const evt of [...batch].sort((a, b) => a.seq - b.seq)) {
-      if (evt.seq < this.nextSeq) continue
-      if (evt.seq > this.nextSeq) result = 'gap'
-      else if (result !== 'gap') result = 'ok'
-      this.events.push(evt)
-      this.nextSeq = evt.seq + 1
+      if (evt.seq < cursor) continue
+      if (evt.seq > cursor) return 'gap'
+      fresh.push(evt)
+      cursor += 1
     }
-    return result
-  }
-
-  requestedFrom(): number {
-    return this.nextSeq
+    if (fresh.length === 0) return 'dup'
+    this.events = [...this.events, ...fresh]
+    this.nextSeq = cursor
+    return 'ok'
   }
 
   state(): RequestState {
     return foldRequestState(this.events)
   }
 
-  stateAt(seq: number): RequestState {
-    return requestStateAt(this.events, seq)
-  }
-
-  messages(): Message[] {
-    return this.state().context
-  }
-
-  messagesAt(seq: number): Message[] {
-    return this.stateAt(seq).context
-  }
-
   modelActivity(): ModelActivity[] {
     const requests = new Map<string, ModelActivity>()
+    const state = emptyRequestState()
     for (const evt of this.events) {
+      if (applyStateEvent(state, evt)) continue
       const requestId = typeof evt.data.requestId === 'string' ? evt.data.requestId : null
       if (evt.type === 'model/request' && requestId !== null) {
         requests.set(requestId, {
           requestId,
           requestSeq: evt.seq,
+          requestState: {
+            model: state.model === null
+              ? null
+              : { ...state.model, parameters: { ...state.model.parameters } },
+            context: [...state.context],
+          },
           text: '',
           reasoning: '',
+          deltaCount: 0,
           toolCalls: new Map(),
         })
       } else if (evt.type.startsWith('model/delta/') && requestId !== null) {
         const request = requests.get(requestId)
         if (request === undefined) continue
+        request.deltaCount += 1
         if (evt.type === 'model/delta/text') request.text += String(evt.data.text ?? '')
         if (evt.type === 'model/delta/reasoning') request.reasoning += String(evt.data.text ?? '')
         if (evt.type === 'model/delta/tool-call') {
@@ -112,13 +113,13 @@ export class RunFold {
     return [...tools.values()].sort((a, b) => a.startSeq - b.startSeq)
   }
 
-  get partial(): string {
-    const request = this.modelActivity().at(-1)
-    return request?.responseSeq === undefined ? request?.text ?? '' : ''
+  activeModel(requests = this.modelActivity()): ModelActivity | null {
+    const request = requests.at(-1)
+    return request?.responseSeq === undefined ? request ?? null : null
   }
 
-  get length(): number {
-    return this.nextSeq
+  stepCount(): number {
+    return this.events.filter(evt => evt.type === 'step/start').length
   }
 
   all(): EventEnvelope[] {

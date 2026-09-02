@@ -1,7 +1,6 @@
 'use client';
 
-// 底部状态栏:连接状态 + 当前会话 + 端部关键态簇(state/duration/steps/usage/events),
-// 关键态与 events 同地位(右端对齐、同为 muted font-mono)。
+/** Render connection state and canonical run counters. */
 import { StateBadge, useLanguage } from '@gh-puller/ui';
 import type { ConnStatus } from '../hooks/useMonitorSocket';
 import type { SessionMeta } from '../monitor-data';
@@ -10,7 +9,6 @@ interface Props {
   status: ConnStatus;
   current: string | null;
   events: number;
-  /** 当前会话元数据(state/provider/model/run_id),为空则仅显示事件计数。 */
   meta?: SessionMeta | null;
   duration?: string;
   steps?: number;
@@ -32,7 +30,6 @@ export default function MonitorStatusBar({ status, current, events, meta, durati
         {t(`status.${status}`)}
       </span>
       {current && <span className="truncate font-mono">{current}</span>}
-      {/* 端部:会话关键态簇(右端对齐,与 events 同地位);未选中会话时不渲染任何 key/value */}
       {meta && (
         <span className="ml-auto flex min-w-0 flex-wrap items-center gap-2">
           <StateBadge state={meta.state} label={t(`session.state.${meta.state}`)} />
