@@ -33,7 +33,6 @@ from gh_puller.github import (
     iter_runs,
     iter_versions,
 )
-from gh_puller.github.client import _CATALOG_HINT
 from gh_puller.github.puller import _certified_merge
 
 if TYPE_CHECKING:
@@ -125,6 +124,9 @@ class FakeAPI:
     ) -> list[dict[str, Any]]:
         items = self._items(path, params)
         self._called("page", path, params, requests=max(1, math.ceil(len(items) / 100)))
+        if path in self.fail_once and path not in self.failed:
+            self.failed.add(path)
+            raise RuntimeError(f"injected failure: {path}")
         if page_observer is not None:
             if items:
                 for offset in range(0, len(items), 100):
@@ -209,38 +211,6 @@ class FakeAPI:
             return None
         return len(self.catalog) if self.reported_count is None else self.reported_count
 
-    async def repository_catalog(
-        self,
-        owner: str,
-        repo: str,
-        *,
-        page_observer: Any = None,
-    ) -> tuple[list[dict[str, Any]], int] | None:
-        if not self.count_available:
-            return None
-        issues = [item for item in self.catalog if "pull_request" not in item]
-        pulls = [item for item in self.catalog if "pull_request" in item]
-        issues.sort(key=lambda item: (_time(item["created_at"]), item["number"]), reverse=True)
-        pulls.sort(key=lambda item: (_time(item["created_at"]), item["number"]), reverse=True)
-        pages = max(1, math.ceil(len(issues) / 100), math.ceil(len(pulls) / 100))
-        self._called("catalog", "/graphql/catalog", {"owner": owner, "repo": repo}, requests=pages)
-        if page_observer is not None:
-            for page in range(pages):
-                start = page * 100
-                page_observer(len(issues[start : start + 100]) + len(pulls[start : start + 100]))
-        hints = []
-        for item in issues + pulls:
-            hint = {
-                _CATALOG_HINT: True,
-                "number": item["number"],
-                "created_at": item["created_at"],
-                "updated_at": item["updated_at"],
-            }
-            if "pull_request" in item:
-                hint["pull_request"] = {}
-            hints.append(hint)
-        return hints, len(hints)
-
     def add_issue(
         self,
         number: int,
@@ -257,17 +227,15 @@ class FakeAPI:
             "updated_at": _iso(updated_at),
             "title": f"item {number}",
             "unknown_summary_field": {"preserved": True},
-        }
-        if pull:
-            summary["pull_request"] = {"url": f"{_BASE}/pulls/{number}"}
-        self.catalog.append(summary)
-        detail = deepcopy(summary) | {
             "body": body,
             "comments": 0,
             "reactions": {"total_count": 0},
             "unknown_detail_field": [1, {"raw": "yes"}],
         }
-        self.json[f"{_BASE}/issues/{number}"] = detail
+        if pull:
+            summary["pull_request"] = {"url": f"{_BASE}/pulls/{number}"}
+        self.catalog.append(summary)
+        self.json[f"{_BASE}/issues/{number}"] = summary
         return summary
 
     def _called(
@@ -617,7 +585,7 @@ async def test_cold_pull_preserves_raw_fields_and_publishes_target(tmp_path: Pat
     assert bundle["reactions"][0]["content"] == "heart"
     assert bundle["issue_comment_reactions"] == {"101": []}
     assert catalog["unknown_summary_field"] == {"preserved": True}
-    assert _CATALOG_HINT not in catalog
+    assert catalog == bundle["issue"]
     runs = await _runs(archive)
     assert len(runs) == 1
     assert runs[0].target_at == _iso(_T0)
@@ -626,8 +594,10 @@ async def test_cold_pull_preserves_raw_fields_and_publishes_target(tmp_path: Pat
     assert result.changed_items == 1
     assert result.catalog_items == 1
     assert runs[0].observed_until == _iso(_T0)
-    catalog_call = next(call for call in api.calls if call[0] == "catalog")
-    assert catalog_call[2] == {"owner": "acme", "repo": "widgets"}
+    catalog_call = next(call for call in api.calls if call[0] == "page" and call[1] == f"{_BASE}/issues")
+    assert catalog_call[2] == {"state": "all", "sort": "created", "direction": "desc"}
+    assert sum(call[0] == "count" for call in api.calls) == 1
+    assert not any(call[0] == "json" and call[1] == issue_path for call in api.calls)
 
 
 @pytest.mark.asyncio
@@ -922,6 +892,7 @@ async def test_bundle_validators_survive_puller_restart_and_reuse_only_paired_pa
     changed_at = _T0 + timedelta(hours=1)
     summary = second_api.catalog[0]
     summary["updated_at"] = _iso(changed_at)
+    summary["title"] = "changed root"
     second_api.json[f"{_BASE}/issues/1"]["updated_at"] = _iso(changed_at)
     second_api.json[f"{_BASE}/issues/1"]["title"] = "changed root"
 
@@ -932,7 +903,7 @@ async def test_bundle_validators_survive_puller_restart_and_reuse_only_paired_pa
         f"{_BASE}/issues/1/events",
         f"{_BASE}/issues/1/timeline",
     }
-    assert second_api.charged_bundle_requests == 1
+    assert second_api.charged_bundle_requests == 0
     assert len(await _rows(archive, "SELECT bundle_digest FROM bundle_http_cache")) == 2
     bundle = (await _current(archive))[1].bundle
     assert bundle is not None
@@ -1050,10 +1021,9 @@ async def test_certified_puller_stays_byte_equal_to_exhaustive_oracle(tmp_path: 
     await exhaustive.pull(replacement_target)
     catalog_calls = certified_api.calls[catalog_call_start:]
     root_calls = [call for call in catalog_calls if call[0] == "page" and call[1] == f"{_BASE}/issues"]
-    full_calls = [call for call in catalog_calls if call[0] == "catalog"]
     fetched_roots = [call[1] for call in catalog_calls if call[0] == "json" and call[1].startswith(f"{_BASE}/issues/")]
-    assert (len(root_calls), len(full_calls)) == (1, 2)
-    assert fetched_roots == [f"{_BASE}/issues/5"]
+    assert len(root_calls) == 3
+    assert fetched_roots == []
     assert (await _current(certified_path))[1].present is False
     assert await _managed_snapshot(certified_path) == await _managed_snapshot(exhaustive_path)
 
@@ -1418,20 +1388,23 @@ async def test_large_random_issue_and_comment_churn_matches_exhaustive_oracle(tm
         await exhaustive.pull(target)
         epoch_calls = certified_api.calls[call_start:]
         root_scans = sum(call[0] == "page" and call[1] == f"{_BASE}/issues" for call in epoch_calls)
-        full_scans = sum(call[0] == "catalog" for call in epoch_calls)
-        assert root_scans == 1
         if deleted:
-            assert full_scans == 2
+            assert root_scans == 3
             fallback_epochs += 1
         else:
-            assert full_scans == 0
+            assert root_scans == 1
             fast_epochs += 1
         fetched_roots = {
             int(call[1].rsplit("/", 1)[1])
             for call in epoch_calls
             if call[0] == "json" and call[1].startswith(f"{_BASE}/issues/")
         }
-        assert fetched_roots == set(selected) | set(added)
+        expected_roots = (
+            set()
+            if deleted
+            else {number for number, operation, _ in operations if operation == "add"}
+        )
+        assert fetched_roots == expected_roots
         assert await _managed_snapshot(certified_path) == await _managed_snapshot(exhaustive_path)
 
     assert (added_total, deleted_total) == (60, 20)
@@ -1464,7 +1437,7 @@ async def test_parent_deletion_fallback_reads_catalog_without_survivor_bundles(
     calls = api.calls[call_start:]
     fetched_roots = [call for call in calls if call[0] == "json" and call[1].startswith(f"{_BASE}/issues/")]
     assert fetched_roots == []
-    assert sum(call[0] == "catalog" for call in calls) == 2
+    assert sum(call[0] == "page" and call[1] == f"{_BASE}/issues" for call in calls) == 3
     assert result.requests == 10
     assert result.catalog_items == 249
     assert (await _current(archive))[125].present is False
@@ -1485,14 +1458,14 @@ async def test_quiet_increment_cost_is_four_requests_independent_of_catalog_size
     cold = await puller.pull(_T0)
     baseline = math.ceil(catalog_size / 100) + 5 * catalog_size
     expected = (
-        math.ceil(catalog_size / 100) + 4 * catalog_size
+        math.ceil(catalog_size / 100) + 1 + 3 * catalog_size
         if catalog_size == 1
-        else math.ceil(catalog_size / 100) + 3 * catalog_size + 3
+        else math.ceil(catalog_size / 100) + 1 + 2 * catalog_size + 3
     )
     assert cold.requests == expected
     assert cold.requests < baseline
-    assert sum(call[0] == "catalog" for call in api.calls) == 1
-    assert sum(call[0] == "count" for call in api.calls) == 0
+    assert sum(call[0] == "page" and call[1] == f"{_BASE}/issues" for call in api.calls) == 1
+    assert sum(call[0] == "count" for call in api.calls) == 1
     clock.current += timedelta(hours=1)
     call_start = len(api.calls)
 
@@ -1692,7 +1665,7 @@ async def test_future_target_prefetches_then_closes_with_one_target_run(tmp_path
     assert result.target_at == target
     assert result.changed_items == 3
     assert set(await _current(archive)) == {1, 2}
-    assert sum(call[1] == f"{_BASE}/issues/1" for call in api.calls) == 2
+    assert not any(call[0] == "json" and call[1] == f"{_BASE}/issues/1" for call in api.calls)
     issue_versions = [version for version in await _versions(archive) if version.number == 1]
     assert len(issue_versions) == 2
     assert issue_versions[0].bundle is not None
@@ -1787,7 +1760,7 @@ async def test_interrupted_cold_pull_resumes_staged_bundles_without_publication(
         "review_comments": 0,
     }
     api.add_issue(3)
-    api.fail_once.add(f"{_BASE}/issues/3")
+    api.fail_once.add(f"{_BASE}/issues/3/timeline")
     archive = tmp_path / "archive"
     puller = GitHubPuller(_config(archive, concurrency=1), api=api, now=lambda: _T0)
 
@@ -1807,8 +1780,8 @@ async def test_interrupted_cold_pull_resumes_staged_bundles_without_publication(
         """,
     )
     assert {row["number"] for row in staged} == {1, 2}
-    assert sum(call[1] == f"{_BASE}/issues/1" for call in api.calls) == 1
-    assert sum(call[1] == f"{_BASE}/issues/2" for call in api.calls) == 1
+    assert sum(call[1] == f"{_BASE}/issues/1/timeline" for call in api.calls) == 1
+    assert sum(call[1] == f"{_BASE}/issues/2/timeline" for call in api.calls) == 1
 
     events: list[PullProgress] = []
     result = await GitHubPuller(
@@ -1819,8 +1792,8 @@ async def test_interrupted_cold_pull_resumes_staged_bundles_without_publication(
     ).pull(_T0)
 
     assert result.changed_items == 3
-    assert sum(call[1] == f"{_BASE}/issues/1" for call in api.calls) == 1
-    assert sum(call[1] == f"{_BASE}/issues/2" for call in api.calls) == 1
+    assert sum(call[1] == f"{_BASE}/issues/1/timeline" for call in api.calls) == 1
+    assert sum(call[1] == f"{_BASE}/issues/2/timeline" for call in api.calls) == 1
     assert set(await _current(archive)) == {1, 2, 3}
     assert len(await _runs(archive)) == 1
     restored = next(event for event in events if event.phase == "closing_catalog" and event.bundles_completed == 2)
@@ -1881,17 +1854,17 @@ async def test_cancellation_aborts_work_and_does_not_publish(tmp_path: Path) -> 
             self.started = asyncio.Event()
             self.release = asyncio.Event()
 
-        async def get_json(
+        async def paginate(
             self,
             path: str,
             *,
             params: dict[str, Any] | None = None,
-            accept: str | None = None,
-        ) -> Any:
-            if path == f"{_BASE}/issues/1":
+            page_observer: Any = None,
+        ) -> list[dict[str, Any]]:
+            if path == f"{_BASE}/issues/1/timeline":
                 self.started.set()
                 await self.release.wait()
-            return await super().get_json(path, params=params, accept=accept)
+            return await super().paginate(path, params=params, page_observer=page_observer)
 
     api = BlockingAPI()
     api.add_issue(1)
@@ -1918,19 +1891,19 @@ async def test_candidate_executor_keeps_only_a_concurrency_sized_task_window(tmp
             self.window_full = asyncio.Event()
             self.release = asyncio.Event()
 
-        async def get_json(
+        async def paginate(
             self,
             path: str,
             *,
             params: dict[str, Any] | None = None,
-            accept: str | None = None,
-        ) -> Any:
-            if path.startswith(f"{_BASE}/issues/"):
+            page_observer: Any = None,
+        ) -> list[dict[str, Any]]:
+            if path.endswith("/timeline"):
                 self.started += 1
                 if self.started == self.concurrency:
                     self.window_full.set()
                 await self.release.wait()
-            return await super().get_json(path, params=params, accept=accept)
+            return await super().paginate(path, params=params, page_observer=page_observer)
 
     concurrency = 3
     api = BlockingAPI(concurrency)
@@ -2093,144 +2066,6 @@ async def test_graphql_repository_count_is_exact_and_authenticated() -> None:
 
 
 @pytest.mark.asyncio
-async def test_graphql_catalog_paginates_both_connections_with_one_query_stream() -> None:
-    seen: list[httpx.Request] = []
-    responses = [
-        {
-            "data": {
-                "repository": {
-                    "issues": {
-                        "totalCount": 2,
-                        "pageInfo": {"hasNextPage": True, "endCursor": "issue-1"},
-                        "nodes": [
-                            {
-                                "number": 3,
-                                "createdAt": "2026-08-01T11:00:00Z",
-                                "updatedAt": "2026-08-01T11:30:00Z",
-                            },
-                        ],
-                    },
-                    "pullRequests": {
-                        "totalCount": 1,
-                        "pageInfo": {"hasNextPage": False, "endCursor": "pull-1"},
-                        "nodes": [
-                            {
-                                "number": 2,
-                                "createdAt": "2026-08-01T10:00:00Z",
-                                "updatedAt": "2026-08-01T10:30:00Z",
-                            },
-                        ],
-                    },
-                },
-            },
-        },
-        {
-            "data": {
-                "repository": {
-                    "issues": {
-                        "totalCount": 2,
-                        "pageInfo": {"hasNextPage": False, "endCursor": "issue-2"},
-                        "nodes": [
-                            {
-                                "number": 1,
-                                "createdAt": "2026-08-01T09:00:00Z",
-                                "updatedAt": "2026-08-01T09:30:00Z",
-                            },
-                        ],
-                    },
-                },
-            },
-        },
-    ]
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        seen.append(request)
-        return httpx.Response(200, json=responses.pop(0), request=request)
-
-    page_sizes: list[int] = []
-    client = httpx.AsyncClient(base_url="https://api.github.test", transport=httpx.MockTransport(handler))
-    api = GitHubAPI(token=str(id(client)), client=client, graphql_url="/graphql")
-    try:
-        result = await api.repository_catalog(
-            "acme",
-            "widgets",
-            page_observer=page_sizes.append,
-        )
-    finally:
-        await client.aclose()
-
-    assert result is not None
-    catalog, count = result
-    assert ([item["number"] for item in catalog], count) == ([3, 1, 2], 3)
-    assert catalog[0] == {
-        _CATALOG_HINT: True,
-        "number": 3,
-        "created_at": "2026-08-01T11:00:00Z",
-        "updated_at": "2026-08-01T11:30:00Z",
-    }
-    assert catalog[-1]["pull_request"] == {}
-    assert page_sizes == [2, 1]
-    assert api.request_count == 2
-    bodies = [json.loads(request.content) for request in seen]
-    assert bodies[0]["variables"] == {
-        "owner": "acme",
-        "repo": "widgets",
-        "issuesAfter": None,
-        "pullsAfter": None,
-        "scanIssues": True,
-        "scanPulls": True,
-    }
-    assert bodies[1]["variables"] == {
-        "owner": "acme",
-        "repo": "widgets",
-        "issuesAfter": "issue-1",
-        "pullsAfter": "pull-1",
-        "scanIssues": True,
-        "scanPulls": False,
-    }
-    assert bodies[0]["query"].count("orderBy: {field: CREATED_AT, direction: DESC}") == 2
-
-
-@pytest.mark.asyncio
-async def test_graphql_catalog_rejects_a_truncated_connection() -> None:
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(
-            200,
-            json={
-                "data": {
-                    "repository": {
-                        "issues": {
-                            "totalCount": 2,
-                            "pageInfo": {"hasNextPage": False, "endCursor": "issue-1"},
-                            "nodes": [
-                                {
-                                    "number": 1,
-                                    "createdAt": "2026-08-01T09:00:00Z",
-                                    "updatedAt": "2026-08-01T09:30:00Z",
-                                },
-                            ],
-                        },
-                        "pullRequests": {
-                            "totalCount": 0,
-                            "pageInfo": {"hasNextPage": False, "endCursor": None},
-                            "nodes": [],
-                        },
-                    },
-                },
-            },
-            request=request,
-        )
-
-    client = httpx.AsyncClient(base_url="https://api.github.test", transport=httpx.MockTransport(handler))
-    api = GitHubAPI(token=str(id(client)), client=client, graphql_url="/graphql")
-    try:
-        with pytest.raises(GitHubAPIError, match="catalog changed while paginating"):
-            await api.repository_catalog("acme", "widgets")
-    finally:
-        await client.aclose()
-
-
-@pytest.mark.asyncio
 async def test_anonymous_repository_discovery_uses_no_graphql_quota() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         pytest.fail(f"unexpected request: {request.url}")
@@ -2239,7 +2074,6 @@ async def test_anonymous_repository_discovery_uses_no_graphql_quota() -> None:
     api = GitHubAPI(client=client, graphql_url="/graphql")
     try:
         assert await api.repository_item_count("acme", "widgets") is None
-        assert await api.repository_catalog("acme", "widgets") is None
     finally:
         await client.aclose()
 

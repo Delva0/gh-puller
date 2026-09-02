@@ -20,7 +20,7 @@ from itertools import islice
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
-from .client import _CATALOG_HINT, GitHubAPI, GitHubAPIError
+from .client import GitHubAPI, GitHubAPIError
 from .progress import _PullProgressTracker
 from .store import (
     ArchivedRun,
@@ -103,14 +103,6 @@ class _API(Protocol):
     ) -> int | None: ...
 
     async def repository_item_count(self, owner: str, repo: str) -> int | None: ...
-
-    async def repository_catalog(
-        self,
-        owner: str,
-        repo: str,
-        *,
-        page_observer: Callable[[int], None] | None = None,
-    ) -> tuple[list[dict[str, Any]], int] | None: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -535,15 +527,6 @@ class GitHubPuller:
         api: _API,
         progress: _PullProgressTracker,
     ) -> tuple[list[dict[str, Any]], int | None]:
-        catalog = await api.repository_catalog(
-            self._owner,
-            self._repo,
-            page_observer=progress.catalog_page,
-        )
-        if catalog is not None:
-            items, count = catalog
-            progress.catalog_count(count)
-            return items, count
         items = await api.paginate(
             f"{self._base}/issues",
             params={"state": "all", "sort": "created", "direction": "desc"},
@@ -611,29 +594,20 @@ class GitHubPuller:
                 previous_bundle, previous_cache = await archive.load_bundle_state(
                     previous.bundle_digest,
                 )
-            catalog_hint = summary.get(_CATALOG_HINT) is True
             bundle, http_cache = await self._fetch_bundle(
                 api,
                 summary,
                 feeds,
                 previous_bundle,
                 previous_cache,
+                catalog_issue=summary if stored_summary is not None else None,
             )
-            if catalog_hint:
-                if (
-                    previous is None
-                    or not previous.present
-                    or previous.updated_at != summary.get("updated_at")
-                    or previous.kind != bundle.get("kind")
-                ):
-                    detail = bundle.get("issue")
-                    if not isinstance(detail, dict):
-                        raise IncompleteGitHubDataError(
-                            f"issue #{number} bundle has no detail summary",
-                        )
+            if stored_summary is None:
+                detail = bundle.get("issue")
+                if not isinstance(detail, dict):
+                    raise IncompleteGitHubDataError(f"issue #{number} bundle has no root object")
+                if previous is None or previous.summary_digest != json_digest(detail):
                     stored_summary = detail
-                else:
-                    stored_summary = None
             return number, bundle, stored_summary, http_cache
 
         numbers = iter(sorted(candidates))
@@ -808,17 +782,22 @@ class GitHubPuller:
         feeds: _BundleFeeds,
         previous: dict[str, Any] | None,
         previous_cache: dict[str, Any] | None,
+        *,
+        catalog_issue: dict[str, Any] | None,
     ) -> tuple[dict[str, Any], dict[str, Any] | None]:
         number = int(summary["number"])
         issue_path = f"{self._base}/issues/{number}"
         http_cache: dict[str, Any] = {}
-        issue, cache = await self._cached_json(
-            api,
-            issue_path,
-            _dict_field(previous, "issue"),
-            _dict_field(previous_cache, "issue"),
-        )
-        _set_cache(http_cache, "issue", cache)
+        if catalog_issue is None:
+            issue, cache = await self._cached_json(
+                api,
+                issue_path,
+                _dict_field(previous, "issue"),
+                _dict_field(previous_cache, "issue"),
+            )
+            _set_cache(http_cache, "issue", cache)
+        else:
+            issue = catalog_issue
         if feeds.issue_comments is None:
             comments, cache = await self._cached_page(
                 api,
@@ -1382,12 +1361,6 @@ def _overlay_plan(
 def _needs_refresh(head: StoredHead | None, summary: dict[str, Any]) -> bool:
     if head is None or not head.present or head.bundle_digest is None:
         return True
-    if summary.get(_CATALOG_HINT) is True:
-        return (
-            head.kind != _kind(summary)
-            or head.created_at != summary.get("created_at")
-            or head.updated_at != summary.get("updated_at")
-        )
     return (
         head.kind != _kind(summary)
         or head.updated_at != summary.get("updated_at")

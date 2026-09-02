@@ -24,45 +24,11 @@ if TYPE_CHECKING:
 
 _LOG = logging.getLogger(__name__)
 _DEFAULT_ACCEPT = "application/vnd.github.full+json"
-_CATALOG_HINT = "_gh_puller_graphql_catalog"
 _REPOSITORY_ITEM_COUNT = """
 query RepositoryItemCount($owner: String!, $repo: String!) {
   repository(owner: $owner, name: $repo) {
     issues(states: [OPEN, CLOSED]) { totalCount }
     pullRequests(states: [OPEN, CLOSED, MERGED]) { totalCount }
-  }
-}
-"""
-_REPOSITORY_CATALOG = """
-query RepositoryCatalog(
-  $owner: String!
-  $repo: String!
-  $issuesAfter: String
-  $pullsAfter: String
-  $scanIssues: Boolean!
-  $scanPulls: Boolean!
-) {
-  repository(owner: $owner, name: $repo) {
-    issues(
-      first: 100
-      after: $issuesAfter
-      states: [OPEN, CLOSED]
-      orderBy: {field: CREATED_AT, direction: DESC}
-    ) @include(if: $scanIssues) {
-      totalCount
-      pageInfo { hasNextPage endCursor }
-      nodes { number createdAt updatedAt }
-    }
-    pullRequests(
-      first: 100
-      after: $pullsAfter
-      states: [OPEN, CLOSED, MERGED]
-      orderBy: {field: CREATED_AT, direction: DESC}
-    ) @include(if: $scanPulls) {
-      totalCount
-      pageInfo { hasNextPage endCursor }
-      nodes { number createdAt updatedAt }
-    }
   }
 }
 """
@@ -464,79 +430,6 @@ class GitHubAPI:
             raise GitHubAPIError("GitHub returned non-integer repository counts")
         return issues + pulls
 
-    async def repository_catalog(
-        self,
-        owner: str,
-        repo: str,
-        *,
-        page_observer: Callable[[int], None] | None = None,
-    ) -> tuple[list[dict[str, Any]], int] | None:
-        """读取 Issue 与 PR 的完整稳定序目录。
-
-        Args:
-            owner: 仓库 owner。
-            repo: 仓库名。
-            page_observer: 每次 GraphQL 查询返回的节点数同步观察器。
-
-        Returns:
-            目录提示与首次连接总数；匿名客户端返回 None，使调用方回退到 REST。
-
-        Raises:
-            GitHubAPIError: 连接截断、重复或返回结构无效。
-        """
-        if not self._authenticated:
-            return None
-        issue_cursor: str | None = None
-        pull_cursor: str | None = None
-        scan_issues = True
-        scan_pulls = True
-        issue_total: int | None = None
-        pull_total: int | None = None
-        issues: list[dict[str, Any]] = []
-        pulls: list[dict[str, Any]] = []
-        while scan_issues or scan_pulls:
-            payload = await self._graphql(
-                _REPOSITORY_CATALOG,
-                {
-                    "owner": owner,
-                    "repo": repo,
-                    "issuesAfter": issue_cursor,
-                    "pullsAfter": pull_cursor,
-                    "scanIssues": scan_issues,
-                    "scanPulls": scan_pulls,
-                },
-            )
-            try:
-                repository = payload["data"]["repository"]
-            except (KeyError, TypeError) as exc:
-                raise GitHubAPIError("GitHub returned incomplete repository catalog") from exc
-            observed = 0
-            if scan_issues:
-                connection = _catalog_connection(repository, "issues", pull=False)
-                issue_total = connection[0] if issue_total is None else issue_total
-                issues.extend(connection[1])
-                issue_cursor, scan_issues = connection[2], connection[3]
-                observed += len(connection[1])
-            if scan_pulls:
-                connection = _catalog_connection(repository, "pullRequests", pull=True)
-                pull_total = connection[0] if pull_total is None else pull_total
-                pulls.extend(connection[1])
-                pull_cursor, scan_pulls = connection[2], connection[3]
-                observed += len(connection[1])
-            if page_observer is not None:
-                page_observer(observed)
-        if issue_total is None or pull_total is None:
-            raise GitHubAPIError("GitHub returned no repository catalog counts")
-        if len(issues) != issue_total or len(pulls) != pull_total:
-            raise GitHubAPIError(
-                "GitHub repository catalog changed while paginating; retry the pull",
-            )
-        catalog = issues + pulls
-        numbers = {item["number"] for item in catalog}
-        if len(numbers) != len(catalog):
-            raise GitHubAPIError("GitHub repository catalog contains duplicate numbers")
-        return catalog, issue_total + pull_total
-
     async def _graphql(
         self,
         query: str,
@@ -793,43 +686,3 @@ def _integer_header(response: httpx.Response, name: str) -> int | None:
         return int(response.headers[name])
     except (KeyError, ValueError):
         return None
-
-
-def _catalog_connection(
-    repository: Any,
-    name: str,
-    *,
-    pull: bool,
-) -> tuple[int, list[dict[str, Any]], str | None, bool]:
-    try:
-        connection = repository[name]
-        total = connection["totalCount"]
-        nodes = connection["nodes"]
-        page_info = connection["pageInfo"]
-        has_next = page_info["hasNextPage"]
-        end_cursor = page_info["endCursor"]
-    except (KeyError, TypeError) as exc:
-        raise GitHubAPIError(f"GitHub returned incomplete {name} connection") from exc
-    if type(total) is not int or total < 0 or not isinstance(nodes, list) or type(has_next) is not bool:
-        raise GitHubAPIError(f"GitHub returned invalid {name} connection")
-    items: list[dict[str, Any]] = []
-    for node in nodes:
-        if not isinstance(node, dict):
-            raise GitHubAPIError(f"GitHub returned invalid {name} node")
-        number = node.get("number")
-        created_at = node.get("createdAt")
-        updated_at = node.get("updatedAt")
-        if type(number) is not int or not isinstance(created_at, str) or not isinstance(updated_at, str):
-            raise GitHubAPIError(f"GitHub returned incomplete {name} node")
-        item: dict[str, Any] = {
-            _CATALOG_HINT: True,
-            "number": number,
-            "created_at": created_at,
-            "updated_at": updated_at,
-        }
-        if pull:
-            item["pull_request"] = {}
-        items.append(item)
-    if has_next and not isinstance(end_cursor, str):
-        raise GitHubAPIError(f"GitHub returned no cursor for {name} connection")
-    return total, items, end_cursor, has_next
