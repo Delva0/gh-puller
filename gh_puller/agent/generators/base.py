@@ -13,6 +13,7 @@ class BaseGenerator:
 
     generator = ""
     provider = ""
+    model_parameter_keys: tuple[str, ...] = ()
 
     def __init__(self, config: dict):
         self.config = dict(config)
@@ -33,14 +34,13 @@ class BaseGenerator:
         event_recorder.start()
         model = self.config.get("model")
         if model:
-            parameters = {
-                key: value for key, value in self.config.items()
-                if key not in {"model", "api_key", "base_url", "system_prompt", "mcp_servers"}
-            }
-            event_recorder.set_model(model, provider=self.provider or None, parameters=parameters)
-        instructions = ([{"type": "text", "text": self.config["system_prompt"]}]
-                        if self.config.get("system_prompt") else [])
-        event_recorder.set_header(instructions=instructions, tools=[])
+            parameters = {key: self.config[key] for key in self.model_parameter_keys
+                          if self.config.get(key) is not None}
+            event_recorder.set_model(
+                model, provider=self.config.get("provider") or self.provider or None,
+                parameters=parameters)
+        if context := self._initial_context():
+            event_recorder.set_context(context)
         self._event_recorder = event_recorder
         ok = False
         try:
@@ -66,6 +66,13 @@ class BaseGenerator:
         if self._event_recorder is None:
             raise RuntimeError("stream/result 只能在 async with gen.session(...) 块内调用")
         return self._event_recorder
+
+    def _initial_context(self) -> list[dict]:
+        """Project observable construction-time instructions into context."""
+        prompt = self.config.get("system_prompt")
+        if not prompt:
+            return []
+        return [{"role": "system", "content": [{"type": "text", "text": prompt}]}]
 
     async def _enter(self) -> None:
         """Subclass hook: enter the client (same semantics as its `__aenter__`)."""

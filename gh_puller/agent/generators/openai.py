@@ -28,7 +28,7 @@ def _headers(headers: dict | None, api_key: str | None) -> dict:
 
 def _blocks(content) -> list[dict]:
     if isinstance(content, list):
-        return content
+        return [dict(block) for block in content]
     return [{"type": "text", "text": content or ""}]
 
 
@@ -49,25 +49,29 @@ def _message(message: dict) -> dict:
     return result
 
 
-def _instructions(messages: list[dict]) -> list[dict]:
-    result = []
-    for message in messages:
-        if message.get("role") not in {"system", "developer"}:
-            continue
-        result.extend(_blocks(message.get("content")))
-    return result
-
-
-def _tools(tools: list[dict]) -> list[dict]:
+def _tool_blocks(tools: list[dict]) -> list[dict]:
     result = []
     for tool in tools:
         function = tool.get("function") or tool
         result.append({
-            "name": function.get("name") or "",
+            "type": "tool_definition", "name": function.get("name") or "",
             "description": function.get("description") or "",
             "inputSchema": function.get("parameters") or function.get("inputSchema") or {},
         })
     return result
+
+
+def _request_context(messages: list[dict], tools: list[dict]) -> list[dict]:
+    """Normalize the complete model-visible context of one request."""
+    context = [_message(message) for message in messages]
+    definitions = _tool_blocks(tools)
+    if not definitions:
+        return context
+    leading = 0
+    while leading < len(context) and context[leading]["role"] in {"system", "developer"}:
+        leading += 1
+    context.insert(leading, {"role": "system", "content": definitions})
+    return context
 
 
 class OpenAI(BaseGenerator):
@@ -79,6 +83,9 @@ class OpenAI(BaseGenerator):
     def __init__(self, config: dict):
         super().__init__(config)
         self._client = httpx.AsyncClient(timeout=None)  # noqa: S113 - requests set timeout
+
+    def _initial_context(self) -> list[dict]:
+        return []
 
     async def _enter(self):
         await self._client.__aenter__()
@@ -114,10 +121,7 @@ class OpenAI(BaseGenerator):
                       if key not in {"model", "messages", "tools", "stream"}}
         recorder.set_model(body["model"], provider=self.config.get("provider") or self.provider,
                            parameters=parameters)
-        recorder.set_header(instructions=_instructions(messages),
-                            tools=_tools(list(body.get("tools") or [])))
-        recorder.set_context([_message(message) for message in messages
-                              if message.get("role") not in {"system", "developer"}])
+        recorder.set_context(_request_context(messages, list(body.get("tools") or [])))
         recorder.begin_step()
         recorder.model_request()
 

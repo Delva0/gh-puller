@@ -11,9 +11,10 @@ def _event(event_type: str, seq: int, **data) -> dict:
 
 def test_taxonomy_separates_state_activity_and_markers() -> None:
     assert {
-        "model/set", "header/set", "context/set", "context/append",
+        "model/set", "context/set", "context/append",
         "context/append/user", "context/append/assistant", "context/append/tool",
     } <= TAXONOMY
+    assert "header/set" not in TAXONOMY
     assert {
         "model/request", "model/response", "tool/start", "tool/end",
         "turn/start", "turn/end", "step/start", "step/end",
@@ -47,11 +48,21 @@ def test_state_fold_ignores_activity_and_marker_placement() -> None:
     events = [
         _event("turn/end", 0, outcome="unusual"),
         _event("model/set", 1, model="m1", provider="p", parameters={}),
-        _event("header/set", 2, instructions=[], tools=[{"name": "read"}]),
+        _event("context/set", 2, messages=[{
+            "role": "system", "content": [
+                {"type": "text", "text": "instructions"},
+                {"type": "tool_definition", "name": "read", "description": "",
+                 "inputSchema": {}},
+            ],
+        }]),
         _event("context/append/user", 3, content=[{"type": "text", "text": "old"}]),
         _event("model/request", 4, requestId="r1"),
         _event("model/delta/text", 5, requestId="r1", index=0, text="ignored"),
         _event("context/set", 6, messages=[
+            {"role": "system", "content": [
+                {"type": "tool_definition", "name": "read", "description": "",
+                 "inputSchema": {}},
+            ]},
             {"role": "assistant", "content": [{"type": "text", "text": "summary"}]},
         ]),
         _event("context/append", 7, role="critic",
@@ -60,8 +71,10 @@ def test_state_fold_ignores_activity_and_marker_placement() -> None:
     ]
     state = fold_request_state(events)
     assert state["model"] == {"model": "m2", "parameters": {"temperature": 0}}
-    assert state["header"]["tools"] == [{"name": "read"}]
-    assert [message["role"] for message in state["context"]] == ["assistant", "critic"]
+    assert state["context"][0]["content"][0]["type"] == "tool_definition"
+    assert [message["role"] for message in state["context"]] == [
+        "system", "assistant", "critic",
+    ]
 
 
 def test_content_and_correlation_validation() -> None:

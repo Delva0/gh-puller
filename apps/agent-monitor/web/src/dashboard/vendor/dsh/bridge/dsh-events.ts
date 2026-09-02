@@ -70,15 +70,19 @@ export class GhToDshEvents {
   private turn = 0
   private step = 0
   private model: Record<string, unknown> = {}
+  private context: Message[] = []
   private surface: number[] = []
   private readonly starts = new Set<string>()
+  private headerSeen = false
 
   reset(): void {
     this.turn = 0
     this.step = 0
     this.model = {}
+    this.context = []
     this.surface = []
     this.starts.clear()
+    this.headerSeen = false
   }
 
   private make(evt: EventEnvelope, type: DshEvent['type'], data: Record<string, unknown>,
@@ -120,15 +124,45 @@ export class GhToDshEvents {
     return event
   }
 
+  private requestHeader(evt: EventEnvelope, seq = evt.seq): DshEvent {
+    const content = this.context
+      .filter(message => message.role === 'system' || message.role === 'developer')
+      .flatMap(message => message.content)
+    const system = content
+      .filter(block => block.type === 'text' && typeof block.text === 'string')
+      .map(block => String(block.text)).join('\n')
+    const tools = content
+      .filter(block => block.type === 'tool_definition')
+      .map(block => ({
+        name: String(block.name ?? ''),
+        description: String(block.description ?? ''),
+        parameters: (block.inputSchema ?? {}) as Record<string, unknown>,
+      }))
+    const reason = this.headerSeen ? 'change' : 'initial'
+    this.headerSeen = true
+    return this.make(evt, 'request/header', {
+      header: {
+        config: this.model,
+        ...(system ? { system } : {}),
+        ...(tools.length ? { tools } : {}),
+      },
+      reason,
+    }, seq)
+  }
+
   private appendMessage(evt: EventEnvelope): DshEvent[] {
-    if (evt.type === 'context/append/tool') return []
     const message = { ...evt.data } as Message
     if (evt.type !== 'context/append') message.role = evt.type.slice('context/append/'.length)
+    this.context.push(message)
+    if (message.role === 'system' || message.role === 'developer') return []
+    if (message.role === 'tool') return []
     return [this.contextMessage(evt, message, evt.seq, 'append')]
   }
 
   private setContext(evt: EventEnvelope): DshEvent[] {
-    const messages = (evt.data.messages ?? []) as Message[]
+    this.context = [...((evt.data.messages ?? []) as Message[])]
+    const messages = this.context.filter(
+      message => message.role !== 'system' && message.role !== 'developer')
     if (messages.length === 0) {
       if (this.surface.length === 0) return []
       const op: SurfaceOp = {
@@ -230,18 +264,14 @@ export class GhToDshEvents {
       case 'step/end':
         return [this.make(evt, 'step/end', { turn: this.turn || 1, step: this.step || 1 })]
       case 'model/set':
-        this.model = evt.data
+        this.model = {
+          ...((evt.data.parameters ?? {}) as Record<string, unknown>),
+          ...(typeof evt.data.provider === 'string' ? { provider: evt.data.provider } : {}),
+          model: String(evt.data.model ?? ''),
+        }
         return []
-      case 'header/set':
-        return [this.make(evt, 'request/header', {
-          header: {
-            config: this.model,
-            system: ((evt.data.instructions ?? []) as Array<Record<string, unknown>>)
-              .map(block => String(block.text ?? '')).filter(Boolean).join('\n'),
-            tools: evt.data.tools ?? [],
-          },
-          reason: 'change',
-        })]
+      case 'model/request':
+        return [this.requestHeader(evt)]
       case 'context/set':
         return this.setContext(evt)
       case 'tool/start':

@@ -33,6 +33,7 @@ class CodexConfig(TypedDict, total=False):
     config_overrides: dict
     launch_args_override: list[str]
     base_instructions: str
+    developer_instructions: str
     service_tier: str
     summary: dict
     web_search: bool
@@ -428,6 +429,9 @@ class Codex(BaseGenerator):
 
     generator = "codex"
     provider = "openai"
+    model_parameter_keys = (
+        "effort", "output_schema", "personality", "service_tier", "summary",
+    )
 
     def __init__(self, config: dict):
         super().__init__(config)
@@ -435,6 +439,18 @@ class Codex(BaseGenerator):
 
         self._codex = AsyncCodex(config=codex_config(config))
         self._thread = None
+
+    def _initial_context(self) -> list[dict]:
+        context = []
+        if prompt := self.config.get("base_instructions") or self.config.get("system_prompt"):
+            context.append({
+                "role": "system", "content": [{"type": "text", "text": prompt}],
+            })
+        if prompt := self.config.get("developer_instructions"):
+            context.append({
+                "role": "developer", "content": [{"type": "text", "text": prompt}],
+            })
+        return context
 
     async def _enter(self):
         await self._codex.__aenter__()

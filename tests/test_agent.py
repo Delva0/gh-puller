@@ -55,6 +55,13 @@ def _event(event_type: str, seq: int, session: str = "s", **data) -> dict:
     return {**new_event(event_type, **data), "seq": seq, "session": session}
 
 
+def _roles_at_requests(events: list[dict]) -> list[list[str]]:
+    return [
+        [message["role"] for message in fold_request_state(events[:index])["context"]]
+        for index, event in enumerate(events) if event["type"] == "model/request"
+    ]
+
+
 @pytest.mark.asyncio
 async def test_event_bus_preserves_order_for_every_sink() -> None:
     first: list[dict] = []
@@ -78,7 +85,6 @@ async def test_recorder_supports_multiple_loose_turns_and_replay() -> None:
     recorder = EventRecorder("s", generator="custom")
     recorder.start()
     recorder.set_model("m", provider="p", parameters={})
-    recorder.set_header(instructions=[], tools=[])
     for index in range(2):
         recorder.begin_turn()
         recorder.append_context({
@@ -258,7 +264,10 @@ async def test_claude_code_is_multi_turn(monkeypatch, tmp_path) -> None:
 
     _install_claude(monkeypatch, [_claude_text("a1"), fallback("a2"), fallback("a3")])
     events = await _capture(tmp_path)
-    generator = agent.ClaudeCode({"model": "m", "system_prompt": "system"})
+    generator = agent.ClaudeCode({
+        "model": "m", "system_prompt": "system", "cwd": str(tmp_path),
+        "allowed_tools": ["Read"],
+    })
     async with generator.session(session="cc/s", session_name="cc"):
         assert await _collect(generator.stream("q1")) == "a1"
         assert await _collect(generator.stream("q2")) == "a2"
@@ -266,8 +275,15 @@ async def test_claude_code_is_multi_turn(monkeypatch, tmp_path) -> None:
     await _settle()
     assert [event["data"]["requestId"] for event in events
             if event["type"] == "model/request"] == ["r1", "r2", "r3"]
+    assert next(event for event in events if event["type"] == "model/set")["data"][
+        "parameters"] == {}
     assert [message["role"] for message in fold_request_state(events)["context"]] == [
-        "user", "assistant", "user", "assistant", "user", "assistant",
+        "system", "user", "assistant", "user", "assistant", "user", "assistant",
+    ]
+    assert _roles_at_requests(events) == [
+        ["system", "user"],
+        ["system", "user", "assistant", "user"],
+        ["system", "user", "assistant", "user", "assistant", "user"],
     ]
 
 
@@ -294,6 +310,9 @@ async def test_claude_tool_result_is_activity_then_context(monkeypatch, tmp_path
     end = types_.index("tool/end")
     result = types_.index("context/append/tool")
     assert assistant < start < end < result
+    assert _roles_at_requests(events) == [
+        ["user"], ["user", "assistant", "tool"],
+    ]
 
 
 # --- OpenAI-compatible ---------------------------------------------------
@@ -350,12 +369,39 @@ async def test_openai_is_multi_turn(monkeypatch, tmp_path) -> None:
     events = await _capture(tmp_path)
     generator = agent.OpenAI({"model": "m", "base_url": "http://fake", "provider": "p"})
     async with generator.session(session="openai/s"):
-        assert await generator.result({"messages": [{"role": "user", "content": "q1"}]}) == "a1"
+        assert await generator.result({
+            "messages": [
+                {"role": "system", "content": "system"},
+                {"role": "user", "content": "q1"},
+            ],
+            "tools": [{"type": "function", "function": {
+                "name": "read", "description": "Read a file",
+                "parameters": {"type": "object"},
+            }}],
+        }) == "a1"
         assert await generator.result({"messages": [{"role": "user", "content": "q2"}]}) == "a2"
     await _settle()
-    assert len([event for event in events if event["type"] == "context/set"]) == 2
+    contexts = [event["data"]["messages"] for event in events
+                if event["type"] == "context/set"]
+    assert len(contexts) == 2
+    assert next(event for event in events if event["type"] == "model/set")["data"][
+        "parameters"] == {}
+    assert contexts[0][0] == {
+        "role": "system", "content": [{"type": "text", "text": "system"}],
+    }
+    assert contexts[0][1] == {
+        "role": "system", "content": [
+            {"type": "tool_definition", "name": "read", "description": "Read a file",
+             "inputSchema": {"type": "object"}},
+        ],
+    }
+    assert [message["role"] for message in contexts[0]] == ["system", "system", "user"]
+    assert [message["role"] for message in contexts[1]] == ["user"]
     assert [event["data"]["requestId"] for event in events
             if event["type"] == "model/request"] == ["r1", "r2"]
+    assert _roles_at_requests(events) == [
+        ["system", "system", "user"], ["user"],
+    ]
 
 
 # --- Codex ---------------------------------------------------------------
@@ -446,7 +492,10 @@ def _codex_text(value: str, item_id: str) -> list:
 async def test_codex_is_multi_turn(monkeypatch, tmp_path) -> None:
     _install_codex(monkeypatch, [_codex_text("a1", "a1"), _codex_text("a2", "a2")])
     events = await _capture(tmp_path)
-    generator = agent.Codex({"model": "m", "codex_home": str(tmp_path / "codex")})
+    generator = agent.Codex({
+        "model": "m", "codex_home": str(tmp_path / "codex"),
+        "base_instructions": "system", "developer_instructions": "developer",
+    })
     async with generator.session(session="codex/s"):
         assert await _collect(generator.stream("q1")) == "a1"
         assert await _collect(generator.stream("q2")) == "a2"
@@ -454,6 +503,15 @@ async def test_codex_is_multi_turn(monkeypatch, tmp_path) -> None:
     await _settle()
     assert [event["data"]["requestId"] for event in events
             if event["type"] == "model/request"] == ["r1", "r2"]
+    assert next(event for event in events if event["type"] == "model/set")["data"][
+        "parameters"] == {}
+    assert [message["role"] for message in fold_request_state(events)["context"]] == [
+        "system", "developer", "user", "assistant", "user", "assistant",
+    ]
+    assert _roles_at_requests(events) == [
+        ["system", "developer", "user"],
+        ["system", "developer", "user", "assistant", "user"],
+    ]
 
 
 @pytest.mark.asyncio
@@ -482,6 +540,9 @@ async def test_codex_batches_model_tool_calls_before_execution(monkeypatch, tmp_
         "type": "tool_call", "callId": "c1", "name": "shell",
         "arguments": {"command": "ls", "cwd": "/tmp"},
     }
+    assert _roles_at_requests(events) == [
+        ["user"], ["user", "assistant", "tool"],
+    ]
 
 
 # --- OpenCode ------------------------------------------------------------
@@ -512,7 +573,9 @@ async def test_opencode_is_multi_turn(tmp_path) -> None:
     events = await _capture(tmp_path / "logs")
     args_path = tmp_path / "args"
     binary = _opencode_script(tmp_path, _opencode_events("answer"), args_path)
-    generator = agent.OpenCode({"model": "m", "opencode_bin": binary})
+    generator = agent.OpenCode({
+        "model": "m", "opencode_bin": binary, "system_prompt": "system",
+    })
     async with generator.session(session="opencode/s"):
         assert await _collect(generator.stream("q1")) == "answer"
         assert await _collect(generator.stream("q2")) == "answer"
@@ -522,7 +585,15 @@ async def test_opencode_is_multi_turn(tmp_path) -> None:
     await _settle()
     assert [event["data"]["requestId"] for event in events
             if event["type"] == "model/request"] == ["r1", "r2"]
+    assert next(event for event in events if event["type"] == "model/set")["data"][
+        "parameters"] == {}
     assert len([event for event in events if event["type"] == "context/append/assistant"]) == 2
+    assert [message["role"] for message in fold_request_state(events)["context"]] == [
+        "system", "user", "assistant", "user", "assistant",
+    ]
+    assert _roles_at_requests(events) == [
+        ["system", "user"], ["system", "user", "assistant", "user"],
+    ]
 
 
 # --- DSH -----------------------------------------------------------------
@@ -567,11 +638,16 @@ def _install_dsh(monkeypatch, scripts: list[list[dict]]) -> None:
 
 def _dsh_events(value: str) -> list[dict]:
     return [
+        {"type": "request/header", "data": {"header": {
+            "config": {"provider": "p", "model": "m"},
+            "system": "system", "tools": [],
+        }}},
         {"type": "turn/start", "data": {}},
         {"type": "step/start", "data": {}},
         {"type": "user/message", "data": {
             "role": "user", "content": [{"type": "text", "text": "q"}],
         }},
+        {"type": "request/context", "data": {}},
         {"type": "assistant/chunk", "data": {
             "chunk": {"type": "text-delta", "index": 0, "text": value},
         }},
@@ -592,19 +668,36 @@ async def test_dsh_is_retained_as_multi_turn_adapter(monkeypatch, tmp_path) -> N
 
     monkeypatch.setattr(asyncio, "to_thread", immediate)
     events = await _capture(tmp_path)
-    generator = agent.Dsh({"provider": "p", "model": "m", "cordis": "/tmp/fake.yml"})
+    generator = agent.Dsh({
+        "provider": "p", "model": "m", "system_prompt": "system",
+        "cordis": "/tmp/fake.yml",
+    })
     async with generator.session(session="dsh/s"):
         assert await _collect(generator.stream("q1")) == "a1"
         assert await _collect(generator.stream("q2")) == "a2"
     await _settle()
     assert [event["data"]["requestId"] for event in events
             if event["type"] == "model/request"] == ["r1", "r2"]
+    assert next(event for event in events if event["type"] == "model/set")["data"][
+        "parameters"] == {}
     assert len([event for event in events if event["type"] == "context/append/assistant"]) == 2
+    assert [message["role"] for message in fold_request_state(events)["context"]] == [
+        "system", "user", "assistant", "user", "assistant",
+    ]
+    assert _roles_at_requests(events) == [
+        ["system", "user"], ["system", "user", "assistant", "user"],
+    ]
 
 
 @pytest.mark.asyncio
 async def test_dsh_normalizes_model_tools_before_local_activity(monkeypatch, tmp_path) -> None:
     script = [
+        {"type": "request/header", "data": {"header": {
+            "config": {"provider": "p2", "model": "m2", "temperature": 0},
+            "system": "system",
+            "tools": [{"name": "read", "description": "Read a file",
+                       "parameters": {"type": "object"}}],
+        }}},
         {"type": "turn/start", "data": {}},
         {"type": "step/start", "data": {}},
         {"type": "user/message", "data": {
@@ -648,3 +741,58 @@ async def test_dsh_normalizes_model_tools_before_local_activity(monkeypatch, tmp
         "type": "tool_call", "callId": "c1", "name": "read",
         "arguments": {"path": "a.py"},
     }
+    state = fold_request_state(events)
+    assert state["model"] == {
+        "model": "m2", "provider": "p2", "parameters": {"temperature": 0},
+    }
+    assert state["context"][0] == {
+        "role": "system", "content": [
+            {"type": "text", "text": "system"},
+            {"type": "tool_definition", "name": "read", "description": "Read a file",
+             "inputSchema": {"type": "object"}},
+        ],
+    }
+
+
+@pytest.mark.asyncio
+async def test_dsh_surface_replacement_becomes_context_set(monkeypatch, tmp_path) -> None:
+    script = [
+        {"type": "turn/start", "seq": 0, "data": {}},
+        {"type": "step/start", "seq": 1, "data": {}},
+        {"type": "user/message", "seq": 2, "surfaceOp": "append", "data": {
+            "role": "user", "content": [{"type": "text", "text": "old question"}],
+        }},
+        {"type": "assistant/message", "seq": 3, "surfaceOp": "append", "data": {
+            "message": {
+                "role": "assistant", "content": [{"type": "text", "text": "old answer"}],
+            },
+        }},
+        {"type": "user/message", "seq": 4, "surfaceOp": {
+            "op": "replace", "start": 2, "end": 3,
+        }, "data": {
+            "role": "user", "content": [{"type": "text", "text": "summary"}],
+        }},
+        {"type": "assistant/message", "seq": 5, "surfaceOp": "append", "data": {
+            "message": {
+                "role": "assistant", "content": [{"type": "text", "text": "final"}],
+            },
+        }},
+        {"type": "step/end", "seq": 6, "data": {}},
+        {"type": "turn/end", "seq": 7, "data": {"reason": {"kind": "completed"}}},
+    ]
+    _install_dsh(monkeypatch, [script])
+
+    async def immediate(fn, *args, **kwargs):
+        return fn(*args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "to_thread", immediate)
+    events = await _capture(tmp_path)
+    generator = agent.Dsh({"provider": "p", "model": "m", "cordis": "/tmp/fake.yml"})
+    async with generator.session(session="dsh/replace"):
+        assert await _collect(generator.stream("old question")) == ""
+    await _settle()
+    assert len([event for event in events if event["type"] == "context/set"]) == 1
+    assert fold_request_state(events)["context"] == [
+        {"role": "user", "content": [{"type": "text", "text": "summary"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "final"}]},
+    ]

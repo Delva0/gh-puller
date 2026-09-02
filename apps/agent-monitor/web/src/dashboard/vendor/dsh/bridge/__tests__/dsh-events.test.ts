@@ -67,4 +67,31 @@ describe('canonical to DSH presentation adapter', () => {
       .toEqual({ op: 'replace', start: 1, end: 1 })
     expect((out[1] as { surfaceOp?: unknown }).surfaceOp).toBe('append')
   })
+
+  it('derives DSH request inspection from system context', () => {
+    const adapter = new GhToDshEvents()
+    expect(adapter.translate(evt('model/set', 0, {
+      model: 'm', provider: 'p', parameters: { temperature: 0 },
+    }))).toEqual([])
+    const out = adapter.translate(evt('context/set', 1, { messages: [
+      { role: 'system', content: [
+        { type: 'text', text: 'system' },
+        { type: 'tool_definition', name: 'read', description: 'Read', inputSchema: {
+          type: 'object',
+        } },
+      ] },
+      { role: 'user', content: [{ type: 'text', text: 'q' }] },
+    ] }))
+    expect(out).toHaveLength(1)
+    const [header] = adapter.translate(evt('model/request', 2, { requestId: 'r1' }))
+    expect(header).toMatchObject({
+      type: 'request/header',
+      data: { header: {
+        config: { provider: 'p', model: 'm', temperature: 0 },
+        system: 'system',
+        tools: [{ name: 'read', description: 'Read', parameters: { type: 'object' } }],
+      } },
+    })
+    expect(out[0]).toMatchObject({ type: 'user/message' })
+  })
 })

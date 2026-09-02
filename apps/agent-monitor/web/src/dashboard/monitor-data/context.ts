@@ -1,6 +1,6 @@
 /** Fold canonical state events into the exact model request state at any prefix. */
 
-import type { EventEnvelope, HeaderState, Message, RequestState } from './types'
+import type { EventEnvelope, Message, RequestState } from './types'
 
 export const CONTEXT_APPEND_TYPES = new Set([
   'context/append',
@@ -17,7 +17,7 @@ export function appendedMessage(evt: EventEnvelope): Message | null {
 }
 
 export function emptyRequestState(): RequestState {
-  return { model: null, header: { instructions: [], tools: [] }, context: [] }
+  return { model: null, context: [] }
 }
 
 export function applyStateEvent(state: RequestState, evt: EventEnvelope): boolean {
@@ -26,13 +26,6 @@ export function applyStateEvent(state: RequestState, evt: EventEnvelope): boolea
       model: String(evt.data.model),
       ...(typeof evt.data.provider === 'string' ? { provider: evt.data.provider } : {}),
       parameters: (evt.data.parameters ?? {}) as Record<string, unknown>,
-    }
-    return true
-  }
-  if (evt.type === 'header/set') {
-    state.header = {
-      instructions: (evt.data.instructions ?? []) as HeaderState['instructions'],
-      tools: (evt.data.tools ?? []) as HeaderState['tools'],
     }
     return true
   }

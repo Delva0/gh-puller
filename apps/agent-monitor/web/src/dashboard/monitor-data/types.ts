@@ -17,14 +17,8 @@ export interface ModelState {
   parameters: Record<string, unknown>
 }
 
-export interface HeaderState {
-  instructions: Block[]
-  tools: Record<string, unknown>[]
-}
-
 export interface RequestState {
   model: ModelState | null
-  header: HeaderState
   context: Message[]
 }
 

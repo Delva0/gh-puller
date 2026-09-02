@@ -1,8 +1,8 @@
 """Canonical agent events and the in-process observation bus.
 
-Model, header, and context events form replayable request state. Model and tool
-activity records facts without changing that state. Turn and step events are optional
-semantic markers; consumers must not depend on their placement for correctness.
+Model and context events form replayable request state. Model and tool activity
+records facts without changing that state. Turn and step events are optional semantic
+markers; consumers must not depend on their placement for correctness.
 """
 
 import asyncio
@@ -22,7 +22,7 @@ DELTA_TYPES = frozenset({
 TAXONOMY = frozenset({
     "session/start", "session/end", "session/error",
     "turn/start", "turn/end", "step/start", "step/end",
-    "model/set", "header/set", "context/set",
+    "model/set", "context/set",
     "model/request", "model/response", "tool/start", "tool/end",
 }) | CONTEXT_APPEND_TYPES | DELTA_TYPES
 NON_STREAM_TYPES = TAXONOMY - DELTA_TYPES
@@ -75,10 +75,6 @@ def new_event(event_type: str, **data) -> dict:
             raise ValueError("model/set requires model")
         if not isinstance(data.get("parameters"), dict):
             raise TypeError("model/set requires parameters")
-    elif event_type == "header/set":
-        if not isinstance(data.get("instructions"), list) or not isinstance(data.get("tools"), list):
-            raise ValueError("header/set requires instructions and tools")
-        _validate_content({"content": data["instructions"]}, event_type)
     elif event_type.startswith("model/") and event_type != "model/set":
         if not isinstance(data.get("requestId"), str) or not data["requestId"]:
             raise ValueError(f"{event_type} requires requestId")
@@ -121,22 +117,20 @@ def message_of(event: dict) -> dict | None:
 
 
 def fold_request_state(events: list[dict]) -> dict:
-    """Fold model, header, and context state from an ordered event prefix.
+    """Fold model and context state from an ordered event prefix.
 
     Args:
         events: Events in log order. Activity and semantic markers are ignored.
 
     Returns:
-        ``model``, ``header``, and ``context`` snapshots after the prefix.
+        ``model`` and ``context`` snapshots after the prefix.
     """
-    state = {"model": None, "header": {"instructions": [], "tools": []}, "context": []}
+    state = {"model": None, "context": []}
     for event in events:
         event_type = event.get("type")
         data = event.get("data") or {}
         if event_type == "model/set":
             state["model"] = data
-        elif event_type == "header/set":
-            state["header"] = data
         elif event_type == "context/set":
             state["context"] = list(data["messages"])
         else:
@@ -244,6 +238,7 @@ class EventRecorder:
         self.result_cost_usd: float | None = None
         self._keepwarm_task: asyncio.Task | None = None
         self._tool_calls_seen: set[str] = set()
+        self._context: list[dict] = []
 
     def event(self, event_type: str, **data) -> dict | None:
         """Validate, sequence, and publish one event."""
@@ -272,11 +267,6 @@ class EventRecorder:
             data["provider"] = provider
         self.event("model/set", **data)
 
-    def set_header(self, *, instructions: list[dict] | None = None,
-                   tools: list[dict] | None = None) -> None:
-        """Replace model-visible instructions and tool definitions."""
-        self.event("header/set", instructions=instructions or [], tools=_jsonable(tools or []))
-
     def append_context(self, message: dict) -> None:
         """Append a message using a role-specialized event when possible."""
         data = dict(message)
@@ -285,10 +275,16 @@ class EventRecorder:
         if event_type == "context/append":
             data["role"] = role
         self.event(event_type, **data)
+        self._context.append(dict(message))
 
     def set_context(self, messages: list[dict]) -> None:
         """Replace the complete ordered model context."""
         self.event("context/set", messages=messages)
+        self._context = [dict(message) for message in messages]
+
+    def context(self) -> list[dict]:
+        """Return the recorder's current context snapshot."""
+        return [dict(message) for message in self._context]
 
     def begin_turn(self) -> None:
         """Open a conventional turn marker, closing an earlier one first."""
@@ -406,11 +402,12 @@ class EventRecorder:
         result = block.get("content", content)
         error = ({"type": "ToolError", "message": str(result)} if is_error else None)
         self.tool_end(call_id, result=result, error=error)
-        self.append_context({
+        committed = {
             "role": "tool", "callId": call_id, "name": name or "",
             "isError": is_error,
             "content": [{"type": "text", "text": str(result or "")}],
-        })
+        }
+        self.append_context(committed)
 
     def result_meta(self, message) -> None:
         """Retain provider summary fields for the session footer."""

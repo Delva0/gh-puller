@@ -142,8 +142,7 @@ export function createDshSession(): DshSessionStore {
     if (reset < 0) return ordered
     const prefix = ordered.slice(0, reset)
     const model = prefix.findLast(evt => evt.type === 'model/set')
-    const header = prefix.findLast(evt => evt.type === 'header/set')
-    return [...[model, header].filter(evt => evt !== undefined), ...ordered.slice(reset)]
+    return [...[model].filter(evt => evt !== undefined), ...ordered.slice(reset)]
   }
 
   function rebuild(): void {

@@ -305,6 +305,7 @@ class OpenCode(BaseGenerator):
 
     generator = "opencode"
     provider = "opencode"
+    model_parameter_keys = ("variant", "thinking")
 
     def __init__(self, config: dict):
         super().__init__(config)

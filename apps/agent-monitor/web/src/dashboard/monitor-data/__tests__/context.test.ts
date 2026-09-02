@@ -12,20 +12,27 @@ function append(role: string, seq: number, value: string): EventEnvelope {
 }
 
 describe('canonical request-state fold', () => {
-  it('restores model, header, and context at any event prefix', () => {
+  it('restores model and context at any event prefix', () => {
     const events = [
       evt('model/set', 0, { model: 'm1', provider: 'p', parameters: {} }),
-      evt('header/set', 1, { instructions: [{ type: 'text', text: 'system' }], tools: [] }),
+      evt('context/set', 1, { messages: [{
+        role: 'system',
+        content: [
+          { type: 'text', text: 'system' },
+          { type: 'tool_definition', name: 'read', inputSchema: {} },
+        ],
+      }] }),
       append('user', 2, 'q'),
       evt('model/request', 3, { requestId: 'r1' }),
       append('assistant', 4, 'a'),
       evt('model/set', 5, { model: 'm2', parameters: { temperature: 0 } }),
     ]
-    expect(requestStateAt(events, 3).context.map(message => message.role)).toEqual(['user'])
+    expect(requestStateAt(events, 3).context.map(message => message.role))
+      .toEqual(['system', 'user'])
     const state = foldRequestState(events)
     expect(state.model).toMatchObject({ model: 'm2', parameters: { temperature: 0 } })
-    expect(state.header.instructions[0]).toMatchObject({ text: 'system' })
-    expect(state.context.map(message => message.role)).toEqual(['user', 'assistant'])
+    expect(state.context[0].content[1]).toMatchObject({ type: 'tool_definition', name: 'read' })
+    expect(state.context.map(message => message.role)).toEqual(['system', 'user', 'assistant'])
   })
 
   it('context/set replaces the complete sequence and generic append keeps custom roles', () => {
