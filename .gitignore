@@ -16,6 +16,7 @@ playground/
 archive/
 
 # Runtime artifacts
+archives/
 logs/
 outputs/
 

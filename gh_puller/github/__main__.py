@@ -1,4 +1,4 @@
-"""提供 GitHub 归档的一次性与整点小时调度命令。
+"""提供 GitHub 归档的一次性与固定间隔调度命令。
 
 本模块只负责 CLI、调度恢复和结构化运行结果；拉取契约见 ``gh_puller.github``，
 算法与运维说明见 ``docs/github-puller.md``。
@@ -10,6 +10,7 @@ import argparse
 import asyncio
 import fcntl
 import json
+import re
 import signal
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
@@ -18,14 +19,22 @@ from typing import TYPE_CHECKING, Any
 
 from dotenv import load_dotenv
 
+from .progress import ConsoleProgress
 from .puller import GitHubPullConfig, GitHubPuller, PullResult
 from .store import schedule_state
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator, Sequence
 
-_HOUR = timedelta(hours=1)
-_HOURLY_SERIES = "hourly"
+_DEFAULT_INTERVAL = timedelta(hours=1)
+_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
+_INTERVAL = re.compile(r"([1-9][0-9]*)([smhd])\Z")
+_INTERVAL_UNITS = {
+    "s": timedelta(seconds=1),
+    "m": timedelta(minutes=1),
+    "h": timedelta(hours=1),
+    "d": timedelta(days=1),
+}
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -36,8 +45,15 @@ def _parser() -> argparse.ArgumentParser:
     _add_common_arguments(once)
     once.add_argument("--target", type=_parse_time)
 
-    hourly = commands.add_parser("hourly", help="pull every UTC clock hour without skipping targets")
-    _add_common_arguments(hourly)
+    schedule = commands.add_parser("schedule", help="pull on UTC-aligned fixed intervals")
+    _add_common_arguments(schedule)
+    schedule.add_argument(
+        "--interval",
+        type=_parse_interval,
+        default=_DEFAULT_INTERVAL,
+        metavar="DURATION",
+        help="UTC-aligned cadence such as 30m, 1h, or 1d (default: 1h)",
+    )
     return parser
 
 
@@ -52,6 +68,7 @@ def _add_common_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--transient-retries", type=int, default=5)
     parser.add_argument("--overlap-seconds", type=int, default=2)
     parser.add_argument("--catalog-mode", choices=("certified", "exhaustive"), default="certified")
+    parser.add_argument("--no-progress", action="store_true", help="disable progress on stderr")
 
 
 def _parse_time(value: str) -> datetime:
@@ -62,6 +79,14 @@ def _parse_time(value: str) -> datetime:
     if parsed.tzinfo is None or parsed.utcoffset() is None:
         raise argparse.ArgumentTypeError("target must include a timezone")
     return parsed.astimezone(UTC)
+
+
+def _parse_interval(value: str) -> timedelta:
+    match = _INTERVAL.fullmatch(value)
+    if match is None:
+        raise argparse.ArgumentTypeError("interval must be a positive integer followed by s, m, h, or d")
+    amount, unit = match.groups()
+    return int(amount) * _INTERVAL_UNITS[unit]
 
 
 def _config(args: argparse.Namespace) -> GitHubPullConfig:
@@ -80,63 +105,78 @@ def _config(args: argparse.Namespace) -> GitHubPullConfig:
 
 
 async def _dispatch(args: argparse.Namespace) -> None:
-    puller = GitHubPuller(_config(args))
+    observer = None if args.no_progress else ConsoleProgress()
+    puller = GitHubPuller(_config(args), observer=observer)
     if args.command == "once":
         _emit(await puller.pull(args.target))
         return
-    with _hourly_lock(args.destination):
-        await _run_hourly(puller, args.destination)
+    with _schedule_lock(args.destination):
+        await _run_schedule(puller, args.destination, args.interval)
 
 
-async def _run_hourly(
+async def _run_schedule(
     puller: GitHubPuller,
     destination: Path,
+    interval: timedelta,
     *,
     now: Callable[[], datetime] = lambda: datetime.now(UTC),
     emit: Callable[[PullResult], None] | None = None,
     max_runs: int | None = None,
 ) -> None:
-    target = await _hourly_start(destination, _utc(now()))
+    if interval <= timedelta(0):
+        raise ValueError("interval must be positive")
     sink = _emit if emit is None else emit
     runs = 0
+    if max_runs is not None and runs >= max_runs:
+        return
+    state = await schedule_state(destination)
+    committed = None if state.committed_target is None else _parse_time(state.committed_target)
+    if state.pending_target is not None:
+        pending = _parse_time(state.pending_target)
+        sink(await puller.pull(pending))
+        runs += 1
+        committed = pending if committed is None else max(committed, pending)
+        if max_runs is not None and runs >= max_runs:
+            return
     while max_runs is None or runs < max_runs:
-        result = await puller.pull(target, series=_HOURLY_SERIES)
+        target = _scheduled_target(committed, _utc(now()), interval)
+        result = await puller.pull(target)
         sink(result)
-        target = _next_hour(target)
+        committed = target
         runs += 1
 
 
-async def _hourly_start(destination: Path, now: datetime) -> datetime:
-    committed_value, pending_value = await schedule_state(destination, _HOURLY_SERIES)
-    if pending_value is not None:
-        return _parse_time(pending_value)
-    if committed_value is not None:
-        return _next_hour(_parse_time(committed_value))
-    return _floor_hour(now)
-
-
 @contextmanager
-def _hourly_lock(destination: Path) -> Iterator[None]:
+def _schedule_lock(destination: Path) -> Iterator[None]:
     destination.parent.mkdir(parents=True, exist_ok=True)
-    path = destination.parent / f".{destination.name}.gh-puller-hourly.lock"
+    path = destination.parent / f".{destination.name}.gh-puller-schedule.lock"
     file = path.open("a+")
     try:
         try:
             fcntl.flock(file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
-            raise RuntimeError(f"hourly puller already runs for {destination}") from exc
+            raise RuntimeError(f"scheduled puller already runs for {destination}") from exc
         yield
     finally:
         fcntl.flock(file.fileno(), fcntl.LOCK_UN)
         file.close()
 
 
-def _floor_hour(value: datetime) -> datetime:
-    return _utc(value).replace(minute=0, second=0, microsecond=0)
+def _scheduled_target(
+    committed: datetime | None,
+    now: datetime,
+    interval: timedelta,
+) -> datetime:
+    due = _floor_interval(now, interval)
+    if committed is None:
+        return due
+    following = _floor_interval(committed, interval) + interval
+    return max(due, following)
 
 
-def _next_hour(value: datetime) -> datetime:
-    return _floor_hour(value) + _HOUR
+def _floor_interval(value: datetime, interval: timedelta) -> datetime:
+    elapsed = _utc(value) - _EPOCH
+    return _EPOCH + (elapsed // interval) * interval
 
 
 def _utc(value: datetime) -> datetime:

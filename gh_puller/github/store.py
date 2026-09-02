@@ -2,7 +2,8 @@
 
 SQLite 是本模块的唯一事实边界：未完成 run 可恢复但不进入公共读取流，committed
 run 中的内容寻址 payload 与对象版本足以在无网络条件下重建任意下游数据。
-拉取算法与 GitHub HTTP 契约分别见 puller 和 client。
+与 bundle 摘要配对的 HTTP cache 可丢弃且不进入版本流。拉取算法与 GitHub HTTP
+契约分别见 puller 和 client。
 """
 
 from __future__ import annotations
@@ -11,6 +12,7 @@ import hashlib
 import json
 import zlib
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Self
 
@@ -19,7 +21,7 @@ import aiosqlite
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Iterable
 
-_SCHEMA_VERSION = "1"
+_SCHEMA_VERSION = "3"
 _CODEC = "zlib-json-v1"
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS archive_meta (
@@ -34,6 +36,14 @@ CREATE TABLE IF NOT EXISTS payload_blobs (
     payload BLOB NOT NULL
 ) WITHOUT ROWID;
 
+CREATE TABLE IF NOT EXISTS bundle_http_cache (
+    bundle_digest TEXT PRIMARY KEY REFERENCES payload_blobs(digest),
+    cache_digest TEXT NOT NULL,
+    codec TEXT NOT NULL,
+    raw_size INTEGER NOT NULL,
+    payload BLOB NOT NULL
+) WITHOUT ROWID;
+
 CREATE TABLE IF NOT EXISTS pull_runs (
     id INTEGER PRIMARY KEY,
     target_at TEXT NOT NULL,
@@ -41,7 +51,6 @@ CREATE TABLE IF NOT EXISTS pull_runs (
     observed_until TEXT,
     completed_at TEXT,
     status TEXT NOT NULL CHECK (status IN ('pending', 'committed')),
-    series TEXT,
     request_count INTEGER NOT NULL DEFAULT 0,
     changed_items INTEGER,
     catalog_items INTEGER
@@ -50,14 +59,8 @@ CREATE TABLE IF NOT EXISTS pull_runs (
 CREATE UNIQUE INDEX IF NOT EXISTS one_pending_pull
 ON pull_runs(status) WHERE status = 'pending';
 
-CREATE INDEX IF NOT EXISTS pull_runs_series_target
-ON pull_runs(series, target_at) WHERE status = 'committed';
-
-CREATE UNIQUE INDEX IF NOT EXISTS one_unlabeled_committed_target
-ON pull_runs(target_at) WHERE status = 'committed' AND series IS NULL;
-
-CREATE UNIQUE INDEX IF NOT EXISTS one_labeled_committed_target
-ON pull_runs(series, target_at) WHERE status = 'committed' AND series IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS one_pull_target
+ON pull_runs(target_at);
 
 CREATE TABLE IF NOT EXISTS resource_heads (
     number INTEGER PRIMARY KEY,
@@ -100,7 +103,6 @@ class PullRun:
     target_at: str  # Requested coverage watermark.
     started_at: str  # First attempt start time.
     observed_until: str | None  # Durable staged observation watermark.
-    series: str | None  # Opaque scheduler series label.
     request_count: int  # Attempts accumulated across crash recovery.
 
 
@@ -123,6 +125,7 @@ class StagedResource:
     observed_at: str  # Pass watermark associated with this observation.
     summary: dict[str, Any] | None  # None reuses head.summary_digest.
     bundle: dict[str, Any] | None  # None reuses head.bundle_digest.
+    http_cache: dict[str, Any] | None = None  # Recoverable transport metadata for bundle.
 
 
 @dataclass(frozen=True, slots=True)
@@ -143,16 +146,34 @@ class ArchivedVersion:
 
 
 @dataclass(frozen=True, slots=True)
+class ArchivedHead:
+    number: int  # Repository-local Issue/PR number.
+    github_id: int  # Immutable GitHub object identity.
+    kind: str  # issue or pull.
+    created_at: str  # GitHub creation timestamp.
+    updated_at: str  # GitHub root update timestamp.
+    present: bool  # False represents the current tombstone.
+    missing_since: str | None  # First target that certified absence.
+    summary: dict[str, Any]  # Unprojected current catalog response.
+    bundle: dict[str, Any] | None  # Complete last observed bundle.
+
+
+@dataclass(frozen=True, slots=True)
 class ArchivedRun:
     id: int  # Stable local invocation identity.
     target_at: str  # Requested coverage watermark T.
     started_at: str  # First attempt start time.
     observed_until: str  # Durable closed observation watermark.
     completed_at: str  # Actual completion time C.
-    series: str | None  # Opaque scheduler series label.
     request_count: int  # HTTP attempts accumulated across recovery.
     changed_items: int  # Object versions or tombstones published.
     catalog_items: int  # Objects present after publication.
+
+
+@dataclass(frozen=True, slots=True)
+class ScheduleState:
+    committed_target: str | None  # Greatest committed coverage target.
+    pending_target: str | None  # Target of the archive-wide pending run.
 
 
 class SQLiteArchive:
@@ -189,24 +210,23 @@ class SQLiteArchive:
         await self._connection.close()
         self._db = None
 
-    async def start_run(self, target_at: str, started_at: str, series: str | None) -> PullRun:
+    async def start_run(self, target_at: str, started_at: str) -> PullRun:
         """创建或恢复唯一 pending run。
 
         Args:
             target_at: 本次覆盖水位。
             started_at: 新 run 的首次调用时刻。
-            series: 调度器提供的可选系列标签。
 
         Returns:
             新建或同水位恢复的 run。
 
         Raises:
-            RuntimeError: 数据库存在另一水位或系列的 pending run。
+            RuntimeError: 数据库存在另一水位的 pending run。
         """
         db = self._connection
         row = await _fetchone(db, "SELECT * FROM pull_runs WHERE status = 'pending'")
         if row is not None:
-            if row["target_at"] != target_at or row["series"] != series:
+            if row["target_at"] != target_at:
                 raise RuntimeError(
                     f"pending pull {row['target_at']} must finish before {target_at}",
                 )
@@ -225,10 +245,10 @@ class SQLiteArchive:
         cursor = await db.execute(
             """
             INSERT INTO pull_runs(
-                target_at, started_at, observed_until, status, series
-            ) VALUES (?, ?, ?, 'pending', ?)
+                target_at, started_at, observed_until, status
+            ) VALUES (?, ?, ?, 'pending')
             """,
-            (target_at, started_at, observed, series),
+            (target_at, started_at, observed),
         )
         await db.commit()
         return PullRun(
@@ -236,20 +256,14 @@ class SQLiteArchive:
             target_at=target_at,
             started_at=started_at,
             observed_until=observed,
-            series=series,
             request_count=0,
         )
 
-    async def committed_run(
-        self,
-        target_at: str,
-        series: str | None,
-    ) -> ArchivedRun | None:
+    async def committed_run(self, target_at: str) -> ArchivedRun | None:
         """读取幂等键对应的 committed run。
 
         Args:
             target_at: 规范化后的覆盖水位。
-            series: 调度系列标签；None 也是独立的键空间。
 
         Returns:
             已发布的原始运行结果；键不存在时为 None。
@@ -259,11 +273,11 @@ class SQLiteArchive:
             """
             SELECT *
             FROM pull_runs
-            WHERE status = 'committed' AND target_at = ? AND series IS ?
+            WHERE status = 'committed' AND target_at = ?
             ORDER BY id
             LIMIT 1
             """,
-            (target_at, series),
+            (target_at,),
         )
         return None if row is None else _archived_run(row)
 
@@ -295,6 +309,53 @@ class SQLiteArchive:
         heads.update({int(row["number"]): _head(row) for row in staged})
         return heads
 
+    async def load_bundle_state(
+        self,
+        bundle_digest: str | None,
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        """读取与一个 bundle 摘要原子配对的事实和传输缓存。
+
+        Args:
+            bundle_digest: committed 或当前 run staged head 引用的 bundle 摘要。
+
+        Returns:
+            完整 bundle 与可丢弃的 HTTP validator 元数据；无摘要时均为 None。
+        """
+        if bundle_digest is None:
+            return None, None
+        row = await _fetchone(
+            self._connection,
+            """
+            SELECT
+                b.digest, b.codec, b.raw_size, b.payload,
+                c.cache_digest, c.codec AS cache_codec,
+                c.raw_size AS cache_size, c.payload AS cache_payload
+            FROM payload_blobs AS b
+            LEFT JOIN bundle_http_cache AS c ON c.bundle_digest = b.digest
+            WHERE b.digest = ?
+            """,
+            (bundle_digest,),
+        )
+        if row is None:
+            raise ValueError(f"missing bundle payload {bundle_digest}")
+        bundle = _decode_row(
+            str(row["digest"]),
+            str(row["codec"]),
+            int(row["raw_size"]),
+            bytes(row["payload"]),
+        )
+        cache = None
+        if row["cache_digest"] is not None:
+            cache = _decode_row(
+                str(row["cache_digest"]),
+                str(row["cache_codec"]),
+                int(row["cache_size"]),
+                bytes(row["cache_payload"]),
+            )
+        if not isinstance(bundle, dict) or (cache is not None and not isinstance(cache, dict)):
+            raise ValueError("bundle state is not a JSON object")
+        return bundle, cache
+
     async def stage(self, run_id: int, resources: Iterable[StagedResource]) -> None:
         """持久化一批可恢复对象，但不向 committed 读取者发布。
 
@@ -320,6 +381,8 @@ class SQLiteArchive:
                     summary_digest = await _put_json(db, resource.summary)
                 if resource.bundle is not None:
                     bundle_digest = await _put_json(db, resource.bundle)
+                    if resource.http_cache is not None:
+                        await _put_http_cache(db, bundle_digest, resource.http_cache)
                 if summary_digest != head.summary_digest or bundle_digest != head.bundle_digest:
                     head = StoredHead(
                         number=head.number,
@@ -482,6 +545,13 @@ class SQLiteArchive:
             )
             await db.commit()
             return
+        if schema is not None and schema["value"] == "2":
+            await db.execute(
+                "UPDATE archive_meta SET value = ? WHERE key = 'schema_version'",
+                (_SCHEMA_VERSION,),
+            )
+            await db.commit()
+            schema = {"value": _SCHEMA_VERSION}
         if schema is None or schema["value"] != _SCHEMA_VERSION:
             raise ValueError("unsupported GitHub archive schema")
         if repository is None or repository["value"] != self.repository:
@@ -494,54 +564,48 @@ class SQLiteArchive:
         return self._db
 
 
-async def schedule_state(
-    path: Path,
-    series: str,
-) -> tuple[str | None, str | None]:
-    """读取调度系列的 committed 与 pending 水位。
+async def schedule_state(path: Path) -> ScheduleState:
+    """读取最大 committed 水位与 archive-wide pending run。
 
     Args:
         path: SQLite 事实库。
-        series: 调度器的稳定系列标签。
 
     Returns:
-        最近 committed target 与同系列 pending target；数据库不存在时均为 None。
+        最大 committed target 与唯一 pending target；数据库不存在时均为 None。
     """
     path = Path(path)
     if not path.exists():
-        return None, None
+        return ScheduleState(None, None)
     uri = _readonly_uri(path)
     db = await aiosqlite.connect(uri, uri=True)
     db.row_factory = aiosqlite.Row
     try:
-        committed = await _fetchone(
+        committed = await _fetchall(
             db,
             """
             SELECT target_at
             FROM pull_runs
-            WHERE status = 'committed' AND series = ?
-            ORDER BY target_at DESC, id DESC
-            LIMIT 1
+            WHERE status = 'committed'
             """,
-            (series,),
         )
         pending = await _fetchone(
             db,
             """
-            SELECT target_at, series
+            SELECT target_at
             FROM pull_runs
             WHERE status = 'pending'
             ORDER BY id DESC
             LIMIT 1
             """,
         )
-        if pending is not None and pending["series"] != series:
-            raise RuntimeError(
-                f"pending pull belongs to series {pending['series']!r}, not {series!r}",
-            )
-        return (
-            None if committed is None else str(committed["target_at"]),
-            None if pending is None else str(pending["target_at"]),
+        committed_target = max(
+            (str(row["target_at"]) for row in committed),
+            key=datetime.fromisoformat,
+            default=None,
+        )
+        return ScheduleState(
+            committed_target=committed_target,
+            pending_target=None if pending is None else str(pending["target_at"]),
         )
     finally:
         await db.close()
@@ -579,27 +643,65 @@ async def iter_versions(path: Path) -> AsyncIterator[ArchivedVersion]:
             """,
         )
         async for row in cursor:
-            summary = _decode_row(
-                str(row["summary_digest"]),
-                str(row["summary_codec"]),
-                int(row["summary_size"]),
-                bytes(row["summary_payload"]),
-            )
-            bundle = None
-            if row["bundle_digest"] is not None:
-                bundle = _decode_row(
-                    str(row["bundle_digest"]),
-                    str(row["bundle_codec"]),
-                    int(row["bundle_size"]),
-                    bytes(row["bundle_payload"]),
-                )
-            if not isinstance(summary, dict) or (bundle is not None and not isinstance(bundle, dict)):
-                raise ValueError("archive version payload is not a JSON object")
+            summary, bundle = _decode_payloads(row)
             yield ArchivedVersion(
                 run_id=int(row["run_id"]),
                 target_at=str(row["target_at"]),
                 completed_at=str(row["completed_at"]),
                 observed_at=str(row["observed_at"]),
+                number=int(row["number"]),
+                github_id=int(row["github_id"]),
+                kind=str(row["kind"]),
+                created_at=str(row["created_at"]),
+                updated_at=str(row["updated_at"]),
+                present=bool(row["present"]),
+                missing_since=(None if row["missing_since"] is None else str(row["missing_since"])),
+                summary=summary,
+                bundle=bundle,
+            )
+        await cursor.close()
+    finally:
+        await db.close()
+
+
+async def iter_heads(
+    path: Path,
+    *,
+    present_only: bool = False,
+) -> AsyncIterator[ArchivedHead]:
+    """按 number 流式读取已发布的当前对象状态。
+
+    Args:
+        path: SQLite 事实库。
+        present_only: True 时跳过 tombstone，仅返回当前可见对象。
+
+    Yields:
+        无需回放版本流即可读取的 committed head。
+    """
+    db = await aiosqlite.connect(_readonly_uri(Path(path)), uri=True)
+    db.row_factory = aiosqlite.Row
+    try:
+        cursor = await db.execute(
+            """
+            SELECT
+                h.number, h.github_id, h.kind, h.created_at, h.updated_at,
+                h.present, h.missing_since,
+                h.summary_digest, h.bundle_digest,
+                s.codec AS summary_codec, s.raw_size AS summary_size,
+                s.payload AS summary_payload,
+                b.codec AS bundle_codec, b.raw_size AS bundle_size,
+                b.payload AS bundle_payload
+            FROM resource_heads AS h
+            JOIN payload_blobs AS s ON s.digest = h.summary_digest
+            LEFT JOIN payload_blobs AS b ON b.digest = h.bundle_digest
+            WHERE ? = 0 OR h.present = 1
+            ORDER BY h.number
+            """,
+            (int(present_only),),
+        )
+        async for row in cursor:
+            summary, bundle = _decode_payloads(row)
+            yield ArchivedHead(
                 number=int(row["number"]),
                 github_id=int(row["github_id"]),
                 kind=str(row["kind"]),
@@ -622,7 +724,7 @@ async def iter_runs(path: Path) -> AsyncIterator[ArchivedRun]:
         path: SQLite 事实库。
 
     Yields:
-        包含 T、C、调度标签和调用统计的已完成 run。
+        包含 T、C 和调用统计的已完成 run。
     """
     db = await aiosqlite.connect(_readonly_uri(Path(path)), uri=True)
     db.row_factory = aiosqlite.Row
@@ -655,6 +757,28 @@ async def _put_json(db: aiosqlite.Connection, value: Any) -> str:
     return digest
 
 
+async def _put_http_cache(
+    db: aiosqlite.Connection,
+    bundle_digest: str,
+    value: dict[str, Any],
+) -> None:
+    raw = _json_bytes(value)
+    digest = hashlib.sha256(raw).hexdigest()
+    await db.execute(
+        """
+        INSERT INTO bundle_http_cache(
+            bundle_digest, cache_digest, codec, raw_size, payload
+        ) VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(bundle_digest) DO UPDATE SET
+            cache_digest = excluded.cache_digest,
+            codec = excluded.codec,
+            raw_size = excluded.raw_size,
+            payload = excluded.payload
+        """,
+        (bundle_digest, digest, _CODEC, len(raw), zlib.compress(raw)),
+    )
+
+
 def _decode_row(digest: str, codec: str, raw_size: int, payload: bytes) -> Any:
     if codec != _CODEC:
         raise ValueError(f"unsupported payload codec {codec}")
@@ -662,6 +786,26 @@ def _decode_row(digest: str, codec: str, raw_size: int, payload: bytes) -> Any:
     if len(raw) != raw_size or hashlib.sha256(raw).hexdigest() != digest:
         raise ValueError(f"corrupt payload blob {digest}")
     return json.loads(raw)
+
+
+def _decode_payloads(row: aiosqlite.Row) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    summary = _decode_row(
+        str(row["summary_digest"]),
+        str(row["summary_codec"]),
+        int(row["summary_size"]),
+        bytes(row["summary_payload"]),
+    )
+    bundle = None
+    if row["bundle_digest"] is not None:
+        bundle = _decode_row(
+            str(row["bundle_digest"]),
+            str(row["bundle_codec"]),
+            int(row["bundle_size"]),
+            bytes(row["bundle_payload"]),
+        )
+    if not isinstance(summary, dict) or (bundle is not None and not isinstance(bundle, dict)):
+        raise ValueError("archive payload is not a JSON object")
+    return summary, bundle
 
 
 def _json_bytes(value: Any) -> bytes:
@@ -748,7 +892,6 @@ def _run(row: aiosqlite.Row) -> PullRun:
         target_at=str(row["target_at"]),
         started_at=str(row["started_at"]),
         observed_until=None if row["observed_until"] is None else str(row["observed_until"]),
-        series=None if row["series"] is None else str(row["series"]),
         request_count=int(row["request_count"]),
     )
 
@@ -760,7 +903,6 @@ def _archived_run(row: aiosqlite.Row) -> ArchivedRun:
         started_at=str(row["started_at"]),
         observed_until=str(row["observed_until"]),
         completed_at=str(row["completed_at"]),
-        series=None if row["series"] is None else str(row["series"]),
         request_count=int(row["request_count"]),
         changed_items=int(row["changed_items"]),
         catalog_items=int(row["catalog_items"]),

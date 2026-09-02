@@ -1,4 +1,4 @@
-"""GitHub CLI 的整点调度、恢复、输出与信号退出测试。"""
+"""GitHub CLI 的固定间隔调度、恢复、输出与信号退出测试。"""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ import pytest
 
 from gh_puller.github import PullResult
 from gh_puller.github import __main__ as cli
-from gh_puller.github.store import SQLiteArchive
+from gh_puller.github.store import SQLiteArchive, schedule_state
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -25,17 +25,10 @@ _T0 = datetime(2026, 9, 2, 12, tzinfo=UTC)
 @dataclass
 class StubPuller:
     targets: list[datetime] = field(default_factory=list)
-    series: list[str | None] = field(default_factory=list)
 
-    async def pull(
-        self,
-        target: datetime | None = None,
-        *,
-        series: str | None = None,
-    ) -> PullResult:
+    async def pull(self, target: datetime | None = None) -> PullResult:
         assert target is not None
         self.targets.append(target)
-        self.series.append(series)
         return PullResult(
             target_at=target,
             completed_at=target,
@@ -55,11 +48,10 @@ async def _seed_run(
     path: Path,
     target: datetime,
     *,
-    series: str | None = "hourly",
     committed: bool,
 ) -> None:
     async with SQLiteArchive(path, "acme/widgets") as archive:
-        run = await archive.start_run(_iso(target), _iso(target), series)
+        run = await archive.start_run(_iso(target), _iso(target))
         if committed:
             await archive.update_observed(run.id, _iso(target))
             await archive.finalize(run.id, _iso(target))
@@ -77,6 +69,7 @@ def test_parser_builds_once_config_and_normalizes_target() -> None:
             "8",
             "--catalog-mode",
             "exhaustive",
+            "--no-progress",
         ],
     )
 
@@ -85,6 +78,7 @@ def test_parser_builds_once_config_and_normalizes_target() -> None:
     assert config.repository == "acme/widgets"
     assert config.concurrency == 8
     assert config.catalog_mode == "exhaustive"
+    assert args.no_progress is True
 
 
 def test_parser_rejects_naive_target() -> None:
@@ -94,54 +88,87 @@ def test_parser_rejects_naive_target() -> None:
         )
 
 
+def test_parser_accepts_configurable_schedule_interval() -> None:
+    args = cli._parser().parse_args(
+        ["schedule", "acme/widgets", "/tmp/widgets", "--interval", "90m"],
+    )
+
+    assert args.interval == timedelta(minutes=90)
+
+
+@pytest.mark.parametrize("value", ["0s", "1.5h", "hour", "-1h"])
+def test_parser_rejects_invalid_schedule_interval(value: str) -> None:
+    with pytest.raises(SystemExit):
+        cli._parser().parse_args(
+            ["schedule", "acme/widgets", "/tmp/widgets", "--interval", value],
+        )
+
+
 @pytest.mark.asyncio
-async def test_hourly_starts_at_latest_due_hour_and_never_skips(tmp_path: Path) -> None:
+async def test_schedule_starts_at_latest_due_boundary(tmp_path: Path) -> None:
     puller = StubPuller()
     emitted: list[PullResult] = []
 
-    await cli._run_hourly(
+    await cli._run_schedule(
         puller,
         tmp_path / "new-archive",
+        timedelta(minutes=30),
         now=lambda: _T0 + timedelta(minutes=37),
         emit=emitted.append,
         max_runs=4,
     )
 
-    assert puller.targets == [_T0 + timedelta(hours=offset) for offset in range(4)]
-    assert puller.series == ["hourly"] * 4
+    assert puller.targets == [_T0 + timedelta(minutes=30 * offset) for offset in range(1, 5)]
     assert [result.target_at for result in emitted] == puller.targets
 
 
 @pytest.mark.asyncio
-async def test_hourly_restart_uses_committed_then_retries_pending_run(tmp_path: Path) -> None:
+async def test_schedule_restart_uses_committed_then_retries_pending_run(tmp_path: Path) -> None:
     archive = tmp_path / "archive"
     await _seed_run(archive, _T0, committed=True)
-
-    assert await cli._hourly_start(archive, _T0 + timedelta(minutes=37)) == _T0 + timedelta(hours=1)
-
     pending = _T0 + timedelta(hours=1)
     await _seed_run(archive, pending, committed=False)
-    assert await cli._hourly_start(archive, _T0 + timedelta(hours=2)) == pending
 
     puller = StubPuller()
-    await cli._run_hourly(
+    await cli._run_schedule(
         puller,
         archive,
+        timedelta(hours=1),
         now=lambda: _T0 + timedelta(hours=2),
         emit=lambda _: None,
         max_runs=2,
     )
     assert puller.targets == [pending, _T0 + timedelta(hours=2)]
-    assert puller.series == ["hourly", "hourly"]
 
 
 @pytest.mark.asyncio
-async def test_hourly_refuses_a_pending_run_from_another_series(tmp_path: Path) -> None:
+async def test_schedule_coalesces_missed_targets_to_latest_boundary(tmp_path: Path) -> None:
     archive = tmp_path / "archive"
-    await _seed_run(archive, _T0, series=None, committed=False)
+    await _seed_run(archive, _T0, committed=True)
 
-    with pytest.raises(RuntimeError, match="belongs to series"):
-        await cli._hourly_start(archive, _T0)
+    puller = StubPuller()
+    await cli._run_schedule(
+        puller,
+        archive,
+        timedelta(hours=1),
+        now=lambda: _T0 + timedelta(hours=3, minutes=37),
+        emit=lambda _: None,
+        max_runs=1,
+    )
+
+    assert puller.targets == [_T0 + timedelta(hours=3)]
+
+
+@pytest.mark.asyncio
+async def test_schedule_state_uses_greatest_target_not_latest_run_id(tmp_path: Path) -> None:
+    archive = tmp_path / "archive"
+    greatest = _T0 + timedelta(microseconds=900)
+    await _seed_run(archive, greatest, committed=True)
+    await _seed_run(archive, _T0 + timedelta(microseconds=100), committed=True)
+
+    state = await schedule_state(archive)
+
+    assert state.committed_target == _iso(greatest)
 
 
 def test_emit_writes_machine_readable_result(capsys: pytest.CaptureFixture[str]) -> None:
@@ -167,13 +194,13 @@ def test_emit_writes_machine_readable_result(capsys: pytest.CaptureFixture[str])
     }
 
 
-def test_hourly_process_lock_rejects_duplicate_scheduler(tmp_path: Path) -> None:
+def test_schedule_process_lock_rejects_duplicate_scheduler(tmp_path: Path) -> None:
     destination = tmp_path / "archive"
 
     with (
-        cli._hourly_lock(destination),
+        cli._schedule_lock(destination),
         pytest.raises(RuntimeError, match="already runs"),
-        cli._hourly_lock(destination),
+        cli._schedule_lock(destination),
     ):
         pytest.fail("duplicate scheduler acquired the lock")
 

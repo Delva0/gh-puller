@@ -1,7 +1,7 @@
 """提供遵守 GitHub 限流恢复契约的异步 API 读取层。
 
-本模块只负责 HTTP、分页、仓库对象精确计数与重试，不解释 Issue/PR 数据，也不
-写归档。覆盖水位与持久化契约见 ``gh_puller.github``。
+本模块只负责 HTTP、条件校验、分页、仓库对象精确计数与重试，不解释 Issue/PR
+数据，也不写归档。覆盖水位与持久化契约见 ``gh_puller.github``。
 """
 
 from __future__ import annotations
@@ -15,16 +15,54 @@ from typing import TYPE_CHECKING, Any
 
 import httpx
 
+from .progress import APIProgress
+
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Mapping
 
+    from .progress import APIProgressObserver
+
 _LOG = logging.getLogger(__name__)
 _DEFAULT_ACCEPT = "application/vnd.github.full+json"
+_CATALOG_HINT = "_gh_puller_graphql_catalog"
 _REPOSITORY_ITEM_COUNT = """
 query RepositoryItemCount($owner: String!, $repo: String!) {
   repository(owner: $owner, name: $repo) {
     issues(states: [OPEN, CLOSED]) { totalCount }
     pullRequests(states: [OPEN, CLOSED, MERGED]) { totalCount }
+  }
+}
+"""
+_REPOSITORY_CATALOG = """
+query RepositoryCatalog(
+  $owner: String!
+  $repo: String!
+  $issuesAfter: String
+  $pullsAfter: String
+  $scanIssues: Boolean!
+  $scanPulls: Boolean!
+) {
+  repository(owner: $owner, name: $repo) {
+    issues(
+      first: 100
+      after: $issuesAfter
+      states: [OPEN, CLOSED]
+      orderBy: {field: CREATED_AT, direction: DESC}
+    ) @include(if: $scanIssues) {
+      totalCount
+      pageInfo { hasNextPage endCursor }
+      nodes { number createdAt updatedAt }
+    }
+    pullRequests(
+      first: 100
+      after: $pullsAfter
+      states: [OPEN, CLOSED, MERGED]
+      orderBy: {field: CREATED_AT, direction: DESC}
+    ) @include(if: $scanPulls) {
+      totalCount
+      pageInfo { hasNextPage endCursor }
+      nodes { number createdAt updatedAt }
+    }
   }
 }
 """
@@ -47,6 +85,7 @@ class GitHubAPI:
         client: 测试或宿主注入的 ``httpx.AsyncClient``。
         sleep: 限流与退避使用的异步等待函数。
         now: 计算限流恢复时刻使用的 UTC 时钟。
+        progress: HTTP 尝试、配额与等待的同步带外观察器。
     """
 
     def __init__(
@@ -61,6 +100,7 @@ class GitHubAPI:
         client: httpx.AsyncClient | None = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         now: Callable[[], datetime] = lambda: datetime.now(UTC),
+        progress: APIProgressObserver | None = None,
     ) -> None:
         headers = {
             "Accept": _DEFAULT_ACCEPT,
@@ -83,8 +123,13 @@ class GitHubAPI:
         self._transient_retries = transient_retries
         self._sleep = sleep
         self._now = now
+        self._progress = progress
         self._blocked_until = 0.0
         self._gate_lock = asyncio.Lock()
+        self._quota_limit: int | None = None
+        self._quota_remaining: int | None = None
+        self._quota_reset_at: datetime | None = None
+        self._quota_resource: str | None = None
         self.request_count = 0
 
     async def close(self) -> None:
@@ -115,6 +160,49 @@ class GitHubAPI:
         except json.JSONDecodeError as exc:
             raise GitHubAPIError(f"GitHub returned invalid JSON for {response.url}") from exc
 
+    async def get_json_cached(
+        self,
+        path: str,
+        *,
+        previous: Any | None,
+        cache: dict[str, Any] | None,
+        params: Mapping[str, Any] | None = None,
+        accept: str | None = None,
+    ) -> tuple[Any, dict[str, Any] | None]:
+        """用 HTTP validator 校验并读取单个 JSON 响应。
+
+        Args:
+            path: 相对 API 路径。
+            previous: 与 cache 同一次成功响应的未改写 JSON；None 强制完整读取。
+            cache: 本客户端产生并与 previous 原子持久化的传输元数据。
+            params: 查询参数。
+            accept: 覆盖默认 full JSON media type。
+
+        Returns:
+            当前原始 JSON 及其新传输元数据。304 返回 previous；200 总是解析新响应。
+        """
+        key = self._cache_key(path, params, accept, "json")
+        headers = _validator_headers(cache, key) if previous is not None else None
+        response = await self._request(
+            "GET",
+            path,
+            params=params,
+            accept=accept,
+            request_headers=headers,
+        )
+        if response.status_code == 304:
+            if headers is None:
+                raise GitHubAPIError(f"GitHub returned unsolicited 304 for {response.url}")
+            updated = _response_cache(response, key, cache)
+            if updated is None:
+                raise GitHubAPIError(f"GitHub returned 304 without a validator for {response.url}")
+            return previous, updated
+        try:
+            value = response.json()
+        except json.JSONDecodeError as exc:
+            raise GitHubAPIError(f"GitHub returned invalid JSON for {response.url}") from exc
+        return value, _response_cache(response, key)
+
     async def get_text(self, path: str, *, accept: str) -> str:
         """读取自定义 media type 的文本响应。
 
@@ -127,17 +215,55 @@ class GitHubAPI:
         """
         return (await self._request("GET", path, accept=accept)).text
 
+    async def get_text_cached(
+        self,
+        path: str,
+        *,
+        accept: str,
+        previous: str | None,
+        cache: dict[str, Any] | None,
+    ) -> tuple[str, dict[str, Any] | None]:
+        """用 ETag 校验并读取一个自定义 media type 响应。
+
+        Args:
+            path: 相对 API 路径。
+            accept: 请求的 GitHub media type，也是 validator identity 的一部分。
+            previous: 与 cache 配对的完整旧文本；None 强制完整读取。
+            cache: 本客户端产生并与 previous 原子持久化的传输元数据。
+
+        Returns:
+            当前未改写文本及其传输元数据；304 精确复用 previous。
+        """
+        key = self._cache_key(path, None, accept, "text")
+        headers = _validator_headers(cache, key) if previous is not None else None
+        response = await self._request(
+            "GET",
+            path,
+            accept=accept,
+            request_headers=headers,
+        )
+        if response.status_code == 304:
+            if headers is None:
+                raise GitHubAPIError(f"GitHub returned unsolicited 304 for {response.url}")
+            updated = _response_cache(response, key, cache)
+            if updated is None:
+                raise GitHubAPIError(f"GitHub returned 304 without a validator for {response.url}")
+            return previous, updated
+        return response.text, _response_cache(response, key)
+
     async def paginate(
         self,
         path: str,
         *,
         params: Mapping[str, Any] | None = None,
+        page_observer: Callable[[int], None] | None = None,
     ) -> list[dict[str, Any]]:
         """沿 GitHub ``Link`` 响应头读取完整列表。
 
         Args:
             path: 首个分页 API 路径。
             params: 首页查询参数；``per_page`` 缺省固定为 GitHub 上限 100。
+            page_observer: 每个已验证页面的条目数同步观察器。
 
         Returns:
             按服务端顺序拼接、字段不裁剪的所有条目。
@@ -145,22 +271,171 @@ class GitHubAPI:
         Raises:
             GitHubAPIError: 任一分页响应不是 JSON 对象数组。
         """
-        query: dict[str, Any] | None = dict(params or {})
+        items, _ = await self.paginate_cached(
+            path,
+            previous=None,
+            cache=None,
+            params=params,
+            page_observer=page_observer,
+        )
+        return items
+
+    async def paginate_cached(
+        self,
+        path: str,
+        *,
+        previous: list[dict[str, Any]] | None,
+        cache: dict[str, Any] | None,
+        params: Mapping[str, Any] | None = None,
+        page_observer: Callable[[int], None] | None = None,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+        """逐页校验一个已有完整集合，变化时重新完整分页。
+
+        Args:
+            path: 首个分页 API 路径。
+            previous: 与 cache 配对的完整旧集合。
+            cache: 本客户端产生并与 previous 配对的分页 validator 元数据。
+            params: 首页查询参数；``per_page`` 固定为 100。
+            page_observer: 每个已验证页面的条目数同步观察器。
+
+        Returns:
+            当前完整集合及其分页传输元数据。末页恰好为 100 条时不产生缓存，
+            使后续请求必须探测可能新增的下一页。
+
+        Raises:
+            GitHubAPIError: 任一 200 响应不是 JSON 对象数组。
+        """
+        query = dict(params or {})
         query.setdefault("per_page", 100)
-        url: str | None = path
+        key = self._cache_key(path, query, None, "page")
+        pages = _cached_pages(cache, key, previous)
+        if pages is not None:
+            updated_pages = []
+            changed: tuple[int, httpx.Response] | None = None
+            for index, page in enumerate(pages):
+                headers = _validator_headers(page, str(page["key"]))
+                response = await self._request(
+                    "GET",
+                    str(page["url"]),
+                    request_headers=headers,
+                )
+                if response.status_code != 304:
+                    changed = index, response
+                    break
+                updated = _response_cache(response, str(page["key"]), page)
+                if updated is None:
+                    raise GitHubAPIError(
+                        f"GitHub returned 304 without a validator for {response.url}",
+                    )
+                updated_pages.append(
+                    updated | {"size": int(page["size"]), "url": str(page["url"])},
+                )
+            if changed is None:
+                if page_observer is not None:
+                    for page in pages:
+                        page_observer(int(page["size"]))
+                return previous, {
+                    "key": key,
+                    "pages": updated_pages,
+                    "size": len(previous),
+                }
+            if changed[0] == 0:
+                return await self._paginate_response(changed[1], key, page_observer)
+
+        response = await self._request(
+            "GET",
+            path,
+            params=query,
+        )
+        return await self._paginate_response(response, key, page_observer)
+
+    async def _paginate_response(
+        self,
+        response: httpx.Response,
+        key: str,
+        page_observer: Callable[[int], None] | None,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
         items: list[dict[str, Any]] = []
-        while url:
-            response = await self._request("GET", url, params=query)
-            query = None
+        pages: list[dict[str, Any]] = []
+        page_count = 0
+        while True:
             try:
                 page = response.json()
             except json.JSONDecodeError as exc:
                 raise GitHubAPIError(f"GitHub returned invalid JSON for {response.url}") from exc
             if not isinstance(page, list) or any(not isinstance(item, dict) for item in page):
                 raise GitHubAPIError(f"GitHub returned a non-object page for {response.url}")
+            page_count += 1
             items.extend(page)
-            url = response.links.get("next", {}).get("url")
-        return items
+            page_key = self._cache_key(str(response.url), None, None, "page")
+            validator = _response_cache(response, page_key)
+            if validator is not None:
+                pages.append(
+                    validator | {"size": len(page), "url": str(response.url)},
+                )
+            if page_observer is not None:
+                page_observer(len(page))
+            next_url = response.links.get("next", {}).get("url")
+            if not next_url:
+                break
+            response = await self._request("GET", next_url)
+        sizes = [int(page["size"]) for page in pages]
+        if len(pages) == page_count and all(size == 100 for size in sizes[:-1]) and sizes[-1] < 100:
+            return items, {"key": key, "pages": pages, "size": len(items)}
+        return items, None
+
+    def _cache_key(
+        self,
+        path: str,
+        params: Mapping[str, Any] | None,
+        accept: str | None,
+        kind: str,
+    ) -> str:
+        payload = {
+            "accept": accept or self._client.headers.get("Accept"),
+            "api_version": self._client.headers.get("X-GitHub-Api-Version"),
+            "base_url": str(self._client.base_url),
+            "kind": kind,
+            "params": dict(params or {}),
+            "path": path,
+        }
+        return json.dumps(payload, default=str, sort_keys=True, separators=(",", ":"))
+
+    async def collection_size(
+        self,
+        path: str,
+        *,
+        params: Mapping[str, Any] | None = None,
+    ) -> int | None:
+        """以一个列表条目请求估算页式 REST 集合的当前大小。
+
+        Args:
+            path: 分页 API 路径。
+            params: 决定集合成员与顺序的查询参数。
+
+        Returns:
+            ``per_page=1`` 下 ``last`` 链接证明的条目数；服务端不给出可解析
+            的末页时返回 None。该结果仅用于调用成本规划，不参与完整性认证。
+        """
+        query = dict(params or {})
+        query["per_page"] = 1
+        response = await self._request("GET", path, params=query)
+        try:
+            page = response.json()
+        except json.JSONDecodeError as exc:
+            raise GitHubAPIError(f"GitHub returned invalid JSON for {response.url}") from exc
+        if not isinstance(page, list) or any(not isinstance(item, dict) for item in page):
+            raise GitHubAPIError(f"GitHub returned a non-object page for {response.url}")
+        if "next" not in response.links:
+            return len(page)
+        last = response.links.get("last", {}).get("url")
+        if not isinstance(last, str):
+            return None
+        try:
+            count = int(httpx.URL(last).params["page"])
+        except (KeyError, ValueError):
+            return None
+        return count if count > 0 else None
 
     async def repository_item_count(self, owner: str, repo: str) -> int | None:
         """读取仓库当前 Issue 与 PR 的精确总数。
@@ -175,15 +450,104 @@ class GitHubAPI:
         """
         if not self._authenticated:
             return None
+        payload = await self._graphql(
+            _REPOSITORY_ITEM_COUNT,
+            {"owner": owner, "repo": repo},
+        )
+        try:
+            repository = payload["data"]["repository"]
+            issues = repository["issues"]["totalCount"]
+            pulls = repository["pullRequests"]["totalCount"]
+        except (KeyError, TypeError) as exc:
+            raise GitHubAPIError("GitHub returned incomplete repository counts") from exc
+        if not isinstance(issues, int) or not isinstance(pulls, int):
+            raise GitHubAPIError("GitHub returned non-integer repository counts")
+        return issues + pulls
+
+    async def repository_catalog(
+        self,
+        owner: str,
+        repo: str,
+        *,
+        page_observer: Callable[[int], None] | None = None,
+    ) -> tuple[list[dict[str, Any]], int] | None:
+        """读取 Issue 与 PR 的完整稳定序目录。
+
+        Args:
+            owner: 仓库 owner。
+            repo: 仓库名。
+            page_observer: 每次 GraphQL 查询返回的节点数同步观察器。
+
+        Returns:
+            目录提示与首次连接总数；匿名客户端返回 None，使调用方回退到 REST。
+
+        Raises:
+            GitHubAPIError: 连接截断、重复或返回结构无效。
+        """
+        if not self._authenticated:
+            return None
+        issue_cursor: str | None = None
+        pull_cursor: str | None = None
+        scan_issues = True
+        scan_pulls = True
+        issue_total: int | None = None
+        pull_total: int | None = None
+        issues: list[dict[str, Any]] = []
+        pulls: list[dict[str, Any]] = []
+        while scan_issues or scan_pulls:
+            payload = await self._graphql(
+                _REPOSITORY_CATALOG,
+                {
+                    "owner": owner,
+                    "repo": repo,
+                    "issuesAfter": issue_cursor,
+                    "pullsAfter": pull_cursor,
+                    "scanIssues": scan_issues,
+                    "scanPulls": scan_pulls,
+                },
+            )
+            try:
+                repository = payload["data"]["repository"]
+            except (KeyError, TypeError) as exc:
+                raise GitHubAPIError("GitHub returned incomplete repository catalog") from exc
+            observed = 0
+            if scan_issues:
+                connection = _catalog_connection(repository, "issues", pull=False)
+                issue_total = connection[0] if issue_total is None else issue_total
+                issues.extend(connection[1])
+                issue_cursor, scan_issues = connection[2], connection[3]
+                observed += len(connection[1])
+            if scan_pulls:
+                connection = _catalog_connection(repository, "pullRequests", pull=True)
+                pull_total = connection[0] if pull_total is None else pull_total
+                pulls.extend(connection[1])
+                pull_cursor, scan_pulls = connection[2], connection[3]
+                observed += len(connection[1])
+            if page_observer is not None:
+                page_observer(observed)
+        if issue_total is None or pull_total is None:
+            raise GitHubAPIError("GitHub returned no repository catalog counts")
+        if len(issues) != issue_total or len(pulls) != pull_total:
+            raise GitHubAPIError(
+                "GitHub repository catalog changed while paginating; retry the pull",
+            )
+        catalog = issues + pulls
+        numbers = {item["number"] for item in catalog}
+        if len(numbers) != len(catalog):
+            raise GitHubAPIError("GitHub repository catalog contains duplicate numbers")
+        return catalog, issue_total + pull_total
+
+    async def _graphql(
+        self,
+        query: str,
+        variables: Mapping[str, Any],
+    ) -> dict[str, Any]:
         secondary_attempt = 0
         while True:
             response = await self._request(
                 "POST",
                 self._graphql_url,
-                json_body={
-                    "query": _REPOSITORY_ITEM_COUNT,
-                    "variables": {"owner": owner, "repo": repo},
-                },
+                json_body={"query": query, "variables": variables},
             )
             try:
                 payload = response.json()
@@ -194,23 +558,13 @@ class GitHubAPI:
             if not isinstance(payload, dict):
                 raise GitHubAPIError(f"GitHub returned invalid GraphQL data for {response.url}")
             errors = payload.get("errors")
-            if errors:
-                if self._is_rate_limited(response):
-                    await self._wait_after_rate_limit(response, secondary_attempt)
-                    secondary_attempt += 1
-                    continue
-                raise GitHubAPIError(f"GitHub GraphQL error for {response.url}: {errors!r}")
-            try:
-                repository = payload["data"]["repository"]
-                issues = repository["issues"]["totalCount"]
-                pulls = repository["pullRequests"]["totalCount"]
-            except (KeyError, TypeError) as exc:
-                raise GitHubAPIError(
-                    f"GitHub returned incomplete GraphQL data for {response.url}",
-                ) from exc
-            if not isinstance(issues, int) or not isinstance(pulls, int):
-                raise GitHubAPIError(f"GitHub returned non-integer counts for {response.url}")
-            return issues + pulls
+            if not errors:
+                return payload
+            if self._is_rate_limited(response):
+                await self._wait_after_rate_limit(response, secondary_attempt)
+                secondary_attempt += 1
+                continue
+            raise GitHubAPIError(f"GitHub GraphQL error for {response.url}: {errors!r}")
 
     async def _request(
         self,
@@ -220,28 +574,35 @@ class GitHubAPI:
         params: Mapping[str, Any] | None = None,
         accept: str | None = None,
         json_body: Mapping[str, Any] | None = None,
+        request_headers: Mapping[str, str] | None = None,
     ) -> httpx.Response:
         transient_attempt = 0
         secondary_attempt = 0
         while True:
             await self._wait_for_primary_limit()
-            headers = {"Accept": accept} if accept else None
+            headers = dict(request_headers or {})
+            if accept:
+                headers["Accept"] = accept
             try:
                 self.request_count += 1
                 response = await self._client.request(
                     method,
                     path,
                     params=params,
-                    headers=headers,
+                    headers=headers or None,
                     json=json_body,
                 )
             except httpx.RequestError as exc:
                 if transient_attempt >= self._transient_retries:
                     raise GitHubAPIError(f"GitHub request failed: {path}") from exc
                 transient_attempt += 1
-                await self._sleep(min(2 ** (transient_attempt - 1), 30))
+                wait = min(2 ** (transient_attempt - 1), 30)
+                self._emit_progress(wait_seconds=wait, detail="transient_retry")
+                await self._sleep(wait)
                 continue
 
+            self._remember_quota(response)
+            self._emit_progress()
             if response.status_code in {403, 429} and self._is_rate_limited(response):
                 await self._wait_after_rate_limit(response, secondary_attempt)
                 secondary_attempt += 1
@@ -253,7 +614,9 @@ class GitHubAPI:
                         f"GitHub returned {response.status_code} for {response.url}",
                     )
                 transient_attempt += 1
-                await self._sleep(min(2 ** (transient_attempt - 1), 30))
+                wait = min(2 ** (transient_attempt - 1), 30)
+                self._emit_progress(wait_seconds=wait, detail="transient_retry")
+                await self._sleep(wait)
                 continue
             if response.is_error:
                 detail = response.text[:500]
@@ -269,6 +632,7 @@ class GitHubAPI:
         if wait <= 0:
             return
         _LOG.warning("GitHub primary quota exhausted; waiting %.1fs", wait)
+        self._emit_progress(wait_seconds=wait, detail="primary_rate_limit")
         await self._sleep(wait)
         async with self._gate_lock:
             if self._blocked_until == blocked_until:
@@ -280,6 +644,7 @@ class GitHubAPI:
         async with self._gate_lock:
             self._blocked_until = max(self._blocked_until, blocked_until)
         _LOG.warning("GitHub rate limited %s; retrying in %.1fs", response.url, wait)
+        self._emit_progress(wait_seconds=wait, detail="secondary_rate_limit")
         await self._sleep(wait)
         async with self._gate_lock:
             if self._blocked_until == blocked_until:
@@ -293,6 +658,42 @@ class GitHubAPI:
         except (KeyError, ValueError):
             return
         self._blocked_until = max(self._blocked_until, reset + 1)
+
+    def _remember_quota(self, response: httpx.Response) -> None:
+        limit = _integer_header(response, "x-ratelimit-limit")
+        remaining = _integer_header(response, "x-ratelimit-remaining")
+        reset = _integer_header(response, "x-ratelimit-reset")
+        if limit is not None:
+            self._quota_limit = limit
+        if remaining is not None:
+            self._quota_remaining = remaining
+        if reset is not None:
+            self._quota_reset_at = datetime.fromtimestamp(reset, UTC)
+        resource = response.headers.get("x-ratelimit-resource")
+        if resource is not None:
+            self._quota_resource = resource
+
+    def _emit_progress(
+        self,
+        *,
+        wait_seconds: float | None = None,
+        detail: str | None = None,
+    ) -> None:
+        if self._progress is None:
+            return
+        event = APIProgress(
+            request_count=self.request_count,
+            quota_limit=self._quota_limit,
+            quota_remaining=self._quota_remaining,
+            quota_reset_at=self._quota_reset_at,
+            quota_resource=self._quota_resource,
+            wait_seconds=wait_seconds,
+            detail=detail,
+        )
+        try:
+            self._progress(event)
+        except Exception:
+            self._progress = None
 
     def _rate_limit_wait(self, response: httpx.Response, attempt: int) -> float:
         retry_after = response.headers.get("retry-after")
@@ -323,8 +724,112 @@ class GitHubAPI:
         return "rate limit" in response.text.lower() or "abuse detection" in response.text.lower()
 
 
+def _validator_headers(cache: dict[str, Any] | None, key: str) -> dict[str, str] | None:
+    if cache is None or cache.get("key") != key:
+        return None
+    etag = cache.get("etag")
+    return {"If-None-Match": etag} if isinstance(etag, str) else None
+
+
+def _cached_pages(
+    cache: dict[str, Any] | None,
+    key: str,
+    previous: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]] | None:
+    if previous is None or cache is None or cache.get("key") != key:
+        return None
+    pages = cache.get("pages")
+    if not isinstance(pages, list) or not pages or cache.get("size") != len(previous):
+        return None
+    total = 0
+    urls: set[str] = set()
+    for index, page in enumerate(pages):
+        if not isinstance(page, dict):
+            return None
+        page_key = page.get("key")
+        url = page.get("url")
+        size = page.get("size")
+        if (
+            not isinstance(page_key, str)
+            or not isinstance(url, str)
+            or not url
+            or url in urls
+            or type(size) is not int
+            or size < 0
+            or size > 100
+            or (index < len(pages) - 1 and size != 100)
+            or _validator_headers(page, page_key) is None
+        ):
+            return None
+        urls.add(url)
+        total += size
+    if total != len(previous) or pages[-1]["size"] == 100:
+        return None
+    return pages
+
+
+def _response_cache(
+    response: httpx.Response,
+    key: str,
+    previous: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    etag = response.headers.get("etag")
+    if previous is not None:
+        etag = etag or previous.get("etag")
+    if not isinstance(etag, str):
+        return None
+    return {"key": key, "etag": etag}
+
+
 def _graphql_endpoint(base_url: str) -> str:
     root = base_url.rstrip("/")
     if root.endswith("/api/v3"):
         return f"{root.removesuffix('/api/v3')}/api/graphql"
     return f"{root}/graphql"
+
+
+def _integer_header(response: httpx.Response, name: str) -> int | None:
+    try:
+        return int(response.headers[name])
+    except (KeyError, ValueError):
+        return None
+
+
+def _catalog_connection(
+    repository: Any,
+    name: str,
+    *,
+    pull: bool,
+) -> tuple[int, list[dict[str, Any]], str | None, bool]:
+    try:
+        connection = repository[name]
+        total = connection["totalCount"]
+        nodes = connection["nodes"]
+        page_info = connection["pageInfo"]
+        has_next = page_info["hasNextPage"]
+        end_cursor = page_info["endCursor"]
+    except (KeyError, TypeError) as exc:
+        raise GitHubAPIError(f"GitHub returned incomplete {name} connection") from exc
+    if type(total) is not int or total < 0 or not isinstance(nodes, list) or type(has_next) is not bool:
+        raise GitHubAPIError(f"GitHub returned invalid {name} connection")
+    items: list[dict[str, Any]] = []
+    for node in nodes:
+        if not isinstance(node, dict):
+            raise GitHubAPIError(f"GitHub returned invalid {name} node")
+        number = node.get("number")
+        created_at = node.get("createdAt")
+        updated_at = node.get("updatedAt")
+        if type(number) is not int or not isinstance(created_at, str) or not isinstance(updated_at, str):
+            raise GitHubAPIError(f"GitHub returned incomplete {name} node")
+        item: dict[str, Any] = {
+            _CATALOG_HINT: True,
+            "number": number,
+            "created_at": created_at,
+            "updated_at": updated_at,
+        }
+        if pull:
+            item["pull_request"] = {}
+        items.append(item)
+    if has_next and not isinstance(end_cursor, str):
+        raise GitHubAPIError(f"GitHub returned no cursor for {name} connection")
+    return total, items, end_cursor, has_next
