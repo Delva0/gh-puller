@@ -13,55 +13,52 @@ import pytest
 import pytest_asyncio
 
 from gh_puller import agent
+from gh_puller.agent.events import fold_state
 
-MODEL = os.environ.get("GH_PULLER_MODEL", "deepseek-v4-flash")  # cc/dsh 路(测试自定)
-LLM_MODEL = os.environ.get("LLM_MODEL", MODEL)  # llm 路按 Agent env 面(webui/__main__ 同约定)
-MODEL_CODEX = "gpt-5.6-luna"  # 常量直写:codex 无环境变量(同 cc 路线);luna = 本地模型(不烧 token)
+DSH_MODEL = os.environ.get("DSH_MODEL", "deepseek-v4-flash")
+LLM_MODEL = os.environ.get("LLM_MODEL", "deepseek-v4-flash")
+MODEL_CODEX = "gpt-5.6-luna"
 
-# llm 路端点:缺省 DeepSeek(OpenAI 兼容,低成本),经 OPENAI_BASE_URL 覆写(与 webui/__main__ 同约定)
+# The OpenAI-compatible route defaults to the low-cost DeepSeek endpoint.
 LLM_BASE_URL = os.environ.get("OPENAI_BASE_URL", "https://api.deepseek.com/v1")
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("GH_PULLER_REAL_TESTS") != "1",
-    reason="真机测试:需 GH_PULLER_REAL_TESTS=1(烧真实 token)",
+    reason="real backends require GH_PULLER_REAL_TESTS=1 and may consume tokens",
 )
 
 
 @pytest_asyncio.fixture(autouse=True)
 async def _monitor_cleanup():
-    """每测后复元监控配置:撤 ws/otel;文件落盘默认重定向(conftest tmp),防真实 ~/.gh-puller。"""
+    """Restore monitor outputs after each isolated real-backend test."""
     yield
     agent.configure(ws_urls=[], otel_urls=[])
     await asyncio.sleep(0.01)
 
 
 async def _collect(stream) -> list[str]:
-    """收满真实后端的全部文本增量,末了等一拍让 sink worker 写盘(EventBus 异步 drain)。"""
+    """Collect visible deltas and yield once for asynchronous sink draining."""
     parts = [p async for p in stream]
     await asyncio.sleep(0.05)
     return parts
 
 
 def _text_of(content) -> str:
-    """递归扁平化 message.content(str 或 [{"type":"text","text":...}] 块列表)。"""
+    """Flatten text carried by canonical Items and content parts."""
     if isinstance(content, str):
         return content
-    if isinstance(content, list):
-        return "".join(
-            _text_of(c.get("text") or c.get("content") or "") if isinstance(c, dict) else _text_of(c)
-            for c in content
+    if isinstance(content, dict):
+        return _text_of(
+            content.get("text") or content.get("output") or content.get("content")
+            or content.get("items") or "",
         )
+    if isinstance(content, list):
+        return "".join(_text_of(item) for item in content)
     return ""
 
 
 async def _read_single_session(tmp_path) -> list[dict]:
-    """读 file_dir 下唯一的会话 jsonl(轮询至终态写入;文件名只取会话 uuid 段)。
-
-    EventBus 落盘是异步 drain(同事件循环),轮询必须 await 让出:最多 40 次
-    间隔 0.05s,直至最后一行是 session/end(事件带终态,drain 完成即现);
-    超时则返回当前内容,由 _assert_flow 收紧报错。文件名不按 ns 匹配,只数
-    目录下唯一 jsonl(会话 id = <ns>/<uuid>,文件取 uuid 段)。
-    """
+    """Wait for and read the only complete FileSink session in the test directory."""
     sess = tmp_path
     for _ in range(40):
         files = sorted(sess.glob("*.jsonl"))
@@ -71,147 +68,142 @@ async def _read_single_session(tmp_path) -> list[dict]:
                 return [json.loads(line) for line in lines]
         await asyncio.sleep(0.05)
     files = sorted(sess.glob("*.jsonl"))
-    assert len(files) == 1, f"期望恰 1 个 jsonl,实际 {[p.name for p in files]}"
+    assert len(files) == 1, f"expected one JSONL file, got {[p.name for p in files]}"
     return [json.loads(line) for line in files[0].read_text(encoding="utf-8").splitlines()]
 
 
 def _assert_flow(events: list[dict], agent_name: str) -> None:
     """Assert compact persistence, correlation, and replayable context."""
-    assert events, "根下应有事件落盘"
+    assert events, "expected persisted events"
     assert events[0]["type"] == "session/start", events[0]
     types = [e["type"] for e in events]
     assert not {"model/delta/text", "model/delta/reasoning", "model/delta/tool-call"} & set(types)
     agent_event = next(event for event in events if event["type"] == "agent/set")
     assert agent_event["data"]["agent"] == agent_name
-    request_ids = {
+    if "api_key" in agent_event["data"]["config"]:
+        assert agent_event["data"]["config"]["api_key"] == "<redacted>"
+    request_ids = [
         event["data"]["requestId"] for event in events if event["type"] == "model/request"
-    }
+    ]
     assert request_ids
-    assert all(
-        event["data"]["requestId"] in request_ids
-        for event in events if event["type"] == "model/response"
-    )
-    user = next(e for e in events if e["type"] == "context/append/user")
-    assert "你好" in _text_of(user["data"]["content"]), user
-    assistants = [e for e in events if e["type"] == "context/append/assistant"]
+    responses = [event for event in events if event["type"] == "model/response"]
+    assert [event["data"]["requestId"] for event in responses] == request_ids
+    assert all(isinstance(event["data"]["output"], list) for event in responses)
+    context = fold_state(events)["context"]
+    user = next(item for item in context
+                if item["type"] == "message" and item.get("role") == "user")
+    assert "你好" in _text_of(user), user
+    assistants = [item for item in context
+                  if item["type"] == "message" and item.get("role") == "assistant"]
     assert assistants
     end = events[-1]
     assert end["type"] == "session/end", end
     assert end["data"]["outcome"] == "completed", end
-    assert any(_text_of(e["data"]["content"]).strip() for e in assistants)
+    assert any(_text_of(item).strip() for item in assistants)
 
 
 @pytest.mark.asyncio
 async def test_cc_stream_real(tmp_path):
-    """cc 真机:spawn 本地 claude CLI,凭证走本地配置(不传 setting_sources/api_key/base_url)。"""
+    """Run cc through the local Claude CLI and its own credentials."""
     agent.configure(file_dir=str(tmp_path), ws_urls=[], otel_urls=[])
     config = {
-        "model": MODEL,
         "cwd": str(tmp_path),
-        "allowed_tools": [],  # "你好" 无工具需求,关工具省流量
+        "allowed_tools": [],
         "max_turns": 1,
-        "include_partial_messages": True,  # 让 StreamEvent 路径真实产 chunk
+        "include_partial_messages": True,
     }
-    gen = agent.ClaudeCode(config)
-    async with gen.session(session_name="real:cc", run_id="r-cc"):
-        parts = await _collect(gen.stream("你好"))
-    print("cc 回复:", "".join(parts))  # pytest -s 查看真机回显
-    assert "".join(parts) != "", "cc 后端应有文本增量"
+    if model := os.environ.get("CC_MODEL"):
+        config["model"] = model
+    subject = agent.ClaudeCode(config)
+    async with subject.session(session_name="real:cc", run_id="r-cc"):
+        parts = await _collect(subject.stream("你好"))
+    print("cc response:", "".join(parts))
+    assert "".join(parts) != "", "cc should emit text deltas"
     _assert_flow(await _read_single_session(tmp_path), "cc")
 
 
 @pytest.mark.asyncio
 async def test_llm_stream_real(tmp_path):
-    """llm 真机:httpx 直连 OpenAI 兼容端;凭证照 Agent env 面(OPENAI_API_KEY,webui/__main__ 同约定)。"""
+    """Run the OpenAI adapter against an OpenAI-compatible endpoint."""
     key = os.environ.get("OPENAI_API_KEY")
     if not key:
-        pytest.skip("OPENAI_API_KEY 缺失(env;不读任何组件私有文件)")
+        pytest.skip("OPENAI_API_KEY is not configured")
 
     agent.configure(file_dir=str(tmp_path), ws_urls=[], otel_urls=[])
     config = {"model": LLM_MODEL, "base_url": LLM_BASE_URL, "api_key": key}
     payload = {"messages": [{"role": "user", "content": "你好"}],
                "max_tokens": 256, "temperature": 0}
-    gen = agent.OpenAI(config)
-    async with gen.session(session_name="real:llm", run_id="r-llm"):
-        parts = await _collect(gen.stream(
+    subject = agent.OpenAI(config)
+    async with subject.session(session_name="real:llm", run_id="r-llm"):
+        parts = await _collect(subject.stream(
             payload, timeout=httpx.Timeout(connect=10.0, read=180.0, write=10.0, pool=10.0)))
-    assert "".join(parts) != "", "llm 后端应有文本增量"
-    print("llm 回复:", "".join(parts))  # pytest -s 查看真机回显
+    assert "".join(parts) != "", "OpenAI-compatible backend should emit text deltas"
+    print("llm response:", "".join(parts))
     _assert_flow(await _read_single_session(tmp_path), "llm")
 
 
 @pytest.mark.skip(
-    reason="TODO(dsh 真机):SDK stdio JSON-RPC runtime 载体在本 dev 机未就绪 —— 单文件 "
-           "exe 未构建(deepseek-harness runtime 缺 dsh-jsonrpc-agent-pkg-linux-x64)、"
-           "demo bin 裸插件以配置文件目录为解析锚点(仓库 node_modules 无 workspace 链接、"
-           "npm 无 dsh-jsonrpc-agent 发布版)、pnpm dsh web 为 http 形态不响应 stdio "
-           "initialize。恢复点①:packages/examples/jsonrpc-demo 补 13 个 @deepseek-ai/dsh-* "
-           "依赖(内置 cordis 置于该包目录);②:scripts/build-exe-for-python-sdk.ts 构建。",
+    reason="the DSH SDK stdio runtime is unavailable in this development environment",
 )
 @pytest.mark.asyncio
 async def test_dsh_stream_real(tmp_path):
-    """dsh 真机:DeepSeek Harness SDK(凭证 SDK 自足,不传 api_key/base_url/cordis)。"""
+    """Run DSH through its SDK-managed runtime and credentials."""
     work = tmp_path / "work"
     work.mkdir()
     sessions = tmp_path / "dsh-sessions"
     sessions.mkdir()
     agent.configure(file_dir=str(tmp_path), ws_urls=[], otel_urls=[])
     config = {
-        "provider": "deepseek-official",  # SDK 缺省域(deepseek_harness.api.py)
-        "model": MODEL,
+        "provider": "deepseek-official",
+        "model": DSH_MODEL,
         "cwd": str(work),
-        "session_root": str(sessions),  # 隔离,dsh 会话不落真实 ~/.gh-puller
+        "session_root": str(sessions),
         "max_tokens": 1024,
     }
-    gen = agent.Dsh(config)
-    async with gen.session(session_name="real:dsh", run_id="r-dsh"):
-        parts = await _collect(gen.stream("你好"))
-    print("dsh 回复:", "".join(parts))  # pytest -s 查看真机回显
-    assert "".join(parts) != "", "dsh 后端应有文本增量"
+    subject = agent.Dsh(config)
+    async with subject.session(session_name="real:dsh", run_id="r-dsh"):
+        parts = await _collect(subject.stream("你好"))
+    print("dsh response:", "".join(parts))
+    assert "".join(parts) != "", "DSH should emit text deltas"
     _assert_flow(await _read_single_session(tmp_path), "dsh")
 
 
 @pytest.mark.asyncio
 async def test_codex_stream_real(tmp_path):
-    """codex 真机:openai_codex SDK;隔离 home 符号链接引用真实 ~/.codex/auth.json(同 cc 路线)。"""
+    """Run Codex through an isolated SDK home linked to local authentication."""
     agent.configure(file_dir=str(tmp_path), ws_urls=[], otel_urls=[])
     config = {
-        "codex_home": str(tmp_path / "codex-home"),  # 必须隔离;_codex_home_setup 建符号链接
-        "sandbox": "full_access",  # 生产缺省(deepwiki._codex_options 同值)
-        "approval_mode": "auto_review",  # 生产缺省同值
+        "codex_home": str(tmp_path / "codex-home"),
+        "sandbox": "full_access",
+        "approval_mode": "auto_review",
         "model": MODEL_CODEX,
         "cwd": str(tmp_path),
-        "timeout_seconds": 300,  # 兜底防止 approval 挂流
+        "timeout_seconds": 300,
     }
-    gen = agent.Codex(config)
-    async with gen.session(session_name="real:codex", run_id="r-codex"):
-        parts = await _collect(gen.stream("你好"))
-    print("codex 回复:", "".join(parts))  # pytest -s 查看真机回显
-    assert "".join(parts) != "", "codex 后端应有文本增量"
+    subject = agent.Codex(config)
+    async with subject.session(session_name="real:codex", run_id="r-codex"):
+        parts = await _collect(subject.stream("你好"))
+    print("codex response:", "".join(parts))
+    assert "".join(parts) != "", "Codex should emit text deltas"
     _assert_flow(await _read_single_session(tmp_path), "codex")
 
 
 @pytest.mark.asyncio
 async def test_opencode_stream_real(tmp_path):
-    """opencode 真机:CLI run --format json 子进程;模型路由/凭证随 opencode 自身配置。
-
-    凭证通道不隔离:凭据由 opencode CLI 自持(~/.local/share/opencode/auth.json,
-    同 cc 的 CLI 自持凭证约定);隔离只管注入面(--pure/--auto/config)。
-    model 不传 —— 引擎无该轴快照时 model=None(模型由 opencode 配置决定)。
-    """
+    """Run OpenCode through its CLI-managed routing and credentials."""
     binpath = shutil.which("opencode")
     if not binpath:
-        pytest.skip("opencode 可执行文件缺失(which;见 opencode 官网安装)")
+        pytest.skip("opencode executable is unavailable")
     agent.configure(file_dir=str(tmp_path), ws_urls=[], otel_urls=[])
     config = {
         "opencode_bin": binpath,
         "cwd": str(tmp_path),
-        "auto": True,  # 无头自动批准(生产缺省由引擎 adapter 恒置)
-        "timeout_seconds": 300,  # 兜底防止权限等待挂流
+        "auto": True,
+        "timeout_seconds": 300,
     }
-    gen = agent.OpenCode(config)
-    async with gen.session(session_name="real:opencode", run_id="r-opencode"):
-        parts = await _collect(gen.stream("你好"))
-    print("opencode 回复:", "".join(parts))  # pytest -s 查看真机回显
-    assert "".join(parts) != "", "opencode 后端应有文本增量"
+    subject = agent.OpenCode(config)
+    async with subject.session(session_name="real:opencode", run_id="r-opencode"):
+        parts = await _collect(subject.stream("你好"))
+    print("opencode response:", "".join(parts))
+    assert "".join(parts) != "", "OpenCode should emit text deltas"
     _assert_flow(await _read_single_session(tmp_path), "opencode")

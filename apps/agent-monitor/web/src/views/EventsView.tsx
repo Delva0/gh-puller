@@ -12,11 +12,25 @@ function jsonValue(value: unknown) {
   return <pre className="overflow-x-auto p-2 text-xs">{JSON.stringify(value, null, 2)}</pre>;
 }
 
-function messagePreview(data: Record<string, unknown>): string {
-  const content = Array.isArray(data.content) ? data.content : [];
-  const text = content
-    .filter(block => typeof block === 'object' && block !== null && 'text' in block)
-    .map(block => String((block as { text?: unknown }).text ?? ''))
+function itemsPreview(data: Record<string, unknown>): string {
+  const items = Array.isArray(data.items)
+    ? data.items
+    : Array.isArray(data.output) ? data.output : [];
+  const text = items
+    .filter(item => typeof item === 'object' && item !== null)
+    .flatMap((item) => {
+      const value = item as Record<string, unknown>;
+      const content = Array.isArray(value.content) ? value.content : [];
+      const parts = content
+        .filter(part => typeof part === 'object' && part !== null)
+        .map((part) => {
+          const record = part as Record<string, unknown>;
+          return String(record.text ?? record.refusal ?? '');
+        });
+      if (value.type === 'function_call') parts.push(String(value.name ?? 'function_call'));
+      if (value.type === 'function_call_output') parts.push(String(value.output ?? ''));
+      return parts;
+    })
     .join(' ')
     .trim();
   return text.length > 80 ? `${text.slice(0, 80)}…` : text;
@@ -36,15 +50,17 @@ function eventSummary(event: EventEnvelope, request?: ModelActivity): string {
     return JSON.stringify(data[facet]);
   }
   if (event.type === 'context/set') {
-    return `${Array.isArray(data.messages) ? data.messages.length : 0} messages`;
+    return `${Array.isArray(data.items) ? data.items.length : 0} items`;
   }
-  if (event.type.startsWith('context/append')) return messagePreview(data);
+  if (event.type.startsWith('context/append')) return itemsPreview(data);
   if (event.type === 'model/request') {
     const suffix = request === undefined ? '' : ` · ${request.deltaCount} deltas`;
     const target = [data.provider, data.model].filter(Boolean).map(String).join('/');
     return `${String(data.requestId ?? '')}${target ? ` · ${target}` : ''}${suffix}`;
   }
-  if (event.type === 'model/response') return String(data.stopReason ?? data.requestId ?? '');
+  if (event.type === 'model/response') {
+    return [data.stopReason, itemsPreview(data)].filter(Boolean).map(String).join(' · ');
+  }
   if (event.type === 'tool/start') return `${String(data.name ?? '')} · ${String(data.callId ?? '')}`;
   if (event.type === 'tool/end') {
     return `${String(data.callId ?? '')} · ${data.error === undefined ? 'completed' : 'error'}`;

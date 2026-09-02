@@ -5,7 +5,7 @@ import {
   emptyState,
   foldState,
 } from './state'
-import type { CanonicalState, EventEnvelope, Message, ModelActivity, ToolActivity } from './types'
+import type { CanonicalState, EventEnvelope, Item, ModelActivity, ToolActivity } from './types'
 
 export type IngestResult = 'ok' | 'dup' | 'gap'
 
@@ -84,7 +84,7 @@ export class RunFold {
         const request = requests.get(requestId)
         if (request === undefined) continue
         request.responseSeq = evt.seq
-        request.message = evt.data.message as Message
+        request.output = evt.data.output as Item[]
         request.usage = evt.data.usage as ModelActivity['usage']
         if (typeof evt.data.stopReason === 'string') request.stopReason = evt.data.stopReason
       }

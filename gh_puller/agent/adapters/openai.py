@@ -1,12 +1,18 @@
 """Adapt OpenAI-compatible streaming calls to canonical Agent events."""
 
-import contextlib
 import json
 from typing import TypedDict
 
 import httpx
 
 from ..base import BaseAgent
+from ..events import (
+    function_call_item,
+    function_output_item,
+    message_item,
+    reasoning_item,
+    text_message,
+)
 
 
 class OpenAIConfig(TypedDict, total=False):
@@ -26,26 +32,39 @@ def _headers(headers: dict | None, api_key: str | None) -> dict:
     return result
 
 
-def _blocks(content) -> list[dict]:
+def _message_content(content, *, output: bool) -> list[dict]:
     if isinstance(content, list):
-        return [dict(block) for block in content]
-    return [{"type": "text", "text": content or ""}]
+        parts = []
+        for value in content:
+            part = dict(value)
+            if part.get("type") == "text":
+                part["type"] = "output_text" if output else "input_text"
+            parts.append(part)
+        return parts
+    part_type = "output_text" if output else "input_text"
+    return [{"type": part_type, "text": content or ""}]
 
 
-def _message(message: dict) -> dict:
-    result = {"role": message.get("role") or "user", "content": _blocks(message.get("content"))}
-    if message.get("tool_call_id"):
-        result["callId"] = message["tool_call_id"]
+def _message_items(message: dict) -> list[dict]:
+    role = message.get("role") or "user"
+    if role == "tool":
+        return [function_output_item(
+            message.get("tool_call_id") or message.get("call_id") or "",
+            message.get("content") or "",
+        )]
+    result = []
+    if reasoning := message.get("reasoning_content"):
+        result.append(reasoning_item(reasoning))
+    content = _message_content(message.get("content"), output=role == "assistant")
+    if content and any(part.get("text") or part.get("type") != "output_text" for part in content):
+        result.append(message_item(role, content))
     calls = message.get("tool_calls") or []
     for call in calls:
         function = call.get("function") or {}
-        arguments = function.get("arguments") or ""
-        with contextlib.suppress(json.JSONDecodeError):
-            arguments = json.loads(arguments)
-        result["content"].append({
-            "type": "tool_call", "callId": call.get("id") or "",
-            "name": function.get("name") or "", "arguments": arguments,
-        })
+        result.append(function_call_item(
+            call.get("id") or "", function.get("name") or "",
+            function.get("arguments") or "",
+        ))
     return result
 
 
@@ -63,14 +82,14 @@ def _tool_blocks(tools: list[dict]) -> list[dict]:
 
 def _request_context(messages: list[dict], tools: list[dict]) -> list[dict]:
     """Normalize the complete model-visible context of one request."""
-    context = [_message(message) for message in messages]
+    context = [item for message in messages for item in _message_items(message)]
     definitions = _tool_blocks(tools)
     if not definitions:
         return context
     leading = 0
-    while leading < len(context) and context[leading]["role"] in {"system", "developer"}:
+    while leading < len(context) and context[leading].get("role") in {"system", "developer"}:
         leading += 1
-    context.insert(leading, {"role": "system", "content": definitions})
+    context.insert(leading, message_item("system", definitions))
     return context
 
 
@@ -127,6 +146,7 @@ class OpenAI(BaseAgent):
         calls: dict[int, dict] = {}
         usage = None
         stop_reason = None
+        response_model = None
         url = self.config.get("base_url") or ""
         async with self._client.stream(
             "POST", f"{url}/chat/completions", json=body,
@@ -141,6 +161,7 @@ class OpenAI(BaseAgent):
                     break
                 packet = json.loads(raw)
                 usage = packet.get("usage") or usage
+                response_model = packet.get("model") or response_model
                 choices = packet.get("choices") or []
                 if not choices:
                     continue
@@ -169,24 +190,19 @@ class OpenAI(BaseAgent):
                         call_id=slot["callId"], name=slot["name"],
                         arguments_delta=fragment)
 
-        content = []
+        output = []
         if reasoning:
-            content.append({"type": "reasoning", "text": reasoning})
+            output.append(reasoning_item(reasoning))
         if text:
-            content.append({"type": "text", "text": text})
+            output.append(text_message("assistant", text))
         for slot in calls.values():
             raw_arguments = "".join(slot["parts"])
-            try:
-                arguments = json.loads(raw_arguments)
-            except json.JSONDecodeError:
-                arguments = raw_arguments
-            content.append({
-                "type": "tool_call", "callId": slot["callId"],
-                "name": slot["name"], "arguments": arguments,
-            })
-        message = {"role": "assistant", "content": content}
+            output.append(function_call_item(
+                slot["callId"], slot["name"], raw_arguments,
+            ))
         recorder.model_response(
-            message, request_id=request_id, stop_reason=stop_reason, usage=usage)
-        recorder.append_context(message)
+            output, request_id=request_id, model=response_model,
+            stop_reason=stop_reason, usage=usage)
+        recorder.append_context(output, role="assistant")
         recorder.end_step()
         recorder.end_turn(reason="final_response")

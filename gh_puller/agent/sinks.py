@@ -117,6 +117,15 @@ def _attrs(span, mapping: dict) -> None:
             key, json.dumps(value, ensure_ascii=False) if isinstance(value, (list, dict)) else value)
 
 
+def _response_text(output: list[dict], item_type: str, part_type: str) -> str:
+    """Extract displayed text from one canonical response Item kind."""
+    return "".join(
+        str(part.get("text") or "")
+        for item in output if item.get("type") == item_type
+        for part in item.get("content") or [] if part.get("type") == part_type
+    )
+
+
 def _otel():
     """Lazy import of opentelemetry symbols; missing → ImportError (optional dependency, downgraded by ensure_bus)."""
     from opentelemetry import trace
@@ -253,6 +262,9 @@ class OtelSink:
         usage = d.get("usage") or {}
         text = request["text"] if request else ""
         reasoning = request["reasoning"] if request else ""
+        output = d.get("output") or []
+        text = text or _response_text(output, "message", "output_text")
+        reasoning = reasoning or _response_text(output, "reasoning", "reasoning_text")
         _attrs(span, {
             "gen_ai.usage.input_tokens": usage.get("input"),
             "gen_ai.usage.output_tokens": usage.get("output"),

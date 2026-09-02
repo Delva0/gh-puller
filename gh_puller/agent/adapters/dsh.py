@@ -8,7 +8,15 @@ from pathlib import Path
 from typing import TypedDict
 
 from ..base import BaseAgent, RequestFailedError
-from ..events import EventRecorder, _normalize_usage
+from ..events import (
+    EventRecorder,
+    _normalize_usage,
+    function_call_item,
+    function_output_item,
+    message_item,
+    reasoning_item,
+    text_message,
+)
 
 
 class DshConfig(TypedDict, total=False):
@@ -175,13 +183,16 @@ class _DshProj:
         self.session_id = session_id
         same_session = previous is not None and previous.session_id == session_id
         context = event_recorder.context()
-        self.header = ([dict(message) for message in previous.header] if same_session else [
-            message for message in context if message.get("role") in {"system", "developer"}
+        self.header = ([dict(item) for item in previous.header] if same_session else [
+            item for item in context
+            if item.get("type") == "message" and item.get("role") in {"system", "developer"}
         ])
-        self.surface = ([(seq, dict(message)) for seq, message in previous.surface]
+        self.surface = ([(seq, [dict(item) for item in items])
+                         for seq, items in previous.surface]
                         if same_session else [
-                            (None, message) for message in context
-                            if message.get("role") not in {"system", "developer"}
+                            (None, [item]) for item in context
+                            if not (item.get("type") == "message"
+                                    and item.get("role") in {"system", "developer"})
                         ])
         self.tool_names = dict(previous.tool_names) if same_session else {}
         self.tool_pieces: dict[int, dict] = {}
@@ -189,21 +200,21 @@ class _DshProj:
         self.request_id: str | None = None
         self.saw_user_message = False
         self.last_finish_kind: str | None = None
+        self.usage = None
 
     def context(self) -> list[dict]:
         """Return the model context represented by the current DSH surface."""
-        return [*self.header, *(message for _, message in self.surface)]
+        return [*self.header, *(item for _, items in self.surface for item in items)]
 
-    def apply_header(self, message: dict | None) -> None:
+    def apply_header(self, items: list[dict]) -> None:
         """Replace DSH request metadata after projecting it into context."""
-        header = [] if message is None else [message]
-        if header == self.header:
+        if items == self.header:
             return
-        if not self.header and not self.surface and message is not None:
-            self.header = header
-            self.event_recorder.append_context(message)
+        if not self.header and not self.surface and items:
+            self.header = items
+            self.event_recorder.append_context(items, role="system")
             return
-        self.header = header
+        self.header = items
         self.event_recorder.set_context(self.context())
 
     def begin_request(self) -> str:
@@ -212,43 +223,70 @@ class _DshProj:
             self.request_id = self.event_recorder.model_request(**self.request)
         return self.request_id
 
-    def commit(self, envelope: dict, message: dict) -> None:
+    def commit(self, envelope: dict, items: list[dict], *, role: str | None = None) -> None:
         """Apply one DSH surface operation as a canonical context operation."""
+        if not items:
+            return
         seq = envelope.get("seq")
         op = envelope.get("surfaceOp") or "append"
         if op == "append":
-            self.surface.append((seq, message))
-            self.event_recorder.append_context(message)
+            self.surface.append((seq, items))
+            self.event_recorder.append_context(items, role=role)
             return
         start = next(index for index, (source, _) in enumerate(self.surface)
                      if source == op["start"])
         end = next(index for index, (source, _) in enumerate(self.surface)
                    if source == op["end"])
-        self.surface[start:end + 1] = [(seq, message)]
+        self.surface[start:end + 1] = [(seq, items)]
         self.event_recorder.set_context(self.context())
 
 
-def _dsh_message(message: dict) -> dict:
-    """Normalize DSH message blocks at the native-input boundary."""
+def _dsh_input_items(message: dict) -> list[dict]:
+    """Normalize a DSH input message at the native boundary."""
+    role = message.get("role") or "user"
     content = []
     for raw in message.get("content") or []:
         block = dict(raw)
-        if block.get("type") == "tool-call":
-            block = {
-                "type": "tool_call", "callId": block.get("id") or "",
-                "name": block.get("name") or "", "arguments": block.get("arguments") or {},
-            }
-        elif block.get("type") == "thinking":
-            block["type"] = "reasoning"
+        if block.get("type") == "text":
+            block["type"] = "input_text"
         content.append(block)
-    return {"role": message.get("role") or "assistant", "content": content}
+    return [message_item(role, content)]
 
 
-def _dsh_header_message(header: dict) -> dict | None:
+def _dsh_output_items(message: dict) -> list[dict]:
+    """Normalize one complete DSH assistant output into ordered Items."""
+    reasoning = []
+    content = []
+    calls = []
+    for raw in message.get("content") or []:
+        block = dict(raw)
+        block_type = block.get("type")
+        if block_type in {"thinking", "reasoning"}:
+            if text := block.get("text") or block.get("thinking"):
+                reasoning.append(text)
+        elif block_type in {"tool-call", "tool_call", "function_call"}:
+            calls.append(function_call_item(
+                block.get("id") or block.get("callId") or block.get("call_id") or "",
+                block.get("name") or "", block.get("arguments") or {},
+            ))
+        else:
+            if block_type == "text":
+                block["type"] = "output_text"
+            content.append(block)
+    output = []
+    if reasoning:
+        output.append(reasoning_item("".join(reasoning)))
+    if content:
+        output.append(message_item("assistant", content))
+    output.extend(calls)
+    return output
+
+
+def _dsh_header_items(header: dict) -> list[dict]:
     """Project one DSH request header into a model-visible system message."""
     content = []
     if system := header.get("system"):
-        content.append({"type": "text", "text": system})
+        content.append({"type": "input_text", "text": system})
     for tool in header.get("tools") or []:
         function = tool.get("function") or tool
         content.append({
@@ -256,7 +294,7 @@ def _dsh_header_message(header: dict) -> dict | None:
             "description": function.get("description") or "",
             "inputSchema": function.get("parameters") or function.get("inputSchema") or {},
         })
-    return {"role": "system", "content": content} if content else None
+    return [message_item("system", content)] if content else []
 
 
 def _project_dsh_chunk(event_recorder: EventRecorder, proj: _DshProj, chunk: dict) -> list[str]:
@@ -297,7 +335,8 @@ def _project_dsh_chunk(event_recorder: EventRecorder, proj: _DshProj, chunk: dic
     if ctype == "usage":
         usage = chunk.get("usage")
         if usage:
-            event_recorder.result_usage = _normalize_usage(usage)
+            proj.usage = _normalize_usage(usage)
+            event_recorder.result_usage = proj.usage
         return []
     if ctype == "finish":
         reason = chunk.get("reason")
@@ -322,14 +361,15 @@ def _project_dsh_event(event_recorder: EventRecorder, proj: _DshProj, notif) -> 
 
     if evt_type.startswith("assistant/") and not proj.saw_user_message:
         proj.saw_user_message = True
-        proj.commit({}, {
-            "role": "user", "content": [{"type": "text", "text": proj.prompt}]})
+        proj.commit({}, [text_message("user", proj.prompt)], role="user")
 
     if evt_type == "turn/start":
         event_recorder.event("turn/start")
     elif evt_type == "step/start":
         proj.tool_pieces = {}
         proj.request_id = None
+        proj.usage = None
+        proj.last_finish_kind = None
         event_recorder.event("step/start")
     elif evt_type == "step/end":
         event_recorder.event("step/end")
@@ -339,18 +379,20 @@ def _project_dsh_event(event_recorder: EventRecorder, proj: _DshProj, notif) -> 
         event_recorder.event("turn/end", outcome="completed", **({"reason": kind} if kind else {}))
     elif evt_type == "user/message":
         proj.saw_user_message = True
-        proj.commit(envelope, {
-            "role": data.get("role", "user"), "content": data.get("content") or []})
+        role = data.get("role", "user")
+        proj.commit(envelope, _dsh_input_items({
+            "role": role, "content": data.get("content") or [],
+        }), role=role)
     elif evt_type == "assistant/chunk":
         return _project_dsh_chunk(event_recorder, proj, data.get("chunk") or {})
     elif evt_type == "assistant/message":
-        message = _dsh_message(
+        output = _dsh_output_items(
             data.get("message") or {"role": "assistant", "content": []})
         event_recorder.model_response(
-            message, request_id=proj.begin_request(), usage=data.get("usage"),
+            output, request_id=proj.begin_request(), usage=data.get("usage") or proj.usage,
             stop_reason=proj.last_finish_kind)
         proj.request_id = None
-        proj.commit(envelope, message)
+        proj.commit(envelope, output, role="assistant")
     elif evt_type == "tool/call":
         call_id = data.get("callId") or ""
         name = data.get("name") or ""
@@ -367,15 +409,9 @@ def _project_dsh_event(event_recorder: EventRecorder, proj: _DshProj, notif) -> 
                        if isinstance(b, dict) and b.get("type") == "text")
         name = proj.tool_names.get(call_id) or ""
         event_recorder.tool_call(call_id, name, None)
-        if is_error:
-            event_recorder.tool_end(
-                call_id, error={"type": "ToolError", "message": text})
-        else:
-            event_recorder.tool_end(call_id, result=text)
-        proj.commit(envelope, {
-            "role": "tool", "callId": call_id, "name": name, "isError": is_error,
-            "content": [{"type": "text", "text": text}],
-        })
+        error = {"type": "ToolError", "message": text} if is_error else None
+        event_recorder.tool_end(call_id, result=text, error=error)
+        proj.commit(envelope, [function_output_item(call_id, text)], role="tool")
     elif evt_type == "request/context":
         proj.begin_request()
     elif evt_type == "request/header":
@@ -389,7 +425,7 @@ def _project_dsh_event(event_recorder: EventRecorder, proj: _DshProj, notif) -> 
                       if key not in {"provider", "model"}}
         if parameters:
             proj.request["parameters"] = parameters
-        proj.apply_header(_dsh_header_message(header))
+        proj.apply_header(_dsh_header_items(header))
     return []
 
 

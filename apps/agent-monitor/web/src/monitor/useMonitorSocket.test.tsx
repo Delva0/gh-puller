@@ -87,18 +87,24 @@ it('loads every compact history page before publishing one canonical fold', () =
     type: 'evt',
     event: {
       seq: 6, ts: 7, session: 's1', type: 'context/append/user',
-      data: { content: [{ type: 'text', text: 'next' }] },
+      data: { items: [{
+        type: 'message', role: 'user', content: [{ type: 'input_text', text: 'next' }],
+      }] },
     },
   }));
   act(() => socket.receive({
     type: 'history', session: 's1', hasMore: true, nextBeforeSeq: 3,
     events: [
       { seq: 3, ts: 4, session: 's1', type: 'context/append/user', data: {
-        content: [{ type: 'text', text: 'question' }],
+        items: [{
+          type: 'message', role: 'user', content: [{ type: 'input_text', text: 'question' }],
+        }],
       } },
       { seq: 4, ts: 5, session: 's1', type: 'model/request', data: { requestId: 'r1' } },
       { seq: 5, ts: 6, session: 's1', type: 'context/append/assistant', data: {
-        content: [{ type: 'text', text: 'answer' }],
+        items: [{
+          type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'answer' }],
+        }],
       } },
     ],
   }));
@@ -115,7 +121,10 @@ it('loads every compact history page before publishing one canonical fold', () =
         agent: 'custom', config: { model: 'configured' },
       } },
       { seq: 2, ts: 3, session: 's1', type: 'context/set', data: {
-        messages: [{ role: 'system', content: [{ type: 'text', text: 'instruction' }] }],
+        items: [{
+          type: 'message', role: 'system',
+          content: [{ type: 'input_text', text: 'instruction' }],
+        }],
       } },
     ],
   }));
@@ -124,6 +133,6 @@ it('loads every compact history page before publishing one canonical fold', () =
   expect(snapshot.loaded).toBe(true);
   expect(snapshot.events.map(event => event.seq)).toEqual([0, 1, 2, 3, 4, 5, 6]);
   expect(snapshot.state.agent).toEqual({ agent: 'custom', config: { model: 'configured' } });
-  expect(snapshot.state.context.map(message => message.role))
+  expect(snapshot.state.context.map(item => item.role))
     .toEqual(['system', 'user', 'assistant', 'user']);
 });

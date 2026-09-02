@@ -3,7 +3,13 @@
 from typing import TypedDict
 
 from ..base import BaseAgent, RequestFailedError
-from ..events import EventRecorder, _normalize_usage
+from ..events import (
+    EventRecorder,
+    _normalize_usage,
+    function_call_item,
+    reasoning_item,
+    text_message,
+)
 
 
 class ClaudeConfig(TypedDict, total=False):
@@ -65,16 +71,61 @@ class _ClaudeSynth:
         self.tool_result: dict | None = None
         self.tool_results_seen: set[str] = set()
         self.tool_names: dict[str, str] = {}
+        self.message_id: str | None = None
+        self.message_model: str | None = None
+        self.complete_reasoning: list[str] = []
+        self.complete_text: list[str] = []
+        self.complete_calls: list[dict] = []
+        self.message_usage = None
         self.message_text = ""
         self.message_reasoning = ""
         self.message_stop_reason: str | None = None
         self.message_yielded = False
 
     def reset_message(self) -> None:
+        self.message_id = None
+        self.message_model = None
+        self.complete_reasoning = []
+        self.complete_text = []
+        self.complete_calls = []
+        self.message_usage = None
         self.message_text = ""
         self.message_reasoning = ""
         self.message_stop_reason = None
         self.message_yielded = False
+
+
+def _commit_assistant_message(event_recorder: EventRecorder, state: _ClaudeSynth) -> None:
+    """Commit all SDK fragments belonging to one provider message."""
+    reasoning = "".join(state.complete_reasoning) or state.message_reasoning
+    text = "".join(state.complete_text) or state.message_text
+    output = []
+    if reasoning:
+        output.append(reasoning_item(reasoning))
+    if text:
+        output.append(text_message("assistant", text))
+    output.extend(state.complete_calls)
+    if not output:
+        state.reset_message()
+        return
+    event_recorder.model_response(
+        output, request_id=state.request_id, model=state.message_model,
+        usage=state.message_usage, stop_reason=state.message_stop_reason)
+    event_recorder.append_context(output, role="assistant")
+    state.reset_message()
+
+
+def _has_assistant_output(state: _ClaudeSynth) -> bool:
+    return bool(
+        state.complete_reasoning or state.complete_text or state.complete_calls
+        or state.message_reasoning or state.message_text,
+    )
+
+
+def _begin_next_request(event_recorder: EventRecorder, state: _ClaudeSynth) -> None:
+    event_recorder.begin_step()
+    state.request_id = event_recorder.model_request()
+    state.tool_pending = False
 
 
 def _handle_stream_event(event_recorder: EventRecorder, state: _ClaudeSynth,
@@ -82,11 +133,16 @@ def _handle_stream_event(event_recorder: EventRecorder, state: _ClaudeSynth,
     """Translate one Claude streaming event without changing yielded text."""
     typ = event.get("type")
     if typ == "message_start":
-        if state.tool_pending and (event.get("message") or {}).get("role") == "assistant":
-            event_recorder.begin_step()
-            state.request_id = event_recorder.model_request()
-            state.tool_pending = False
+        has_output = _has_assistant_output(state)
+        if has_output:
+            _commit_assistant_message(event_recorder, state)
+        if (has_output or state.tool_pending) \
+                and (event.get("message") or {}).get("role") == "assistant":
+            _begin_next_request(event_recorder, state)
         state.reset_message()
+        message = event.get("message") or {}
+        state.message_id = message.get("id")
+        state.message_model = message.get("model")
         return
     if typ == "message_delta":
         stop = (event.get("delta") or {}).get("stop_reason")
@@ -139,10 +195,7 @@ def _handle_stream_event(event_recorder: EventRecorder, state: _ClaudeSynth,
             text = "".join(state.tool_result["pieces"])
             tid = state.tool_result["id"]
             event_recorder.tool_result(
-                {"role": "user", "content": [
-                    {"type": "tool_result", "tool_use_id": tid, "content": text,
-                     "is_error": state.tool_result["is_error"]},
-                ]},
+                text,
                 call_id=tid, name=state.tool_names.get(tid),
                 is_error=state.tool_result["is_error"],
             )
@@ -153,12 +206,26 @@ def _handle_stream_event(event_recorder: EventRecorder, state: _ClaudeSynth,
             state.active_tool_use.pop(idx, None)
             return
         return
+    if typ == "message_stop":
+        return
 
 
 def _handle_assistant_message(event_recorder: EventRecorder, state: _ClaudeSynth,
                               msg) -> list[str]:
-    """Commit one complete assistant message, rebuilding empty partial markers."""
-    content = []
+    """Accumulate one SDK fragment and return text absent from partial events."""
+    message_id = getattr(msg, "message_id", None)
+    if _has_assistant_output(state) and message_id and state.message_id \
+            and message_id != state.message_id:
+        _commit_assistant_message(event_recorder, state)
+        _begin_next_request(event_recorder, state)
+    if message_id:
+        state.message_id = message_id
+    if model := getattr(msg, "model", None):
+        state.message_model = model
+    if usage := _normalize_usage(getattr(msg, "usage", None)):
+        state.message_usage = {**(state.message_usage or {}), **usage}
+    if stop_reason := getattr(msg, "stop_reason", None):
+        state.message_stop_reason = stop_reason
     fallback = []
     for b in msg.content:
         t = _block_kind(b)
@@ -167,26 +234,16 @@ def _handle_assistant_message(event_recorder: EventRecorder, state: _ClaudeSynth
             if text and not state.message_yielded:
                 event_recorder.text(text, request_id=state.request_id)
                 fallback.append(text)
-            content.append({"type": "text", "text": text})
+            state.complete_text.append(text)
         elif t == "thinking":
-            content.append({"type": "reasoning", "text": getattr(b, "thinking", None) or ""})
+            state.complete_reasoning.append(getattr(b, "thinking", None) or "")
         elif t == "tool_use":
-            content.append({
-                "type": "tool_call", "callId": getattr(b, "id", None) or "",
-                "name": getattr(b, "name", None) or "", "arguments": getattr(b, "input", None) or {},
-            })
-    if not content:
-        if state.message_reasoning:
-            content.append({"type": "reasoning", "text": state.message_reasoning})
-        if state.message_text:
-            content.append({"type": "text", "text": state.message_text})
-    stop_reason = getattr(msg, "stop_reason", None) or state.message_stop_reason
-    message = {"role": "assistant", "content": content}
-    event_recorder.model_response(
-        message, request_id=state.request_id,
-        usage=_normalize_usage(getattr(msg, "usage", None)), stop_reason=stop_reason)
-    event_recorder.append_context(message)
-    state.reset_message()
+            call_id = getattr(b, "id", None) or ""
+            name = getattr(b, "name", None) or ""
+            state.tool_names[call_id] = name
+            state.complete_calls.append(function_call_item(
+                call_id, name, getattr(b, "input", None) or {},
+            ))
     return fallback
 
 
@@ -211,8 +268,7 @@ def _handle_user_message(event_recorder: EventRecorder, state: _ClaudeSynth, msg
         else:
             text = raw or ""
         event_recorder.tool_result(
-            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": tid,
-                                          "content": text, "is_error": is_error}]},
+            text,
             call_id=tid, name=state.tool_names.get(tid),
             is_error=is_error,
         )
@@ -234,10 +290,7 @@ class ClaudeCode(BaseAgent):
     async def _enter(self):
         await self._client.__aenter__()
         if prompt := self.config.get("system_prompt"):
-            self._require_event_recorder().append_context({
-                "role": "system",
-                "content": [{"type": "text", "text": prompt}],
-            })
+            self._require_event_recorder().append_context(text_message("system", prompt))
 
     async def _exit(self, exc):
         await self._client.__aexit__(*exc)
@@ -253,7 +306,7 @@ class ClaudeCode(BaseAgent):
 
         event_recorder = self._require_event_recorder()
         event_recorder.begin_turn()
-        event_recorder.append_context({"role": "user", "content": [{"type": "text", "text": prompt}]})
+        event_recorder.append_context(text_message("user", prompt))
         event_recorder.begin_step()
         state = _ClaudeSynth(event_recorder.model_request())
         await self._client.query(prompt)
@@ -270,8 +323,10 @@ class ClaudeCode(BaseAgent):
                 for text in _handle_assistant_message(event_recorder, state, msg):
                     yield text
             elif isinstance(msg, UserMessage):
+                _commit_assistant_message(event_recorder, state)
                 _handle_user_message(event_recorder, state, msg)
             elif isinstance(msg, ResultMessage):
+                _commit_assistant_message(event_recorder, state)
                 if msg.is_error:
                     detail = (msg.errors or [])[-1] if msg.errors else msg.result
                     raise RequestFailedError(detail or msg.subtype)
@@ -285,7 +340,7 @@ class ClaudeCode(BaseAgent):
 
         event_recorder = self._require_event_recorder()
         event_recorder.begin_turn()
-        event_recorder.append_context({"role": "user", "content": [{"type": "text", "text": prompt}]})
+        event_recorder.append_context(text_message("user", prompt))
         event_recorder.begin_step()
         state = _ClaudeSynth(event_recorder.model_request())
         await self._client.query(prompt)
@@ -295,8 +350,10 @@ class ClaudeCode(BaseAgent):
             elif isinstance(msg, AssistantMessage):
                 _handle_assistant_message(event_recorder, state, msg)
             elif isinstance(msg, UserMessage):
+                _commit_assistant_message(event_recorder, state)
                 _handle_user_message(event_recorder, state, msg)
             elif isinstance(msg, ResultMessage):
+                _commit_assistant_message(event_recorder, state)
                 if msg.is_error:
                     detail = (msg.errors or [])[-1] if msg.errors else msg.result
                     raise RequestFailedError(detail or msg.subtype)

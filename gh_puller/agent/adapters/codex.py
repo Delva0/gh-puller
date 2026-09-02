@@ -1,14 +1,20 @@
 """Configure Codex SDK isolation and adapt its notifications to canonical events."""
 
 import asyncio
-import contextlib
 import json
 import shutil
 from pathlib import Path
 from typing import Any, TypedDict
 
 from ..base import BaseAgent, RequestFailedError
-from ..events import EventRecorder, _normalize_usage
+from ..events import (
+    EventRecorder,
+    _normalize_usage,
+    function_call_item,
+    message_item,
+    reasoning_item,
+    text_message,
+)
 
 
 class CodexConfig(TypedDict, total=False):
@@ -208,10 +214,16 @@ class _CodexSynth:
         self.request_id = request_id
         self.turn_id: str | None = None
         self.agent_pieces: dict[str, list[str]] = {}
-        self.reasoning_seen: set[str] = set()
-        self.tool_round_open = False
+        self.reasoning_order: list[str] = []
+        self.reasoning_pieces: dict[str, list[str]] = {}
+        self.complete_reasoning: dict[str, str] = {}
+        self.message_parts: list[dict] = []
         self.pending_tools: list[dict] = []
-        self.plan_items: set[str] = set()
+        self.plan_pieces: dict[str, list[str]] = {}
+        self.completed_plans: set[str] = set()
+        self.request_open = True
+        self.usage = None
+        self.total_usage = None
         self.saw_turn_completed = False
         self.final_response = ""
 
@@ -265,28 +277,47 @@ def _codex_tool_result(item, itype: str) -> dict:
             "is_error": is_error, "arguments": arguments}
 
 
-def _flush_codex_tools(event_recorder: EventRecorder, st: _CodexSynth) -> None:
-    """Commit one model tool-call message, then record each local execution."""
-    if not st.pending_tools:
+def _flush_codex_response(event_recorder: EventRecorder, st: _CodexSynth) -> None:
+    """Commit one inferred model output, followed by its completed tools."""
+    if not st.request_open:
         return
-    content = []
+    reasoning = []
+    for item_id in st.reasoning_order:
+        text = st.complete_reasoning.get(item_id) or "".join(
+            st.reasoning_pieces.get(item_id) or [],
+        )
+        if text:
+            reasoning.append(text)
+    output = []
+    if reasoning:
+        output.append(reasoning_item("\n".join(reasoning)))
+    if st.message_parts:
+        output.append(message_item("assistant", list(st.message_parts)))
+    output.extend(
+        function_call_item(
+            spec["call_id"], spec["name"], spec["arguments"],
+        ) for spec in st.pending_tools
+    )
+    event_recorder.model_response(output, request_id=st.request_id, usage=st.usage)
+    if st.total_usage:
+        event_recorder.result_usage = st.total_usage
+    if output:
+        event_recorder.append_context(output, role="assistant")
     for spec in st.pending_tools:
-        arguments = spec["arguments"]
-        with contextlib.suppress(json.JSONDecodeError, TypeError):
-            arguments = json.loads(arguments)
-        content.append({
-            "type": "tool_call", "callId": spec["call_id"],
-            "name": spec["name"], "arguments": arguments,
-        })
-    message = {"role": "assistant", "content": content}
-    event_recorder.model_response(message, request_id=st.request_id)
-    event_recorder.append_context(message)
-    for spec in st.pending_tools:
-        event_recorder.tool_start(spec["call_id"], spec["name"], spec["arguments"])
+        event_recorder.tool_call(spec["call_id"], spec["name"], spec["arguments"])
         event_recorder.tool_result(
-            {"role": "tool", "content": [{"type": "text", "text": spec["content"]}]},
+            spec["content"],
             call_id=spec["call_id"], name=spec["name"], is_error=spec["is_error"])
+    st.agent_pieces = {}
+    st.reasoning_order = []
+    st.reasoning_pieces = {}
+    st.complete_reasoning = {}
+    st.message_parts = []
     st.pending_tools = []
+    st.plan_pieces = {}
+    st.completed_plans = set()
+    st.request_open = False
+    st.usage = None
 
 
 def _codex_item_completed(event_recorder: EventRecorder, st: _CodexSynth, payload) -> list[str]:
@@ -301,15 +332,10 @@ def _codex_item_completed(event_recorder: EventRecorder, st: _CodexSynth, payloa
             event_recorder.text(text, request_id=st.request_id)
         if text:
             st.final_response = text
-        message = {"role": "assistant", "content": [{"type": "text", "text": text}]}
-        phase = getattr(item, "phase", None)
-        if phase is not None:
-            message["content"][0]["phase"] = codex_val(phase)
-        event_recorder.model_response(message, request_id=st.request_id)
-        event_recorder.append_context(message)
+        if text:
+            st.message_parts.append({"type": "output_text", "text": text})
         return [text] if not pieces and text else []
     if itype in ("dynamicToolCall", "mcpToolCall", "commandExecution"):
-        st.tool_round_open = True
         info = _codex_tool_result(item, itype)
         st.pending_tools.append({"call_id": item_id, **info})
         return []
@@ -319,18 +345,24 @@ def _codex_item_completed(event_recorder: EventRecorder, st: _CodexSynth, payloa
         pieces = content or (getattr(item, "summary", None) or [])
         if not pieces:
             return []
-        if item_id not in st.reasoning_seen:
-            event_recorder.reasoning("".join(pieces), request_id=st.request_id)
+        text = "".join(pieces)
+        if item_id not in st.reasoning_order:
+            st.reasoning_order.append(item_id)
+        st.complete_reasoning[item_id] = text
+        if item_id not in st.reasoning_pieces:
+            event_recorder.reasoning(text, request_id=st.request_id)
         return []
     if itype == "plan":
-        text = getattr(item, "text", None) or ""
-        if text and item_id not in st.plan_items:
-            st.plan_items.add(item_id)
+        streamed = "".join(st.plan_pieces.get(item_id) or [])
+        text = streamed or (getattr(item, "text", None) or "")
+        if text and not streamed:
             event_recorder.delta("text", request_id=st.request_id, index=0, text=text)
+        if text and item_id not in st.completed_plans:
+            st.completed_plans.add(item_id)
+            st.message_parts.append({"type": "output_text", "text": text})
         return []
     if itype == "webSearch":
         # The started web-search item is empty; only completed carries useful data.
-        st.tool_round_open = True
         act = _codex_item(getattr(item, "action", None))
         action = None
         if act is not None:
@@ -361,7 +393,6 @@ def _handle_codex_notification(event_recorder: EventRecorder, st: _CodexSynth, n
         st.turn_id = getattr(turn, "id", None)
         return []
     if method == "turn/completed":
-        _flush_codex_tools(event_recorder, st)
         st.saw_turn_completed = True
         turn = getattr(payload, "turn", None) or {}
         kind = codex_val(getattr(turn, "status", None))
@@ -370,17 +401,22 @@ def _handle_codex_notification(event_recorder: EventRecorder, st: _CodexSynth, n
             error = getattr(turn, "error", None) or {}
             detail = getattr(error, "message", None) or kind
             raise RequestFailedError(detail)
+        _flush_codex_response(event_recorder, st)
         return []
     if method == "item/started":
         item = _codex_item(getattr(payload, "item", None))
         itype = _codex_item_type(item)
-        if itype == "agentMessage":
-            st.agent_pieces.setdefault(getattr(item, "id", None) or "", [])
-        if itype in ("agentMessage", "reasoning", "plan") and st.tool_round_open:
-            _flush_codex_tools(event_recorder, st)
-            st.tool_round_open = False
+        if itype in ("agentMessage", "reasoning", "plan") and st.pending_tools:
+            _flush_codex_response(event_recorder, st)
             event_recorder.begin_step()
             st.request_id = event_recorder.model_request()
+            st.request_open = True
+        if itype == "agentMessage":
+            st.agent_pieces.setdefault(getattr(item, "id", None) or "", [])
+        elif itype == "reasoning":
+            item_id = getattr(item, "id", None) or ""
+            if item_id not in st.reasoning_order:
+                st.reasoning_order.append(item_id)
         return []
     if method == "item/agentMessage/delta":
         text = getattr(payload, "delta", None) or ""
@@ -392,7 +428,10 @@ def _handle_codex_notification(event_recorder: EventRecorder, st: _CodexSynth, n
     if method in ("item/reasoning/textDelta", "item/reasoning/summaryTextDelta"):
         delta = getattr(payload, "delta", None) or ""
         if delta:
-            st.reasoning_seen.add(getattr(payload, "item_id", None) or "")
+            item_id = getattr(payload, "item_id", None) or ""
+            if item_id not in st.reasoning_order:
+                st.reasoning_order.append(item_id)
+            st.reasoning_pieces.setdefault(item_id, []).append(delta)
             # Preserve SDK segment indexes across full and summarized reasoning.
             index = (getattr(payload, "content_index", None)
                      if method == "item/reasoning/textDelta"
@@ -404,7 +443,8 @@ def _handle_codex_notification(event_recorder: EventRecorder, st: _CodexSynth, n
     if method == "item/plan/delta":
         delta = getattr(payload, "delta", None) or ""
         if delta:
-            st.plan_items.add(getattr(payload, "item_id", None) or "")
+            item_id = getattr(payload, "item_id", None) or ""
+            st.plan_pieces.setdefault(item_id, []).append(delta)
             event_recorder.delta(
                 "text", request_id=st.request_id, index=0, text=delta)
         return []
@@ -412,9 +452,11 @@ def _handle_codex_notification(event_recorder: EventRecorder, st: _CodexSynth, n
         return _codex_item_completed(event_recorder, st, payload)
     if method == "thread/tokenUsage/updated":
         usage = getattr(payload, "token_usage", None) or {}
-        breakdown = getattr(usage, "total", None) or getattr(usage, "last", None)
-        if breakdown is not None:
-            event_recorder.result_usage = _normalize_usage(breakdown)
+        latest = getattr(usage, "last", None)
+        total = getattr(usage, "total", None)
+        st.usage = _normalize_usage(latest)
+        st.total_usage = _normalize_usage(total) or st.usage
+        event_recorder.result_usage = st.total_usage
         return []
     return []
 
@@ -452,13 +494,9 @@ class Codex(BaseAgent):
         self._thread = await self._codex.thread_start(**codex_thread(config))
         recorder = self._require_event_recorder()
         if prompt := config.get("base_instructions") or config.get("system_prompt"):
-            recorder.append_context({
-                "role": "system", "content": [{"type": "text", "text": prompt}],
-            })
+            recorder.append_context(text_message("system", prompt))
         if prompt := config.get("developer_instructions"):
-            recorder.append_context({
-                "role": "developer", "content": [{"type": "text", "text": prompt}],
-            })
+            recorder.append_context(text_message("developer", prompt))
 
     async def _exit(self, exc):
         self._thread = None
@@ -469,7 +507,7 @@ class Codex(BaseAgent):
         config = self.config
         event_recorder = self._require_event_recorder()
         event_recorder.begin_turn()
-        event_recorder.append_context({"role": "user", "content": [{"type": "text", "text": prompt}]})
+        event_recorder.append_context(text_message("user", prompt))
         event_recorder.begin_step()
         st = _CodexSynth(event_recorder.model_request())
         timeout = config.get("timeout_seconds")
@@ -490,7 +528,7 @@ class Codex(BaseAgent):
         config = self.config
         event_recorder = self._require_event_recorder()
         event_recorder.begin_turn()
-        event_recorder.append_context({"role": "user", "content": [{"type": "text", "text": prompt}]})
+        event_recorder.append_context(text_message("user", prompt))
         event_recorder.begin_step()
         st = _CodexSynth(event_recorder.model_request())
         timeout = config.get("timeout_seconds")

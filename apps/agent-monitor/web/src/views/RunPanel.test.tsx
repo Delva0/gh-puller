@@ -52,34 +52,37 @@ describe('native canonical run view', () => {
     const fold = new RunFold();
     fold.applyBatch([
       evt('agent/set', 0, { agent: 'custom', config: { model: 'configured' } }),
-      evt('context/set', 1, { messages: [{
+      evt('context/set', 1, { items: [{
+        type: 'message',
         role: 'system',
         content: [
-          { type: 'text', text: 'system instruction' },
+          { type: 'input_text', text: 'system instruction' },
           { type: 'tool_definition', name: 'read', inputSchema: { type: 'object' } },
         ],
       }] }),
-      evt('context/append/user', 2, { content: [{ type: 'text', text: 'question' }] }),
+      evt('context/append/user', 2, { items: [{
+        type: 'message', role: 'user', content: [{ type: 'input_text', text: 'question' }],
+      }] }),
       evt('model/request', 3, { requestId: 'r1', model: 'actual' }),
       evt('model/delta/tool-call', 4, {
         requestId: 'r1', index: 0, callId: 'c1', name: 'read', argumentsDelta: '{"path":"a.py"}',
       }),
       evt('model/response', 5, {
         requestId: 'r1',
-        message: { role: 'assistant', content: [{
-          type: 'tool_call', callId: 'c1', name: 'read', arguments: { path: 'a.py' },
-        }] },
+        output: [{
+          type: 'function_call', call_id: 'c1', name: 'read', arguments: '{"path":"a.py"}',
+        }],
       }),
-      evt('context/append/assistant', 6, { content: [{
-        type: 'tool_call', callId: 'c1', name: 'read', arguments: { path: 'a.py' },
+      evt('context/append/assistant', 6, { items: [{
+        type: 'function_call', call_id: 'c1', name: 'read', arguments: '{"path":"a.py"}',
       }] }),
       evt('tool/start', 7, { callId: 'c1', name: 'read', arguments: { path: 'a.py' } }),
       evt('tool/end', 8, { callId: 'c1', result: 'file body' }),
-      evt('context/append/tool', 9, {
-        callId: 'c1', name: 'read', content: [{ type: 'text', text: 'file body' }],
-      }),
+      evt('context/append/tool', 9, { items: [{
+        type: 'function_call_output', call_id: 'c1', output: 'file body',
+      }] }),
       evt('context/append', 10, {
-        role: 'critic', content: [{ type: 'score', value: 0.9 }],
+        items: [{ type: 'message', role: 'critic', content: [{ type: 'score', value: 0.9 }] }],
       }),
     ]);
     render(fold);
@@ -97,9 +100,14 @@ describe('native canonical run view', () => {
   it('lets context/set replace the visible model context without presentation metadata', () => {
     const fold = new RunFold();
     fold.applyBatch([
-      evt('context/append/user', 0, { content: [{ type: 'text', text: 'obsolete' }] }),
+      evt('context/append/user', 0, { items: [{
+        type: 'message', role: 'user', content: [{ type: 'input_text', text: 'obsolete' }],
+      }] }),
       evt('context/set', 1, {
-        messages: [{ role: 'assistant', content: [{ type: 'text', text: 'summary' }] }],
+        items: [{
+          type: 'message', role: 'assistant',
+          content: [{ type: 'output_text', text: 'summary' }],
+        }],
       }),
     ]);
     render(fold);
@@ -112,7 +120,9 @@ describe('native canonical run view', () => {
   it('shows open model activity and folds stream deltas into one event row', () => {
     const fold = new RunFold();
     fold.applyBatch([
-      evt('context/append/user', 0, { content: [{ type: 'text', text: 'prompt' }] }),
+      evt('context/append/user', 0, { items: [{
+        type: 'message', role: 'user', content: [{ type: 'input_text', text: 'prompt' }],
+      }] }),
       evt('model/request', 1, { requestId: 'r1' }),
       evt('model/delta/reasoning', 2, { requestId: 'r1', index: 0, text: 'think' }),
       evt('model/delta/text', 3, { requestId: 'r1', index: 1, text: 'streaming answer' }),

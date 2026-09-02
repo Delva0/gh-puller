@@ -9,7 +9,14 @@ from pathlib import Path
 from typing import Any, TypedDict
 
 from ..base import BaseAgent, RequestFailedError
-from ..events import EventRecorder, _normalize_usage
+from ..events import (
+    EventRecorder,
+    _normalize_usage,
+    function_call_item,
+    message_item,
+    reasoning_item,
+    text_message,
+)
 
 # OpenCode 1.18 emits cumulative text snapshots keyed by part id.
 _CUMULATIVE_TEXT = True
@@ -100,7 +107,12 @@ class _OpencodeSynth:
         self.request_id = request_id
         self.parts: dict[str, str] = {}
         self.step_parts: dict[str, str] = {}
+        self.step_reasoning: dict[str, str] = {}
         self.pending_tools: list[dict] = []
+        self.request_open = True
+        self.usage = None
+        self.stop_reason: str | None = None
+        self.model: str | None = None
         self.open_steps = 0
         self.saw_stop = False
         self.final_response = ""
@@ -108,25 +120,34 @@ class _OpencodeSynth:
         self.stderr_tail: list[str] = []
 
 
-def _flush_step_message(event_recorder: EventRecorder, st: _OpencodeSynth) -> None:
+def _flush_step_response(event_recorder: EventRecorder, st: _OpencodeSynth) -> None:
     """Commit the complete assistant output before buffered tool executions."""
-    if not st.step_parts and not st.pending_tools:
+    if not st.request_open:
         return
-    content = [{"type": "text", "text": text} for text in st.step_parts.values()]
-    for spec in st.pending_tools:
-        arguments = spec["arguments"]
-        with contextlib.suppress(json.JSONDecodeError, TypeError):
-            arguments = json.loads(arguments)
-        content.append({
-            "type": "tool_call", "callId": spec["call_id"],
-            "name": spec["name"], "arguments": arguments,
-        })
-    message = {"role": "assistant", "content": content}
+    output = []
+    reasoning = "\n".join(text for text in st.step_reasoning.values() if text)
+    if reasoning:
+        output.append(reasoning_item(reasoning))
+    content = [{"type": "output_text", "text": text}
+               for text in st.step_parts.values() if text]
+    if content:
+        output.append(message_item("assistant", content))
+    output.extend(
+        function_call_item(
+            spec["call_id"], spec["name"], spec["arguments"],
+        ) for spec in st.pending_tools
+    )
     event_recorder.model_response(
-        message, request_id=st.request_id, usage=event_recorder.result_usage,
-        stop_reason=event_recorder.result_stop_reason)
-    event_recorder.append_context(message)
+        output, request_id=st.request_id, model=st.model,
+        usage=st.usage, stop_reason=st.stop_reason)
+    if output:
+        event_recorder.append_context(output, role="assistant")
     st.step_parts = {}
+    st.step_reasoning = {}
+    st.request_open = False
+    st.usage = None
+    st.stop_reason = None
+    st.model = None
 
 
 def _flush_pending_tools(event_recorder: EventRecorder, st: _OpencodeSynth) -> None:
@@ -134,8 +155,7 @@ def _flush_pending_tools(event_recorder: EventRecorder, st: _OpencodeSynth) -> N
     for spec in st.pending_tools:
         event_recorder.tool_call(spec["call_id"], spec["name"], spec["arguments"])
         event_recorder.tool_result(
-            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": spec["call_id"],
-                                          "content": spec["content"], "is_error": spec["is_error"]}]},
+            spec["content"],
             call_id=spec["call_id"], name=spec["name"], is_error=spec["is_error"],
         )
     st.pending_tools = []
@@ -150,10 +170,18 @@ def _handle_opencode_line(event_recorder: EventRecorder, st: _OpencodeSynth, evt
     if kind == "step_start":
         st.open_steps += 1
         if st.open_steps >= 2:
+            _flush_step_response(event_recorder, st)
+            _flush_pending_tools(event_recorder, st)
             event_recorder.begin_step()
             st.request_id = event_recorder.model_request()
+        st.request_open = True
+        st.parts = {}
         st.step_parts = {}
+        st.step_reasoning = {}
+        st.model = part.get("modelID") or part.get("model")
         return []
+    if model := part.get("modelID") or part.get("model"):
+        st.model = model
     if kind == "text":
         text = part.get("text") or ""
         if not text:
@@ -182,8 +210,11 @@ def _handle_opencode_line(event_recorder: EventRecorder, st: _OpencodeSynth, evt
             prev = st.parts.get(pid, "")
             delta = text[len(prev):] if prev and text.startswith(prev) else text
             st.parts[pid] = text
+            st.step_reasoning[pid] = text
         else:
             delta = text
+            if delta:
+                st.step_reasoning[pid] = (st.step_reasoning.get(pid) or "") + delta
         if delta:
             event_recorder.reasoning(delta, request_id=st.request_id)
         return []
@@ -216,14 +247,18 @@ def _handle_opencode_line(event_recorder: EventRecorder, st: _OpencodeSynth, evt
         usage = {"input_tokens": tokens.get("input"), "output_tokens": tokens.get("output"),
                  "cache_read_input_tokens": cache.get("read")}
         if any(v is not None for v in usage.values()):
-            event_recorder.result_usage = _normalize_usage(usage)
+            st.usage = _normalize_usage(usage)
+            event_recorder.result_usage = st.usage
         cost = part.get("cost")
         if isinstance(cost, (int, float)):
             event_recorder.result_cost_usd = float(cost)
-        if part.get("reason") == "stop":
+        reason = part.get("reason")
+        if isinstance(reason, str):
+            st.stop_reason = reason
+        if reason == "stop":
             st.saw_stop = True
             event_recorder.result_stop_reason = "stop"
-        _flush_step_message(event_recorder, st)
+        _flush_step_response(event_recorder, st)
         _flush_pending_tools(event_recorder, st)
         return []
     if kind == "error":
@@ -291,8 +326,6 @@ async def _opencode_drain(proc, event_recorder: EventRecorder, st: _OpencodeSynt
             for delta in _handle_opencode_line(event_recorder, st, evt):
                 yield delta
     finally:
-        _flush_step_message(event_recorder, st)
-        _flush_pending_tools(event_recorder, st)
         rc = await proc.wait()
     if rc != 0:
         detail = f"opencode 退出码 {rc}" + (f": {'; '.join(st.stderr_tail[-20:])}" if st.stderr_tail else "")
@@ -318,10 +351,7 @@ class OpenCode(BaseAgent):
 
     async def _enter(self) -> None:
         if prompt := self.config.get("system_prompt"):
-            self._require_event_recorder().append_context({
-                "role": "system",
-                "content": [{"type": "text", "text": prompt}],
-            })
+            self._require_event_recorder().append_context(text_message("system", prompt))
 
     async def _exit(self, exc) -> None:
         """Same: nothing to reap at the client layer (child reaping in _opencode_subprocess)."""
@@ -331,7 +361,7 @@ class OpenCode(BaseAgent):
         config = self._call_config()
         event_recorder = self._require_event_recorder()
         event_recorder.begin_turn()
-        event_recorder.append_context({"role": "user", "content": [{"type": "text", "text": prompt}]})
+        event_recorder.append_context(text_message("user", prompt))
         event_recorder.begin_step()
         st = _OpencodeSynth(event_recorder.model_request())
         with tempfile.TemporaryDirectory(prefix="gh-puller-opencode-") as tmp:
@@ -362,7 +392,7 @@ class OpenCode(BaseAgent):
         config = self._call_config()
         event_recorder = self._require_event_recorder()
         event_recorder.begin_turn()
-        event_recorder.append_context({"role": "user", "content": [{"type": "text", "text": prompt}]})
+        event_recorder.append_context(text_message("user", prompt))
         event_recorder.begin_step()
         st = _OpencodeSynth(event_recorder.model_request())
         with tempfile.TemporaryDirectory(prefix="gh-puller-opencode-") as tmp:

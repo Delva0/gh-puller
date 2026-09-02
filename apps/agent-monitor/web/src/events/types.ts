@@ -1,13 +1,18 @@
 /** Canonical agent event shapes consumed by the monitor fold and native UI. */
 
-export interface Block {
+export interface ContentPart {
   type: string
   [key: string]: unknown
 }
 
-export interface Message {
-  role: string
-  content: Block[]
+export interface Item {
+  type: string
+  role?: string
+  content?: ContentPart[]
+  call_id?: string
+  name?: string
+  arguments?: string
+  output?: unknown
   [key: string]: unknown
 }
 
@@ -18,7 +23,7 @@ export interface AgentState {
 
 export interface CanonicalState {
   agent: AgentState | null
-  context: Message[]
+  context: Item[]
 }
 
 export interface Usage {
@@ -47,7 +52,7 @@ export interface ModelActivity {
   reasoning: string
   deltaCount: number
   toolCalls: Map<number, { callId: string; name?: string; arguments: string }>
-  message?: Message
+  output?: Item[]
   usage?: Usage
   stopReason?: string
 }

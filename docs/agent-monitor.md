@@ -14,82 +14,78 @@ The following source packages and files were used as context for this document:
 
 # Agent observation and monitor
 
-`gh_puller.agent` translates heterogeneous Agents into one ordered semantic event
-language. Its fold reconstructs everything the adapter can assert about Agent control
-state and model-visible Context at every event prefix. Model and tool execution remain
-correlated activity rather than implicit state mutations.
+`gh_puller.agent` translates black-box Agents into one ordered semantic language. At
+every event prefix, the canonical fold reconstructs the Agent controls and the complete
+model-visible Context that an adapter can assert.
 
-## Canonical state
-
-The replayable state is:
+## State algebra
 
 ```text
 State = Agent × Context
+Context = Seq<Item>
 ```
 
-| Operation | Fold effect |
-| --- | --- |
-| `agent/set` | Replace Agent identity and its complete opaque configuration. |
-| `agent/set/<facet>` | Replace one explicitly observed configuration facet. |
-| `context/set` | Replace the complete ordered Context. |
-| `context/append[/<role>]` | Append one message. |
+| Operation | Payload | Fold effect |
+| --- | --- | --- |
+| `agent/set` | `{agent, config}` | Replace Agent identity and opaque configuration. |
+| `agent/set/<facet>` | `{<facet>: value}` | Replace one explicitly observed control facet. |
+| `context/set` | `{items}` | Replace the complete Item sequence. |
+| `context/append[/<role>]` | `{items}` | Atomically append an Item sequence. |
 
-`agent/set` records the configuration supplied to an Agent without interpreting its
-fields. Facet routes such as `agent/set/model` and `agent/set/mode` are open extension
-points; they are emitted only when an adapter observes that control change explicitly.
+The role-specialized append routes make common producers easy to identify. The generic
+route accepts Items with any role or no role. Context compression and other rewrites
+are ordinary `context/set` operations.
 
-Context is an ordered sequence of message-like objects. `system`, `user`, `assistant`,
-and `tool` have short append routes; any other role uses `context/append` with `role` in
-the payload. Content blocks are open objects identified by `type`. A context rewrite or
-compression emits one `context/set` containing the resulting complete sequence.
-
-Configuration and semantic effect are separate facts. For example, CC may receive a
-`system_prompt` inside its opaque configuration and then append the applied instruction
-as `context/append/system`. Only that adapter knows the mapping; the recorder, fold, and
-monitor never infer Context by inspecting configuration keys. If a black-box backend
-does not expose an internal prompt, the adapter does not invent it. “Complete Context”
-therefore means the logical model-visible Context that the adapter can confirm.
+Agent configuration is recorded as supplied and is never opened to infer Context. An
+adapter may therefore record `system_prompt` in `agent/set.config`, then separately
+append a system message when it observes that instruction taking effect. Tools exposed
+to a model are likewise Context content, not a separate state axis. Credential-shaped
+configuration fields are replaced with `<redacted>` before any sink receives them.
 
 Sources: [gh_puller/agent/](../gh_puller/agent/); [tests/test_event_taxonomy.py](../tests/test_event_taxonomy.py)
 
-## Correlated activity
+## Items and inference
 
-Each `model/request` introduces a `requestId`. Its deltas and response carry the same
-identifier, so model calls may overlap or interleave. Request payloads may include
-facts such as the effective model when the adapter actually observes them; no model,
-provider, or credential field is assumed globally. `model/response` records the model
-output, while `context/append/assistant` records what the Agent committed. Multi-model
-Agents may make those facts differ.
-
-A model-produced tool call is an assistant content block:
+Items use the vocabulary of the [OpenAI Responses API](https://developers.openai.com/api/reference/cli/resources/responses/methods/create), while remaining an observation format rather than a provider wire format. Typical Items are:
 
 ```json
-{
-  "role": "assistant",
-  "content": [{
-    "type": "tool_call",
-    "callId": "c1",
-    "name": "read_file",
-    "arguments": {"path": "a.py"}
-  }]
-}
+{"type":"message","role":"user","content":[{"type":"input_text","text":"Read a.py"}]}
+{"type":"reasoning","content":[{"type":"reasoning_text","text":"I should inspect it."}]}
+{"type":"message","role":"assistant","content":[{"type":"output_text","text":"I will read it."}]}
+{"type":"function_call","call_id":"c1","name":"read_file","arguments":"{\"path\":\"a.py\"}"}
+{"type":"function_call_output","call_id":"c1","output":"file contents"}
 ```
 
-`tool/start` and `tool/end` describe local execution through `callId`. When the result
-becomes model-visible, it is also committed as a tool Context message. This separates
-the Agent's conversation state from execution timing without losing either fact.
+One actual inference has this causal output shape:
 
-`session/*`, `turn/*`, and `step/*` are semantic markers. The expected convention uses
-a turn for one user-level interaction and a step for one context preparation, model
-invocation, and related tool work. Their placement never changes the canonical fold.
+```text
+reasoning? → message? → function_call*
+```
 
-Sources: [gh_puller/agent/](../gh_puller/agent/); [tests/test_agent.py](../tests/test_agent.py)
+Its stream is `model/delta/*` zero or more times followed by exactly one
+`model/response {requestId, output}`. Provider chunks and content-block boundaries are
+adapter details. If the Agent commits the output, one
+`context/append/assistant {items: output}` records that fact without conversion.
 
-## Adapters
+`tool/start` and `tool/end` describe local execution through `callId`. The corresponding
+`function_call_output` enters Context only when the result becomes model-visible. Any
+model output that depends on that result belongs to a new `model/request`.
 
-`BaseAgent` owns session lifetime only. It emits the opaque initial `agent/set` and does
-not inspect configuration. Concrete adapters translate the context, model, and tool
-facts they can observe. One session supports repeated `stream` and `result` calls.
+A request or response may report an effective model or provider when the backend
+exposes it. Neither field is required, and a single Agent session may use different
+models across requests.
+
+Sources: [gh_puller/agent/](../gh_puller/agent/); [tests/test_event_taxonomy.py](../tests/test_event_taxonomy.py); [tests/test_agent.py](../tests/test_agent.py)
+
+## Semantic markers
+
+`session/*`, `turn/*`, and `step/*` annotate the stream and never affect the fold. The
+expected convention is one turn per user-level interaction and one step per context
+preparation, inference, and related tool work. Adapters may place them differently when
+the observed Agent uses another control flow.
+
+`BaseAgent` owns session lifetime. Concrete adapters translate only the facts their
+backends expose, and each supports repeated `stream` and `result` calls in one session.
 
 ```python
 from gh_puller.agent import AGENTS
@@ -100,37 +96,30 @@ async with agent.session(session_name="example"):
     answer = await agent.result("Explain this repository.")
 ```
 
-Mock-backed contract tests cover multi-turn behavior for every adapter. Opt-in
-real-backend tests exercise the same persisted event boundary.
-
 Sources: [gh_puller/agent/](../gh_puller/agent/); [tests/test_agent.py](../tests/test_agent.py); [tests/test_agent_real.py](../tests/test_agent_real.py)
 
 ## Monitor flow
 
 ```mermaid
 flowchart TD
-    Agent[Agent adapter] --> Bus[Canonical event bus]
+    Adapter[Agent adapter] --> Bus[Canonical event bus]
     Bus --> File[Compact JSONL]
     Bus --> Live[Live WebSocket]
-    File --> Hub[Local Hub projection]
+    File --> Hub[Local sidecar]
     Live --> Hub
-    Hub --> Browser[Browser]
-    Browser --> Fold[Canonical fold]
-    Fold --> Context[Context view]
-    Fold --> Events[Event view]
+    Hub --> Fold[Browser canonical fold]
+    Fold --> Context[Context Items]
+    Fold --> Activity[Model and tool activity]
+    Fold --> Events[Event list]
 ```
 
-JSONL is the durable source. Compact files omit only `model/delta/*`, which cannot
-change canonical state. Sink backlogs may shed those deltas, but retain every compact
-event in order. The FastAPI sidecar scans the files, maintains session leases, and
-forwards live events; it does not own another Agent event model. The browser merges
-history and live sequence numbers, then derives Agent, Context, model activity, and
-tool activity from its canonical fold. Multiple open model requests are rendered
-independently.
+JSONL is the durable source. Compact files omit only `model/delta/*`; all state-changing
+and terminal facts remain. The sidecar indexes files, maintains leases, and forwards
+events without interpreting Item semantics. The browser folds `Item[]` directly and
+uses the same Item renderer for committed Context and live delta projections.
 
-The views use vendored DSH visual primitives for Markdown, JSON, menus, and theme
-tokens only. Event semantics and rendering decisions belong to the monitor's own
-`events/` and `views/` modules.
+The viewer reuses vendored DSH Markdown, JSON, menu, and theme primitives. Its event
+fold and rendering policy are native monitor code.
 
 Sources: [apps/agent-monitor/server/](../apps/agent-monitor/server/); [apps/agent-monitor/web/](../apps/agent-monitor/web/)
 
@@ -149,8 +138,8 @@ pnpm --dir apps/agent-monitor/web typecheck
 pnpm --dir apps/agent-monitor/web test
 ```
 
-Set `GH_PULLER_REAL_TESTS=1` to include `tests/test_agent_real.py`. Event histories
-contain the complete observed Agent configuration, prompts, outputs, and tool data;
-protect the history directory and WebSocket endpoint accordingly.
+Set `GH_PULLER_REAL_TESTS=1` to include `tests/test_agent_real.py`. Histories retain
+prompts, outputs, tool data, and non-credential configuration; protect the history
+directory and WebSocket endpoint accordingly.
 
 Sources: [tests/test_event_taxonomy.py](../tests/test_event_taxonomy.py); [tests/test_agent.py](../tests/test_agent.py); [tests/test_agent_real.py](../tests/test_agent_real.py); [apps/agent-monitor/server/](../apps/agent-monitor/server/); [apps/agent-monitor/web/](../apps/agent-monitor/web/)

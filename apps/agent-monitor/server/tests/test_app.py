@@ -1,7 +1,7 @@
 """Tests for the monitor's observable HTTP and WebSocket protocol."""
 
 from fastapi.testclient import TestClient
-from gh_puller.agent.events import new_event
+from gh_puller.agent.events import new_event, text_message
 
 from app import create_app
 from hub import Hub
@@ -34,7 +34,7 @@ def test_producer_events_flow_through_the_public_websocket_protocol() -> None:
                     "events": [
                         _event("session/start", 0, label="demo"),
                         _event("agent/set", 1, agent="custom", config={"model": "m"}),
-                        _event("context/append/user", 2, content=[{"type": "text", "text": "q"}]),
+                        _event("context/append/user", 2, items=[text_message("user", "q")]),
                     ],
                 },
             )

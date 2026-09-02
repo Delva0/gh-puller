@@ -4,7 +4,7 @@ import json
 import os
 import time
 
-from gh_puller.agent.events import new_event
+from gh_puller.agent.events import new_event, text_message
 
 from hub import Hub
 
@@ -62,7 +62,10 @@ def test_history_is_paginated_and_missing_sessions_are_empty() -> None:
         [
             _start(),
             _event("model/request", 1, requestId="r1"),
-            _event("context/append/assistant", 2, content=[{"type": "text", "text": "a"}]),
+            _event(
+                "context/append/assistant", 2,
+                items=[text_message("assistant", "a")],
+            ),
             _event("session/end", 3, outcome="completed", durationMs=1),
         ],
     )
@@ -85,7 +88,10 @@ def test_scan_discovers_files_created_after_startup(tmp_path) -> None:
         [
             _start(session="ns/seed"),
             _event("agent/set", 1, "ns/seed", agent="custom", config={"model": "m"}),
-            _event("context/append/user", 2, "ns/seed", content=[{"type": "text", "text": "q"}]),
+            _event(
+                "context/append/user", 2, "ns/seed",
+                items=[text_message("user", "q")],
+            ),
         ],
     )
 

@@ -1,6 +1,6 @@
 /** Fold canonical Agent and Context state at any event prefix. */
 
-import type { AgentState, CanonicalState, EventEnvelope, Message } from './types'
+import type { AgentState, CanonicalState, EventEnvelope, Item } from './types'
 
 export const CONTEXT_APPEND_TYPES = new Set([
   'context/append',
@@ -10,11 +10,9 @@ export const CONTEXT_APPEND_TYPES = new Set([
   'context/append/tool',
 ])
 
-export function appendedMessage(evt: EventEnvelope): Message | null {
+export function appendedItems(evt: EventEnvelope): Item[] | null {
   if (!CONTEXT_APPEND_TYPES.has(evt.type)) return null
-  const data = { ...evt.data } as Message
-  if (evt.type !== 'context/append') data.role = evt.type.slice('context/append/'.length)
-  return data
+  return [...((evt.data.items ?? []) as Item[])]
 }
 
 function agentFacet(type: string): string | null {
@@ -45,12 +43,12 @@ export function applyStateEvent(state: CanonicalState, evt: EventEnvelope): bool
     return true
   }
   if (evt.type === 'context/set') {
-    state.context = [...((evt.data.messages ?? []) as Message[])]
+    state.context = [...((evt.data.items ?? []) as Item[])]
     return true
   }
-  const message = appendedMessage(evt)
-  if (message === null) return false
-  state.context = [...state.context, message]
+  const items = appendedItems(evt)
+  if (items === null) return false
+  state.context = [...state.context, ...items]
   return true
 }
 

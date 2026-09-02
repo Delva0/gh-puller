@@ -1,13 +1,13 @@
 """Define the canonical Agent observation language and its in-process bus.
 
-``agent/*`` records opaque control state, while ``context/*`` records the logical
-model-visible context asserted by an adapter. Their ordered fold is replayable at
-every event prefix. ``model/*`` and ``tool/*`` are correlated activity; lifecycle,
-turn, and step events are semantic markers and never affect the fold.
+``agent/*`` records opaque control state, while ``context/*`` folds an ordered
+Responses-style Item sequence asserted by an adapter. A model inference produces
+``reasoning? -> message? -> function_call*`` in one ``model/response``; committing
+that output is a separate Context fact. Lifecycle, turn, and step events are semantic
+markers and never affect the fold.
 
-Configuration and effect are separate facts: only the adapter that applies an Agent
-setting may also express its Context effect. Context excludes backend state the
-adapter cannot observe.
+Configuration and effect remain separate facts. Credential-shaped Agent configuration
+fields are redacted before reaching any sink.
 """
 
 import asyncio
@@ -25,6 +25,8 @@ CONTEXT_APPEND_TYPES = frozenset({
 DELTA_TYPES = frozenset({
     "model/delta/text", "model/delta/reasoning", "model/delta/tool-call",
 })
+MODEL_OUTPUT_TYPES = ("reasoning", "message", "function_call")
+_MODEL_OUTPUT_RANK = {item_type: rank for rank, item_type in enumerate(MODEL_OUTPUT_TYPES)}
 _DELTA_BACKLOG = 5000
 EVENT_TYPES = frozenset({
     "session/start", "session/end", "session/error",
@@ -57,20 +59,53 @@ def _put_event(queue: asyncio.Queue[dict], event: dict) -> None:
     queue.put_nowait(event)
 
 
-def _validate_content(data: dict, event_type: str) -> None:
-    content = data.get("content")
+def _validate_content(content, event_type: str) -> None:
     if not isinstance(content, list):
         raise TypeError(f"{event_type} requires list content")
     if any(not isinstance(block, dict) or not isinstance(block.get("type"), str)
            for block in content):
-        raise ValueError(f"{event_type} content blocks require a string type")
+        raise ValueError(f"{event_type} content parts require a string type")
 
 
-def _validate_message(message, event_type: str) -> None:
-    if not isinstance(message, dict) or not isinstance(message.get("role"), str) \
-            or not message["role"]:
-        raise TypeError(f"{event_type} requires a message role")
-    _validate_content(message, event_type)
+def _validate_item(item, event_type: str) -> None:
+    if not isinstance(item, dict) or not isinstance(item.get("type"), str) or not item["type"]:
+        raise TypeError(f"{event_type} requires typed items")
+    item_type = item["type"]
+    if item_type == "message":
+        if not isinstance(item.get("role"), str) or not item["role"]:
+            raise TypeError(f"{event_type} message requires role")
+        _validate_content(item.get("content"), event_type)
+    elif item_type == "reasoning":
+        if "content" in item:
+            _validate_content(item["content"], event_type)
+    elif item_type == "function_call":
+        if not isinstance(item.get("call_id"), str) or not item["call_id"]:
+            raise ValueError(f"{event_type} function_call requires call_id")
+        if not isinstance(item.get("name"), str) or not isinstance(item.get("arguments"), str):
+            raise TypeError(f"{event_type} function_call requires name and string arguments")
+    elif item_type == "function_call_output":
+        if not isinstance(item.get("call_id"), str) or not item["call_id"]:
+            raise ValueError(f"{event_type} function_call_output requires call_id")
+        if "output" not in item:
+            raise ValueError(f"{event_type} function_call_output requires output")
+
+
+def _validate_items(items, event_type: str) -> None:
+    if not isinstance(items, list):
+        raise TypeError(f"{event_type} requires list items")
+    for item in items:
+        _validate_item(item, event_type)
+
+
+def _validate_model_output(output, event_type: str) -> None:
+    _validate_items(output, event_type)
+    ranks = []
+    for item in output:
+        if item["type"] not in _MODEL_OUTPUT_RANK:
+            raise ValueError(f"{event_type} unsupported output item: {item['type']!r}")
+        ranks.append(_MODEL_OUTPUT_RANK[item["type"]])
+    if ranks != sorted(ranks):
+        raise ValueError(f"{event_type} output must be reasoning -> message -> function_call")
 
 
 def new_event(event_type: str, **data) -> dict:
@@ -94,20 +129,8 @@ def new_event(event_type: str, **data) -> dict:
     elif facet is not None:
         if facet not in data:
             raise ValueError(f"{event_type} requires {facet}")
-    elif event_type in CONTEXT_APPEND_TYPES:
-        _validate_content(data, event_type)
-        role = data.get("role")
-        if event_type == "context/append":
-            if not isinstance(role, str) or not role:
-                raise ValueError("context/append requires a non-empty role")
-        elif role is not None:
-            raise ValueError(f"{event_type} derives role from its type")
-    elif event_type == "context/set":
-        messages = data.get("messages")
-        if not isinstance(messages, list):
-            raise ValueError("context/set requires messages")
-        for message in messages:
-            _validate_message(message, event_type)
+    elif event_type in CONTEXT_APPEND_TYPES or event_type == "context/set":
+        _validate_items(data.get("items"), event_type)
     elif event_type.startswith("model/"):
         if not isinstance(data.get("requestId"), str) or not data["requestId"]:
             raise ValueError(f"{event_type} requires requestId")
@@ -123,7 +146,7 @@ def new_event(event_type: str, **data) -> dict:
     elif event_type == "session/end" and not isinstance(data.get("outcome"), str):
         raise TypeError("session/end requires outcome")
     if event_type == "model/response":
-        _validate_message(data.get("message"), event_type)
+        _validate_model_output(data.get("output"), event_type)
     elif event_type in {"model/delta/text", "model/delta/reasoning"}:
         if not isinstance(data.get("index"), int) or not isinstance(data.get("text"), str):
             raise TypeError(f"{event_type} requires integer index and string text")
@@ -137,16 +160,11 @@ def new_event(event_type: str, **data) -> dict:
     return event
 
 
-def message_of(event: dict) -> dict | None:
-    """Return the context message appended by an event, if any."""
-    event_type = event.get("type")
-    if event_type not in CONTEXT_APPEND_TYPES:
+def items_of(event: dict) -> list[dict] | None:
+    """Return the Context items appended by an event, if any."""
+    if event.get("type") not in CONTEXT_APPEND_TYPES:
         return None
-    data = dict(event.get("data") or {})
-    if event_type == "context/append":
-        return data
-    data["role"] = event_type.rsplit("/", 1)[-1]
-    return data
+    return list((event.get("data") or {}).get("items") or [])
 
 
 def fold_state(events: list[dict]) -> dict:
@@ -171,11 +189,11 @@ def fold_state(events: list[dict]) -> dict:
                 "config": {**agent["config"], facet: data[facet]},
             }
         elif event_type == "context/set":
-            state["context"] = list(data["messages"])
+            state["context"] = list(data["items"])
         else:
-            message = message_of(event)
-            if message is not None:
-                state["context"] = [*state["context"], message]
+            items = items_of(event)
+            if items is not None:
+                state["context"] = [*state["context"], *items]
     return state
 
 
@@ -188,15 +206,91 @@ def truncate(text: str | None, n: int) -> tuple[int, str]:
     return (len(text), text[:n] + "…")
 
 
+_REDACTED = "<redacted>"
+_SECRET_SUFFIXES = (
+    "apikey", "authkey", "accesstoken", "refreshtoken", "idtoken", "privatekey",
+    "secretkey", "accesskey", "clientsecret", "password", "passwd", "authorization",
+    "credential", "credentials", "token",
+)
+
+
+def _secret_key(key: str) -> bool:
+    normalized = "".join(char for char in key.lower() if char.isalnum())
+    return normalized.endswith(_SECRET_SUFFIXES)
+
+
 def _jsonable(value):
-    """Convert assembly values to JSON, replacing opaque objects by type names."""
+    """Convert adapter values to JSON-compatible observation values."""
     if isinstance(value, dict):
-        return {key: _jsonable(item) for key, item in value.items()}
+        return {name: _jsonable(item) for name, item in value.items()}
     if isinstance(value, (list, tuple)):
         return [_jsonable(item) for item in value]
     if isinstance(value, (str, int, float, bool)) or value is None:
         return value
     return f"<{type(value).__name__}>"
+
+
+def _redacted(value, key: str | None = None):
+    """Convert Agent configuration while hiding credential-shaped fields."""
+    if key is not None and _secret_key(key) and value is not None:
+        return _REDACTED
+    if isinstance(value, dict):
+        return {name: _redacted(item, str(name)) for name, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_redacted(item) for item in value]
+    return _jsonable(value)
+
+
+def message_item(role: str, content: list[dict]) -> dict:
+    """Build a Responses-style message item.
+
+    Args:
+        role: Model-context role.
+        content: Ordered input or output content parts.
+    """
+    return {"type": "message", "role": role, "content": content}
+
+
+def text_message(role: str, text: str) -> dict:
+    """Build a text message, selecting input or output text from its role.
+
+    Args:
+        role: Message role; ``assistant`` selects ``output_text``.
+        text: Complete visible message text.
+    """
+    part_type = "output_text" if role == "assistant" else "input_text"
+    return message_item(role, [{"type": part_type, "text": text}])
+
+
+def reasoning_item(text: str) -> dict:
+    """Build one exposed reasoning output item.
+
+    Args:
+        text: Complete reasoning text observed by the adapter.
+    """
+    return {"type": "reasoning", "content": [{"type": "reasoning_text", "text": text}]}
+
+
+def function_call_item(call_id: str, name: str, arguments) -> dict:
+    """Build one model-produced function call.
+
+    Args:
+        call_id: Correlation shared with execution and output.
+        name: Function name.
+        arguments: Serialized or structured arguments.
+    """
+    raw = arguments if isinstance(arguments, str) else json.dumps(arguments, ensure_ascii=False)
+    return {"type": "function_call", "call_id": call_id, "name": name, "arguments": raw}
+
+
+def function_output_item(call_id: str, output) -> dict:
+    """Build one function result returned to the model Context.
+
+    Args:
+        call_id: Correlation shared with the originating function call.
+        output: Backend-visible function result.
+    """
+    return {"type": "function_call_output", "call_id": call_id, "output": output}
 
 
 def _session_id(session: str | None, run_id: str | None, session_name: str | None) -> str:
@@ -216,19 +310,23 @@ def _value(value, keys: tuple[str, ...]):
 
 
 def _normalize_usage(value) -> dict | None:
-    """Normalize provider token counters without manufacturing zero values."""
+    """Normalize provider counters, omitting absent and all-zero reports."""
     if not value:
         return None
     mapping = {
         "input": ("input", "input_tokens", "prompt_tokens", "inputTokens"),
         "output": ("output", "output_tokens", "completion_tokens", "outputTokens"),
-        "cacheRead": ("cacheRead", "cache_read_input_tokens", "cacheReadTokens"),
+        "cacheRead": (
+            "cacheRead", "cache_read_input_tokens", "cached_input_tokens", "cacheReadTokens",
+        ),
         "cacheWrite": ("cacheWrite", "cache_write_input_tokens", "cacheWriteTokens"),
-        "reasoning": ("reasoning", "reasoning_tokens", "reasoningTokens"),
+        "reasoning": (
+            "reasoning", "reasoning_tokens", "reasoning_output_tokens", "reasoningTokens",
+        ),
     }
     result = {name: token for name, keys in mapping.items()
               if (token := _value(value, keys)) is not None}
-    return result or None
+    return result if any(result.values()) else None
 
 
 _active_bus: "EventBus | None" = None
@@ -300,7 +398,7 @@ class EventRecorder:
         bus = _ensure_maybe_bus()
         if bus is None or not bus.enabled:
             return None
-        event = new_event(event_type, **data)
+        event = new_event(event_type, **_jsonable(data))
         event["session"] = self.session
         event["seq"] = self.seq
         self.seq += 1
@@ -323,7 +421,7 @@ class EventRecorder:
             agent: Agent identifier.
             config: Complete configuration without semantic interpretation.
         """
-        self.event("agent/set", agent=agent, config=_jsonable(config))
+        self.event("agent/set", agent=agent, config=_redacted(config))
 
     def set_agent_facet(self, facet: str, value) -> None:
         """Replace one explicitly observed Agent control facet.
@@ -332,38 +430,41 @@ class EventRecorder:
             facet: Single route segment and configuration key.
             value: New facet value.
         """
-        self.event(f"agent/set/{facet}", **{facet: _jsonable(value)})
+        self.event(f"agent/set/{facet}", **{facet: _redacted(value, facet)})
 
-    def append_context(self, message: dict) -> None:
-        """Append a message using a role-specialized event when possible.
+    def append_context(self, items: dict | list[dict], *, role: str | None = None) -> None:
+        """Append one atomic Item batch using a role-specialized route when possible.
 
         Args:
-            message: Complete message-like object with ``role`` and ``content``.
+            items: One Item or an ordered Item sequence.
+            role: Semantic producer role used only to select the event route. A
+                single message item supplies its own role when omitted.
         """
-        data = dict(message)
-        role = data.pop("role", None)
+        batch = [items] if isinstance(items, dict) else list(items)
+        if role is None and len(batch) == 1 and batch[0].get("type") == "message":
+            role = batch[0].get("role")
         event_type = f"context/append/{role}" if role in CONTEXT_APPEND_ROLES else "context/append"
-        if event_type == "context/append":
-            data["role"] = role
-        self.event(event_type, **data)
-        self._context.append(dict(message))
+        items = _jsonable(batch)
+        self.event(event_type, items=items)
+        self._context.extend(items)
 
-    def set_context(self, messages: list[dict]) -> None:
-        """Replace the complete ordered model context.
+    def set_context(self, items: list[dict]) -> None:
+        """Replace the complete ordered model Context.
 
         Args:
-            messages: New complete message sequence.
+            items: New complete Item sequence.
         """
-        self.event("context/set", messages=messages)
-        self._context = [dict(message) for message in messages]
+        snapshot = _jsonable(items)
+        self.event("context/set", items=snapshot)
+        self._context = snapshot
 
     def context(self) -> list[dict]:
         """Return the recorder's current context snapshot.
 
         Returns:
-            A shallow copy of the current message sequence.
+            A shallow copy of the current Item sequence.
         """
-        return [dict(message) for message in self._context]
+        return [dict(item) for item in self._context]
 
     def begin_turn(self) -> None:
         """Open a conventional turn marker, closing an earlier one first."""
@@ -439,7 +540,7 @@ class EventRecorder:
         Args:
             text: Incremental text.
             request_id: Owning model request.
-            index: Provider block index.
+            index: Adapter-local text stream lane.
         """
         self.delta("text", request_id=request_id, index=index, text=text)
 
@@ -449,7 +550,7 @@ class EventRecorder:
         Args:
             text: Incremental reasoning text.
             request_id: Owning model request.
-            index: Provider block index.
+            index: Adapter-local reasoning stream lane.
         """
         self.delta("reasoning", request_id=request_id, index=index, text=text)
 
@@ -459,7 +560,7 @@ class EventRecorder:
 
         Args:
             request_id: Owning model request.
-            index: Provider block index.
+            index: Adapter-local tool-call stream lane.
             call_id: Tool-call correlation.
             name: Tool name when available.
             arguments_delta: Incremental serialized arguments.
@@ -469,17 +570,20 @@ class EventRecorder:
             data["name"] = name
         self.delta("tool-call", request_id=request_id, **data)
 
-    def model_response(self, message: dict, *, request_id: str,
+    def model_response(self, output: list[dict], *, request_id: str, model: str | None = None,
                        stop_reason: str | None = None, usage=None) -> None:
         """Record a complete model output without committing it to context.
 
         Args:
-            message: Complete message-like model output.
+            output: Complete ordered model output Items.
             request_id: Owning model request.
+            model: Effective response model when exposed by the backend.
             stop_reason: Backend completion reason when exposed.
             usage: Backend token counters when exposed.
         """
-        data = {"requestId": request_id, "message": message}
+        data = {"requestId": request_id, "output": output}
+        if model:
+            data["model"] = model
         normalized = _normalize_usage(usage)
         if normalized:
             data["usage"] = normalized
@@ -531,12 +635,12 @@ class EventRecorder:
             parsed = arguments
         self.tool_start(call_id, name or "", parsed)
 
-    def tool_result(self, message: dict, *, call_id: str, name: str | None,
+    def tool_result(self, output, *, call_id: str, name: str | None,
                     is_error: bool, **_ignored) -> None:
         """Record a tool terminal and commit its model-visible result.
 
         Args:
-            message: Native result message used to obtain visible content.
+            output: Model-visible function result.
             call_id: Tool-call correlation.
             name: Tool name when available.
             is_error: Whether execution failed.
@@ -544,17 +648,9 @@ class EventRecorder:
         """
         if call_id not in self._tool_calls_seen:
             self.tool_start(call_id, name or "", None)
-        content = message.get("content") or []
-        block = content[0] if content and isinstance(content[0], dict) else {}
-        result = block.get("content", content)
-        error = ({"type": "ToolError", "message": str(result)} if is_error else None)
-        self.tool_end(call_id, result=result, error=error)
-        committed = {
-            "role": "tool", "callId": call_id, "name": name or "",
-            "isError": is_error,
-            "content": [{"type": "text", "text": str(result or "")}],
-        }
-        self.append_context(committed)
+        error = ({"type": "ToolError", "message": str(output)} if is_error else None)
+        self.tool_end(call_id, result=output, error=error)
+        self.append_context(function_output_item(call_id, output), role="tool")
 
     def result_meta(self, message) -> None:
         """Retain backend summary fields for the session footer.

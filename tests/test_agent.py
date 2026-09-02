@@ -17,7 +17,16 @@ from opentelemetry.trace import StatusCode
 
 from gh_puller import agent
 from gh_puller.agent import sinks
-from gh_puller.agent.events import EventBus, EventRecorder, fold_state, new_event, set_active_bus
+from gh_puller.agent.events import (
+    EventBus,
+    EventRecorder,
+    fold_state,
+    function_call_item,
+    new_event,
+    reasoning_item,
+    set_active_bus,
+    text_message,
+)
 from gh_puller.agent.sinks import FileSink, OtelSink
 
 
@@ -55,11 +64,29 @@ def _event(event_type: str, seq: int, session: str = "s", **data) -> dict:
     return {**new_event(event_type, **data), "seq": seq, "session": session}
 
 
-def _roles_at_requests(events: list[dict]) -> list[list[str]]:
+def _context_labels(context: list[dict]) -> list[str]:
+    return [item.get("role", item["type"]) for item in context]
+
+
+def _context_at_requests(events: list[dict]) -> list[list[str]]:
     return [
-        [message["role"] for message in fold_state(events[:index])["context"]]
+        _context_labels(fold_state(events[:index])["context"])
         for index, event in enumerate(events) if event["type"] == "model/request"
     ]
+
+
+def _assert_inferences(events: list[dict]) -> None:
+    requests = [event["data"]["requestId"] for event in events
+                if event["type"] == "model/request"]
+    responses = [event for event in events if event["type"] == "model/response"]
+    assert [event["data"]["requestId"] for event in responses] == requests
+    for response in responses:
+        if not response["data"]["output"]:
+            continue
+        index = events.index(response)
+        commit = events[index + 1]
+        assert commit["type"] == "context/append/assistant"
+        assert commit["data"]["items"] == response["data"]["output"]
 
 
 @pytest.mark.asyncio
@@ -83,7 +110,7 @@ async def test_event_bus_backlog_never_drops_compact_events() -> None:
     bus.add(_receiver(received))
     for index in range(5100):
         bus.publish({"type": "model/delta/text", "index": index})
-    committed = {"type": "context/append/user", "content": []}
+    committed = {"type": "context/append/user", "items": []}
     bus.publish(committed)
     for _ in range(100):
         if committed in received:
@@ -104,23 +131,19 @@ async def test_recorder_supports_multiple_loose_turns_and_replay() -> None:
     recorder.start()
     for index in range(2):
         recorder.begin_turn()
-        recorder.append_context({
-            "role": "user", "content": [{"type": "text", "text": f"q{index}"}],
-        })
+        recorder.append_context(text_message("user", f"q{index}"))
         recorder.begin_step()
         request_id = recorder.model_request(model=f"m{index}")
         recorder.text(f"a{index}", request_id=request_id)
-        message = {
-            "role": "assistant", "content": [{"type": "text", "text": f"a{index}"}],
-        }
-        recorder.model_response(message, request_id=request_id)
-        recorder.append_context(message)
+        output = [text_message("assistant", f"a{index}")]
+        recorder.model_response(output, request_id=request_id)
+        recorder.append_context(output, role="assistant")
         recorder.end_turn()
     recorder.finish(True)
     await _settle()
     state = fold_state(events)
     assert state["agent"] == {"agent": "custom", "config": {"mode": "default"}}
-    assert [message["role"] for message in state["context"]] == [
+    assert _context_labels(state["context"]) == [
         "user", "assistant", "user", "assistant",
     ]
     assert [event["data"]["requestId"] for event in events
@@ -141,11 +164,11 @@ async def test_recorder_correlates_interleaved_model_activity() -> None:
     recorder.text("R", request_id=right)
     recorder.text("L", request_id=left)
     recorder.model_response(
-        {"role": "assistant", "content": [{"type": "text", "text": "L"}]},
+        [text_message("assistant", "L")],
         request_id=left,
     )
     recorder.model_response(
-        {"role": "assistant", "content": [{"type": "text", "text": "R"}]},
+        [text_message("assistant", "R")],
         request_id=right,
     )
     await _settle()
@@ -190,10 +213,10 @@ async def test_file_sink_compact_and_raw_have_identical_state(tmp_path) -> None:
     events = [
         _event("session/start", 0, label="x"),
         _event("agent/set", 1, agent="x", config={"model": "m"}),
-        _event("context/append/user", 2, content=[{"type": "text", "text": "q"}]),
+        _event("context/append/user", 2, items=[text_message("user", "q")]),
         _event("model/request", 3, requestId="r1"),
         _event("model/delta/text", 4, requestId="r1", index=0, text="a"),
-        _event("context/append/assistant", 5, content=[{"type": "text", "text": "a"}]),
+        _event("context/append/assistant", 5, items=[text_message("assistant", "a")]),
         _event("session/end", 6, outcome="completed", durationMs=1),
     ]
     for event in events:
@@ -222,7 +245,7 @@ async def test_otel_uses_request_and_call_correlations() -> None:
         _event("model/request", 2, requestId="r1", model="m", provider="p"),
         _event("model/delta/text", 3, requestId="r1", index=0, text="ok"),
         _event("model/response", 4, requestId="r1",
-               message={"role": "assistant", "content": [{"type": "text", "text": "ok"}]},
+               output=[text_message("assistant", "ok")],
                usage={"input": 2, "output": 1}),
         _event("tool/start", 5, callId="c1", name="read", arguments={"path": "a"}),
         _event("tool/end", 6, callId="c1", error={"type": "IOError", "message": "bad"}),
@@ -252,10 +275,13 @@ class _ClaudeStream:
 
 
 class _ClaudeAssistant:
-    def __init__(self, content, *, stop_reason="end_turn", usage=None):
+    def __init__(self, content, *, stop_reason="end_turn", usage=None,
+                 message_id=None, model="m"):
         self.content = content
         self.stop_reason = stop_reason
         self.usage = usage
+        self.message_id = message_id
+        self.model = model
 
 
 class _ClaudeResult:
@@ -352,13 +378,60 @@ async def test_claude_code_is_multi_turn(monkeypatch, tmp_path) -> None:
     assert next(event for event in events if event["type"] == "agent/set")["data"][
         "config"]["model"] == "m"
     assert len([event for event in events if event["type"] == "context/append/system"]) == 1
-    assert [message["role"] for message in fold_state(events)["context"]] == [
+    assert _context_labels(fold_state(events)["context"]) == [
         "system", "user", "assistant", "user", "assistant", "user", "assistant",
     ]
-    assert _roles_at_requests(events) == [
+    assert _context_at_requests(events) == [
         ["system", "user"],
         ["system", "user", "assistant", "user"],
         ["system", "user", "assistant", "user", "assistant", "user"],
+    ]
+    _assert_inferences(events)
+
+
+@pytest.mark.asyncio
+async def test_claude_fragments_share_one_model_response(monkeypatch, tmp_path) -> None:
+    script = [
+        _ClaudeStream({
+            "type": "message_start",
+            "message": {"role": "assistant", "id": "m1", "model": "actual"},
+        }),
+        _ClaudeAssistant(
+            [types.SimpleNamespace(type="thinking", thinking="why")],
+            stop_reason=None, usage={"input_tokens": 2}, message_id="m1", model="actual"),
+        _ClaudeStream({
+            "type": "content_block_delta", "index": 1,
+            "delta": {"type": "text_delta", "text": "answer"},
+        }),
+        _ClaudeAssistant(
+            [types.SimpleNamespace(type="text", text="answer")],
+            stop_reason=None, usage={"output_tokens": 1}, message_id="m1", model="actual"),
+        _ClaudeStream({"type": "message_delta", "delta": {"stop_reason": "end_turn"}}),
+        _ClaudeStream({"type": "message_stop"}),
+        _ClaudeResult("answer"),
+    ]
+    _install_claude(monkeypatch, [script])
+    events = await _capture(tmp_path)
+    subject = agent.ClaudeCode({})
+    async with subject.session(session="cc/fragments"):
+        assert await _collect(subject.stream("q")) == "answer"
+    await _settle()
+    responses = [event for event in events if event["type"] == "model/response"]
+    assert len(responses) == 1
+    assert responses[0]["data"] == {
+        "requestId": "r1",
+        "output": [
+            {"type": "reasoning", "content": [
+                {"type": "reasoning_text", "text": "why"},
+            ]},
+            text_message("assistant", "answer"),
+        ],
+        "model": "actual",
+        "usage": {"input": 2, "output": 1},
+        "stopReason": "end_turn",
+    }
+    assert _context_labels(fold_state(events)["context"]) == [
+        "user", "reasoning", "assistant",
     ]
 
 
@@ -385,9 +458,10 @@ async def test_claude_tool_result_is_activity_then_context(monkeypatch, tmp_path
     end = types_.index("tool/end")
     result = types_.index("context/append/tool")
     assert assistant < start < end < result
-    assert _roles_at_requests(events) == [
-        ["user"], ["user", "assistant", "tool"],
+    assert _context_at_requests(events) == [
+        ["user"], ["user", "function_call", "function_call_output"],
     ]
+    _assert_inferences(events)
 
 
 # --- OpenAI-compatible ---------------------------------------------------
@@ -456,7 +530,7 @@ async def test_openai_is_multi_turn(monkeypatch, tmp_path) -> None:
         }) == "a1"
         assert await subject.result({"messages": [{"role": "user", "content": "q2"}]}) == "a2"
     await _settle()
-    contexts = [event["data"]["messages"] for event in events
+    contexts = [event["data"]["items"] for event in events
                 if event["type"] == "context/set"]
     assert len(contexts) == 2
     assert next(event for event in events if event["type"] == "agent/set")["data"][
@@ -469,21 +543,65 @@ async def test_openai_is_multi_turn(monkeypatch, tmp_path) -> None:
         {"model": "m", "parameters": {}, "provider": "p"},
     ]
     assert contexts[0][0] == {
-        "role": "system", "content": [{"type": "text", "text": "system"}],
+        "type": "message", "role": "system",
+        "content": [{"type": "input_text", "text": "system"}],
     }
     assert contexts[0][1] == {
-        "role": "system", "content": [
+        "type": "message", "role": "system", "content": [
             {"type": "tool_definition", "name": "read", "description": "Read a file",
              "inputSchema": {"type": "object"}},
         ],
     }
-    assert [message["role"] for message in contexts[0]] == ["system", "system", "user"]
-    assert [message["role"] for message in contexts[1]] == ["user"]
+    assert _context_labels(contexts[0]) == ["system", "system", "user"]
+    assert _context_labels(contexts[1]) == ["user"]
     assert [event["data"]["requestId"] for event in events
             if event["type"] == "model/request"] == ["r1", "r2"]
-    assert _roles_at_requests(events) == [
+    assert _context_at_requests(events) == [
         ["system", "system", "user"], ["user"],
     ]
+    _assert_inferences(events)
+
+
+@pytest.mark.asyncio
+async def test_openai_normalizes_one_complete_inference(monkeypatch, tmp_path) -> None:
+    from gh_puller.agent.adapters import openai
+
+    _HttpClient.scripts = [[
+        {"model": "actual", "choices": [{"delta": {"reasoning_content": "why"}}]},
+        {"choices": [{"delta": {"content": "answer"}}]},
+        {"usage": {"prompt_tokens": 2, "completion_tokens": 3}, "choices": [{
+            "delta": {"tool_calls": [{
+                "index": 0, "id": "c1",
+                "function": {"name": "read", "arguments": '{"path":"a.py"}'},
+            }]},
+            "finish_reason": "tool_calls",
+        }]},
+    ]]
+    monkeypatch.setattr(openai.httpx, "AsyncClient", _HttpClient)
+    events = await _capture(tmp_path)
+    subject = agent.OpenAI({
+        "model": "configured", "base_url": "http://fake", "api_key": "secret",
+    })
+    async with subject.session(session="openai/output"):
+        assert await subject.result({
+            "messages": [{"role": "user", "content": "question"}],
+        }) == "answer"
+    await _settle()
+    response = next(event for event in events if event["type"] == "model/response")
+    assert response["data"] == {
+        "requestId": "r1",
+        "output": [
+            reasoning_item("why"),
+            text_message("assistant", "answer"),
+            function_call_item("c1", "read", '{"path":"a.py"}'),
+        ],
+        "model": "actual",
+        "usage": {"input": 2, "output": 3},
+        "stopReason": "tool_calls",
+    }
+    config = next(event for event in events if event["type"] == "agent/set")["data"]["config"]
+    assert config["api_key"] == "<redacted>"
+    _assert_inferences(events)
 
 
 # --- Codex ---------------------------------------------------------------
@@ -589,21 +707,76 @@ async def test_codex_is_multi_turn(monkeypatch, tmp_path) -> None:
         "config"]["model"] == "m"
     assert len([event for event in events if event["type"] == "context/append/system"]) == 1
     assert len([event for event in events if event["type"] == "context/append"]) == 1
-    assert [message["role"] for message in fold_state(events)["context"]] == [
+    assert _context_labels(fold_state(events)["context"]) == [
         "system", "developer", "user", "assistant", "user", "assistant",
     ]
-    assert _roles_at_requests(events) == [
+    assert _context_at_requests(events) == [
         ["system", "developer", "user"],
         ["system", "developer", "user", "assistant", "user"],
     ]
+    _assert_inferences(events)
+
+
+@pytest.mark.asyncio
+async def test_codex_keeps_response_and_session_usage_scopes(monkeypatch, tmp_path) -> None:
+    item = types.SimpleNamespace(type="agentMessage", id="a1", text="done", phase=None)
+    usage = types.SimpleNamespace(
+        last=types.SimpleNamespace(
+            input_tokens=2,
+            output_tokens=1,
+            cached_input_tokens=1,
+            cache_write_input_tokens=0,
+            reasoning_output_tokens=1,
+        ),
+        total=types.SimpleNamespace(
+            input_tokens=20,
+            output_tokens=10,
+            cached_input_tokens=8,
+            cache_write_input_tokens=3,
+            reasoning_output_tokens=5,
+        ),
+    )
+    script = [
+        _Notification("item/started", item=item),
+        _Notification("item/agentMessage/delta", item_id="a1", delta="done"),
+        _Notification("item/completed", item=item),
+        _Notification("thread/tokenUsage/updated", token_usage=usage),
+        _Notification("turn/completed", turn=types.SimpleNamespace(status="completed")),
+    ]
+    _install_codex(monkeypatch, [script])
+    events = await _capture(tmp_path)
+    subject = agent.Codex({"model": "m", "codex_home": str(tmp_path / "codex")})
+    async with subject.session(session="codex/usage"):
+        assert await _collect(subject.stream("q")) == "done"
+    await _settle()
+    response = next(event for event in events if event["type"] == "model/response")
+    terminal = next(event for event in events if event["type"] == "session/end")
+    assert response["data"]["usage"] == {
+        "input": 2,
+        "output": 1,
+        "cacheRead": 1,
+        "cacheWrite": 0,
+        "reasoning": 1,
+    }
+    assert terminal["data"]["usage"] == {
+        "input": 20,
+        "output": 10,
+        "cacheRead": 8,
+        "cacheWrite": 3,
+        "reasoning": 5,
+    }
 
 
 @pytest.mark.asyncio
 async def test_codex_batches_model_tool_calls_before_execution(monkeypatch, tmp_path) -> None:
+    reasoning = types.SimpleNamespace(type="reasoning", id="reasoning-1", content=["why"])
     tool = types.SimpleNamespace(
         type="commandExecution", id="c1", command="ls", cwd="/tmp",
         aggregated_output="ok", exit_code=0, status="completed")
     script = [
+        _Notification("item/started", item=reasoning),
+        _Notification("item/reasoning/textDelta", item_id="reasoning-1", delta="why"),
+        _Notification("item/completed", item=reasoning),
         _Notification("item/completed", item=tool),
         *_codex_text("done", "a1"),
     ]
@@ -619,14 +792,14 @@ async def test_codex_batches_model_tool_calls_before_execution(monkeypatch, tmp_
     end = types_.index("tool/end")
     result = types_.index("context/append/tool")
     assert assistant < start < end < result
-    block = events[assistant]["data"]["content"][0]
-    assert block == {
-        "type": "tool_call", "callId": "c1", "name": "shell",
-        "arguments": {"command": "ls", "cwd": "/tmp"},
-    }
-    assert _roles_at_requests(events) == [
-        ["user"], ["user", "assistant", "tool"],
+    assert events[assistant]["data"]["items"] == [
+        reasoning_item("why"),
+        function_call_item("c1", "shell", {"command": "ls", "cwd": "/tmp"}),
     ]
+    assert _context_at_requests(events) == [
+        ["user"], ["user", "reasoning", "function_call", "function_call_output"],
+    ]
+    _assert_inferences(events)
 
 
 # --- OpenCode ------------------------------------------------------------
@@ -673,12 +846,57 @@ async def test_opencode_is_multi_turn(tmp_path) -> None:
         "config"]["model"] == "m"
     assert len([event for event in events if event["type"] == "context/append/system"]) == 1
     assert len([event for event in events if event["type"] == "context/append/assistant"]) == 2
-    assert [message["role"] for message in fold_state(events)["context"]] == [
+    assert _context_labels(fold_state(events)["context"]) == [
         "system", "user", "assistant", "user", "assistant",
     ]
-    assert _roles_at_requests(events) == [
+    assert _context_at_requests(events) == [
         ["system", "user"], ["system", "user", "assistant", "user"],
     ]
+    _assert_inferences(events)
+
+
+@pytest.mark.asyncio
+async def test_opencode_normalizes_reasoning_message_and_tool(tmp_path) -> None:
+    native = [
+        {"type": "step_start", "sessionID": "native", "part": {
+            "id": "s1", "modelID": "actual-1",
+        }},
+        {"type": "reasoning", "part": {"id": "r1", "text": "why"}},
+        {"type": "text", "part": {"id": "m1", "text": "checking"}},
+        {"type": "tool_use", "part": {
+            "callID": "c1", "tool": "read", "state": {
+                "status": "completed", "input": {"path": "a.py"}, "output": "file",
+            },
+        }},
+        {"type": "step_finish", "part": {
+            "id": "f1", "reason": "tool-calls", "tokens": {"input": 2, "output": 3},
+        }},
+        {"type": "step_start", "part": {"id": "s2", "modelID": "actual-2"}},
+        {"type": "text", "part": {"id": "m2", "text": "done"}},
+        {"type": "step_finish", "part": {"id": "f2", "reason": "stop"}},
+    ]
+    events = await _capture(tmp_path / "logs")
+    subject = agent.OpenCode({"opencode_bin": _opencode_script(tmp_path, native)})
+    async with subject.session(session="opencode/output"):
+        assert await _collect(subject.stream("q")) == "checkingdone"
+    await _settle()
+    responses = [event for event in events if event["type"] == "model/response"]
+    assert responses[0]["data"] == {
+        "requestId": "r1",
+        "output": [
+            reasoning_item("why"),
+            text_message("assistant", "checking"),
+            function_call_item("c1", "read", {"path": "a.py"}),
+        ],
+        "model": "actual-1",
+        "usage": {"input": 2, "output": 3},
+        "stopReason": "tool-calls",
+    }
+    assert _context_at_requests(events) == [
+        ["user"],
+        ["user", "reasoning", "assistant", "function_call", "function_call_output"],
+    ]
+    _assert_inferences(events)
 
 
 # --- DSH -----------------------------------------------------------------
@@ -767,12 +985,13 @@ async def test_dsh_is_retained_as_multi_turn_adapter(monkeypatch, tmp_path) -> N
         "config"]["model"] == "m"
     assert len([event for event in events if event["type"] == "context/append/system"]) == 1
     assert len([event for event in events if event["type"] == "context/append/assistant"]) == 2
-    assert [message["role"] for message in fold_state(events)["context"]] == [
+    assert _context_labels(fold_state(events)["context"]) == [
         "system", "user", "assistant", "user", "assistant",
     ]
-    assert _roles_at_requests(events) == [
+    assert _context_at_requests(events) == [
         ["system", "user"], ["system", "user", "assistant", "user"],
     ]
+    _assert_inferences(events)
 
 
 @pytest.mark.asyncio
@@ -791,6 +1010,8 @@ async def test_dsh_normalizes_model_tools_before_local_activity(monkeypatch, tmp
         }},
         {"type": "assistant/message", "data": {"message": {
             "role": "assistant", "content": [
+                {"type": "thinking", "text": "why"},
+                {"type": "text", "text": "checking"},
                 {"type": "tool-call", "id": "c1", "name": "read",
                  "arguments": {"path": "a.py"}},
             ],
@@ -823,10 +1044,11 @@ async def test_dsh_normalizes_model_tools_before_local_activity(monkeypatch, tmp
     end = types_.index("tool/end")
     result = types_.index("context/append/tool")
     assert assistant < start < end < result
-    assert events[assistant]["data"]["content"][0] == {
-        "type": "tool_call", "callId": "c1", "name": "read",
-        "arguments": {"path": "a.py"},
-    }
+    assert events[assistant]["data"]["items"] == [
+        reasoning_item("why"),
+        text_message("assistant", "checking"),
+        function_call_item("c1", "read", {"path": "a.py"}),
+    ]
     request = next(event for event in events if event["type"] == "model/request")
     assert request["data"] == {
         "requestId": "r1", "model": "m2", "provider": "p2",
@@ -834,12 +1056,13 @@ async def test_dsh_normalizes_model_tools_before_local_activity(monkeypatch, tmp
     }
     state = fold_state(events)
     assert state["context"][0] == {
-        "role": "system", "content": [
-            {"type": "text", "text": "system"},
+        "type": "message", "role": "system", "content": [
+            {"type": "input_text", "text": "system"},
             {"type": "tool_definition", "name": "read", "description": "Read a file",
              "inputSchema": {"type": "object"}},
         ],
     }
+    _assert_inferences(events)
 
 
 @pytest.mark.asyncio
@@ -881,6 +1104,6 @@ async def test_dsh_surface_replacement_becomes_context_set(monkeypatch, tmp_path
     await _settle()
     assert len([event for event in events if event["type"] == "context/set"]) == 1
     assert fold_state(events)["context"] == [
-        {"role": "user", "content": [{"type": "text", "text": "summary"}]},
-        {"role": "assistant", "content": [{"type": "text", "text": "final"}]},
+        text_message("user", "summary"),
+        text_message("assistant", "final"),
     ]
