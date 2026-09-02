@@ -6,6 +6,7 @@ import json
 import pytest
 
 from gh_puller.agent.context import (
+    OPAQUE,
     instruction,
     mcp,
     skill_list,
@@ -81,7 +82,7 @@ def test_system_parts_preserve_tool_collection_semantics() -> None:
         skill_list(["review"]),
     ])
     assert item["content"] == [
-        {"type": "instruction"},
+        {"type": "instruction", "text": OPAQUE},
         {"type": "tool_defs", "tools": [
             {"name": "Read"},
             {"name": "empty", "inputSchema": {}},
@@ -91,9 +92,13 @@ def test_system_parts_preserve_tool_collection_semantics() -> None:
     ]
     assert tool_defs() == {"type": "tool_defs", "tools": []}
     assert tool_defs([]) == {"type": "tool_defs", "tools": []}
-    assert tool_defs(["opaque"]) == {
-        "type": "tool_defs", "tools": [{"name": "opaque"}],
+    assert instruction() == {"type": "instruction", "text": OPAQUE}
+    assert tool_defs([OPAQUE]) == {
+        "type": "tool_defs", "tools": [{"name": OPAQUE}],
     }
+    assert mcp() == {"type": "mcp", "name": OPAQUE}
+    assert skill_list() == {"type": "skill_list", "skills": []}
+    assert skill_list([OPAQUE]) == {"type": "skill_list", "skills": [OPAQUE]}
 
 
 def test_system_content_vocabulary_is_open() -> None:
@@ -101,6 +106,7 @@ def test_system_content_vocabulary_is_open() -> None:
         "type": "prompt_template",
         "strategy": "replace",
         "fragments": ["base", "project"],
+        "source": OPAQUE,
     }
     item = system_message([instruction("exact"), custom])
     event = new_event("context/append/system", items=[item])

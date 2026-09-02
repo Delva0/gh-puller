@@ -3,6 +3,7 @@
 import { useMemo } from 'react';
 import { useLanguage } from '@gh-puller/ui';
 import { JsonTree, MarkdownText } from '../vendor/dsh';
+import { OPAQUE } from '../events/types';
 import type {
   CanonicalState,
   ContentPart,
@@ -101,6 +102,7 @@ function ToolDefinition({ value, index }: { value: unknown; index: number }) {
       className="rounded border border-[var(--border-color)] px-3 py-2"
       data-tool-definition
       data-tool-name={name}
+      data-opaque={name === OPAQUE || undefined}
     >
       <div className="font-mono">{name}</div>
       {typeof tool.description === 'string' && (
@@ -142,10 +144,13 @@ function SemanticSystemPart({ part }: { part: ContentPart }) {
     ? `mcp${part.name === undefined ? '' : ` · ${String(part.name)}`}`
     : 'skill_list';
   const value = part.type === 'skill_list' ? part.skills : undefined;
+  const opaque = part.name === OPAQUE
+    || (Array.isArray(value) && value.includes(OPAQUE));
   return (
     <details
       className="my-2 rounded border border-[var(--border-color)] px-3 py-2 text-xs"
       data-system-part={part.type}
+      data-opaque={opaque || undefined}
     >
       <summary className="cursor-pointer font-mono">{label}</summary>
       {value !== undefined && (
@@ -168,13 +173,17 @@ function ContentPartView({ part, streaming = false }: {
     return <MarkdownText text={part.refusal} streaming={streaming} />;
   }
   if (part.type === 'instruction') {
-    return typeof part.text === 'string'
-      ? <MarkdownText text={part.text} streaming={streaming} />
-      : (
-          <p className="text-xs italic text-[var(--muted)]" data-system-part="instruction">
-            instruction · content unavailable
-          </p>
-        );
+    if (part.text === OPAQUE) {
+      return <code className="text-xs text-[var(--muted)]" data-opaque>{OPAQUE}</code>;
+    }
+    if (typeof part.text === 'string') {
+      return <MarkdownText text={part.text} streaming={streaming} />;
+    }
+    return (
+      <p className="text-xs italic text-[var(--muted)]" data-system-part="instruction">
+        instruction · empty
+      </p>
+    );
   }
   if (part.type === 'tool_defs') return <ToolDefinitions part={part} />;
   if (part.type === 'mcp' || part.type === 'skill_list') {

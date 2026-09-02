@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, TypedDict
 
 from ..base import BaseAgent, RequestFailedError
-from ..context import instruction, mcps, system_message, tool_defs
+from ..context import OPAQUE, instruction, mcps, system_message, tool_defs
 from ..events import (
     EventRecorder,
     _normalize_usage,
@@ -70,7 +70,7 @@ def codex_turn_fields(config: dict) -> dict:
 def _codex_system_items(config: dict) -> list[dict]:
     """Project system inputs whose contents the Codex boundary exposes."""
     prompt = config.get("base_instructions") or config.get("system_prompt")
-    content = [instruction(prompt) if prompt else instruction(), tool_defs(["opaque"])]
+    content = [instruction(prompt) if prompt else instruction(), tool_defs([OPAQUE])]
     content.extend(mcps(config.get("mcp_servers")))
     items = [system_message(content)]
     if developer := config.get("developer_instructions"):

@@ -68,13 +68,18 @@ Agent may expose its complete rendered instruction, preserve structured parts, o
 its own content types for finer prompt behavior. The fold preserves every type, payload,
 and position without parsing it; the monitor renders unknown types as structured data.
 
+`"<opaque>"` is the shared reserved placeholder for a value known to exist whose content
+or exact cardinality is unavailable. It may appear in standard or custom content parts.
+Within a collection it represents at least one unknown member and may follow known
+members.
+
 `tool_defs.tools` is the observable tool collection. A missing `tools` field and
 `tools: []` both mean an observed empty collection. An Agent with unenumerable built-in
-tools uses `tools: [{"name": "opaque"}]`. Within a known tool, an omitted schema means
-unavailable schema and `{}` means an observed empty schema. `mcp` keeps one MCP
-contribution atomic, and `skill_list` records the catalog exposed to the Agent. Transport
-commands, credentials, and other launch configuration remain Agent configuration rather
-than Context.
+tools uses `tools: [{"name": "<opaque>"}]`. Within a known tool, an omitted schema means
+that no schema value was asserted, `{}` means an observed empty schema, and `"<opaque>"`
+means that a schema exists but is unavailable. `mcp` keeps one MCP contribution atomic,
+and `skill_list` records the catalog exposed to the Agent. Transport commands, credentials,
+and other launch configuration remain Agent configuration rather than Context.
 
 Sources: [gh_puller/agent/](../gh_puller/agent/); [tests/test_event_taxonomy.py](../tests/test_event_taxonomy.py); [tests/test_agent.py](../tests/test_agent.py)
 

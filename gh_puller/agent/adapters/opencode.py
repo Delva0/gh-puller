@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, TypedDict
 
 from ..base import BaseAgent, RequestFailedError
-from ..context import instruction, mcps, system_message, tool_defs
+from ..context import OPAQUE, instruction, mcps, system_message, tool_defs
 from ..events import (
     EventRecorder,
     _normalize_usage,
@@ -95,7 +95,7 @@ def _opencode_config_content(config: dict, instruction_path: str | None, env: di
 def _opencode_system_item(config: dict) -> dict:
     """Project the system inputs selected at the OpenCode boundary."""
     prompt = config.get("system_prompt")
-    content = [instruction(prompt) if prompt else instruction(), tool_defs(["opaque"])]
+    content = [instruction(prompt) if prompt else instruction(), tool_defs([OPAQUE])]
     content.extend(mcps(config.get("mcp_servers")))
     return system_message(content)
 

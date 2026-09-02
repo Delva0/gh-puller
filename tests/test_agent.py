@@ -17,7 +17,7 @@ from opentelemetry.trace import StatusCode
 
 from gh_puller import agent
 from gh_puller.agent import sinks
-from gh_puller.agent.context import instruction, mcp, skill_list, tool_defs
+from gh_puller.agent.context import OPAQUE, instruction, mcp, skill_list, tool_defs
 from gh_puller.agent.events import (
     EventBus,
     EventRecorder,
@@ -382,7 +382,7 @@ async def test_claude_code_is_multi_turn(monkeypatch, tmp_path) -> None:
         "config"]["model"] == "m"
     system = next(event for event in events if event["type"] == "context/append/system")
     assert system["data"]["items"][0]["content"] == [
-        instruction("system"), tool_defs(["Read", "opaque"]),
+        instruction("system"), tool_defs(["Read", OPAQUE]),
         mcp("graph"), skill_list(["review"]),
     ]
     assert _context_labels(fold_state(events)["context"]) == [
@@ -748,7 +748,7 @@ async def test_codex_is_multi_turn(monkeypatch, tmp_path) -> None:
     system = next(event for event in events if event["type"] == "context/append/system")
     assert system["data"]["items"] == [
         {"type": "message", "role": "system", "content": [
-            instruction("system"), tool_defs(["opaque"]), mcp("graph"),
+            instruction("system"), tool_defs([OPAQUE]), mcp("graph"),
         ]},
         {"type": "message", "role": "developer", "content": [
             instruction("developer"),
@@ -896,7 +896,7 @@ async def test_opencode_is_multi_turn(tmp_path) -> None:
         "config"]["model"] == "m"
     system = next(event for event in events if event["type"] == "context/append/system")
     assert system["data"]["items"][0]["content"] == [
-        instruction("system"), tool_defs(["opaque"]), mcp("graph"),
+        instruction("system"), tool_defs([OPAQUE]), mcp("graph"),
     ]
     assert len([event for event in events if event["type"] == "context/append/assistant"]) == 2
     assert _context_labels(fold_state(events)["context"]) == [

@@ -1,7 +1,8 @@
 """Expose Agent adapters and observation configuration.
 
 Concrete integrations live in ``adapters``; the canonical language and fold live in
-``events``; delivery channels live in ``sinks``.
+``events``; common Context semantics live in ``context``; delivery channels live in
+``sinks``.
 """
 
 from .adapters import (
@@ -19,10 +20,12 @@ from .adapters import (
     OpenCodeConfig,
     RequestFailedError,
 )
+from .context import OPAQUE
 from .sinks import configure
 
 __all__ = [
     "AGENTS",
+    "OPAQUE",
     "BaseAgent",
     "ClaudeCode",
     "ClaudeConfig",

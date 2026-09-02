@@ -1,5 +1,7 @@
 /** Canonical agent event shapes consumed by the monitor fold and native UI. */
 
+export const OPAQUE = '<opaque>';
+
 export interface ContentPart {
   type: string
   [key: string]: unknown

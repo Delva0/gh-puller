@@ -3,7 +3,7 @@
 from typing import TypedDict
 
 from ..base import BaseAgent, RequestFailedError
-from ..context import instruction, mcps, skill_list, system_message, tool_defs
+from ..context import OPAQUE, instruction, mcps, skill_list, system_message, tool_defs
 from ..events import (
     EventRecorder,
     _normalize_usage,
@@ -77,13 +77,13 @@ def _cc_system_parts(config: dict) -> list[dict]:
         names.extend(name for name in config.get("allowed_tools") or []
                      if not name.startswith("mcp__"))
     names = list(dict.fromkeys(_cc_tool_name(name) for name in names))
-    if not isinstance(configured_tools, list) and "opaque" not in names:
-        names.append("opaque")
+    if not isinstance(configured_tools, list) and OPAQUE not in names:
+        names.append(OPAQUE)
     parts.append(tool_defs(names))
 
     parts.extend(mcps(config.get("mcp_servers")))
     if skills := config.get("skills"):
-        parts.append(skill_list(skills))
+        parts.append(skill_list(skills if isinstance(skills, list) else [OPAQUE]))
     return parts
 
 

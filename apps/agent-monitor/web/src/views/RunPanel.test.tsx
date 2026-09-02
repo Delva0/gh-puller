@@ -4,7 +4,7 @@ import { createRoot } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { LanguageProvider } from '@gh-puller/ui';
 import { RunFold } from '../events/fold';
-import type { EventEnvelope } from '../events/types';
+import { OPAQUE, type EventEnvelope } from '../events/types';
 import { monitorMessages } from '../messages';
 import RunPanel from './RunPanel';
 
@@ -108,6 +108,26 @@ describe('native canonical run view', () => {
     expect(container.querySelector('[data-tool-call-id="c1"]')).not.toBeNull();
     expect(container.querySelector('[data-context-role="critic"]')).not.toBeNull();
     expect(container.textContent).toContain('score');
+  });
+
+  it('renders the shared opaque placeholder across standard system parts', () => {
+    const fold = new RunFold();
+    fold.applyBatch([
+      evt('context/set', 0, { items: [{
+        type: 'message',
+        role: 'system',
+        content: [
+          { type: 'instruction', text: OPAQUE },
+          { type: 'tool_defs', tools: [{ name: OPAQUE }] },
+          { type: 'mcp', name: OPAQUE },
+          { type: 'skill_list', skills: [OPAQUE] },
+        ],
+      }] }),
+    ]);
+    render(fold);
+
+    expect(container.querySelectorAll('[data-opaque]')).toHaveLength(4);
+    expect(container.textContent).toContain(OPAQUE);
   });
 
   it('lets context/set replace the visible model context without presentation metadata', () => {

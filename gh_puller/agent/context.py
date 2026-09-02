@@ -3,24 +3,25 @@
 ``instruction``, ``tool_defs``, ``mcp``, and ``skill_list`` are shared conventions,
 not a closed vocabulary. Adapters may emit any typed content part, and the canonical fold
 preserves its payload and order. These helpers only construct common semantics; they never
-interpret a complete Agent configuration.
+interpret a complete Agent configuration. ``<opaque>`` means that at least one value is
+known to exist while its content or exact cardinality is unavailable.
 """
 
 from collections.abc import Iterable
 
 from .events import message_item
 
+OPAQUE = "<opaque>"
 
-def instruction(text: str | None = None) -> dict:
-    """Build an instruction whose text may be unavailable.
+
+def instruction(text: str = OPAQUE) -> dict:
+    """Build an exact or opaque instruction.
 
     Args:
-        text: Exact instruction text, or ``None`` when only its existence is known.
+        text: Exact instruction text, or ``OPAQUE`` when at least one instruction exists
+            but its content is unavailable.
     """
-    part = {"type": "instruction"}
-    if text is not None:
-        part["text"] = text
-    return part
+    return {"type": "instruction", "text": text}
 
 
 def _tool_definition(value: str | dict) -> dict:
@@ -44,22 +45,20 @@ def tool_defs(values: Iterable[str | dict] = ()) -> dict:
 
     Args:
         values: Tool names or direct/OpenAI-shaped definitions in source order. Omission
-            and an empty iterable both mean an observed empty collection. Use a definition
-            named ``opaque`` when built-in tools may exist but cannot be enumerated.
+            and an empty iterable both mean an observed empty collection. Include a
+            definition named ``OPAQUE`` when at least one tool cannot be enumerated.
     """
     return {"type": "tool_defs", "tools": [_tool_definition(value) for value in values]}
 
 
-def mcp(name: str | None = None) -> dict:
-    """Build one atomic MCP contribution.
+def mcp(name: str = OPAQUE) -> dict:
+    """Build one exact or opaque atomic MCP contribution.
 
     Args:
-        name: Observable server identity, or ``None`` when unavailable.
+        name: Observable server identity, or ``OPAQUE`` when at least one contribution
+            exists but its identity is unavailable.
     """
-    part = {"type": "mcp"}
-    if name is not None:
-        part["name"] = name
-    return part
+    return {"type": "mcp", "name": name}
 
 
 def mcps(servers) -> list[dict]:
@@ -77,19 +76,22 @@ def mcps(servers) -> list[dict]:
     if isinstance(servers, dict):
         return [mcp(str(name)) for name in servers]
     if isinstance(servers, list):
-        return [mcp(spec.get("id") or spec.get("serverName") or spec.get("name") or None)
-                if isinstance(spec, dict) else mcp()
-                for spec in servers]
+        return [
+            mcp(spec.get("id") or spec.get("serverName") or spec.get("name") or OPAQUE)
+            if isinstance(spec, dict) else mcp()
+            for spec in servers
+        ]
     return [mcp()]
 
 
-def skill_list(skills: list[str] | str) -> dict:
+def skill_list(skills: Iterable[str] = ()) -> dict:
     """Build the skill catalog exposed to an Agent.
 
     Args:
-        skills: Exact names or the adapter's observable catalog selector.
+        skills: Exact names in source order. Include ``OPAQUE`` when at least one skill
+            exists but its identity is unavailable.
     """
-    return {"type": "skill_list", "skills": skills}
+    return {"type": "skill_list", "skills": list(skills)}
 
 
 def system_message(content: list[dict]) -> dict:
