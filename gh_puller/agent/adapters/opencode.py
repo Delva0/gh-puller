@@ -8,9 +8,8 @@ import tempfile
 from pathlib import Path
 from typing import Any, TypedDict
 
+from ..base import BaseAgent, RequestFailedError
 from ..events import EventRecorder, _normalize_usage
-from .base import BaseGenerator
-from .utils import RequestFailedError
 
 # OpenCode 1.18 emits cumulative text snapshots keyed by part id.
 _CUMULATIVE_TEXT = True
@@ -97,7 +96,8 @@ def _opencode_args_json(arguments) -> str:
 class _OpencodeSynth:
     """Hold JSONL assembly state for one OpenCode call."""
 
-    def __init__(self):
+    def __init__(self, request_id: str):
+        self.request_id = request_id
         self.parts: dict[str, str] = {}
         self.step_parts: dict[str, str] = {}
         self.pending_tools: list[dict] = []
@@ -123,7 +123,7 @@ def _flush_step_message(event_recorder: EventRecorder, st: _OpencodeSynth) -> No
         })
     message = {"role": "assistant", "content": content}
     event_recorder.model_response(
-        message, usage=event_recorder.result_usage,
+        message, request_id=st.request_id, usage=event_recorder.result_usage,
         stop_reason=event_recorder.result_stop_reason)
     event_recorder.append_context(message)
     st.step_parts = {}
@@ -150,7 +150,8 @@ def _handle_opencode_line(event_recorder: EventRecorder, st: _OpencodeSynth, evt
     if kind == "step_start":
         st.open_steps += 1
         if st.open_steps >= 2:
-            event_recorder.step_boundary()
+            event_recorder.begin_step()
+            st.request_id = event_recorder.model_request()
         st.step_parts = {}
         return []
     if kind == "text":
@@ -169,7 +170,7 @@ def _handle_opencode_line(event_recorder: EventRecorder, st: _OpencodeSynth, evt
                 st.step_parts[pid] = (st.step_parts.get(pid) or "") + delta
         if delta:
             st.final_response = text
-            event_recorder.text(delta)
+            event_recorder.text(delta, request_id=st.request_id)
             return [delta]
         return []
     if kind == "reasoning":
@@ -184,7 +185,7 @@ def _handle_opencode_line(event_recorder: EventRecorder, st: _OpencodeSynth, evt
         else:
             delta = text
         if delta:
-            event_recorder.reasoning(delta)
+            event_recorder.reasoning(delta, request_id=st.request_id)
         return []
     if kind == "tool_use":
         state = part.get("state") or {}
@@ -300,12 +301,10 @@ async def _opencode_drain(proc, event_recorder: EventRecorder, st: _OpencodeSynt
         raise RequestFailedError("turn 未收到完成事件")
 
 
-class OpenCode(BaseGenerator):
+class OpenCode(BaseAgent):
     """Run reusable OpenCode CLI calls with isolated injected configuration."""
 
-    generator = "opencode"
-    provider = "opencode"
-    model_parameter_keys = ("variant", "thinking")
+    agent = "opencode"
 
     def __init__(self, config: dict):
         super().__init__(config)
@@ -318,7 +317,11 @@ class OpenCode(BaseGenerator):
         return config
 
     async def _enter(self) -> None:
-        """No client lifecycle: the child spawns during stream/result calls (base session hooks no-op)."""
+        if prompt := self.config.get("system_prompt"):
+            self._require_event_recorder().append_context({
+                "role": "system",
+                "content": [{"type": "text", "text": prompt}],
+            })
 
     async def _exit(self, exc) -> None:
         """Same: nothing to reap at the client layer (child reaping in _opencode_subprocess)."""
@@ -330,8 +333,7 @@ class OpenCode(BaseGenerator):
         event_recorder.begin_turn()
         event_recorder.append_context({"role": "user", "content": [{"type": "text", "text": prompt}]})
         event_recorder.begin_step()
-        event_recorder.model_request()
-        st = _OpencodeSynth()
+        st = _OpencodeSynth(event_recorder.model_request())
         with tempfile.TemporaryDirectory(prefix="gh-puller-opencode-") as tmp:
             instruction_path = None
             if system_prompt := config.get("system_prompt"):
@@ -362,8 +364,7 @@ class OpenCode(BaseGenerator):
         event_recorder.begin_turn()
         event_recorder.append_context({"role": "user", "content": [{"type": "text", "text": prompt}]})
         event_recorder.begin_step()
-        event_recorder.model_request()
-        st = _OpencodeSynth()
+        st = _OpencodeSynth(event_recorder.model_request())
         with tempfile.TemporaryDirectory(prefix="gh-puller-opencode-") as tmp:
             instruction_path = None
             if system_prompt := config.get("system_prompt"):

@@ -18,7 +18,6 @@ def _start(seq: int = 0, session: str = "s") -> dict:
         "session/start",
         seq,
         session,
-        generator="custom",
         label="demo",
         runId="run-1",
     )
@@ -36,26 +35,21 @@ def test_ingest_projects_metadata_and_retains_only_compact_events() -> None:
     assert hub.ingest(
         [
             _start(),
-            _event("model/set", 1, model="m", provider="p", parameters={}),
-            _event("model/request", 2, requestId="r1"),
+            _event("agent/set", 1, agent="custom", config={"model": "configured"}),
+            _event("model/request", 2, requestId="r1", model="actual"),
             _event("model/delta/text", 3, requestId="r1", index=0, text="a"),
             _event("session/end", 4, outcome="completed", durationMs=1),
         ],
     )
 
     row = hub.index()[0]
-    assert (row["session"], row["run_id"], row["label"], row["generator"]) == (
+    assert (row["session"], row["run_id"], row["label"], row["agent"]) == (
         "s",
         "run-1",
         "demo",
         "custom",
     )
-    assert (row["provider"], row["model"], row["state"], row["num_events"]) == (
-        "p",
-        "m",
-        "completed",
-        5,
-    )
+    assert (row["state"], row["num_events"]) == ("completed", 5)
     assert row["ts"] <= row["last_ts"]
     events, has_more, next_before = hub.history("s")
     assert [event["seq"] for event in events] == [0, 1, 2, 4]
@@ -90,7 +84,7 @@ def test_scan_discovers_files_created_after_startup(tmp_path) -> None:
         path,
         [
             _start(session="ns/seed"),
-            _event("model/set", 1, "ns/seed", model="m", provider="p", parameters={}),
+            _event("agent/set", 1, "ns/seed", agent="custom", config={"model": "m"}),
             _event("context/append/user", 2, "ns/seed", content=[{"type": "text", "text": "q"}]),
         ],
     )
@@ -99,7 +93,7 @@ def test_scan_discovers_files_created_after_startup(tmp_path) -> None:
     assert hub.scan() is False
     row = hub.index()[0]
     assert row["session"] == "ns/seed"
-    assert (row["provider"], row["model"], row["num_events"]) == ("p", "m", 3)
+    assert (row["agent"], row["num_events"]) == ("custom", 3)
     assert [event["seq"] for event in hub.history("ns/seed")[0]] == [0, 1, 2]
 
 

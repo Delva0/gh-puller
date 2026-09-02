@@ -1,4 +1,4 @@
-"""OpenAI-compatible streaming adapter with canonical request-state observation."""
+"""Adapt OpenAI-compatible streaming calls to canonical Agent events."""
 
 import contextlib
 import json
@@ -6,7 +6,7 @@ from typing import TypedDict
 
 import httpx
 
-from .base import BaseGenerator
+from ..base import BaseAgent
 
 
 class OpenAIConfig(TypedDict, total=False):
@@ -74,18 +74,14 @@ def _request_context(messages: list[dict], tools: list[dict]) -> list[dict]:
     return context
 
 
-class OpenAI(BaseGenerator):
+class OpenAI(BaseAgent):
     """Direct ``chat/completions`` client; one session may carry multiple requests."""
 
-    generator = "llm"
-    provider = "openai"
+    agent = "llm"
 
     def __init__(self, config: dict):
         super().__init__(config)
         self._client = httpx.AsyncClient(timeout=None)  # noqa: S113 - requests set timeout
-
-    def _initial_context(self) -> list[dict]:
-        return []
 
     async def _enter(self):
         await self._client.__aenter__()
@@ -119,11 +115,12 @@ class OpenAI(BaseGenerator):
         recorder.begin_turn()
         parameters = {key: value for key, value in body.items()
                       if key not in {"model", "messages", "tools", "stream"}}
-        recorder.set_model(body["model"], provider=self.config.get("provider") or self.provider,
-                           parameters=parameters)
         recorder.set_context(_request_context(messages, list(body.get("tools") or [])))
         recorder.begin_step()
-        recorder.model_request()
+        request = {"model": body["model"], "parameters": parameters}
+        if provider := self.config.get("provider"):
+            request["provider"] = provider
+        request_id = recorder.model_request(**request)
 
         text = ""
         reasoning = ""
@@ -153,11 +150,11 @@ class OpenAI(BaseGenerator):
                 thought = delta.get("reasoning_content") or ""
                 if thought:
                     reasoning += thought
-                    recorder.reasoning(thought)
+                    recorder.reasoning(thought, request_id=request_id)
                 part = delta.get("content") or ""
                 if part:
                     text += part
-                    recorder.text(part, index=1 if reasoning else 0)
+                    recorder.text(part, request_id=request_id, index=1 if reasoning else 0)
                     yield part
                 for tool_call in delta.get("tool_calls") or []:
                     index = tool_call.get("index", 0)
@@ -168,7 +165,8 @@ class OpenAI(BaseGenerator):
                     fragment = function.get("arguments") or ""
                     slot["parts"].append(fragment)
                     recorder.tool_call_delta(
-                        index=index, call_id=slot["callId"], name=slot["name"],
+                        request_id=request_id, index=index,
+                        call_id=slot["callId"], name=slot["name"],
                         arguments_delta=fragment)
 
         content = []
@@ -187,7 +185,8 @@ class OpenAI(BaseGenerator):
                 "name": slot["name"], "arguments": arguments,
             })
         message = {"role": "assistant", "content": content}
-        recorder.model_response(message, stop_reason=stop_reason, usage=usage)
+        recorder.model_response(
+            message, request_id=request_id, stop_reason=stop_reason, usage=usage)
         recorder.append_context(message)
         recorder.end_step()
         recorder.end_turn(reason="final_response")

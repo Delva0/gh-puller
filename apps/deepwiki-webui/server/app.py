@@ -82,10 +82,10 @@ from tasks import WikiTask, WikiTaskSubmitResult, registry  # noqa: E402 - 须�
 # 语言与模型契约(仅 HTTP 层展示用;_LANGUAGE_NAMES 为引擎侧映射)
 _LANG_CONFIG = {"supported_languages": dict(_LANGUAGE_NAMES), "default": "en"}
 
-from gh_puller.agent import GENERATORS as AGENT_GENERATORS  # noqa: E402 - 须后于 load_dotenv
+from gh_puller.agent import AGENTS  # noqa: E402 - 须后于 load_dotenv
 from gh_puller.deepwiki.utils import resolve_generator  # noqa: E402 - 须后于 load_dotenv
 
-# /generators/config 前端元数据表(键 = GENERATORS id;file 类无 provider 键,object 类
+# /generators/config 前端元数据表(键 = AGENTS id;file 类无 provider 键,object 类
 # 无 configPath 键 —— 键集互斥即类别;configDefault = 配置路径 UI 占位/缺省展示)。
 _GENERATOR_META: dict[str, dict] = {
     "cc": {"name": "Claude Code", "capability": "anthropic-agent-api",
@@ -112,7 +112,7 @@ def _generators_config() -> dict:
         default_config = {"provider": _GENERATOR_META[default_gid].get("provider", ""),
                           "model": ""}
     generators, providers = [], []
-    for gid in AGENT_GENERATORS:
+    for gid in AGENTS:
         meta = _GENERATOR_META.get(gid)
         if meta is None:  # 注册表含未配置元数据的后端(如 llm)→ 不展示
             continue

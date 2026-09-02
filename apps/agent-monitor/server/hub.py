@@ -11,7 +11,7 @@ import logging
 import time
 from pathlib import Path
 
-from gh_puller.agent.events import NON_STREAM_TYPES
+from gh_puller.agent.events import fold_state, is_compact_event
 
 _LOG = logging.getLogger("agent-monitor")
 
@@ -32,9 +32,7 @@ class _Session:
         self.session = session
         self.path = path
         self.label = session
-        self.provider = ""
-        self.generator = ""
-        self.model = ""
+        self.agent = ""
         self.run_id: str | None = None
         self.state = "running"
         self.ts = now
@@ -80,15 +78,12 @@ class Hub:
             head = starts[0]
             data = head.get("data") or {}
             session.label = data.get("label") or session.session
-            session.generator = head.get("generator") or data.get("generator") or ""
             session.run_id = data.get("runId")
             session.ts = head.get("ts") or session.ts
 
-        models = [event for event in ordered if event.get("type") == "model/set"]
-        if models:
-            data = models[-1].get("data") or {}
-            session.provider = data.get("provider") or ""
-            session.model = data.get("model") or ""
+        agent = fold_state(ordered)["agent"]
+        if agent is not None:
+            session.agent = agent.get("agent") or ""
 
         ends = [event for event in ordered if event.get("type") == "session/end"]
         if ends:
@@ -120,7 +115,7 @@ class Hub:
             except (json.JSONDecodeError, KeyError, TypeError, ValueError):
                 continue
             last_seq = seq if last_seq is None else max(last_seq, seq)
-            if event.get("type") in NON_STREAM_TYPES:
+            if is_compact_event(event.get("type") or ""):
                 events[seq] = event
 
         head = next((event for event in events.values() if event.get("type") == "session/start"), None)
@@ -169,9 +164,7 @@ class Hub:
                     "session": session.session,
                     "run_id": session.run_id,
                     "label": session.label,
-                    "generator": session.generator,
-                    "provider": session.provider,
-                    "model": session.model,
+                    "agent": session.agent,
                     "state": session.state,
                     "ts": session.ts,
                     "last_ts": session.last_ts,
@@ -251,7 +244,7 @@ class Hub:
                 high-water mark but are not retained in compact history.
 
         Returns:
-            Whether session identity, model metadata, or terminal state changed.
+            Whether session identity or terminal state changed.
         """
         changed = False
         for event in events:
@@ -272,26 +265,16 @@ class Hub:
         if seq is not None:
             seq = int(seq)
             session.last_seq = seq if session.last_seq is None else max(session.last_seq, seq)
-            if event_type in NON_STREAM_TYPES:
+            if is_compact_event(event_type or ""):
                 session.events[seq] = event
 
         previous_state = session.state
         session.live_seen_at = time.time()
         session.live_last_ts = max(session.live_last_ts, event.get("ts") or session.live_seen_at)
         session.last_ts = session.live_last_ts
-        data = event.get("data") or {}
-        if event_type == "session/start":
-            session.label = data.get("label") or session.session
-            session.generator = event.get("generator") or data.get("generator") or ""
-            session.run_id = data.get("runId")
-            session.state = "running"
-            session.ts = event.get("ts") or session.ts
-        elif event_type == "model/set":
-            session.provider = data.get("provider") or ""
-            session.model = data.get("model") or ""
-        elif event_type == "session/end":
-            session.state = _session_state(data.get("outcome"))
-        elif session.state == "aborted":
+        if is_compact_event(event_type or ""):
+            self._project(session)
+        if event_type != "session/end" and session.state == "aborted":
             session.state = "running"
         return (
             created
@@ -299,7 +282,7 @@ class Hub:
             or event_type
             in {
                 "session/start",
-                "model/set",
+                "agent/set",
                 "session/end",
             }
         )

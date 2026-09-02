@@ -2,9 +2,8 @@
 
 from typing import TypedDict
 
+from ..base import BaseAgent, RequestFailedError
 from ..events import EventRecorder, _normalize_usage
-from .base import BaseGenerator
-from .utils import RequestFailedError
 
 
 class ClaudeConfig(TypedDict, total=False):
@@ -59,7 +58,8 @@ def _block_kind(block) -> str:
 class _ClaudeSynth:
     """Hold SDK assembly state for one Claude call."""
 
-    def __init__(self):
+    def __init__(self, request_id: str):
+        self.request_id = request_id
         self.tool_pending = False
         self.active_tool_use: dict[int, str] = {}
         self.tool_result: dict | None = None
@@ -83,7 +83,8 @@ def _handle_stream_event(event_recorder: EventRecorder, state: _ClaudeSynth,
     typ = event.get("type")
     if typ == "message_start":
         if state.tool_pending and (event.get("message") or {}).get("role") == "assistant":
-            event_recorder.step_boundary()
+            event_recorder.begin_step()
+            state.request_id = event_recorder.model_request()
             state.tool_pending = False
         state.reset_message()
         return
@@ -117,18 +118,19 @@ def _handle_stream_event(event_recorder: EventRecorder, state: _ClaudeSynth,
             text = delta.get("text") or ""
             state.message_text += text
             state.message_yielded = True
-            event_recorder.text(text, index=idx)
+            event_recorder.text(text, request_id=state.request_id, index=idx)
             return
         if dtype == "thinking_delta":
             text = delta.get("thinking") or ""
             state.message_reasoning += text
-            event_recorder.reasoning(text, index=idx)
+            event_recorder.reasoning(text, request_id=state.request_id, index=idx)
             return
         if dtype == "input_json_delta":
             piece = delta.get("partial_json") or ""
             tid = state.active_tool_use.get(idx, "pending")
             event_recorder.tool_call_delta(
-                index=idx, call_id=tid, name=state.tool_names.get(tid),
+                request_id=state.request_id, index=idx, call_id=tid,
+                name=state.tool_names.get(tid),
                 arguments_delta=piece)
         return
     if typ == "content_block_stop":
@@ -163,7 +165,7 @@ def _handle_assistant_message(event_recorder: EventRecorder, state: _ClaudeSynth
         if t == "text":
             text = getattr(b, "text", None) or ""
             if text and not state.message_yielded:
-                event_recorder.text(text)
+                event_recorder.text(text, request_id=state.request_id)
                 fallback.append(text)
             content.append({"type": "text", "text": text})
         elif t == "thinking":
@@ -181,7 +183,8 @@ def _handle_assistant_message(event_recorder: EventRecorder, state: _ClaudeSynth
     stop_reason = getattr(msg, "stop_reason", None) or state.message_stop_reason
     message = {"role": "assistant", "content": content}
     event_recorder.model_response(
-        message, usage=_normalize_usage(getattr(msg, "usage", None)), stop_reason=stop_reason)
+        message, request_id=state.request_id,
+        usage=_normalize_usage(getattr(msg, "usage", None)), stop_reason=stop_reason)
     event_recorder.append_context(message)
     state.reset_message()
     return fallback
@@ -217,11 +220,10 @@ def _handle_user_message(event_recorder: EventRecorder, state: _ClaudeSynth, msg
         state.tool_pending = True
 
 
-class ClaudeCode(BaseGenerator):
+class ClaudeCode(BaseAgent):
     """Run a reusable Claude Code SDK client inside one observation session."""
 
-    generator = "cc"
-    provider = "anthropic"
+    agent = "cc"
 
     def __init__(self, config: dict):
         super().__init__(config)
@@ -231,6 +233,11 @@ class ClaudeCode(BaseGenerator):
 
     async def _enter(self):
         await self._client.__aenter__()
+        if prompt := self.config.get("system_prompt"):
+            self._require_event_recorder().append_context({
+                "role": "system",
+                "content": [{"type": "text", "text": prompt}],
+            })
 
     async def _exit(self, exc):
         await self._client.__aexit__(*exc)
@@ -248,8 +255,7 @@ class ClaudeCode(BaseGenerator):
         event_recorder.begin_turn()
         event_recorder.append_context({"role": "user", "content": [{"type": "text", "text": prompt}]})
         event_recorder.begin_step()
-        event_recorder.model_request()
-        state = _ClaudeSynth()
+        state = _ClaudeSynth(event_recorder.model_request())
         await self._client.query(prompt)
         async for msg in self._client.receive_response():
             if isinstance(msg, StreamEvent):
@@ -281,8 +287,7 @@ class ClaudeCode(BaseGenerator):
         event_recorder.begin_turn()
         event_recorder.append_context({"role": "user", "content": [{"type": "text", "text": prompt}]})
         event_recorder.begin_step()
-        event_recorder.model_request()
-        state = _ClaudeSynth()
+        state = _ClaudeSynth(event_recorder.model_request())
         await self._client.query(prompt)
         async for msg in self._client.receive_response():
             if isinstance(msg, StreamEvent):

@@ -7,8 +7,8 @@ import type { SessionMeta } from '../monitor/protocol';
 import SessionList from './SessionList';
 
 const sessions: SessionMeta[] = [
-  { session: 'ns/u1', run_id: 'chat:r1', label: 'chat:r1', provider: 'claude', model: 'm', state: 'running', ts: 1700000000, last_ts: 1700000001, num_events: 3 },
-  { session: 'ns/u2', run_id: null, label: 'l2', provider: '', model: '', state: 'completed', ts: 1700000002, last_ts: 1700000003, num_events: 1 },
+  { session: 'ns/u1', run_id: 'chat:r1', label: 'chat:r1', agent: 'cc', state: 'running', ts: 1700000000, last_ts: 1700000001, num_events: 3 },
+  { session: 'ns/u2', run_id: null, label: 'l2', agent: '', state: 'completed', ts: 1700000002, last_ts: 1700000003, num_events: 1 },
 ];
 
 let container: HTMLDivElement;

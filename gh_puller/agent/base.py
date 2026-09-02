@@ -1,28 +1,40 @@
-"""Generator lifecycle shared by every provider adapter."""
+"""Define the common Agent lifecycle and caller-visible failure contract."""
 
 import contextlib
 import sys
 from collections.abc import AsyncIterator
+from typing import Any
 
-from ... import envs
-from ..events import EventRecorder, _session_id
+from .. import envs
+from .events import EventRecorder, _session_id
 
 
-class BaseGenerator:
+class RequestFailedError(Exception):
+    """Report an Agent failure with a caller-readable detail string."""
+
+    def __init__(self, detail: Any):
+        super().__init__(detail)
+        self.detail = str(detail)
+
+
+class BaseAgent:
     """Share client lifetime and one reusable observation session across adapters."""
 
-    generator = ""
-    provider = ""
-    model_parameter_keys: tuple[str, ...] = ()
+    agent = ""
 
     def __init__(self, config: dict):
+        """Create an adapter from its complete opaque configuration.
+
+        Args:
+            config: Adapter configuration recorded without semantic interpretation.
+        """
         self.config = dict(config)
         self._event_recorder: EventRecorder | None = None
 
     @contextlib.asynccontextmanager
     async def session(self, *, session: str | None = None, run_id: str | None = None,
                       session_name: str | None = None):
-        """Bind one reusable generator client to a canonical observation session.
+        """Bind one reusable Agent client to a canonical observation session.
 
         Args:
             session: Explicit observation-session id.
@@ -32,15 +44,6 @@ class BaseGenerator:
         event_recorder = self._recorder(
             session=session, run_id=run_id, session_name=session_name)
         event_recorder.start()
-        model = self.config.get("model")
-        if model:
-            parameters = {key: self.config[key] for key in self.model_parameter_keys
-                          if self.config.get(key) is not None}
-            event_recorder.set_model(
-                model, provider=self.config.get("provider") or self.provider or None,
-                parameters=parameters)
-        if context := self._initial_context():
-            event_recorder.set_context(context)
         self._event_recorder = event_recorder
         ok = False
         try:
@@ -62,17 +65,10 @@ class BaseGenerator:
             self._event_recorder = None
 
     def _require_event_recorder(self) -> EventRecorder:
-        """Event recorder of the active session; calling stream/result outside the block raises a contract error."""
+        """Return the active recorder or reject a call outside ``session``."""
         if self._event_recorder is None:
-            raise RuntimeError("stream/result 只能在 async with gen.session(...) 块内调用")
+            raise RuntimeError("stream/result 只能在 async with agent.session(...) 块内调用")
         return self._event_recorder
-
-    def _initial_context(self) -> list[dict]:
-        """Project observable construction-time instructions into context."""
-        prompt = self.config.get("system_prompt")
-        if not prompt:
-            return []
-        return [{"role": "system", "content": [{"type": "text", "text": prompt}]}]
 
     async def _enter(self) -> None:
         """Subclass hook: enter the client (same semantics as its `__aenter__`)."""
@@ -83,11 +79,11 @@ class BaseGenerator:
         raise NotImplementedError
 
     def _recorder(self, *, session: str | None = None, run_id: str | None = None,
-                  session_name: str | None = None, generator: str | None = None) -> EventRecorder:
+                  session_name: str | None = None, agent: str | None = None) -> EventRecorder:
         """Build a recorder for one session."""
         return EventRecorder(
-            _session_id(session, run_id, session_name), generator=generator or self.generator,
-            label=session_name, run_id=run_id)
+            _session_id(session, run_id, session_name), agent=agent or self.agent,
+            config=self.config, label=session_name, run_id=run_id)
 
     async def stream(self, prompt: str) -> AsyncIterator[str]:
         """Stream the assistant text increments (subclasses implement); only callable inside a session block.

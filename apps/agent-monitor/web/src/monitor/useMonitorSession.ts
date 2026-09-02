@@ -6,17 +6,17 @@ import { RunFold } from '../events/fold';
 import type {
   EventEnvelope,
   ModelActivity,
-  RequestState,
+  CanonicalState,
   ToolActivity,
 } from '../events/types';
 
 export interface SessionSnapshot {
   loaded: boolean;
   events: EventEnvelope[];
-  state: RequestState;
+  state: CanonicalState;
   requests: ModelActivity[];
   tools: ToolActivity[];
-  activeModel: ModelActivity | null;
+  activeModels: ModelActivity[];
   steps: number;
 }
 
@@ -66,7 +66,7 @@ class MonitorSessionStore {
       state: this.fold.state(),
       requests,
       tools: this.fold.toolActivity(),
-      activeModel: this.fold.activeModel(requests),
+      activeModels: this.fold.activeModels(requests),
       steps: this.fold.stepCount(),
     };
   }

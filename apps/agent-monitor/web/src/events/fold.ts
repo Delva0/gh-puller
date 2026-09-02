@@ -1,11 +1,11 @@
-/** Incrementally fold a session while keeping request state and activity separate. */
+/** Incrementally fold a session while keeping canonical state and activity separate. */
 
 import {
   applyStateEvent,
-  emptyRequestState,
-  foldRequestState,
+  emptyState,
+  foldState,
 } from './state'
-import type { EventEnvelope, Message, ModelActivity, RequestState, ToolActivity } from './types'
+import type { CanonicalState, EventEnvelope, Message, ModelActivity, ToolActivity } from './types'
 
 export type IngestResult = 'ok' | 'dup' | 'gap'
 
@@ -37,13 +37,13 @@ export class RunFold {
     return 'ok'
   }
 
-  state(): RequestState {
-    return foldRequestState(this.events)
+  state(): CanonicalState {
+    return foldState(this.events)
   }
 
   modelActivity(): ModelActivity[] {
     const requests = new Map<string, ModelActivity>()
-    const state = emptyRequestState()
+    const state = emptyState()
     for (const evt of this.events) {
       if (applyStateEvent(state, evt)) continue
       const requestId = typeof evt.data.requestId === 'string' ? evt.data.requestId : null
@@ -51,10 +51,11 @@ export class RunFold {
         requests.set(requestId, {
           requestId,
           requestSeq: evt.seq,
-          requestState: {
-            model: state.model === null
+          request: { ...evt.data },
+          stateAtRequest: {
+            agent: state.agent === null
               ? null
-              : { ...state.model, parameters: { ...state.model.parameters } },
+              : { ...state.agent, config: { ...state.agent.config } },
             context: [...state.context],
           },
           text: '',
@@ -113,9 +114,8 @@ export class RunFold {
     return [...tools.values()].sort((a, b) => a.startSeq - b.startSeq)
   }
 
-  activeModel(requests = this.modelActivity()): ModelActivity | null {
-    const request = requests.at(-1)
-    return request?.responseSeq === undefined ? request ?? null : null
+  activeModels(requests = this.modelActivity()): ModelActivity[] {
+    return requests.filter(request => request.responseSeq === undefined)
   }
 
   stepCount(): number {

@@ -1,4 +1,4 @@
-"""Opt-in real-backend tests for every generator and its persisted event flow.
+"""Opt-in real-backend tests for every Agent adapter and its persisted event flow.
 
 Set ``GH_PULLER_REAL_TESTS=1`` to run tests that may spawn local agents or consume
 provider tokens. Each test writes monitor data only under its pytest temporary path.
@@ -15,7 +15,7 @@ import pytest_asyncio
 from gh_puller import agent
 
 MODEL = os.environ.get("GH_PULLER_MODEL", "deepseek-v4-flash")  # cc/dsh 路(测试自定)
-LLM_MODEL = os.environ.get("LLM_MODEL", MODEL)  # llm 路按生成器 env 面(webui/__main__ 同约定)
+LLM_MODEL = os.environ.get("LLM_MODEL", MODEL)  # llm 路按 Agent env 面(webui/__main__ 同约定)
 MODEL_CODEX = "gpt-5.6-luna"  # 常量直写:codex 无环境变量(同 cc 路线);luna = 本地模型(不烧 token)
 
 # llm 路端点:缺省 DeepSeek(OpenAI 兼容,低成本),经 OPENAI_BASE_URL 覆写(与 webui/__main__ 同约定)
@@ -75,18 +75,22 @@ async def _read_single_session(tmp_path) -> list[dict]:
     return [json.loads(line) for line in files[0].read_text(encoding="utf-8").splitlines()]
 
 
-def _assert_flow(events: list[dict], provider: str, model: str | None, generator: str = "") -> None:
-    """Assert compact persistence and replayable model context."""
+def _assert_flow(events: list[dict], agent_name: str) -> None:
+    """Assert compact persistence, correlation, and replayable context."""
     assert events, "根下应有事件落盘"
     assert events[0]["type"] == "session/start", events[0]
-    if generator:
-        assert events[0]["data"]["generator"] == generator, events[0]
     types = [e["type"] for e in events]
     assert not {"model/delta/text", "model/delta/reasoning", "model/delta/tool-call"} & set(types)
-    model_events = [event for event in events if event["type"] == "model/set"]
-    if model is not None:
-        assert model_events[-1]["data"]["model"] == model
-        assert model_events[-1]["data"].get("provider") == provider
+    agent_event = next(event for event in events if event["type"] == "agent/set")
+    assert agent_event["data"]["agent"] == agent_name
+    request_ids = {
+        event["data"]["requestId"] for event in events if event["type"] == "model/request"
+    }
+    assert request_ids
+    assert all(
+        event["data"]["requestId"] in request_ids
+        for event in events if event["type"] == "model/response"
+    )
     user = next(e for e in events if e["type"] == "context/append/user")
     assert "你好" in _text_of(user["data"]["content"]), user
     assistants = [e for e in events if e["type"] == "context/append/assistant"]
@@ -113,12 +117,12 @@ async def test_cc_stream_real(tmp_path):
         parts = await _collect(gen.stream("你好"))
     print("cc 回复:", "".join(parts))  # pytest -s 查看真机回显
     assert "".join(parts) != "", "cc 后端应有文本增量"
-    _assert_flow(await _read_single_session(tmp_path), "anthropic", MODEL, generator="cc")
+    _assert_flow(await _read_single_session(tmp_path), "cc")
 
 
 @pytest.mark.asyncio
 async def test_llm_stream_real(tmp_path):
-    """llm 真机:httpx 直连 OpenAI 兼容端;凭证照生成器 env 面(OPENAI_API_KEY,webui/__main__ 同约定)。"""
+    """llm 真机:httpx 直连 OpenAI 兼容端;凭证照 Agent env 面(OPENAI_API_KEY,webui/__main__ 同约定)。"""
     key = os.environ.get("OPENAI_API_KEY")
     if not key:
         pytest.skip("OPENAI_API_KEY 缺失(env;不读任何组件私有文件)")
@@ -133,7 +137,7 @@ async def test_llm_stream_real(tmp_path):
             payload, timeout=httpx.Timeout(connect=10.0, read=180.0, write=10.0, pool=10.0)))
     assert "".join(parts) != "", "llm 后端应有文本增量"
     print("llm 回复:", "".join(parts))  # pytest -s 查看真机回显
-    _assert_flow(await _read_single_session(tmp_path), "openai", LLM_MODEL, generator="llm")
+    _assert_flow(await _read_single_session(tmp_path), "llm")
 
 
 @pytest.mark.skip(
@@ -164,7 +168,7 @@ async def test_dsh_stream_real(tmp_path):
         parts = await _collect(gen.stream("你好"))
     print("dsh 回复:", "".join(parts))  # pytest -s 查看真机回显
     assert "".join(parts) != "", "dsh 后端应有文本增量"
-    _assert_flow(await _read_single_session(tmp_path), "deepseek", MODEL, generator="dsh")
+    _assert_flow(await _read_single_session(tmp_path), "dsh")
 
 
 @pytest.mark.asyncio
@@ -184,7 +188,7 @@ async def test_codex_stream_real(tmp_path):
         parts = await _collect(gen.stream("你好"))
     print("codex 回复:", "".join(parts))  # pytest -s 查看真机回显
     assert "".join(parts) != "", "codex 后端应有文本增量"
-    _assert_flow(await _read_single_session(tmp_path), "openai", MODEL_CODEX, generator="codex")
+    _assert_flow(await _read_single_session(tmp_path), "codex")
 
 
 @pytest.mark.asyncio
@@ -210,4 +214,4 @@ async def test_opencode_stream_real(tmp_path):
         parts = await _collect(gen.stream("你好"))
     print("opencode 回复:", "".join(parts))  # pytest -s 查看真机回显
     assert "".join(parts) != "", "opencode 后端应有文本增量"
-    _assert_flow(await _read_single_session(tmp_path), "opencode", None, generator="opencode")
+    _assert_flow(await _read_single_session(tmp_path), "opencode")

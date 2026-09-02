@@ -5,7 +5,7 @@ import { useLanguage } from '@gh-puller/ui';
 import type {
   EventEnvelope,
   ModelActivity,
-  RequestState,
+  CanonicalState,
   ToolActivity,
 } from '../events/types';
 import { Pill } from '../vendor/dsh';
@@ -16,11 +16,11 @@ type View = 'context' | 'events';
 
 export interface RunPanelProps {
   loaded: boolean;
-  state: RequestState;
+  state: CanonicalState;
   events: EventEnvelope[];
   requests: ModelActivity[];
   tools: ToolActivity[];
-  activeModel: ModelActivity | null;
+  activeModels: ModelActivity[];
 }
 
 export default function RunPanel({
@@ -29,7 +29,7 @@ export default function RunPanel({
   events,
   requests,
   tools,
-  activeModel,
+  activeModels,
 }: RunPanelProps) {
   const { t } = useLanguage();
   const [view, setView] = useState<View>('context');
@@ -48,7 +48,7 @@ export default function RunPanel({
         {!loaded ? (
           <div className="p-6 text-sm text-[var(--muted)]">{t('view.loading')}</div>
         ) : view === 'context' ? (
-          <ContextView state={state} tools={tools} activeModel={activeModel} />
+          <ContextView state={state} tools={tools} activeModels={activeModels} />
         ) : (
           <EventsView events={events} requests={requests} />
         )}

@@ -129,7 +129,7 @@ export default function App() {
               events={session.events}
               requests={session.requests}
               tools={session.tools}
-              activeModel={session.activeModel}
+              activeModels={session.activeModels}
             />
           )}
         </div>

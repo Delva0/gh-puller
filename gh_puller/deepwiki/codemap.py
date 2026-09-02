@@ -235,9 +235,7 @@ async def _codemap(
                     system_prompt=_CODEMAP_SKELETON_PROMPT.format(**fmt),
                 )
                 async with adapter.session(
-                    session_name="codemap:skeleton", run_id=f"codemap:{repo.name}",
-                    retry={"attempt": attempt, "prev_error": str(last_error)} if last_error else None,
-                ):
+                    session_name="codemap:skeleton", run_id=f"codemap:{repo.name}"):
                     raw = await adapter.result(prompt)
                 return _extract_json(raw)
             except Exception as e:

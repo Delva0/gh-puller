@@ -2,7 +2,7 @@
 
     uv run python apps/gh-puller-mcp/examples/opencode_mcp_vllm.py
 
-展示的 gh_puller.agent API(契约一律见 gh_puller/agent/generators/__init__.py
+展示的 gh_puller.agent API(契约一律见 gh_puller/agent/adapters/__init__.py
 包 docstring;用法与 cc_mcp_vllm.py 同式):OpenCode(config) 构造期注入 config,
 键集白名单见 OpenCodeConfig —— mcp_servers 为通用工具桌描述 list({id,
 command, args, env_vars}),生成器渲染为 opencode mcp 配置段(命令行 stdio

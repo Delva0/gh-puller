@@ -7,9 +7,8 @@ import tempfile
 from pathlib import Path
 from typing import TypedDict
 
+from ..base import BaseAgent, RequestFailedError
 from ..events import EventRecorder, _normalize_usage
-from .base import BaseGenerator
-from .utils import RequestFailedError
 
 
 class DshConfig(TypedDict, total=False):
@@ -186,6 +185,8 @@ class _DshProj:
                         ])
         self.tool_names = dict(previous.tool_names) if same_session else {}
         self.tool_pieces: dict[int, dict] = {}
+        self.request: dict = {}
+        self.request_id: str | None = None
         self.saw_user_message = False
         self.last_finish_kind: str | None = None
 
@@ -195,8 +196,21 @@ class _DshProj:
 
     def apply_header(self, message: dict | None) -> None:
         """Replace DSH request metadata after projecting it into context."""
-        self.header = [] if message is None else [message]
+        header = [] if message is None else [message]
+        if header == self.header:
+            return
+        if not self.header and not self.surface and message is not None:
+            self.header = header
+            self.event_recorder.append_context(message)
+            return
+        self.header = header
         self.event_recorder.set_context(self.context())
+
+    def begin_request(self) -> str:
+        """Return the current DSH model correlation, opening it when needed."""
+        if self.request_id is None:
+            self.request_id = self.event_recorder.model_request(**self.request)
+        return self.request_id
 
     def commit(self, envelope: dict, message: dict) -> None:
         """Apply one DSH surface operation as a canonical context operation."""
@@ -250,10 +264,13 @@ def _project_dsh_chunk(event_recorder: EventRecorder, proj: _DshProj, chunk: dic
     ctype = chunk.get("type")
     if ctype == "text-delta":
         text = chunk.get("text") or ""
-        event_recorder.text(text, index=chunk.get("index", 0))
+        event_recorder.text(
+            text, request_id=proj.begin_request(), index=chunk.get("index", 0))
         return [text] if text else []
     if ctype == "reasoning-delta":
-        event_recorder.reasoning(chunk.get("text") or "", index=chunk.get("index", 0))
+        event_recorder.reasoning(
+            chunk.get("text") or "", request_id=proj.begin_request(),
+            index=chunk.get("index", 0))
         return []
     if ctype == "tool-call-delta":
         idx = chunk.get("index", -1)
@@ -264,7 +281,8 @@ def _project_dsh_chunk(event_recorder: EventRecorder, proj: _DshProj, chunk: dic
         piece = chunk.get("argumentsDelta") or ""
         slot["pieces"].append(piece)
         event_recorder.tool_call_delta(
-            index=idx, call_id=slot["id"] or "pending", name=slot["name"],
+            request_id=proj.begin_request(), index=idx,
+            call_id=slot["id"] or "pending", name=slot["name"],
             arguments_delta=piece)
         return []
     if ctype == "block-end":
@@ -311,6 +329,7 @@ def _project_dsh_event(event_recorder: EventRecorder, proj: _DshProj, notif) -> 
         event_recorder.event("turn/start")
     elif evt_type == "step/start":
         proj.tool_pieces = {}
+        proj.request_id = None
         event_recorder.event("step/start")
     elif evt_type == "step/end":
         event_recorder.event("step/end")
@@ -328,7 +347,9 @@ def _project_dsh_event(event_recorder: EventRecorder, proj: _DshProj, notif) -> 
         message = _dsh_message(
             data.get("message") or {"role": "assistant", "content": []})
         event_recorder.model_response(
-            message, usage=data.get("usage"), stop_reason=proj.last_finish_kind)
+            message, request_id=proj.begin_request(), usage=data.get("usage"),
+            stop_reason=proj.last_finish_kind)
+        proj.request_id = None
         proj.commit(envelope, message)
     elif evt_type == "tool/call":
         call_id = data.get("callId") or ""
@@ -356,17 +377,18 @@ def _project_dsh_event(event_recorder: EventRecorder, proj: _DshProj, notif) -> 
             "content": [{"type": "text", "text": text}],
         })
     elif evt_type == "request/context":
-        if event_recorder.request_id is None:
-            event_recorder.model_request()
+        proj.begin_request()
     elif evt_type == "request/header":
         header = data.get("header") or {}
         config = header.get("config") or {}
-        model = config.get("model")
-        if model:
-            event_recorder.set_model(
-                model, provider=config.get("provider"),
-                parameters={key: value for key, value in config.items()
-                            if key not in {"provider", "model"}})
+        proj.request = {
+            **({"model": config["model"]} if config.get("model") else {}),
+            **({"provider": config["provider"]} if config.get("provider") else {}),
+        }
+        parameters = {key: value for key, value in config.items()
+                      if key not in {"provider", "model"}}
+        if parameters:
+            proj.request["parameters"] = parameters
         proj.apply_header(_dsh_header_message(header))
     return []
 
@@ -376,25 +398,16 @@ def _dsh_worker(harness, prompt: str, session_id: str, pump):
     return harness.run(prompt, session_id=session_id, on_notification=pump)
 
 
-class Dsh(BaseGenerator):
-    """Bridge a reusable synchronous DSH harness into the async generator contract."""
+class Dsh(BaseAgent):
+    """Bridge a reusable synchronous DSH harness into the Agent contract."""
 
-    generator = "dsh"
-    provider = "deepseek"
-    model_parameter_keys = ("max_tokens",)
+    agent = "dsh"
 
     def __init__(self, config: dict):
         super().__init__(config)
         self._harness = dsh_harness(config)
         self._run_task: asyncio.Task | None = None
         self._proj: _DshProj | None = None
-
-    def _initial_context(self) -> list[dict]:
-        prompt = (self.config.get("env") or {}).get("DSH_SYSTEM_PROMPT") \
-            or self.config.get("system_prompt")
-        if not prompt:
-            return []
-        return [{"role": "system", "content": [{"type": "text", "text": prompt}]}]
 
     async def _enter(self):
         await asyncio.to_thread(self._harness.__enter__)

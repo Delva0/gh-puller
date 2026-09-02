@@ -17,7 +17,7 @@ from pathlib import Path
 import pytest
 
 from gh_puller import deepwiki
-from gh_puller.agent import GENERATORS, RequestFailedError
+from gh_puller.agent import AGENTS, RequestFailedError
 from gh_puller.deepwiki import (
     WikiPage,
     WikiStructureModel,
@@ -318,10 +318,10 @@ class _FakeGenerator:
 async def test_agent_dispatch_by_generator(monkeypatch):
     """分派冒烟(原 generate_* 迁移测试接替):模块级 adapter 按 generator
 
-    (wire target 拆包)经 GENERATORS[gid](config) 收敛构造;空选型 = 引擎内建 cc。
+    (wire target 拆包)经 AGENTS[gid](config) 收敛构造;空选型 = 引擎内建 cc。
     """
     for gid in ("cc", "dsh", "codex", "opencode"):
-        monkeypatch.setitem(GENERATORS, gid, _FakeGenerator)
+        monkeypatch.setitem(AGENTS, gid, _FakeGenerator)
         monkeypatch.setattr(_FakeGenerator, "generator", gid)
         inst = adapt_generator(**_gen_kwargs({"generator": gid}), system_prompt="s")
         assert inst.generator == gid and isinstance(inst, _FakeGenerator)
@@ -338,7 +338,7 @@ def test_dsh_options_config(monkeypatch, tmp_path):
     mcp_servers 白名单透传(app 经 generator_config 注入图工具桌,适配层零工具名)。
     """
     repo = Repo(str(tmp_path), "local")
-    monkeypatch.setitem(GENERATORS, "dsh", _FakeGenerator)
+    monkeypatch.setitem(AGENTS, "dsh", _FakeGenerator)
     monkeypatch.setattr(_FakeGenerator, "generator", "dsh")
     fake_mcp = [{"id": "fake", "command": "x"}]
     cfg = adapt_generator(
@@ -364,7 +364,7 @@ def test_opencode_options_config(monkeypatch, tmp_path):
     透传(app 经 generator_config 注入图工具桌);repo 空不注入。
     """
     repo = Repo(str(tmp_path), "local")
-    monkeypatch.setitem(GENERATORS, "opencode", _FakeGenerator)
+    monkeypatch.setitem(AGENTS, "opencode", _FakeGenerator)
     monkeypatch.setattr(_FakeGenerator, "generator", "opencode")
     fake_mcp = [{"id": "fake", "command": "x"}]
     cfg = adapt_generator(
@@ -388,7 +388,7 @@ def test_agent_options_cc_setting_sources_isolated(monkeypatch):
     """cc 完全隔离本地 claude 配置(setting_sources=[]):用户级 MCP/skills/hooks 不掺入 agent。
 
     """
-    monkeypatch.setitem(GENERATORS, "cc", _FakeGenerator)
+    monkeypatch.setitem(AGENTS, "cc", _FakeGenerator)
     cfg = adapt_generator(**_gen_kwargs({}), system_prompt="sys").config
     assert cfg["setting_sources"] == []
     assert cfg["system_prompt"] == "sys"
@@ -411,8 +411,8 @@ async def test_chat_stream_history_trim_no_context(monkeypatch):
         captured.update(prompt=prompt)
         yield "hi"
 
-    monkeypatch.setattr(GENERATORS["cc"], "session", fake_session)  # 适配器单例直连(agent 路)
-    monkeypatch.setattr(GENERATORS["cc"], "stream", fake_stream)
+    monkeypatch.setattr(AGENTS["cc"], "session", fake_session)  # 适配器单例直连(agent 路)
+    monkeypatch.setattr(AGENTS["cc"], "stream", fake_stream)
     monkeypatch.setattr(deepwiki.envs, "CHAT_TOKEN_LIMIT_ESTIMATE", 0)  # 估算必超 → 触发裁剪
     request = {
         "repo_url": "/tmp/deepwiki-chat-test", "type": "local", "language": "en",
@@ -464,7 +464,7 @@ def test_options_cc_cache_write_mode(monkeypatch, tmp_path):
     注入(app 侧 runtime_config 组装),引擎并入基座读工具。
     """
     repo = Repo(str(tmp_path), "local")
-    monkeypatch.setitem(GENERATORS, "cc", _FakeGenerator)
+    monkeypatch.setitem(AGENTS, "cc", _FakeGenerator)
     graph_tools = ["graphify_query", "mcp__graphify__graphify_query"]
     cfg = adapt_generator(
         **_gen_kwargs({"generator_config": {"allowed_tools": graph_tools}}),
@@ -512,8 +512,8 @@ async def test_agent_chat_natural_history(monkeypatch):
         captured.update(prompt=prompt)
         yield "hi"
 
-    monkeypatch.setattr(GENERATORS["cc"], "session", fake_session)  # 适配器单例直连
-    monkeypatch.setattr(GENERATORS["cc"], "stream", fake_stream)
+    monkeypatch.setattr(AGENTS["cc"], "session", fake_session)  # 适配器单例直连
+    monkeypatch.setattr(AGENTS["cc"], "stream", fake_stream)
     request = {
         "repo_url": "/tmp/gh-puller-chat-natural", "type": "local", "language": "en",
         "target": {}, "token": None,
@@ -547,8 +547,8 @@ async def test_agent_chat_deep_one_shot(monkeypatch):
         captured["prompt"] = prompt
         yield "hi"
 
-    monkeypatch.setattr(GENERATORS["cc"], "session", fake_session)  # 适配器单例直连
-    monkeypatch.setattr(GENERATORS["cc"], "stream", fake_stream)
+    monkeypatch.setattr(AGENTS["cc"], "session", fake_session)  # 适配器单例直连
+    monkeypatch.setattr(AGENTS["cc"], "stream", fake_stream)
     request = {
         "repo_url": "/tmp/gh-puller-chat-natural", "type": "local", "language": "en",
         "target": {}, "token": None,
@@ -620,11 +620,11 @@ async def test_produce_file_wraps_request_failure(monkeypatch, tmp_path):
         raise RequestFailedError("sdk exploded")
         yield  # 保持 async generator
 
-    monkeypatch.setattr(GENERATORS["cc"], "session", fake_session)  # 适配器单例直连
-    monkeypatch.setattr(GENERATORS["cc"], "stream", boom_stream)
+    monkeypatch.setattr(AGENTS["cc"], "session", fake_session)  # 适配器单例直连
+    monkeypatch.setattr(AGENTS["cc"], "stream", boom_stream)
     out_path = tmp_path / "out" / "page.md"
     with pytest.raises(RuntimeError) as ei:
-        await _produce_file(GENERATORS["cc"]({}), "", out_path,
+        await _produce_file(AGENTS["cc"]({}), "", out_path,
                             label="wiki:page:p1", run_id="r1")
     assert str(ei.value) == "generator 执行失败: sdk exploded"
     assert isinstance(ei.value.__cause__, RequestFailedError)
@@ -642,8 +642,8 @@ async def test_agent_chat_wraps_request_failure_in_degrade(monkeypatch):
         raise RequestFailedError("sdk exploded")
         yield  # 保持 async generator
 
-    monkeypatch.setattr(GENERATORS["cc"], "session", fake_session)  # 适配器单例直连
-    monkeypatch.setattr(GENERATORS["cc"], "stream", boom_stream)
+    monkeypatch.setattr(AGENTS["cc"], "session", fake_session)  # 适配器单例直连
+    monkeypatch.setattr(AGENTS["cc"], "stream", boom_stream)
     request = {
         "repo_url": "/tmp/gh-puller-chat-wrap", "type": "local", "language": "en",
         "target": {}, "token": None,
@@ -661,7 +661,7 @@ def test_codex_options_config(monkeypatch, tmp_path):
     原样透传(app 侧 runtime_config 注入;repo 空时无 cwd/图位)。
     """
     repo = Repo(str(tmp_path), "local")
-    monkeypatch.setitem(GENERATORS, "codex", _FakeGenerator)
+    monkeypatch.setitem(AGENTS, "codex", _FakeGenerator)
     monkeypatch.setattr(_FakeGenerator, "generator", "codex")
     fake_mcp = [{"id": "fake", "command": "x"}]
     cfg = adapt_generator(

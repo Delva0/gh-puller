@@ -32,8 +32,8 @@ def test_producer_events_flow_through_the_public_websocket_protocol() -> None:
                 {
                     "type": "evts",
                     "events": [
-                        _event("session/start", 0, generator="custom", label="demo"),
-                        _event("model/set", 1, model="m", provider="p", parameters={}),
+                        _event("session/start", 0, label="demo"),
+                        _event("agent/set", 1, agent="custom", config={"model": "m"}),
                         _event("context/append/user", 2, content=[{"type": "text", "text": "q"}]),
                     ],
                 },

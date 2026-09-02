@@ -9,7 +9,7 @@ from urllib.parse import urlsplit
 
 from .. import envs
 from ..utils import _log as _utils_log
-from .events import NON_STREAM_TYPES, EventBus, set_active_bus, truncate
+from .events import EventBus, _put_event, is_compact_event, set_active_bus, truncate
 
 
 def _file_stem(session: str) -> str:
@@ -36,7 +36,7 @@ class FileSink:
 
     async def consume(self, evt: dict) -> None:
         """Append one event line to the session file; non-stream only unless raw."""
-        if not self.raw and evt["type"] not in NON_STREAM_TYPES:
+        if not self.raw and not is_compact_event(evt["type"]):
             return
         session = evt.get("session", "")
         if evt["type"] == "session/start":
@@ -66,24 +66,21 @@ class FileSink:
 class WsSink:
     """WS channel (producer side): background task pushes events to the hub, silent 1→2→…→30s backoff on disconnect.
 
-    Internal bounded queue (5000, drop-oldest) absorbs backlog during disconnect;
-    push failures never bubble (monitoring must not drag callers). Events only deliver
-    after connect (reconnect resumes from the break point). Raw events keep their own
-    envelopes and seqs but travel in short batches to amortize token-stream framing.
+    Its queue retains every compact event and bounds only model-delta backlog during
+    disconnect. Push failures never bubble (monitoring must not drag callers). Events
+    only deliver after connect (reconnect resumes from the break point). Raw events
+    keep their own envelopes and seqs but travel in short batches to amortize
+    token-stream framing.
     """
 
     def __init__(self, url: str):
         self.url = url
-        self._q: asyncio.Queue[dict] = asyncio.Queue(maxsize=5000)
+        self._q: asyncio.Queue[dict] = asyncio.Queue()
         self._task = asyncio.create_task(self._run())
 
     async def consume(self, evt: dict) -> None:
-        """Queue one event for delivery; drops the oldest when the bounded queue is full."""
-        try:
-            self._q.put_nowait(evt)
-        except asyncio.QueueFull:
-            self._q.get_nowait()
-            self._q.put_nowait(evt)
+        """Queue one event for delivery, shedding only excess model deltas."""
+        _put_event(self._q, evt)
 
     async def _run(self) -> None:
         import websockets  # Lazy optional sink dependency.
@@ -163,8 +160,8 @@ class OtelSink:
                 return
             elif t == "session/end":
                 self._on_session_end(session, evt)
-            elif t == "model/set":
-                self._on_model_set(state, evt)
+            elif t == "agent/set" or t.startswith("agent/set/"):
+                self._on_agent_set(state, evt)
             elif t == "model/request":
                 self._on_model_request(state, evt)
             elif t.startswith("model/delta/"):
@@ -206,25 +203,34 @@ class OtelSink:
         _attrs(root, {
             "gh_puller.session": session,
             "gh_puller.label": label,
-            "gh_puller.generator": d.get("generator") or "",
             "gh_puller.run_id": d.get("runId"),
         })
 
-    def _on_model_set(self, state: dict, evt: dict) -> None:
+    def _on_agent_set(self, state: dict, evt: dict) -> None:
         d = evt["data"]
-        _attrs(state["root"], {
-            "gen_ai.provider.name": d.get("provider"),
-            "gen_ai.request.model": d.get("model"),
-            "gen_ai.request.parameters": d.get("parameters"),
-        })
+        if evt["type"] == "agent/set":
+            _attrs(state["root"], {
+                "gh_puller.agent": d.get("agent"),
+                "gh_puller.agent.config": d.get("config"),
+            })
+            return
+        facet = evt["type"].removeprefix("agent/set/")
+        _attrs(state["root"], {f"gh_puller.agent.{facet}": d.get(facet)})
 
     def _on_model_request(self, state: dict, evt: dict) -> None:
         request_id = evt["data"]["requestId"]
         stale = state["requests"].pop(request_id, None)
         if stale is not None:
             stale["span"].end(end_time=_ns(evt.get("ts")))
+        span = self._child(state, f"model:{request_id}", evt.get("ts"))
+        d = evt["data"]
+        _attrs(span, {
+            "gen_ai.provider.name": d.get("provider"),
+            "gen_ai.request.model": d.get("model"),
+            "gen_ai.request.parameters": d.get("parameters"),
+        })
         state["requests"][request_id] = {
-            "span": self._child(state, f"model:{request_id}", evt.get("ts")),
+            "span": span,
             "text": "",
             "reasoning": "",
         }

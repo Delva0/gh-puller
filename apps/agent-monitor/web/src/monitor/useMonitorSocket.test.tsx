@@ -110,9 +110,9 @@ it('loads every compact history page before publishing one canonical fold', () =
   act(() => socket.receive({
     type: 'history', session: 's1', hasMore: false, nextBeforeSeq: null,
     events: [
-      { seq: 0, ts: 1, session: 's1', type: 'session/start', data: { generator: 'custom' } },
-      { seq: 1, ts: 2, session: 's1', type: 'model/set', data: {
-        model: 'm', provider: 'p', parameters: {},
+      { seq: 0, ts: 1, session: 's1', type: 'session/start', data: { label: 'run' } },
+      { seq: 1, ts: 2, session: 's1', type: 'agent/set', data: {
+        agent: 'custom', config: { model: 'configured' },
       } },
       { seq: 2, ts: 3, session: 's1', type: 'context/set', data: {
         messages: [{ role: 'system', content: [{ type: 'text', text: 'instruction' }] }],
@@ -123,7 +123,7 @@ it('loads every compact history page before publishing one canonical fold', () =
   const snapshot = sessionStore.snapshot();
   expect(snapshot.loaded).toBe(true);
   expect(snapshot.events.map(event => event.seq)).toEqual([0, 1, 2, 3, 4, 5, 6]);
-  expect(snapshot.state.model).toMatchObject({ provider: 'p', model: 'm' });
+  expect(snapshot.state.agent).toEqual({ agent: 'custom', config: { model: 'configured' } });
   expect(snapshot.state.context.map(message => message.role))
     .toEqual(['system', 'user', 'assistant', 'user']);
 });

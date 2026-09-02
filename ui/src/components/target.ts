@@ -1,5 +1,5 @@
 // Generator → generator_config 统一 target 契约(前端侧)。配置形态分类
-// (file/object,configKind)见 gh_puller/agent/generators/__init__.py config 概念
+// (file/object,configKind)见 gh_puller/agent/adapters/__init__.py config 概念
 // 契约;本文件只写前端特有的持久化与提交规则(与后端 _strip_creds 落盘形态一致):
 // - URL/localStorage:公开部分(strippedTarget)—— file 类 = generator + config_path
 //   (路径非凭证);object 类 = generator + provider/model;

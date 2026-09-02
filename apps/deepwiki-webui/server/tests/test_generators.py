@@ -5,7 +5,7 @@
 覆盖构造参数注入(runtime_config)。引擎侧(gh_puller.deepwiki)已零 graphify/零
 生成器 SDK —— 装配契约在此验证。
 
-不调模型:generator 经 GENERATORS[gid] → _FakeGenerator 替换(零 SDK 构造副作用);
+不调模型:generator 经 AGENTS[gid] → _FakeGenerator 替换(零 SDK 构造副作用);
 MCP 建图调用面(_run_index)全部 fake(CBM_CACHE_DIR 由 conftest 钉临时根 ——
 index_ready 的 fs 判定确定性)。
 """
@@ -13,9 +13,9 @@ index_ready 的 fs 判定确定性)。
 from pathlib import Path
 
 import pytest
-from gh_puller.agent import GENERATORS
-from gh_puller.agent.generators.codex import codex_home_setup
-from gh_puller.agent.generators.dsh import dsh_cordis_path
+from gh_puller.agent import AGENTS
+from gh_puller.agent.adapters.codex import codex_home_setup
+from gh_puller.agent.adapters.dsh import dsh_cordis_path
 from gh_puller.deepwiki.utils import adapt_generator
 from gh_puller.utils import Repo
 
@@ -93,7 +93,7 @@ def test_runtime_config_injects_tooltable_by_backend(tmp_path, monkeypatch):
 def test_adapter_chain_gets_injected_graphify_config(tmp_path, monkeypatch):
     """链:runtime_config → 引擎 adapter —— 白名单透传后落地 SDK 组装 config。"""
     repo = Repo(str(tmp_path), "local")
-    monkeypatch.setitem(GENERATORS, "dsh", _FakeGenerator)
+    monkeypatch.setitem(AGENTS, "dsh", _FakeGenerator)
     monkeypatch.setattr(_FakeGenerator, "generator", "dsh")
     gc = generators.runtime_config("dsh", {}, repo=repo)
     cfg = adapt_generator("dsh", generator_config=gc, system_prompt="sys", repo=repo).config

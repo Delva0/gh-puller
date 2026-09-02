@@ -15,7 +15,7 @@
 已知简化(v1,详见 gh_puller/envs.py):克隆走 git CLI;token 上限按字符数/4 估算;
 语言仅 en/zh;聊天记忆由单次生成器会话内承。模型极简:选型 = generator +
 generator_config 两个散装参数(术语与解析唯一知识源见 utils.py docstring;
-生成器侧契约见 gh_puller.agent.generators 各生成器文件)。
+Agent 侧契约见 gh_puller.agent.adapters 各适配器文件)。
 
 本包是引擎(无 FastAPI 依赖):HTTP 端点层(SSE/WS)在 apps/deepwiki-webui/server/app.py;
 任务状态机/调度/进度投影在其 server/tasks.py。续跑落盘(resume_*)语义见 ./wiki.py。

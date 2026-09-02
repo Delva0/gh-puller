@@ -6,7 +6,7 @@
 
 - **DeepWiki 兼容问答**：`gh_puller/deepwiki/`（引擎）+ `apps/deepwiki-webui`（FastAPI 后端 + Next.js 前端）。前端契约沿用 deepwiki-open，引擎替换为 Claude Code + 代码图谱；生成单一管道（cc/dsh/codex/opencode），wiki 生成中途落盘、重启可续跑
 - **graphify 库索引**：`gh_puller/graphify.py` 封装 graphify CLI（extract/export/query）——纯本地 AST 建图，无 embedding/RAG；检索由 agent 按需调用 `graphify_query` 工具完成
-- **agent 统一入口 + 流式监控**：`gh_puller/agent/` 事件溯源式事件模型 + 文件/WS/OTel 观测通道；`apps/agent-monitor` 实时查看 CC 与 LLM 调用过程
+- **Agent 统一入口 + 流式监控**：`gh_puller/agent/` 以 `Agent × Context` fold 和关联活动统一各类 Agent；`apps/agent-monitor` 通过文件、WS 与 OTel 观测运行过程
 - **benchmark 评测框架**：`gh_puller/benchmark/` 按 REST 协议 v1 单点评测——一个题库 + 一个参赛方 endpoint，题库（`JUDGE`）自治
 - **共享 UI**：`ui/` 基础组件包 `@gh-puller/ui`，apps 经 `workspace:*` 直引源码
 
@@ -40,9 +40,9 @@ uv run benchmark gh_puller/benchmark/judges/vllm_mechanism/bank.py --url http://
 # 产物：outputs/<时间戳>/result.json
 ```
 
-**agent 可观测（可选）**
+**Agent 可观测（可选）**
 
 ```bash
 uv --directory apps/agent-monitor/server run uvicorn app:app --port 8765
-# 浏览器 :8765；LLM 调用默认自动对接（AGENT_MONITOR_WEBUI_URL 默认 ws://localhost:8765/ws）
+# 浏览器 :8765；Agent 调用默认自动对接（AGENT_MONITOR_WEBUI_URL 默认 ws://localhost:8765/ws）
 ```

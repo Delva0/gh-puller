@@ -4,7 +4,7 @@ The monitor is a local sidecar over the compact histories written by
 `gh_puller.agent.sinks.FileSink`. The producer and server share
 `AGENT_MONITOR_DIR`; those JSONL files are the durable source.
 
-- `hub.py` scans files and projects session indexes, history pages, and leases. Its
+- `hub.py` scans files and projects Agent session indexes, history pages, and leases. Its
   in-memory state is disposable and has no transport dependency.
 - `app.py` serves the viewer, handles WebSocket frames and subscriptions, and merges
   raw live events into the projection for immediate display.

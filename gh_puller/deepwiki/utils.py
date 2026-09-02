@@ -7,7 +7,7 @@ monkeypatch 位点打在本模块,不得 from-import 后裸名调用)。
 本模块 sdk-free / 零工具假设:生成器装配只做选型收敛 + 白名单透传,工具配置/
 工具指引文本全部由上层经 generator_config 覆盖构造参数注入,本层不假设
 任何工具由上层提供(图知识在 webui 组装层,见包 docstring)。生成器契约类型
-(GENERATORS/RequestFailedError)保留(生成器依赖的定义来源)。
+(AGENTS/RequestFailedError)保留(生成器依赖的定义来源)。
 
 术语:引擎内部一律说 generator;函数签名统一为 generator + generator_config
 两个散装参数;wire 字段 "target" 只在 app 层,拆分/解析经 resolve_generator
@@ -22,7 +22,7 @@ from functools import partial
 from typing import Any
 
 from .. import envs  # 模块对象绑定:属性一律调用时取(patch/强刷活性)
-from ..agent import GENERATORS, RequestFailedError
+from ..agent import AGENTS, RequestFailedError
 from ..utils import Repo
 from ..utils import _log as _utils_log
 
@@ -46,8 +46,8 @@ def resolve_generator(generator: str | None = None, generator_config: dict | Non
     boundary (DEEPWIKI_GENERATOR) — the engine never reads env for selection.
     """
     gen_id = generator or "cc"
-    if gen_id not in GENERATORS:
-        raise ValueError(f"未知 generator: {gen_id!r}(可选 {sorted(GENERATORS)})")
+    if gen_id not in AGENTS:
+        raise ValueError(f"未知 generator: {gen_id!r}(可选 {sorted(AGENTS)})")
     return gen_id, dict(generator_config or {})
 
 
@@ -191,7 +191,7 @@ def prompt_fmt(repo: Repo, *, language: str = "en") -> dict:
 def adapt_generator(generator: str | None = None, *, generator_config: dict | None = None,
             system_prompt: str = "", repo: Repo | None = None,
             generator_cache_dir: str | None = None, generator_cache_write_mode: bool = False):
-    """generator → adapter instance (converged construction entry; ≈ GENERATORS[gid](config)).
+    """generator → adapter instance (converged construction entry; ≈ AGENTS[gid](config)).
 
     generator_config passes through untouched; this layer only adds engine-base
     keys (system_prompt / cwd / tool-desk assembly) — key-set selection belongs
@@ -208,7 +208,7 @@ def adapt_generator(generator: str | None = None, *, generator_config: dict | No
     """
     gid, resolved = resolve_generator(generator, generator_config)
     if gid == "llm":
-        return GENERATORS["llm"](resolved)
+        return AGENTS["llm"](resolved)
     # 拼接:generator_config 传入的 system_prompt(用户级)在前,参数 system_prompt(task 级)追加在后
     if resolved.get("system_prompt"):
         system_prompt = f"{resolved['system_prompt']}\n\n{system_prompt}" if system_prompt else resolved["system_prompt"]
@@ -254,7 +254,7 @@ def adapt_generator(generator: str | None = None, *, generator_config: dict | No
                 options["permission_mode"] = "acceptEdits"
                 tools = ["Write", *tools]
             options["allowed_tools"] = tools
-    return GENERATORS[gid](options)
+    return AGENTS[gid](options)
 
 
 def failure(exc: Exception) -> Exception:

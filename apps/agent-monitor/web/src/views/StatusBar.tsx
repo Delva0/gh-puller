@@ -33,7 +33,7 @@ export default function StatusBar({ status, current, events, meta, duration, ste
       {meta && (
         <span className="ml-auto flex min-w-0 flex-wrap items-center gap-2">
           <StateBadge state={meta.state} label={t(`session.state.${meta.state}`)} />
-          {meta.provider && <span className="font-mono">{meta.provider}/{meta.model || '—'}</span>}
+          {meta.agent && <span className="font-mono">{meta.agent}</span>}
           <span className="font-mono">{t('meta.duration')} {duration}</span>
           {typeof steps === 'number' && steps > 0 && (
             <span className="font-mono">{t('meta.steps')} {steps}</span>

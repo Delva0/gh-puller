@@ -1,9 +1,9 @@
 # agent-monitor
 
-Agent 流式监控仪表盘(完整应用,`web/` + `server/` 两个子项目):
+Agent 流式监控应用，由 `web/` 与 `server/` 组成：
 
-- `server/` — 本地 sidecar(`hub.py` 投影共享 JSONL 历史,`app.py` 承担 FastAPI/WS 与 viewer 静态入口;独立 uv 项目,经 path 依赖吃根 `gh-puller` 包)
-- `web/` — React/Vite 查看端(单一 canonical fold 驱动原生 Context/Events 视图;单文件构建 → `server/static/agent_monitor_viewer.html`;根 pnpm 工作区成员,共享基础组件包 `@gh-puller/ui` 源码在 `ui/`)
+- `server/` — 本地 sidecar。`hub.py` 投影共享 JSONL 历史，`app.py` 提供 FastAPI、WS 与 viewer 静态入口。
+- `web/` — React/Vite 查看端。单一 canonical fold 驱动原生 Agent、Context 与 Events 视图，构建为 `server/static/agent_monitor_viewer.html`。
 
 `web/src/` 中，`events/` 只包含事件状态与折叠，`monitor/` 负责 hub 同步，
 `views/` 直接渲染折叠结果，`vendor/dsh/` 只提供视觉原语。
@@ -24,7 +24,7 @@ pnpm --dir apps/agent-monitor/web dev
 pnpm --dir apps/agent-monitor/web build
 ```
 
-浏览器打开 `http://localhost:8765/` 即查看端;生产侧 LLM 调用默认自动对接
+浏览器打开 `http://localhost:8765/`。生产侧 Agent 调用默认自动对接
 (`AGENT_MONITOR_WEBUI_URL` 默认 `ws://localhost:8765/ws` 且 hub 可达才注册;
 可逗号分隔多个 hub),实时上屏。
 生产进程的 FileSink 与 server 必须共享 `AGENT_MONITOR_DIR`;JSONL 是持久事实源，

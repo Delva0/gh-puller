@@ -24,14 +24,16 @@ function messagePreview(data: Record<string, unknown>): string {
 
 function eventSummary(event: EventEnvelope, request?: ModelActivity): string {
   const data = event.data;
-  if (event.type === 'session/start') return String(data.label ?? data.generator ?? '');
+  if (event.type === 'session/start') return String(data.label ?? '');
   if (event.type === 'session/end') return String(data.outcome ?? '');
   if (event.type === 'session/error') {
     const error = data.error as { message?: unknown } | undefined;
     return String(error?.message ?? data.scope ?? '');
   }
-  if (event.type === 'model/set') {
-    return [data.provider, data.model].filter(Boolean).map(String).join('/');
+  if (event.type === 'agent/set') return String(data.agent ?? '');
+  if (event.type.startsWith('agent/set/')) {
+    const facet = event.type.slice('agent/set/'.length);
+    return JSON.stringify(data[facet]);
   }
   if (event.type === 'context/set') {
     return `${Array.isArray(data.messages) ? data.messages.length : 0} messages`;
@@ -39,7 +41,8 @@ function eventSummary(event: EventEnvelope, request?: ModelActivity): string {
   if (event.type.startsWith('context/append')) return messagePreview(data);
   if (event.type === 'model/request') {
     const suffix = request === undefined ? '' : ` · ${request.deltaCount} deltas`;
-    return `${String(data.requestId ?? '')}${suffix}`;
+    const target = [data.provider, data.model].filter(Boolean).map(String).join('/');
+    return `${String(data.requestId ?? '')}${target ? ` · ${target}` : ''}${suffix}`;
   }
   if (event.type === 'model/response') return String(data.stopReason ?? data.requestId ?? '');
   if (event.type === 'tool/start') return `${String(data.name ?? '')} · ${String(data.callId ?? '')}`;
@@ -50,7 +53,8 @@ function eventSummary(event: EventEnvelope, request?: ModelActivity): string {
 }
 
 function tone(type: string): string {
-  if (type === 'model/set' || type.startsWith('context/')) return 'border-l-violet-400';
+  if (type.startsWith('agent/')) return 'border-l-violet-400';
+  if (type.startsWith('context/')) return 'border-l-emerald-400';
   if (type.startsWith('model/')) return 'border-l-blue-400';
   if (type.startsWith('tool/')) return 'border-l-amber-400';
   if (type.endsWith('/error') || type === 'session/error') return 'border-l-red-400';
@@ -143,10 +147,10 @@ export default function EventsView({ events, requests }: {
               <>
                 <details className="ml-14 mt-1 text-xs">
                   <summary className="cursor-pointer select-none text-[var(--muted)]">
-                    {t('event.requestState')}
+                    {t('event.stateAtRequest')}
                   </summary>
                   <div className="mt-1 overflow-hidden rounded border border-[var(--border-color)]">
-                    {jsonValue(request.requestState)}
+                    {jsonValue(request.stateAtRequest)}
                   </div>
                 </details>
                 <StreamDeltas events={deltasByRequest.get(request.requestId) ?? []} />

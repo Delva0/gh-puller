@@ -11,14 +11,13 @@ export interface Message {
   [key: string]: unknown
 }
 
-export interface ModelState {
-  model: string
-  provider?: string
-  parameters: Record<string, unknown>
+export interface AgentState {
+  agent: string | null
+  config: Record<string, unknown>
 }
 
-export interface RequestState {
-  model: ModelState | null
+export interface CanonicalState {
+  agent: AgentState | null
   context: Message[]
 }
 
@@ -41,7 +40,8 @@ export interface EventEnvelope {
 export interface ModelActivity {
   requestId: string
   requestSeq: number
-  requestState: RequestState
+  request: Record<string, unknown>
+  stateAtRequest: CanonicalState
   responseSeq?: number
   text: string
   reasoning: string

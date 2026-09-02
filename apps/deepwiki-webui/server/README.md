@@ -28,7 +28,7 @@ uv --directory apps/deepwiki-webui/server run uvicorn app:app --port 8001
   自 cwd 向上找仓库根 `.env`,先于任何 gh_puller 导入与本模块快照；仓库根 `.env` 已 gitignore,
   可放 `ANTHROPIC_API_KEY`/`ANTHROPIC_BASE_URL` 等进程级兜底凭证（由 agent SDK 直读进程环境）
 - target 契约:generator + generator_config(cc/dsh/codex/opencode = 本地配置文件路径 `config_path`,
-  服务端纯透传给生成器),见 `gh_puller/agent/generators:GENERATORS`;
+  服务端纯透传给 Agent),见 `gh_puller/agent/adapters:AGENTS`;
   gh-puller-mcp 工具桌由本目录 `generators.py` 经 `runtime_config` 注入 generator_config
   (引擎 adapter 只做白名单透传);工具桌档位 scout(只读正查面),变更面(index_repository 等)
   仅服务器进程内建图使用

@@ -2,7 +2,7 @@
 
     uv run python apps/gh-puller-mcp/examples/cc_mcp_vllm.py
 
-展示的 gh_puller.agent API(契约一律见 gh_puller/agent/generators/__init__.py 包
+展示的 gh_puller.agent API(契约一律见 gh_puller/agent/adapters/__init__.py 包
 docstring):ClaudeCode(config) 构造期注入 config,键集白名单见 ClaudeConfig ——
 mcp_servers 经 ClaudeAgentOptions 透传(SDK 子进程启动 stdio MCP 服务器);
 `async with cc.session(...)` 一次上游对话;stream/result 契约见包 docstring。

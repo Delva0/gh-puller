@@ -32,7 +32,8 @@ export default function SessionList({ sessions, current, onSelect, onDelete, que
         if (stateFilter !== 'all' && s.state !== stateFilter) return false;
         const q = query.trim().toLowerCase();
         if (!q) return true;
-        return `${s.label} ${s.session} ${s.run_id ?? ''}`.toLowerCase().includes(q);
+        return `${s.label} ${s.session} ${s.run_id ?? ''} ${s.agent ?? ''}`
+          .toLowerCase().includes(q);
       }),
     [sessions, query, stateFilter],
   );
@@ -64,9 +65,9 @@ export default function SessionList({ sessions, current, onSelect, onDelete, que
               }`}
             >
               <span className="flex-1 truncate font-mono">{s.label}</span>
-              {(s.generator || s.provider) && (
+              {s.agent && (
                 <span className="font-mono text-[10px] text-[var(--muted)]">
-                  {s.generator ? `${s.generator}·` : ''}{s.provider || '—'}/{s.model || '—'}
+                  {s.agent}
                 </span>
               )}
               <StateBadge state={s.state} label={t(`session.state.${s.state}`)} />

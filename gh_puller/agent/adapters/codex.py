@@ -7,9 +7,8 @@ import shutil
 from pathlib import Path
 from typing import Any, TypedDict
 
+from ..base import BaseAgent, RequestFailedError
 from ..events import EventRecorder, _normalize_usage
-from .base import BaseGenerator
-from .utils import RequestFailedError
 
 
 class CodexConfig(TypedDict, total=False):
@@ -205,7 +204,8 @@ def _codex_tool_name(server: str, tool: str) -> str:
 class _CodexSynth:
     """Hold notification assembly state for one Codex call."""
 
-    def __init__(self):
+    def __init__(self, request_id: str):
+        self.request_id = request_id
         self.turn_id: str | None = None
         self.agent_pieces: dict[str, list[str]] = {}
         self.reasoning_seen: set[str] = set()
@@ -279,7 +279,7 @@ def _flush_codex_tools(event_recorder: EventRecorder, st: _CodexSynth) -> None:
             "name": spec["name"], "arguments": arguments,
         })
     message = {"role": "assistant", "content": content}
-    event_recorder.model_response(message)
+    event_recorder.model_response(message, request_id=st.request_id)
     event_recorder.append_context(message)
     for spec in st.pending_tools:
         event_recorder.tool_start(spec["call_id"], spec["name"], spec["arguments"])
@@ -298,14 +298,14 @@ def _codex_item_completed(event_recorder: EventRecorder, st: _CodexSynth, payloa
         pieces = st.agent_pieces.get(item_id) or []
         text = "".join(pieces) or (getattr(item, "text", None) or "")
         if not pieces and text:
-            event_recorder.text(text)
+            event_recorder.text(text, request_id=st.request_id)
         if text:
             st.final_response = text
         message = {"role": "assistant", "content": [{"type": "text", "text": text}]}
         phase = getattr(item, "phase", None)
         if phase is not None:
             message["content"][0]["phase"] = codex_val(phase)
-        event_recorder.model_response(message)
+        event_recorder.model_response(message, request_id=st.request_id)
         event_recorder.append_context(message)
         return [text] if not pieces and text else []
     if itype in ("dynamicToolCall", "mcpToolCall", "commandExecution"):
@@ -320,13 +320,13 @@ def _codex_item_completed(event_recorder: EventRecorder, st: _CodexSynth, payloa
         if not pieces:
             return []
         if item_id not in st.reasoning_seen:
-            event_recorder.reasoning("".join(pieces))
+            event_recorder.reasoning("".join(pieces), request_id=st.request_id)
         return []
     if itype == "plan":
         text = getattr(item, "text", None) or ""
         if text and item_id not in st.plan_items:
             st.plan_items.add(item_id)
-            event_recorder.delta("text", index=0, text=text)
+            event_recorder.delta("text", request_id=st.request_id, index=0, text=text)
         return []
     if itype == "webSearch":
         # The started web-search item is empty; only completed carries useful data.
@@ -379,14 +379,15 @@ def _handle_codex_notification(event_recorder: EventRecorder, st: _CodexSynth, n
         if itype in ("agentMessage", "reasoning", "plan") and st.tool_round_open:
             _flush_codex_tools(event_recorder, st)
             st.tool_round_open = False
-            event_recorder.step_boundary()
+            event_recorder.begin_step()
+            st.request_id = event_recorder.model_request()
         return []
     if method == "item/agentMessage/delta":
         text = getattr(payload, "delta", None) or ""
         if not text:
             return []
         st.agent_pieces.setdefault(getattr(payload, "item_id", None) or "", []).append(text)
-        event_recorder.text(text)
+        event_recorder.text(text, request_id=st.request_id)
         return [text]
     if method in ("item/reasoning/textDelta", "item/reasoning/summaryTextDelta"):
         delta = getattr(payload, "delta", None) or ""
@@ -396,13 +397,16 @@ def _handle_codex_notification(event_recorder: EventRecorder, st: _CodexSynth, n
             index = (getattr(payload, "content_index", None)
                      if method == "item/reasoning/textDelta"
                      else getattr(payload, "summary_index", None))
-            event_recorder.reasoning(delta, index=index if index is not None else 0)
+            event_recorder.reasoning(
+                delta, request_id=st.request_id,
+                index=index if index is not None else 0)
         return []
     if method == "item/plan/delta":
         delta = getattr(payload, "delta", None) or ""
         if delta:
             st.plan_items.add(getattr(payload, "item_id", None) or "")
-            event_recorder.delta("text", index=0, text=delta)
+            event_recorder.delta(
+                "text", request_id=st.request_id, index=0, text=delta)
         return []
     if method == "item/completed":
         return _codex_item_completed(event_recorder, st, payload)
@@ -424,14 +428,10 @@ async def _codex_drain(handle, event_recorder: EventRecorder, st: _CodexSynth):
         raise RequestFailedError("turn 未收到完成事件")
 
 
-class Codex(BaseGenerator):
+class Codex(BaseAgent):
     """Run reusable Codex SDK calls from an isolated Codex home."""
 
-    generator = "codex"
-    provider = "openai"
-    model_parameter_keys = (
-        "effort", "output_schema", "personality", "service_tier", "summary",
-    )
+    agent = "codex"
 
     def __init__(self, config: dict):
         super().__init__(config)
@@ -439,18 +439,6 @@ class Codex(BaseGenerator):
 
         self._codex = AsyncCodex(config=codex_config(config))
         self._thread = None
-
-    def _initial_context(self) -> list[dict]:
-        context = []
-        if prompt := self.config.get("base_instructions") or self.config.get("system_prompt"):
-            context.append({
-                "role": "system", "content": [{"type": "text", "text": prompt}],
-            })
-        if prompt := self.config.get("developer_instructions"):
-            context.append({
-                "role": "developer", "content": [{"type": "text", "text": prompt}],
-            })
-        return context
 
     async def _enter(self):
         await self._codex.__aenter__()
@@ -462,6 +450,15 @@ class Codex(BaseGenerator):
                 auth.unlink()
             await self._codex.login_api_key(token)
         self._thread = await self._codex.thread_start(**codex_thread(config))
+        recorder = self._require_event_recorder()
+        if prompt := config.get("base_instructions") or config.get("system_prompt"):
+            recorder.append_context({
+                "role": "system", "content": [{"type": "text", "text": prompt}],
+            })
+        if prompt := config.get("developer_instructions"):
+            recorder.append_context({
+                "role": "developer", "content": [{"type": "text", "text": prompt}],
+            })
 
     async def _exit(self, exc):
         self._thread = None
@@ -474,8 +471,7 @@ class Codex(BaseGenerator):
         event_recorder.begin_turn()
         event_recorder.append_context({"role": "user", "content": [{"type": "text", "text": prompt}]})
         event_recorder.begin_step()
-        event_recorder.model_request()
-        st = _CodexSynth()
+        st = _CodexSynth(event_recorder.model_request())
         timeout = config.get("timeout_seconds")
         handle = await self._thread.turn(prompt, **codex_turn(config))
 
@@ -496,8 +492,7 @@ class Codex(BaseGenerator):
         event_recorder.begin_turn()
         event_recorder.append_context({"role": "user", "content": [{"type": "text", "text": prompt}]})
         event_recorder.begin_step()
-        event_recorder.model_request()
-        st = _CodexSynth()
+        st = _CodexSynth(event_recorder.model_request())
         timeout = config.get("timeout_seconds")
         handle = await self._thread.turn(prompt, **codex_turn(config))
         if timeout is not None:

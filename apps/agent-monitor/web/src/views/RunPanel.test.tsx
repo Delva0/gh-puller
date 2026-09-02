@@ -19,7 +19,7 @@ function props(fold: RunFold) {
     events: fold.all(),
     requests: fold.modelActivity(),
     tools: fold.toolActivity(),
-    activeModel: fold.activeModel(),
+    activeModels: fold.activeModels(),
   };
 }
 
@@ -48,10 +48,10 @@ function render(fold: RunFold) {
 }
 
 describe('native canonical run view', () => {
-  it('renders model, complete context, tool correlation, and generic fallbacks', () => {
+  it('renders Agent, complete Context, tool correlation, and generic fallbacks', () => {
     const fold = new RunFold();
     fold.applyBatch([
-      evt('model/set', 0, { model: 'm', provider: 'p', parameters: { temperature: 0 } }),
+      evt('agent/set', 0, { agent: 'custom', config: { model: 'configured' } }),
       evt('context/set', 1, { messages: [{
         role: 'system',
         content: [
@@ -60,7 +60,7 @@ describe('native canonical run view', () => {
         ],
       }] }),
       evt('context/append/user', 2, { content: [{ type: 'text', text: 'question' }] }),
-      evt('model/request', 3, { requestId: 'r1' }),
+      evt('model/request', 3, { requestId: 'r1', model: 'actual' }),
       evt('model/delta/tool-call', 4, {
         requestId: 'r1', index: 0, callId: 'c1', name: 'read', argumentsDelta: '{"path":"a.py"}',
       }),
@@ -84,7 +84,7 @@ describe('native canonical run view', () => {
     ]);
     render(fold);
 
-    expect(container.querySelector('[data-model-name]')?.textContent).toBe('p/m');
+    expect(container.querySelector('[data-agent-name]')?.textContent).toBe('custom');
     expect(container.textContent).toContain('system instruction');
     expect(container.textContent).toContain('tool_definition · read');
     expect(container.textContent).toContain('question');
@@ -127,7 +127,7 @@ describe('native canonical run view', () => {
     expect(container.querySelector('[data-event-type="model/request"]')?.textContent)
       .toContain('2 deltas');
     expect(container.querySelector('[data-event-type="model/delta/text"]')).toBeNull();
-    expect(container.textContent).toContain('request state');
+    expect(container.textContent).toContain('state at request');
     expect(container.textContent).toContain('stream deltas (2)');
   });
 });

@@ -8,9 +8,9 @@ export const monitorMessages = {
     'view.noContext': 'No context',
     'view.noEvents': 'No events',
     'event.payload': 'payload',
-    'event.requestState': 'request state',
+    'event.stateAtRequest': 'state at request',
     'event.streamDeltas': 'stream deltas',
-    'model.parameters': 'parameters',
+    'agent.config': 'configuration',
     'model.waiting': 'waiting for model output…',
   },
   zh: {
@@ -20,9 +20,9 @@ export const monitorMessages = {
     'view.noContext': '暂无上下文',
     'view.noEvents': '暂无事件',
     'event.payload': '载荷',
-    'event.requestState': '请求状态',
+    'event.stateAtRequest': '请求时状态',
     'event.streamDeltas': '流式增量',
-    'model.parameters': '参数',
+    'agent.config': '配置',
     'model.waiting': '等待模型输出…',
   },
 };

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { RunFold } from './fold'
-import { foldRequestState, requestStateAt } from './state'
+import { foldState, stateAt } from './state'
 import type { EventEnvelope } from './types'
 
 function evt(type: string, seq: number, data: Record<string, unknown> = {}): EventEnvelope {
@@ -11,10 +11,10 @@ function append(role: string, seq: number, value: string): EventEnvelope {
   return evt(`context/append/${role}`, seq, { content: [{ type: 'text', text: value }] })
 }
 
-describe('canonical request-state fold', () => {
-  it('restores model and context at any event prefix', () => {
+describe('canonical state fold', () => {
+  it('restores Agent and Context at any event prefix', () => {
     const events = [
-      evt('model/set', 0, { model: 'm1', provider: 'p', parameters: {} }),
+      evt('agent/set', 0, { agent: 'custom', config: { mode: 'default', cwd: '/x' } }),
       evt('context/set', 1, { messages: [{
         role: 'system',
         content: [
@@ -23,32 +23,31 @@ describe('canonical request-state fold', () => {
         ],
       }] }),
       append('user', 2, 'q'),
-      evt('model/request', 3, { requestId: 'r1' }),
+      evt('model/request', 3, { requestId: 'r1', model: 'm1', provider: 'p' }),
       append('assistant', 4, 'a'),
-      evt('model/set', 5, { model: 'm2', parameters: { temperature: 0 } }),
-      evt('model/request', 6, { requestId: 'r2' }),
+      evt('agent/set/mode', 5, { mode: 'plan' }),
+      evt('model/request', 6, { requestId: 'r2', model: 'm2' }),
     ]
-    expect(requestStateAt(events, 3).context.map(message => message.role))
+    expect(stateAt(events, 3).context.map(message => message.role))
       .toEqual(['system', 'user'])
-    const state = foldRequestState(events)
-    expect(state.model).toMatchObject({ model: 'm2', parameters: { temperature: 0 } })
+    const state = foldState(events)
+    expect(state.agent).toEqual({ agent: 'custom', config: { mode: 'plan', cwd: '/x' } })
     expect(state.context[0].content[1]).toMatchObject({ type: 'tool_definition', name: 'read' })
     expect(state.context.map(message => message.role)).toEqual(['system', 'user', 'assistant'])
 
     const request = new RunFold()
     request.applyBatch(events)
     const requests = request.modelActivity()
-    expect(requests[0].requestState).toMatchObject({
-      model: { model: 'm1', provider: 'p' },
+    expect(requests[0].stateAtRequest).toMatchObject({
+      agent: { agent: 'custom', config: { mode: 'default' } },
       context: [{ role: 'system' }, { role: 'user' }],
     })
-    expect(requests[1].requestState.model).toMatchObject({
-      model: 'm2', parameters: { temperature: 0 },
-    })
+    expect(requests[0].request).toMatchObject({ model: 'm1', provider: 'p' })
+    expect(requests[1].stateAtRequest.agent?.config.mode).toBe('plan')
   })
 
   it('context/set replaces the complete sequence and generic append keeps custom roles', () => {
-    const state = foldRequestState([
+    const state = foldState([
       append('user', 0, 'old'),
       evt('context/set', 1, {
         messages: [{ role: 'assistant', content: [{ type: 'text', text: 'summary' }] }],
@@ -89,7 +88,7 @@ describe('RunFold', () => {
 
   it('keeps replayable state identical when stream deltas are compacted away', () => {
     const raw = [
-      evt('model/set', 0, { model: 'm', parameters: {} }),
+      evt('agent/set', 0, { agent: 'custom', config: { model: 'configured' } }),
       evt('context/set', 1, { messages: [] }),
       evt('turn/start', 2),
       evt('step/start', 3),
@@ -125,5 +124,21 @@ describe('RunFold', () => {
       callId: 'c1', name: 'read', arguments: { path: 'a.py' }, result: 'body',
     })
     expect(fold.state().context).toHaveLength(1)
+  })
+
+  it('tracks interleaved model requests independently', () => {
+    const fold = new RunFold()
+    fold.applyBatch([
+      evt('model/request', 0, { requestId: 'left', model: 'planner' }),
+      evt('model/request', 1, { requestId: 'right', model: 'writer' }),
+      evt('model/delta/text', 2, { requestId: 'right', index: 0, text: 'R' }),
+      evt('model/delta/text', 3, { requestId: 'left', index: 0, text: 'L' }),
+      evt('model/response', 4, {
+        requestId: 'left', message: { role: 'assistant', content: [{ type: 'text', text: 'L' }] },
+      }),
+    ])
+    expect(fold.modelActivity().map(request => [request.requestId, request.text]))
+      .toEqual([['left', 'L'], ['right', 'R']])
+    expect(fold.activeModels().map(request => request.requestId)).toEqual(['right'])
   })
 })

@@ -1,9 +1,10 @@
-/** Fold canonical state events into the exact model request state at any prefix. */
+/** Fold canonical Agent and Context state at any event prefix. */
 
-import type { EventEnvelope, Message, RequestState } from './types'
+import type { AgentState, CanonicalState, EventEnvelope, Message } from './types'
 
 export const CONTEXT_APPEND_TYPES = new Set([
   'context/append',
+  'context/append/system',
   'context/append/user',
   'context/append/assistant',
   'context/append/tool',
@@ -16,16 +17,30 @@ export function appendedMessage(evt: EventEnvelope): Message | null {
   return data
 }
 
-export function emptyRequestState(): RequestState {
-  return { model: null, context: [] }
+function agentFacet(type: string): string | null {
+  if (!type.startsWith('agent/set/')) return null
+  const facet = type.slice('agent/set/'.length)
+  return facet !== '' && !facet.includes('/') ? facet : null
 }
 
-export function applyStateEvent(state: RequestState, evt: EventEnvelope): boolean {
-  if (evt.type === 'model/set') {
-    state.model = {
-      model: String(evt.data.model),
-      ...(typeof evt.data.provider === 'string' ? { provider: evt.data.provider } : {}),
-      parameters: (evt.data.parameters ?? {}) as Record<string, unknown>,
+export function emptyState(): CanonicalState {
+  return { agent: null, context: [] }
+}
+
+export function applyStateEvent(state: CanonicalState, evt: EventEnvelope): boolean {
+  if (evt.type === 'agent/set') {
+    state.agent = {
+      agent: typeof evt.data.agent === 'string' ? evt.data.agent : null,
+      config: { ...((evt.data.config ?? {}) as Record<string, unknown>) },
+    }
+    return true
+  }
+  const facet = agentFacet(evt.type)
+  if (facet !== null) {
+    const agent: AgentState = state.agent ?? { agent: null, config: {} }
+    state.agent = {
+      ...agent,
+      config: { ...agent.config, [facet]: evt.data[facet] },
     }
     return true
   }
@@ -39,12 +54,12 @@ export function applyStateEvent(state: RequestState, evt: EventEnvelope): boolea
   return true
 }
 
-export function foldRequestState(events: EventEnvelope[]): RequestState {
-  const state = emptyRequestState()
+export function foldState(events: EventEnvelope[]): CanonicalState {
+  const state = emptyState()
   for (const evt of [...events].sort((a, b) => a.seq - b.seq)) applyStateEvent(state, evt)
   return state
 }
 
-export function requestStateAt(events: EventEnvelope[], seq: number): RequestState {
-  return foldRequestState(events.filter(evt => evt.seq < seq))
+export function stateAt(events: EventEnvelope[], seq: number): CanonicalState {
+  return foldState(events.filter(evt => evt.seq < seq))
 }

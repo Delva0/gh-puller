@@ -41,7 +41,7 @@ IMPORTANT:You MUST respond in {language_name} language.
 </guidelines>"""  # noqa: E501 - prompt 原文移植,单行语义不拆
 
 # ---------------------------------------------------------------------------
-# 对话历史转写(自然转写)
+# Natural conversation history rendering
 # ---------------------------------------------------------------------------
 
 

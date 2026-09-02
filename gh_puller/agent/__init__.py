@@ -1,11 +1,12 @@
-"""Expose agent generators and observation configuration.
+"""Expose Agent adapters and observation configuration.
 
-Generators live in ``generators``; the canonical protocol and replay fold live in
+Concrete integrations live in ``adapters``; the canonical language and fold live in
 ``events``; delivery channels live in ``sinks``.
 """
 
-from .generators import (
-    GENERATORS,
+from .adapters import (
+    AGENTS,
+    BaseAgent,
     ClaudeCode,
     ClaudeConfig,
     Codex,
@@ -21,7 +22,8 @@ from .generators import (
 from .sinks import configure
 
 __all__ = [
-    "GENERATORS",
+    "AGENTS",
+    "BaseAgent",
     "ClaudeCode",
     "ClaudeConfig",
     "Codex",

@@ -181,17 +181,13 @@ def runtime_config(generator: str | None = None, generator_config: dict | None =
     """
     result = dict(generator_config or {})
     gid, _ = resolve_generator(generator, generator_config)
-    if gid == "cc":
-        if cfg := result.pop("config_path", None):
-            result["settings"] = cfg
-    elif gid == "opencode":
-        if cfg := result.pop("config_path", None):
-            result["config"] = cfg
+    if gid == "cc" and (cfg := result.pop("config_path", None)):
+        result["settings"] = cfg
+    elif gid == "opencode" and (cfg := result.pop("config_path", None)):
+        result["config"] = cfg
     # codex keeps config_path; dsh has no config_path concept — nothing to adapt.
     if repo is None:
         return result
-    # if gid != "llm":
-    #     result["system_prompt"] = _GRAPH_FIRST_SYSTEM_PROMPT  # 图工具优先指引(无工具桌的 llm 不注入)
     if gid == "dsh":
         result["mcp_servers"] = _gh_puller_mcp("dsh")
     elif gid in ("codex", "opencode"):

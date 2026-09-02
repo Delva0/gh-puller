@@ -5,9 +5,9 @@ import { useLanguage } from '@gh-puller/ui';
 import { JsonTree, MarkdownText } from '../vendor/dsh';
 import type {
   Block,
+  CanonicalState,
   Message,
   ModelActivity,
-  RequestState,
   ToolActivity,
 } from '../events/types';
 
@@ -189,9 +189,10 @@ function LiveAssistant({ activity, tools, committedCalls }: {
     <article
       className="rounded-lg border border-[var(--accent-primary)]/40 bg-[var(--card-bg)] px-4 py-3"
       data-live-assistant
+      data-request-id={activity.requestId}
     >
       <div className="mb-2 text-[10px] uppercase tracking-wide text-[var(--muted)]">
-        assistant · streaming
+        assistant · streaming · {activity.requestId}
       </div>
       {blocks.length === 0 ? (
         <span className="text-xs text-[var(--muted)]">{t('model.waiting')}</span>
@@ -209,10 +210,10 @@ function LiveAssistant({ activity, tools, committedCalls }: {
   );
 }
 
-export default function ContextView({ state, tools, activeModel }: {
-  state: RequestState;
+export default function ContextView({ state, tools, activeModels }: {
+  state: CanonicalState;
   tools: ToolActivity[];
-  activeModel: ModelActivity | null;
+  activeModels: ModelActivity[];
 }) {
   const { t } = useLanguage();
   const toolMap = useMemo(() => new Map(tools.map(tool => [tool.callId, tool])), [tools]);
@@ -226,20 +227,18 @@ export default function ContextView({ state, tools, activeModel }: {
     <div className="mx-auto flex w-full max-w-4xl flex-col gap-3 p-4" data-context-view>
       <section className="rounded-lg border border-[var(--border-color)] bg-[var(--background)] px-4 py-3">
         <div className="flex items-center gap-2">
-          <span className="text-[10px] uppercase tracking-wide text-[var(--muted)]">model</span>
-          <span className="font-mono text-xs font-medium" data-model-name>
-            {state.model === null
-              ? 'unset'
-              : [state.model.provider, state.model.model].filter(Boolean).join('/')}
+          <span className="text-[10px] uppercase tracking-wide text-[var(--muted)]">agent</span>
+          <span className="font-mono text-xs font-medium" data-agent-name>
+            {state.agent?.agent ?? 'unset'}
           </span>
         </div>
-        {state.model !== null && Object.keys(state.model.parameters).length > 0 && (
+        {state.agent !== null && Object.keys(state.agent.config).length > 0 && (
           <details className="mt-2 text-xs">
             <summary className="cursor-pointer select-none text-[var(--muted)]">
-              {t('model.parameters')}
+              {t('agent.config')}
             </summary>
             <div className="mt-2 overflow-hidden rounded border border-[var(--border-color)]">
-              {jsonValue(state.model.parameters)}
+              {jsonValue(state.agent.config)}
             </div>
           </details>
         )}
@@ -252,14 +251,15 @@ export default function ContextView({ state, tools, activeModel }: {
           committedCalls={committedCalls}
         />
       ))}
-      {activeModel !== null && (
+      {activeModels.map(activity => (
         <LiveAssistant
-          activity={activeModel}
+          key={activity.requestId}
+          activity={activity}
           tools={toolMap}
           committedCalls={committedCalls}
         />
-      )}
-      {state.context.length === 0 && activeModel === null && (
+      ))}
+      {state.context.length === 0 && activeModels.length === 0 && (
         <div className="py-8 text-center text-sm text-[var(--muted)]">
           {t('view.noContext')}
         </div>

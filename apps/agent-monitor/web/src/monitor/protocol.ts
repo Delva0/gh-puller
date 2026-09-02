@@ -6,9 +6,7 @@ export interface SessionMeta {
   session: string;
   run_id?: string | null;
   label: string;
-  generator?: string;
-  provider?: string;
-  model?: string;
+  agent?: string;
   state: 'running' | 'completed' | 'aborted';
   ts: number;
   last_ts: number;
