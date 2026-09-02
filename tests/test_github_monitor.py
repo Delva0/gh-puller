@@ -21,7 +21,7 @@ def _writer(database: Path, repository: str = "acme/widgets") -> monitor.Managed
     resolved = database.resolve()
     identity = hashlib.sha256(os.fsencode(resolved)).hexdigest()
     return monitor.ManagedWriter(
-        unit=f"gh-puller-{identity}.service",
+        unit=f"gh-puller-{identity[:12]}.service",
         identity=identity,
         repository=repository,
         database=resolved,
@@ -61,10 +61,17 @@ def _status(database: Path, progress: monitor.ProgressState | None = None) -> mo
     )
 
 
-def _write_unit(database: Path, units: Path, repository: str = "acme/widgets") -> Path:
+def _write_unit(
+    database: Path,
+    units: Path,
+    repository: str = "acme/widgets",
+    *,
+    full_digest: bool = False,
+) -> Path:
     writer = _writer(database, repository)
     units.mkdir(exist_ok=True)
-    path = units / writer.unit
+    unit = f"gh-puller-{writer.identity}.service" if full_digest else writer.unit
+    path = units / unit
     path.write_text(
         f"# gh-puller-repository={repository}\n# gh-puller-database={database.resolve()}\n[Unit]\n",
     )
@@ -197,8 +204,10 @@ def test_managed_writers_require_matching_path_identity(tmp_path: Path) -> None:
     units = tmp_path / "units"
     first = tmp_path / "a.sqlite3"
     second = tmp_path / "b.sqlite3"
+    third = tmp_path / "c.sqlite3"
     _write_unit(first, units)
     _write_unit(second, units, "acme/other")
+    _write_unit(third, units, "acme/legacy", full_digest=True)
     (units / f"gh-puller-{'0' * 64}.service").write_text(
         f"# gh-puller-repository=acme/invalid\n# gh-puller-database={first.resolve()}\n",
     )
@@ -207,7 +216,11 @@ def test_managed_writers_require_matching_path_identity(tmp_path: Path) -> None:
     writers = monitor._managed_writers(units)
     selected = monitor._managed_writers(units, second)
 
-    assert {writer.database for writer in writers} == {first.resolve(), second.resolve()}
+    assert {writer.database for writer in writers} == {
+        first.resolve(),
+        second.resolve(),
+        third.resolve(),
+    }
     assert [writer.database for writer in selected] == [second.resolve()]
 
 

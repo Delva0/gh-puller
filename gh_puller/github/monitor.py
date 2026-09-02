@@ -21,14 +21,14 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-_UNIT = re.compile(r"gh-puller-([0-9a-f]{64})\.service\Z")
+_UNIT = re.compile(r"gh-puller-([0-9a-f]{12}|[0-9a-f]{64})\.service\Z")
 _PROGRESS_TYPE = "github_pull_progress"
 _JOURNAL_LINES = 512
 
 
 @dataclass(frozen=True, slots=True)
 class ManagedWriter:
-    unit: str  # Hash-only systemd unit name.
+    unit: str  # Path-hash systemd unit name.
     identity: str  # Full database-path digest.
     repository: str  # Bound GitHub owner/repo.
     database: Path  # Canonical SQLite destination.
@@ -95,7 +95,7 @@ def _managed_writers(systemd_dir: Path, database: Path | None = None) -> list[Ma
             continue
         resolved = Path(destination).resolve()
         identity = hashlib.sha256(os.fsencode(resolved)).hexdigest()
-        if identity != match[1] or (selected is not None and resolved != selected):
+        if not identity.startswith(match[1]) or (selected is not None and resolved != selected):
             continue
         writers.append(
             ManagedWriter(
@@ -252,7 +252,7 @@ def _render_detail(status: WriterStatus, now: datetime | None = None) -> str:
     observed_at = datetime.now(UTC) if now is None else now.astimezone(UTC)
     progress = status.progress
     rows = [
-        ("WRITER", status.writer.identity),
+        ("WRITER", status.writer.identity[:12]),
         ("STATE", _service_detail(status.service)),
         ("REPOSITORY", status.writer.repository),
         ("DATABASE", str(status.writer.database)),

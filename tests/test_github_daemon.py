@@ -18,6 +18,12 @@ _REPOSITORY = "acme/widgets"
 
 def _unit_for(database: Path) -> str:
     canonical = str(database.resolve())
+    identity = hashlib.sha256(canonical.encode()).hexdigest()[:12]
+    return f"gh-puller-{identity}.service"
+
+
+def _full_digest_unit_for(database: Path) -> str:
+    canonical = str(database.resolve())
     identity = hashlib.sha256(canonical.encode()).hexdigest()
     return f"gh-puller-{identity}.service"
 
@@ -37,9 +43,16 @@ def _bind_archive(
         )
 
 
-def _write_managed_unit(units: Path, database: Path, repository: str = _REPOSITORY) -> Path:
+def _write_managed_unit(
+    units: Path,
+    database: Path,
+    repository: str = _REPOSITORY,
+    *,
+    full_digest: bool = False,
+) -> Path:
     units.mkdir(exist_ok=True)
-    unit = units / _unit_for(database)
+    name = _full_digest_unit_for(database) if full_digest else _unit_for(database)
+    unit = units / name
     unit.write_text(
         f"# gh-puller-repository={repository}\n# gh-puller-database={database.resolve()}\n[Unit]\n",
     )
@@ -150,6 +163,23 @@ def test_install_is_idempotent_and_uninstall_preserves_archive(tmp_path: Path) -
     assert calls.count(f"reset-failed {unit_name}") == 2
 
 
+def test_install_converges_full_digest_unit_to_canonical_short_name(tmp_path: Path) -> None:
+    environment, units, log = _environment(tmp_path)
+    database = tmp_path / "facts.sqlite3"
+    legacy = _write_managed_unit(units, database, full_digest=True)
+    canonical = units / _unit_for(database)
+
+    result = _run("install", _REPOSITORY, str(database), environment=environment)
+
+    assert f"Installed and started {canonical.name}" in result.stdout
+    assert canonical.is_file()
+    assert not legacy.exists()
+    calls = log.read_text().splitlines()
+    assert f"disable --now {legacy.name}" in calls
+    assert f"enable {canonical.name}" in calls
+    assert f"restart {canonical.name}" in calls
+
+
 def test_same_repository_can_have_independent_database_writers(tmp_path: Path) -> None:
     environment, units, log = _environment(tmp_path)
     databases = (tmp_path / "a" / "facts.sqlite3", tmp_path / "b" / "facts.sqlite3")
@@ -253,6 +283,32 @@ def test_uninstall_refuses_unmanaged_identity_collision(tmp_path: Path) -> None:
     assert not log.exists()
 
 
+def test_install_rejects_short_identity_collision(tmp_path: Path) -> None:
+    environment, units, log = _environment(tmp_path)
+    database = tmp_path / "facts.sqlite3"
+    other = tmp_path / "other.sqlite3"
+    unit = units / _unit_for(database)
+    units.mkdir()
+    unit.write_text(
+        f"# gh-puller-repository={_REPOSITORY}\n"
+        f"# gh-puller-database={other.resolve()}\n[Unit]\n",
+    )
+    original = unit.read_bytes()
+
+    result = _run(
+        "install",
+        _REPOSITORY,
+        str(database),
+        environment=environment,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert f"writer identity collision for {database.resolve()}" in result.stderr
+    assert unit.read_bytes() == original
+    assert not log.exists()
+
+
 @pytest.mark.parametrize("action", ["status", "start", "stop", "restart", "logs"])
 def test_daemon_control_actions_address_database_writer(
     tmp_path: Path,
@@ -276,6 +332,16 @@ def test_daemon_control_actions_address_database_writer(
         assert calls == [f"stop {unit_name}"]
     else:
         assert calls == [f"--unit {unit_name} --output=cat --lines=100 --follow"]
+
+
+def test_control_action_resolves_existing_full_digest_unit(tmp_path: Path) -> None:
+    environment, units, log = _environment(tmp_path)
+    database = tmp_path / "facts.sqlite3"
+    legacy = _write_managed_unit(units, database, full_digest=True)
+
+    _run("stop", str(database), environment=environment)
+
+    assert log.read_text().splitlines() == [f"stop {legacy.name}"]
 
 
 def test_status_without_database_lists_all_managed_writers(tmp_path: Path) -> None:

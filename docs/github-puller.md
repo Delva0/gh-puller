@@ -371,10 +371,12 @@ and the SQLite destination. The application therefore reads the project-root `.e
 without placing `GH_TOKEN` in the unit file.
 
 The canonical absolute database path is the writer identity. Its unit is named
-`gh-puller-<sha256>.service`, where `<sha256>` is the full SHA-256 digest of that
-path. The database filename and repository are intentionally absent from the name:
-the repository is configuration bound to the writer and to the archive metadata,
-while the path digest alone supplies a stable, database-scoped systemd key.
+`gh-puller-<path-id>.service`, where `<path-id>` is the first 12 hexadecimal digits
+of that path's SHA-256 digest. The database filename and repository are intentionally
+absent from the name: the repository is configuration bound to the writer and to the
+archive metadata, while the compact path digest supplies a stable, database-scoped
+systemd key. Unit metadata retains the canonical database path; every mutation checks
+it and rejects a truncated-digest collision.
 
 Install and immediately start one writer for a database:
 
@@ -384,7 +386,8 @@ sudo scripts/github-puller-daemon.sh install \
 ```
 
 Options after the database are passed to the `schedule` command and persist in the
-unit. Re-running `install` verifies, replaces, enables, and restarts the same unit:
+unit. Re-running `install` verifies the binding, reconciles the database's managed
+unit to its canonical name, enables it, and restarts it:
 
 ```bash
 sudo scripts/github-puller-daemon.sh install \
@@ -420,9 +423,10 @@ watch -n 1 scripts/github-puller-daemon.sh status archives/vllm.sqlite3
 The overview always includes the canonical `DATABASE`, current target T, run,
 phase, event age, and `ITEMS`. `ITEMS` means the certified current catalog count of
 Issues plus pull requests; it is `?` until that count is known. `PROGRESS` reports
-only the active catalog or bundle phase and likewise keeps an unknown denominator
-as `?`. A rate-limit event shows its decreasing local wait estimate. API request and
-quota counters remain available in raw logs but are intentionally absent from the
+the active catalog, repository-feed, or bundle phase and likewise keeps an unknown
+denominator as `?`. Feed page totals are size estimates and carry a `~` marker. A
+rate-limit event shows its decreasing local wait estimate. API request and quota
+counters remain available in raw logs but are intentionally absent from the
 operational summary.
 
 Progress JSON Lines, completed-run JSON, exceptions, and service messages are

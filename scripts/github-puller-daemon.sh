@@ -35,8 +35,12 @@ require_repository() {
     [[ "$1" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || fail "repository must be OWNER/REPO"
 }
 
-writer_id() {
+writer_digest() {
     printf '%s' "$1" | sha256sum | cut -d' ' -f1
+}
+
+writer_id() {
+    writer_digest "$1" | cut -c1-12
 }
 
 unit_name() {
@@ -131,18 +135,43 @@ validate_unit_database() {
     [[ "$configured_database" == "$destination" ]] || fail "writer identity collision for $destination"
 }
 
-require_managed_writer() {
+managed_unit_paths() {
+    local destination="$1"
+    local name path
+    [[ -d "$SYSTEMD_DIR" ]] || return 0
+    for path in "$SYSTEMD_DIR"/gh-puller-*.service; do
+        [[ -e "$path" ]] || continue
+        name="$(basename "$path")"
+        [[ "$name" =~ ^gh-puller-([0-9a-f]{12}|[0-9a-f]{64})\.service$ ]] || continue
+        if [[ "$(configured_value database "$path")" == "$destination" ]]; then
+            printf '%s\n' "$path"
+        fi
+    done
+}
+
+resolve_managed_unit() {
     local action="$1"
     local raw="$2"
     local destination="$3"
-    local path="$4"
-    if [[ ! -e "$path" ]]; then
+    local canonical_path="$SYSTEMD_DIR/$(unit_name "$destination")"
+    local -a paths
+    mapfile -t paths < <(managed_unit_paths "$destination")
+    if [[ ${#paths[@]} -eq 1 ]]; then
+        validate_unit_database "${paths[0]}" "$destination"
+        printf '%s\n' "${paths[0]}"
+        return
+    fi
+    if [[ ${#paths[@]} -gt 1 ]]; then
+        fail "multiple managed writers for database: $destination"
+    fi
+    if [[ ! -e "$canonical_path" ]]; then
         if [[ "$raw" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
             fail "$action expects DATABASE; '$raw' looks like OWNER/REPO"
         fi
         fail "no managed writer for database: $destination"
     fi
-    validate_unit_database "$path" "$destination"
+    validate_unit_database "$canonical_path" "$destination"
+    fail "no managed writer for database: $destination"
 }
 
 unit_quote() {
@@ -260,27 +289,35 @@ case "$action" in
         user="$(service_user)"
         group="$(id -gn "$user")"
         uv="$(uv_binary "$user")"
+        mapfile -t existing_paths < <(managed_unit_paths "$destination")
         if ! bound_repository="$(archive_repository "$destination" "$user" "$uv" 2>/dev/null)"; then
             fail "database is not a valid gh-puller archive: $destination"
         fi
         if [[ -n "$bound_repository" && "$bound_repository" != "$repository" ]]; then
             fail "database belongs to $bound_repository, not $repository"
         fi
-        if [[ -e "$unit_path" ]]; then
-            configured_repository="$(configured_value repository "$unit_path")"
-            configured_database="$(configured_value database "$unit_path")"
+        validate_unit_database "$unit_path" "$destination"
+        for existing_path in "${existing_paths[@]}"; do
+            configured_repository="$(configured_value repository "$existing_path")"
+            configured_database="$(configured_value database "$existing_path")"
             [[ -n "$configured_repository" && -n "$configured_database" ]] || \
-                fail "unit exists but is not managed by this installer: $unit"
+                fail "unit exists but is not managed by this installer: $(basename "$existing_path")"
             [[ "$configured_database" == "$destination" ]] || fail "writer identity collision for $destination"
             [[ "$configured_repository" == "$repository" ]] || \
                 fail "database writer is configured for $configured_repository, not $repository"
-        fi
+        done
         mkdir -p "$SYSTEMD_DIR"
         verify_dir="$(mktemp -d)"
         trap 'rm -r -- "$verify_dir"' EXIT
         render_unit "$repository" "$destination" "$user" "$group" "$uv" "${@:4}" >"$verify_dir/$unit"
         "$SYSTEMD_ANALYZE" verify "$verify_dir/$unit"
         install -m 0644 "$verify_dir/$unit" "$unit_path"
+        for existing_path in "${existing_paths[@]}"; do
+            [[ "$existing_path" == "$unit_path" ]] && continue
+            existing_unit="$(basename "$existing_path")"
+            "$SYSTEMCTL" disable --now "$existing_unit" >/dev/null 2>&1 || true
+            rm -f -- "$existing_path"
+        done
         "$SYSTEMCTL" daemon-reload
         "$SYSTEMCTL" enable "$unit"
         "$SYSTEMCTL" restart "$unit"
@@ -295,11 +332,20 @@ case "$action" in
         destination="$(absolute_destination "$2")"
         unit="$(unit_name "$destination")"
         unit_path="$SYSTEMD_DIR/$unit"
-        validate_unit_database "$unit_path" "$destination"
-        "$SYSTEMCTL" disable --now "$unit" >/dev/null 2>&1 || true
-        rm -f -- "$unit_path"
+        mapfile -t existing_paths < <(managed_unit_paths "$destination")
+        if [[ ${#existing_paths[@]} -eq 0 ]]; then
+            validate_unit_database "$unit_path" "$destination"
+            existing_paths=("$unit_path")
+        fi
+        for existing_path in "${existing_paths[@]}"; do
+            existing_unit="$(basename "$existing_path")"
+            "$SYSTEMCTL" disable --now "$existing_unit" >/dev/null 2>&1 || true
+            rm -f -- "$existing_path"
+        done
         "$SYSTEMCTL" daemon-reload
-        "$SYSTEMCTL" reset-failed "$unit" >/dev/null 2>&1 || true
+        for existing_path in "${existing_paths[@]}"; do
+            "$SYSTEMCTL" reset-failed "$(basename "$existing_path")" >/dev/null 2>&1 || true
+        done
         printf 'Uninstalled %s\n' "$unit"
         printf 'SQLite archives, .env, environments, and source files were preserved.\n'
         ;;
@@ -307,8 +353,8 @@ case "$action" in
         [[ $# -eq 2 ]] || fail "$action accepts only DATABASE"
         require_system_access
         destination="$(absolute_destination "$2")"
-        unit="$(unit_name "$destination")"
-        require_managed_writer "$action" "$2" "$destination" "$SYSTEMD_DIR/$unit"
+        unit_path="$(resolve_managed_unit "$action" "$2" "$destination")"
+        unit="$(basename "$unit_path")"
         "$SYSTEMCTL" "$action" "$unit"
         if [[ "$action" != "stop" ]]; then
             "$SYSTEMCTL" is-active --quiet "$unit"
@@ -320,15 +366,14 @@ case "$action" in
             monitor_status
         fi
         destination="$(absolute_destination "$2")"
-        unit="$(unit_name "$destination")"
-        require_managed_writer status "$2" "$destination" "$SYSTEMD_DIR/$unit"
+        resolve_managed_unit status "$2" "$destination" >/dev/null
         monitor_status "$destination"
         ;;
     logs)
         [[ $# -eq 2 ]] || fail "logs accepts only DATABASE"
         destination="$(absolute_destination "$2")"
-        unit="$(unit_name "$destination")"
-        require_managed_writer logs "$2" "$destination" "$SYSTEMD_DIR/$unit"
+        unit_path="$(resolve_managed_unit logs "$2" "$destination")"
+        unit="$(basename "$unit_path")"
         exec "$JOURNALCTL" --unit "$unit" --output=cat --lines=100 --follow
         ;;
     *)
