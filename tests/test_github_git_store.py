@@ -137,7 +137,6 @@ async def test_git_store_keeps_old_head_after_remote_force_push(tmp_path: Path) 
     second_head = _git(source, "rev-parse", "HEAD")
     _git(source, "update-ref", "refs/pull/7/head", second_head)
 
-    await store.prefetch([7])
     second = await store.capture(
         7,
         {"base": {"sha": base}, "head": {"sha": second_head}, "merged": False},
@@ -149,16 +148,16 @@ async def test_git_store_keeps_old_head_after_remote_force_push(tmp_path: Path) 
 
 
 @pytest.mark.asyncio
-async def test_git_store_refreshes_refs_when_pull_merges_after_prefetch(tmp_path: Path) -> None:
+async def test_git_store_pins_reachable_merge_commit(tmp_path: Path) -> None:
     source = tmp_path / "source"
     base, head = _source_repository(source, 1)
     _git(source, "branch", "feature", head)
     _git(source, "reset", "--hard", base)
+    _git(source, "merge", "--quiet", "--no-ff", "feature", "-m", "merge pull")
+    merge = _git(source, "rev-parse", "HEAD")
     path = git_store_path(tmp_path / "facts.sqlite3")
     store = GitObjectStore(path, "acme/widgets", str(source))
     await store.prefetch([7])
-    _git(source, "merge", "--quiet", "--no-ff", "feature", "-m", "merge pull")
-    merge = _git(source, "rev-parse", "HEAD")
 
     snapshot = await store.capture(
         7,
@@ -175,23 +174,27 @@ async def test_git_store_refreshes_refs_when_pull_merges_after_prefetch(tmp_path
 
 
 @pytest.mark.asyncio
-async def test_git_store_rejects_api_commit_missing_after_targeted_refresh(tmp_path: Path) -> None:
+async def test_git_store_keeps_snapshot_when_merge_commit_is_unreachable(tmp_path: Path) -> None:
     source = tmp_path / "source"
     base, head = _source_repository(source, 1)
     path = git_store_path(tmp_path / "facts.sqlite3")
     store = GitObjectStore(path, "acme/widgets", str(source))
     await store.prefetch([7])
 
-    with pytest.raises(GitStoreError, match="nonexistent object"):
-        await store.capture(
-            7,
-            {
-                "base": {"sha": base},
-                "head": {"sha": head},
-                "merge_commit_sha": "f" * 40,
-                "merged": True,
-            },
-        )
+    snapshot = await store.capture(
+        7,
+        {
+            "base": {"sha": base},
+            "head": {"sha": head},
+            "merge_commit_sha": "f" * 40,
+            "merged": True,
+        },
+    )
+
+    assert snapshot["base_sha"] == base
+    assert snapshot["head_sha"] == head
+    assert "merge_commit_ref" not in snapshot
+    assert "merge_commit_sha" not in snapshot
 
 
 @pytest.mark.asyncio

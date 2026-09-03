@@ -218,11 +218,14 @@ the REST `core` or GraphQL primary-rate-limit buckets. See
 [git-update-ref](https://git-scm.com/docs/git-update-ref), and
 [git-diff](https://git-scm.com/docs/git-diff).
 
-Snapshot pinning validates every API-named base, head, and merged commit against the
-local object store. If refs changed between batch prefetch and the PR-detail response,
-the store refreshes only the branch refs or PR head needed by the missing commit and
-retries pinning once. A commit still absent after that refresh aborts the task; it is
-never represented by a dangling archive ref.
+Snapshot pinning requires the API-named base and head in the local object store. If
+either ref changed between batch prefetch and the PR-detail response, the store
+refreshes only the branch refs or PR head needed by that object and retries once. A
+required object still absent after that refresh aborts the task. The PR detail always
+retains GitHub's `merge_commit_sha`; the Git manifest adds `merge_commit_ref` only
+when that commit is reachable in the local store. A merge commit left behind by a
+deleted target branch therefore remains an observed API fact without becoming a
+dangling Git ref or blocking the run.
 
 Sources: [gh_puller/github/](../gh_puller/github/); [tests/test_github_git_store.py](../tests/test_github_git_store.py)
 
@@ -340,7 +343,9 @@ The companion `DATABASE.git` directory is a bare repository bound to the same Gi
 repository as SQLite. Archive-owned refs pin each observed PR base, head, comparison
 base, and available merge commit, so remote branch deletion or force-push cannot make
 an already published code snapshot unreachable. The comparison base is the unique
-merge-base for an ordinary PR and Git's empty tree for an unrelated-history PR.
+merge-base for an ordinary PR and Git's empty tree for an unrelated-history PR. A
+merge SHA whose object was already unreachable at observation time remains in PR
+detail without an archive-owned merge ref.
 
 Git refs are durable before the referencing SQLite record is staged. A crash between
 those steps can leave extra unreachable-from-SQLite archive refs, but cannot publish a

@@ -101,6 +101,7 @@ class GitObjectStore:
 
         Returns:
             固定的 base/head 与可直接交给 ``git diff`` 的比较基准引用。
+            API 声明的 merge commit 仅在对象已可达时一同固定。
 
         Raises:
             GitStoreError: SHA 缺失、对象未取得或引用无法持久化。
@@ -112,16 +113,30 @@ class GitObjectStore:
         prefix = f"refs/gh-puller/snapshots/pulls/{number}"
         async with self._lock:
             await self._prepare()
+            pinnable_merge_sha = await self._available_commit(merge_sha)
             try:
-                return await self._pin_snapshot(number, prefix, base_sha, head_sha, merge_sha)
+                return await self._pin_snapshot(
+                    number,
+                    prefix,
+                    base_sha,
+                    head_sha,
+                    pinnable_merge_sha,
+                )
             except GitStoreError as exc:
                 failure = exc
-            required = (base_sha, head_sha) if merge_sha is None else (base_sha, head_sha, merge_sha)
+            required = (base_sha, head_sha)
             missing = await self._missing_commits(required)
             if missing:
                 try:
-                    await self._refresh_missing(number, base_sha, head_sha, merge_sha, missing)
-                    return await self._pin_snapshot(number, prefix, base_sha, head_sha, merge_sha)
+                    await self._refresh_missing(number, base_sha, head_sha, missing)
+                    pinnable_merge_sha = await self._available_commit(merge_sha)
+                    return await self._pin_snapshot(
+                        number,
+                        prefix,
+                        base_sha,
+                        head_sha,
+                        pinnable_merge_sha,
+                    )
                 except GitStoreError as exc:
                     failure = exc
             raise GitStoreError(
@@ -197,16 +212,20 @@ class GitObjectStore:
                 missing.add(sha)
         return missing
 
+    async def _available_commit(self, sha: str | None) -> str | None:
+        if sha is None:
+            return None
+        return None if await self._missing_commits((sha,)) else sha
+
     async def _refresh_missing(
         self,
         number: int,
         base_sha: str,
         head_sha: str,
-        merge_sha: str | None,
         missing: set[str],
     ) -> None:
         refspecs = []
-        if base_sha in missing or (merge_sha is not None and merge_sha in missing):
+        if base_sha in missing:
             refspecs.append("+refs/heads/*:refs/gh-puller/remotes/heads/*")
         if head_sha in missing:
             refspecs.append(f"+refs/pull/{number}/head:refs/gh-puller/remotes/pulls/{number}/head")
