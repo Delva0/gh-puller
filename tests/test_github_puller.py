@@ -2038,7 +2038,7 @@ async def test_rate_limit_waits_asynchronously() -> None:
     assert api.request_count == 3
     waits = [event for event in progress if event.wait_seconds is not None]
     assert [(event.detail, event.wait_seconds) for event in waits] == [
-        ("secondary_rate_limit", 3),
+        ("primary_rate_limit", 3),
         ("secondary_rate_limit", 4),
     ]
     assert waits[0].quotas == (RateQuota("core", 5000, 0, _T0 + timedelta(seconds=2)),)
@@ -2452,6 +2452,71 @@ async def test_successful_last_quota_response_gates_the_next_request() -> None:
     assert waits[0].detail == "primary_rate_limit"
     assert waits[0].wait_seconds == 3
     assert waits[0].quotas[0].remaining == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("exhausted", "next_path"),
+    [("core", "/graphql"), ("graphql", "/rest")],
+)
+async def test_primary_quota_gate_does_not_block_the_other_resource(
+    exhausted: str,
+    next_path: str,
+) -> None:
+    clock = Clock(_T0)
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.path)
+        resource = "graphql" if request.url.path == "/graphql" else "core"
+        remaining = 0 if resource == exhausted else 4_999
+        body = (
+            {
+                "data": {
+                    "repository": {
+                        "issues": {"totalCount": 1},
+                        "pullRequests": {"totalCount": 2},
+                    },
+                },
+            }
+            if resource == "graphql"
+            else {"ok": True}
+        )
+        return httpx.Response(
+            200,
+            headers={
+                "x-ratelimit-limit": "5000",
+                "x-ratelimit-remaining": str(remaining),
+                "x-ratelimit-reset": str(int((_T0 + timedelta(hours=1)).timestamp())),
+                "x-ratelimit-resource": resource,
+            },
+            json=body,
+            request=request,
+        )
+
+    client = httpx.AsyncClient(
+        base_url="https://api.github.test",
+        transport=httpx.MockTransport(handler),
+    )
+    api = GitHubAPI(
+        token=str(id(client)),
+        client=client,
+        graphql_url="/graphql",
+        sleep=clock.sleep,
+        now=clock,
+    )
+    try:
+        if exhausted == "core":
+            await api.get_json("/rest")
+            assert await api.repository_item_count("acme", "widgets") == 3
+        else:
+            assert await api.repository_item_count("acme", "widgets") == 3
+            await api.get_json("/rest")
+    finally:
+        await client.aclose()
+
+    assert seen == (["/rest", next_path] if exhausted == "core" else ["/graphql", next_path])
+    assert clock.sleeps == []
 
 
 @pytest.mark.asyncio

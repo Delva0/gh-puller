@@ -114,7 +114,8 @@ class GitHubAPI:
         self._sleep = sleep
         self._now = now
         self._progress = progress
-        self._blocked_until = 0.0
+        self._primary_blocked_until: dict[str, float] = {}
+        self._secondary_blocked_until = 0.0
         self._gate_lock = asyncio.Lock()
         self._quotas: dict[str, RateQuota] = {}
         self.request_count = 0
@@ -553,6 +554,7 @@ class GitHubAPI:
                 "POST",
                 self._graphql_url,
                 json_body={"query": query, "variables": variables},
+                resource="graphql",
             )
             try:
                 payload = response.json()
@@ -566,7 +568,7 @@ class GitHubAPI:
             if not errors:
                 return payload
             if self._is_rate_limited(response):
-                await self._wait_after_rate_limit(response, secondary_attempt)
+                await self._wait_after_rate_limit(response, secondary_attempt, "graphql")
                 secondary_attempt += 1
                 continue
             raise GitHubAPIError(f"GitHub GraphQL error for {response.url}: {errors!r}")
@@ -580,11 +582,12 @@ class GitHubAPI:
         accept: str | None = None,
         json_body: Mapping[str, Any] | None = None,
         request_headers: Mapping[str, str] | None = None,
+        resource: str = "core",
     ) -> httpx.Response:
         transient_attempt = 0
         secondary_attempt = 0
         while True:
-            await self._wait_for_primary_limit()
+            await self._wait_for_limit(resource)
             headers = dict(request_headers or {})
             if accept:
                 headers["Accept"] = accept
@@ -608,10 +611,10 @@ class GitHubAPI:
             self._remember_quota(response)
             self._emit_progress()
             if response.status_code in {403, 429} and self._is_rate_limited(response):
-                await self._wait_after_rate_limit(response, secondary_attempt)
+                await self._wait_after_rate_limit(response, secondary_attempt, resource)
                 secondary_attempt += 1
                 continue
-            self._remember_primary_limit(response)
+            self._remember_primary_limit(response, resource)
             if response.status_code >= 500:
                 transient_attempt += 1
                 await self._wait_transient(
@@ -634,39 +637,70 @@ class GitHubAPI:
         self._emit_progress(wait_seconds=wait, detail="transient_retry")
         await self._sleep(wait)
 
-    async def _wait_for_primary_limit(self) -> None:
+    async def _wait_for_limit(self, resource: str) -> None:
         async with self._gate_lock:
-            blocked_until = self._blocked_until
+            primary_until = self._primary_blocked_until.get(resource, 0.0)
+            secondary_until = self._secondary_blocked_until
+        blocked_until = max(primary_until, secondary_until)
         wait = blocked_until - self._now().timestamp()
         if wait <= 0:
             return
-        _LOG.warning("GitHub primary quota exhausted; waiting %.1fs", wait)
-        self._emit_progress(wait_seconds=wait, detail="primary_rate_limit")
+        primary = primary_until >= secondary_until
+        detail = "primary_rate_limit" if primary else "secondary_rate_limit"
+        _LOG.warning("GitHub %s blocked; waiting %.1fs", resource, wait)
+        self._emit_progress(wait_seconds=wait, detail=detail)
         await self._sleep(wait)
         async with self._gate_lock:
-            if self._blocked_until == blocked_until:
-                self._blocked_until = 0.0
+            if self._primary_blocked_until.get(resource) == primary_until:
+                self._primary_blocked_until.pop(resource, None)
+            if self._secondary_blocked_until == secondary_until:
+                self._secondary_blocked_until = 0.0
 
-    async def _wait_after_rate_limit(self, response: httpx.Response, attempt: int) -> None:
+    async def _wait_after_rate_limit(
+        self,
+        response: httpx.Response,
+        attempt: int,
+        resource: str,
+    ) -> None:
         wait = self._rate_limit_wait(response, attempt)
         blocked_until = self._now().timestamp() + wait
+        primary = response.headers.get("x-ratelimit-remaining") == "0"
         async with self._gate_lock:
-            self._blocked_until = max(self._blocked_until, blocked_until)
+            if primary:
+                bucket = response.headers.get("x-ratelimit-resource", resource)
+                self._primary_blocked_until[bucket] = max(
+                    self._primary_blocked_until.get(bucket, 0.0),
+                    blocked_until,
+                )
+            else:
+                self._secondary_blocked_until = max(
+                    self._secondary_blocked_until,
+                    blocked_until,
+                )
         _LOG.warning("GitHub rate limited %s; retrying in %.1fs", response.url, wait)
-        self._emit_progress(wait_seconds=wait, detail="secondary_rate_limit")
+        detail = "primary_rate_limit" if primary else "secondary_rate_limit"
+        self._emit_progress(wait_seconds=wait, detail=detail)
         await self._sleep(wait)
         async with self._gate_lock:
-            if self._blocked_until == blocked_until:
-                self._blocked_until = 0.0
+            if primary:
+                bucket = response.headers.get("x-ratelimit-resource", resource)
+                if self._primary_blocked_until.get(bucket) == blocked_until:
+                    self._primary_blocked_until.pop(bucket, None)
+            elif self._secondary_blocked_until == blocked_until:
+                self._secondary_blocked_until = 0.0
 
-    def _remember_primary_limit(self, response: httpx.Response) -> None:
+    def _remember_primary_limit(self, response: httpx.Response, resource: str) -> None:
         if response.headers.get("x-ratelimit-remaining") != "0":
             return
         try:
             reset = float(response.headers["x-ratelimit-reset"])
         except (KeyError, ValueError):
             return
-        self._blocked_until = max(self._blocked_until, reset + 1)
+        bucket = response.headers.get("x-ratelimit-resource", resource)
+        self._primary_blocked_until[bucket] = max(
+            self._primary_blocked_until.get(bucket, 0.0),
+            reset + 1,
+        )
 
     def _remember_quota(self, response: httpx.Response) -> None:
         limit = _integer_header(response, "x-ratelimit-limit")
