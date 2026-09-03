@@ -461,12 +461,12 @@ Issues plus pull requests; it is `?` until that count is known. `PROGRESS` repor
 the active catalog or bundle phase and likewise keeps an unknown denominator as `?`.
 `QUOTA` retains every resource bucket observed by the writer and shows each
 `remaining/limit` independently. Normal authenticated operation therefore displays
-both REST `core` and `graphql` after each has responded. The detailed view also shows
-each advertised reset timestamp and local countdown. These samples come from response
-headers, so `status` itself makes no API call. A rate-limit event shows its decreasing
-local wait estimate. The per-run HTTP-attempt counter remains available in raw logs
-rather than the operational summary; it must not be treated as either REST units or
-GraphQL points when comparing pull strategies.
+both REST `core` and `graphql` after each has responded. Each bucket occupies one
+aligned line with its own advertised reset timestamp. These samples come from
+response headers, so `status` itself makes no API call. A rate-limit event shows its
+decreasing local wait estimate. The per-run HTTP-attempt counter remains available
+in raw logs rather than the operational summary; it must not be treated as either
+REST units or GraphQL points when comparing pull strategies.
 
 Progress JSON Lines, completed-run JSON, exceptions, and service messages are
 retained by journald, so no separate log-file rotation is required. `logs` prints

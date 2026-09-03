@@ -240,9 +240,13 @@ def _render_table(statuses: Sequence[WriterStatus], now: datetime | None = None)
         )
         for status in statuses
     ]
-    widths = [max(len(headers[index]), *(len(row[index]) for row in rows)) for index in range(len(headers) - 1)]
-    lines = [_table_line(headers, widths)]
-    lines.extend(_table_line(row, widths) for row in rows)
+    widths = [
+        max(_cell_width(headers[index]), *(_cell_width(row[index]) for row in rows))
+        for index in range(len(headers) - 1)
+    ]
+    lines = _table_lines(headers, widths)
+    for row in rows:
+        lines.extend(_table_lines(row, widths))
     return "\n".join(lines)
 
 
@@ -261,7 +265,7 @@ def _render_detail(status: WriterStatus, now: datetime | None = None) -> str:
         ("ITEMS", _items(progress)),
         ("PHASE", progress.phase if progress else "-"),
         ("PROGRESS", _progress(progress, 20)),
-        ("QUOTA", _quota(progress, observed_at)),
+        ("QUOTA", _quota(progress)),
         ("STAGED", _staged(progress)),
         ("LATEST", _latest(progress)),
         ("UPDATED", _updated(progress, observed_at)),
@@ -271,12 +275,32 @@ def _render_detail(status: WriterStatus, now: datetime | None = None) -> str:
     if progress and progress.detail:
         rows.append(("DETAIL", progress.detail))
     width = max(len(key) for key, _ in rows)
-    return "\n".join(f"{key:<{width}}  {value}" for key, value in rows)
+    lines = []
+    for key, value in rows:
+        parts = value.splitlines() or [""]
+        lines.append(f"{key:<{width}}  {parts[0]}")
+        lines.extend(f"{'':<{width}}  {part}" for part in parts[1:])
+    return "\n".join(lines)
+
+
+def _cell_width(value: str) -> int:
+    return max(map(len, value.splitlines()), default=0)
+
+
+def _table_lines(values: Sequence[str], widths: Sequence[int]) -> list[str]:
+    cells = [value.splitlines() or [""] for value in values]
+    return [
+        _table_line(
+            tuple(cell[index] if index < len(cell) else "" for cell in cells),
+            widths,
+        )
+        for index in range(max(map(len, cells)))
+    ]
 
 
 def _table_line(values: Sequence[str], widths: Sequence[int]) -> str:
     leading = (f"{value:<{widths[index]}}" for index, value in enumerate(values[:-1]))
-    return "  ".join((*leading, values[-1]))
+    return "  ".join((*leading, values[-1])).rstrip()
 
 
 def _service_label(service: ServiceState) -> str:
@@ -305,22 +329,18 @@ def _progress(progress: ProgressState | None, width: int) -> str:
     return "-"
 
 
-def _quota(progress: ProgressState | None, now: datetime | None = None) -> str:
+def _quota(progress: ProgressState | None) -> str:
     if progress is None or not progress.quotas:
         return "-"
-    return " | ".join(_quota_item(quota, now) for quota in progress.quotas)
+    width = max(len(quota.resource) for quota in progress.quotas)
+    return "\n".join(_quota_item(quota, width) for quota in progress.quotas)
 
 
-def _quota_item(quota: RateQuota, now: datetime | None) -> str:
+def _quota_item(quota: RateQuota, width: int) -> str:
     remaining = "?" if quota.remaining is None else f"{quota.remaining:,}"
     limit = "?" if quota.limit is None else f"{quota.limit:,}"
-    value = f"{quota.resource} {remaining}/{limit}"
-    if now is None or quota.reset_at is None:
-        return value
-    reset_at = quota.reset_at.isoformat().replace("+00:00", "Z")
-    seconds = (quota.reset_at - now).total_seconds()
-    reset = f"in {_duration(seconds)}" if seconds > 0 else "due"
-    return f"{value}; reset {reset} ({reset_at})"
+    reset_at = "?" if quota.reset_at is None else quota.reset_at.isoformat().replace("+00:00", "Z")
+    return f"{quota.resource:<{width}}  {remaining}/{limit} ({reset_at} reset)"
 
 
 def _meter(label: str, completed: int, total: int | None, width: int) -> str:

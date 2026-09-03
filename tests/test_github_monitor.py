@@ -100,8 +100,14 @@ def test_table_prioritizes_target_items_progress_and_database(tmp_path: Path) ->
     assert str((tmp_path / "facts.sqlite3").resolve()) in output
     assert "REQUEST" not in output
     assert "QUOTA" in output
-    assert "core 4,498/5,000" in output
-    assert "graphql 4,997/5,000" in output
+    assert "core     4,498/5,000 (2026-09-02T11:00:00Z reset)" in output
+    assert "graphql  4,997/5,000 (2026-09-02T10:30:00Z reset)" in output
+    lines = output.splitlines()
+    core_line = next(line for line in lines if "core" in line)
+    graphql_line = next(line for line in lines if "graphql" in line)
+    assert lines.index(graphql_line) == lines.index(core_line) + 1
+    assert core_line.index("core") == graphql_line.index("graphql")
+    assert " | " not in output
 
 
 def test_table_output_is_stable_for_external_watch(tmp_path: Path) -> None:
@@ -150,12 +156,19 @@ def test_detail_shows_process_and_durable_run_progress(tmp_path: Path) -> None:
     assert "ITEMS       54,083" in output
     assert "STAGED      issues=117 pulls=107 tombstones=0" in output
     assert "LATEST      pull#2886" in output
-    assert "QUOTA       core 4,498/5,000; reset in 59m57s" in output
-    assert "2026-09-02T11:00:00Z" in output
-    assert "graphql 4,997/5,000; reset in 29m57s" in output
+    assert (
+        "QUOTA       core     4,498/5,000 (2026-09-02T11:00:00Z reset)\n"
+        "            graphql  4,997/5,000 (2026-09-02T10:30:00Z reset)"
+    ) in output
     assert "UPDATED     3s ago" in output
     assert "PASS" not in output
     assert "SERIES" not in output
+
+
+def test_quota_keeps_unknown_fields_explicit() -> None:
+    progress = _progress(quotas=(RateQuota("core", None, None, None),))
+
+    assert monitor._quota(progress) == "core  ?/? (? reset)"
 
 
 def test_latest_progress_ignores_raw_logs_and_keeps_quota_fields() -> None:
