@@ -147,6 +147,15 @@ class _API(Protocol):
         cache: dict[str, Any] | None,
     ) -> GitHubResource: ...
 
+    async def reactions(
+        self,
+        path: str,
+        node_id: str | None,
+        *,
+        previous: list[dict[str, Any]] | None,
+        cache: dict[str, Any] | None,
+    ) -> GitHubResource: ...
+
 
 class _GitStore(Protocol):
     async def prefetch(
@@ -919,17 +928,26 @@ class GitHubPuller:
             _dict_field(previous_cache, "events"),
         )
         _set_cache(http_cache, "events", cache)
+        reaction_resource: GitHubResource | None = None
         if _is_zero_count(issue.get("reactions")):
             reactions = []
         else:
-            reactions, cache = await self._cached_page(
-                api,
+            reaction_resource = await api.reactions(
                 f"{issue_path}/reactions",
-                _list_field(previous, "reactions"),
-                _dict_field(previous_cache, "reactions"),
+                _str_field(issue, "node_id"),
+                previous=_list_field(previous, "reactions"),
+                cache=_dict_field(previous_cache, "reactions"),
             )
+            reactions = reaction_resource.value
+            cache = reaction_resource.cache
+            if not isinstance(reactions, list) or any(
+                not isinstance(reaction, dict) for reaction in reactions
+            ):
+                raise IncompleteGitHubDataError(
+                    f"GitHub returned invalid reactions for {issue_path}",
+                )
             _set_cache(http_cache, "reactions", cache)
-        comment_reactions, cache = await self._reactions(
+        comment_reactions, cache, comment_reaction_sources = await self._reactions(
             api,
             "issues/comments",
             comments,
@@ -944,6 +962,13 @@ class GitHubPuller:
                 f"issue #{number} detail is older than its catalog entry",
             )
         _check_count(number, "issue reactions", issue.get("reactions"), reactions)
+        api_sources: dict[str, Any] = {}
+        if comment_resource is not None:
+            api_sources["issue_comments"] = _api_source(comment_resource)
+        if reaction_resource is not None:
+            api_sources["reactions"] = _api_source(reaction_resource)
+        if comment_reaction_sources:
+            api_sources["issue_comment_reactions"] = comment_reaction_sources
         bundle: dict[str, Any] = {
             "schema_version": _BUNDLE_SCHEMA_VERSION,
             "repository": self.config.repository,
@@ -955,11 +980,7 @@ class GitHubPuller:
             "events": events,
             "reactions": reactions,
             "issue_comment_reactions": comment_reactions,
-            "api_sources": (
-                {}
-                if comment_resource is None
-                else {"issue_comments": _api_source(comment_resource)}
-            ),
+            "api_sources": api_sources,
         }
         if bundle["kind"] == "pull":
             pull, cache = await self._fetch_pull(
@@ -1069,7 +1090,7 @@ class GitHubPuller:
                 _dict_field(previous_cache, "requested_reviewers"),
             )
             _set_cache(http_cache, "requested_reviewers", cache)
-        review_reactions, cache = await self._reactions(
+        review_reactions, cache, review_reaction_sources = await self._reactions(
             api,
             "pulls/comments",
             review_comments,
@@ -1090,6 +1111,8 @@ class GitHubPuller:
             api_sources["commits"] = _api_source(commit_resource)
         if review_comment_resource is not None:
             api_sources["review_comments"] = _api_source(review_comment_resource)
+        if review_reaction_sources:
+            api_sources["review_comment_reactions"] = review_reaction_sources
         result = {
             "detail": pull,
             "reviews": reviews,
@@ -1139,9 +1162,14 @@ class GitHubPuller:
         comments: list[dict[str, Any]],
         previous: dict[str, Any] | None,
         previous_cache: dict[str, Any] | None,
-    ) -> tuple[dict[str, list[dict[str, Any]]], dict[str, Any] | None]:
+    ) -> tuple[
+        dict[str, list[dict[str, Any]]],
+        dict[str, Any] | None,
+        dict[str, dict[str, Any]],
+    ]:
         result: dict[str, list[dict[str, Any]]] = {}
         http_cache: dict[str, Any] = {}
+        sources: dict[str, dict[str, Any]] = {}
         for comment in comments:
             reaction_summary = comment.get("reactions")
             if isinstance(reaction_summary, dict) and reaction_summary.get("total_count") == 0:
@@ -1149,16 +1177,25 @@ class GitHubPuller:
                 continue
             comment_id = int(comment["id"])
             key = str(comment_id)
-            reactions, cache = await self._cached_page(
-                api,
+            resource = await api.reactions(
                 f"{self._base}/{endpoint}/{comment_id}/reactions",
-                _list_field(previous, key),
-                _dict_field(previous_cache, key),
+                _str_field(comment, "node_id"),
+                previous=_list_field(previous, key),
+                cache=_dict_field(previous_cache, key),
             )
+            reactions = resource.value
+            cache = resource.cache
+            if not isinstance(reactions, list) or any(
+                not isinstance(reaction, dict) for reaction in reactions
+            ):
+                raise IncompleteGitHubDataError(
+                    f"GitHub returned invalid reactions for comment {comment_id}",
+                )
             result[key] = reactions
+            sources[key] = _api_source(resource)
             _set_cache(http_cache, key, cache)
             _check_count(comment_id, "comment reactions", reaction_summary, reactions)
-        return result, http_cache or None
+        return result, http_cache or None, sources
 
 
 async def incremental_pull(

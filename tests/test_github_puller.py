@@ -327,6 +327,21 @@ class FakeAPI:
         )
         return GitHubResource(value, "rest", value, updated)
 
+    async def reactions(
+        self,
+        path: str,
+        node_id: str | None,
+        *,
+        previous: list[dict[str, Any]] | None,
+        cache: dict[str, Any] | None,
+    ) -> GitHubResource:
+        value, updated = await self.paginate_cached(
+            path,
+            previous=previous,
+            cache=cache,
+        )
+        return GitHubResource(value, "rest", value, updated)
+
     async def closing_issue_references(
         self,
         owner: str,
@@ -633,6 +648,24 @@ def _graphql_issue_comment(number: int) -> dict[str, Any]:
     }
 
 
+def _graphql_reaction(number: int, content: str) -> dict[str, Any]:
+    return {
+        "id": f"reaction-{number}",
+        "databaseId": number,
+        "content": content,
+        "createdAt": _iso(_T0 - timedelta(minutes=number)),
+        "user": {
+            "__typename": "User",
+            "id": f"user-{number}",
+            "databaseId": number + 100,
+            "login": f"reactor-{number}",
+            "avatarUrl": f"https://avatars.test/{number}",
+            "url": f"https://github.test/reactor-{number}",
+            "isSiteAdmin": False,
+        },
+    }
+
+
 def _config(path: Path, **kwargs: Any) -> GitHubPullConfig:
     return GitHubPullConfig(repository="acme/widgets", destination=path, **kwargs)
 
@@ -899,6 +932,7 @@ async def test_pull_request_bundle_preserves_discussion_and_git_snapshot(tmp_pat
         "commits": {"source": "rest"},
         "detail": {"source": "rest"},
         "review_comments": {"source": "rest"},
+        "review_comment_reactions": {"72": {"source": "rest"}},
         "reviews": {"source": "rest"},
     }
     assert {"files", "diff", "patch"}.isdisjoint(pull)
@@ -2978,6 +3012,77 @@ async def test_issue_comments_graphql_paginates_for_issue_or_pull() -> None:
     assert result.value[0]["body_html"] == "<p>comment 81</p>"
     assert result.value[0]["user"]["login"] == "commenter-81"
     assert result.value[0]["reactions"]["total_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_reactions_graphql_paginates_and_maps_content() -> None:
+    seen: list[dict[str, Any]] = []
+    reactions = [
+        _graphql_reaction(91, "THUMBS_UP"),
+        _graphql_reaction(92, "ROCKET"),
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path != "/graphql":
+            return httpx.Response(
+                200,
+                headers=_quota_headers("core", 500),
+                json={"seed": True},
+                request=request,
+            )
+        body = json.loads(request.content)
+        seen.append(body)
+        cursor = body["variables"]["cursor"]
+        nodes = reactions[:1] if cursor is None else reactions[1:]
+        connection = {
+            "totalCount": 2,
+            "nodes": nodes,
+            "pageInfo": {
+                "hasNextPage": cursor is None,
+                "endCursor": "next-reaction" if cursor is None else None,
+            },
+        }
+        return httpx.Response(
+            200,
+            headers=_quota_headers("graphql", 4_900 - len(seen)),
+            json={
+                "data": {
+                    "node": {
+                        "id": "comment-node-81",
+                        "reactions": connection,
+                    },
+                },
+            },
+            request=request,
+        )
+
+    client = httpx.AsyncClient(
+        base_url="https://api.github.test",
+        transport=httpx.MockTransport(handler),
+    )
+    api = GitHubAPI(
+        token=str(id(client)),
+        client=client,
+        graphql_url="/graphql",
+        now=lambda: _T0,
+    )
+    try:
+        await api.get_json("/seed-core")
+        result = await api.reactions(
+            "/repos/acme/widgets/issues/comments/81/reactions",
+            "comment-node-81",
+            previous=None,
+            cache=None,
+        )
+    finally:
+        await client.aclose()
+
+    assert [body["variables"]["cursor"] for body in seen] == [None, "next-reaction"]
+    assert result.source == "graphql"
+    assert result.raw == reactions
+    assert [reaction["id"] for reaction in result.value] == [91, 92]
+    assert [reaction["content"] for reaction in result.value] == ["+1", "rocket"]
+    assert result.value[0]["user"]["login"] == "reactor-91"
 
 
 @pytest.mark.asyncio

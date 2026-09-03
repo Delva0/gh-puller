@@ -276,6 +276,26 @@ query IssueComments($owner: String!, $repo: String!, $number: Int!, $cursor: Str
   }
 }
 """ + _ISSUE_COMMENT_FRAGMENT
+_REACTIONS = """
+query Reactions($id: ID!, $cursor: String) {
+  node(id: $id) {
+    id
+    ... on Reactable {
+      reactions(first: 100, after: $cursor) {
+        totalCount
+        nodes {
+          id
+          databaseId
+          content
+          createdAt
+          user { __typename id databaseId login avatarUrl url isSiteAdmin }
+        }
+        pageInfo { hasNextPage endCursor }
+      }
+    }
+  }
+}
+"""
 
 
 class _Transport(StrEnum):
@@ -988,6 +1008,53 @@ class GitHubAPI:
 
         return await self._either(rest, graphql, rest_cached=cache is not None)
 
+    async def reactions(
+        self,
+        path: str,
+        node_id: str | None,
+        *,
+        previous: list[dict[str, Any]] | None,
+        cache: dict[str, Any] | None,
+    ) -> GitHubResource:
+        """读取一个 reactable 的完整 reaction 集合并选择配额池。
+
+        Args:
+            path: REST reaction collection 的相对路径。
+            node_id: 同一 reactable 的 GraphQL node ID；None 使操作固定使用 REST。
+            previous: 与 cache 配对的上一版稳定集合；None 表示冷读取。
+            cache: 本操作先前返回的 REST 分页 validator。
+
+        Returns:
+            REST 兼容的稳定 reaction 集合、来源、来源原文与 validator。
+        """
+
+        async def rest(wait_primary: bool) -> GitHubResource:
+            value, updated = await self._paginate_cached(
+                path,
+                previous=previous,
+                cache=cache,
+                primary_wait=wait_primary,
+            )
+            return GitHubResource(value, _Transport.REST, value, updated)
+
+        if not self._authenticated or not node_id:
+            return await rest(True)
+
+        async def graphql(wait_primary: bool) -> GitHubResource:
+            raw = await self._node_items(
+                _REACTIONS,
+                "reactions",
+                node_id,
+                primary_wait=wait_primary,
+            )
+            return GitHubResource(
+                [_rest_reaction(reaction) for reaction in raw],
+                _Transport.GRAPHQL,
+                raw,
+            )
+
+        return await self._either(rest, graphql, rest_cached=cache is not None)
+
     async def compare_commits(
         self,
         owner: str,
@@ -1417,6 +1484,51 @@ class GitHubAPI:
                 f"review thread {node_id} advertised {expected} comments, got {len(items)}",
             )
         return items
+
+    async def _node_items(
+        self,
+        query: str,
+        field: str,
+        node_id: str,
+        *,
+        primary_wait: bool,
+    ) -> list[dict[str, Any]]:
+        items: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        cursor: str | None = None
+        expected: int | None = None
+        while True:
+            payload = await self._graphql(
+                query,
+                {"id": node_id, "cursor": cursor},
+                primary_wait=primary_wait,
+            )
+            node = payload.get("data", {}).get("node")
+            if not isinstance(node, dict) or node.get("id") != node_id:
+                raise GitHubAPIError(f"GitHub returned no matching node {node_id}")
+            connection = _node_connection(node, field, f"node {node_id}")
+            total = connection["totalCount"]
+            if expected is None:
+                expected = total
+            elif expected != total:
+                raise GitHubAPIError(f"node {node_id} {field} count changed while paging")
+            for item in connection["nodes"]:
+                item_id = item.get("id")
+                if not isinstance(item_id, str) or not item_id or item_id in seen:
+                    raise GitHubAPIError(f"node {node_id} has invalid {field} identities")
+                seen.add(item_id)
+                items.append(item)
+            page_info = connection["pageInfo"]
+            if not page_info["hasNextPage"]:
+                if len(items) != expected:
+                    raise GitHubAPIError(
+                        f"node {node_id} advertised {expected} {field}, got {len(items)}",
+                    )
+                return items
+            next_cursor = page_info["endCursor"]
+            if not isinstance(next_cursor, str) or not next_cursor or next_cursor == cursor:
+                raise GitHubAPIError(f"node {node_id} has an invalid {field} cursor")
+            cursor = next_cursor
 
     async def _request(
         self,
@@ -2061,6 +2173,28 @@ def _rest_issue_comment(
             "url": f"{api}/issues/comments/{comment_id}/reactions",
             "total_count": comment["reactions"]["totalCount"],
         },
+    }
+
+
+def _rest_reaction(reaction: dict[str, Any]) -> dict[str, Any]:
+    content = {
+        "THUMBS_UP": "+1",
+        "THUMBS_DOWN": "-1",
+        "LAUGH": "laugh",
+        "HOORAY": "hooray",
+        "CONFUSED": "confused",
+        "HEART": "heart",
+        "ROCKET": "rocket",
+        "EYES": "eyes",
+    }.get(reaction.get("content"))
+    if content is None:
+        raise GitHubAPIError("GitHub returned an invalid reaction content")
+    return {
+        "id": _database_id(reaction.get("databaseId")),
+        "node_id": reaction["id"],
+        "user": _rest_actor(reaction.get("user")),
+        "content": content,
+        "created_at": reaction["createdAt"],
     }
 
 
