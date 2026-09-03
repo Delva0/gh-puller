@@ -9,7 +9,12 @@ from typing import TYPE_CHECKING, Any
 import pytest
 
 import gh_puller.github.git_store as git_store_module
-from gh_puller.github.git_store import GitObjectStore, GitStoreError, git_store_path
+from gh_puller.github.git_store import (
+    GitObjectStore,
+    GitStoreError,
+    TransientGitStoreError,
+    git_store_path,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -340,6 +345,44 @@ async def test_git_fetch_retries_transient_transport_failures(
     assert reported == waits
     assert heartbeats >= 7
     assert not failed_pack.exists()
+
+
+@pytest.mark.asyncio
+async def test_git_prefetch_can_delegate_a_transient_ref_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    _source_repository(source, 1)
+    real_command = git_store_module._command
+    attempts = 0
+    environments: list[dict[str, str]] = []
+
+    async def disconnected(command: Sequence[str], **kwargs: Any) -> str:
+        nonlocal attempts
+        if _is_fetch(command):
+            environments.append(kwargs["environment"])
+        if _is_fetch(command) and any("refs/pull/7" in value for value in command):
+            attempts += 1
+            raise GitStoreError("git fetch failed: fatal: early EOF")
+        return await real_command(command, **kwargs)
+
+    waits: list[float] = []
+    monkeypatch.setattr(git_store_module, "_command", disconnected)
+    store = GitObjectStore(
+        tmp_path / "facts.sqlite3.git",
+        "acme/widgets",
+        str(source),
+    )
+
+    with pytest.raises(TransientGitStoreError, match="early EOF"):
+        await store.prefetch([7], retry=waits.append, retry_transient=False)
+
+    assert attempts == 1
+    assert waits == []
+    assert environments
+    assert all(environment["GIT_CONFIG_KEY_0"] == "http.version" for environment in environments)
+    assert all(environment["GIT_CONFIG_VALUE_0"] == "HTTP/1.1" for environment in environments)
 
 
 @pytest.mark.asyncio

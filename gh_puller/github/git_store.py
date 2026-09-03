@@ -51,6 +51,10 @@ class GitStoreError(RuntimeError):
     """持久化 Git 对象库无法建立或验证所需快照。"""
 
 
+class TransientGitStoreError(GitStoreError):
+    """单次 Git fetch 因可重试的传输错误失败。"""
+
+
 class GitObjectStore:
     """管理一个仓库专属的 bare Git 对象库。
 
@@ -86,6 +90,7 @@ class GitObjectStore:
         *,
         heartbeat: Callable[[], None] | None = None,
         retry: Callable[[float], None] | None = None,
+        retry_transient: bool = True,
     ) -> None:
         """批量取得随后将被固定的 PR refs。
 
@@ -93,6 +98,7 @@ class GitObjectStore:
             numbers: 当前 API 消费批次中的 PR numbers。
             heartbeat: Git 网络操作未结束时周期调用的带外观察器。
             retry: 瞬时 Git 传输错误发生时接收退避秒数的观察器。
+            retry_transient: 为 False 时将 PR ref 的瞬时失败交还调用方拆批。
         """
         selected = sorted(set(numbers))
         if not selected:
@@ -124,6 +130,7 @@ class GitObjectStore:
                 *refspecs,
                 heartbeat=heartbeat,
                 retry=retry,
+                retry_transient=retry_transient,
             )
 
     async def capture(
@@ -366,6 +373,7 @@ class GitObjectStore:
         input_text: str | None = None,
         heartbeat: Callable[[], None] | None = None,
         retry: Callable[[float], None] | None = None,
+        retry_transient: bool = True,
         ok: tuple[int, ...] = (0,),
     ) -> str:
         wait = 1.0
@@ -384,6 +392,8 @@ class GitObjectStore:
                 _remove_temporary_packs(self.path)
                 if not _is_transient_fetch_failure(exc):
                     raise
+                if not retry_transient:
+                    raise TransientGitStoreError(str(exc)) from exc
                 _LOG.warning("%s; retrying in %.1fs", exc, wait)
                 if retry is not None:
                     retry(wait)
@@ -393,13 +403,19 @@ class GitObjectStore:
                 wait = min(wait * 2, _FETCH_RETRY_CEILING)
 
     def _environment(self) -> dict[str, str]:
-        environment = os.environ | {"GIT_TERMINAL_PROMPT": "0", "LC_ALL": "C"}
+        environment = os.environ | {
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "http.version",
+            "GIT_CONFIG_VALUE_0": "HTTP/1.1",
+            "GIT_TERMINAL_PROMPT": "0",
+            "LC_ALL": "C",
+        }
         if self._token and self.remote_url.startswith(("http://", "https://")):
             credential = base64.b64encode(f"x-access-token:{self._token}".encode()).decode()
             environment |= {
-                "GIT_CONFIG_COUNT": "1",
-                "GIT_CONFIG_KEY_0": "http.extraHeader",
-                "GIT_CONFIG_VALUE_0": f"Authorization: Basic {credential}",
+                "GIT_CONFIG_COUNT": "2",
+                "GIT_CONFIG_KEY_1": "http.extraHeader",
+                "GIT_CONFIG_VALUE_1": f"Authorization: Basic {credential}",
             }
         return environment
 

@@ -36,6 +36,7 @@ from gh_puller.github import (
     iter_versions,
 )
 from gh_puller.github.client import GitHubPage, GitHubResource
+from gh_puller.github.git_store import TransientGitStoreError
 from gh_puller.github.store import SQLiteArchive
 
 if TYPE_CHECKING:
@@ -416,7 +417,9 @@ class FakeGitStore:
         *,
         heartbeat: Any = None,
         retry: Any = None,
+        retry_transient: bool = True,
     ) -> None:
+        del retry_transient
         self.prefetches.append(list(numbers))
         if heartbeat is not None:
             heartbeat()
@@ -1197,6 +1200,171 @@ async def test_closing_issue_queries_batch_selected_pulls_per_catalog_page(tmp_p
 
 
 @pytest.mark.asyncio
+async def test_git_prefetch_batches_do_not_split_closing_reference_queries(
+    tmp_path: Path,
+) -> None:
+    api = FakeAPI()
+    git = FakeGitStore()
+    for number in range(1, 24):
+        api.add_issue(number, pull=True)
+        api.json[f"{_BASE}/pulls/{number}"] = {
+            "id": number * 10,
+            "changed_files": 0,
+            "commits": 0,
+            "review_comments": 0,
+        }
+
+    await _puller(
+        _config(tmp_path / "archive", concurrency=16),
+        api=api,
+        git=git,
+        now=lambda: _T0,
+    ).pull(_T0)
+
+    assert git.prefetches == [list(range(1, 9)), list(range(9, 17)), list(range(17, 24))]
+    calls = [call for call in api.calls if call[0] == "closing"]
+    assert [call[2]["numbers"] for call in calls] == [list(range(1, 24))]
+
+
+@pytest.mark.asyncio
+async def test_transient_git_ref_is_isolated_deferred_and_eventually_staged(
+    tmp_path: Path,
+) -> None:
+    class IsolatingGitStore(FakeGitStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.single_failures = 0
+
+        async def prefetch(
+            self,
+            numbers: list[int],
+            *,
+            heartbeat: Any = None,
+            retry: Any = None,
+            retry_transient: bool = True,
+        ) -> None:
+            del retry
+            assert not retry_transient
+            self.prefetches.append(list(numbers))
+            if heartbeat is not None:
+                heartbeat()
+            if 6 not in numbers:
+                return
+            if len(numbers) > 1 or self.single_failures == 0:
+                self.single_failures += len(numbers) == 1
+                raise TransientGitStoreError("transient pull ref failure")
+
+    api = FakeAPI()
+    git = IsolatingGitStore()
+    for number in range(1, 13):
+        api.add_issue(number, pull=True)
+        api.json[f"{_BASE}/pulls/{number}"] = {
+            "id": number * 10,
+            "changed_files": 0,
+            "commits": 0,
+            "review_comments": 0,
+        }
+    clock = Clock(_T0)
+    progress: list[PullProgress] = []
+
+    result = await _puller(
+        _config(tmp_path / "archive", concurrency=8),
+        api=api,
+        git=git,
+        now=clock,
+        sleep=clock.sleep,
+        observer=progress.append,
+    ).pull(_T0)
+
+    assert result.catalog_items == 12
+    assert sorted(git.captures) == list(range(1, 13))
+    assert git.captures.count(6) == 1
+    assert clock.sleeps == [1]
+    assert any(event.detail == "git_ref_retry=pull#6" for event in progress)
+    assert git.prefetches == [
+        list(range(1, 9)),
+        list(range(1, 5)),
+        list(range(5, 9)),
+        [5, 6],
+        [5],
+        [6],
+        [7, 8],
+        list(range(9, 13)),
+        [6],
+    ]
+
+
+@pytest.mark.asyncio
+async def test_completed_git_batches_survive_a_later_permanent_failure(
+    tmp_path: Path,
+) -> None:
+    class FailingGitStore(FakeGitStore):
+        async def prefetch(
+            self,
+            numbers: list[int],
+            *,
+            heartbeat: Any = None,
+            retry: Any = None,
+            retry_transient: bool = True,
+        ) -> None:
+            del heartbeat, retry, retry_transient
+            self.prefetches.append(list(numbers))
+            if 9 in numbers:
+                raise GitStoreError("permanent pull ref failure")
+
+    def api_fixture() -> FakeAPI:
+        api = FakeAPI()
+        for number in range(1, 12):
+            api.add_issue(number, pull=True)
+            api.json[f"{_BASE}/pulls/{number}"] = {
+                "id": number * 10,
+                "changed_files": 0,
+                "commits": 0,
+                "review_comments": 0,
+            }
+        return api
+
+    archive = tmp_path / "archive"
+    api = api_fixture()
+    failing = FailingGitStore()
+    with pytest.raises(GitStoreError, match="permanent pull ref failure"):
+        await _puller(
+            _config(archive, concurrency=8),
+            api=api,
+            git=failing,
+            now=lambda: _T0,
+        ).pull(_T0)
+
+    assert failing.prefetches == [list(range(1, 9)), [9, 10, 11]]
+    assert await _rows(
+        archive,
+        "SELECT count(*) AS count FROM pull_tasks WHERE completed = 1",
+    ) == [{"count": 8}]
+
+    resumed_git = FakeGitStore()
+    await _puller(
+        _config(archive, concurrency=8),
+        api=api,
+        git=resumed_git,
+        now=lambda: _T0,
+    ).pull(_T0)
+    reference = tmp_path / "reference"
+    await _puller(
+        _config(reference, concurrency=8),
+        api=api_fixture(),
+        git=FakeGitStore(),
+        now=lambda: _T0,
+    ).pull(_T0)
+
+    assert resumed_git.prefetches == [[9, 10, 11]]
+    actual = await _current(archive)
+    expected = await _current(reference)
+    assert {number: head.bundle for number, head in actual.items()} == {
+        number: head.bundle for number, head in expected.items()
+    }
+
+
+@pytest.mark.asyncio
 async def test_quiet_pull_does_not_query_closing_issue_references(tmp_path: Path) -> None:
     api = FakeAPI()
     api.add_issue(2, pull=True)
@@ -1717,7 +1885,9 @@ async def test_git_retry_is_observable_and_restores_the_work_phase(tmp_path: Pat
             *,
             heartbeat: Any = None,
             retry: Any = None,
+            retry_transient: bool = True,
         ) -> None:
+            del retry_transient
             self.prefetches.append(list(numbers))
             retry(4)
             heartbeat()

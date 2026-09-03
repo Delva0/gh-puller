@@ -18,7 +18,12 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
 from .client import GitHubAPI, GitHubAPIError, GitHubPage, GitHubResource
-from .git_store import GitObjectStore, default_git_url, git_store_path
+from .git_store import (
+    GitObjectStore,
+    TransientGitStoreError,
+    default_git_url,
+    git_store_path,
+)
 from .progress import _PullProgressTracker
 from .store import (
     ArchivedRun,
@@ -38,6 +43,8 @@ if TYPE_CHECKING:
 
 _NUMBER_AT_END = re.compile(r"/(\d+)$")
 _CLOSING_REFERENCE_BATCH_SIZE = 100
+_GIT_PREFETCH_BATCH_SIZE = 8
+_GIT_DEFER_RETRY_CEILING = 30.0
 _CATALOG_ACCEPT = "application/vnd.github.raw+json"
 _BUNDLE_SCHEMA_VERSION = 6
 
@@ -164,6 +171,7 @@ class _GitStore(Protocol):
         *,
         heartbeat: Callable[[], None] | None = None,
         retry: Callable[[float], None] | None = None,
+        retry_transient: bool = True,
     ) -> None: ...
 
     async def capture(
@@ -456,6 +464,33 @@ class GitHubPuller:
 
         changed = asyncio.Event()
         store_lock = asyncio.Lock()
+        deferred_git: set[int] = set()
+        git_retry_wait = 1.0
+
+        async def consume(tasks: list[PullTask]) -> None:
+            nonlocal git_retry_wait
+            deferred = await self._consume_tasks(
+                api,
+                git,
+                archive,
+                run_id,
+                heads,
+                tasks,
+                _iso(cutoff),
+                progress,
+                store_lock,
+            )
+            deferred_git.update(deferred)
+            if not deferred:
+                git_retry_wait = 1.0
+
+        async def retry_deferred() -> None:
+            nonlocal git_retry_wait
+            progress.git_deferred_retry(deferred_git, git_retry_wait)
+            await self._sleep(git_retry_wait)
+            deferred_git.clear()
+            git_retry_wait = min(git_retry_wait * 2, _GIT_DEFER_RETRY_CEILING)
+
         producer = asyncio.create_task(
             self._produce_catalog(
                 api,
@@ -470,40 +505,28 @@ class GitHubPuller:
         try:
             while True:
                 async with store_lock:
-                    tasks = await archive.pending_catalog_tasks(run_id)
+                    tasks = await archive.pending_catalog_tasks(run_id, exclude=deferred_git)
                 if tasks:
-                    await self._consume_tasks(
-                        api,
-                        git,
-                        archive,
-                        run_id,
-                        heads,
-                        tasks,
-                        _iso(cutoff),
-                        progress,
-                        store_lock,
-                    )
+                    await consume(tasks)
                     continue
                 if producer.done():
                     await producer
+                    if deferred_git:
+                        await retry_deferred()
+                        continue
                     break
                 await changed.wait()
                 changed.clear()
+            git_retry_wait = 1.0
             while True:
-                tasks = await archive.pending_signal_tasks(run_id)
-                if not tasks:
-                    break
-                await self._consume_tasks(
-                    api,
-                    git,
-                    archive,
-                    run_id,
-                    heads,
-                    tasks,
-                    _iso(cutoff),
-                    progress,
-                    store_lock,
-                )
+                tasks = await archive.pending_signal_tasks(run_id, exclude=deferred_git)
+                if tasks:
+                    await consume(tasks)
+                    continue
+                if deferred_git:
+                    await retry_deferred()
+                    continue
+                break
             await archive.finish_pass(run_id, _iso(cutoff))
         finally:
             if not producer.done():
@@ -628,7 +651,7 @@ class GitHubPuller:
         observed_at: str,
         progress: _PullProgressTracker,
         store_lock: asyncio.Lock,
-    ) -> None:
+    ) -> set[int]:
         selected = []
         cutoff = _parse_required_time(observed_at)
         for task in tasks:
@@ -658,7 +681,7 @@ class GitHubPuller:
                 continue
             selected.append(task)
         if selected:
-            await self._fetch_candidates(
+            return await self._fetch_candidates(
                 api,
                 git,
                 archive,
@@ -669,6 +692,7 @@ class GitHubPuller:
                 progress,
                 store_lock,
             )
+        return set()
 
     async def _fetch_candidates(
         self,
@@ -681,7 +705,7 @@ class GitHubPuller:
         observed_at: str,
         progress: _PullProgressTracker,
         store_lock: asyncio.Lock,
-    ) -> None:
+    ) -> set[int]:
         indexed = {task.number: task for task in tasks}
         summaries = {
             task.number: task.summary for task in tasks if task.summary is not None
@@ -863,24 +887,60 @@ class GitHubPuller:
             summary = summaries.get(number)
             return heads[number].kind if summary is None else _kind(summary)
 
-        for batch in _closing_reference_batches(sorted(indexed), kind):
+        deferred: set[int] = set()
+
+        async def prefetch_and_fetch(
+            batch: list[int],
+            closing_references: dict[int, list[dict[str, Any]]],
+        ) -> None:
             pull_numbers = [number for number in batch if kind(number) == "pull"]
             if pull_numbers:
                 progress.git_fetch(len(pull_numbers))
+                transient_failure = False
                 try:
                     await git.prefetch(
                         pull_numbers,
                         heartbeat=progress.git_heartbeat,
                         retry=progress.git_retry,
+                        retry_transient=False,
                     )
+                except TransientGitStoreError:
+                    transient_failure = True
                 finally:
                     progress.git_done()
+                if transient_failure:
+                    if len(pull_numbers) == 1:
+                        deferred.add(pull_numbers[0])
+                        issues = [number for number in batch if kind(number) == "issue"]
+                        if issues:
+                            await fetch_batch(issues, closing_references)
+                        return
+                    split_size = (len(pull_numbers) + 1) // 2
+                    for child in _pull_batches(pull_numbers, kind, split_size):
+                        await prefetch_and_fetch(child, closing_references)
+                    return
+            await fetch_batch(batch, closing_references)
+
+        for closing_batch in _pull_batches(
+            sorted(indexed),
+            kind,
+            _CLOSING_REFERENCE_BATCH_SIZE,
+        ):
+            closing_pulls = [
+                number for number in closing_batch if kind(number) == "pull"
+            ]
             closing_references = (
-                await api.closing_issue_references(self._owner, self._repo, pull_numbers)
-                if pull_numbers
+                await api.closing_issue_references(self._owner, self._repo, closing_pulls)
+                if closing_pulls
                 else {}
             )
-            await fetch_batch(batch, closing_references)
+            for batch in _pull_batches(
+                closing_batch,
+                kind,
+                _GIT_PREFETCH_BATCH_SIZE,
+            ):
+                await prefetch_and_fetch(batch, closing_references)
+        return deferred
 
     async def _fetch_bundle(
         self,
@@ -1472,15 +1532,16 @@ def _kind(item: dict[str, Any]) -> str:
     return "pull" if "pull_request" in item else "issue"
 
 
-def _closing_reference_batches(
+def _pull_batches(
     numbers: list[int],
     kind: Callable[[int], str],
+    size: int,
 ) -> Iterator[list[int]]:
     batch: list[int] = []
     pulls = 0
     for number in numbers:
         is_pull = kind(number) == "pull"
-        if is_pull and pulls == _CLOSING_REFERENCE_BATCH_SIZE:
+        if is_pull and pulls == size:
             yield batch
             batch = []
             pulls = 0

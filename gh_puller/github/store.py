@@ -23,7 +23,7 @@ from .v6 import MIGRATE_V5
 from .v7 import MIGRATE_V6, SCHEMA, VERSION
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Iterable
+    from collections.abc import AsyncIterator, Collection, Iterable
 
 _CODEC = "zlib-json-v1"
 
@@ -534,11 +534,17 @@ class SQLiteArchive:
         heads.update(staged)
         return heads, staged
 
-    async def pending_catalog_tasks(self, run_id: int) -> list[PullTask]:
+    async def pending_catalog_tasks(
+        self,
+        run_id: int,
+        *,
+        exclude: Collection[int] = (),
+    ) -> list[PullTask]:
         """读取当前已落盘目录页中尚未处理的对象。
 
         Args:
             run_id: 当前 pending run。
+            exclude: 本进程暂缓重试的 PR numbers。
 
         Returns:
             最多一个 GitHub 页大小、按发现顺序排列的任务。
@@ -551,17 +557,27 @@ class SQLiteArchive:
             JOIN payload_blobs AS b ON b.digest = t.summary_digest
             WHERE t.run_id = ? AND t.catalog_member = 1 AND t.completed = 0
             ORDER BY t.id
-            LIMIT 100
+            LIMIT ?
             """,
-            (run_id,),
+            (run_id, 100 + len(exclude)),
         )
-        return [_task(row, decode_summary=True) for row in rows]
+        return [
+            _task(row, decode_summary=True)
+            for row in rows
+            if int(row["number"]) not in exclude
+        ][:100]
 
-    async def pending_signal_tasks(self, run_id: int) -> list[PullTask]:
+    async def pending_signal_tasks(
+        self,
+        run_id: int,
+        *,
+        exclude: Collection[int] = (),
+    ) -> list[PullTask]:
         """读取目录闭合后仍需处理的 signal-only parents。
 
         Args:
             run_id: 当前 pending run。
+            exclude: 本进程暂缓重试的 PR numbers。
 
         Returns:
             至多 100 个按 number 排列的任务。
@@ -574,11 +590,15 @@ class SQLiteArchive:
             WHERE run_id = ? AND catalog_member = 0
                 AND force_comments = 1 AND completed = 0
             ORDER BY number
-            LIMIT 100
+            LIMIT ?
             """,
-            (run_id,),
+            (run_id, 100 + len(exclude)),
         )
-        return [_task(row, decode_summary=False) for row in rows]
+        return [
+            _task(row, decode_summary=False)
+            for row in rows
+            if int(row["number"]) not in exclude
+        ][:100]
 
     async def task_progress(self, run_id: int) -> tuple[int, int]:
         """读取活动 pass 已完成和全部 Issue/PR 任务数。

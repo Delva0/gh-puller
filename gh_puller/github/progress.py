@@ -197,6 +197,19 @@ class _PullProgressTracker:
             detail="git_transient_retry",
         )
 
+    def git_deferred_retry(self, pulls: Iterable[int], wait_seconds: float) -> None:
+        selected = sorted(pulls)
+        detail = (
+            f"git_ref_retry=pull#{selected[0]}"
+            if len(selected) == 1
+            else f"git_ref_retry=pulls:{len(selected)}"
+        )
+        self._emit(
+            phase="retry_wait",
+            wait_seconds=wait_seconds,
+            detail=detail,
+        )
+
     def git_done(self) -> None:
         self._git_detail = None
         self._emit(phase=self._work_phase, wait_seconds=None, detail=None)
