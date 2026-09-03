@@ -320,24 +320,25 @@ def _tty_line(progress: PullProgress) -> str:
     else:
         width = 20
         filled = width if total == 0 else min(width, int(width * completed / total))
-        bar = f"[{'#' * filled}{'-' * (width - filled)}] {completed}/{total}"
-    catalog_total = "?" if progress.catalog_total is None else str(progress.catalog_total)
-    catalog = f"{progress.catalog_seen}/{catalog_total}"
+        bar = f"[{'#' * filled}{'-' * (width - filled)}] {completed:,}/{total:,}"
+    catalog = f"{progress.catalog_seen:,}/{_count(progress.catalog_total)}"
     latest = "-"
     if progress.latest_number is not None:
         latest = f"{progress.latest_kind}#{progress.latest_number}"
-    quota = "|".join(
-        f"{item.resource}:{item.remaining if item.remaining is not None else '?'}"
-        f"/{item.limit if item.limit is not None else '?'}"
-        for item in progress.quotas
-    ) or "?"
+    quota = (
+        " ".join(f"{item.resource}={_count(item.remaining)}/{_count(item.limit)}" for item in progress.quotas) or "?"
+    )
     wait = "" if progress.wait_seconds is None else f" wait={progress.wait_seconds:.1f}s"
     return (
-        f"{progress.phase} {bar} catalog={catalog} "
-        f"issues={progress.issues_completed} prs={progress.pulls_completed} "
-        f"tombstones={progress.tombstones} latest={latest} "
-        f"requests={progress.requests} quota={quota}{wait}"
+        f"{progress.phase}  {bar}  catalog={catalog} "
+        f"issues={progress.issues_completed:,} pulls={progress.pulls_completed:,} "
+        f"tombstones={progress.tombstones:,} latest={latest} "
+        f"requests={progress.requests:,} {quota}{wait}"
     )
+
+
+def _count(value: int | None) -> str:
+    return "?" if value is None else f"{value:,}"
 
 
 def _json_event(progress: PullProgress) -> dict[str, Any]:

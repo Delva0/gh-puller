@@ -374,7 +374,7 @@ case "$action" in
         destination="$(absolute_destination "$2")"
         unit_path="$(resolve_managed_unit logs "$2" "$destination")"
         unit="$(basename "$unit_path")"
-        exec "$JOURNALCTL" --unit "$unit" --output=cat --lines=100 --follow
+        exec "$JOURNALCTL" --unit "$unit" --output=short-full --lines=100 --follow
         ;;
     *)
         usage >&2

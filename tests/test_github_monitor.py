@@ -6,7 +6,7 @@ import hashlib
 import json
 import os
 from dataclasses import replace
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from typing import TYPE_CHECKING
 
 from gh_puller.github import monitor
@@ -16,6 +16,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 _EVENT_AT = datetime(2026, 9, 2, 10, 0, tzinfo=UTC)
+_LOCAL = timezone(timedelta(hours=8), "CST")
 
 
 def _writer(database: Path, repository: str = "acme/widgets") -> monitor.ManagedWriter:
@@ -89,19 +90,20 @@ def test_table_prioritizes_target_items_progress_and_database(tmp_path: Path) ->
     output = monitor._render_table(
         [_status(tmp_path / "facts.sqlite3", progress)],
         now=_EVENT_AT + timedelta(minutes=5),
+        zone=_LOCAL,
     )
 
     assert "TARGET T" in output
     assert "ITEMS" in output
     assert "54,083" in output
-    assert "2026-09-02T05:37:49.940630Z" in output
+    assert "Wed 2026-09-02 13:37:49.940630 CST" in output
     assert "bundles [----------] 224/51,549" in output
     assert "5m00s remaining" in output
     assert str((tmp_path / "facts.sqlite3").resolve()) in output
     assert "REQUEST" not in output
     assert "QUOTA" in output
-    assert "core     4,498/5,000 (2026-09-02T11:00:00Z reset)" in output
-    assert "graphql  4,997/5,000 (2026-09-02T10:30:00Z reset)" in output
+    assert "core     4,498/5,000  reset Wed 2026-09-02 19:00:00 CST" in output
+    assert "graphql  4,997/5,000  reset Wed 2026-09-02 18:30:00 CST" in output
     lines = output.splitlines()
     core_line = next(line for line in lines if "core" in line)
     graphql_line = next(line for line in lines if "graphql" in line)
@@ -113,8 +115,8 @@ def test_table_prioritizes_target_items_progress_and_database(tmp_path: Path) ->
 def test_table_output_is_stable_for_external_watch(tmp_path: Path) -> None:
     statuses = [_status(tmp_path / "facts.sqlite3")]
 
-    first = monitor._render_table(statuses, now=_EVENT_AT + timedelta(seconds=5))
-    second = monitor._render_table(statuses, now=_EVENT_AT + timedelta(seconds=5))
+    first = monitor._render_table(statuses, now=_EVENT_AT + timedelta(seconds=5), zone=_LOCAL)
+    second = monitor._render_table(statuses, now=_EVENT_AT + timedelta(seconds=5), zone=_LOCAL)
 
     assert first == second
     assert "\x1b" not in first
@@ -136,6 +138,7 @@ def test_detail_uses_honest_unknown_catalog_denominator(tmp_path: Path) -> None:
     output = monitor._render_detail(
         _status(tmp_path / "facts.sqlite3", progress),
         now=_EVENT_AT,
+        zone=_LOCAL,
     )
 
     assert "ITEMS       ?" in output
@@ -148,19 +151,20 @@ def test_detail_shows_process_and_durable_run_progress(tmp_path: Path) -> None:
     output = monitor._render_detail(
         _status(tmp_path / "facts.sqlite3"),
         now=_EVENT_AT + timedelta(seconds=3),
+        zone=_LOCAL,
     )
 
     assert "STATE       running (active=active, sub=running)" in output
     assert "PID         1234" in output
-    assert "TARGET T    2026-09-02T05:37:49.940630Z" in output
+    assert "TARGET T    Wed 2026-09-02 13:37:49.940630 CST" in output
     assert "ITEMS       54,083" in output
     assert "STAGED      issues=117 pulls=107 tombstones=0" in output
     assert "LATEST      pull#2886" in output
     assert (
-        "QUOTA       core     4,498/5,000 (2026-09-02T11:00:00Z reset)\n"
-        "            graphql  4,997/5,000 (2026-09-02T10:30:00Z reset)"
+        "QUOTA       core     4,498/5,000  reset Wed 2026-09-02 19:00:00 CST\n"
+        "            graphql  4,997/5,000  reset Wed 2026-09-02 18:30:00 CST"
     ) in output
-    assert "UPDATED     3s ago" in output
+    assert "UPDATED     Wed 2026-09-02 18:00:00 CST; 3s ago" in output
     assert "PASS" not in output
     assert "SERIES" not in output
 
@@ -168,7 +172,7 @@ def test_detail_shows_process_and_durable_run_progress(tmp_path: Path) -> None:
 def test_quota_keeps_unknown_fields_explicit() -> None:
     progress = _progress(quotas=(RateQuota("core", None, None, None),))
 
-    assert monitor._quota(progress) == "core  ?/? (? reset)"
+    assert monitor._quota(progress, _LOCAL) == "core  ?/?  reset ?"
 
 
 def test_latest_progress_ignores_raw_logs_and_keeps_quota_fields() -> None:

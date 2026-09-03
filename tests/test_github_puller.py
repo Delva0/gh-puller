@@ -2700,7 +2700,7 @@ def test_console_progress_uses_throttled_json_for_logs_and_a_tty_bar() -> None:
     tty(replace(progress, phase="done", bundles_completed=2))
     rendered = terminal.getvalue()
     assert "[##########----------] 1/2" in rendered
-    assert "issues=1 prs=0" in rendered
+    assert "issues=1 pulls=0" in rendered
     assert "latest=issue#1" in rendered
-    assert "quota=core:4993/5000|graphql:4998/5000" in rendered
+    assert "core=4,993/5,000 graphql=4,998/5,000" in rendered
     assert rendered.endswith("\n")

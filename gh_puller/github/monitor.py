@@ -14,7 +14,7 @@ import re
 import subprocess
 import sys
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, tzinfo
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -26,6 +26,7 @@ if TYPE_CHECKING:
 _UNIT = re.compile(r"gh-puller-([0-9a-f]{12}|[0-9a-f]{64})\.service\Z")
 _PROGRESS_TYPE = "github_pull_progress"
 _JOURNAL_LINES = 512
+_WEEKDAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 
 
 @dataclass(frozen=True, slots=True)
@@ -205,7 +206,11 @@ def _latest_progress(output: str) -> ProgressState | None:
     return None
 
 
-def _render_table(statuses: Sequence[WriterStatus], now: datetime | None = None) -> str:
+def _render_table(
+    statuses: Sequence[WriterStatus],
+    now: datetime | None = None,
+    zone: tzinfo | None = None,
+) -> str:
     if not statuses:
         return "No managed GitHub writers."
     observed_at = datetime.now(UTC) if now is None else now.astimezone(UTC)
@@ -230,11 +235,11 @@ def _render_table(statuses: Sequence[WriterStatus], now: datetime | None = None)
             status.writer.repository,
             str(status.writer.database),
             _show(status.progress.run_id if status.progress else None),
-            status.progress.target_at if status.progress and status.progress.target_at else "-",
+            _target(status.progress, zone),
             _items(status.progress),
             status.progress.phase if status.progress else "-",
             _progress(status.progress, 10),
-            _quota(status.progress),
+            _quota(status.progress, zone),
             _wait(status.progress, observed_at),
             _age(status.progress.event_at, observed_at) if status.progress else "-",
         )
@@ -250,7 +255,11 @@ def _render_table(statuses: Sequence[WriterStatus], now: datetime | None = None)
     return "\n".join(lines)
 
 
-def _render_detail(status: WriterStatus, now: datetime | None = None) -> str:
+def _render_detail(
+    status: WriterStatus,
+    now: datetime | None = None,
+    zone: tzinfo | None = None,
+) -> str:
     observed_at = datetime.now(UTC) if now is None else now.astimezone(UTC)
     progress = status.progress
     rows = [
@@ -261,14 +270,14 @@ def _render_detail(status: WriterStatus, now: datetime | None = None) -> str:
         ("PID", str(status.service.pid) if status.service.pid else "-"),
         ("RESTARTS", str(status.service.restarts)),
         ("RUN", _show(progress.run_id if progress else None)),
-        ("TARGET T", progress.target_at if progress and progress.target_at else "-"),
+        ("TARGET T", _target(progress, zone)),
         ("ITEMS", _items(progress)),
         ("PHASE", progress.phase if progress else "-"),
         ("PROGRESS", _progress(progress, 20)),
-        ("QUOTA", _quota(progress)),
+        ("QUOTA", _quota(progress, zone)),
         ("STAGED", _staged(progress)),
         ("LATEST", _latest(progress)),
-        ("UPDATED", _updated(progress, observed_at)),
+        ("UPDATED", _updated(progress, observed_at, zone)),
     ]
     if progress and progress.wait_seconds is not None:
         rows.append(("WAIT", _wait(progress, observed_at)))
@@ -329,18 +338,25 @@ def _progress(progress: ProgressState | None, width: int) -> str:
     return "-"
 
 
-def _quota(progress: ProgressState | None) -> str:
+def _target(progress: ProgressState | None, zone: tzinfo | None = None) -> str:
+    if progress is None or progress.target_at is None:
+        return "-"
+    target = _time(progress.target_at)
+    return progress.target_at if target is None else _local_time(target, zone)
+
+
+def _quota(progress: ProgressState | None, zone: tzinfo | None = None) -> str:
     if progress is None or not progress.quotas:
         return "-"
     width = max(len(quota.resource) for quota in progress.quotas)
-    return "\n".join(_quota_item(quota, width) for quota in progress.quotas)
+    return "\n".join(_quota_item(quota, width, zone) for quota in progress.quotas)
 
 
-def _quota_item(quota: RateQuota, width: int) -> str:
+def _quota_item(quota: RateQuota, width: int, zone: tzinfo | None) -> str:
     remaining = "?" if quota.remaining is None else f"{quota.remaining:,}"
     limit = "?" if quota.limit is None else f"{quota.limit:,}"
-    reset_at = "?" if quota.reset_at is None else quota.reset_at.isoformat().replace("+00:00", "Z")
-    return f"{quota.resource:<{width}}  {remaining}/{limit} ({reset_at} reset)"
+    reset_at = "?" if quota.reset_at is None else _local_time(quota.reset_at, zone)
+    return f"{quota.resource:<{width}}  {remaining}/{limit}  reset {reset_at}"
 
 
 def _meter(label: str, completed: int, total: int | None, width: int) -> str:
@@ -362,10 +378,23 @@ def _latest(progress: ProgressState | None) -> str:
     return f"{progress.latest_kind or 'item'}#{progress.latest_number}"
 
 
-def _updated(progress: ProgressState | None, now: datetime) -> str:
+def _updated(
+    progress: ProgressState | None,
+    now: datetime,
+    zone: tzinfo | None = None,
+) -> str:
     if progress is None or progress.event_at is None:
         return "-"
-    return f"{_age(progress.event_at, now)} ago ({progress.event_at.isoformat().replace('+00:00', 'Z')})"
+    return f"{_local_time(progress.event_at, zone)}; {_age(progress.event_at, now)} ago"
+
+
+def _local_time(value: datetime, zone: tzinfo | None = None) -> str:
+    local = value.astimezone(zone)
+    clock = local.strftime("%H:%M:%S")
+    if local.microsecond:
+        clock = f"{clock}.{local.microsecond:06d}"
+    name = local.tzname() or local.strftime("%z")
+    return f"{_WEEKDAYS[local.weekday()]} {local:%Y-%m-%d} {clock} {name}"
 
 
 def _wait(progress: ProgressState | None, now: datetime) -> str:

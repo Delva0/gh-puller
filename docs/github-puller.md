@@ -199,7 +199,8 @@ publication. This makes the same callback suitable for an embedded monitor while
 keeping the archive schema independent of a particular operations stack.
 
 The CLI installs `ConsoleProgress` by default. A TTY receives a throttled single-line
-progress bar on stderr. A non-TTY receives throttled JSON Lines on stderr with
+progress bar on stderr with human-formatted counts and separate REST and GraphQL
+quota fields. A non-TTY receives throttled JSON Lines on stderr with
 `type="github_pull_progress"`; phase changes, waits, completion, and failure are
 emitted immediately. The one committed `PullResult` remains JSON on stdout, so a
 supervisor can route progress and results independently. `--no-progress` disables
@@ -462,15 +463,18 @@ the active catalog or bundle phase and likewise keeps an unknown denominator as 
 `QUOTA` retains every resource bucket observed by the writer and shows each
 `remaining/limit` independently. Normal authenticated operation therefore displays
 both REST `core` and `graphql` after each has responded. Each bucket occupies one
-aligned line with its own advertised reset timestamp. These samples come from
-response headers, so `status` itself makes no API call. A rate-limit event shows its
-decreasing local wait estimate. The per-run HTTP-attempt counter remains available
-in raw logs rather than the operational summary; it must not be treated as either
-REST units or GraphQL points when comparing pull strategies.
+aligned line with its own advertised reset timestamp. Absolute times in `status` use
+the system timezone and systemd-style notation; stored and structured event times
+remain UTC. These samples come from response headers, so `status` itself makes no API
+call. A rate-limit event shows its decreasing local wait estimate. The per-run
+HTTP-attempt counter remains available in raw logs rather than the operational
+summary; it must not be treated as either REST units or GraphQL points when comparing
+pull strategies.
 
 Progress JSON Lines, completed-run JSON, exceptions, and service messages are
 retained by journald, so no separate log-file rotation is required. `logs` prints
-the most recent 100 raw messages and follows new output until interrupted:
+the most recent 100 messages with journalctl's local-time `short-full` prefix and
+follows new output until interrupted:
 
 ```bash
 scripts/github-puller-daemon.sh logs archives/vllm.sqlite3

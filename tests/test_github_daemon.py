@@ -340,7 +340,7 @@ def test_daemon_control_actions_address_database_writer(
     elif action == "stop":
         assert calls == [f"stop {unit_name}"]
     else:
-        assert calls == [f"--unit {unit_name} --output=cat --lines=100 --follow"]
+        assert calls == [f"--unit {unit_name} --output=short-full --lines=100 --follow"]
 
 
 def test_control_action_resolves_existing_full_digest_unit(tmp_path: Path) -> None:
