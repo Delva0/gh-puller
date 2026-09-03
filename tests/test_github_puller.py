@@ -29,6 +29,7 @@ from gh_puller.github import (
     GitHubPuller,
     IncompleteGitHubDataError,
     PullProgress,
+    RateQuota,
     iter_heads,
     iter_runs,
     iter_versions,
@@ -1939,10 +1940,7 @@ async def test_rate_limit_waits_asynchronously_and_does_not_consume_retry_budget
         ("secondary_rate_limit", 3),
         ("secondary_rate_limit", 4),
     ]
-    assert waits[0].quota_limit == 5000
-    assert waits[0].quota_remaining == 0
-    assert waits[0].quota_resource == "core"
-    assert waits[0].quota_reset_at == _T0 + timedelta(seconds=2)
+    assert waits[0].quotas == (RateQuota("core", 5000, 0, _T0 + timedelta(seconds=2)),)
 
 
 @pytest.mark.asyncio
@@ -1979,6 +1977,52 @@ async def test_graphql_repository_count_is_exact_and_authenticated() -> None:
     assert body["variables"] == {"owner": "acme", "repo": "widgets"}
     assert "issues(states: [OPEN, CLOSED])" in body["query"]
     assert "pullRequests(states: [OPEN, CLOSED, MERGED])" in body["query"]
+
+
+@pytest.mark.asyncio
+async def test_quota_progress_keeps_rest_and_graphql_buckets() -> None:
+    progress = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/graphql":
+            resource = "graphql"
+            remaining = 4_997
+            body = {
+                "data": {
+                    "repository": {
+                        "issues": {"totalCount": 1},
+                        "pullRequests": {"totalCount": 2},
+                    },
+                },
+            }
+        else:
+            resource = "core"
+            remaining = 4_321
+            body = {"ok": True}
+        return httpx.Response(
+            200,
+            headers={
+                "x-ratelimit-limit": "5000",
+                "x-ratelimit-remaining": str(remaining),
+                "x-ratelimit-reset": str(int((_T0 + timedelta(hours=1)).timestamp())),
+                "x-ratelimit-resource": resource,
+            },
+            json=body,
+            request=request,
+        )
+
+    client = httpx.AsyncClient(base_url="https://api.github.test", transport=httpx.MockTransport(handler))
+    api = GitHubAPI(token=str(id(client)), client=client, graphql_url="/graphql", progress=progress.append)
+    try:
+        await api.repository_item_count("acme", "widgets")
+        await api.get_json("/rest")
+    finally:
+        await client.aclose()
+
+    assert progress[-1].quotas == (
+        RateQuota("core", 5_000, 4_321, _T0 + timedelta(hours=1)),
+        RateQuota("graphql", 5_000, 4_997, _T0 + timedelta(hours=1)),
+    )
 
 
 @pytest.mark.asyncio
@@ -2079,7 +2123,52 @@ async def test_successful_last_quota_response_gates_the_next_request() -> None:
     assert len(waits) == 1
     assert waits[0].detail == "primary_rate_limit"
     assert waits[0].wait_seconds == 3
-    assert waits[0].quota_remaining == 0
+    assert waits[0].quotas[0].remaining == 0
+
+
+@pytest.mark.asyncio
+async def test_concurrent_quota_responses_never_move_backward() -> None:
+    slow_started = asyncio.Event()
+    release_slow = asyncio.Event()
+    progress = []
+    first_reset = int((_T0 + timedelta(hours=1)).timestamp())
+    next_reset = int((_T0 + timedelta(hours=2)).timestamp())
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/old-slow":
+            slow_started.set()
+            await release_slow.wait()
+            reset, remaining = first_reset, 4_999
+        elif request.url.path == "/old-fast":
+            reset, remaining = first_reset, 4_998
+        else:
+            reset, remaining = next_reset, 4_999
+        return httpx.Response(
+            200,
+            headers={
+                "x-ratelimit-limit": "5000",
+                "x-ratelimit-remaining": str(remaining),
+                "x-ratelimit-reset": str(reset),
+                "x-ratelimit-resource": "core",
+            },
+            json={"ok": True},
+            request=request,
+        )
+
+    client = httpx.AsyncClient(base_url="https://api.github.test", transport=httpx.MockTransport(handler))
+    api = GitHubAPI(client=client, progress=progress.append)
+    try:
+        slow = asyncio.create_task(api.get_json("/old-slow"))
+        await slow_started.wait()
+        await api.get_json("/old-fast")
+        assert progress[-1].quotas[0].remaining == 4_998
+        await api.get_json("/new-fast")
+        release_slow.set()
+        await slow
+    finally:
+        await client.aclose()
+
+    assert progress[-1].quotas == (RateQuota("core", 5_000, 4_999, _T0 + timedelta(hours=2)),)
 
 
 @pytest.mark.asyncio
@@ -2474,10 +2563,10 @@ def test_console_progress_uses_throttled_json_for_logs_and_a_tty_bar() -> None:
         latest_number=1,
         latest_kind="issue",
         requests=7,
-        quota_limit=5000,
-        quota_remaining=4993,
-        quota_reset_at=_T0 + timedelta(hours=1),
-        quota_resource="core",
+        quotas=(
+            RateQuota("core", 5000, 4993, _T0 + timedelta(hours=1)),
+            RateQuota("graphql", 5000, 4998, _T0 + timedelta(minutes=30)),
+        ),
     )
     log = StringIO()
     ticks = iter((0.0, 0.1, 0.2))
@@ -2491,7 +2580,20 @@ def test_console_progress_uses_throttled_json_for_logs_and_a_tty_bar() -> None:
     assert len(lines) == 2
     assert lines[0]["type"] == "github_pull_progress"
     assert lines[0]["event_at"] == _iso(_T0)
-    assert lines[0]["quota_reset_at"] == _iso(_T0 + timedelta(hours=1))
+    assert lines[0]["quotas"] == [
+        {
+            "resource": "core",
+            "limit": 5000,
+            "remaining": 4993,
+            "reset_at": _iso(_T0 + timedelta(hours=1)),
+        },
+        {
+            "resource": "graphql",
+            "limit": 5000,
+            "remaining": 4998,
+            "reset_at": _iso(_T0 + timedelta(minutes=30)),
+        },
+    ]
     assert lines[1]["phase"] == "done"
 
     terminal = StringIO()
@@ -2502,4 +2604,5 @@ def test_console_progress_uses_throttled_json_for_logs_and_a_tty_bar() -> None:
     assert "[##########----------] 1/2" in rendered
     assert "issues=1 prs=0" in rendered
     assert "latest=issue#1" in rendered
+    assert "quota=core:4993/5000|graphql:4998/5000" in rendered
     assert rendered.endswith("\n")

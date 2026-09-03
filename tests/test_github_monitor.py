@@ -10,6 +10,7 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
 from gh_puller.github import monitor
+from gh_puller.github.progress import RateQuota
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -43,6 +44,10 @@ def _progress(**changes: object) -> monitor.ProgressState:
         tombstones=0,
         latest_number=2886,
         latest_kind="pull",
+        quotas=(
+            RateQuota("core", 5_000, 4_498, _EVENT_AT + timedelta(hours=1)),
+            RateQuota("graphql", 5_000, 4_997, _EVENT_AT + timedelta(minutes=30)),
+        ),
         wait_seconds=None,
         detail=None,
     )
@@ -94,7 +99,9 @@ def test_table_prioritizes_target_items_progress_and_database(tmp_path: Path) ->
     assert "5m00s remaining" in output
     assert str((tmp_path / "facts.sqlite3").resolve()) in output
     assert "REQUEST" not in output
-    assert "QUOTA" not in output
+    assert "QUOTA" in output
+    assert "core 4,498/5,000" in output
+    assert "graphql 4,997/5,000" in output
 
 
 def test_table_output_is_stable_for_external_watch(tmp_path: Path) -> None:
@@ -143,12 +150,15 @@ def test_detail_shows_process_and_durable_run_progress(tmp_path: Path) -> None:
     assert "ITEMS       54,083" in output
     assert "STAGED      issues=117 pulls=107 tombstones=0" in output
     assert "LATEST      pull#2886" in output
+    assert "QUOTA       core 4,498/5,000; reset in 59m57s" in output
+    assert "2026-09-02T11:00:00Z" in output
+    assert "graphql 4,997/5,000; reset in 29m57s" in output
     assert "UPDATED     3s ago" in output
     assert "PASS" not in output
     assert "SERIES" not in output
 
 
-def test_latest_progress_ignores_raw_logs_and_request_fields() -> None:
+def test_latest_progress_ignores_raw_logs_and_keeps_quota_fields() -> None:
     old = {
         "type": "github_pull_progress",
         "event_at": "2026-09-02T09:59:00Z",
@@ -164,7 +174,20 @@ def test_latest_progress_ignores_raw_logs_and_request_fields() -> None:
         "run_id": 1,
         "catalog_seen": 200,
         "requests": 24_946,
-        "quota_remaining": 4_498,
+        "quotas": [
+            {
+                "resource": "core",
+                "limit": 5_000,
+                "remaining": 4_498,
+                "reset_at": "2026-09-02T11:00:00Z",
+            },
+            {
+                "resource": "graphql",
+                "limit": 5_000,
+                "remaining": 4_997,
+                "reset_at": "2026-09-02T10:30:00Z",
+            },
+        ],
     }
     output = "\n".join((json.dumps(old), "Traceback: diagnostic", json.dumps(latest)))
 
@@ -174,7 +197,10 @@ def test_latest_progress_ignores_raw_logs_and_request_fields() -> None:
     assert progress.phase == "closing_catalog"
     assert progress.catalog_seen == 200
     assert not hasattr(progress, "requests")
-    assert not hasattr(progress, "quota_remaining")
+    assert progress.quotas == (
+        RateQuota("core", 5_000, 4_498, _EVENT_AT + timedelta(hours=1)),
+        RateQuota("graphql", 5_000, 4_997, _EVENT_AT + timedelta(minutes=30)),
+    )
 
 
 def test_managed_writers_require_matching_path_identity(tmp_path: Path) -> None:

@@ -207,7 +207,7 @@ emits the resulting snapshot through the same progress stream.
 | `issues_completed`, `pulls_completed` | Kind split of durable completed bundles in the current plan. | Their sum equals `bundles_completed`. |
 | `tombstones` | Durable absences that agree with the current certified catalog plan. | They are reported separately from bundle progress and are excluded from the resulting visible N. |
 | `latest_number`, `latest_kind` | Most recently completed and durably staged parent. | Completion follows response time rather than parent number; gaps are ordinary concurrent work, not missing facts. |
-| `requests`, `quota_*` | Attempts accumulated by the run and the latest GitHub quota headers. | They measure API work, not objects; one bundle can require many paginated requests. |
+| `requests`, `quotas` | HTTP attempts accumulated by the run and the latest independently sampled GitHub quota buckets. | They measure API work, not objects; REST `core` uses request units while GraphQL uses points, so neither can be derived from the other. |
 
 A future-T operation has separate `prefetch_*` and `closing_*` phases. Each pass moves
 through catalog proof and parent-bundle materialization. It recomputes its catalog
@@ -414,9 +414,14 @@ The overview always includes the canonical `DATABASE`, current target T, run,
 phase, event age, and `ITEMS`. `ITEMS` means the certified current catalog count of
 Issues plus pull requests; it is `?` until that count is known. `PROGRESS` reports
 the active catalog or bundle phase and likewise keeps an unknown denominator as `?`.
-A rate-limit event shows its decreasing local wait estimate. API request and quota
-counters remain available in raw logs but are intentionally absent from the
-operational summary.
+`QUOTA` retains every resource bucket observed by the writer and shows each
+`remaining/limit` independently. Normal authenticated operation therefore displays
+both REST `core` and `graphql` after each has responded. The detailed view also shows
+each advertised reset timestamp and local countdown. These samples come from response
+headers, so `status` itself makes no API call. A rate-limit event shows its decreasing
+local wait estimate. The per-run HTTP-attempt counter remains available in raw logs
+rather than the operational summary; it must not be treated as either REST units or
+GraphQL points when comparing pull strategies.
 
 Progress JSON Lines, completed-run JSON, exceptions, and service messages are
 retained by journald, so no separate log-file rotation is required. `logs` prints

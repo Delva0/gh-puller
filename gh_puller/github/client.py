@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Any
 
 import httpx
 
-from .progress import APIProgress
+from .progress import APIProgress, RateQuota
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Mapping
@@ -92,10 +92,7 @@ class GitHubAPI:
         self._progress = progress
         self._blocked_until = 0.0
         self._gate_lock = asyncio.Lock()
-        self._quota_limit: int | None = None
-        self._quota_remaining: int | None = None
-        self._quota_reset_at: datetime | None = None
-        self._quota_resource: str | None = None
+        self._quotas: dict[str, RateQuota] = {}
         self.request_count = 0
 
     async def close(self) -> None:
@@ -520,15 +517,36 @@ class GitHubAPI:
         limit = _integer_header(response, "x-ratelimit-limit")
         remaining = _integer_header(response, "x-ratelimit-remaining")
         reset = _integer_header(response, "x-ratelimit-reset")
-        if limit is not None:
-            self._quota_limit = limit
-        if remaining is not None:
-            self._quota_remaining = remaining
-        if reset is not None:
-            self._quota_reset_at = datetime.fromtimestamp(reset, UTC)
+        reset_at = None if reset is None else datetime.fromtimestamp(reset, UTC)
         resource = response.headers.get("x-ratelimit-resource")
-        if resource is not None:
-            self._quota_resource = resource
+        if resource is None:
+            return
+        previous = self._quotas.get(resource)
+        if (
+            previous is not None
+            and reset_at is not None
+            and previous.reset_at is not None
+            and reset_at < previous.reset_at
+        ):
+            return
+        new_window = previous is None or (
+            reset_at is not None and (previous.reset_at is None or reset_at > previous.reset_at)
+        )
+        if new_window:
+            self._quotas[resource] = RateQuota(resource, limit, remaining, reset_at)
+            return
+        self._quotas[resource] = RateQuota(
+            resource,
+            limit if limit is not None else previous.limit,
+            (
+                previous.remaining
+                if remaining is None
+                else remaining
+                if previous.remaining is None
+                else min(previous.remaining, remaining)
+            ),
+            reset_at if reset_at is not None else previous.reset_at,
+        )
 
     def _emit_progress(
         self,
@@ -540,10 +558,7 @@ class GitHubAPI:
             return
         event = APIProgress(
             request_count=self.request_count,
-            quota_limit=self._quota_limit,
-            quota_remaining=self._quota_remaining,
-            quota_reset_at=self._quota_reset_at,
-            quota_resource=self._quota_resource,
+            quotas=tuple(sorted(self._quotas.values(), key=lambda quota: quota.resource)),
             wait_seconds=wait_seconds,
             detail=detail,
         )

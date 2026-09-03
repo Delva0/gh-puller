@@ -9,7 +9,7 @@
 """
 
 from .client import GitHubAPI, GitHubAPIError
-from .progress import ConsoleProgress, ProgressObserver, PullProgress
+from .progress import ConsoleProgress, ProgressObserver, PullProgress, RateQuota
 from .puller import (
     GitHubPullConfig,
     GitHubPuller,
@@ -32,6 +32,7 @@ __all__ = [
     "ProgressObserver",
     "PullProgress",
     "PullResult",
+    "RateQuota",
     "incremental_pull",
     "iter_heads",
     "iter_runs",

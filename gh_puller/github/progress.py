@@ -16,12 +16,17 @@ from typing import Any, TextIO
 
 
 @dataclass(frozen=True, slots=True)
+class RateQuota:
+    resource: str  # GitHub primary quota bucket.
+    limit: int | None  # Bucket capacity reported by GitHub.
+    remaining: int | None  # Latest conservative remaining value in this window.
+    reset_at: datetime | None  # Current primary window reset time.
+
+
+@dataclass(frozen=True, slots=True)
 class APIProgress:
     request_count: int  # HTTP attempts made by this client.
-    quota_limit: int | None = None  # Latest GitHub resource limit.
-    quota_remaining: int | None = None  # Latest remaining requests.
-    quota_reset_at: datetime | None = None  # Latest primary reset time.
-    quota_resource: str | None = None  # GitHub quota bucket name.
+    quotas: tuple[RateQuota, ...] = ()  # Latest independent resource buckets.
     wait_seconds: float | None = None  # Delay before the next attempt.
     detail: str | None = None  # Machine-readable wait or retry reason.
 
@@ -43,10 +48,7 @@ class PullProgress:
     latest_number: int | None = None  # Latest durably staged parent number.
     latest_kind: str | None = None  # issue or pull for latest_number.
     requests: int = 0  # Attempts accumulated by this run.
-    quota_limit: int | None = None  # Latest GitHub resource limit.
-    quota_remaining: int | None = None  # Latest remaining requests.
-    quota_reset_at: datetime | None = None  # Latest primary reset time.
-    quota_resource: str | None = None  # GitHub quota bucket name.
+    quotas: tuple[RateQuota, ...] = ()  # Latest independent GitHub resource buckets.
     wait_seconds: float | None = None  # Current target, retry, or quota wait.
     reused: bool = False  # True when an existing committed run was returned.
     detail: str | None = None  # Machine-readable phase detail.
@@ -210,13 +212,11 @@ class _PullProgressTracker:
         self._emit(
             phase=phase,
             requests=self._run_requests(progress.request_count),
-            quota_limit=progress.quota_limit,
-            quota_remaining=progress.quota_remaining,
-            quota_reset_at=progress.quota_reset_at,
-            quota_resource=progress.quota_resource,
+            quotas=progress.quotas,
             wait_seconds=progress.wait_seconds,
             detail=progress.detail,
         )
+
     def done(
         self,
         *,
@@ -326,11 +326,11 @@ def _tty_line(progress: PullProgress) -> str:
     latest = "-"
     if progress.latest_number is not None:
         latest = f"{progress.latest_kind}#{progress.latest_number}"
-    quota = "?"
-    if progress.quota_remaining is not None:
-        quota = str(progress.quota_remaining)
-        if progress.quota_limit is not None:
-            quota = f"{quota}/{progress.quota_limit}"
+    quota = "|".join(
+        f"{item.resource}:{item.remaining if item.remaining is not None else '?'}"
+        f"/{item.limit if item.limit is not None else '?'}"
+        for item in progress.quotas
+    ) or "?"
     wait = "" if progress.wait_seconds is None else f" wait={progress.wait_seconds:.1f}s"
     return (
         f"{progress.phase} {bar} catalog={catalog} "
@@ -343,10 +343,17 @@ def _tty_line(progress: PullProgress) -> str:
 def _json_event(progress: PullProgress) -> dict[str, Any]:
     payload = asdict(progress)
     payload["type"] = "github_pull_progress"
-    for key, value in tuple(payload.items()):
-        if isinstance(value, datetime):
-            payload[key] = value.astimezone(UTC).isoformat().replace("+00:00", "Z")
-    return payload
+    return _json_value(payload)
+
+
+def _json_value(value: Any) -> Any:
+    if isinstance(value, datetime):
+        return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
+    if isinstance(value, dict):
+        return {key: _json_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_value(item) for item in value]
+    return value
 
 
 def _utc(value: datetime) -> datetime:

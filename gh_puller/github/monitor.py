@@ -18,6 +18,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from .progress import RateQuota
+
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
@@ -57,6 +59,7 @@ class ProgressState:
     tombstones: int  # Durable absences compatible with the current run plan.
     latest_number: int | None  # Latest durably staged parent number.
     latest_kind: str | None  # Kind of latest_number.
+    quotas: tuple[RateQuota, ...]  # Latest independent GitHub resource buckets.
     wait_seconds: float | None  # Current target, retry, or rate-limit wait.
     detail: str | None  # Machine-readable phase detail.
 
@@ -195,6 +198,7 @@ def _latest_progress(output: str) -> ProgressState | None:
             tombstones=_int(payload.get("tombstones")) or 0,
             latest_number=_int(payload.get("latest_number")),
             latest_kind=_text(payload.get("latest_kind")),
+            quotas=_quotas(payload.get("quotas")),
             wait_seconds=_float(payload.get("wait_seconds")),
             detail=_text(payload.get("detail")),
         )
@@ -215,6 +219,7 @@ def _render_table(statuses: Sequence[WriterStatus], now: datetime | None = None)
         "ITEMS",
         "PHASE",
         "PROGRESS",
+        "QUOTA",
         "WAIT",
         "UPDATED",
     )
@@ -229,6 +234,7 @@ def _render_table(statuses: Sequence[WriterStatus], now: datetime | None = None)
             _items(status.progress),
             status.progress.phase if status.progress else "-",
             _progress(status.progress, 10),
+            _quota(status.progress),
             _wait(status.progress, observed_at),
             _age(status.progress.event_at, observed_at) if status.progress else "-",
         )
@@ -255,6 +261,7 @@ def _render_detail(status: WriterStatus, now: datetime | None = None) -> str:
         ("ITEMS", _items(progress)),
         ("PHASE", progress.phase if progress else "-"),
         ("PROGRESS", _progress(progress, 20)),
+        ("QUOTA", _quota(progress, observed_at)),
         ("STAGED", _staged(progress)),
         ("LATEST", _latest(progress)),
         ("UPDATED", _updated(progress, observed_at)),
@@ -296,6 +303,25 @@ def _progress(progress: ProgressState | None, width: int) -> str:
     if progress.wait_seconds is not None:
         return f"wait {progress.wait_seconds:.1f}s"
     return "-"
+
+
+def _quota(progress: ProgressState | None, now: datetime | None = None) -> str:
+    if progress is None or not progress.quotas:
+        return "-"
+    return " | ".join(_quota_item(quota, now) for quota in progress.quotas)
+
+
+def _quota_item(quota: RateQuota, now: datetime | None) -> str:
+    remaining = "?" if quota.remaining is None else f"{quota.remaining:,}"
+    limit = "?" if quota.limit is None else f"{quota.limit:,}"
+    value = f"{quota.resource} {remaining}/{limit}"
+    if now is None or quota.reset_at is None:
+        return value
+    reset_at = quota.reset_at.isoformat().replace("+00:00", "Z")
+    seconds = (quota.reset_at - now).total_seconds()
+    reset = f"in {_duration(seconds)}" if seconds > 0 else "due"
+    return f"{value}; reset {reset} ({reset_at})"
+
 
 def _meter(label: str, completed: int, total: int | None, width: int) -> str:
     if total is None:
@@ -386,6 +412,27 @@ def _time(value: object) -> datetime | None:
     if parsed.tzinfo is None or parsed.utcoffset() is None:
         return None
     return parsed.astimezone(UTC)
+
+
+def _quotas(value: object) -> tuple[RateQuota, ...]:
+    if not isinstance(value, list):
+        return ()
+    quotas = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        resource = _text(item.get("resource"))
+        if resource is None:
+            continue
+        quotas.append(
+            RateQuota(
+                resource=resource,
+                limit=_int(item.get("limit")),
+                remaining=_int(item.get("remaining")),
+                reset_at=_time(item.get("reset_at")),
+            ),
+        )
+    return tuple(quotas)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
