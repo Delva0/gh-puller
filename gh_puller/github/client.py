@@ -227,6 +227,55 @@ query ReviewThreadComments($id: ID!, $cursor: String) {
   }
 }
 """ + _REVIEW_COMMENT_FRAGMENT
+_ISSUE_COMMENT_FRAGMENT = """
+fragment IssueCommentFields on IssueComment {
+  id
+  fullDatabaseId
+  body
+  bodyHTML
+  bodyText
+  authorAssociation
+  createdAt
+  updatedAt
+  url
+  reactions { totalCount }
+  author {
+    __typename
+    login
+    avatarUrl
+    url
+    ... on User { id databaseId name email isSiteAdmin }
+    ... on Organization { id databaseId name email }
+    ... on Bot { id databaseId }
+    ... on Mannequin { id databaseId email }
+  }
+}
+"""
+_ISSUE_COMMENTS = """
+query IssueComments($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
+  repository(owner: $owner, name: $repo) {
+    issueOrPullRequest(number: $number) {
+      __typename
+      ... on Issue {
+        number
+        comments(first: 100, after: $cursor) {
+          totalCount
+          nodes { ...IssueCommentFields }
+          pageInfo { hasNextPage endCursor }
+        }
+      }
+      ... on PullRequest {
+        number
+        comments(first: 100, after: $cursor) {
+          totalCount
+          nodes { ...IssueCommentFields }
+          pageInfo { hasNextPage endCursor }
+        }
+      }
+    }
+  }
+}
+""" + _ISSUE_COMMENT_FRAGMENT
 
 
 class _Transport(StrEnum):
@@ -886,6 +935,59 @@ class GitHubAPI:
 
         return await self._either(rest, graphql, rest_cached=cache is not None)
 
+    async def issue_comments(
+        self,
+        owner: str,
+        repo: str,
+        number: int,
+        *,
+        previous: list[dict[str, Any]] | None,
+        cache: dict[str, Any] | None,
+    ) -> GitHubResource:
+        """读取一个 Issue/PR 的完整 conversation-comment 集合并选择配额池。
+
+        Args:
+            owner: 仓库 owner。
+            repo: 仓库名。
+            number: 仓库内 Issue/PR number。
+            previous: 与 cache 配对的上一版稳定集合；None 表示冷读取。
+            cache: 本操作先前返回的 REST 分页 validator。
+
+        Returns:
+            REST 兼容的稳定 comment 集合、来源、来源原文与 validator。
+        """
+        if number < 1:
+            raise ValueError("number must be positive")
+        path = (
+            f"/repos/{quote(owner, safe='')}/{quote(repo, safe='')}/issues/{number}/comments"
+        )
+
+        async def rest(wait_primary: bool) -> GitHubResource:
+            value, updated = await self._paginate_cached(
+                path,
+                previous=previous,
+                cache=cache,
+                primary_wait=wait_primary,
+            )
+            return GitHubResource(value, _Transport.REST, value, updated)
+
+        async def graphql(wait_primary: bool) -> GitHubResource:
+            raw = await self._parent_connection(
+                _ISSUE_COMMENTS,
+                "comments",
+                owner,
+                repo,
+                number,
+                primary_wait=wait_primary,
+            )
+            value = [
+                _rest_issue_comment(comment, self._base_url, owner, repo, number)
+                for comment in raw
+            ]
+            return GitHubResource(value, _Transport.GRAPHQL, raw)
+
+        return await self._either(rest, graphql, rest_cached=cache is not None)
+
     async def compare_commits(
         self,
         owner: str,
@@ -1147,6 +1249,51 @@ class GitHubAPI:
             next_cursor = page_info["endCursor"]
             if not isinstance(next_cursor, str) or not next_cursor or next_cursor == cursor:
                 raise GitHubAPIError(f"pull #{number} has an invalid {field} cursor")
+            cursor = next_cursor
+
+    async def _parent_connection(
+        self,
+        query: str,
+        field: str,
+        owner: str,
+        repo: str,
+        number: int,
+        *,
+        primary_wait: bool,
+    ) -> list[dict[str, Any]]:
+        items: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        cursor: str | None = None
+        expected: int | None = None
+        while True:
+            payload = await self._graphql(
+                query,
+                {"owner": owner, "repo": repo, "number": number, "cursor": cursor},
+                primary_wait=primary_wait,
+            )
+            parent = _graphql_parent(payload, number)
+            connection = _node_connection(parent, field, f"parent #{number}")
+            total = connection["totalCount"]
+            if expected is None:
+                expected = total
+            elif expected != total:
+                raise GitHubAPIError(f"parent #{number} {field} count changed while paging")
+            for node in connection["nodes"]:
+                node_id = node.get("id")
+                if not isinstance(node_id, str) or not node_id or node_id in seen:
+                    raise GitHubAPIError(f"parent #{number} has invalid {field} identities")
+                seen.add(node_id)
+                items.append(node)
+            page_info = connection["pageInfo"]
+            if not page_info["hasNextPage"]:
+                if len(items) != expected:
+                    raise GitHubAPIError(
+                        f"parent #{number} advertised {expected} {field}, got {len(items)}",
+                    )
+                return items
+            next_cursor = page_info["endCursor"]
+            if not isinstance(next_cursor, str) or not next_cursor or next_cursor == cursor:
+                raise GitHubAPIError(f"parent #{number} has an invalid {field} cursor")
             cursor = next_cursor
 
     async def _graphql_review_comments(
@@ -1629,6 +1776,17 @@ def _graphql_pull(payload: dict[str, Any], number: int) -> dict[str, Any]:
     return pull
 
 
+def _graphql_parent(payload: dict[str, Any], number: int) -> dict[str, Any]:
+    try:
+        repository = payload["data"]["repository"]
+        parent = repository["issueOrPullRequest"]
+    except (KeyError, TypeError) as exc:
+        raise GitHubAPIError(f"GitHub returned incomplete parent #{number}") from exc
+    if not isinstance(parent, dict) or parent.get("number") != number:
+        raise GitHubAPIError(f"GitHub returned no matching parent #{number}")
+    return parent
+
+
 def _graphql_connection(
     pull: dict[str, Any],
     field: str,
@@ -1872,6 +2030,35 @@ def _rest_review_comment(
         "subject_type": str(comment["subjectType"]).lower(),
         "reactions": {
             "url": f"{api}/pulls/comments/{comment_id}/reactions",
+            "total_count": comment["reactions"]["totalCount"],
+        },
+    }
+
+
+def _rest_issue_comment(
+    comment: dict[str, Any],
+    base_url: str,
+    owner: str,
+    repo: str,
+    parent_number: int,
+) -> dict[str, Any]:
+    comment_id = _database_id(comment.get("fullDatabaseId"))
+    api = f"{base_url}/repos/{quote(owner, safe='')}/{quote(repo, safe='')}"
+    return {
+        "url": f"{api}/issues/comments/{comment_id}",
+        "html_url": comment["url"],
+        "issue_url": f"{api}/issues/{parent_number}",
+        "id": comment_id,
+        "node_id": comment["id"],
+        "user": _rest_actor(comment.get("author")),
+        "created_at": comment["createdAt"],
+        "updated_at": comment["updatedAt"],
+        "author_association": comment["authorAssociation"],
+        "body": comment["body"],
+        "body_text": comment["bodyText"],
+        "body_html": comment["bodyHTML"],
+        "reactions": {
+            "url": f"{api}/issues/comments/{comment_id}/reactions",
             "total_count": comment["reactions"]["totalCount"],
         },
     }

@@ -311,6 +311,22 @@ class FakeAPI:
         )
         return GitHubResource(value, "rest", value, updated)
 
+    async def issue_comments(
+        self,
+        owner: str,
+        repo: str,
+        number: int,
+        *,
+        previous: list[dict[str, Any]] | None,
+        cache: dict[str, Any] | None,
+    ) -> GitHubResource:
+        value, updated = await self.paginate_cached(
+            f"/repos/{owner}/{repo}/issues/{number}/comments",
+            previous=previous,
+            cache=cache,
+        )
+        return GitHubResource(value, "rest", value, updated)
+
     async def closing_issue_references(
         self,
         owner: str,
@@ -578,6 +594,31 @@ def _graphql_review_comment(number: int) -> dict[str, Any]:
         "originalCommit": {"oid": f"{number - 1:040x}"},
         "replyTo": None,
         "pullRequestReview": {"fullDatabaseId": "71"},
+        "reactions": {"totalCount": 1},
+        "author": {
+            "__typename": "User",
+            "id": f"user-{number}",
+            "databaseId": number + 100,
+            "login": f"commenter-{number}",
+            "avatarUrl": f"https://avatars.test/{number}",
+            "url": f"https://github.test/commenter-{number}",
+            "isSiteAdmin": False,
+        },
+        "futureGraphQLField": {"kept": number},
+    }
+
+
+def _graphql_issue_comment(number: int) -> dict[str, Any]:
+    return {
+        "id": f"issue-comment-{number}",
+        "fullDatabaseId": str(number),
+        "body": f"comment {number}",
+        "bodyHTML": f"<p>comment {number}</p>",
+        "bodyText": f"comment {number}",
+        "authorAssociation": "CONTRIBUTOR",
+        "createdAt": _iso(_T0 - timedelta(minutes=number + 1)),
+        "updatedAt": _iso(_T0 - timedelta(minutes=number)),
+        "url": f"https://github.test/acme/widgets/issues/7#issuecomment-{number}",
         "reactions": {"totalCount": 1},
         "author": {
             "__typename": "User",
@@ -2863,6 +2904,79 @@ async def test_pull_review_comments_graphql_closes_both_pagination_levels() -> N
     assert [comment["id"] for comment in result.value] == [81, 82, 83]
     assert result.value[0]["pull_request_review_id"] == 71
     assert result.value[0]["path"] == "src/example.py"
+    assert result.value[0]["reactions"]["total_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_issue_comments_graphql_paginates_for_issue_or_pull() -> None:
+    seen: list[dict[str, Any]] = []
+    comments = [_graphql_issue_comment(81), _graphql_issue_comment(82)]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path != "/graphql":
+            return httpx.Response(
+                200,
+                headers=_quota_headers("core", 500),
+                json={"seed": True},
+                request=request,
+            )
+        body = json.loads(request.content)
+        seen.append(body)
+        cursor = body["variables"]["cursor"]
+        nodes = comments[:1] if cursor is None else comments[1:]
+        connection = {
+            "totalCount": 2,
+            "nodes": nodes,
+            "pageInfo": {
+                "hasNextPage": cursor is None,
+                "endCursor": "next-comment" if cursor is None else None,
+            },
+        }
+        return httpx.Response(
+            200,
+            headers=_quota_headers("graphql", 4_900 - len(seen)),
+            json={
+                "data": {
+                    "repository": {
+                        "issueOrPullRequest": {
+                            "__typename": "PullRequest",
+                            "number": 7,
+                            "comments": connection,
+                        },
+                    },
+                },
+            },
+            request=request,
+        )
+
+    client = httpx.AsyncClient(
+        base_url="https://api.github.test",
+        transport=httpx.MockTransport(handler),
+    )
+    api = GitHubAPI(
+        token=str(id(client)),
+        client=client,
+        graphql_url="/graphql",
+        now=lambda: _T0,
+    )
+    try:
+        await api.get_json("/seed-core")
+        result = await api.issue_comments(
+            "acme",
+            "widgets",
+            7,
+            previous=None,
+            cache=None,
+        )
+    finally:
+        await client.aclose()
+
+    assert [body["variables"]["cursor"] for body in seen] == [None, "next-comment"]
+    assert result.source == "graphql"
+    assert result.raw == comments
+    assert [comment["id"] for comment in result.value] == [81, 82]
+    assert result.value[0]["body_html"] == "<p>comment 81</p>"
+    assert result.value[0]["user"]["login"] == "commenter-81"
     assert result.value[0]["reactions"]["total_count"] == 1
 
 

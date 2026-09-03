@@ -137,6 +137,16 @@ class _API(Protocol):
         cache: dict[str, Any] | None,
     ) -> GitHubResource: ...
 
+    async def issue_comments(
+        self,
+        owner: str,
+        repo: str,
+        number: int,
+        *,
+        previous: list[dict[str, Any]] | None,
+        cache: dict[str, Any] | None,
+    ) -> GitHubResource: ...
+
 
 class _GitStore(Protocol):
     async def prefetch(
@@ -874,15 +884,25 @@ class GitHubPuller:
             _set_cache(http_cache, "issue", cache)
         else:
             issue = catalog_issue
+        comment_resource: GitHubResource | None = None
         if not force_comments and _is_zero_integer(issue.get("comments")):
             comments = []
         else:
-            comments, cache = await self._cached_page(
-                api,
-                f"{issue_path}/comments",
-                _list_field(previous, "issue_comments"),
-                _dict_field(previous_cache, "issue_comments"),
+            comment_resource = await api.issue_comments(
+                self._owner,
+                self._repo,
+                number,
+                previous=_list_field(previous, "issue_comments"),
+                cache=_dict_field(previous_cache, "issue_comments"),
             )
+            comments = comment_resource.value
+            cache = comment_resource.cache
+            if not isinstance(comments, list) or any(
+                not isinstance(comment, dict) for comment in comments
+            ):
+                raise IncompleteGitHubDataError(
+                    f"GitHub returned invalid issue comments for {issue_path}",
+                )
             _set_cache(http_cache, "issue_comments", cache)
         comments = _canonical_comments(comments)
         timeline, cache = await self._cached_page(
@@ -935,6 +955,11 @@ class GitHubPuller:
             "events": events,
             "reactions": reactions,
             "issue_comment_reactions": comment_reactions,
+            "api_sources": (
+                {}
+                if comment_resource is None
+                else {"issue_comments": _api_source(comment_resource)}
+            ),
         }
         if bundle["kind"] == "pull":
             pull, cache = await self._fetch_pull(
