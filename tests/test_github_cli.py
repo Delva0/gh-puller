@@ -85,6 +85,13 @@ def test_parser_rejects_naive_target() -> None:
         )
 
 
+def test_parser_has_no_finite_retry_budget() -> None:
+    with pytest.raises(SystemExit):
+        cli._parser().parse_args(
+            ["once", "acme/widgets", "/tmp/widgets", "--transient-retries", "5"],
+        )
+
+
 def test_parser_accepts_configurable_schedule_interval() -> None:
     args = cli._parser().parse_args(
         ["schedule", "acme/widgets", "/tmp/widgets", "--interval", "90m"],

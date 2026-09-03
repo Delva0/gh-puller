@@ -180,13 +180,15 @@ consumption. See the
 and
 [GraphQL resource limits](https://docs.github.com/en/graphql/overview/rate-limits-and-query-limits-for-the-graphql-api).
 
-Primary or secondary limiting waits outside the transient-retry budget, so a cold
-start may span quota windows while remaining one blocking `pull(T)` call. Bundle work
-uses at most `concurrency` in-flight parent tasks. Results are consumed in completion
-order and each completed bundle is staged immediately, so one slow parent neither
-holds the concurrency window nor prevents later work from becoming crash-recoverable.
-Public version iteration remains deterministic by run, parent number, and intra-parent
-observation order.
+Primary or secondary limiting follows GitHub's advertised recovery time, so a cold
+start may span quota windows while remaining one blocking `pull(T)` call. Network
+errors and HTTP 5xx responses retry the same request indefinitely with backoff capped
+at 30 seconds; they neither restart a catalog scan nor consume already completed
+in-memory pagination. Bundle work uses at most `concurrency` in-flight parent tasks.
+Results are consumed in completion order and each completed bundle is staged
+immediately, so one slow parent neither holds the concurrency window nor prevents
+later work from becoming crash-recoverable. Public version iteration remains
+deterministic by run, parent number, and intra-parent observation order.
 
 Sources: [gh_puller/github/](../gh_puller/github/); [tests/test_github_puller.py](../tests/test_github_puller.py)
 

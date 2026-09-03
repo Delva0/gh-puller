@@ -25,6 +25,7 @@ if TYPE_CHECKING:
 _LOG = logging.getLogger(__name__)
 _DEFAULT_ACCEPT = "application/vnd.github.full+json"
 _GRAPHQL_PAGE_SIZE = 100
+_TRANSIENT_DELAYS = (1, 2, 4, 8, 16, 30)
 _REPOSITORY_ITEM_COUNT = """
 query RepositoryItemCount($owner: String!, $repo: String!) {
   repository(owner: $owner, name: $repo) {
@@ -36,7 +37,7 @@ query RepositoryItemCount($owner: String!, $repo: String!) {
 
 
 class GitHubAPIError(RuntimeError):
-    """GitHub 返回不可恢复响应或瞬时故障超过重试预算。"""
+    """GitHub 返回不可恢复响应或不一致数据。"""
 
 
 class GitHubAPI:
@@ -48,7 +49,6 @@ class GitHubAPI:
         graphql_url: GraphQL API 地址；None 从 REST 根地址推导。
         api_version: 发送到 ``X-GitHub-Api-Version`` 的版本。
         timeout: 单次请求超时秒数。
-        transient_retries: 网络错误和 5xx 的重试次数；限流不消耗此预算。
         client: 测试或宿主注入的 ``httpx.AsyncClient``。
         sleep: 限流与退避使用的异步等待函数。
         now: 计算限流恢复时刻使用的 UTC 时钟。
@@ -63,7 +63,6 @@ class GitHubAPI:
         graphql_url: str | None = None,
         api_version: str = "2022-11-28",
         timeout: float = 30.0,
-        transient_retries: int = 5,
         client: httpx.AsyncClient | None = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         now: Callable[[], datetime] = lambda: datetime.now(UTC),
@@ -87,7 +86,6 @@ class GitHubAPI:
         self._owns_client = client is None
         self._authenticated = bool(token or self._client.headers.get("Authorization"))
         self._graphql_url = graphql_url or _graphql_endpoint(base_url)
-        self._transient_retries = transient_retries
         self._sleep = sleep
         self._now = now
         self._progress = progress
@@ -528,13 +526,12 @@ class GitHubAPI:
                     headers=headers or None,
                     json=json_body,
                 )
-            except httpx.RequestError as exc:
-                if transient_attempt >= self._transient_retries:
-                    raise GitHubAPIError(f"GitHub request failed: {path}") from exc
+            except httpx.RequestError:
                 transient_attempt += 1
-                wait = min(2 ** (transient_attempt - 1), 30)
-                self._emit_progress(wait_seconds=wait, detail="transient_retry")
-                await self._sleep(wait)
+                await self._wait_transient(
+                    transient_attempt,
+                    f"GitHub request failed: {path}",
+                )
                 continue
 
             self._remember_quota(response)
@@ -545,14 +542,11 @@ class GitHubAPI:
                 continue
             self._remember_primary_limit(response)
             if response.status_code >= 500:
-                if transient_attempt >= self._transient_retries:
-                    raise GitHubAPIError(
-                        f"GitHub returned {response.status_code} for {response.url}",
-                    )
                 transient_attempt += 1
-                wait = min(2 ** (transient_attempt - 1), 30)
-                self._emit_progress(wait_seconds=wait, detail="transient_retry")
-                await self._sleep(wait)
+                await self._wait_transient(
+                    transient_attempt,
+                    f"GitHub returned {response.status_code} for {response.url}",
+                )
                 continue
             if response.is_error:
                 detail = response.text[:500]
@@ -560,6 +554,12 @@ class GitHubAPI:
                     f"GitHub returned {response.status_code} for {response.url}: {detail}",
                 )
             return response
+
+    async def _wait_transient(self, attempt: int, failure: str) -> None:
+        wait = _TRANSIENT_DELAYS[min(attempt - 1, len(_TRANSIENT_DELAYS) - 1)]
+        _LOG.warning("%s; retrying in %.1fs", failure, wait)
+        self._emit_progress(wait_seconds=wait, detail="transient_retry")
+        await self._sleep(wait)
 
     async def _wait_for_primary_limit(self) -> None:
         async with self._gate_lock:

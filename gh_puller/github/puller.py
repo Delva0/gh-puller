@@ -102,7 +102,6 @@ class GitHubPullConfig:
     api_version: str = "2022-11-28"  # Version sent to GitHub's versioned REST API.
     concurrency: int = 4  # Concurrent item bundles; each bundle paginates serially.
     request_timeout: float = 30.0  # Per-request timeout in seconds.
-    transient_retries: int = 5  # Network/5xx retry budget; rate limits wait separately.
     overlap_seconds: int = 2  # Replayed boundary for second-resolution GitHub timestamps.
 
     def __post_init__(self) -> None:
@@ -306,7 +305,6 @@ class GitHubPuller:
             graphql_url=self.config.graphql_url,
             api_version=self.config.api_version,
             timeout=self.config.request_timeout,
-            transient_retries=self.config.transient_retries,
             progress=progress.api_progress,
         ), True
 

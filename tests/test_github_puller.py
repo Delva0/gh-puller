@@ -1849,7 +1849,7 @@ async def test_naive_target_is_rejected_before_archive_creation(tmp_path: Path) 
 
 
 @pytest.mark.asyncio
-async def test_rate_limit_waits_asynchronously_and_does_not_consume_retry_budget() -> None:
+async def test_rate_limit_waits_asynchronously() -> None:
     clock = Clock(_T0)
     progress = []
     responses = [
@@ -1874,7 +1874,6 @@ async def test_rate_limit_waits_asynchronously_and_does_not_consume_retry_budget
     client = httpx.AsyncClient(base_url="https://api.github.test", transport=httpx.MockTransport(handler))
     api = GitHubAPI(
         client=client,
-        transient_retries=0,
         sleep=clock.sleep,
         now=clock,
         progress=progress.append,
@@ -1892,6 +1891,81 @@ async def test_rate_limit_waits_asynchronously_and_does_not_consume_retry_budget
         ("secondary_rate_limit", 4),
     ]
     assert waits[0].quotas == (RateQuota("core", 5000, 0, _T0 + timedelta(seconds=2)),)
+
+
+@pytest.mark.asyncio
+async def test_transient_failures_retry_in_place_until_the_page_succeeds() -> None:
+    clock = Clock(_T0)
+    progress = []
+    observed_pages: list[int] = []
+    requested: list[str] = []
+    page_two_attempt = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal page_two_attempt
+        requested.append(str(request.url))
+        if request.url.params.get("page") is None:
+            return httpx.Response(
+                200,
+                headers={"link": '<https://api.github.test/items?page=2>; rel="next"'},
+                json=[{"id": 1}],
+                request=request,
+            )
+        page_two_attempt += 1
+        if page_two_attempt == 1:
+            raise httpx.ConnectError("connection reset", request=request)
+        if page_two_attempt <= 7:
+            return httpx.Response(500, json={"message": "temporary"}, request=request)
+        return httpx.Response(200, json=[{"id": 2}], request=request)
+
+    client = httpx.AsyncClient(base_url="https://api.github.test", transport=httpx.MockTransport(handler))
+    api = GitHubAPI(client=client, sleep=clock.sleep, now=clock, progress=progress.append)
+    try:
+        items = await api.paginate("/items", page_observer=observed_pages.append)
+    finally:
+        await client.aclose()
+
+    assert items == [{"id": 1}, {"id": 2}]
+    assert observed_pages == [1, 1]
+    assert sum("page=2" not in url for url in requested) == 1
+    assert clock.sleeps == [1, 2, 4, 8, 16, 30, 30]
+    assert api.request_count == 9
+    waits = [event for event in progress if event.wait_seconds is not None]
+    assert [event.wait_seconds for event in waits] == clock.sleeps
+    assert {event.detail for event in waits} == {"transient_retry"}
+
+
+@pytest.mark.asyncio
+async def test_transient_retry_remains_cancellable() -> None:
+    async def cancel(_: float) -> None:
+        raise asyncio.CancelledError
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, json={"message": "temporary"}, request=request)
+
+    client = httpx.AsyncClient(base_url="https://api.github.test", transport=httpx.MockTransport(handler))
+    api = GitHubAPI(client=client, sleep=cancel)
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await api.get_json("/resource")
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_non_retryable_http_error_fails_immediately() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(422, json={"message": "invalid"}, request=request)
+
+    client = httpx.AsyncClient(base_url="https://api.github.test", transport=httpx.MockTransport(handler))
+    api = GitHubAPI(client=client)
+    try:
+        with pytest.raises(GitHubAPIError, match="GitHub returned 422"):
+            await api.get_json("/resource")
+    finally:
+        await client.aclose()
+
+    assert api.request_count == 1
 
 
 @pytest.mark.asyncio
