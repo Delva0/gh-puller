@@ -12,6 +12,7 @@ import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
+from enum import StrEnum
 from typing import TYPE_CHECKING, Any
 from urllib.parse import quote
 
@@ -36,6 +37,66 @@ query RepositoryItemCount($owner: String!, $repo: String!) {
   }
 }
 """
+_PULL_REQUEST_DETAIL = """
+query PullRequestDetail($owner: String!, $repo: String!, $number: Int!) {
+  repository(owner: $owner, name: $repo) {
+    pullRequest(number: $number) {
+      id
+      fullDatabaseId
+      number
+      url
+      state
+      locked
+      title
+      body
+      authorAssociation
+      createdAt
+      updatedAt
+      closedAt
+      mergedAt
+      isDraft
+      merged
+      mergeable
+      mergeStateStatus
+      canBeRebased
+      maintainerCanModify
+      additions
+      deletions
+      changedFiles
+      baseRefName
+      baseRefOid
+      baseRepository { id name nameWithOwner url isFork owner { login avatarUrl url } }
+      headRefName
+      headRefOid
+      headRepository { id name nameWithOwner url isFork owner { login avatarUrl url } }
+      mergeCommit { oid }
+      author {
+        __typename
+        login
+        avatarUrl
+        url
+        ... on User { id databaseId name email isSiteAdmin }
+        ... on Organization { id databaseId name email }
+        ... on Bot { id databaseId }
+        ... on Mannequin { id databaseId email }
+      }
+      comments { totalCount }
+      commits { totalCount }
+    }
+  }
+}
+"""
+
+
+class _Transport(StrEnum):
+    REST = "rest"
+    GRAPHQL = "graphql"
+
+
+class _PrimaryRateLimitError(RuntimeError):
+    def __init__(self, resource: str) -> None:
+        super().__init__(resource)
+        self.resource = resource
 
 
 class GitHubAPIError(RuntimeError):
@@ -63,6 +124,14 @@ class GitHubAPIError(RuntimeError):
 class GitHubPage:
     items: list[dict[str, Any]]  # Validated raw objects from one REST page.
     next_url: str | None  # Opaque GitHub Link cursor for the next page.
+
+
+@dataclass(frozen=True, slots=True)
+class GitHubResource:
+    value: Any  # Stable operation shape consumed by the puller.
+    source: str  # API transport that produced raw.
+    raw: Any  # Exact source-native data selected by the operation.
+    cache: dict[str, Any] | None = None  # REST validators paired with value.
 
 
 class GitHubAPI:
@@ -109,6 +178,7 @@ class GitHubAPI:
         if client:
             self._client.headers.update(headers)
         self._owns_client = client is None
+        self._base_url = str(self._client.base_url).rstrip("/")
         self._authenticated = bool(token or self._client.headers.get("Authorization"))
         self._graphql_url = graphql_url or _graphql_endpoint(base_url)
         self._sleep = sleep
@@ -169,6 +239,25 @@ class GitHubAPI:
         Returns:
             当前原始 JSON 及其新传输元数据。304 返回 previous；200 总是解析新响应。
         """
+        return await self._get_json_cached(
+            path,
+            previous=previous,
+            cache=cache,
+            params=params,
+            accept=accept,
+            primary_wait=True,
+        )
+
+    async def _get_json_cached(
+        self,
+        path: str,
+        *,
+        previous: Any | None,
+        cache: dict[str, Any] | None,
+        params: Mapping[str, Any] | None = None,
+        accept: str | None = None,
+        primary_wait: bool,
+    ) -> tuple[Any, dict[str, Any] | None]:
         key = self._cache_key(path, params, accept, "json")
         headers = _validator_headers(cache, key) if previous is not None else None
         response = await self._request(
@@ -177,6 +266,7 @@ class GitHubAPI:
             params=params,
             accept=accept,
             request_headers=headers,
+            primary_wait=primary_wait,
         )
         if response.status_code == 304:
             if headers is None:
@@ -389,6 +479,59 @@ class GitHubAPI:
             raise GitHubAPIError("GitHub returned non-integer repository counts")
         return issues + pulls
 
+    async def pull_request(
+        self,
+        owner: str,
+        repo: str,
+        number: int,
+        *,
+        previous: dict[str, Any] | None,
+        cache: dict[str, Any] | None,
+    ) -> GitHubResource:
+        """读取一个 PR 的稳定详情事实，并自动选择主配额池。
+
+        Args:
+            owner: 仓库 owner。
+            repo: 仓库名。
+            number: 仓库内 PR number。
+            previous: 与 cache 配对的上一版稳定详情；None 表示冷读取。
+            cache: 本操作先前返回的 REST validator；GraphQL 结果没有 validator。
+
+        Returns:
+            REST 兼容的稳定详情、事实来源、来源原文与可复用 validator。
+        """
+        if number < 1:
+            raise ValueError("number must be positive")
+        path = (
+            f"/repos/{quote(owner, safe='')}/{quote(repo, safe='')}/pulls/{number}"
+        )
+
+        async def rest(wait_primary: bool) -> GitHubResource:
+            value, updated = await self._get_json_cached(
+                path,
+                previous=previous,
+                cache=cache,
+                primary_wait=wait_primary,
+            )
+            if not isinstance(value, dict):
+                raise GitHubAPIError(f"GitHub returned a non-object for {path}")
+            return GitHubResource(value, _Transport.REST, value, updated)
+
+        async def graphql(wait_primary: bool) -> GitHubResource:
+            payload = await self._graphql(
+                _PULL_REQUEST_DETAIL,
+                {"owner": owner, "repo": repo, "number": number},
+                primary_wait=wait_primary,
+            )
+            raw = _graphql_pull(payload, number)
+            return GitHubResource(
+                _rest_pull_detail(raw, self._base_url, owner, repo),
+                _Transport.GRAPHQL,
+                raw,
+            )
+
+        return await self._either(rest, graphql, rest_cached=cache is not None)
+
     async def compare_commits(
         self,
         owner: str,
@@ -547,6 +690,8 @@ class GitHubAPI:
         self,
         query: str,
         variables: Mapping[str, Any],
+        *,
+        primary_wait: bool = True,
     ) -> dict[str, Any]:
         secondary_attempt = 0
         while True:
@@ -555,6 +700,7 @@ class GitHubAPI:
                 self._graphql_url,
                 json_body={"query": query, "variables": variables},
                 resource="graphql",
+                primary_wait=primary_wait,
             )
             try:
                 payload = response.json()
@@ -568,6 +714,11 @@ class GitHubAPI:
             if not errors:
                 return payload
             if self._is_rate_limited(response):
+                if (
+                    not primary_wait
+                    and response.headers.get("x-ratelimit-remaining") == "0"
+                ):
+                    raise _PrimaryRateLimitError("graphql")
                 await self._wait_after_rate_limit(response, secondary_attempt, "graphql")
                 secondary_attempt += 1
                 continue
@@ -583,11 +734,12 @@ class GitHubAPI:
         json_body: Mapping[str, Any] | None = None,
         request_headers: Mapping[str, str] | None = None,
         resource: str = "core",
+        primary_wait: bool = True,
     ) -> httpx.Response:
         transient_attempt = 0
         secondary_attempt = 0
         while True:
-            await self._wait_for_limit(resource)
+            await self._wait_for_limit(resource, primary_wait=primary_wait)
             headers = dict(request_headers or {})
             if accept:
                 headers["Accept"] = accept
@@ -611,6 +763,12 @@ class GitHubAPI:
             self._remember_quota(response)
             self._emit_progress()
             if response.status_code in {403, 429} and self._is_rate_limited(response):
+                self._remember_primary_limit(response, resource)
+                if (
+                    not primary_wait
+                    and response.headers.get("x-ratelimit-remaining") == "0"
+                ):
+                    raise _PrimaryRateLimitError(resource)
                 await self._wait_after_rate_limit(response, secondary_attempt, resource)
                 secondary_attempt += 1
                 continue
@@ -637,7 +795,7 @@ class GitHubAPI:
         self._emit_progress(wait_seconds=wait, detail="transient_retry")
         await self._sleep(wait)
 
-    async def _wait_for_limit(self, resource: str) -> None:
+    async def _wait_for_limit(self, resource: str, *, primary_wait: bool) -> None:
         async with self._gate_lock:
             primary_until = self._primary_blocked_until.get(resource, 0.0)
             secondary_until = self._secondary_blocked_until
@@ -646,6 +804,8 @@ class GitHubAPI:
         if wait <= 0:
             return
         primary = primary_until >= secondary_until
+        if primary and not primary_wait:
+            raise _PrimaryRateLimitError(resource)
         detail = "primary_rate_limit" if primary else "secondary_rate_limit"
         _LOG.warning("GitHub %s blocked; waiting %.1fs", resource, wait)
         self._emit_progress(wait_seconds=wait, detail=detail)
@@ -655,6 +815,45 @@ class GitHubAPI:
                 self._primary_blocked_until.pop(resource, None)
             if self._secondary_blocked_until == secondary_until:
                 self._secondary_blocked_until = 0.0
+
+    async def _either(
+        self,
+        rest: Callable[[bool], Awaitable[GitHubResource]],
+        graphql: Callable[[bool], Awaitable[GitHubResource]],
+        *,
+        rest_cached: bool,
+    ) -> GitHubResource:
+        operations = {
+            _Transport.REST: rest,
+            _Transport.GRAPHQL: graphql,
+        }
+        order = self._transport_order(rest_cached)
+        for transport in order:
+            try:
+                return await operations[transport](False)
+            except _PrimaryRateLimitError:
+                pass
+        return await operations[self._transport_order(rest_cached)[0]](True)
+
+    def _transport_order(self, rest_cached: bool) -> tuple[_Transport, _Transport]:
+        if rest_cached or not self._authenticated:
+            return _Transport.REST, _Transport.GRAPHQL
+        capacities = {
+            transport: self._quota_capacity(transport)
+            for transport in (_Transport.REST, _Transport.GRAPHQL)
+        }
+        if capacities[_Transport.REST] > capacities[_Transport.GRAPHQL]:
+            return _Transport.REST, _Transport.GRAPHQL
+        return _Transport.GRAPHQL, _Transport.REST
+
+    def _quota_capacity(self, transport: _Transport) -> float:
+        resource = "core" if transport is _Transport.REST else "graphql"
+        quota = self._quotas.get(resource)
+        if quota is None or quota.remaining is None or quota.limit in {None, 0}:
+            return 1.0
+        if quota.reset_at is not None and quota.reset_at <= self._now():
+            return 1.0
+        return quota.remaining / quota.limit
 
     async def _wait_after_rate_limit(
         self,
@@ -870,6 +1069,151 @@ def _closing_issue_id(node: dict[str, Any], pull_number: int) -> str:
     ):
         raise GitHubAPIError(f"pull #{pull_number} has an invalid closing issue node")
     return str(node["id"])
+
+
+def _graphql_pull(payload: dict[str, Any], number: int) -> dict[str, Any]:
+    try:
+        repository = payload["data"]["repository"]
+        pull = repository["pullRequest"]
+    except (KeyError, TypeError) as exc:
+        raise GitHubAPIError(f"GitHub returned incomplete pull request #{number}") from exc
+    if not isinstance(pull, dict) or pull.get("number") != number:
+        raise GitHubAPIError(f"GitHub returned no matching pull request #{number}")
+    return pull
+
+
+def _rest_pull_detail(
+    pull: dict[str, Any],
+    base_url: str,
+    owner: str,
+    repo: str,
+) -> dict[str, Any]:
+    number = pull["number"]
+    api = f"{base_url}/repos/{quote(owner, safe='')}/{quote(repo, safe='')}"
+    url = f"{api}/pulls/{number}"
+    html_url = str(pull["url"])
+    base = _rest_ref(pull, "base", owner)
+    head = _rest_ref(pull, "head", owner)
+    merge = pull.get("mergeCommit")
+    state = str(pull["state"]).lower()
+    if state == "merged":
+        state = "closed"
+    return {
+        "id": _database_id(pull.get("fullDatabaseId")),
+        "node_id": pull["id"],
+        "url": url,
+        "html_url": html_url,
+        "diff_url": f"{html_url}.diff",
+        "patch_url": f"{html_url}.patch",
+        "issue_url": f"{api}/issues/{number}",
+        "commits_url": f"{url}/commits",
+        "review_comments_url": f"{url}/comments",
+        "review_comment_url": f"{url}/comments{{/number}}",
+        "comments_url": f"{api}/issues/{number}/comments",
+        "statuses_url": f"{api}/statuses/{head['sha']}",
+        "number": number,
+        "state": state,
+        "locked": pull["locked"],
+        "title": pull["title"],
+        "user": _rest_actor(pull.get("author")),
+        "body": pull.get("body"),
+        "created_at": pull["createdAt"],
+        "updated_at": pull["updatedAt"],
+        "closed_at": pull.get("closedAt"),
+        "merged_at": pull.get("mergedAt"),
+        "merge_commit_sha": merge.get("oid") if isinstance(merge, dict) else None,
+        "draft": pull["isDraft"],
+        "commits": pull["commits"]["totalCount"],
+        "comments": pull["comments"]["totalCount"],
+        "additions": pull["additions"],
+        "deletions": pull["deletions"],
+        "changed_files": pull["changedFiles"],
+        "head": head,
+        "base": base,
+        "merged": pull["merged"],
+        "mergeable": _mergeable(pull["mergeable"]),
+        "rebaseable": pull.get("canBeRebased"),
+        "mergeable_state": str(pull["mergeStateStatus"]).lower(),
+        "maintainer_can_modify": pull.get("maintainerCanModify"),
+        "author_association": pull["authorAssociation"],
+        "_links": {
+            "self": {"href": url},
+            "html": {"href": html_url},
+            "issue": {"href": f"{api}/issues/{number}"},
+            "comments": {"href": f"{api}/issues/{number}/comments"},
+            "review_comments": {"href": f"{url}/comments"},
+            "review_comment": {"href": f"{url}/comments{{/number}}"},
+            "commits": {"href": f"{url}/commits"},
+            "statuses": {"href": f"{api}/statuses/{head['sha']}"},
+        },
+    }
+
+
+def _rest_ref(pull: dict[str, Any], prefix: str, default_owner: str) -> dict[str, Any]:
+    repository = pull.get(f"{prefix}Repository")
+    name = pull.get(f"{prefix}RefName")
+    owner = default_owner
+    if isinstance(repository, dict):
+        name_with_owner = repository.get("nameWithOwner")
+        if isinstance(name_with_owner, str) and "/" in name_with_owner:
+            owner = name_with_owner.split("/", 1)[0]
+    return {
+        "label": f"{owner}:{name}",
+        "ref": name,
+        "sha": pull[f"{prefix}RefOid"],
+        "user": _rest_actor(repository.get("owner") if isinstance(repository, dict) else None),
+        "repo": _rest_repository(repository),
+    }
+
+
+def _rest_repository(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    name_with_owner = value.get("nameWithOwner")
+    return {
+        "node_id": value.get("id"),
+        "name": value.get("name"),
+        "full_name": name_with_owner,
+        "private": None,
+        "owner": _rest_actor(value.get("owner")),
+        "html_url": value.get("url"),
+        "fork": value.get("isFork"),
+    }
+
+
+def _rest_actor(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    actor = {
+        "login": value.get("login"),
+        "node_id": value.get("id"),
+        "avatar_url": value.get("avatarUrl"),
+        "html_url": value.get("url"),
+        "type": value.get("__typename"),
+        "site_admin": value.get("isSiteAdmin", False),
+    }
+    database_id = value.get("databaseId")
+    if database_id is not None:
+        actor["id"] = _database_id(database_id)
+    return actor
+
+
+def _database_id(value: Any) -> int:
+    if type(value) is int:
+        return value
+    if isinstance(value, str) and value.isdigit():
+        return int(value)
+    raise GitHubAPIError("GitHub returned an invalid database identity")
+
+
+def _mergeable(value: Any) -> bool | None:
+    if value == "MERGEABLE":
+        return True
+    if value == "CONFLICTING":
+        return False
+    if value == "UNKNOWN":
+        return None
+    raise GitHubAPIError("GitHub returned an invalid mergeable state")
 
 
 def _validator_headers(cache: dict[str, Any] | None, key: str) -> dict[str, str] | None:

@@ -35,7 +35,7 @@ from gh_puller.github import (
     iter_runs,
     iter_versions,
 )
-from gh_puller.github.client import GitHubPage
+from gh_puller.github.client import GitHubPage, GitHubResource
 from gh_puller.github.store import SQLiteArchive
 
 if TYPE_CHECKING:
@@ -241,6 +241,22 @@ class FakeAPI:
         )
         return items
 
+    async def pull_request(
+        self,
+        owner: str,
+        repo: str,
+        number: int,
+        *,
+        previous: dict[str, Any] | None,
+        cache: dict[str, Any] | None,
+    ) -> GitHubResource:
+        value, updated = await self.get_json_cached(
+            f"/repos/{owner}/{repo}/pulls/{number}",
+            previous=previous,
+            cache=cache,
+        )
+        return GitHubResource(value, "rest", value, updated)
+
     async def closing_issue_references(
         self,
         owner: str,
@@ -327,6 +343,15 @@ def _iso(value: datetime) -> str:
     return value.isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
+def _quota_headers(resource: str, remaining: int) -> dict[str, str]:
+    return {
+        "x-ratelimit-limit": "5000",
+        "x-ratelimit-remaining": str(remaining),
+        "x-ratelimit-reset": str(int((_T0 + timedelta(hours=1)).timestamp())),
+        "x-ratelimit-resource": resource,
+    }
+
+
 def _time(value: str) -> datetime:
     return datetime.fromisoformat(value)
 
@@ -343,6 +368,65 @@ def _closing_issue(number: int, *, repository: str = "acme/widgets") -> dict[str
             "nameWithOwner": repository,
             "url": f"https://github.test/{repository}",
         },
+    }
+
+
+def _graphql_pull(number: int = 7) -> dict[str, Any]:
+    repository = {
+        "id": "repository-acme-widgets",
+        "name": "widgets",
+        "nameWithOwner": "acme/widgets",
+        "url": "https://github.test/acme/widgets",
+        "isFork": False,
+        "owner": {
+            "id": "owner-acme",
+            "login": "acme",
+            "avatarUrl": "https://avatars.test/acme",
+            "url": "https://github.test/acme",
+        },
+    }
+    return {
+        "id": f"pull-{number}",
+        "fullDatabaseId": str(number * 100),
+        "number": number,
+        "url": f"https://github.test/acme/widgets/pull/{number}",
+        "state": "MERGED",
+        "locked": False,
+        "title": f"pull {number}",
+        "body": "body",
+        "authorAssociation": "CONTRIBUTOR",
+        "createdAt": _iso(_T0 - timedelta(days=2)),
+        "updatedAt": _iso(_T0 - timedelta(hours=1)),
+        "closedAt": _iso(_T0 - timedelta(hours=2)),
+        "mergedAt": _iso(_T0 - timedelta(hours=2)),
+        "isDraft": False,
+        "merged": True,
+        "mergeable": "UNKNOWN",
+        "mergeStateStatus": "CLEAN",
+        "canBeRebased": True,
+        "maintainerCanModify": True,
+        "additions": 11,
+        "deletions": 3,
+        "changedFiles": 2,
+        "baseRefName": "main",
+        "baseRefOid": "a" * 40,
+        "baseRepository": repository,
+        "headRefName": "feature",
+        "headRefOid": "b" * 40,
+        "headRepository": repository,
+        "mergeCommit": {"oid": "c" * 40},
+        "author": {
+            "__typename": "User",
+            "id": "user-alice",
+            "databaseId": 17,
+            "login": "alice",
+            "avatarUrl": "https://avatars.test/alice",
+            "url": "https://github.test/alice",
+            "isSiteAdmin": False,
+        },
+        "comments": {"totalCount": 4},
+        "commits": {"totalCount": 3},
+        "futureGraphQLField": {"kept": True},
     }
 
 
@@ -502,7 +586,7 @@ async def test_cold_pull_preserves_raw_fields_and_publishes_target(tmp_path: Pat
     bundle = current[1].bundle
     catalog = current[1].summary
     assert bundle is not None
-    assert bundle["schema_version"] == 4
+    assert bundle["schema_version"] == 5
     assert bundle["issue"]["unknown_detail_field"] == [1, {"raw": "yes"}]
     assert bundle["issue_comments"][0]["future_field"] == {"kept": 1}
     assert bundle["timeline"][0]["rename"] == {"from": "a", "to": "b"}
@@ -608,6 +692,7 @@ async def test_pull_request_bundle_preserves_discussion_and_git_snapshot(tmp_pat
     assert pull["git"]["head_sha"] == "b" * 40
     assert pull["requested_reviewers"]["users"][0]["login"] == "alice"
     assert pull["closing_issues_references"] == [_closing_issue(11)]
+    assert pull["api_sources"] == {"detail": {"source": "rest"}}
     assert {"files", "diff", "patch"}.isdisjoint(pull)
     assert git.prefetches == [[7]]
     assert git.captures == [7]
@@ -2153,6 +2238,196 @@ async def test_graphql_repository_count_is_exact_and_authenticated() -> None:
     assert body["variables"] == {"owner": "acme", "repo": "widgets"}
     assert "issues(states: [OPEN, CLOSED])" in body["query"]
     assert "pullRequests(states: [OPEN, CLOSED, MERGED])" in body["query"]
+
+
+@pytest.mark.asyncio
+async def test_pull_detail_uses_graphql_when_its_capacity_is_higher() -> None:
+    seen: list[str] = []
+    raw = _graphql_pull()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.path)
+        if request.url.path != "/graphql":
+            return httpx.Response(
+                200,
+                headers=_quota_headers("core", 500),
+                json={"seed": True},
+                request=request,
+            )
+        query = json.loads(request.content)["query"]
+        body = (
+            {
+                "data": {
+                    "repository": {
+                        "issues": {"totalCount": 1},
+                        "pullRequests": {"totalCount": 2},
+                    },
+                },
+            }
+            if "RepositoryItemCount" in query
+            else {"data": {"repository": {"pullRequest": raw}}}
+        )
+        return httpx.Response(
+            200,
+            headers=_quota_headers("graphql", 4_900),
+            json=body,
+            request=request,
+        )
+
+    client = httpx.AsyncClient(
+        base_url="https://api.github.test",
+        transport=httpx.MockTransport(handler),
+    )
+    api = GitHubAPI(
+        token=str(id(client)),
+        client=client,
+        graphql_url="/graphql",
+        now=lambda: _T0,
+    )
+    try:
+        await api.get_json("/seed-core")
+        await api.repository_item_count("acme", "widgets")
+        result = await api.pull_request(
+            "acme",
+            "widgets",
+            7,
+            previous=None,
+            cache=None,
+        )
+    finally:
+        await client.aclose()
+
+    assert seen == ["/seed-core", "/graphql", "/graphql"]
+    assert result.source == "graphql"
+    assert result.raw == raw
+    assert result.cache is None
+    assert result.value["id"] == 700
+    assert result.value["node_id"] == "pull-7"
+    assert result.value["state"] == "closed"
+    assert result.value["merged"] is True
+    assert result.value["mergeable"] is None
+    assert result.value["mergeable_state"] == "clean"
+    assert result.value["base"]["sha"] == "a" * 40
+    assert result.value["head"]["sha"] == "b" * 40
+    assert result.value["merge_commit_sha"] == "c" * 40
+    assert result.value["user"]["login"] == "alice"
+    assert result.value["commits"] == 3
+
+
+@pytest.mark.asyncio
+async def test_pull_detail_uses_rest_when_its_capacity_is_higher() -> None:
+    seen: list[str] = []
+    rest = {"id": 700, "number": 7, "unknown": {"kept": True}}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.path)
+        if request.url.path == "/graphql":
+            return httpx.Response(
+                200,
+                headers=_quota_headers("graphql", 400),
+                json={
+                    "data": {
+                        "repository": {
+                            "issues": {"totalCount": 1},
+                            "pullRequests": {"totalCount": 2},
+                        },
+                    },
+                },
+                request=request,
+            )
+        body = {"seed": True} if request.url.path == "/seed-core" else rest
+        return httpx.Response(
+            200,
+            headers=_quota_headers("core", 4_900),
+            json=body,
+            request=request,
+        )
+
+    client = httpx.AsyncClient(
+        base_url="https://api.github.test",
+        transport=httpx.MockTransport(handler),
+    )
+    api = GitHubAPI(
+        token=str(id(client)),
+        client=client,
+        graphql_url="/graphql",
+        now=lambda: _T0,
+    )
+    try:
+        await api.repository_item_count("acme", "widgets")
+        await api.get_json("/seed-core")
+        result = await api.pull_request(
+            "acme",
+            "widgets",
+            7,
+            previous=None,
+            cache=None,
+        )
+    finally:
+        await client.aclose()
+
+    assert seen == ["/graphql", "/seed-core", "/repos/acme/widgets/pulls/7"]
+    assert result.source == "rest"
+    assert result.value is result.raw
+    assert result.value == rest
+
+
+@pytest.mark.asyncio
+async def test_pull_detail_falls_back_when_preferred_graphql_quota_exhausts() -> None:
+    clock = Clock(_T0)
+    seen: list[str] = []
+    rest = {"id": 700, "number": 7}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.path)
+        if request.url.path == "/seed-core":
+            return httpx.Response(
+                200,
+                headers=_quota_headers("core", 500),
+                json={"seed": True},
+                request=request,
+            )
+        if request.url.path == "/graphql":
+            return httpx.Response(
+                200,
+                headers=_quota_headers("graphql", 0),
+                json={"errors": [{"message": "API rate limit exceeded"}]},
+                request=request,
+            )
+        return httpx.Response(
+            200,
+            headers=_quota_headers("core", 499),
+            json=rest,
+            request=request,
+        )
+
+    client = httpx.AsyncClient(
+        base_url="https://api.github.test",
+        transport=httpx.MockTransport(handler),
+    )
+    api = GitHubAPI(
+        token=str(id(client)),
+        client=client,
+        graphql_url="/graphql",
+        sleep=clock.sleep,
+        now=clock,
+    )
+    try:
+        await api.get_json("/seed-core")
+        result = await api.pull_request(
+            "acme",
+            "widgets",
+            7,
+            previous=None,
+            cache=None,
+        )
+    finally:
+        await client.aclose()
+
+    assert seen == ["/seed-core", "/graphql", "/repos/acme/widgets/pulls/7"]
+    assert result.source == "rest"
+    assert result.value == rest
+    assert clock.sleeps == []
 
 
 @pytest.mark.asyncio

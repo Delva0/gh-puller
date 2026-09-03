@@ -17,7 +17,7 @@ from itertools import islice
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
-from .client import GitHubAPI, GitHubAPIError, GitHubPage
+from .client import GitHubAPI, GitHubAPIError, GitHubPage, GitHubResource
 from .git_store import GitObjectStore, default_git_url, git_store_path
 from .progress import _PullProgressTracker
 from .store import (
@@ -40,7 +40,7 @@ _NUMBER_AT_END = re.compile(r"/(\d+)$")
 _CLOSING_REFERENCE_BATCH_SIZE = 100
 _CATALOG_ACCEPT = "application/vnd.github.raw+json"
 _PULL_COMMITS_LIMIT = 250
-_BUNDLE_SCHEMA_VERSION = 4
+_BUNDLE_SCHEMA_VERSION = 5
 
 
 class IncompleteGitHubDataError(RuntimeError):
@@ -102,6 +102,16 @@ class _API(Protocol):
         base: str,
         head: str,
     ) -> list[dict[str, Any]]: ...
+
+    async def pull_request(
+        self,
+        owner: str,
+        repo: str,
+        number: int,
+        *,
+        previous: dict[str, Any] | None,
+        cache: dict[str, Any] | None,
+    ) -> GitHubResource: ...
 
 
 class _GitStore(Protocol):
@@ -931,12 +941,17 @@ class GitHubPuller:
             raise IncompleteGitHubDataError(f"pull #{number} has no closing issue references")
         path = f"{self._base}/pulls/{number}"
         http_cache: dict[str, Any] = {}
-        pull, cache = await self._cached_json(
-            api,
-            path,
-            _dict_field(previous, "detail"),
-            _dict_field(previous_cache, "detail"),
+        detail = await api.pull_request(
+            self._owner,
+            self._repo,
+            number,
+            previous=_dict_field(previous, "detail"),
+            cache=_dict_field(previous_cache, "detail"),
         )
+        pull = detail.value
+        cache = detail.cache
+        if not isinstance(pull, dict):
+            raise IncompleteGitHubDataError(f"GitHub returned a non-object for {path}")
         _set_cache(http_cache, "detail", cache)
         reviews, cache = await self._cached_page(
             api,
@@ -1005,6 +1020,7 @@ class GitHubPuller:
             "git": git_snapshot,
             "requested_reviewers": requested_reviewers,
             "closing_issues_references": closing_references,
+            "api_sources": {"detail": _api_source(detail)},
         }
         return result, http_cache or None
 
@@ -1169,6 +1185,13 @@ def _set_cache(
 ) -> None:
     if value is not None:
         target[key] = value
+
+
+def _api_source(resource: GitHubResource) -> dict[str, Any]:
+    source = {"source": resource.source}
+    if resource.source != "rest":
+        source["raw"] = resource.raw
+    return source
 
 
 def _canonical_comments(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
