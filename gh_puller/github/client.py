@@ -1634,21 +1634,36 @@ class GitHubAPI:
             _Transport.GRAPHQL: graphql,
         }
         order = self._transport_order(rest_cached)
+        limited: set[_Transport] = set()
+        failures: list[GitHubAPIError] = []
         for transport in order:
             try:
                 return await operations[transport](False)
             except _PrimaryRateLimitError:
-                pass
-        return await operations[self._transport_order(rest_cached)[0]](True)
+                limited.add(transport)
+            except GitHubAPIError as exc:
+                failures.append(exc)
+        if limited:
+            transport = next(
+                transport
+                for transport in self._transport_order(rest_cached)
+                if transport in limited
+            )
+            return await operations[transport](True)
+        raise failures[0]
 
     def _transport_order(self, rest_cached: bool) -> tuple[_Transport, _Transport]:
-        if rest_cached or not self._authenticated:
+        if not self._authenticated:
             return _Transport.REST, _Transport.GRAPHQL
-        capacities = {
-            transport: self._quota_capacity(transport)
-            for transport in (_Transport.REST, _Transport.GRAPHQL)
-        }
-        if capacities[_Transport.REST] > capacities[_Transport.GRAPHQL]:
+        rest_capacity = self._quota_capacity(_Transport.REST)
+        if rest_cached and rest_capacity > 0:
+            return _Transport.REST, _Transport.GRAPHQL
+        graphql_capacity = self._quota_capacity(_Transport.GRAPHQL)
+        if rest_capacity > graphql_capacity:
+            return _Transport.REST, _Transport.GRAPHQL
+        if rest_capacity == graphql_capacity == 0 and self._quota_wait(
+            _Transport.REST,
+        ) < self._quota_wait(_Transport.GRAPHQL):
             return _Transport.REST, _Transport.GRAPHQL
         return _Transport.GRAPHQL, _Transport.REST
 
@@ -1660,6 +1675,13 @@ class GitHubAPI:
         if quota.reset_at is not None and quota.reset_at <= self._now():
             return 1.0
         return quota.remaining / quota.limit
+
+    def _quota_wait(self, transport: _Transport) -> float:
+        resource = "core" if transport is _Transport.REST else "graphql"
+        quota = self._quotas.get(resource)
+        if quota is None or quota.reset_at is None:
+            return 0.0
+        return max((quota.reset_at - self._now()).total_seconds(), 0.0)
 
     async def _wait_after_rate_limit(
         self,

@@ -2673,6 +2673,199 @@ async def test_pull_detail_falls_back_when_preferred_graphql_quota_exhausts() ->
 
 
 @pytest.mark.asyncio
+async def test_pull_detail_falls_back_after_graphql_operation_error() -> None:
+    seen: list[str] = []
+    rest = {"id": 700, "number": 7}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.path)
+        if request.url.path == "/seed-core":
+            return httpx.Response(
+                200,
+                headers=_quota_headers("core", 500),
+                json={"seed": True},
+                request=request,
+            )
+        if request.url.path == "/graphql":
+            return httpx.Response(
+                200,
+                headers=_quota_headers("graphql", 4_900),
+                json={"errors": [{"message": "field is temporarily unavailable"}]},
+                request=request,
+            )
+        return httpx.Response(200, json=rest, request=request)
+
+    client = httpx.AsyncClient(
+        base_url="https://api.github.test",
+        transport=httpx.MockTransport(handler),
+    )
+    api = GitHubAPI(
+        token=str(id(client)),
+        client=client,
+        graphql_url="/graphql",
+        now=lambda: _T0,
+    )
+    try:
+        await api.get_json("/seed-core")
+        result = await api.pull_request(
+            "acme",
+            "widgets",
+            7,
+            previous=None,
+            cache=None,
+        )
+    finally:
+        await client.aclose()
+
+    assert seen == ["/seed-core", "/graphql", "/repos/acme/widgets/pulls/7"]
+    assert result.source == "rest"
+
+
+@pytest.mark.asyncio
+async def test_pull_detail_falls_back_after_rest_operation_error() -> None:
+    seen: list[str] = []
+    raw = _graphql_pull()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.path)
+        if request.url.path == "/graphql":
+            query = json.loads(request.content)["query"]
+            body = (
+                {
+                    "data": {
+                        "repository": {
+                            "issues": {"totalCount": 1},
+                            "pullRequests": {"totalCount": 2},
+                        },
+                    },
+                }
+                if "RepositoryItemCount" in query
+                else {"data": {"repository": {"pullRequest": raw}}}
+            )
+            return httpx.Response(
+                200,
+                headers=_quota_headers("graphql", 400),
+                json=body,
+                request=request,
+            )
+        if request.url.path == "/seed-core":
+            return httpx.Response(
+                200,
+                headers=_quota_headers("core", 4_900),
+                json={"seed": True},
+                request=request,
+            )
+        return httpx.Response(422, json={"message": "invalid"}, request=request)
+
+    client = httpx.AsyncClient(
+        base_url="https://api.github.test",
+        transport=httpx.MockTransport(handler),
+    )
+    api = GitHubAPI(
+        token=str(id(client)),
+        client=client,
+        graphql_url="/graphql",
+        now=lambda: _T0,
+    )
+    try:
+        await api.repository_item_count("acme", "widgets")
+        await api.get_json("/seed-core")
+        result = await api.pull_request(
+            "acme",
+            "widgets",
+            7,
+            previous=None,
+            cache=None,
+        )
+    finally:
+        await client.aclose()
+
+    assert seen == [
+        "/graphql",
+        "/seed-core",
+        "/repos/acme/widgets/pulls/7",
+        "/graphql",
+    ]
+    assert result.source == "graphql"
+
+
+@pytest.mark.asyncio
+async def test_dual_operation_waits_for_the_earlier_primary_reset() -> None:
+    clock = Clock(_T0)
+    seen: list[str] = []
+    graphql_calls = 0
+
+    def headers(resource: str, reset_seconds: int, remaining: int = 0) -> dict[str, str]:
+        return {
+            "x-ratelimit-limit": "5000",
+            "x-ratelimit-remaining": str(remaining),
+            "x-ratelimit-reset": str(int(_T0.timestamp()) + reset_seconds),
+            "x-ratelimit-resource": resource,
+        }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal graphql_calls
+        seen.append(request.url.path)
+        if request.url.path == "/graphql":
+            graphql_calls += 1
+            query = json.loads(request.content)["query"]
+            if "RepositoryItemCount" in query:
+                body = {
+                    "data": {
+                        "repository": {
+                            "issues": {"totalCount": 1},
+                            "pullRequests": {"totalCount": 2},
+                        },
+                    },
+                }
+                remaining = 0
+            else:
+                body = {"data": {"repository": {"pullRequest": _graphql_pull()}}}
+                remaining = 4_999
+            return httpx.Response(
+                200,
+                headers=headers("graphql", 3, remaining),
+                json=body,
+                request=request,
+            )
+        return httpx.Response(
+            200,
+            headers=headers("core", 10),
+            json={"seed": True},
+            request=request,
+        )
+
+    client = httpx.AsyncClient(
+        base_url="https://api.github.test",
+        transport=httpx.MockTransport(handler),
+    )
+    api = GitHubAPI(
+        token=str(id(client)),
+        client=client,
+        graphql_url="/graphql",
+        sleep=clock.sleep,
+        now=clock,
+    )
+    try:
+        await api.repository_item_count("acme", "widgets")
+        await api.get_json("/seed-core")
+        result = await api.pull_request(
+            "acme",
+            "widgets",
+            7,
+            previous=None,
+            cache=None,
+        )
+    finally:
+        await client.aclose()
+
+    assert result.source == "graphql"
+    assert graphql_calls == 2
+    assert seen == ["/graphql", "/seed-core", "/graphql"]
+    assert clock.sleeps == [4]
+
+
+@pytest.mark.asyncio
 async def test_pull_reviews_graphql_paginates_and_preserves_source() -> None:
     seen: list[dict[str, Any]] = []
     reviews = [_graphql_review(71), _graphql_review(72)]
