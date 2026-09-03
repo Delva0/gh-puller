@@ -18,7 +18,31 @@ from urllib.parse import quote
 
 import httpx
 
+from .errors import GitHubAPIError
+from .facts import (
+    check_size,
+    graphql_connection,
+    graphql_parent,
+    graphql_pull,
+    node_connection,
+    rest_commit,
+    rest_issue_comment,
+    rest_pull_detail,
+    rest_reaction,
+    rest_review,
+    rest_review_comment,
+)
 from .progress import APIProgress, RateQuota
+from .queries import (
+    ISSUE_COMMENTS,
+    PULL_COMMITS,
+    PULL_REQUEST_DETAIL,
+    PULL_REVIEW_COMMENTS,
+    PULL_REVIEWS,
+    REACTIONS,
+    REPOSITORY_ITEM_COUNT,
+    REVIEW_THREAD_COMMENTS,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Mapping, Sequence
@@ -29,273 +53,6 @@ _LOG = logging.getLogger(__name__)
 _DEFAULT_ACCEPT = "application/vnd.github.full+json"
 _GRAPHQL_PAGE_SIZE = 100
 _TRANSIENT_DELAYS = (1, 2, 4, 8, 16, 30)
-_REPOSITORY_ITEM_COUNT = """
-query RepositoryItemCount($owner: String!, $repo: String!) {
-  repository(owner: $owner, name: $repo) {
-    issues(states: [OPEN, CLOSED]) { totalCount }
-    pullRequests(states: [OPEN, CLOSED, MERGED]) { totalCount }
-  }
-}
-"""
-_PULL_REQUEST_DETAIL = """
-query PullRequestDetail($owner: String!, $repo: String!, $number: Int!) {
-  repository(owner: $owner, name: $repo) {
-    pullRequest(number: $number) {
-      id
-      fullDatabaseId
-      number
-      url
-      state
-      locked
-      title
-      body
-      authorAssociation
-      createdAt
-      updatedAt
-      closedAt
-      mergedAt
-      isDraft
-      merged
-      mergeable
-      mergeStateStatus
-      canBeRebased
-      maintainerCanModify
-      additions
-      deletions
-      changedFiles
-      baseRefName
-      baseRefOid
-      baseRepository { id name nameWithOwner url isFork owner { login avatarUrl url } }
-      headRefName
-      headRefOid
-      headRepository { id name nameWithOwner url isFork owner { login avatarUrl url } }
-      mergeCommit { oid }
-      author {
-        __typename
-        login
-        avatarUrl
-        url
-        ... on User { id databaseId name email isSiteAdmin }
-        ... on Organization { id databaseId name email }
-        ... on Bot { id databaseId }
-        ... on Mannequin { id databaseId email }
-      }
-      comments { totalCount }
-      commits { totalCount }
-    }
-  }
-}
-"""
-_PULL_REVIEWS = """
-query PullReviews($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
-  repository(owner: $owner, name: $repo) {
-    pullRequest(number: $number) {
-      number
-      reviews(first: 100, after: $cursor) {
-        totalCount
-        nodes {
-          id
-          fullDatabaseId
-          body
-          state
-          authorAssociation
-          submittedAt
-          createdAt
-          updatedAt
-          url
-          commit { oid }
-          author {
-            __typename
-            login
-            avatarUrl
-            url
-            ... on User { id databaseId name email isSiteAdmin }
-            ... on Organization { id databaseId name email }
-            ... on Bot { id databaseId }
-            ... on Mannequin { id databaseId email }
-          }
-        }
-        pageInfo { hasNextPage endCursor }
-      }
-    }
-  }
-}
-"""
-_PULL_COMMITS = """
-query PullCommits($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
-  repository(owner: $owner, name: $repo) {
-    pullRequest(number: $number) {
-      number
-      commits(first: 100, after: $cursor) {
-        totalCount
-        nodes {
-          id
-          url
-          commit {
-            id
-            oid
-            url
-            message
-            authoredDate
-            committedDate
-            additions
-            deletions
-            changedFilesIfAvailable
-            author { name email date user { id databaseId login avatarUrl url isSiteAdmin } }
-            committer { name email date user { id databaseId login avatarUrl url isSiteAdmin } }
-            tree { oid }
-            parents(first: 100) {
-              totalCount
-              nodes { oid }
-              pageInfo { hasNextPage endCursor }
-            }
-          }
-        }
-        pageInfo { hasNextPage endCursor }
-      }
-    }
-  }
-}
-"""
-_REVIEW_COMMENT_FRAGMENT = """
-fragment ReviewCommentFields on PullRequestReviewComment {
-  id
-  fullDatabaseId
-  body
-  authorAssociation
-  createdAt
-  updatedAt
-  url
-  diffHunk
-  path
-  line
-  originalLine
-  originalStartLine
-  startLine
-  outdated
-  subjectType
-  state
-  commit { oid }
-  originalCommit { oid }
-  replyTo { fullDatabaseId }
-  pullRequestReview { fullDatabaseId }
-  reactions { totalCount }
-  author {
-    __typename
-    login
-    avatarUrl
-    url
-    ... on User { id databaseId name email isSiteAdmin }
-    ... on Organization { id databaseId name email }
-    ... on Bot { id databaseId }
-    ... on Mannequin { id databaseId email }
-  }
-}
-"""
-_PULL_REVIEW_COMMENTS = """
-query PullReviewComments($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
-  repository(owner: $owner, name: $repo) {
-    pullRequest(number: $number) {
-      number
-      reviewThreads(first: 100, after: $cursor) {
-        totalCount
-        nodes {
-          id
-          comments(first: 100) {
-            totalCount
-            nodes { ...ReviewCommentFields }
-            pageInfo { hasNextPage endCursor }
-          }
-        }
-        pageInfo { hasNextPage endCursor }
-      }
-    }
-  }
-}
-""" + _REVIEW_COMMENT_FRAGMENT
-_REVIEW_THREAD_COMMENTS = """
-query ReviewThreadComments($id: ID!, $cursor: String) {
-  node(id: $id) {
-    ... on PullRequestReviewThread {
-      id
-      comments(first: 100, after: $cursor) {
-        totalCount
-        nodes { ...ReviewCommentFields }
-        pageInfo { hasNextPage endCursor }
-      }
-    }
-  }
-}
-""" + _REVIEW_COMMENT_FRAGMENT
-_ISSUE_COMMENT_FRAGMENT = """
-fragment IssueCommentFields on IssueComment {
-  id
-  fullDatabaseId
-  body
-  bodyHTML
-  bodyText
-  authorAssociation
-  createdAt
-  updatedAt
-  url
-  reactions { totalCount }
-  author {
-    __typename
-    login
-    avatarUrl
-    url
-    ... on User { id databaseId name email isSiteAdmin }
-    ... on Organization { id databaseId name email }
-    ... on Bot { id databaseId }
-    ... on Mannequin { id databaseId email }
-  }
-}
-"""
-_ISSUE_COMMENTS = """
-query IssueComments($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
-  repository(owner: $owner, name: $repo) {
-    issueOrPullRequest(number: $number) {
-      __typename
-      ... on Issue {
-        number
-        comments(first: 100, after: $cursor) {
-          totalCount
-          nodes { ...IssueCommentFields }
-          pageInfo { hasNextPage endCursor }
-        }
-      }
-      ... on PullRequest {
-        number
-        comments(first: 100, after: $cursor) {
-          totalCount
-          nodes { ...IssueCommentFields }
-          pageInfo { hasNextPage endCursor }
-        }
-      }
-    }
-  }
-}
-""" + _ISSUE_COMMENT_FRAGMENT
-_REACTIONS = """
-query Reactions($id: ID!, $cursor: String) {
-  node(id: $id) {
-    id
-    ... on Reactable {
-      reactions(first: 100, after: $cursor) {
-        totalCount
-        nodes {
-          id
-          databaseId
-          content
-          createdAt
-          user { __typename id databaseId login avatarUrl url isSiteAdmin }
-        }
-        pageInfo { hasNextPage endCursor }
-      }
-    }
-  }
-}
-"""
 
 
 class _Transport(StrEnum):
@@ -307,27 +64,6 @@ class _PrimaryRateLimitError(RuntimeError):
     def __init__(self, resource: str) -> None:
         super().__init__(resource)
         self.resource = resource
-
-
-class GitHubAPIError(RuntimeError):
-    """GitHub 返回不可恢复响应或不一致数据。
-
-    Args:
-        message: 面向操作者的失败说明。
-        status_code: HTTP 失败状态；本地验证或 GraphQL 失败时为 None。
-        url: 失败 HTTP request 的最终 URL；本地验证或 GraphQL 结构失败时为 None。
-    """
-
-    def __init__(
-        self,
-        message: str,
-        *,
-        status_code: int | None = None,
-        url: str | None = None,
-    ) -> None:
-        super().__init__(message)
-        self.status_code = status_code
-        self.url = url
 
 
 @dataclass(frozen=True, slots=True)
@@ -713,7 +449,7 @@ class GitHubAPI:
         if not self._authenticated:
             return None
         payload = await self._graphql(
-            _REPOSITORY_ITEM_COUNT,
+            REPOSITORY_ITEM_COUNT,
             {"owner": owner, "repo": repo},
         )
         try:
@@ -766,13 +502,13 @@ class GitHubAPI:
 
         async def graphql(wait_primary: bool) -> GitHubResource:
             payload = await self._graphql(
-                _PULL_REQUEST_DETAIL,
+                PULL_REQUEST_DETAIL,
                 {"owner": owner, "repo": repo, "number": number},
                 primary_wait=wait_primary,
             )
-            raw = _graphql_pull(payload, number)
+            raw = graphql_pull(payload, number)
             return GitHubResource(
-                _rest_pull_detail(raw, self._base_url, owner, repo),
+                rest_pull_detail(raw, self._base_url, owner, repo),
                 _Transport.GRAPHQL,
                 raw,
             )
@@ -817,7 +553,7 @@ class GitHubAPI:
 
         async def graphql(wait_primary: bool) -> GitHubResource:
             raw = await self._pull_connection(
-                _PULL_REVIEWS,
+                PULL_REVIEWS,
                 "reviews",
                 owner,
                 repo,
@@ -825,7 +561,7 @@ class GitHubAPI:
                 primary_wait=wait_primary,
             )
             value = [
-                _rest_review(review, self._base_url, owner, repo, number)
+                rest_review(review, self._base_url, owner, repo, number)
                 for review in raw
             ]
             return GitHubResource(value, _Transport.GRAPHQL, raw)
@@ -874,7 +610,7 @@ class GitHubAPI:
                     head,
                     primary_wait=wait_primary,
                 )
-                _check_size(number, "commits", expected, value)
+                check_size(number, "commits", expected, value)
                 return GitHubResource(value, _Transport.REST, value)
             value, updated = await self._paginate_cached(
                 path,
@@ -882,12 +618,12 @@ class GitHubAPI:
                 cache=cache,
                 primary_wait=wait_primary,
             )
-            _check_size(number, "commits", expected, value)
+            check_size(number, "commits", expected, value)
             return GitHubResource(value, _Transport.REST, value, updated)
 
         async def graphql(wait_primary: bool) -> GitHubResource:
             raw = await self._pull_connection(
-                _PULL_COMMITS,
+                PULL_COMMITS,
                 "commits",
                 owner,
                 repo,
@@ -895,10 +631,10 @@ class GitHubAPI:
                 primary_wait=wait_primary,
             )
             value = [
-                _rest_commit(item, self._base_url, owner, repo, number)
+                rest_commit(item, self._base_url, owner, repo, number)
                 for item in raw
             ]
-            _check_size(number, "commits", expected, value)
+            check_size(number, "commits", expected, value)
             return GitHubResource(value, _Transport.GRAPHQL, raw)
 
         rest_cached = expected <= 250 and cache is not None
@@ -948,7 +684,7 @@ class GitHubAPI:
                 primary_wait=wait_primary,
             )
             value = [
-                _rest_review_comment(comment, self._base_url, owner, repo, number)
+                rest_review_comment(comment, self._base_url, owner, repo, number)
                 for comment in raw
             ]
             return GitHubResource(value, _Transport.GRAPHQL, raw)
@@ -993,7 +729,7 @@ class GitHubAPI:
 
         async def graphql(wait_primary: bool) -> GitHubResource:
             raw = await self._parent_connection(
-                _ISSUE_COMMENTS,
+                ISSUE_COMMENTS,
                 "comments",
                 owner,
                 repo,
@@ -1001,7 +737,7 @@ class GitHubAPI:
                 primary_wait=wait_primary,
             )
             value = [
-                _rest_issue_comment(comment, self._base_url, owner, repo, number)
+                rest_issue_comment(comment, self._base_url, owner, repo, number)
                 for comment in raw
             ]
             return GitHubResource(value, _Transport.GRAPHQL, raw)
@@ -1042,13 +778,13 @@ class GitHubAPI:
 
         async def graphql(wait_primary: bool) -> GitHubResource:
             raw = await self._node_items(
-                _REACTIONS,
+                REACTIONS,
                 "reactions",
                 node_id,
                 primary_wait=wait_primary,
             )
             return GitHubResource(
-                [_rest_reaction(reaction) for reaction in raw],
+                [rest_reaction(reaction) for reaction in raw],
                 _Transport.GRAPHQL,
                 raw,
             )
@@ -1289,8 +1025,8 @@ class GitHubAPI:
                 {"owner": owner, "repo": repo, "number": number, "cursor": cursor},
                 primary_wait=primary_wait,
             )
-            pull = _graphql_pull(payload, number)
-            connection = _graphql_connection(pull, field, number)
+            pull = graphql_pull(payload, number)
+            connection = graphql_connection(pull, field, number)
             total = connection["totalCount"]
             if expected is None:
                 expected = total
@@ -1338,8 +1074,8 @@ class GitHubAPI:
                 {"owner": owner, "repo": repo, "number": number, "cursor": cursor},
                 primary_wait=primary_wait,
             )
-            parent = _graphql_parent(payload, number)
-            connection = _node_connection(parent, field, f"parent #{number}")
+            parent = graphql_parent(payload, number)
+            connection = node_connection(parent, field, f"parent #{number}")
             total = connection["totalCount"]
             if expected is None:
                 expected = total
@@ -1378,12 +1114,12 @@ class GitHubAPI:
         expected_threads: int | None = None
         while True:
             payload = await self._graphql(
-                _PULL_REVIEW_COMMENTS,
+                PULL_REVIEW_COMMENTS,
                 {"owner": owner, "repo": repo, "number": number, "cursor": cursor},
                 primary_wait=primary_wait,
             )
-            pull = _graphql_pull(payload, number)
-            connection = _graphql_connection(pull, "reviewThreads", number)
+            pull = graphql_pull(payload, number)
+            connection = graphql_connection(pull, "reviewThreads", number)
             total = connection["totalCount"]
             if expected_threads is None:
                 expected_threads = total
@@ -1402,7 +1138,7 @@ class GitHubAPI:
                         f"pull #{number} has invalid reviewThreads identities",
                     )
                 seen_threads.add(thread_id)
-                page = _node_connection(thread, "comments", f"review thread {thread_id}")
+                page = node_connection(thread, "comments", f"review thread {thread_id}")
                 thread_comments = await self._finish_node_connection(
                     thread_id,
                     page,
@@ -1454,14 +1190,14 @@ class GitHubAPI:
             if not isinstance(cursor, str) or not cursor:
                 raise GitHubAPIError(f"node {node_id} has an invalid comments cursor")
             payload = await self._graphql(
-                _REVIEW_THREAD_COMMENTS,
+                REVIEW_THREAD_COMMENTS,
                 {"id": node_id, "cursor": cursor},
                 primary_wait=primary_wait,
             )
             node = payload.get("data", {}).get("node")
             if not isinstance(node, dict) or node.get("id") != node_id:
                 raise GitHubAPIError(f"GitHub returned no matching review thread {node_id}")
-            page = _node_connection(node, "comments", f"review thread {node_id}")
+            page = node_connection(node, "comments", f"review thread {node_id}")
             if page["totalCount"] != expected:
                 raise GitHubAPIError(
                     f"review thread {node_id} comment count changed while paging",
@@ -1506,7 +1242,7 @@ class GitHubAPI:
             node = payload.get("data", {}).get("node")
             if not isinstance(node, dict) or node.get("id") != node_id:
                 raise GitHubAPIError(f"GitHub returned no matching node {node_id}")
-            connection = _node_connection(node, field, f"node {node_id}")
+            connection = node_connection(node, field, f"node {node_id}")
             total = connection["totalCount"]
             if expected is None:
                 expected = total
@@ -1899,423 +1635,6 @@ def _closing_issue_id(node: dict[str, Any], pull_number: int) -> str:
     return str(node["id"])
 
 
-def _graphql_pull(payload: dict[str, Any], number: int) -> dict[str, Any]:
-    try:
-        repository = payload["data"]["repository"]
-        pull = repository["pullRequest"]
-    except (KeyError, TypeError) as exc:
-        raise GitHubAPIError(f"GitHub returned incomplete pull request #{number}") from exc
-    if not isinstance(pull, dict) or pull.get("number") != number:
-        raise GitHubAPIError(f"GitHub returned no matching pull request #{number}")
-    return pull
-
-
-def _graphql_parent(payload: dict[str, Any], number: int) -> dict[str, Any]:
-    try:
-        repository = payload["data"]["repository"]
-        parent = repository["issueOrPullRequest"]
-    except (KeyError, TypeError) as exc:
-        raise GitHubAPIError(f"GitHub returned incomplete parent #{number}") from exc
-    if not isinstance(parent, dict) or parent.get("number") != number:
-        raise GitHubAPIError(f"GitHub returned no matching parent #{number}")
-    return parent
-
-
-def _graphql_connection(
-    pull: dict[str, Any],
-    field: str,
-    number: int,
-) -> dict[str, Any]:
-    connection = pull.get(field)
-    if not isinstance(connection, dict):
-        raise GitHubAPIError(f"pull #{number} has no {field} connection")
-    nodes = connection.get("nodes")
-    total = connection.get("totalCount")
-    page_info = connection.get("pageInfo")
-    if (
-        not isinstance(nodes, list)
-        or any(not isinstance(node, dict) for node in nodes)
-        or type(total) is not int
-        or total < 0
-        or not isinstance(page_info, dict)
-        or type(page_info.get("hasNextPage")) is not bool
-    ):
-        raise GitHubAPIError(f"pull #{number} has invalid {field} pagination")
-    return connection
-
-
-def _node_connection(
-    node: dict[str, Any],
-    field: str,
-    context: str,
-) -> dict[str, Any]:
-    connection = node.get(field)
-    if not isinstance(connection, dict):
-        raise GitHubAPIError(f"{context} has no {field} connection")
-    nodes = connection.get("nodes")
-    total = connection.get("totalCount")
-    page_info = connection.get("pageInfo")
-    if (
-        not isinstance(nodes, list)
-        or any(not isinstance(item, dict) for item in nodes)
-        or type(total) is not int
-        or total < 0
-        or not isinstance(page_info, dict)
-        or type(page_info.get("hasNextPage")) is not bool
-    ):
-        raise GitHubAPIError(f"{context} has invalid {field} pagination")
-    return connection
-
-
-def _rest_pull_detail(
-    pull: dict[str, Any],
-    base_url: str,
-    owner: str,
-    repo: str,
-) -> dict[str, Any]:
-    number = pull["number"]
-    api = f"{base_url}/repos/{quote(owner, safe='')}/{quote(repo, safe='')}"
-    url = f"{api}/pulls/{number}"
-    html_url = str(pull["url"])
-    base = _rest_ref(pull, "base", owner)
-    head = _rest_ref(pull, "head", owner)
-    merge = pull.get("mergeCommit")
-    state = str(pull["state"]).lower()
-    if state == "merged":
-        state = "closed"
-    return {
-        "id": _database_id(pull.get("fullDatabaseId")),
-        "node_id": pull["id"],
-        "url": url,
-        "html_url": html_url,
-        "diff_url": f"{html_url}.diff",
-        "patch_url": f"{html_url}.patch",
-        "issue_url": f"{api}/issues/{number}",
-        "commits_url": f"{url}/commits",
-        "review_comments_url": f"{url}/comments",
-        "review_comment_url": f"{url}/comments{{/number}}",
-        "comments_url": f"{api}/issues/{number}/comments",
-        "statuses_url": f"{api}/statuses/{head['sha']}",
-        "number": number,
-        "state": state,
-        "locked": pull["locked"],
-        "title": pull["title"],
-        "user": _rest_actor(pull.get("author")),
-        "body": pull.get("body"),
-        "created_at": pull["createdAt"],
-        "updated_at": pull["updatedAt"],
-        "closed_at": pull.get("closedAt"),
-        "merged_at": pull.get("mergedAt"),
-        "merge_commit_sha": merge.get("oid") if isinstance(merge, dict) else None,
-        "draft": pull["isDraft"],
-        "commits": pull["commits"]["totalCount"],
-        "comments": pull["comments"]["totalCount"],
-        "additions": pull["additions"],
-        "deletions": pull["deletions"],
-        "changed_files": pull["changedFiles"],
-        "head": head,
-        "base": base,
-        "merged": pull["merged"],
-        "mergeable": _mergeable(pull["mergeable"]),
-        "rebaseable": pull.get("canBeRebased"),
-        "mergeable_state": str(pull["mergeStateStatus"]).lower(),
-        "maintainer_can_modify": pull.get("maintainerCanModify"),
-        "author_association": pull["authorAssociation"],
-        "_links": {
-            "self": {"href": url},
-            "html": {"href": html_url},
-            "issue": {"href": f"{api}/issues/{number}"},
-            "comments": {"href": f"{api}/issues/{number}/comments"},
-            "review_comments": {"href": f"{url}/comments"},
-            "review_comment": {"href": f"{url}/comments{{/number}}"},
-            "commits": {"href": f"{url}/commits"},
-            "statuses": {"href": f"{api}/statuses/{head['sha']}"},
-        },
-    }
-
-
-def _rest_review(
-    review: dict[str, Any],
-    base_url: str,
-    owner: str,
-    repo: str,
-    number: int,
-) -> dict[str, Any]:
-    pull_url = (
-        f"{base_url}/repos/{quote(owner, safe='')}/{quote(repo, safe='')}/pulls/{number}"
-    )
-    html_url = review["url"]
-    commit = review.get("commit")
-    return {
-        "id": _database_id(review.get("fullDatabaseId")),
-        "node_id": review["id"],
-        "user": _rest_actor(review.get("author")),
-        "body": review["body"],
-        "state": review["state"],
-        "html_url": html_url,
-        "pull_request_url": pull_url,
-        "author_association": review["authorAssociation"],
-        "_links": {
-            "html": {"href": html_url},
-            "pull_request": {"href": pull_url},
-        },
-        "submitted_at": review.get("submittedAt"),
-        "commit_id": commit.get("oid") if isinstance(commit, dict) else None,
-        "created_at": review["createdAt"],
-        "updated_at": review["updatedAt"],
-    }
-
-
-def _rest_commit(
-    item: dict[str, Any],
-    base_url: str,
-    owner: str,
-    repo: str,
-    pull_number: int,
-) -> dict[str, Any]:
-    commit = item.get("commit")
-    if not isinstance(commit, dict):
-        raise GitHubAPIError(f"pull #{pull_number} has an invalid commit node")
-    sha = commit.get("oid")
-    parents = commit.get("parents")
-    if not isinstance(sha, str) or not sha or not isinstance(parents, dict):
-        raise GitHubAPIError(f"pull #{pull_number} has incomplete commit data")
-    parent_nodes = parents.get("nodes")
-    if (
-        not isinstance(parent_nodes, list)
-        or any(not isinstance(parent, dict) for parent in parent_nodes)
-        or parents.get("totalCount") != len(parent_nodes)
-        or parents.get("pageInfo", {}).get("hasNextPage") is not False
-    ):
-        raise GitHubAPIError(f"pull #{pull_number} has incomplete commit parents")
-    api = f"{base_url}/repos/{quote(owner, safe='')}/{quote(repo, safe='')}"
-    tree = commit.get("tree")
-    tree_sha = tree.get("oid") if isinstance(tree, dict) else None
-    return {
-        "sha": sha,
-        "node_id": commit["id"],
-        "commit": {
-            "author": _rest_signature(commit.get("author")),
-            "committer": _rest_signature(commit.get("committer")),
-            "message": commit["message"],
-            "tree": {
-                "sha": tree_sha,
-                "url": None if tree_sha is None else f"{api}/git/trees/{tree_sha}",
-            },
-            "url": f"{api}/git/commits/{sha}",
-        },
-        "url": f"{api}/commits/{sha}",
-        "html_url": commit["url"],
-        "comments_url": f"{api}/commits/{sha}/comments",
-        "author": _rest_actor(_nested_value(commit, "author", "user")),
-        "committer": _rest_actor(_nested_value(commit, "committer", "user")),
-        "parents": [
-            {"sha": parent["oid"], "url": f"{api}/commits/{parent['oid']}"}
-            for parent in parent_nodes
-        ],
-    }
-
-
-def _rest_review_comment(
-    comment: dict[str, Any],
-    base_url: str,
-    owner: str,
-    repo: str,
-    pull_number: int,
-) -> dict[str, Any]:
-    comment_id = _database_id(comment.get("fullDatabaseId"))
-    api = f"{base_url}/repos/{quote(owner, safe='')}/{quote(repo, safe='')}"
-    pull_url = f"{api}/pulls/{pull_number}"
-    review = comment.get("pullRequestReview")
-    reply = comment.get("replyTo")
-    commit = comment.get("commit")
-    original_commit = comment.get("originalCommit")
-    return {
-        "url": f"{api}/pulls/comments/{comment_id}",
-        "pull_request_review_id": (
-            _optional_database_id(review.get("fullDatabaseId"))
-            if isinstance(review, dict)
-            else None
-        ),
-        "id": comment_id,
-        "node_id": comment["id"],
-        "diff_hunk": comment["diffHunk"],
-        "path": comment["path"],
-        "commit_id": commit.get("oid") if isinstance(commit, dict) else None,
-        "original_commit_id": (
-            original_commit.get("oid") if isinstance(original_commit, dict) else None
-        ),
-        "user": _rest_actor(comment.get("author")),
-        "body": comment["body"],
-        "created_at": comment["createdAt"],
-        "updated_at": comment["updatedAt"],
-        "html_url": comment["url"],
-        "pull_request_url": pull_url,
-        "author_association": comment["authorAssociation"],
-        "in_reply_to_id": (
-            _optional_database_id(reply.get("fullDatabaseId"))
-            if isinstance(reply, dict)
-            else None
-        ),
-        "line": comment.get("line"),
-        "original_line": comment.get("originalLine"),
-        "original_start_line": comment.get("originalStartLine"),
-        "start_line": comment.get("startLine"),
-        "subject_type": str(comment["subjectType"]).lower(),
-        "reactions": {
-            "url": f"{api}/pulls/comments/{comment_id}/reactions",
-            "total_count": comment["reactions"]["totalCount"],
-        },
-    }
-
-
-def _rest_issue_comment(
-    comment: dict[str, Any],
-    base_url: str,
-    owner: str,
-    repo: str,
-    parent_number: int,
-) -> dict[str, Any]:
-    comment_id = _database_id(comment.get("fullDatabaseId"))
-    api = f"{base_url}/repos/{quote(owner, safe='')}/{quote(repo, safe='')}"
-    return {
-        "url": f"{api}/issues/comments/{comment_id}",
-        "html_url": comment["url"],
-        "issue_url": f"{api}/issues/{parent_number}",
-        "id": comment_id,
-        "node_id": comment["id"],
-        "user": _rest_actor(comment.get("author")),
-        "created_at": comment["createdAt"],
-        "updated_at": comment["updatedAt"],
-        "author_association": comment["authorAssociation"],
-        "body": comment["body"],
-        "body_text": comment["bodyText"],
-        "body_html": comment["bodyHTML"],
-        "reactions": {
-            "url": f"{api}/issues/comments/{comment_id}/reactions",
-            "total_count": comment["reactions"]["totalCount"],
-        },
-    }
-
-
-def _rest_reaction(reaction: dict[str, Any]) -> dict[str, Any]:
-    content = {
-        "THUMBS_UP": "+1",
-        "THUMBS_DOWN": "-1",
-        "LAUGH": "laugh",
-        "HOORAY": "hooray",
-        "CONFUSED": "confused",
-        "HEART": "heart",
-        "ROCKET": "rocket",
-        "EYES": "eyes",
-    }.get(reaction.get("content"))
-    if content is None:
-        raise GitHubAPIError("GitHub returned an invalid reaction content")
-    return {
-        "id": _database_id(reaction.get("databaseId")),
-        "node_id": reaction["id"],
-        "user": _rest_actor(reaction.get("user")),
-        "content": content,
-        "created_at": reaction["createdAt"],
-    }
-
-
-def _rest_signature(value: Any) -> dict[str, Any] | None:
-    if not isinstance(value, dict):
-        return None
-    return {
-        "name": value.get("name"),
-        "email": value.get("email"),
-        "date": value.get("date"),
-    }
-
-
-def _nested_value(value: dict[str, Any], first: str, second: str) -> Any:
-    nested = value.get(first)
-    return nested.get(second) if isinstance(nested, dict) else None
-
-
-def _rest_ref(pull: dict[str, Any], prefix: str, default_owner: str) -> dict[str, Any]:
-    repository = pull.get(f"{prefix}Repository")
-    name = pull.get(f"{prefix}RefName")
-    owner = default_owner
-    if isinstance(repository, dict):
-        name_with_owner = repository.get("nameWithOwner")
-        if isinstance(name_with_owner, str) and "/" in name_with_owner:
-            owner = name_with_owner.split("/", 1)[0]
-    return {
-        "label": f"{owner}:{name}",
-        "ref": name,
-        "sha": pull[f"{prefix}RefOid"],
-        "user": _rest_actor(repository.get("owner") if isinstance(repository, dict) else None),
-        "repo": _rest_repository(repository),
-    }
-
-
-def _rest_repository(value: Any) -> dict[str, Any] | None:
-    if not isinstance(value, dict):
-        return None
-    name_with_owner = value.get("nameWithOwner")
-    return {
-        "node_id": value.get("id"),
-        "name": value.get("name"),
-        "full_name": name_with_owner,
-        "private": None,
-        "owner": _rest_actor(value.get("owner")),
-        "html_url": value.get("url"),
-        "fork": value.get("isFork"),
-    }
-
-
-def _rest_actor(value: Any) -> dict[str, Any] | None:
-    if not isinstance(value, dict):
-        return None
-    actor = {
-        "login": value.get("login"),
-        "node_id": value.get("id"),
-        "avatar_url": value.get("avatarUrl"),
-        "html_url": value.get("url"),
-        "type": value.get("__typename"),
-        "site_admin": value.get("isSiteAdmin", False),
-    }
-    database_id = value.get("databaseId")
-    if database_id is not None:
-        actor["id"] = _database_id(database_id)
-    return actor
-
-
-def _database_id(value: Any) -> int:
-    if type(value) is int:
-        return value
-    if isinstance(value, str) and value.isdigit():
-        return int(value)
-    raise GitHubAPIError("GitHub returned an invalid database identity")
-
-
-def _optional_database_id(value: Any) -> int | None:
-    return None if value is None else _database_id(value)
-
-
-def _mergeable(value: Any) -> bool | None:
-    if value == "MERGEABLE":
-        return True
-    if value == "CONFLICTING":
-        return False
-    if value == "UNKNOWN":
-        return None
-    raise GitHubAPIError("GitHub returned an invalid mergeable state")
-
-
-def _check_size(
-    number: int,
-    resource: str,
-    expected: int,
-    items: list[dict[str, Any]],
-) -> None:
-    if len(items) != expected:
-        raise GitHubAPIError(
-            f"pull #{number} advertised {expected} {resource}, got {len(items)}",
-        )
 
 
 def _validator_headers(cache: dict[str, Any] | None, key: str) -> dict[str, str] | None:
