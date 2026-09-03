@@ -1,0 +1,60 @@
+[project]
+name = "vllm-kb-adapter"
+version = "0.1.0"
+description = "Version-aware MCP adapter between vllm-kb and gh-puller-mcp"
+requires-python = ">=3.13"
+dependencies = [
+    "fastapi>=0.139.0",
+    "httpx>=0.28.1",
+    "packaging>=25.0",
+    "uvicorn[standard]>=0.51.0",
+]
+
+[project.scripts]
+vllm-kb-adapter = "vllm_kb_adapter.__main__:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["vllm_kb_adapter*"]
+
+[[tool.uv.index]]
+url = "https://pypi.org/simple"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+    "ruff>=0.13",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 120
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["ALL"]
+ignore = [
+    "RUF001", "RUF002", "RUF003",
+    "D415", "D403",
+    "D101", "D102", "D103", "D105", "D107",
+    "ANN",
+    "ARG", "SLF001", "BLE001", "PLC0415", "TID252", "PTH", "FBT",
+    "EM", "TRY003", "T201", "TRY301",
+    "PLW0602", "PLW0603", "S603", "S607",
+    "N803", "N806", "N815",
+    "C901", "PLR0911", "PLR0912", "PLR0913", "PLR0915", "PLR0917", "PLR2004",
+    "CPY001", "TD", "FIX", "PT018",
+]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "S104", "S108", "INP001", "D100", "D104"]
