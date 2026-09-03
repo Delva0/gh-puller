@@ -73,6 +73,7 @@ class FakeAPI:
         self.reported_count: int | None = None
         self.count_available = True
         self.closing: dict[int, list[dict[str, Any]]] = {}
+        self.comparisons: dict[tuple[str, str], list[dict[str, Any]]] = {}
         self.catalog_accepts: list[str | None] = []
 
     async def close(self) -> None:
@@ -236,6 +237,22 @@ class FakeAPI:
         if not self.count_available:
             return None
         return len(self.catalog) if self.reported_count is None else self.reported_count
+
+    async def compare_commits(
+        self,
+        owner: str,
+        repo: str,
+        base: str,
+        head: str,
+    ) -> list[dict[str, Any]]:
+        items = deepcopy(self.comparisons[base, head])
+        self._called(
+            "compare",
+            f"/repos/{owner}/{repo}/compare/{base}...{head}",
+            None,
+            requests=max(1, math.ceil(len(items) / 100)),
+        )
+        return items
 
     async def closing_issue_references(
         self,
@@ -572,6 +589,116 @@ async def test_pull_request_bundle_preserves_all_discussion_and_diff_data(tmp_pa
     assert pull["patch"].startswith("From abc")
     assert (await _current(tmp_path / "archive"))[7].kind == "pull"
     assert not any(call[1] == f"{issue_path}/comments" for call in api.calls)
+
+
+@pytest.mark.parametrize("commit_count", [250, 251, 413])
+@pytest.mark.asyncio
+async def test_pull_commit_transport_crosses_the_documented_250_limit(
+    tmp_path: Path,
+    commit_count: int,
+) -> None:
+    api = FakeAPI()
+    api.add_issue(7, pull=True)
+    pull_path = f"{_BASE}/pulls/7"
+    commits = [
+        {
+            "sha": f"{index:040x}",
+            "commit": {"message": f"commit {index}"},
+            "unknown_commit_field": {"index": index},
+        }
+        for index in range(commit_count)
+    ]
+    api.json[pull_path] = {
+        "id": 700,
+        "base": {"sha": "base-sha"},
+        "head": {"sha": "head-sha"},
+        "changed_files": 0,
+        "commits": commit_count,
+        "review_comments": 0,
+    }
+    if commit_count <= 250:
+        api.pages[f"{pull_path}/commits"] = commits
+    else:
+        api.comparisons["base-sha", "head-sha"] = commits
+
+    await GitHubPuller(
+        _config(tmp_path / "archive"),
+        api=api,
+        now=lambda: _T0,
+    ).pull(_T0)
+
+    bundle = (await _current(tmp_path / "archive"))[7].bundle
+    assert bundle is not None
+    assert bundle["pull_request"]["commits"] == commits
+    pull_commit_calls = [call for call in api.calls if call[1] == f"{pull_path}/commits"]
+    compare_calls = [call for call in api.calls if call[0] == "compare"]
+    assert bool(pull_commit_calls) is (commit_count <= 250)
+    assert bool(compare_calls) is (commit_count > 250)
+
+
+@pytest.mark.asyncio
+async def test_large_pull_comparison_mismatch_resumes_the_same_task(tmp_path: Path) -> None:
+    class ShortComparisonAPI(FakeAPI):
+        short = True
+
+        async def compare_commits(
+            self,
+            owner: str,
+            repo: str,
+            base: str,
+            head: str,
+        ) -> list[dict[str, Any]]:
+            commits = await super().compare_commits(owner, repo, base, head)
+            return commits[:-1] if self.short else commits
+
+    api = ShortComparisonAPI()
+    api.add_issue(7, pull=True)
+    pull_path = f"{_BASE}/pulls/7"
+    commits = [{"sha": f"{index:040x}"} for index in range(251)]
+    api.json[pull_path] = {
+        "id": 700,
+        "base": {"sha": "base-sha"},
+        "head": {"sha": "head-sha"},
+        "changed_files": 0,
+        "commits": 251,
+        "review_comments": 0,
+    }
+    api.comparisons["base-sha", "head-sha"] = commits
+    archive = tmp_path / "archive"
+    events: list[PullProgress] = []
+    puller = GitHubPuller(
+        _config(archive),
+        api=api,
+        now=lambda: _T0,
+        observer=events.append,
+    )
+
+    with pytest.raises(
+        IncompleteGitHubDataError,
+        match="pull #7 advertised 251 commits, got 250",
+    ):
+        await puller.pull(_T0)
+
+    assert events[-1].detail == (
+        "IncompleteGitHubDataError: pull #7 advertised 251 commits, got 250"
+    )
+    assert await _rows(
+        archive,
+        "SELECT number, completed FROM pull_tasks",
+    ) == [{"number": 7, "completed": 0}]
+    api.short = False
+
+    result = await puller.pull(_T0)
+
+    bundle = (await _current(archive))[7].bundle
+    assert bundle is not None
+    assert bundle["pull_request"]["commits"] == commits
+    assert result.catalog_items == 1
+    assert sum(
+        call[0] == "page" and call[1] == f"{_BASE}/issues"
+        for call in api.calls
+    ) == 1
+    assert sum(call[0] == "compare" for call in api.calls) == 2
 
 
 @pytest.mark.asyncio
@@ -2480,6 +2607,113 @@ async def test_rest_page_exposes_the_opaque_next_cursor_without_following_it() -
         "https://api.github.test/items?state=all&per_page=100",
         "https://api.github.test/items?cursor=opaque",
     ]
+
+
+@pytest.mark.asyncio
+async def test_compare_commits_paginates_all_413_raw_objects() -> None:
+    seen: list[str] = []
+    total = 413
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        page_number = int(request.url.params.get("page", "1"))
+        start = (page_number - 1) * 100
+        stop = min(start + 100, total)
+        headers = {}
+        if stop < total:
+            headers["link"] = (
+                "<https://api.github.test/repos/acme/widgets/compare/base...head"
+                f'?per_page=100&page={page_number + 1}>; rel="next"'
+            )
+        return httpx.Response(
+            200,
+            headers=headers,
+            json={
+                "total_commits": total,
+                "commits": [
+                    {"sha": f"{index:040x}", "unknown": {"index": index}}
+                    for index in range(start, stop)
+                ],
+            },
+            request=request,
+        )
+
+    client = httpx.AsyncClient(
+        base_url="https://api.github.test",
+        transport=httpx.MockTransport(handler),
+    )
+    api = GitHubAPI(client=client)
+    try:
+        commits = await api.compare_commits("acme", "widgets", "base", "head")
+    finally:
+        await client.aclose()
+
+    assert len(commits) == total
+    assert len({commit["sha"] for commit in commits}) == total
+    assert commits[-1]["unknown"] == {"index": total - 1}
+    assert len(seen) == api.request_count == 5
+    assert seen[0].endswith("/compare/base...head?per_page=100")
+    assert seen[-1].endswith("/compare/base...head?per_page=100&page=5")
+
+
+@pytest.mark.asyncio
+async def test_compare_commits_rejects_a_total_that_changes_between_pages() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.params.get("page") == "2":
+            return httpx.Response(
+                200,
+                json={"total_commits": 100, "commits": [{"sha": f"{100:040x}"}]},
+                request=request,
+            )
+        return httpx.Response(
+            200,
+            headers={
+                "link": (
+                    "<https://api.github.test/repos/acme/widgets/compare/base...head"
+                    '?per_page=100&page=2>; rel="next"'
+                ),
+            },
+            json={
+                "total_commits": 101,
+                "commits": [{"sha": f"{index:040x}"} for index in range(100)],
+            },
+            request=request,
+        )
+
+    client = httpx.AsyncClient(
+        base_url="https://api.github.test",
+        transport=httpx.MockTransport(handler),
+    )
+    api = GitHubAPI(client=client)
+    try:
+        with pytest.raises(GitHubAPIError, match="total changed"):
+            await api.compare_commits("acme", "widgets", "base", "head")
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_compare_commits_rejects_duplicate_commit_identities() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "total_commits": 2,
+                "commits": [{"sha": "duplicate"}, {"sha": "duplicate"}],
+            },
+            request=request,
+        )
+
+    client = httpx.AsyncClient(
+        base_url="https://api.github.test",
+        transport=httpx.MockTransport(handler),
+    )
+    api = GitHubAPI(client=client)
+    try:
+        with pytest.raises(GitHubAPIError, match="invalid commit identities"):
+            await api.compare_commits("acme", "widgets", "base", "head")
+    finally:
+        await client.aclose()
 
 
 @pytest.mark.asyncio

@@ -38,6 +38,7 @@ if TYPE_CHECKING:
 _NUMBER_AT_END = re.compile(r"/(\d+)$")
 _CLOSING_REFERENCE_BATCH_SIZE = 100
 _CATALOG_ACCEPT = "application/vnd.github.raw+json"
+_PULL_COMMITS_LIMIT = 250
 
 
 class IncompleteGitHubDataError(RuntimeError):
@@ -102,6 +103,14 @@ class _API(Protocol):
         repo: str,
         numbers: list[int],
     ) -> dict[int, list[dict[str, Any]]]: ...
+
+    async def compare_commits(
+        self,
+        owner: str,
+        repo: str,
+        base: str,
+        head: str,
+    ) -> list[dict[str, Any]]: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -880,8 +889,16 @@ class GitHubPuller:
             )
             _set_cache(http_cache, "review_comments", cache)
         review_comments = _canonical_comments(review_comments)
-        if _is_zero_integer(pull.get("commits")):
+        expected_commits = pull.get("commits")
+        if _is_zero_integer(expected_commits):
             commits = []
+        elif isinstance(expected_commits, int) and expected_commits > _PULL_COMMITS_LIMIT:
+            base, head = _comparison_shas(pull, number)
+            commits = await api.compare_commits(self._owner, self._repo, base, head)
+            if len(commits) != expected_commits:
+                raise IncompleteGitHubDataError(
+                    f"pull #{number} advertised {expected_commits} commits, got {len(commits)}",
+                )
         else:
             commits, cache = await self._cached_page(
                 api,
@@ -922,7 +939,6 @@ class GitHubPuller:
             raise IncompleteGitHubDataError(
                 f"pull #{number} advertised {expected_files} files, got {len(files)}",
             )
-        expected_commits = pull.get("commits")
         if isinstance(expected_commits, int) and len(commits) < expected_commits:
             raise IncompleteGitHubDataError(
                 f"pull #{number} advertised {expected_commits} commits, got {len(commits)}",
@@ -1259,6 +1275,16 @@ def _embedded_review_requests(pull: dict[str, Any]) -> dict[str, Any] | None:
     ):
         return None
     return {"users": users, "teams": []}
+
+
+def _comparison_shas(pull: dict[str, Any], number: int) -> tuple[str, str]:
+    base = _dict_field(pull, "base")
+    head = _dict_field(pull, "head")
+    base_sha = _str_field(base, "sha")
+    head_sha = _str_field(head, "sha")
+    if not base_sha or not head_sha:
+        raise IncompleteGitHubDataError(f"pull #{number} has no complete comparison range")
+    return base_sha, head_sha
 
 
 def _head_from_summary(

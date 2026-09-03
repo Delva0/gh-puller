@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from typing import TYPE_CHECKING, Any
+from urllib.parse import quote
 
 import httpx
 
@@ -434,6 +435,79 @@ class GitHubAPI:
         if not isinstance(issues, int) or not isinstance(pulls, int):
             raise GitHubAPIError("GitHub returned non-integer repository counts")
         return issues + pulls
+
+    async def compare_commits(
+        self,
+        owner: str,
+        repo: str,
+        base: str,
+        head: str,
+    ) -> list[dict[str, Any]]:
+        """通过可分页 comparison 读取两个 commit 之间的完整列表。
+
+        Args:
+            owner: 仓库 owner。
+            repo: 仓库名。
+            base: comparison 的 base commit SHA。
+            head: comparison 的 head commit SHA。
+
+        Returns:
+            按 GitHub comparison 顺序排列、字段不裁剪的 commit 对象。
+
+        Raises:
+            GitHubAPIError: 分页的总数、cursor 或 commit identity 不一致。
+        """
+        path = (
+            f"/repos/{quote(owner, safe='')}/{quote(repo, safe='')}/compare/"
+            f"{quote(base, safe='')}...{quote(head, safe='')}"
+        )
+        params: Mapping[str, Any] | None = {"per_page": 100}
+        commits: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        visited: set[str] = set()
+        expected: int | None = None
+        while True:
+            response = await self._request("GET", path, params=params)
+            try:
+                payload = response.json()
+            except json.JSONDecodeError as exc:
+                raise GitHubAPIError(
+                    f"GitHub returned invalid comparison JSON for {response.url}",
+                ) from exc
+            if not isinstance(payload, dict):
+                raise GitHubAPIError(f"GitHub returned a non-object comparison for {response.url}")
+            page = payload.get("commits")
+            total = payload.get("total_commits")
+            if (
+                not isinstance(page, list)
+                or any(not isinstance(item, dict) for item in page)
+                or type(total) is not int
+                or total < 0
+            ):
+                raise GitHubAPIError(f"GitHub returned incomplete comparison data for {response.url}")
+            if expected is None:
+                expected = total
+            elif expected != total:
+                raise GitHubAPIError("GitHub comparison total changed while paging")
+            for commit in page:
+                sha = commit.get("sha")
+                if not isinstance(sha, str) or not sha or sha in seen:
+                    raise GitHubAPIError("GitHub comparison returned invalid commit identities")
+                seen.add(sha)
+                commits.append(commit)
+            next_url = response.links.get("next", {}).get("url")
+            if not next_url:
+                if len(commits) != expected:
+                    raise GitHubAPIError(
+                        f"GitHub comparison advertised {expected} commits, got {len(commits)}",
+                    )
+                return commits
+            current_url = str(response.url)
+            if next_url == current_url or next_url in visited:
+                raise GitHubAPIError("GitHub comparison repeated a pagination cursor")
+            visited.add(current_url)
+            path = next_url
+            params = None
 
     async def closing_issue_references(
         self,

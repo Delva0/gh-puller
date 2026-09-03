@@ -218,10 +218,12 @@ class _PullProgressTracker:
 
     def error(self, error: BaseException) -> None:
         self._work_phase = "error"
+        name = type(error).__name__
+        message = str(error).strip()
         self._emit(
             phase="error",
             wait_seconds=None,
-            detail=type(error).__name__,
+            detail=name if not message else f"{name}: {message}",
         )
 
     def _run_requests(self, request_count: int) -> int:

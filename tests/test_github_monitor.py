@@ -170,6 +170,24 @@ def test_detail_shows_process_and_durable_run_progress(tmp_path: Path) -> None:
     assert "SERIES" not in output
 
 
+def test_detail_shows_the_actionable_error_message(tmp_path: Path) -> None:
+    progress = _progress(
+        phase="error",
+        detail="IncompleteGitHubDataError: pull #7 advertised 251 commits, got 250",
+    )
+
+    output = monitor._render_detail(
+        _status(tmp_path / "facts.sqlite3", progress),
+        now=_EVENT_AT,
+        zone=_LOCAL,
+    )
+
+    assert (
+        "DETAIL      IncompleteGitHubDataError: pull #7 advertised 251 commits, got 250"
+        in output
+    )
+
+
 def test_quota_keeps_unknown_fields_explicit() -> None:
     progress = _progress(quotas=(RateQuota("core", None, None, None),))
 

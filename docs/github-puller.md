@@ -162,16 +162,23 @@ Sources: [gh_puller/github/](../gh_puller/github/); [tests/test_github_puller.py
 | Issue comments | Read the complete per-parent collection; skip the call only when the root has an exact zero and no repository signal selected the parent. | Comment identities must be unique. A repository signal overrides the zero shortcut. |
 | PR review comments | Read the complete per-parent collection; skip only on an exact zero with no repository signal. | Comment identities must be unique; a signal overrides the shortcut. |
 | Issue reactions | No collection request when detail reports `total_count == 0` | Zero is itself the complete collection; every nonzero or absent count still paginates and is checked against the aggregate. |
-| PR commits and files | No collection request when PR detail reports an exact zero | Nonzero and absent counts still paginate; a returned collection shorter than `commits` or `changed_files` aborts publication. |
+| PR commits | No collection request when PR detail reports an exact zero. Counts through 250 use the PR-commits endpoint; larger PRs paginate the exact `base.sha...head.sha` comparison. | GitHub caps the PR endpoint at 250 commits. A comparison must contain exactly the advertised count with unique commit SHAs and a stable `total_commits` across pages. |
+| PR files | No collection request when PR detail reports an exact zero | Nonzero and absent counts still paginate; a returned collection shorter than `changed_files` aborts publication. |
 | Requested reviewers | Reuse embedded users only when the PR detail contains a valid user list and an empty team list. | Any team or ambiguous embedded value selects the dedicated endpoint, whose team objects carry richer fields. |
 | Issues closed by a PR | Batch up to 100 selected PRs into one GraphQL request, include user-linked Issues, and follow every `closingIssuesReferences` cursor. | Each connection's `totalCount` must equal its unique returned nodes. Missing, duplicate, or malformed data aborts the run instead of becoming an empty relation. |
-| Per-parent JSON, complete paginated lists, diff, and patch | Conditional GET with the prior ETag | Validators are keyed by API root, API version, media type, path, and parameters, and are stored atomically with the exact bundle digest whose body they validate. A paginated list is reusable only when every page has an ETag and the terminal page has fewer than 100 entries. Every page must return `304 Not Modified`; any changed page restarts complete pagination. A terminal full page has no cache, so 100→101 growth cannot hide on a new page. |
+| Eligible per-parent JSON, complete paginated lists, diff, and patch | Conditional GET with the prior ETag | Validators are keyed by API root, API version, media type, path, and parameters, and are stored atomically with the exact bundle digest whose body they validate. A paginated list is reusable only when every page has an ETag and the terminal page has fewer than 100 entries. Every page must return `304 Not Modified`; any changed page restarts complete pagination. A terminal full page has no cache, so 100→101 growth cannot hide on a new page. Large-PR comparisons are fetched only when their parent is selected and do not use this validator cache. |
 | Timeline, events, diff, and patch aggregation | No repository-wide consolidation | Repository event responses have a different raw shape, while diff and patch have independent lossless fallback rules. Their per-parent responses remain unprojected; eligible responses still use the conditional transport above. |
 
 Authenticated ETag requests that return 304 do not consume primary REST quota; they
 remain HTTP attempts and therefore remain included in the run's `requests` counter.
 See GitHub's
 [conditional-request guidance](https://docs.github.com/en/rest/using-the-rest-api/best-practices-for-using-the-rest-api#use-conditional-requests).
+
+GitHub documents the 250-entry cap on
+[List commits on a pull request](https://docs.github.com/en/rest/pulls/pulls#list-commits-on-a-pull-request).
+For a larger selected PR, the puller uses the paginated
+[Compare two commits](https://docs.github.com/en/rest/commits/commits#compare-two-commits)
+response because its base/head range is exact and its commit list can cross that cap.
 
 When the three REST discovery streams each fit on one page and nothing changed, one
 authenticated warm pass costs three REST attempts and no GraphQL query. The cost is
@@ -197,9 +204,11 @@ PR detail, reviews, diff, and patch. The PR batch term reads the first page of e
 closing relation, where B is the number of nonempty selected-PR batches and each batch
 contains at most 100 PRs. A relation beyond 100 nodes adds cursor requests, while
 non-empty comments, reactions, commits, files, review teams, pagination, and media
-fallback add their actual REST requests. On a warm pass, only selected PRs enter the
-GraphQL relation batches. GitHub's response headers remain authoritative for actual
-point consumption. See the
+fallback add their actual REST requests. A PR with K commits adds `ceil(K / 100)`
+REST requests; above 250 those requests are comparison pages instead of a knowingly
+capped PR collection. On a warm pass, only selected PRs enter the GraphQL relation
+batches. GitHub's response headers remain authoritative for actual point consumption.
+See the
 [PullRequest GraphQL fields](https://docs.github.com/en/graphql/reference/pulls#pullrequest)
 and
 [GraphQL resource limits](https://docs.github.com/en/graphql/overview/rate-limits-and-query-limits-for-the-graphql-api).
@@ -253,7 +262,8 @@ identity, durable page cursor, staged records, and accumulated request count con
 across restarts. A
 `rate_limit` event reports the wait duration and any known quota reset time without
 pretending that object progress moved; `retry_wait` distinguishes network and 5xx
-backoff from quota exhaustion.
+backoff from quota exhaustion. An `error` event retains both the exception class and
+its message, so `status` exposes the object and invariant that stopped the writer.
 
 Sources: [gh_puller/github/](../gh_puller/github/); [tests/test_github_puller.py](../tests/test_github_puller.py); [tests/test_github_cli.py](../tests/test_github_cli.py)
 
@@ -580,13 +590,14 @@ The suite covers raw-field retention, durable page/task/cursor recovery, concurr
 directory production and bounded Issue/PR consumption, expired-cursor directory
 replay with completed-record reuse, PR resources, batched and paginated closing-Issue
 relations, same-second boundaries, future prefetch history, diff/patch fallback and
-validator reuse, pass-local progress, zero-request idempotent reuse, observer failure
-isolation, TTY and JSON progress, rate-limit waits, current-head visibility, single-
-and multi-page conditional validation, 100→101 page growth, content deduplication,
-directly observed tombstones, cancellation, completion-order durable resume,
-concurrent duplicate calls, scheduler recovery, randomized observable Issue/PR and
-comment churn, silent-deletion best effort, schema migration and rejection, and
-request-saving shortcuts for selected Issue/PR records.
+validator reuse, 250-entry PR-commit routing, complete large comparisons, pass-local
+progress, zero-request idempotent reuse, observer failure isolation, TTY and JSON
+progress, rate-limit waits, current-head visibility, single- and multi-page
+conditional validation, 100→101 page growth, content deduplication, directly observed
+tombstones, cancellation, completion-order durable resume, concurrent duplicate
+calls, scheduler recovery, randomized observable Issue/PR and comment churn,
+silent-deletion best effort, schema migration and rejection, and request-saving
+shortcuts for selected Issue/PR records.
 
 The daemon tests additionally verify unit rendering, repeatable installation and
 uninstallation, archive preservation, database-scoped controls, repository-binding
