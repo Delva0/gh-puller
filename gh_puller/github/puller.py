@@ -17,10 +17,13 @@ from itertools import islice
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
-from .client import GitHubAPI, GitHubAPIError
+from .client import GitHubAPI, GitHubAPIError, GitHubPage
 from .progress import _PullProgressTracker
 from .store import (
     ArchivedRun,
+    CatalogItem,
+    PullPass,
+    PullTask,
     SQLiteArchive,
     StagedResource,
     StoredHead,
@@ -34,6 +37,7 @@ if TYPE_CHECKING:
 
 _NUMBER_AT_END = re.compile(r"/(\d+)$")
 _CLOSING_REFERENCE_BATCH_SIZE = 100
+_CATALOG_ACCEPT = "application/vnd.github.raw+json"
 
 
 class IncompleteGitHubDataError(RuntimeError):
@@ -82,6 +86,14 @@ class _API(Protocol):
         page_observer: Callable[[int], None] | None = None,
     ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]: ...
 
+    async def get_page(
+        self,
+        path: str,
+        *,
+        params: dict[str, Any] | None = None,
+        accept: str | None = None,
+    ) -> GitHubPage: ...
+
     async def repository_item_count(self, owner: str, repo: str) -> int | None: ...
 
     async def closing_issue_references(
@@ -128,13 +140,6 @@ class PullResult:
     def lag_seconds(self) -> float:
         """Return the non-negative completion lag behind the target watermark."""
         return max((self.completed_at - self.target_at).total_seconds(), 0.0)
-
-
-@dataclass(frozen=True, slots=True)
-class _CatalogPlan:
-    items: dict[int, dict[str, Any]]  # Raw REST catalog objects available in this pass.
-    present: set[int]  # Certified membership through the cutoff.
-    signals: set[int]  # Parents dirtied by repository-wide child feeds.
 
 
 class GitHubPuller:
@@ -236,17 +241,29 @@ class GitHubPuller:
             progress.bind_run(run.id, run.request_count, request_start)
             observed = _parse_time(run.observed_until)
             try:
-                now = _as_utc(self._now())
-                if now < target_at:
+                active = await archive.active_pass(run.id)
+                if active is not None:
                     observed = await self._sync_pass(
                         api,
                         archive,
                         run.id,
-                        now,
+                        _parse_required_time(active.cutoff_at),
                         observed,
-                        "prefetch",
+                        active.name,
                         progress,
                     )
+                now = _as_utc(self._now())
+                if now < target_at:
+                    if observed is None or now > observed:
+                        observed = await self._sync_pass(
+                            api,
+                            archive,
+                            run.id,
+                            now,
+                            observed,
+                            "prefetch",
+                            progress,
+                        )
                     wait = (target_at - _as_utc(self._now())).total_seconds()
                     while wait > 0:
                         progress.phase(
@@ -256,15 +273,16 @@ class GitHubPuller:
                         )
                         await self._sleep(wait)
                         wait = (target_at - _as_utc(self._now())).total_seconds()
-                await self._sync_pass(
-                    api,
-                    archive,
-                    run.id,
-                    target_at,
-                    observed,
-                    "closing",
-                    progress,
-                )
+                if observed is None or target_at > observed:
+                    await self._sync_pass(
+                        api,
+                        archive,
+                        run.id,
+                        target_at,
+                        observed,
+                        "closing",
+                        progress,
+                    )
                 attempt_requests = api.request_count - request_start
                 await archive.add_requests(run.id, attempt_requests)
                 accounted = True
@@ -320,168 +338,150 @@ class GitHubPuller:
     ) -> datetime | None:
         progress.start_pass(pass_name, cutoff)
         heads, staged = await archive.load_head_state(run_id)
+        progress.restore_items(sum(head.present for head in heads.values()))
         progress.restore_staged((head.number, head.kind, head.present) for head in staged.values())
-        if observed is not None and cutoff <= observed:
-            return observed
-        plan = await self._catalog_plan(api, heads, cutoff, observed, progress)
-        candidates = {
-            number for number, item in plan.items.items() if _needs_refresh(heads.get(number), item)
-        }
-        candidates.update(plan.signals)
-        candidates.intersection_update(plan.present)
-        carried = [
-            (head.number, head.kind)
-            for number, head in staged.items()
-            if head.present and number in plan.present and number not in candidates
-        ]
-        carried_tombstones = sum(not head.present and number not in plan.present for number, head in staged.items())
-        progress.catalog_complete(len(plan.present))
-        progress.start_bundles(
-            pass_name,
-            len(candidates),
-            carried,
-            carried_tombstones,
-            api.request_count,
-        )
-
-        await self._fetch_candidates(
-            api,
-            archive,
-            run_id,
-            heads,
-            plan.items,
-            candidates,
-            plan.signals,
-            _iso(cutoff),
-            progress,
-        )
-        tombstones = [
-            StagedResource(
-                head=StoredHead(
-                    number=head.number,
-                    github_id=head.github_id,
-                    kind=head.kind,
-                    created_at=head.created_at,
-                    updated_at=head.updated_at,
-                    summary_digest=head.summary_digest,
-                    bundle_digest=head.bundle_digest,
-                    present=False,
-                    missing_since=_iso(cutoff),
-                ),
-                observed_at=_iso(cutoff),
-                summary=None,
-                bundle=None,
+        state = await archive.active_pass(run_id)
+        if state is None:
+            if observed is not None and cutoff <= observed:
+                return observed
+            state = await archive.start_pass(
+                run_id,
+                pass_name,
+                _iso(cutoff),
+                "full" if observed is None else "delta",
             )
-            for number, head in heads.items()
-            if head.present and number not in plan.present
-        ]
-        if tombstones:
-            await archive.stage(run_id, tombstones)
-            progress.tombstones_staged(len(tombstones), api.request_count)
-        await archive.update_observed(run_id, _iso(cutoff))
-        return cutoff
+        elif (state.name, state.cutoff_at) != (pass_name, _iso(cutoff)):
+            raise RuntimeError("another observation pass must finish first")
+        if not state.prepared:
+            state = await self._prepare_pass(api, archive, state, observed, progress)
+        progress.catalog_restore(state.catalog_items, state.expected_count)
 
-    async def _catalog_plan(
-        self,
-        api: _API,
-        heads: dict[int, StoredHead],
-        cutoff: datetime,
-        observed: datetime | None,
-        progress: _PullProgressTracker,
-    ) -> _CatalogPlan:
-        if observed is None:
-            return _full_plan(await self._counted_catalog(api, cutoff, progress))
-
-        previous = {number: head for number, head in heads.items() if head.present}
-        if not previous:
-            return _full_plan(await self._stable_catalog(api, cutoff, progress))
-
-        since = _iso_seconds(observed - timedelta(seconds=self.config.overlap_seconds))
-        progress.catalog_scan()
-        catalog_task = asyncio.create_task(
-            api.paginate(
-                f"{self._base}/issues",
-                params={
-                    "state": "all",
-                    "sort": "created",
-                    "direction": "asc",
-                    "since": since,
-                },
-                page_observer=progress.catalog_page,
+        changed = asyncio.Event()
+        store_lock = asyncio.Lock()
+        producer = asyncio.create_task(
+            self._produce_catalog(
+                api,
+                archive,
+                state,
+                observed,
+                progress,
+                changed,
+                store_lock,
             ),
         )
-        issue_signal_task = asyncio.create_task(
-            self._signal_numbers(api, "issues/comments", "issue_url", since),
-        )
-        review_signal_task = asyncio.create_task(
-            self._signal_numbers(api, "pulls/comments", "pull_request_url", since),
-        )
-        count_task = asyncio.create_task(self._repository_item_count(api, progress))
-        tasks = [catalog_task, issue_signal_task, review_signal_task, count_task]
         try:
-            delta, issue_signals, review_signals, current_count = await asyncio.gather(*tasks)
-        except BaseException:
-            for task in tasks:
-                task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
-            raise
+            while True:
+                async with store_lock:
+                    tasks = await archive.pending_catalog_tasks(run_id)
+                if tasks:
+                    await self._consume_tasks(
+                        api,
+                        archive,
+                        run_id,
+                        heads,
+                        tasks,
+                        _iso(cutoff),
+                        progress,
+                        store_lock,
+                    )
+                    continue
+                if producer.done():
+                    await producer
+                    break
+                await changed.wait()
+                changed.clear()
+            while True:
+                tasks = await archive.pending_signal_tasks(run_id)
+                if not tasks:
+                    break
+                await self._consume_tasks(
+                    api,
+                    archive,
+                    run_id,
+                    heads,
+                    tasks,
+                    _iso(cutoff),
+                    progress,
+                    store_lock,
+                )
+            await archive.finish_pass(run_id, _iso(cutoff))
+        finally:
+            if not producer.done():
+                producer.cancel()
+                await asyncio.gather(producer, return_exceptions=True)
+        return cutoff
 
-        certified = _certified_head_merge(previous, delta, current_count, cutoff)
-        signals = issue_signals | review_signals
-        if certified is None:
-            full = _full_plan(await self._stable_catalog(api, cutoff, progress))
-            return _overlay_plan(full, delta, signals, cutoff)
-        present, items = certified
-        return _CatalogPlan(
-            items=items,
-            present=present,
-            signals=signals,
+    async def _prepare_pass(
+        self,
+        api: _API,
+        archive: SQLiteArchive,
+        state: PullPass,
+        observed: datetime | None,
+        progress: _PullProgressTracker,
+    ) -> PullPass:
+        if state.mode == "full":
+            expected = await self._repository_item_count(api, progress)
+            return await archive.prepare_pass(state.run_id, (), expected)
+        if observed is None:
+            raise RuntimeError("delta discovery requires a prior observation watermark")
+        since = _iso_seconds(observed - timedelta(seconds=self.config.overlap_seconds))
+        signals = await self._signal_numbers(api, "issues/comments", "issue_url", since)
+        signals.update(
+            await self._signal_numbers(
+                api,
+                "pulls/comments",
+                "pull_request_url",
+                since,
+            ),
         )
+        return await archive.prepare_pass(state.run_id, signals, None)
 
-    async def _counted_catalog(
+    async def _produce_catalog(
         self,
         api: _API,
-        cutoff: datetime,
+        archive: SQLiteArchive,
+        state: PullPass,
+        observed: datetime | None,
         progress: _PullProgressTracker,
-    ) -> list[dict[str, Any]]:
-        progress.catalog_scan()
-        catalog = await self._catalog_scan(api, progress)
-        current_count = await self._repository_item_count(api, progress)
-        certified = _certified_full_catalog(catalog, current_count, cutoff)
-        if certified is not None:
-            return certified
-        return await self._stable_catalog(api, cutoff, progress, previous_catalog=catalog)
-
-    async def _stable_catalog(
-        self,
-        api: _API,
-        cutoff: datetime,
-        progress: _PullProgressTracker,
-        *,
-        previous_catalog: list[dict[str, Any]] | None = None,
-    ) -> list[dict[str, Any]]:
-        previous = _catalog_signature(previous_catalog, cutoff) if previous_catalog is not None else None
+        changed: asyncio.Event,
+        store_lock: asyncio.Lock,
+    ) -> None:
+        if state.catalog_complete:
+            return
+        path = state.next_url if state.catalog_started else f"{self._base}/issues"
+        if path is None:
+            raise RuntimeError("unfinished catalog traversal has no next cursor")
+        params = None if state.catalog_started else _catalog_params(state.mode, observed, self.config)
+        visited: set[str] = set()
+        restarted = False
         while True:
-            progress.catalog_scan()
-            catalog = await self._catalog_scan(api, progress)
-            signature = _catalog_signature(catalog, cutoff)
-            if signature is None:
-                previous = None
+            try:
+                page = await api.get_page(path, params=params, accept=_CATALOG_ACCEPT)
+            except GitHubAPIError as exc:
+                if restarted or not state.catalog_started or exc.status_code not in {404, 410, 422}:
+                    raise
+                async with store_lock:
+                    state = await archive.restart_catalog(state.run_id)
+                path = f"{self._base}/issues"
+                params = _catalog_params(state.mode, observed, self.config)
+                visited.clear()
+                restarted = True
                 continue
-            if signature == previous:
-                return _visible_catalog(catalog, cutoff)
-            previous = signature
-
-    async def _catalog_scan(
-        self,
-        api: _API,
-        progress: _PullProgressTracker,
-    ) -> list[dict[str, Any]]:
-        return await api.paginate(
-            f"{self._base}/issues",
-            params={"state": "all", "sort": "created", "direction": "desc"},
-            page_observer=progress.catalog_page,
-        )
+            if page.next_url == path or page.next_url in visited:
+                raise IncompleteGitHubDataError("GitHub catalog repeated a pagination cursor")
+            items = [_catalog_item(item) for item in page.items]
+            try:
+                async with store_lock:
+                    state = await archive.stage_catalog_page(state.run_id, items, page.next_url)
+            except ValueError as exc:
+                raise IncompleteGitHubDataError(str(exc)) from exc
+            progress.catalog_restore(state.catalog_items, state.expected_count)
+            changed.set()
+            if page.next_url is None:
+                return
+            visited.add(path)
+            path = page.next_url
+            params = None
 
     async def _repository_item_count(
         self,
@@ -510,49 +510,153 @@ class GitHubPuller:
                 numbers.add(int(match.group(1)))
         return numbers
 
+    async def _consume_tasks(
+        self,
+        api: _API,
+        archive: SQLiteArchive,
+        run_id: int,
+        heads: dict[int, StoredHead],
+        tasks: list[PullTask],
+        observed_at: str,
+        progress: _PullProgressTracker,
+        store_lock: asyncio.Lock,
+    ) -> None:
+        selected = []
+        cutoff = _parse_required_time(observed_at)
+        for task in tasks:
+            if task.created_at is not None and _parse_required_time(task.created_at) > cutoff:
+                async with store_lock:
+                    await archive.complete_task(run_id, task.number, task.summary_digest)
+                continue
+            if (
+                task.summary is not None
+                and not task.force_comments
+                and not _needs_refresh(heads.get(task.number), task.summary)
+            ):
+                async with store_lock:
+                    await archive.complete_task(run_id, task.number, task.summary_digest)
+                continue
+            selected.append(task)
+        if selected:
+            await self._fetch_candidates(
+                api,
+                archive,
+                run_id,
+                heads,
+                selected,
+                observed_at,
+                progress,
+                store_lock,
+            )
+
     async def _fetch_candidates(
         self,
         api: _API,
         archive: SQLiteArchive,
         run_id: int,
         heads: dict[int, StoredHead],
-        summaries: dict[int, dict[str, Any]],
-        candidates: set[int],
-        comment_signals: set[int],
+        tasks: list[PullTask],
         observed_at: str,
         progress: _PullProgressTracker,
+        store_lock: asyncio.Lock,
     ) -> None:
+        indexed = {task.number: task for task in tasks}
+        summaries = {
+            task.number: task.summary for task in tasks if task.summary is not None
+        }
+        preloaded = set(summaries)
+        previous_states: dict[
+            int,
+            tuple[dict[str, Any] | None, dict[str, Any] | None],
+        ] = {}
+        root_caches: dict[int, dict[str, Any]] = {}
+        for task in tasks:
+            previous = heads.get(task.number)
+            if task.number in summaries or (previous is not None and previous.kind == "issue"):
+                continue
+            issue_path = f"{self._base}/issues/{task.number}"
+            previous_bundle = None
+            previous_cache = None
+            if previous is not None:
+                async with store_lock:
+                    previous_bundle, previous_cache = await archive.load_bundle_state(
+                        previous.bundle_digest,
+                    )
+                previous_states[task.number] = previous_bundle, previous_cache
+            try:
+                summary, root_cache = await self._cached_json(
+                    api,
+                    issue_path,
+                    _dict_field(previous_bundle, "issue"),
+                    _dict_field(previous_cache, "issue"),
+                )
+            except GitHubAPIError as exc:
+                if not _is_parent_absence(exc, issue_path):
+                    raise
+                if previous is None:
+                    async with store_lock:
+                        await archive.complete_task(run_id, task.number, task.summary_digest)
+                else:
+                    resource = StagedResource(
+                        head=_absent_head(previous, observed_at),
+                        observed_at=observed_at,
+                        summary=None,
+                        bundle=None,
+                    )
+                    async with store_lock:
+                        stored = await archive.stage_task(
+                            run_id,
+                            task.number,
+                            task.summary_digest,
+                            resource,
+                        )
+                    if stored:
+                        heads[task.number] = resource.head
+                        progress.absence_staged(api.request_count)
+                indexed.pop(task.number)
+                continue
+            summaries[task.number] = summary
+            preloaded.add(task.number)
+            if root_cache is not None:
+                root_caches[task.number] = root_cache
+
         async def fetch(
             number: int,
             closing_references: dict[int, list[dict[str, Any]]],
         ) -> tuple[
             int,
-            dict[str, Any],
+            dict[str, Any] | None,
             dict[str, Any] | None,
             dict[str, Any] | None,
         ]:
             summary = summaries.get(number)
             if summary is None:
-                summary = _minimal_summary(heads[number])
-                stored_summary = None
-            else:
-                stored_summary = summary
+                summary = _minimal_summary(heads.get(number))
+            stored_summary = summary if number in preloaded else None
             previous = heads.get(number)
-            previous_bundle = None
-            previous_cache = None
-            if previous is not None:
-                previous_bundle, previous_cache = await archive.load_bundle_state(
-                    previous.bundle_digest,
+            previous_bundle, previous_cache = previous_states.get(number, (None, None))
+            if previous is not None and number not in previous_states:
+                async with store_lock:
+                    previous_bundle, previous_cache = await archive.load_bundle_state(
+                        previous.bundle_digest,
+                    )
+            try:
+                bundle, http_cache = await self._fetch_bundle(
+                    api,
+                    summary,
+                    previous_bundle,
+                    previous_cache,
+                    catalog_issue=summary if stored_summary is not None else None,
+                    force_comments=indexed[number].force_comments,
+                    closing_references=closing_references.get(number),
                 )
-            bundle, http_cache = await self._fetch_bundle(
-                api,
-                summary,
-                previous_bundle,
-                previous_cache,
-                catalog_issue=summary if stored_summary is not None else None,
-                force_comments=number in comment_signals,
-                closing_references=closing_references.get(number),
-            )
+            except GitHubAPIError as exc:
+                if not _is_parent_absence(exc, f"{self._base}/issues/{number}"):
+                    raise
+                return number, None, None, None
+            if number in root_caches:
+                http_cache = dict(http_cache or {})
+                http_cache["issue"] = root_caches[number]
             if stored_summary is None:
                 detail = bundle.get("issue")
                 if not isinstance(detail, dict):
@@ -582,7 +686,14 @@ class GitHubPuller:
                     pending.remove(task)
                     number, bundle, summary, http_cache = task.result()
                     old = heads.get(number)
-                    head = _candidate_head(summary, old, bundle)
+                    if bundle is None:
+                        if old is None:
+                            raise IncompleteGitHubDataError(
+                                f"unobserved parent #{number} became unavailable",
+                            )
+                        head = _absent_head(old, observed_at)
+                    else:
+                        head = _candidate_head(summary, old, bundle)
                     resource = StagedResource(
                         head=head,
                         observed_at=observed_at,
@@ -590,8 +701,25 @@ class GitHubPuller:
                         bundle=bundle,
                         http_cache=http_cache,
                     )
-                    await archive.stage(run_id, (resource,))
-                    progress.bundles_staged(((head.number, head.kind),), api.request_count)
+                    discovery = indexed[number]
+                    async with store_lock:
+                        stored = await archive.stage_task(
+                            run_id,
+                            number,
+                            discovery.summary_digest,
+                            resource,
+                        )
+                    if stored:
+                        new_item = old is None or not old.present
+                        heads[number] = head
+                        if head.present:
+                            progress.bundles_staged(
+                                ((head.number, head.kind),),
+                                api.request_count,
+                                new_items=int(new_item),
+                            )
+                        else:
+                            progress.absence_staged(api.request_count)
                     next_number = next(numbers, None)
                     if next_number is not None:
                         start(next_number)
@@ -605,7 +733,7 @@ class GitHubPuller:
             summary = summaries.get(number)
             return heads[number].kind if summary is None else _kind(summary)
 
-        for batch in _closing_reference_batches(sorted(candidates), kind):
+        for batch in _closing_reference_batches(sorted(indexed), kind):
             pull_numbers = [number for number in batch if kind(number) == "pull"]
             closing_references = (
                 await api.closing_issue_references(self._owner, self._repo, pull_numbers)
@@ -1028,130 +1156,41 @@ def _pull_result(run: ArchivedRun) -> PullResult:
     )
 
 
-def _certified_head_merge(
-    previous: dict[int, StoredHead],
-    delta: list[dict[str, Any]],
-    current_count: int | None,
-    cutoff: datetime,
-) -> tuple[set[int], dict[int, dict[str, Any]]] | None:
-    if type(current_count) is not int or current_count < 0:
-        return None
-    changed = _unique_catalog(delta)
-    if changed is None:
-        return None
-    visible: dict[int, dict[str, Any]] = {}
-    future: set[int] = set()
-    try:
-        for number, item in changed.items():
-            created_at = _item_time(item, "created_at")
-            _item_time(item, "updated_at")
-            prior = previous.get(number)
-            if prior is not None and not _same_head(prior, item):
-                return None
-            if created_at <= cutoff:
-                visible[number] = item
-            elif prior is not None:
-                return None
-            else:
-                future.add(number)
-        for head in previous.values():
-            if _parse_required_time(head.created_at) > cutoff:
-                return None
-            _parse_required_time(head.updated_at)
-    except (IncompleteGitHubDataError, TypeError, ValueError):
-        return None
-
-    additions = set(visible) - set(previous)
-    if current_count - len(future) != len(previous) + len(additions):
-        return None
-    return set(previous) | set(visible), visible
+def _catalog_params(
+    mode: str,
+    observed: datetime | None,
+    config: GitHubPullConfig,
+) -> dict[str, Any]:
+    if mode == "full":
+        return {"state": "all", "sort": "created", "direction": "desc"}
+    if observed is None:
+        raise RuntimeError("delta discovery requires a prior observation watermark")
+    return {
+        "state": "all",
+        "sort": "updated",
+        "direction": "asc",
+        "since": _iso_seconds(observed - timedelta(seconds=config.overlap_seconds)),
+    }
 
 
-def _certified_full_catalog(
-    catalog: list[dict[str, Any]],
-    current_count: int | None,
-    cutoff: datetime,
-) -> list[dict[str, Any]] | None:
-    if type(current_count) is not int or current_count < 0:
-        return None
-    indexed = _unique_catalog(catalog)
-    if indexed is None or len(indexed) != current_count:
-        return None
-    try:
-        return _visible_catalog(catalog, cutoff)
-    except (IncompleteGitHubDataError, TypeError, ValueError):
-        return None
-
-
-def _catalog_signature(
-    catalog: list[dict[str, Any]] | None,
-    cutoff: datetime,
-) -> list[tuple[int, str]] | None:
-    if catalog is None or _unique_catalog(catalog) is None:
-        return None
-    try:
-        visible = _visible_catalog(catalog, cutoff)
-    except (IncompleteGitHubDataError, TypeError, ValueError):
-        return None
-    return [(int(item["number"]), item["created_at"]) for item in visible]
-
-
-def _visible_catalog(
-    catalog: list[dict[str, Any]],
-    cutoff: datetime,
-) -> list[dict[str, Any]]:
-    visible = []
-    for item in catalog:
-        created_at = _item_time(item, "created_at")
-        _item_time(item, "updated_at")
-        if created_at <= cutoff:
-            visible.append(item)
-    return _sort_catalog(visible)
-
-
-def _unique_catalog(items: list[dict[str, Any]]) -> dict[int, dict[str, Any]] | None:
-    result: dict[int, dict[str, Any]] = {}
-    for item in items:
-        number = item.get("number")
-        if type(number) is not int or number < 1 or number in result:
-            return None
-        result[number] = item
-    return result
-
-
-def _full_plan(catalog: list[dict[str, Any]]) -> _CatalogPlan:
-    indexed = _unique_catalog(catalog)
-    if indexed is None:
-        raise IncompleteGitHubDataError("GitHub catalog contains duplicate or invalid numbers")
-    return _CatalogPlan(
-        items=indexed,
-        present=set(indexed),
-        signals=set(),
-    )
-
-
-def _overlay_plan(
-    plan: _CatalogPlan,
-    delta: list[dict[str, Any]],
-    signals: set[int],
-    cutoff: datetime,
-) -> _CatalogPlan:
-    items = dict(plan.items)
-    changed = _unique_catalog(delta)
-    if changed is not None:
-        for number, item in changed.items():
-            if number not in plan.present or _item_time(item, "created_at") > cutoff:
-                continue
-            catalog_item = items[number]
-            if catalog_item.get("created_at") != item.get("created_at") or _kind(catalog_item) != _kind(item):
-                raise IncompleteGitHubDataError(
-                    f"GitHub catalog sources disagree for #{number}",
-                )
-            items[number] = item
-    return _CatalogPlan(
-        items=items,
-        present=plan.present,
-        signals=signals,
+def _catalog_item(item: dict[str, Any]) -> CatalogItem:
+    number = item.get("number")
+    github_id = item.get("id")
+    created_at = item.get("created_at")
+    updated_at = item.get("updated_at")
+    if type(number) is not int or number < 1 or type(github_id) is not int or github_id < 1:
+        raise IncompleteGitHubDataError("GitHub catalog item has invalid identity")
+    if not isinstance(created_at, str) or not isinstance(updated_at, str):
+        raise IncompleteGitHubDataError(f"GitHub item #{number} has invalid timestamps")
+    _parse_required_time(created_at)
+    _parse_required_time(updated_at)
+    return CatalogItem(
+        number=number,
+        github_id=github_id,
+        kind=_kind(item),
+        created_at=created_at,
+        updated_at=updated_at,
+        summary=item,
     )
 
 
@@ -1260,7 +1299,7 @@ def _candidate_head(
     if summary is not None:
         return _head_from_summary(summary, bundle)
     if previous is None:
-        raise IncompleteGitHubDataError("dirty parent is absent from the certified catalog")
+        raise IncompleteGitHubDataError("dirty parent has no previously observed root")
     if bundle.get("kind") != previous.kind:
         raise IncompleteGitHubDataError(
             f"GitHub item #{previous.number} changed kind while fetching",
@@ -1278,9 +1317,31 @@ def _candidate_head(
     )
 
 
+def _absent_head(previous: StoredHead, observed_at: str) -> StoredHead:
+    return StoredHead(
+        number=previous.number,
+        github_id=previous.github_id,
+        kind=previous.kind,
+        created_at=previous.created_at,
+        updated_at=previous.updated_at,
+        summary_digest=previous.summary_digest,
+        bundle_digest=previous.bundle_digest,
+        present=False,
+        missing_since=previous.missing_since or observed_at,
+    )
+
+
+def _is_parent_absence(error: GitHubAPIError, path: str) -> bool:
+    return (
+        error.status_code in {404, 410}
+        and error.url is not None
+        and error.url.rstrip("/").endswith(path)
+    )
+
+
 def _minimal_summary(head: StoredHead | None) -> dict[str, Any]:
     if head is None:
-        raise IncompleteGitHubDataError("dirty parent is absent from the certified catalog")
+        raise IncompleteGitHubDataError("dirty parent has no previously observed root")
     summary: dict[str, Any] = {
         "id": head.github_id,
         "number": head.number,
@@ -1290,10 +1351,6 @@ def _minimal_summary(head: StoredHead | None) -> dict[str, Any]:
     if head.kind == "pull":
         summary["pull_request"] = {}
     return summary
-
-
-def _same_head(head: StoredHead, item: dict[str, Any]) -> bool:
-    return head.github_id == item.get("id") and head.created_at == item.get("created_at") and head.kind == _kind(item)
 
 
 def _kind(item: dict[str, Any]) -> str:
@@ -1318,10 +1375,6 @@ def _closing_reference_batches(
         yield batch
 
 
-def _sort_catalog(catalog: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return sorted(catalog, key=lambda item: (_item_time(item, "created_at"), int(item["number"])))
-
-
 def _as_utc(value: datetime) -> datetime:
     if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError("target must be timezone-aware")
@@ -1336,13 +1389,6 @@ def _parse_time(value: str | None) -> datetime | None:
 
 def _parse_required_time(value: str) -> datetime:
     return _as_utc(datetime.fromisoformat(value))
-
-
-def _item_time(item: dict[str, Any], field: str) -> datetime:
-    value = item.get(field)
-    if not isinstance(value, str):
-        raise IncompleteGitHubDataError(f"GitHub item has no {field}: {item.get('url')}")
-    return _parse_required_time(value)
 
 
 def _check_count(

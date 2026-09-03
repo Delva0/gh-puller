@@ -51,18 +51,19 @@ class ProgressState:
     phase: str  # Puller phase name.
     target_at: str | None  # Requested observation watermark T.
     run_id: int | None  # Durable run identity, if allocated.
-    catalog_seen: int  # Catalog rows scanned in the active pass.
-    catalog_total: int | None  # Certified current Issue + PR count.
+    catalog_seen: int  # Unique root rows durably discovered in the active pass.
+    catalog_total: int | None  # Cold-start count estimate when available.
     bundles_completed: int  # Durable bundles completed for the current run plan.
     bundles_total: int | None  # Durable bundles plus remaining plan candidates.
     issues_completed: int  # Issue bundles in bundles_completed.
     pulls_completed: int  # Pull-request bundles in bundles_completed.
-    tombstones: int  # Durable absences compatible with the current run plan.
+    tombstones: int  # Durable directly observed absences.
     latest_number: int | None  # Latest durably staged parent number.
     latest_kind: str | None  # Kind of latest_number.
     quotas: tuple[RateQuota, ...]  # Latest independent GitHub resource buckets.
     wait_seconds: float | None  # Current target, retry, or rate-limit wait.
     detail: str | None  # Machine-readable phase detail.
+    items: int | None = None  # Current or cold-start estimated Issue/PR head count.
 
 
 @dataclass(frozen=True, slots=True)
@@ -202,6 +203,7 @@ def _latest_progress(output: str) -> ProgressState | None:
             quotas=_quotas(payload.get("quotas")),
             wait_seconds=_float(payload.get("wait_seconds")),
             detail=_text(payload.get("detail")),
+            items=_int(payload.get("items")),
         )
     return None
 
@@ -321,9 +323,10 @@ def _service_detail(service: ServiceState) -> str:
 
 
 def _items(progress: ProgressState | None) -> str:
-    if progress is None or progress.catalog_total is None:
+    if progress is None:
         return "?"
-    return f"{progress.catalog_total:,}"
+    items = progress.items if progress.items is not None else progress.catalog_total
+    return "?" if items is None else f"{items:,}"
 
 
 def _progress(progress: ProgressState | None, width: int) -> str:

@@ -31,7 +31,7 @@ def _full_digest_unit_for(database: Path) -> str:
 def _bind_archive(
     database: Path,
     repository: str = _REPOSITORY,
-    schema: str = "4",
+    schema: str = "5",
 ) -> None:
     with sqlite3.connect(database) as connection:
         connection.execute(

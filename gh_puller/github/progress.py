@@ -38,13 +38,14 @@ class PullProgress:
     target_at: datetime  # Requested observation watermark T.
     run_id: int | None = None  # Durable pull run once allocated.
     pass_at: datetime | None = None  # Cutoff of the active observation pass.
-    catalog_seen: int = 0  # Root rows scanned, then certified current objects.
-    catalog_total: int | None = None  # Certified current object count when known.
+    catalog_seen: int = 0  # Unique root rows durably discovered in the active pass.
+    catalog_total: int | None = None  # Cold-start count estimate when available.
+    items: int | None = None  # Current or cold-start estimated Issue/PR head count.
     bundles_completed: int = 0  # Durable bundles completed for the current run plan.
     bundles_total: int | None = None  # Durable bundles plus remaining plan candidates.
     issues_completed: int = 0  # Completed Issue bundles in bundles_completed.
     pulls_completed: int = 0  # Completed pull-request bundles in bundles_completed.
-    tombstones: int = 0  # Durable absences compatible with the current run plan.
+    tombstones: int = 0  # Durable directly observed absences.
     latest_number: int | None = None  # Latest durably staged parent number.
     latest_kind: str | None = None  # issue or pull for latest_number.
     requests: int = 0  # Attempts accumulated by this run.
@@ -115,18 +116,18 @@ class _PullProgressTracker:
             detail=None,
         )
 
-    def catalog_scan(self) -> None:
-        self._emit(catalog_seen=0)
-
-    def catalog_page(self, count: int) -> None:
-        self._emit(catalog_seen=self._state.catalog_seen + count)
-
     def catalog_count(self, count: int | None) -> None:
         if count is not None:
-            self._emit(catalog_total=count)
+            self._emit(catalog_total=count, items=count)
 
-    def catalog_complete(self, count: int) -> None:
-        self._emit(catalog_seen=count, catalog_total=count)
+    def catalog_restore(self, count: int, total: int | None) -> None:
+        changes: dict[str, Any] = {"catalog_seen": count, "catalog_total": total}
+        if total is not None:
+            changes["items"] = total
+        self._emit(**changes)
+
+    def restore_items(self, count: int) -> None:
+        self._emit(items=count)
 
     def restore_staged(self, resources: Iterable[tuple[int, str, bool]]) -> None:
         """将 pending run 的最新 durable stage 恢复到进度快照。
@@ -148,60 +149,37 @@ class _PullProgressTracker:
             latest_kind=latest_kind,
         )
 
-    def start_bundles(
+    def bundles_staged(
         self,
-        name: str,
-        remaining: int,
-        carried: Iterable[tuple[int, str]],
-        tombstones: int,
+        resources: Iterable[tuple[int, str]],
         request_count: int,
+        *,
+        new_items: int = 0,
     ) -> None:
-        """绑定当前目录计划，同时保留兼容的 durable stage 进度。
-
-        Args:
-            name: 当前 closure pass 名称。
-            remaining: 本计划尚需物化的 parent bundle 数量。
-            carried: 可直接复用的 durable parent number 与 kind。
-            tombstones: 与本计划一致的 durable absence 数量。
-            request_count: 当前进程的 HTTP 尝试数。
-        """
-        completed = list(carried)
-        issue_count = sum(kind == "issue" for _, kind in completed)
-        latest_number, latest_kind = completed[-1] if completed else (None, None)
-        self._work_phase = f"{name}_bundles"
-        self._emit(
-            phase=self._work_phase,
-            bundles_completed=len(completed),
-            bundles_total=len(completed) + remaining,
-            issues_completed=issue_count,
-            pulls_completed=len(completed) - issue_count,
-            tombstones=tombstones,
-            latest_number=latest_number,
-            latest_kind=latest_kind,
-            requests=self._run_requests(request_count),
-            wait_seconds=None,
-            detail=None,
-        )
-
-    def bundles_staged(self, resources: Iterable[tuple[int, str]], request_count: int) -> None:
         completed = list(resources)
         if not completed:
             return
         issue_count = sum(kind == "issue" for _, kind in completed)
         pull_count = len(completed) - issue_count
         number, kind = completed[-1]
+        items = self._state.items
+        if items is not None and self._state.catalog_total is None:
+            items += new_items
         self._emit(
             bundles_completed=self._state.bundles_completed + len(completed),
             issues_completed=self._state.issues_completed + issue_count,
             pulls_completed=self._state.pulls_completed + pull_count,
             latest_number=number,
             latest_kind=kind,
+            items=items,
             requests=self._run_requests(request_count),
         )
 
-    def tombstones_staged(self, count: int, request_count: int) -> None:
+    def absence_staged(self, request_count: int) -> None:
+        items = self._state.items
         self._emit(
-            tombstones=self._state.tombstones + count,
+            items=None if items is None else max(items - 1, 0),
+            tombstones=self._state.tombstones + 1,
             requests=self._run_requests(request_count),
         )
 
@@ -231,6 +209,7 @@ class _PullProgressTracker:
             run_id=run_id,
             catalog_seen=catalog_items,
             catalog_total=catalog_items,
+            items=catalog_items,
             requests=requests,
             wait_seconds=None,
             reused=reused,
@@ -330,7 +309,7 @@ def _tty_line(progress: PullProgress) -> str:
     )
     wait = "" if progress.wait_seconds is None else f" wait={progress.wait_seconds:.1f}s"
     return (
-        f"{progress.phase}  {bar}  catalog={catalog} "
+        f"{progress.phase}  {bar}  catalog={catalog} items={_count(progress.items)} "
         f"issues={progress.issues_completed:,} pulls={progress.pulls_completed:,} "
         f"tombstones={progress.tombstones:,} latest={latest} "
         f"requests={progress.requests:,} {quota}{wait}"

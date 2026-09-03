@@ -28,17 +28,21 @@ flowchart TD
     Call["pull(T): freeze T before first await"] --> Existing{"Committed T?"}
     Existing -->|yes| Return["Return the original run"]
     Existing -->|no| Pending["Create or resume one pending run"]
-    Pending --> Future{"T is in the future?"}
-    Future -->|yes| Prefetch["Prefetch current observations"]
-    Prefetch --> Wait["Wait until T"]
-    Future -->|no| Discover["Read parent and comment signals plus exact count"]
-    Wait --> Discover
-    Discover --> Cert{"Parent membership is proved?"}
-    Cert -->|yes| Select["Select changed or signaled Issue/PR"]
-    Cert -->|no| Full["Stabilize full parent membership"]
-    Full --> Select
-    Select --> Stage["Fetch supported resources and durably stage versions"]
-    Stage --> Publish["Atomically publish heads, run, T, and C"]
+    Pending --> Resume{"Active pass in SQLite?"}
+    Resume -->|yes| Pass["Resume its cursor and pending tasks"]
+    Resume -->|no| Future{"T is in the future?"}
+    Future -->|yes| Prefetch["Run a prefetch pass, then wait until T"]
+    Future -->|no| Pass
+    Prefetch --> Pass
+    Pass --> Cold{"First observed pass?"}
+    Cold -->|yes| Full["Produce one descending Issue/PR traversal"]
+    Cold -->|no| Delta["Produce root and comment deltas from W - overlap"]
+    Full --> Journal["Atomically persist each page, tasks, and next cursor"]
+    Delta --> Journal
+    Journal --> Consume["Concurrently consume persisted Issue/PR tasks"]
+    Consume --> Closed{"Terminal page durable and task queue empty?"}
+    Closed -->|no| Journal
+    Closed -->|yes| Publish["Atomically publish heads, run, T, and C"]
     Publish --> Read["Read current heads or replay all versions"]
 ```
 
@@ -68,25 +72,38 @@ Sources: [gh_puller/github/](../gh_puller/github/); [tests/test_github_puller.py
 ## Incremental observation and parent membership
 
 The REST repository-Issues endpoint is the catalog and includes both ordinary Issues
-and pull requests. The client requests GitHub's full JSON media type and keeps each
-returned object without projecting fields. On a cold authenticated pull, one complete
-descending REST scan is accepted when its unique object count equals the sum of the
-GraphQL Issue and pull-request `totalCount` values. Without an authenticated count, or
-when count and scan disagree, the puller repeats the REST scan until two consecutive
-catalog membership signatures agree.
+and pull requests. A cold archive performs one descending traversal. The authenticated
+GraphQL Issue-plus-PR count is an operator-facing progress estimate only: it does not
+prove membership, detect deletion, or decide whether another traversal runs.
 
 GitHub documents the mixed Issue/PR catalog and `since` filter in
 [List repository issues](https://docs.github.com/en/rest/issues/issues#list-repository-issues).
-GraphQL supplies only the exact count used by the parent-membership proof; its
-projected count is not stored as archive content.
+The count projection is not stored as archive content.
 
-Let W be the preceding completed observation watermark. An incremental pass launches
-four discovery operations together:
+The cold traversal is a durable producer. It follows GitHub's opaque `Link` cursor
+from newest to oldest and commits one transaction per page. Catalog requests use
+GitHub's raw-JSON representation: it retains the Markdown body and avoids making
+directory availability depend on server-side HTML/text rendering. That transaction
+stores the unprojected root rows, creates or updates their Issue/PR tasks, and
+advances the next cursor. A bounded consumer begins as soon as the first page is
+durable and materializes up to `concurrency` Issue/PR records at once. Directory
+production can therefore run ahead of expensive per-parent reads without keeping the
+traversal only in memory.
+
+The page journal is pass-local execution state rather than a general HTTP response
+cache. Later runs have different `since` boundaries and unstable page cursors, so
+their expected page hit rate is poor. Cross-run reuse instead occurs at the complete
+Issue/PR record and its atomically paired HTTP validators, where identity remains
+well defined.
+
+Sources: [gh_puller/github/puller.py](../gh_puller/github/puller.py); [gh_puller/github/store.py](../gh_puller/github/store.py); [tests/test_github_puller.py](../tests/test_github_puller.py)
+
+Let W be the preceding completed observation watermark. Every warm pass reads three
+incremental streams:
 
 - the Issue/PR root delta since `W - overlap`;
 - the repository Issue-comment delta since the same boundary;
-- the repository PR-review-comment delta since the same boundary;
-- the authenticated GraphQL Issue-plus-PR count.
+- the repository PR-review-comment delta since the same boundary.
 
 The overlap protects changes that share GitHub's second-resolution boundary. Root
 rows carry full replacement objects. Comment rows are only dirty-parent signals: the
@@ -96,33 +113,32 @@ GitHub defines the two signal endpoints in
 and
 [List review comments in a repository](https://docs.github.com/en/rest/pulls/comments#list-review-comments-for-a-repository).
 
-For the catalog proof, let N be the preceding number of present objects, A the newly
-observed objects with `created_at <= T`, F the objects observed during the request
-with `created_at > T`, D the preceding objects now absent, and M the exact current
-total. GitHub's current catalog satisfies:
+Each root page uses the same durable page/task/cursor journal as the cold traversal.
+The comment streams persist their selected parent numbers before root consumption
+starts. A task is complete only after either the existing record is reusable from
+the observed root or the replacement record is durable. A pass closes only when the
+root stream has reached its terminal page and every persisted task is complete. Only
+then can its observation watermark advance.
 
-```text
-M - F = N - D + A
-```
+If the process exits, the same T resumes the active pass from its stored `next_url`;
+completed Issue/PR records are not fetched again. GitHub may expire an opaque cursor.
+An HTTP 404, 410, or 422 for a resumed cursor restarts only the root traversal and
+reuses all completed Issue/PR tasks. A repeated number with the same immutable ID,
+kind, and creation time is idempotent. A conflicting immutable identity aborts the
+pass instead of silently replacing one object with another.
 
-The incremental path accepts only `M - F = N + A`; comparison with the identity proves
-`D = 0`. Additions cannot conceal deletions because A is counted independently.
-Duplicate numbers, changed identities, invalid timestamps, an unavailable exact
-count, or a failed equality selects the stable full membership scan. That path
-identifies deleted parents without fetching every surviving Issue/PR body. The final
-plan writes a tombstone for each absent parent, refreshes each new or changed root and
-each comment-signaled parent, and reuses every unchanged survivor.
+Sources: [gh_puller/github/puller.py](../gh_puller/github/puller.py); [gh_puller/github/store.py](../gh_puller/github/store.py); [tests/test_github_puller.py](../tests/test_github_puller.py)
 
-The puller intentionally does not reread every old Issue/PR merely to search for a
-silent child-resource change. Its discovery guarantees and limitations are:
+The puller deliberately does not run a warm full traversal or infer absence from
+counts. Its observed-change contract is:
 
 | GitHub change | How it is selected | Boundary |
 | --- | --- | --- |
 | New Issue/PR or changed parent fields | Repository Issue/PR delta | GitHub must return the parent through its `since` behavior. |
-| Deleted Issue/PR previously observed by this database | Exact-count proof falls back to a stable full membership scan | A parent already unavailable before the first observation has no historical row to retain. |
+| Deleted Issue/PR | A direct selected-parent 404/410 can become an observed absence | GitHub does not provide a deletion feed. A silent deletion remains represented by the last observed record. |
 | Added or edited Issue comment | Repository Issue-comment delta | The selected parent is reread from its supported per-parent endpoints. |
 | Added or edited PR review comment | Repository PR-review-comment delta | The selected PR is reread from its supported per-parent endpoints. |
-| Deleted comment, reaction change, timeline/event change, review change, commit/file change, reviewer change, or PR closing relation change | Parent refresh after another observable signal | There is no deliberate repository-wide scan for these resources, so a change with no parent/comment signal may remain undiscovered. |
+| Deleted comment, reaction change, timeline/event change, review change, commit/file change, reviewer change, or PR closing relation change | Parent refresh after another observed signal | There is no repository-wide child scan, so a change with no parent/comment signal may remain undiscovered. |
 | Multiple changes between observations | Latest supported endpoint response after selection | Intermediate states that disappear before an API response are not recoverable. |
 
 Once an Issue/PR is selected, the puller reads every page returned by each supported
@@ -131,18 +147,25 @@ pagination shape. A newly observed response is retained without projecting away
 unknown fields. This is lossless storage of observed data, not a claim that GitHub's
 APIs expose every web-page fact or every historical state.
 
+This is a best-effort discovery boundary, not a perfect GitHub replica. “Source of
+truth” means downstream jobs need only this database to reproduce every fact the
+puller successfully observed; it does not upgrade an unobservable GitHub state into
+an observed fact.
+
+Sources: [gh_puller/github/](../gh_puller/github/); [tests/test_github_puller.py](../tests/test_github_puller.py)
+
 ## Resource transport and detectable consistency
 
 | Resource | Transport | Detectable consistency check |
 | --- | --- | --- |
-| Issue root | Reuse the unprojected full-JSON REST catalog row. A signal-only parent uses the individual Issue endpoint. | Identity, kind, and timestamps must agree with the parent catalog state. |
+| Issue root | Reuse the unprojected raw-JSON REST catalog row. A signal-only parent uses the individual Issue endpoint. | Identity, kind, and timestamps must agree with the parent catalog state. |
 | Issue comments | Read the complete per-parent collection; skip the call only when the root has an exact zero and no repository signal selected the parent. | Comment identities must be unique. A repository signal overrides the zero shortcut. |
 | PR review comments | Read the complete per-parent collection; skip only on an exact zero with no repository signal. | Comment identities must be unique; a signal overrides the shortcut. |
 | Issue reactions | No collection request when detail reports `total_count == 0` | Zero is itself the complete collection; every nonzero or absent count still paginates and is checked against the aggregate. |
 | PR commits and files | No collection request when PR detail reports an exact zero | Nonzero and absent counts still paginate; a returned collection shorter than `commits` or `changed_files` aborts publication. |
 | Requested reviewers | Reuse embedded users only when the PR detail contains a valid user list and an empty team list. | Any team or ambiguous embedded value selects the dedicated endpoint, whose team objects carry richer fields. |
 | Issues closed by a PR | Batch up to 100 selected PRs into one GraphQL request, include user-linked Issues, and follow every `closingIssuesReferences` cursor. | Each connection's `totalCount` must equal its unique returned nodes. Missing, duplicate, or malformed data aborts the run instead of becoming an empty relation. |
-| Per-parent JSON, certified paginated lists, diff, and patch | Conditional GET with the prior ETag | Validators are keyed by API root, API version, media type, path, and parameters, and are stored atomically with the exact bundle digest whose body they validate. A paginated list is reusable only when every page has an ETag and the terminal page has fewer than 100 entries. Every page must return `304 Not Modified`; any changed page restarts complete pagination. A terminal full page has no cache, so 100→101 growth cannot hide on a new page. |
+| Per-parent JSON, complete paginated lists, diff, and patch | Conditional GET with the prior ETag | Validators are keyed by API root, API version, media type, path, and parameters, and are stored atomically with the exact bundle digest whose body they validate. A paginated list is reusable only when every page has an ETag and the terminal page has fewer than 100 entries. Every page must return `304 Not Modified`; any changed page restarts complete pagination. A terminal full page has no cache, so 100→101 growth cannot hide on a new page. |
 | Timeline, events, diff, and patch aggregation | No repository-wide consolidation | Repository event responses have a different raw shape, while diff and patch have independent lossless fallback rules. Their per-parent responses remain unprojected; eligible responses still use the conditional transport above. |
 
 Authenticated ETag requests that return 304 do not consume primary REST quota; they
@@ -151,10 +174,11 @@ See GitHub's
 [conditional-request guidance](https://docs.github.com/en/rest/using-the-rest-api/best-practices-for-using-the-rest-api#use-conditional-requests).
 
 When the three REST discovery streams each fit on one page and nothing changed, one
-authenticated pass costs three REST attempts plus one GraphQL query and is independent
-of archive size. A future-T operation normally performs both prefetch and closure, so
-a quiet hourly writer makes six REST attempts and two GraphQL queries per hour. GitHub
-accounts the two primary budgets independently; see its
+authenticated warm pass costs three REST attempts and no GraphQL query. The cost is
+independent of archive size. A future-T operation that performs both prefetch and
+closure normally costs six quiet REST attempts. Selected PRs add GraphQL
+`closingIssuesReferences` work. GitHub accounts the two primary budgets independently;
+see its
 [REST rate-limit reference](https://docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api)
 and
 [GraphQL rate-limit reference](https://docs.github.com/en/graphql/overview/rate-limits-and-query-limits-for-the-graphql-api).
@@ -164,18 +188,18 @@ minimum is easier to compare as separate primary-rate-limit buckets:
 
 ```text
 REST HTTP requests:    ceil(N / 100) + 2I + 6P
-GraphQL HTTP requests: 1 + ceil(P / 100)
+GraphQL HTTP requests: 1 + B
 ```
 
 The REST catalog and GraphQL count contribute the first term of their respective
 lines. An empty Issue still reads timeline and events. An empty PR additionally reads
 PR detail, reviews, diff, and patch. The PR batch term reads the first page of every
-closing relation. A relation beyond 100 nodes adds cursor requests, while non-empty
-comments, reactions, commits, files, review teams, pagination, and media fallback add
-their actual REST requests. On a warm pass, only selected PRs enter the GraphQL
-relation batches. The query uses GitHub's documented maximum page size and stays well
-below its node limit; GitHub's response headers remain authoritative for actual point
-consumption. See the
+closing relation, where B is the number of nonempty selected-PR batches and each batch
+contains at most 100 PRs. A relation beyond 100 nodes adds cursor requests, while
+non-empty comments, reactions, commits, files, review teams, pagination, and media
+fallback add their actual REST requests. On a warm pass, only selected PRs enter the
+GraphQL relation batches. GitHub's response headers remain authoritative for actual
+point consumption. See the
 [PullRequest GraphQL fields](https://docs.github.com/en/graphql/reference/pulls#pullrequest)
 and
 [GraphQL resource limits](https://docs.github.com/en/graphql/overview/rate-limits-and-query-limits-for-the-graphql-api).
@@ -183,9 +207,9 @@ and
 Primary or secondary limiting follows GitHub's advertised recovery time, so a cold
 start may span quota windows while remaining one blocking `pull(T)` call. Network
 errors and HTTP 5xx responses retry the same request indefinitely with backoff capped
-at 30 seconds; they neither restart a catalog scan nor consume already completed
-in-memory pagination. Bundle work uses at most `concurrency` in-flight parent tasks.
-Results are consumed in completion order and each completed bundle is staged
+at 30 seconds. Every accepted root page and its next cursor are already durable before
+the following page begins. Bundle work uses at most `concurrency` in-flight parent
+tasks. Results are consumed in completion order and each completed bundle is staged
 immediately, so one slow parent neither holds the concurrency window nor prevents
 later work from becoming crash-recoverable. Public version iteration remains
 deterministic by run, parent number, and intra-parent observation order.
@@ -208,25 +232,25 @@ emitted immediately. The one committed `PullResult` remains JSON on stdout, so a
 supervisor can route progress and results independently. `--no-progress` disables
 stderr progress.
 
-The catalog counters describe the active closure pass. Bundle counters describe the
-current run's materialization plan. While the run is pending, they are restored from
-its latest durable SQLite stage when the writer process starts. The observer and
-`status` command remain out of band: only the writer performs that local read, then
-emits the resulting snapshot through the same progress stream.
+The catalog counters describe the durable producer journal for the active pass.
+Bundle counters describe Issue/PR records already staged by its bounded consumer.
+Both counters resume from SQLite after a writer restart. The observer and `status`
+command remain out of band: only the writer performs that local read, then emits the
+resulting snapshot through the same progress stream.
 
 | Field | Definition | Relationship to Issue/PR count |
 | --- | --- | --- |
-| `catalog_seen / catalog_total` | Root rows read during a scan; once certified, both become the current visible catalog size N. | N counts ordinary Issues and PRs because GitHub's Issues catalog contains both. |
-| `bundles_completed / bundles_total` | Parent bundles already durable and compatible with the current catalog plan, divided by that carried set plus the remaining candidates K. | K is normally much smaller than N. A cold pull has total N, and a cold restart resumes from its durable numerator instead of restarting at zero. |
-| `issues_completed`, `pulls_completed` | Kind split of durable completed bundles in the current plan. | Their sum equals `bundles_completed`. |
-| `tombstones` | Durable absences that agree with the current certified catalog plan. | They are reported separately from bundle progress and are excluded from the resulting visible N. |
+| `items` | Current locally observed Issue/PR heads, or the authenticated cold-start estimate before they are all materialized. | This drives `ITEMS` independently of active traversal progress. |
+| `catalog_seen / catalog_total` | Unique Issue/PR root rows durable in the active pass, divided by the cold-start estimate when available. | A warm delta normally has an unknown denominator because it deliberately avoids a full count or traversal. |
+| `bundles_completed / bundles_total` | Complete Issue/PR records durably staged in the current run. | The denominator remains unknown while producer and consumer are streaming; `issues_completed` and `pulls_completed` split the numerator by kind. |
+| `tombstones` | Parent absences directly observed while processing a selected parent. | Silent absence is not counted and does not alter the last observed head. |
 | `latest_number`, `latest_kind` | Most recently completed and durably staged parent. | Completion follows response time rather than parent number; gaps are ordinary concurrent work, not missing facts. |
 | `requests`, `quotas` | HTTP attempts accumulated by the run and the latest independently sampled GitHub quota buckets. | They measure API work, not objects; REST `core` uses request units while GraphQL uses points, so neither can be derived from the other. |
 
 A future-T operation has separate `prefetch_*` and `closing_*` phases. Each pass moves
-through catalog proof and parent-bundle materialization. It recomputes its catalog
-plan, carries forward compatible durable stage, and reclassifies objects that must be
-fetched again. The run identity and accumulated request count continue. A
+through concurrent directory production and Issue/PR materialization. The run
+identity, durable page cursor, staged records, and accumulated request count continue
+across restarts. A
 `rate_limit` event reports the wait duration and any known quota reset time without
 pretending that object progress moved; `retry_wait` distinguishes network and 5xx
 backoff from quota exhaustion.
@@ -247,6 +271,10 @@ current heads:
   observed during one future-T operation remain distinct versions.
 - `resource_heads` is the atomically maintained current state derived from the last
   committed version of each object.
+- `pull_passes` stores the active prefetch or closing cutoff, discovery mode, durable
+  page cursor, and producer counters.
+- `pull_tasks` stores raw root rows, comment-selected parent numbers, and completion
+  state until the pass closes.
 - `bundle_http_cache` stores discardable ETags keyed by the exact content-addressed
   bundle they validate. It is transport state, is ignored by offline readers, and
   can always be reconstructed by unconditional requests.
@@ -283,13 +311,13 @@ manufacture missing rows. Enumeration follows GitHub's
 [list Issue comments endpoint](https://docs.github.com/en/rest/issues/comments#list-issue-comments)
 and
 [list review comments endpoint](https://docs.github.com/en/rest/pulls/comments#list-review-comments-on-a-pull-request).
-A tombstone records certified absence without discarding the last bundle. The
+A tombstone records a directly observed absence without discarding the last bundle. The
 boundary excludes linked external attachments and facts that GitHub made unavailable
 before the archive first observed them.
 
-Archive schema 4 pairs this resource set with record schema 2. Opening a database
-with another archive schema is rejected before pulling, so one file cannot silently
-mix records with different required fields.
+Archive schema 5 pairs this resource set with record schema 2. A schema 4 archive is
+migrated in place before pulling; other versions are rejected, so one file cannot
+silently mix records with different required fields.
 
 Sources: [gh_puller/github/](../gh_puller/github/); [tests/test_github_puller.py](../tests/test_github_puller.py)
 
@@ -302,7 +330,7 @@ presentation.
 
 | Page or mining question | Available offline | Boundary |
 | --- | --- | --- |
-| Issue/PR title, body, rendered body variants returned by full-JSON REST, author, timestamps, state, labels, assignees, and milestone | Yes | Only versions actually observed are retained; GitHub's complete edit history is not an API response. |
+| Issue/PR title, raw Markdown body, author, timestamps, state, labels, assignees, and milestone | Yes | Only versions actually observed are retained; GitHub's complete edit history is not an API response. GitHub's server-generated `body_html` and `body_text` variants are not requested, so offline rendering is not byte-identical to GitHub's. |
 | Conversation comments, reactions, and observed timeline/events | Yes | A deletion or silent child change can remain unknown until another signal selects the parent. |
 | PR source and target repository/branch, draft and merge fields | Yes, from PR detail | Branch contents and the rest of the Git repository are outside this database. |
 | PR commits, changed files, reviews, review comments, aggregate diff, and patch | Yes, for a selected PR | CI checks, workflow runs, deployments, and review-thread resolution state are not fetched. |
@@ -459,9 +487,10 @@ watch -n 1 scripts/github-puller-daemon.sh status archives/vllm.sqlite3
 ```
 
 The overview always includes the canonical `DATABASE`, current target T, run,
-phase, event age, and `ITEMS`. `ITEMS` means the certified current catalog count of
-Issues plus pull requests; it is `?` until that count is known. `PROGRESS` reports
-the active catalog or bundle phase and likewise keeps an unknown denominator as `?`.
+phase, event age, and `ITEMS`. `ITEMS` means the locally observed Issue-plus-PR head
+count, or the authenticated estimate during cold discovery; it is `?` until either is
+known. `PROGRESS` reports the active directory producer or Issue/PR consumer and keeps
+an unknown streaming denominator as `?`.
 `QUOTA` retains every resource bucket observed by the writer and shows each
 `remaining/limit` independently. Normal authenticated operation therefore displays
 both REST `core` and `graphql` after each has responded. Each bucket occupies one
@@ -547,15 +576,17 @@ uvx ruff check \
 bash -n scripts/github-puller-daemon.sh
 ```
 
-The suite covers raw-field retention, REST parent-membership proof and fallback, PR
-resources, batched and paginated closing-Issue relations, same-second boundaries,
-future prefetch history, diff/patch fallback and validator reuse, pass-local progress,
-zero-request idempotent reuse, observer failure isolation, TTY and JSON progress,
-rate-limit waits, current-head visibility, single- and multi-page conditional
-validation, 100→101 page growth, content deduplication, tombstones, cancellation,
-completion-order durable resume, concurrent duplicate calls, scheduler recovery,
-randomized observable Issue/PR and comment churn, parent-deletion fallback, archive
-schema rejection, and request-saving shortcuts for selected Issue/PR records.
+The suite covers raw-field retention, durable page/task/cursor recovery, concurrent
+directory production and bounded Issue/PR consumption, expired-cursor directory
+replay with completed-record reuse, PR resources, batched and paginated closing-Issue
+relations, same-second boundaries, future prefetch history, diff/patch fallback and
+validator reuse, pass-local progress, zero-request idempotent reuse, observer failure
+isolation, TTY and JSON progress, rate-limit waits, current-head visibility, single-
+and multi-page conditional validation, 100→101 page growth, content deduplication,
+directly observed tombstones, cancellation, completion-order durable resume,
+concurrent duplicate calls, scheduler recovery, randomized observable Issue/PR and
+comment churn, silent-deletion best effort, schema migration and rejection, and
+request-saving shortcuts for selected Issue/PR records.
 
 The daemon tests additionally verify unit rendering, repeatable installation and
 uninstallation, archive preservation, database-scoped controls, repository-binding

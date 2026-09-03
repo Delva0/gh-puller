@@ -1,6 +1,6 @@
 """提供遵守 GitHub 限流恢复契约的异步 API 读取层。
 
-本模块只负责 HTTP、条件校验、分页、仓库对象精确计数、PR 关闭关系与重试，不
+本模块只负责 HTTP、条件校验、分页、仓库对象计数、PR 关闭关系与重试，不
 解释 Issue/PR 数据，也不写归档。观测水位与持久化契约见 ``gh_puller.github``。
 """
 
@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from typing import TYPE_CHECKING, Any
@@ -37,7 +38,30 @@ query RepositoryItemCount($owner: String!, $repo: String!) {
 
 
 class GitHubAPIError(RuntimeError):
-    """GitHub 返回不可恢复响应或不一致数据。"""
+    """GitHub 返回不可恢复响应或不一致数据。
+
+    Args:
+        message: 面向操作者的失败说明。
+        status_code: HTTP 失败状态；本地验证或 GraphQL 失败时为 None。
+        url: 失败 HTTP request 的最终 URL；本地验证或 GraphQL 结构失败时为 None。
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        url: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.url = url
+
+
+@dataclass(frozen=True, slots=True)
+class GitHubPage:
+    items: list[dict[str, Any]]  # Validated raw objects from one REST page.
+    next_url: str | None  # Opaque GitHub Link cursor for the next page.
 
 
 class GitHubAPI:
@@ -213,6 +237,32 @@ class GitHubAPI:
             return previous, updated
         return response.text, _response_cache(response, key)
 
+    async def get_page(
+        self,
+        path: str,
+        *,
+        params: Mapping[str, Any] | None = None,
+        accept: str | None = None,
+    ) -> GitHubPage:
+        """读取一个可独立持久化的 GitHub REST page。
+
+        Args:
+            path: 首页相对路径或 GitHub ``Link`` 返回的绝对 URL。
+            params: 仅用于首页的查询参数；``per_page`` 缺省固定为 100。
+            accept: 覆盖默认 JSON media type。
+
+        Returns:
+            当前页原始对象与服务端给出的不透明下一页 URL。
+        """
+        query = None if params is None else dict(params)
+        if query is not None:
+            query.setdefault("per_page", 100)
+        response = await self._request("GET", path, params=query, accept=accept)
+        return GitHubPage(
+            items=_decode_page(response),
+            next_url=response.links.get("next", {}).get("url"),
+        )
+
     async def paginate(
         self,
         path: str,
@@ -321,12 +371,7 @@ class GitHubAPI:
         pages: list[dict[str, Any]] = []
         page_count = 0
         while True:
-            try:
-                page = response.json()
-            except json.JSONDecodeError as exc:
-                raise GitHubAPIError(f"GitHub returned invalid JSON for {response.url}") from exc
-            if not isinstance(page, list) or any(not isinstance(item, dict) for item in page):
-                raise GitHubAPIError(f"GitHub returned a non-object page for {response.url}")
+            page = _decode_page(response)
             page_count += 1
             items.extend(page)
             page_key = self._cache_key(str(response.url), None, None, "page")
@@ -371,8 +416,8 @@ class GitHubAPI:
             repo: 仓库名。
 
         Returns:
-            两类对象的 GraphQL ``totalCount`` 之和；匿名客户端返回 None，使调用方
-            使用无需认证的全目录证明。
+            两类对象的 GraphQL ``totalCount`` 之和；匿名客户端返回 None。该值只
+            用作冷启动进度估计。
         """
         if not self._authenticated:
             return None
@@ -552,6 +597,8 @@ class GitHubAPI:
                 detail = response.text[:500]
                 raise GitHubAPIError(
                     f"GitHub returned {response.status_code} for {response.url}: {detail}",
+                    status_code=response.status_code,
+                    url=str(response.url),
                 )
             return response
 
@@ -676,6 +723,16 @@ class GitHubAPI:
         if "retry-after" in response.headers:
             return True
         return "rate limit" in response.text.lower() or "abuse detection" in response.text.lower()
+
+
+def _decode_page(response: httpx.Response) -> list[dict[str, Any]]:
+    try:
+        page = response.json()
+    except json.JSONDecodeError as exc:
+        raise GitHubAPIError(f"GitHub returned invalid JSON for {response.url}") from exc
+    if not isinstance(page, list) or any(not isinstance(item, dict) for item in page):
+        raise GitHubAPIError(f"GitHub returned a non-object page for {response.url}")
+    return page
 
 
 def _closing_issues_query(size: int) -> str:

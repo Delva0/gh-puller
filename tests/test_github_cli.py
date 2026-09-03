@@ -53,7 +53,10 @@ async def _seed_run(
     async with SQLiteArchive(path, "acme/widgets") as archive:
         run = await archive.start_run(_iso(target), _iso(target))
         if committed:
-            await archive.update_observed(run.id, _iso(target))
+            await archive.start_pass(run.id, "closing", _iso(target), "full")
+            await archive.prepare_pass(run.id, (), 0)
+            await archive.stage_catalog_page(run.id, (), None)
+            await archive.finish_pass(run.id, _iso(target))
             await archive.finalize(run.id, _iso(target))
 
 

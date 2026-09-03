@@ -51,6 +51,7 @@ def _progress(**changes: object) -> monitor.ProgressState:
         ),
         wait_seconds=None,
         detail=None,
+        items=54_083,
     )
     return replace(state, **changes)
 
@@ -122,7 +123,7 @@ def test_table_output_is_stable_for_external_watch(tmp_path: Path) -> None:
     assert "\x1b" not in first
 
 
-def test_detail_uses_honest_unknown_catalog_denominator(tmp_path: Path) -> None:
+def test_detail_separates_current_items_from_unknown_catalog_denominator(tmp_path: Path) -> None:
     progress = _progress(
         phase="closing_catalog",
         catalog_seen=27_400,
@@ -141,7 +142,7 @@ def test_detail_uses_honest_unknown_catalog_denominator(tmp_path: Path) -> None:
         zone=_LOCAL,
     )
 
-    assert "ITEMS       ?" in output
+    assert "ITEMS       54,083" in output
     assert "PROGRESS    catalog 27,400/?" in output
     assert "DATABASE" in output
     assert str((tmp_path / "facts.sqlite3").resolve()) in output
@@ -190,6 +191,7 @@ def test_latest_progress_ignores_raw_logs_and_keeps_quota_fields() -> None:
         "target_at": "2026-09-02T05:37:49Z",
         "run_id": 1,
         "catalog_seen": 200,
+        "items": 54_083,
         "requests": 24_946,
         "quotas": [
             {
@@ -213,6 +215,7 @@ def test_latest_progress_ignores_raw_logs_and_keeps_quota_fields() -> None:
     assert progress is not None
     assert progress.phase == "closing_catalog"
     assert progress.catalog_seen == 200
+    assert progress.items == 54_083
     assert not hasattr(progress, "requests")
     assert progress.quotas == (
         RateQuota("core", 5_000, 4_498, _EVENT_AT + timedelta(hours=1)),

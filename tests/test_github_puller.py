@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import itertools
 import json
 import math
 import random
@@ -13,6 +12,7 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from io import StringIO
 from typing import TYPE_CHECKING, Any
+from urllib.parse import parse_qs, urlencode, urlsplit
 
 import aiosqlite
 import httpx
@@ -34,8 +34,7 @@ from gh_puller.github import (
     iter_runs,
     iter_versions,
 )
-from gh_puller.github.puller import _certified_head_merge
-from gh_puller.github.store import StoredHead, json_digest
+from gh_puller.github.client import GitHubPage
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -74,6 +73,7 @@ class FakeAPI:
         self.reported_count: int | None = None
         self.count_available = True
         self.closing: dict[int, list[dict[str, Any]]] = {}
+        self.catalog_accepts: list[str | None] = []
 
     async def close(self) -> None:
         pass
@@ -152,6 +152,35 @@ class FakeAPI:
         page_observer: Any = None,
     ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
         return await self.paginate(path, params=params, page_observer=page_observer), None
+
+    async def get_page(
+        self,
+        path: str,
+        *,
+        params: dict[str, Any] | None = None,
+        accept: str | None = None,
+    ) -> GitHubPage:
+        self.catalog_accepts.append(accept)
+        parsed = urlsplit(path)
+        route = parsed.path
+        query = {key: values[-1] for key, values in parse_qs(parsed.query).items()}
+        offset = int(query.pop("__offset", 0))
+        query.pop("per_page", None)
+        effective = deepcopy(params) if params is not None else query
+        items = self._items(route, effective)
+        self._called("page", route, effective)
+        if route in self.fail_once and route not in self.failed:
+            self.failed.add(route)
+            raise RuntimeError(f"injected failure: {route}")
+        page = items[offset : offset + 100]
+        next_url = None
+        if offset + 100 < len(items):
+            next_query = dict(effective or {}) | {
+                "per_page": 100,
+                "__offset": offset + 100,
+            }
+            next_url = f"{route}?{urlencode(next_query)}"
+        return GitHubPage(page, next_url)
 
     def _items(
         self,
@@ -318,37 +347,6 @@ async def _rows(
         await db.close()
 
 
-def _subsets(values: tuple[int, ...]) -> Any:
-    return itertools.chain.from_iterable(itertools.combinations(values, size) for size in range(len(values) + 1))
-
-
-def _summary(number: int, created_at: datetime, updated_at: datetime, *, title: str = "old") -> dict[str, Any]:
-    return {
-        "id": number * 10,
-        "number": number,
-        "created_at": _iso(created_at),
-        "updated_at": _iso(updated_at),
-        "title": title,
-    }
-
-
-def _stored_heads(items: list[dict[str, Any]]) -> dict[int, StoredHead]:
-    return {
-        item["number"]: StoredHead(
-            number=item["number"],
-            github_id=item["id"],
-            kind="pull" if "pull_request" in item else "issue",
-            created_at=item["created_at"],
-            updated_at=item["updated_at"],
-            summary_digest=json_digest(item),
-            bundle_digest="bundle",
-            present=True,
-            missing_since=None,
-        )
-        for item in items
-    }
-
-
 def _seed_churn_api(api: FakeAPI, size: int) -> None:
     for number in range(1, size + 1):
         pull = number % 3 == 0
@@ -417,102 +415,6 @@ def _apply_churn_epoch(
             api.closing[number] = [_closing_issue(comment_id)] if operation == "add" else []
         api.json[path]["comments"] = len(comments)
     api.pages[f"{_BASE}/issues/comments"] = signals
-
-
-def test_cardinality_certificate_accepts_exactly_deletion_free_small_transitions() -> None:
-    previous_ids = (1, 2, 3)
-    addition_ids = (4, 5)
-    previous = [_summary(number, _T0 - timedelta(days=number), _T0) for number in previous_ids]
-    cutoff = _T0 + timedelta(hours=1)
-    changed_at = cutoff - timedelta(minutes=1)
-
-    for survivors_tuple in _subsets(previous_ids):
-        survivors = set(survivors_tuple)
-        for additions_tuple in _subsets(addition_ids):
-            additions = set(additions_tuple)
-            for updates_tuple in _subsets(tuple(sorted(survivors))):
-                updates = set(updates_tuple)
-                current: list[dict[str, Any]] = []
-                delta: list[dict[str, Any]] = []
-                for item in previous:
-                    if item["number"] not in survivors:
-                        continue
-                    candidate = deepcopy(item)
-                    if item["number"] in updates:
-                        candidate["updated_at"] = _iso(changed_at)
-                        candidate["title"] = "updated"
-                        delta.append(candidate)
-                    current.append(candidate)
-                for number in additions:
-                    candidate = _summary(number, changed_at, changed_at, title="new")
-                    current.append(candidate)
-                    delta.append(candidate)
-
-                certified = _certified_head_merge(_stored_heads(previous), delta, len(current), cutoff)
-                if survivors == set(previous_ids):
-                    assert certified == (
-                        {item["number"] for item in current},
-                        {item["number"]: item for item in delta},
-                    )
-                else:
-                    assert certified is None
-
-
-def test_cardinality_certificate_excludes_items_created_after_target() -> None:
-    previous = [_summary(1, _T0 - timedelta(days=1), _T0)]
-    cutoff = _T0 + timedelta(hours=1)
-    visible = _summary(2, cutoff, cutoff, title="visible")
-    future = _summary(3, cutoff + timedelta(seconds=1), cutoff + timedelta(seconds=1), title="future")
-
-    heads = _stored_heads(previous)
-    assert _certified_head_merge(heads, [visible, future], 3, cutoff) == ({1, 2}, {2: visible})
-    assert _certified_head_merge(heads, [visible, future], 2, cutoff) is None
-
-
-def test_cardinality_certificate_matches_large_random_catalog_churn() -> None:
-    rng = random.Random(20260901)  # noqa: S311 - The workload must be reproducible, not unpredictable.
-    previous = [_summary(number, _T0 - timedelta(days=1), _T0 - timedelta(hours=1)) for number in range(1, 5001)]
-    next_number = 5001
-    accepted = 0
-    rejected = 0
-
-    for epoch in range(1, 81):
-        cutoff = _T0 + timedelta(hours=epoch)
-        changed_at = cutoff - timedelta(minutes=1)
-        old = {item["number"]: item for item in previous}
-        deleted = set(rng.sample(sorted(old), 5)) if epoch % 2 == 0 else set()
-        survivors = set(old) - deleted
-        updated = set(rng.sample(sorted(survivors), 25))
-        additions = tuple(range(next_number, next_number + 5))
-        next_number += len(additions)
-        current: list[dict[str, Any]] = []
-        delta: list[dict[str, Any]] = []
-        for number in sorted(survivors):
-            item = deepcopy(old[number])
-            if number in updated:
-                item["updated_at"] = _iso(changed_at)
-                item["title"] = f"epoch {epoch}"
-                delta.append(item)
-            current.append(item)
-        for number in additions:
-            item = _summary(number, changed_at, changed_at, title=f"epoch {epoch}")
-            current.append(item)
-            delta.append(item)
-
-        certified = _certified_head_merge(_stored_heads(previous), delta, len(current), cutoff)
-        if deleted:
-            assert certified is None
-            rejected += 1
-        else:
-            assert certified == (
-                {item["number"] for item in current},
-                {item["number"]: item for item in delta},
-            )
-            accepted += 1
-        previous = current
-
-    assert len(previous) == 5200
-    assert (accepted, rejected) == (40, 40)
 
 
 @pytest.mark.asyncio
@@ -584,10 +486,11 @@ async def test_cold_pull_preserves_raw_fields_and_publishes_target(tmp_path: Pat
     assert catalog_call[2] == {"state": "all", "sort": "created", "direction": "desc"}
     assert sum(call[0] == "count" for call in api.calls) == 1
     assert not any(call[0] == "json" and call[1] == issue_path for call in api.calls)
+    assert api.catalog_accepts == ["application/vnd.github.raw+json"]
 
 
 @pytest.mark.asyncio
-async def test_cold_pull_reports_certified_catalog_and_durable_bundles(tmp_path: Path) -> None:
+async def test_cold_pull_reports_durable_catalog_and_bundles(tmp_path: Path) -> None:
     api = FakeAPI()
     api.add_issue(1)
     api.add_issue(2, pull=True)
@@ -608,10 +511,14 @@ async def test_cold_pull_reports_certified_catalog_and_durable_bundles(tmp_path:
 
     phases = [event.phase for event in events]
     assert phases[0:2] == ["waiting_lock", "checking"]
-    assert {"closing_catalog", "closing_bundles", "finalizing", "done"} <= set(phases)
-    completed = [event for event in events if event.phase == "closing_bundles" and event.bundles_completed == 2][-1]
+    assert {"closing_catalog", "finalizing", "done"} <= set(phases)
+    completed = [
+        event
+        for event in events
+        if event.phase == "closing_catalog" and event.bundles_completed == 2
+    ][-1]
     assert completed.catalog_seen == completed.catalog_total == 2
-    assert completed.bundles_total == 2
+    assert completed.bundles_total is None
     assert (completed.issues_completed, completed.pulls_completed) == (1, 1)
     assert (completed.latest_number, completed.latest_kind) == (2, "pull")
     assert events[-1].phase == "done"
@@ -668,7 +575,7 @@ async def test_pull_request_bundle_preserves_all_discussion_and_diff_data(tmp_pa
 
 
 @pytest.mark.asyncio
-async def test_closing_issue_queries_pack_one_hundred_selected_pulls(tmp_path: Path) -> None:
+async def test_closing_issue_queries_batch_selected_pulls_per_catalog_page(tmp_path: Path) -> None:
     api = FakeAPI()
     for number in range(1, 203):
         pull = number % 2 == 0
@@ -688,8 +595,8 @@ async def test_closing_issue_queries_pack_one_hundred_selected_pulls(tmp_path: P
     ).pull(_T0)
 
     calls = [call for call in api.calls if call[0] == "closing"]
-    assert [len(call[2]["numbers"]) for call in calls] == [100, 1]
-    assert result.requests == 814
+    assert [len(call[2]["numbers"]) for call in calls] == [50, 50, 1]
+    assert result.requests == 815
 
 
 @pytest.mark.asyncio
@@ -710,7 +617,7 @@ async def test_quiet_pull_does_not_query_closing_issue_references(tmp_path: Path
 
     result = await puller.pull(clock.current)
 
-    assert result.requests == 4
+    assert result.requests == 3
     assert not any(call[0] == "closing" for call in api.calls[call_start:])
 
 
@@ -1153,8 +1060,7 @@ async def test_large_random_observable_issue_and_comment_churn(tmp_path: Path) -
     comment_additions = 0
     comment_deletions = 0
     pull_comment_operations = 0
-    fast_epochs = 0
-    fallback_epochs = 0
+    observed_numbers = set(range(1, 97))
     for epoch in range(1, 21):
         target = _T0 + timedelta(hours=epoch)
         changed_at = target - timedelta(minutes=1)
@@ -1177,6 +1083,7 @@ async def test_large_random_observable_issue_and_comment_churn(tmp_path: Path) -
         added = tuple(range(next_number, next_number + 3))
         next_number += len(added)
         added_total += len(added)
+        observed_numbers.update(added)
         deleted_total += len(deleted)
         added_pulls += sum(number % 3 == 0 for number in added)
         deleted_pulls += sum(number % 3 == 0 for number in deleted)
@@ -1193,28 +1100,18 @@ async def test_large_random_observable_issue_and_comment_churn(tmp_path: Path) -
         await puller.pull(target)
         epoch_calls = api.calls[call_start:]
         root_scans = sum(call[0] == "page" and call[1] == f"{_BASE}/issues" for call in epoch_calls)
-        if deleted:
-            assert root_scans == 3
-            fallback_epochs += 1
-        else:
-            assert root_scans == 1
-            fast_epochs += 1
+        assert root_scans == 1
         fetched_roots = {
             int(call[1].rsplit("/", 1)[1])
             for call in epoch_calls
             if call[0] == "json" and call[1].startswith(f"{_BASE}/issues/")
         }
-        expected_roots = (
-            set()
-            if deleted
-            else {number for number, operation, _ in operations if operation == "add"}
-        )
+        expected_roots = {number for number, operation, _ in operations if operation == "add"}
         assert fetched_roots == expected_roots
         heads = await _current(archive)
         present = {number for number, head in heads.items() if head.present}
-        expected_present = {item["number"] for item in api.catalog}
-        assert present == expected_present
-        for number in expected_present:
+        assert present == observed_numbers
+        for number in {item["number"] for item in api.catalog}:
             bundle = heads[number].bundle
             assert bundle is not None
             expected_comments = api.pages.get(f"{_BASE}/issues/{number}/comments", [])
@@ -1226,7 +1123,7 @@ async def test_large_random_observable_issue_and_comment_churn(tmp_path: Path) -
                     number,
                     [],
                 )
-        assert all(not heads[number].present for number in deleted)
+        assert all(heads[number].present for number in deleted)
 
     assert (added_total, deleted_total) == (60, 20)
     assert added_pulls > 0
@@ -1235,13 +1132,13 @@ async def test_large_random_observable_issue_and_comment_churn(tmp_path: Path) -
     assert comment_additions > 0
     assert comment_deletions > 0
     assert pull_comment_operations > 0
-    assert (fast_epochs, fallback_epochs) == (10, 10)
     assert len(api.catalog) == 136
+    assert len(await _current(archive)) == 156
     assert len(await _runs(archive)) == 21
 
 
 @pytest.mark.asyncio
-async def test_parent_deletion_fallback_reads_catalog_without_survivor_bundles(
+async def test_silent_parent_deletion_does_not_trigger_full_catalog_scan(
     tmp_path: Path,
 ) -> None:
     api = FakeAPI()
@@ -1260,15 +1157,15 @@ async def test_parent_deletion_fallback_reads_catalog_without_survivor_bundles(
     calls = api.calls[call_start:]
     fetched_roots = [call for call in calls if call[0] == "json" and call[1].startswith(f"{_BASE}/issues/")]
     assert fetched_roots == []
-    assert sum(call[0] == "page" and call[1] == f"{_BASE}/issues" for call in calls) == 3
-    assert result.requests == 10
-    assert result.catalog_items == 249
-    assert (await _current(archive))[125].present is False
+    assert sum(call[0] == "page" and call[1] == f"{_BASE}/issues" for call in calls) == 1
+    assert result.requests == 3
+    assert result.catalog_items == 250
+    assert (await _current(archive))[125].present is True
 
 
 @pytest.mark.parametrize("catalog_size", [1, 250])
 @pytest.mark.asyncio
-async def test_quiet_increment_cost_is_four_requests_independent_of_catalog_size(
+async def test_quiet_increment_cost_is_three_requests_independent_of_catalog_size(
     tmp_path: Path,
     catalog_size: int,
 ) -> None:
@@ -1283,24 +1180,25 @@ async def test_quiet_increment_cost_is_four_requests_independent_of_catalog_size
     expected = math.ceil(catalog_size / 100) + 1 + 2 * catalog_size
     assert cold.requests == expected
     assert cold.requests < baseline
-    assert sum(call[0] == "page" and call[1] == f"{_BASE}/issues" for call in api.calls) == 1
+    assert sum(
+        call[0] == "page" and call[1] == f"{_BASE}/issues" for call in api.calls
+    ) == math.ceil(catalog_size / 100)
     assert sum(call[0] == "count" for call in api.calls) == 1
     clock.current += timedelta(hours=1)
     call_start = len(api.calls)
 
     result = await puller.pull(clock.current)
 
-    assert result.requests == 4
-    assert result.requests / 5000 == 0.0008
+    assert result.requests == 3
+    assert result.requests / 5000 == 0.0006
     discovery = api.calls[call_start:]
     assert {call[1] for call in discovery} == {
         f"{_BASE}/issues",
         f"{_BASE}/issues/comments",
         f"{_BASE}/pulls/comments",
-        "/graphql",
     }
     root_call = next(call for call in discovery if call[1] == f"{_BASE}/issues")
-    assert root_call[2]["sort"] == "created"
+    assert root_call[2]["sort"] == "updated"
     assert root_call[2]["since"] == _iso(_T0 - timedelta(seconds=2))
 
 
@@ -1494,10 +1392,8 @@ async def test_future_target_prefetches_then_closes_with_one_target_run(tmp_path
     assert len(runs) == 1
     assert runs[0].target_at == _iso(target)
     phases = [event.phase for event in events]
-    assert phases.index("prefetch_catalog") < phases.index("prefetch_bundles")
-    assert phases.index("prefetch_bundles") < phases.index("waiting_target")
+    assert phases.index("prefetch_catalog") < phases.index("waiting_target")
     assert phases.index("waiting_target") < phases.index("closing_catalog")
-    assert phases.index("closing_catalog") < phases.index("closing_bundles")
     prefetch = next(event for event in events if event.phase == "prefetch_catalog")
     closing = next(event for event in events if event.phase == "closing_catalog")
     assert prefetch.pass_at == _T0
@@ -1615,16 +1511,178 @@ async def test_interrupted_cold_pull_resumes_staged_bundles_without_publication(
     assert set(await _current(archive)) == {1, 2, 3}
     assert len(await _runs(archive)) == 1
     restored = next(event for event in events if event.phase == "closing_catalog" and event.bundles_completed == 2)
-    planned = next(event for event in events if event.phase == "closing_bundles")
     assert restored.bundles_total is None
     assert (restored.issues_completed, restored.pulls_completed) == (1, 1)
     assert (restored.latest_number, restored.latest_kind) == (2, "pull")
-    assert (planned.bundles_completed, planned.bundles_total) == (2, 3)
-    assert events[-1].bundles_completed == events[-1].bundles_total == 3
+    assert events[-1].bundles_completed == 3
+    assert events[-1].bundles_total is None
 
 
 @pytest.mark.asyncio
-async def test_resumed_plan_reclassifies_a_staged_parent_deleted_before_target(tmp_path: Path) -> None:
+async def test_catalog_producer_runs_ahead_of_blocked_bundle_consumers(tmp_path: Path) -> None:
+    class BlockingTimelineAPI(FakeAPI):
+        def __init__(self) -> None:
+            super().__init__()
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def paginate(
+            self,
+            path: str,
+            *,
+            params: dict[str, Any] | None = None,
+            page_observer: Any = None,
+        ) -> list[dict[str, Any]]:
+            if path.endswith("/timeline"):
+                self.started.set()
+                await self.release.wait()
+            return await super().paginate(path, params=params, page_observer=page_observer)
+
+    api = BlockingTimelineAPI()
+    for number in range(1, 251):
+        api.add_issue(number)
+    archive = tmp_path / "archive"
+    pull = asyncio.create_task(
+        GitHubPuller(
+            _config(archive, concurrency=4),
+            api=api,
+            now=lambda: _T0,
+        ).pull(_T0),
+    )
+    await asyncio.wait_for(api.started.wait(), timeout=1)
+
+    async def catalog_is_durable() -> None:
+        while True:
+            rows = await _rows(
+                archive,
+                "SELECT catalog_complete, catalog_items FROM pull_passes",
+            )
+            if rows == [{"catalog_complete": 1, "catalog_items": 250}]:
+                return
+            await asyncio.sleep(0.01)
+
+    await asyncio.wait_for(catalog_is_durable(), timeout=1)
+    tasks = await _rows(archive, "SELECT count(*) AS count FROM pull_tasks")
+    assert tasks == [{"count": 250}]
+    assert api.catalog_accepts == ["application/vnd.github.raw+json"] * 3
+    assert not pull.done()
+
+    pull.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await pull
+
+
+@pytest.mark.asyncio
+async def test_interrupted_catalog_resumes_at_its_durable_page_cursor(tmp_path: Path) -> None:
+    class ThirdPageFailureAPI(FakeAPI):
+        def __init__(self) -> None:
+            super().__init__()
+            self.catalog_paths: list[str] = []
+            self.failed_page = False
+
+        async def get_page(
+            self,
+            path: str,
+            *,
+            params: dict[str, Any] | None = None,
+            accept: str | None = None,
+        ) -> GitHubPage:
+            self.catalog_paths.append(path)
+            page = await super().get_page(path, params=params, accept=accept)
+            if "__offset=200" in path and not self.failed_page:
+                self.failed_page = True
+                raise RuntimeError("interrupt third catalog page")
+            return page
+
+    api = ThirdPageFailureAPI()
+    for number in range(1, 251):
+        api.add_issue(number)
+    archive = tmp_path / "archive"
+    puller = GitHubPuller(_config(archive, concurrency=16), api=api, now=lambda: _T0)
+
+    with pytest.raises(RuntimeError, match="interrupt third catalog page"):
+        await puller.pull(_T0)
+
+    state = await _rows(
+        archive,
+        "SELECT catalog_complete, catalog_items, next_url FROM pull_passes",
+    )
+    assert state[0]["catalog_complete"] == 0
+    assert state[0]["catalog_items"] == 200
+    assert "__offset=200" in state[0]["next_url"]
+    assert await _rows(
+        archive,
+        "SELECT count(*) AS count FROM pull_tasks WHERE completed = 1",
+    ) == [{"count": 200}]
+    previous_calls = len(api.calls)
+    previous_paths = len(api.catalog_paths)
+
+    result = await puller.pull(_T0)
+
+    assert api.catalog_paths[previous_paths:] == [state[0]["next_url"]]
+    resumed_calls = api.calls[previous_calls:]
+    assert not any(
+        call[1] == f"{_BASE}/issues/250/timeline" for call in resumed_calls
+    )
+    assert result.catalog_items == 250
+    assert await _rows(archive, "SELECT count(*) AS count FROM pull_passes") == [{"count": 0}]
+    assert await _rows(archive, "SELECT count(*) AS count FROM pull_tasks") == [{"count": 0}]
+
+
+@pytest.mark.asyncio
+async def test_expired_durable_cursor_rescans_catalog_but_reuses_completed_bundles(
+    tmp_path: Path,
+) -> None:
+    class ExpiringCursorAPI(FakeAPI):
+        def __init__(self) -> None:
+            super().__init__()
+            self.catalog_paths: list[str] = []
+            self.cursor_attempts = 0
+
+        async def get_page(
+            self,
+            path: str,
+            *,
+            params: dict[str, Any] | None = None,
+            accept: str | None = None,
+        ) -> GitHubPage:
+            self.catalog_paths.append(path)
+            page = await super().get_page(path, params=params, accept=accept)
+            if "__offset=100" not in path:
+                return page
+            self.cursor_attempts += 1
+            if self.cursor_attempts == 1:
+                raise RuntimeError("interrupt second catalog page")
+            if self.cursor_attempts == 2:
+                raise GitHubAPIError("expired catalog cursor", status_code=422)
+            return page
+
+    api = ExpiringCursorAPI()
+    for number in range(1, 102):
+        api.add_issue(number)
+    archive = tmp_path / "archive"
+    puller = GitHubPuller(_config(archive, concurrency=16), api=api, now=lambda: _T0)
+
+    with pytest.raises(RuntimeError, match="interrupt second catalog page"):
+        await puller.pull(_T0)
+    previous_calls = len(api.calls)
+    previous_paths = len(api.catalog_paths)
+
+    result = await puller.pull(_T0)
+
+    paths = api.catalog_paths[previous_paths:]
+    assert "__offset=100" in paths[0]
+    assert paths[1] == f"{_BASE}/issues"
+    assert "__offset=100" in paths[2]
+    assert not any(
+        call[1] == f"{_BASE}/issues/101/timeline"
+        for call in api.calls[previous_calls:]
+    )
+    assert result.catalog_items == 101
+
+
+@pytest.mark.asyncio
+async def test_future_closure_does_not_infer_a_silent_parent_deletion(tmp_path: Path) -> None:
     api = FakeAPI()
     api.add_issue(1)
     archive = tmp_path / "archive"
@@ -1654,14 +1712,10 @@ async def test_resumed_plan_reclassifies_a_staged_parent_deleted_before_target(t
     ).pull(target)
 
     restored = next(event for event in events if event.phase == "closing_catalog" and event.bundles_completed == 1)
-    planned = next(event for event in events if event.phase == "closing_bundles")
     assert (restored.latest_number, restored.latest_kind) == (1, "issue")
-    assert (planned.bundles_completed, planned.bundles_total) == (0, 0)
-    assert (planned.issues_completed, planned.pulls_completed) == (0, 0)
-    assert (planned.latest_number, planned.latest_kind) == (None, None)
-    assert events[-1].tombstones == 1
-    assert result.catalog_items == 0
-    assert (await _current(archive))[1].present is False
+    assert events[-1].tombstones == 0
+    assert result.catalog_items == 1
+    assert (await _current(archive))[1].present is True
 
 
 @pytest.mark.asyncio
@@ -1775,7 +1829,7 @@ async def test_slow_oldest_candidate_does_not_block_newer_durable_bundles(tmp_pa
     durable_newer = asyncio.Event()
 
     def observe(progress: PullProgress) -> None:
-        if progress.phase == "closing_bundles" and progress.bundles_completed == 2:
+        if progress.phase == "closing_catalog" and progress.bundles_completed == 2:
             durable_newer.set()
 
     archive = tmp_path / "archive"
@@ -1800,7 +1854,7 @@ async def test_slow_oldest_candidate_does_not_block_newer_durable_bundles(tmp_pa
 
 
 @pytest.mark.asyncio
-async def test_missing_catalog_item_becomes_tombstone_without_losing_bundle(tmp_path: Path) -> None:
+async def test_missing_catalog_item_remains_as_last_observed_fact(tmp_path: Path) -> None:
     api = FakeAPI()
     api.add_issue(1)
     archive = tmp_path / "archive"
@@ -1814,11 +1868,58 @@ async def test_missing_catalog_item_becomes_tombstone_without_losing_bundle(tmp_
     result = await puller.pull(clock.current)
 
     record = (await _current(archive))[1]
+    assert record.present is True
+    assert record.missing_since is None
+    assert record.bundle == original
+    assert result.catalog_items == 1
+    assert [head.number async for head in iter_heads(archive, present_only=True)] == [1]
+
+
+@pytest.mark.asyncio
+async def test_selected_parent_absence_stages_a_tombstone(tmp_path: Path) -> None:
+    class MissingParentAPI(FakeAPI):
+        missing = False
+
+        async def get_json(
+            self,
+            path: str,
+            *,
+            params: dict[str, Any] | None = None,
+            accept: str | None = None,
+        ) -> Any:
+            if self.missing and path == f"{_BASE}/issues/1":
+                self._called("json", path, params)
+                raise GitHubAPIError(
+                    "parent missing",
+                    status_code=404,
+                    url=f"https://api.github.test{path}",
+                )
+            return await super().get_json(path, params=params, accept=accept)
+
+    api = MissingParentAPI()
+    api.add_issue(1)
+    archive = tmp_path / "archive"
+    clock = Clock(_T0)
+    puller = GitHubPuller(_config(archive), api=api, now=clock, sleep=clock.sleep)
+    await puller.pull(_T0)
+    clock.current += timedelta(hours=1)
+    api.pages[f"{_BASE}/issues/comments"] = [
+        {
+            "id": 1,
+            "created_at": _iso(clock.current),
+            "updated_at": _iso(clock.current),
+            "issue_url": f"{_BASE}/issues/1",
+        },
+    ]
+    api.catalog.clear()
+    api.missing = True
+
+    result = await puller.pull(clock.current)
+
+    record = (await _current(archive))[1]
     assert record.present is False
     assert record.missing_since == _iso(clock.current)
-    assert record.bundle == original
     assert result.catalog_items == 0
-    assert [head async for head in iter_heads(archive, present_only=True)] == []
 
 
 @pytest.mark.asyncio
@@ -2349,6 +2450,39 @@ async def test_concurrent_quota_responses_never_move_backward() -> None:
 
 
 @pytest.mark.asyncio
+async def test_rest_page_exposes_the_opaque_next_cursor_without_following_it() -> None:
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        if request.url.params.get("cursor") == "opaque":
+            return httpx.Response(200, json=[{"id": 2}], request=request)
+        link = '<https://api.github.test/items?cursor=opaque>; rel="next"'
+        return httpx.Response(
+            200,
+            headers={"link": link},
+            json=[{"id": 1, "unknown": ["kept"]}],
+            request=request,
+        )
+
+    client = httpx.AsyncClient(base_url="https://api.github.test", transport=httpx.MockTransport(handler))
+    api = GitHubAPI(client=client)
+    try:
+        page = await api.get_page("/items", params={"state": "all"})
+        next_page = await api.get_page(page.next_url or "")
+    finally:
+        await client.aclose()
+
+    assert page.items == [{"id": 1, "unknown": ["kept"]}]
+    assert page.next_url == "https://api.github.test/items?cursor=opaque"
+    assert next_page == GitHubPage([{"id": 2}], None)
+    assert seen == [
+        "https://api.github.test/items?state=all&per_page=100",
+        "https://api.github.test/items?cursor=opaque",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_rest_pagination_follows_link_header_and_preserves_fields() -> None:
     seen: list[str] = []
     page_sizes: list[int] = []
@@ -2506,7 +2640,7 @@ async def test_conditional_single_page_collection_reuses_then_reads_change() -> 
 
 
 @pytest.mark.asyncio
-async def test_conditional_multi_page_collection_reuses_every_certified_page() -> None:
+async def test_conditional_multi_page_collection_reuses_every_validated_page() -> None:
     seen: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -2692,6 +2826,41 @@ async def test_payload_blobs_are_compressed_and_content_addressed(tmp_path: Path
     assert all(len(row["digest"]) == 64 for row in blobs)
     assert any(row["stored_size"] < row["raw_size"] for row in blobs)
     assert await _rows(archive, "PRAGMA integrity_check") == [{"integrity_check": "ok"}]
+
+
+@pytest.mark.asyncio
+async def test_v4_archive_migrates_to_v5_without_rebuilding_committed_facts(tmp_path: Path) -> None:
+    api = FakeAPI()
+    api.add_issue(1)
+    archive = tmp_path / "archive"
+    clock = Clock(_T0)
+    puller = GitHubPuller(_config(archive), api=api, now=clock, sleep=clock.sleep)
+    await puller.pull(_T0)
+    db = await aiosqlite.connect(archive)
+    try:
+        await db.execute("DROP TABLE pull_tasks")
+        await db.execute("DROP TABLE pull_passes")
+        await db.execute(
+            "UPDATE archive_meta SET value = '4' WHERE key = 'schema_version'",
+        )
+        await db.commit()
+    finally:
+        await db.close()
+    clock.current += timedelta(hours=1)
+
+    result = await puller.pull(clock.current)
+
+    assert result.changed_items == 0
+    assert (await _current(archive))[1].bundle is not None
+    assert await _rows(
+        archive,
+        "SELECT value FROM archive_meta WHERE key = 'schema_version'",
+    ) == [{"value": "5"}]
+    tables = await _rows(
+        archive,
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'pull_%'",
+    )
+    assert {row["name"] for row in tables} == {"pull_passes", "pull_runs", "pull_tasks"}
 
 
 @pytest.mark.asyncio
