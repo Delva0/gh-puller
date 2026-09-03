@@ -100,7 +100,7 @@ ON resource_versions(run_id, number, id);
 @dataclass(frozen=True, slots=True)
 class PullRun:
     id: int  # Stable local invocation identity.
-    target_at: str  # Requested coverage watermark.
+    target_at: str  # Requested observation watermark.
     started_at: str  # First attempt start time.
     observed_until: str | None  # Durable staged observation watermark.
     request_count: int  # Attempts accumulated across crash recovery.
@@ -131,7 +131,7 @@ class StagedResource:
 @dataclass(frozen=True, slots=True)
 class ArchivedVersion:
     run_id: int  # Committed pull run that observed this change.
-    target_at: str  # Run coverage watermark.
+    target_at: str  # Run observation watermark.
     completed_at: str  # Actual completion time C.
     observed_at: str  # Pass watermark associated with this observation.
     number: int  # Repository-local Issue/PR number.
@@ -161,9 +161,9 @@ class ArchivedHead:
 @dataclass(frozen=True, slots=True)
 class ArchivedRun:
     id: int  # Stable local invocation identity.
-    target_at: str  # Requested coverage watermark T.
+    target_at: str  # Requested observation watermark T.
     started_at: str  # First attempt start time.
-    observed_until: str  # Durable closed observation watermark.
+    observed_until: str  # Durable observation-pass watermark.
     completed_at: str  # Actual completion time C.
     request_count: int  # HTTP attempts accumulated across recovery.
     changed_items: int  # Object versions or tombstones published.
@@ -172,7 +172,7 @@ class ArchivedRun:
 
 @dataclass(frozen=True, slots=True)
 class ScheduleState:
-    committed_target: str | None  # Greatest committed coverage target.
+    committed_target: str | None  # Greatest committed observation target.
     pending_target: str | None  # Target of the archive-wide pending run.
 
 
@@ -214,7 +214,7 @@ class SQLiteArchive:
         """创建或恢复唯一 pending run。
 
         Args:
-            target_at: 本次覆盖水位。
+            target_at: 本次观测水位。
             started_at: 新 run 的首次调用时刻。
 
         Returns:
@@ -263,7 +263,7 @@ class SQLiteArchive:
         """读取幂等键对应的 committed run。
 
         Args:
-            target_at: 规范化后的覆盖水位。
+            target_at: 规范化后的观测水位。
 
         Returns:
             已发布的原始运行结果；键不存在时为 None。
@@ -423,7 +423,7 @@ class SQLiteArchive:
 
         Args:
             run_id: 当前 pending run。
-            observed_until: 已完整闭合的观察时刻。
+            observed_until: 已完成的观测 pass 时刻。
         """
         await self._connection.execute(
             "UPDATE pull_runs SET observed_until = ? WHERE id = ? AND status = 'pending'",

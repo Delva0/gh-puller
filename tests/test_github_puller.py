@@ -1,4 +1,4 @@
-"""GitHub 拉取器的水位、原始事实完整性、恢复与 SQLite 发布测试。"""
+"""GitHub 拉取器的观测水位、原始响应保留、恢复与 SQLite 发布测试。"""
 
 from __future__ import annotations
 
@@ -320,87 +320,6 @@ def _stored_heads(items: list[dict[str, Any]]) -> dict[int, StoredHead]:
     }
 
 
-def _seed_differential_api(api: FakeAPI) -> None:
-    api.add_issue(1)
-    api.add_issue(2, pull=True)
-    api.add_issue(4)
-    pull_path = f"{_BASE}/pulls/2"
-    api.json[pull_path] = {
-        "id": 20,
-        "changed_files": 0,
-        "commits": 0,
-        "review_comments": 0,
-    }
-
-
-def _mutate_active_interval(api: FakeAPI, changed_at: datetime) -> None:
-    issue = next(item for item in api.catalog if item["number"] == 1)
-    issue["updated_at"] = _iso(changed_at)
-    issue["title"] = "root edit"
-    api.json[f"{_BASE}/issues/1"]["updated_at"] = _iso(changed_at)
-    api.json[f"{_BASE}/issues/1"]["title"] = "root edit"
-    api.add_issue(3, created_at=changed_at, updated_at=changed_at)
-
-    issue_path = f"{_BASE}/issues/4"
-    api.pages[f"{_BASE}/issues/comments"] = [
-        {
-            "id": 41,
-            "issue_url": issue_path,
-            "created_at": _iso(changed_at),
-            "updated_at": _iso(changed_at),
-        },
-    ]
-    api.json[issue_path]["comments"] = 1
-    api.pages[f"{issue_path}/comments"] = [
-        {
-            "id": 41,
-            "body": "child-only edit",
-            "created_at": _iso(changed_at),
-            "updated_at": _iso(changed_at),
-            "reactions": {"total_count": 0},
-        },
-    ]
-
-    pull_path = f"{_BASE}/pulls/2"
-    api.pages[f"{_BASE}/pulls/comments"] = [
-        {
-            "id": 21,
-            "pull_request_url": pull_path,
-            "created_at": _iso(changed_at),
-            "updated_at": _iso(changed_at),
-        },
-    ]
-    api.json[pull_path]["review_comments"] = 1
-    api.pages[f"{pull_path}/comments"] = [
-        {
-            "id": 21,
-            "body": "review child-only edit",
-            "created_at": _iso(changed_at),
-            "updated_at": _iso(changed_at),
-            "reactions": {"total_count": 0},
-        },
-    ]
-
-
-async def _managed_snapshot(path: Path) -> list[tuple[Any, ...]]:
-    return [
-        (
-            version.target_at,
-            version.observed_at,
-            version.number,
-            version.github_id,
-            version.kind,
-            version.created_at,
-            version.updated_at,
-            version.present,
-            version.missing_since,
-            version.summary,
-            version.bundle,
-        )
-        for version in await _versions(path)
-    ]
-
-
 def _seed_churn_api(api: FakeAPI, size: int) -> None:
     for number in range(1, size + 1):
         api.add_issue(number)
@@ -453,7 +372,7 @@ def _apply_churn_epoch(
     api.pages[f"{_BASE}/issues/comments"] = signals
 
 
-def test_cardinality_certificate_equals_exhaustive_catalog_for_all_small_transitions() -> None:
+def test_cardinality_certificate_accepts_exactly_deletion_free_small_transitions() -> None:
     previous_ids = (1, 2, 3)
     addition_ids = (4, 5)
     previous = [_summary(number, _T0 - timedelta(days=number), _T0) for number in previous_ids]
@@ -981,180 +900,78 @@ async def test_pull_media_validators_survive_puller_restart(tmp_path: Path) -> N
 
 
 @pytest.mark.asyncio
-async def test_certified_puller_stays_byte_equal_to_exhaustive_oracle(tmp_path: Path) -> None:
-    certified_api = FakeAPI()
-    exhaustive_api = FakeAPI()
-    _seed_differential_api(certified_api)
-    _seed_differential_api(exhaustive_api)
-    certified_clock = Clock(_T0)
-    exhaustive_clock = Clock(_T0)
-    certified_path = tmp_path / "certified"
-    exhaustive_path = tmp_path / "exhaustive"
-    certified = GitHubPuller(
-        _config(certified_path, catalog_mode="certified"),
-        api=certified_api,
-        now=certified_clock,
-        sleep=certified_clock.sleep,
-    )
-    exhaustive = GitHubPuller(
-        _config(
-            exhaustive_path,
-            catalog_mode="exhaustive",
-            bundle_mode="exhaustive",
-        ),
-        api=exhaustive_api,
-        now=exhaustive_clock,
-        sleep=exhaustive_clock.sleep,
-    )
-
-    await certified.pull(_T0)
-    await exhaustive.pull(_T0)
-    assert await _managed_snapshot(certified_path) == await _managed_snapshot(exhaustive_path)
-
-    active_target = _T0 + timedelta(hours=1)
-    changed_at = active_target - timedelta(minutes=1)
-    for api in (certified_api, exhaustive_api):
-        _mutate_active_interval(api, changed_at)
-    certified_clock.current = active_target
-    exhaustive_clock.current = active_target
-    await certified.pull(active_target)
-    await exhaustive.pull(active_target)
-    assert await _managed_snapshot(certified_path) == await _managed_snapshot(exhaustive_path)
-
-    quiet_target = active_target + timedelta(hours=1)
-    certified_clock.current = quiet_target
-    exhaustive_clock.current = quiet_target
-    quiet = await certified.pull(quiet_target)
-    await exhaustive.pull(quiet_target)
-    assert quiet.requests == 4
-    assert await _managed_snapshot(certified_path) == await _managed_snapshot(exhaustive_path)
-
-    replacement_target = quiet_target + timedelta(hours=1)
-    replacement_at = replacement_target - timedelta(minutes=1)
-    catalog_call_start = len(certified_api.calls)
-    for api in (certified_api, exhaustive_api):
-        api.catalog = [item for item in api.catalog if item["number"] != 1]
-        api.add_issue(5, created_at=replacement_at, updated_at=replacement_at)
-    certified_clock.current = replacement_target
-    exhaustive_clock.current = replacement_target
-    await certified.pull(replacement_target)
-    await exhaustive.pull(replacement_target)
-    catalog_calls = certified_api.calls[catalog_call_start:]
-    root_calls = [call for call in catalog_calls if call[0] == "page" and call[1] == f"{_BASE}/issues"]
-    fetched_roots = [call[1] for call in catalog_calls if call[0] == "json" and call[1].startswith(f"{_BASE}/issues/")]
-    assert len(root_calls) == 3
-    assert fetched_roots == []
-    assert (await _current(certified_path))[1].present is False
-    assert await _managed_snapshot(certified_path) == await _managed_snapshot(exhaustive_path)
-
-    same_second_target = replacement_target + timedelta(microseconds=1)
-    for api in (certified_api, exhaustive_api):
-        item = next(item for item in api.catalog if item["number"] == 3)
-        item["title"] = "same-second replacement"
-        item["updated_at"] = _iso(replacement_target)
-        api.json[f"{_BASE}/issues/3"]["title"] = "same-second replacement"
-        api.json[f"{_BASE}/issues/3"]["updated_at"] = _iso(replacement_target)
-    certified_clock.current = same_second_target
-    exhaustive_clock.current = same_second_target
-    await certified.pull(same_second_target)
-    await exhaustive.pull(same_second_target)
-    assert await _managed_snapshot(certified_path) == await _managed_snapshot(exhaustive_path)
-
-
-@pytest.mark.asyncio
-async def test_per_bundle_transport_matches_exhaustive_oracle_and_saves_requests(
+async def test_cold_pull_reuses_catalog_rows_and_skips_proven_empty_endpoints(
     tmp_path: Path,
 ) -> None:
-    optimized_api = FakeAPI()
-    oracle_api = FakeAPI()
-    for api in (optimized_api, oracle_api):
-        rng = random.Random(20260902)  # noqa: S311 - The workload must be reproducible.
-        for number in range(1, 361):
-            pull = number % 5 == 0
-            api.add_issue(number, pull=pull)
-            issue_path = f"{_BASE}/issues/{number}"
-            comments = [
-                {
-                    "id": number * 100 + offset,
-                    "body": f"issue comment {number}:{offset}",
-                    "created_at": _iso(_T0 - timedelta(minutes=offset + 1)),
-                    "updated_at": _iso(_T0 - timedelta(minutes=offset + 1)),
-                    "reactions": {"total_count": 0},
-                }
-                for offset in range(rng.randrange(5))
-            ]
-            api.pages[f"{issue_path}/comments"] = comments
-            api.json[issue_path]["comments"] = len(comments)
-            api.pages[f"{issue_path}/timeline"] = [{"id": number * 1000, "event": "labeled"}]
-            api.pages[f"{issue_path}/events"] = [{"id": number * 1000 + 1, "event": "labeled"}]
-            if number % 7 == 0:
-                api.json[issue_path]["reactions"]["total_count"] = 1
-                api.pages[f"{issue_path}/reactions"] = [{"id": number * 1000 + 2, "content": "+1"}]
-            if not pull:
-                continue
-            pull_path = f"{_BASE}/pulls/{number}"
-            users = [{"id": number, "login": f"user-{number}"}] if number % 10 == 0 else []
-            review_comments = [
-                {
-                    "id": 1_000_000 + number * 100 + offset,
-                    "body": f"review comment {number}:{offset}",
-                    "created_at": _iso(_T0 - timedelta(minutes=offset + 1)),
-                    "updated_at": _iso(_T0 - timedelta(minutes=offset + 1)),
-                    "reactions": {"total_count": 0},
-                }
-                for offset in range(rng.randrange(4))
-            ]
-            api.json[pull_path] = {
-                "id": number * 10,
-                "changed_files": 0,
-                "commits": 0,
-                "review_comments": len(review_comments),
-                "requested_reviewers": users,
-                "requested_teams": [],
+    api = FakeAPI()
+    rng = random.Random(20260902)  # noqa: S311 - The workload must be reproducible.
+    for number in range(1, 361):
+        pull = number % 5 == 0
+        api.add_issue(number, pull=pull)
+        issue_path = f"{_BASE}/issues/{number}"
+        comments = [
+            {
+                "id": number * 100 + offset,
+                "body": f"issue comment {number}:{offset}",
+                "created_at": _iso(_T0 - timedelta(minutes=offset + 1)),
+                "updated_at": _iso(_T0 - timedelta(minutes=offset + 1)),
+                "reactions": {"total_count": 0},
             }
-            api.json[f"{pull_path}/requested_reviewers"] = {"users": users, "teams": []}
-            api.pages[f"{pull_path}/comments"] = review_comments
+            for offset in range(rng.randrange(5))
+        ]
+        api.pages[f"{issue_path}/comments"] = comments
+        api.json[issue_path]["comments"] = len(comments)
+        api.pages[f"{issue_path}/timeline"] = [{"id": number * 1000, "event": "labeled"}]
+        api.pages[f"{issue_path}/events"] = [{"id": number * 1000 + 1, "event": "labeled"}]
+        if number % 7 == 0:
+            api.json[issue_path]["reactions"]["total_count"] = 1
+            api.pages[f"{issue_path}/reactions"] = [{"id": number * 1000 + 2, "content": "+1"}]
+        if not pull:
+            continue
+        pull_path = f"{_BASE}/pulls/{number}"
+        users = [{"id": number, "login": f"user-{number}"}] if number % 10 == 0 else []
+        review_comments = [
+            {
+                "id": 1_000_000 + number * 100 + offset,
+                "body": f"review comment {number}:{offset}",
+                "created_at": _iso(_T0 - timedelta(minutes=offset + 1)),
+                "updated_at": _iso(_T0 - timedelta(minutes=offset + 1)),
+                "reactions": {"total_count": 0},
+            }
+            for offset in range(rng.randrange(4))
+        ]
+        api.json[pull_path] = {
+            "id": number * 10,
+            "changed_files": 0,
+            "commits": 0,
+            "review_comments": len(review_comments),
+            "requested_reviewers": users,
+            "requested_teams": [],
+        }
+        api.json[f"{pull_path}/requested_reviewers"] = {"users": users, "teams": []}
+        api.pages[f"{pull_path}/comments"] = review_comments
 
-    optimized_path = tmp_path / "optimized"
-    oracle_path = tmp_path / "oracle"
-    optimized = await GitHubPuller(
-        _config(optimized_path, bundle_mode="optimized", concurrency=32),
-        api=optimized_api,
+    await GitHubPuller(
+        _config(tmp_path / "archive", concurrency=32),
+        api=api,
         now=lambda: _T0,
     ).pull(_T0)
-    oracle = await GitHubPuller(
-        _config(oracle_path, bundle_mode="exhaustive", concurrency=32),
-        api=oracle_api,
-        now=lambda: _T0,
-    ).pull(_T0)
 
-    assert await _managed_snapshot(optimized_path) == await _managed_snapshot(oracle_path)
-    assert optimized.requests < oracle.requests * 0.7
     repository_feeds = {f"{_BASE}/issues/comments", f"{_BASE}/pulls/comments"}
-    assert not any(call[1] in repository_feeds for call in optimized_api.calls)
-    optimized_roots = [
+    assert not any(call[1] in repository_feeds for call in api.calls)
+    fetched_roots = [
         call
-        for call in optimized_api.calls
+        for call in api.calls
         if call[0] == "json" and re.fullmatch(rf"{re.escape(_BASE)}/issues/\d+", call[1])
     ]
-    oracle_roots = [
-        call
-        for call in oracle_api.calls
-        if call[0] == "json" and re.fullmatch(rf"{re.escape(_BASE)}/issues/\d+", call[1])
-    ]
-    assert (len(optimized_roots), len(oracle_roots)) == (0, 360)
-    nonempty_comments = sum(bool(optimized_api.pages[f"{_BASE}/issues/{number}/comments"]) for number in range(1, 361))
-    optimized_comment_calls = sum(
+    assert fetched_roots == []
+    nonempty_comments = sum(bool(api.pages[f"{_BASE}/issues/{number}/comments"]) for number in range(1, 361))
+    comment_calls = sum(
         call[0] == "page" and re.fullmatch(rf"{re.escape(_BASE)}/issues/\d+/comments", call[1]) is not None
-        for call in optimized_api.calls
+        for call in api.calls
     )
-    oracle_comment_calls = sum(
-        call[0] == "page" and re.fullmatch(rf"{re.escape(_BASE)}/issues/\d+/comments", call[1]) is not None
-        for call in oracle_api.calls
-    )
-    assert (optimized_comment_calls, oracle_comment_calls) == (nonempty_comments, 360)
-    assert not any(call[1].endswith("/requested_reviewers") for call in optimized_api.calls)
-    assert sum(call[1].endswith("/requested_reviewers") for call in oracle_api.calls) == 72
+    assert comment_calls == nonempty_comments
+    assert not any(call[1].endswith("/requested_reviewers") for call in api.calls)
 
 
 @pytest.mark.asyncio
@@ -1183,36 +1000,19 @@ async def test_requested_team_uses_richer_dedicated_response(tmp_path: Path) -> 
 
 
 @pytest.mark.asyncio
-async def test_large_random_issue_and_comment_churn_matches_exhaustive_oracle(tmp_path: Path) -> None:
+async def test_large_random_observable_issue_and_comment_churn(tmp_path: Path) -> None:
     rng = random.Random(20260901)  # noqa: S311 - The workload must be reproducible, not unpredictable.
-    certified_api = FakeAPI()
-    exhaustive_api = FakeAPI()
-    _seed_churn_api(certified_api, 96)
-    _seed_churn_api(exhaustive_api, 96)
-    certified_clock = Clock(_T0)
-    exhaustive_clock = Clock(_T0)
-    certified_path = tmp_path / "certified-churn"
-    exhaustive_path = tmp_path / "exhaustive-churn"
-    certified = GitHubPuller(
-        _config(certified_path, catalog_mode="certified", concurrency=32),
-        api=certified_api,
-        now=certified_clock,
-        sleep=certified_clock.sleep,
+    api = FakeAPI()
+    _seed_churn_api(api, 96)
+    clock = Clock(_T0)
+    archive = tmp_path / "churn"
+    puller = GitHubPuller(
+        _config(archive, concurrency=32),
+        api=api,
+        now=clock,
+        sleep=clock.sleep,
     )
-    exhaustive = GitHubPuller(
-        _config(
-            exhaustive_path,
-            catalog_mode="exhaustive",
-            bundle_mode="exhaustive",
-            concurrency=32,
-        ),
-        api=exhaustive_api,
-        now=exhaustive_clock,
-        sleep=exhaustive_clock.sleep,
-    )
-    await certified.pull(_T0)
-    await exhaustive.pull(_T0)
-    assert await _managed_snapshot(certified_path) == await _managed_snapshot(exhaustive_path)
+    await puller.pull(_T0)
 
     next_number = 97
     next_comment = 1_000_000
@@ -1225,13 +1025,13 @@ async def test_large_random_issue_and_comment_churn_matches_exhaustive_oracle(tm
     for epoch in range(1, 21):
         target = _T0 + timedelta(hours=epoch)
         changed_at = target - timedelta(minutes=1)
-        current = sorted(item["number"] for item in certified_api.catalog)
+        current = sorted(item["number"] for item in api.catalog)
         deleted = set(rng.sample(current, 2)) if epoch % 2 == 0 else set()
         old_survivors = [number for number in current if number not in deleted]
         selected = rng.sample(old_survivors, 12)
         operations: list[tuple[int, str, int]] = []
         for number in selected:
-            comments = certified_api.pages.get(f"{_BASE}/issues/{number}/comments", [])
+            comments = api.pages.get(f"{_BASE}/issues/{number}/comments", [])
             if comments and rng.random() < 0.5:
                 comment = rng.choice(comments)
                 operations.append((number, "delete", int(comment["id"])))
@@ -1244,21 +1044,18 @@ async def test_large_random_issue_and_comment_churn_matches_exhaustive_oracle(tm
         next_number += len(added)
         added_total += len(added)
         deleted_total += len(deleted)
-        for api in (certified_api, exhaustive_api):
-            _apply_churn_epoch(
-                api,
-                deleted=deleted,
-                added=added,
-                comment_operations=operations,
-                changed_at=changed_at,
-            )
+        _apply_churn_epoch(
+            api,
+            deleted=deleted,
+            added=added,
+            comment_operations=operations,
+            changed_at=changed_at,
+        )
 
-        certified_clock.current = target
-        exhaustive_clock.current = target
-        call_start = len(certified_api.calls)
-        await certified.pull(target)
-        await exhaustive.pull(target)
-        epoch_calls = certified_api.calls[call_start:]
+        clock.current = target
+        call_start = len(api.calls)
+        await puller.pull(target)
+        epoch_calls = api.calls[call_start:]
         root_scans = sum(call[0] == "page" and call[1] == f"{_BASE}/issues" for call in epoch_calls)
         if deleted:
             assert root_scans == 3
@@ -1277,16 +1074,26 @@ async def test_large_random_issue_and_comment_churn_matches_exhaustive_oracle(tm
             else {number for number, operation, _ in operations if operation == "add"}
         )
         assert fetched_roots == expected_roots
-        assert await _managed_snapshot(certified_path) == await _managed_snapshot(exhaustive_path)
+        heads = await _current(archive)
+        present = {number for number, head in heads.items() if head.present}
+        expected_present = {item["number"] for item in api.catalog}
+        assert present == expected_present
+        for number in expected_present:
+            bundle = heads[number].bundle
+            assert bundle is not None
+            expected_comments = api.pages.get(f"{_BASE}/issues/{number}/comments", [])
+            assert [(item["id"], item["body"]) for item in bundle["issue_comments"]] == [
+                (item["id"], item["body"]) for item in expected_comments
+            ]
+        assert all(not heads[number].present for number in deleted)
 
     assert (added_total, deleted_total) == (60, 20)
     assert comment_additions + comment_deletions == 240
     assert comment_additions > 0
     assert comment_deletions > 0
     assert (fast_epochs, fallback_epochs) == (10, 10)
-    assert len(certified_api.catalog) == 136
-    assert len(await _runs(certified_path)) == 21
-    assert len(await _runs(exhaustive_path)) == 21
+    assert len(api.catalog) == 136
+    assert len(await _runs(archive)) == 21
 
 
 @pytest.mark.asyncio

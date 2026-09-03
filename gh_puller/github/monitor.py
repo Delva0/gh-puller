@@ -48,7 +48,7 @@ class ServiceState:
 class ProgressState:
     event_at: datetime | None  # Observation time of the journal event.
     phase: str  # Puller phase name.
-    target_at: str | None  # Requested coverage watermark T.
+    target_at: str | None  # Requested observation watermark T.
     run_id: int | None  # Durable run identity, if allocated.
     catalog_seen: int  # Catalog rows scanned in the active pass.
     catalog_total: int | None  # Certified current Issue + PR count.

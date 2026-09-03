@@ -15,10 +15,11 @@ The following source packages and files were used as context for this document:
 # GitHub raw fact archive
 
 `gh_puller.github` maintains one SQLite database as the durable source of truth for
-GitHub Issues, pull requests, and their related resources. A successful pull proves
-catalog completeness, retains every distinct raw payload it observes, and publishes
-one run for each target T. The same database supports direct
-current-state reads and full offline reconstruction without GitHub access.
+the GitHub Issue and pull-request facts it observes. A successful pull retains every
+distinct raw payload it obtains and publishes one run for each target T. Downstream
+jobs can read current state or rebuild the complete observed history without GitHub
+access. GitHub states that never reach a supported API response are outside this
+contract.
 
 Sources: [gh_puller/github/](../gh_puller/github/)
 
@@ -30,25 +31,25 @@ flowchart TD
     Pending --> Future{"T is in the future?"}
     Future -->|yes| Prefetch["Prefetch current observations"]
     Prefetch --> Wait["Wait until T"]
-    Future -->|no| Discover["Read deltas, child signals, exact count"]
+    Future -->|no| Discover["Read parent and comment signals plus exact count"]
     Wait --> Discover
-    Discover --> Cert{"Cardinality certificate holds?"}
-    Cert -->|yes| Dirty["Fetch changed or signaled parents"]
-    Cert -->|no| Full["Stable full catalog and metadata diff"]
-    Dirty --> Stage["Durably stage content-addressed versions"]
-    Full --> Stage
+    Discover --> Cert{"Parent membership is proved?"}
+    Cert -->|yes| Select["Select changed or signaled Issue/PR"]
+    Cert -->|no| Full["Stabilize full parent membership"]
+    Full --> Select
+    Select --> Stage["Fetch supported resources and durably stage versions"]
     Stage --> Publish["Atomically publish heads, run, T, and C"]
     Publish --> Read["Read current heads or replay all versions"]
 ```
 
 Sources: [gh_puller/github/](../gh_puller/github/)
 
-## T is a coverage watermark
+## T is an observation watermark
 
-`GitHubPuller.pull(T)` is asynchronous and returns only after coverage through T has
-been closed and published. T may be any timezone-aware timestamp. If omitted, the
-function freezes the call time before its first `await`. If T is in the future, the
-puller prefetches available data, waits until T, and performs a final closure pass.
+`GitHubPuller.pull(T)` is asynchronous and returns only after its final observation
+pass for T has been published. T may be any timezone-aware timestamp. If omitted,
+the function freezes the call time before its first `await`. If T is in the future,
+the puller prefetches available data, waits until T, and performs a final pass.
 
 T is not a historical snapshot timestamp. A run may contain facts observed while the
 operation was in progress, while the database records the actual completion time C
@@ -56,14 +57,15 @@ separately. Normalized UTC T is the complete idempotency key: the first success
 publishes one run, and every retry returns that original run without an HTTP request
 or logical archive-state change. Cancellation, detectable truncation, or an
 unrecoverable API error leaves the run pending and publishes nothing; retrying T
-resumes its durable work.
+resumes its durable work. T does not assert that GitHub exposes every fact through an
+incremental signal. The detection boundary is defined below.
 
 The pull protocol does not round or interpret T. UTC boundary alignment belongs only
 to the configurable CLI scheduler.
 
 Sources: [gh_puller/github/](../gh_puller/github/); [tests/test_github_puller.py](../tests/test_github_puller.py); [tests/test_github_cli.py](../tests/test_github_cli.py)
 
-## Certified increments and the exhaustive oracle
+## Incremental observation and parent membership
 
 The REST repository-Issues endpoint is the catalog and includes both ordinary Issues
 and pull requests. The client requests GitHub's full JSON media type and keeps each
@@ -75,8 +77,8 @@ catalog membership signatures agree.
 
 GitHub documents the mixed Issue/PR catalog and `since` filter in
 [List repository issues](https://docs.github.com/en/rest/issues/issues#list-repository-issues).
-GraphQL supplies only the exact count used by the proof; its projected data is never
-stored as archive content.
+GraphQL supplies only the exact count used by the parent-membership proof; its
+projected count is not stored as archive content.
 
 Let W be the preceding completed observation watermark. An incremental pass launches
 four discovery operations together:
@@ -103,35 +105,37 @@ total. GitHub's current catalog satisfies:
 M - F = N - D + A
 ```
 
-The fast path accepts only `M - F = N + A`; comparison with the identity proves
+The incremental path accepts only `M - F = N + A`; comparison with the identity proves
 `D = 0`. Additions cannot conceal deletions because A is counted independently.
 Duplicate numbers, changed identities, invalid timestamps, an unavailable exact
-count, or a failed equality selects the stable full scan. That path identifies
-deleted parents without fetching surviving bundle bodies. The final plan writes a
-tombstone for each absent parent, refreshes each new or changed root and each
-child-signal parent, and reuses every unchanged survivor.
+count, or a failed equality selects the stable full membership scan. That path
+identifies deleted parents without fetching every surviving Issue/PR body. The final
+plan writes a tombstone for each absent parent, refreshes each new or changed root and
+each comment-signaled parent, and reuses every unchanged survivor.
 
-`catalog_mode="exhaustive"` deliberately refreshes every surviving bundle after the
-stable scan and acts as the slower correctness oracle. Differential tests compare
-complete committed version streams, not only final heads, over exhaustive small
-transitions, 5,000-object catalog churn, and randomized Issue/comment additions and
-deletions. They also assert that a deletion-triggered production fallback fetches
-only the changed parent set while remaining byte-equivalent to the oracle.
+The puller intentionally does not reread every old Issue/PR merely to search for a
+silent child-resource change. Its discovery guarantees and limitations are:
 
-Repository comment deltas report existing comments changed after `since`; they do not
-enumerate deleted rows. A child deletion is selected when GitHub changes its parent
-root or emits another signal for that parent. Parent deletion is independent of this
-upstream behavior because the catalog proof detects absence directly. Facts already
-unavailable from every GitHub endpoint before observation remain outside the archive
-boundary.
-
-Bundle materialization chooses a transport only when its archived payload is equal
-to the per-parent REST result. `bundle_mode="exhaustive"` disables these choices and
-is the transport oracle used by differential tests:
-
-| Resource | Optimized transport | Completeness check |
+| GitHub change | How it is selected | Boundary |
 | --- | --- | --- |
-| Issue root | Reuse the unprojected full-JSON REST catalog row. A signal-only parent uses the individual Issue endpoint. | Identity, kind, and timestamps must agree with the certified catalog state. |
+| New Issue/PR or changed parent fields | Repository Issue/PR delta | GitHub must return the parent through its `since` behavior. |
+| Deleted Issue/PR previously observed by this database | Exact-count proof falls back to a stable full membership scan | A parent already unavailable before the first observation has no historical row to retain. |
+| Added or edited Issue comment | Repository Issue-comment delta | The selected parent is reread from its supported per-parent endpoints. |
+| Added or edited PR review comment | Repository PR-review-comment delta | The selected PR is reread from its supported per-parent endpoints. |
+| Deleted comment, reaction change, timeline/event change, review change, commit/file change, or reviewer change | Parent refresh after another observable signal | There is no deliberate repository-wide scan for these resources, so a change with no parent/comment signal may remain undiscovered. |
+| Multiple changes between observations | Latest supported endpoint response after selection | Intermediate states that disappear before an API response are not recoverable. |
+
+Once an Issue/PR is selected, the puller reads every page returned by each supported
+per-parent endpoint and checks identities, aggregate counts where meaningful, and
+pagination shape. A newly observed response is retained without projecting away
+unknown fields. This is lossless storage of observed data, not a claim that GitHub's
+APIs expose every web-page fact or every historical state.
+
+## Resource transport and detectable consistency
+
+| Resource | Transport | Detectable consistency check |
+| --- | --- | --- |
+| Issue root | Reuse the unprojected full-JSON REST catalog row. A signal-only parent uses the individual Issue endpoint. | Identity, kind, and timestamps must agree with the parent catalog state. |
 | Issue comments | Read the complete per-parent collection; skip the call only when the root has an exact zero and no repository signal selected the parent. | Comment identities must be unique. A repository signal overrides the zero shortcut. |
 | PR review comments | Read the complete per-parent collection; skip only on an exact zero with no repository signal. | Comment identities must be unique; a signal overrides the shortcut. |
 | Issue reactions | No collection request when detail reports `total_count == 0` | Zero is itself the complete collection; every nonzero or absent count still paginates and is checked against the aggregate. |
@@ -164,10 +168,7 @@ ceil(N / 100) + 1 + 2I + 6P
 The first terms are the REST catalog and one GraphQL count. An empty Issue still reads
 timeline and events. An empty PR additionally reads PR detail, reviews, diff, and
 patch. Non-empty comments, reactions, commits, files, review teams, pagination, and
-media fallback add their actual requests. The exhaustive transport oracle instead
-reads every candidate endpoint even when an aggregate is zero. A randomized
-360-object differential workload requires the optimized path to retain the same
-committed byte content with fewer than 70% of the oracle's attempts.
+media fallback add their actual requests.
 
 Primary or secondary limiting waits outside the transient-retry budget, so a cold
 start may span quota windows while remaining one blocking `pull(T)` call. Bundle work
@@ -502,7 +503,8 @@ validator reuse, pass-local progress, zero-request idempotent reuse, observer fa
 isolation, TTY and JSON progress, rate-limit waits, current-head visibility, single-
 and multi-page conditional validation, 100→101 page growth, content deduplication,
 tombstones, cancellation, completion-order durable resume, concurrent duplicate calls,
-scheduler recovery, and differential equivalence to the exhaustive oracle.
+scheduler recovery, randomized observable churn, parent-deletion fallback, and the
+request-saving shortcuts used while materializing selected Issue/PR records.
 
 The daemon tests additionally verify unit rendering, repeatable installation and
 uninstallation, archive preservation, database-scoped controls, repository-binding

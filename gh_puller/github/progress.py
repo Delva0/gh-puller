@@ -35,9 +35,9 @@ class APIProgress:
 class PullProgress:
     event_at: datetime  # Event observation time.
     phase: str  # Current pull phase.
-    target_at: datetime  # Requested coverage watermark T.
+    target_at: datetime  # Requested observation watermark T.
     run_id: int | None = None  # Durable pull run once allocated.
-    pass_at: datetime | None = None  # Cutoff of the active closure pass.
+    pass_at: datetime | None = None  # Cutoff of the active observation pass.
     catalog_seen: int = 0  # Root rows scanned, then certified current objects.
     catalog_total: int | None = None  # Certified current object count when known.
     bundles_completed: int = 0  # Durable bundles completed for the current run plan.

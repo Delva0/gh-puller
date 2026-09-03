@@ -67,8 +67,6 @@ def test_parser_builds_once_config_and_normalizes_target() -> None:
             "2026-09-02T20:30:00+08:00",
             "--concurrency",
             "8",
-            "--catalog-mode",
-            "exhaustive",
             "--no-progress",
         ],
     )
@@ -77,7 +75,6 @@ def test_parser_builds_once_config_and_normalizes_target() -> None:
     assert args.target == _T0 + timedelta(minutes=30)
     assert config.repository == "acme/widgets"
     assert config.concurrency == 8
-    assert config.catalog_mode == "exhaustive"
     assert args.no_progress is True
 
 

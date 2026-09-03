@@ -1,7 +1,7 @@
 """提供遵守 GitHub 限流恢复契约的异步 API 读取层。
 
 本模块只负责 HTTP、条件校验、分页、仓库对象精确计数与重试，不解释 Issue/PR
-数据，也不写归档。覆盖水位与持久化契约见 ``gh_puller.github``。
+数据，也不写归档。观测水位与持久化契约见 ``gh_puller.github``。
 """
 
 from __future__ import annotations

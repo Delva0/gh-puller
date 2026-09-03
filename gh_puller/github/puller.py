@@ -1,4 +1,4 @@
-"""编排 GitHub 原始事实拉取、覆盖水位与 SQLite 原子发布。
+"""编排 GitHub 原始事实拉取、观测水位与 SQLite 原子发布。
 
 协议边界与时间语义见 gh_puller.github；持久化细节由 store 负责。本模块不把
 归档解释为派生知识，也不下载正文中链接的站外附件。
@@ -33,24 +33,14 @@ if TYPE_CHECKING:
     from .progress import ProgressObserver
 
 _NUMBER_AT_END = re.compile(r"/(\d+)$")
-_CATALOG_MODES = {"certified", "exhaustive"}
-_BUNDLE_MODES = {"optimized", "exhaustive"}
 
 
 class IncompleteGitHubDataError(RuntimeError):
-    """GitHub 的可检测截断会破坏全量契约。"""
+    """GitHub 响应存在拉取器能够证明的不一致或截断。"""
 
 
 class _API(Protocol):
     request_count: int
-
-    async def get_json(
-        self,
-        path: str,
-        *,
-        params: dict[str, Any] | None = None,
-        accept: str | None = None,
-    ) -> Any: ...
 
     async def get_json_cached(
         self,
@@ -106,8 +96,6 @@ class GitHubPullConfig:
     request_timeout: float = 30.0  # Per-request timeout in seconds.
     transient_retries: int = 5  # Network/5xx retry budget; rate limits wait separately.
     overlap_seconds: int = 2  # Replayed boundary for second-resolution GitHub timestamps.
-    catalog_mode: str = "certified"  # exhaustive is the correctness oracle.
-    bundle_mode: str = "optimized"  # exhaustive is the per-parent transport oracle.
 
     def __post_init__(self) -> None:
         parts = self.repository.split("/")
@@ -117,16 +105,12 @@ class GitHubPullConfig:
             raise ValueError("concurrency must be positive")
         if self.overlap_seconds < 1:
             raise ValueError("overlap_seconds must be positive")
-        if self.catalog_mode not in _CATALOG_MODES:
-            raise ValueError(f"catalog_mode must be one of {sorted(_CATALOG_MODES)}")
-        if self.bundle_mode not in _BUNDLE_MODES:
-            raise ValueError(f"bundle_mode must be one of {sorted(_BUNDLE_MODES)}")
         object.__setattr__(self, "destination", Path(self.destination))
 
 
 @dataclass(frozen=True, slots=True)
 class PullResult:
-    target_at: datetime  # Requested coverage watermark.
+    target_at: datetime  # Requested observation watermark.
     completed_at: datetime  # Actual completion time C.
     run_id: int  # Committed SQLite pull-run identity.
     changed_items: int  # Object versions or tombstones published by this run.
@@ -144,7 +128,6 @@ class _CatalogPlan:
     items: dict[int, dict[str, Any]]  # Raw REST catalog objects available in this pass.
     present: set[int]  # Certified membership through the cutoff.
     signals: set[int]  # Parents dirtied by repository-wide child feeds.
-    force_all: bool  # Whether every surviving bundle must be fetched.
 
 
 class GitHubPuller:
@@ -179,7 +162,7 @@ class GitHubPuller:
         """完成一次增量拉取并原子发布一个事实库 run。
 
         Args:
-            target: 需要覆盖到的时刻；None 在进入本函数、任何 await 之前取当前
+            target: 需要观测到的时刻；None 在进入本函数、任何 await 之前取当前
                 UTC 时刻。显式值必须带时区。未来值会先预拉已有数据，再等待并
                 做最终闭合。
 
@@ -335,11 +318,9 @@ class GitHubPuller:
         if observed is not None and cutoff <= observed:
             return observed
         plan = await self._catalog_plan(api, heads, cutoff, observed, progress)
-        candidates = (
-            set(plan.present)
-            if plan.force_all
-            else {number for number, item in plan.items.items() if _needs_refresh(heads.get(number), item)}
-        )
+        candidates = {
+            number for number, item in plan.items.items() if _needs_refresh(heads.get(number), item)
+        }
         candidates.update(plan.signals)
         candidates.intersection_update(plan.present)
         carried = [
@@ -403,14 +384,11 @@ class GitHubPuller:
         progress: _PullProgressTracker,
     ) -> _CatalogPlan:
         if observed is None:
-            if self.config.catalog_mode == "exhaustive":
-                catalog = await self._stable_catalog(api, cutoff, progress)
-                return _full_plan(catalog, force_all=False)
-            return _full_plan(await self._counted_catalog(api, cutoff, progress), force_all=False)
+            return _full_plan(await self._counted_catalog(api, cutoff, progress))
 
         previous = {number: head for number, head in heads.items() if head.present}
         if not previous:
-            return _full_plan(await self._stable_catalog(api, cutoff, progress), force_all=False)
+            return _full_plan(await self._stable_catalog(api, cutoff, progress))
 
         since = _iso_seconds(observed - timedelta(seconds=self.config.overlap_seconds))
         progress.catalog_scan()
@@ -444,18 +422,14 @@ class GitHubPuller:
 
         certified = _certified_head_merge(previous, delta, current_count, cutoff)
         signals = issue_signals | review_signals
-        if self.config.catalog_mode == "exhaustive":
-            full = _full_plan(await self._stable_catalog(api, cutoff, progress), force_all=True)
-            return _overlay_plan(full, delta, signals, cutoff)
         if certified is None:
-            full = _full_plan(await self._stable_catalog(api, cutoff, progress), force_all=False)
+            full = _full_plan(await self._stable_catalog(api, cutoff, progress))
             return _overlay_plan(full, delta, signals, cutoff)
         present, items = certified
         return _CatalogPlan(
             items=items,
             present=present,
             signals=signals,
-            force_all=False,
         )
 
     async def _counted_catalog(
@@ -559,7 +533,7 @@ class GitHubPuller:
             previous = heads.get(number)
             previous_bundle = None
             previous_cache = None
-            if self.config.bundle_mode == "optimized" and previous is not None:
+            if previous is not None:
                 previous_bundle, previous_cache = await archive.load_bundle_state(
                     previous.bundle_digest,
                 )
@@ -568,11 +542,7 @@ class GitHubPuller:
                 summary,
                 previous_bundle,
                 previous_cache,
-                catalog_issue=(
-                    summary
-                    if stored_summary is not None and self.config.bundle_mode == "optimized"
-                    else None
-                ),
+                catalog_issue=summary if stored_summary is not None else None,
                 force_comments=number in comment_signals,
             )
             if stored_summary is None:
@@ -642,11 +612,7 @@ class GitHubPuller:
             _set_cache(http_cache, "issue", cache)
         else:
             issue = catalog_issue
-        if (
-            self.config.bundle_mode == "optimized"
-            and not force_comments
-            and _is_zero_integer(issue.get("comments"))
-        ):
+        if not force_comments and _is_zero_integer(issue.get("comments")):
             comments = []
         else:
             comments, cache = await self._cached_page(
@@ -671,7 +637,7 @@ class GitHubPuller:
             _dict_field(previous_cache, "events"),
         )
         _set_cache(http_cache, "events", cache)
-        if self.config.bundle_mode == "optimized" and _is_zero_count(issue.get("reactions")):
+        if _is_zero_count(issue.get("reactions")):
             reactions = []
         else:
             reactions, cache = await self._cached_page(
@@ -745,11 +711,7 @@ class GitHubPuller:
             _dict_field(previous_cache, "reviews"),
         )
         _set_cache(http_cache, "reviews", cache)
-        if (
-            self.config.bundle_mode == "optimized"
-            and not force_comments
-            and _is_zero_integer(pull.get("review_comments"))
-        ):
+        if not force_comments and _is_zero_integer(pull.get("review_comments")):
             review_comments = []
         else:
             review_comments, cache = await self._cached_page(
@@ -760,7 +722,7 @@ class GitHubPuller:
             )
             _set_cache(http_cache, "review_comments", cache)
         review_comments = _canonical_comments(review_comments)
-        if self.config.bundle_mode == "optimized" and _is_zero_integer(pull.get("commits")):
+        if _is_zero_integer(pull.get("commits")):
             commits = []
         else:
             commits, cache = await self._cached_page(
@@ -770,9 +732,7 @@ class GitHubPuller:
                 _dict_field(previous_cache, "commits"),
             )
             _set_cache(http_cache, "commits", cache)
-        if self.config.bundle_mode == "optimized" and _is_zero_integer(
-            pull.get("changed_files"),
-        ):
+        if _is_zero_integer(pull.get("changed_files")):
             files = []
         else:
             files, cache = await self._cached_page(
@@ -782,7 +742,7 @@ class GitHubPuller:
                 _dict_field(previous_cache, "files"),
             )
             _set_cache(http_cache, "files", cache)
-        requested_reviewers = _embedded_review_requests(pull) if self.config.bundle_mode == "optimized" else None
+        requested_reviewers = _embedded_review_requests(pull)
         if requested_reviewers is None:
             requested_reviewers, cache = await self._cached_json(
                 api,
@@ -856,9 +816,6 @@ class GitHubPuller:
         previous: dict[str, Any] | None,
         cache: dict[str, Any] | None,
     ) -> tuple[dict[str, Any], dict[str, Any] | None]:
-        if self.config.bundle_mode == "exhaustive":
-            value = await api.get_json(path)
-            return value, None
         value, updated = await api.get_json_cached(
             path,
             previous=previous,
@@ -875,8 +832,6 @@ class GitHubPuller:
         previous: list[dict[str, Any]] | None,
         cache: dict[str, Any] | None,
     ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
-        if self.config.bundle_mode == "exhaustive":
-            return await api.paginate(path), None
         return await api.paginate_cached(
             path,
             previous=previous,
@@ -933,8 +888,6 @@ class GitHubPuller:
         previous: str | None,
         cache: dict[str, Any] | None,
     ) -> tuple[str, dict[str, Any] | None]:
-        if self.config.bundle_mode == "exhaustive":
-            return await api.get_text(path, accept=accept), None
         return await api.get_text_cached(
             path,
             accept=accept,
@@ -1019,11 +972,11 @@ async def incremental_pull(
     *,
     observer: ProgressObserver | None = None,
 ) -> PullResult:
-    """执行一次完整的增量拉取。
+    """执行一次增量观测并原子发布结果。
 
     Args:
         config: 仓库、SQLite 事实库与请求策略。
-        target: 覆盖目标；None 在函数入口冻结为当前 UTC 时刻。
+        target: 观测目标；None 在函数入口冻结为当前 UTC 时刻。
         observer: 同步带外进度观察器；失败不影响事实拉取。
 
     Returns:
@@ -1135,7 +1088,7 @@ def _unique_catalog(items: list[dict[str, Any]]) -> dict[int, dict[str, Any]] | 
     return result
 
 
-def _full_plan(catalog: list[dict[str, Any]], *, force_all: bool) -> _CatalogPlan:
+def _full_plan(catalog: list[dict[str, Any]]) -> _CatalogPlan:
     indexed = _unique_catalog(catalog)
     if indexed is None:
         raise IncompleteGitHubDataError("GitHub catalog contains duplicate or invalid numbers")
@@ -1143,7 +1096,6 @@ def _full_plan(catalog: list[dict[str, Any]], *, force_all: bool) -> _CatalogPla
         items=indexed,
         present=set(indexed),
         signals=set(),
-        force_all=force_all,
     )
 
 
@@ -1169,7 +1121,6 @@ def _overlay_plan(
         items=items,
         present=plan.present,
         signals=signals,
-        force_all=plan.force_all,
     )
 
 

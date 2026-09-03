@@ -67,7 +67,6 @@ def _add_common_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--request-timeout", type=float, default=30.0)
     parser.add_argument("--transient-retries", type=int, default=5)
     parser.add_argument("--overlap-seconds", type=int, default=2)
-    parser.add_argument("--catalog-mode", choices=("certified", "exhaustive"), default="certified")
     parser.add_argument("--no-progress", action="store_true", help="disable progress on stderr")
 
 
@@ -100,7 +99,6 @@ def _config(args: argparse.Namespace) -> GitHubPullConfig:
         request_timeout=args.request_timeout,
         transient_retries=args.transient_retries,
         overlap_seconds=args.overlap_seconds,
-        catalog_mode=args.catalog_mode,
     )
 
 
