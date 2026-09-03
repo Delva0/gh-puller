@@ -170,7 +170,7 @@ Sources: [gh_puller/github/](../gh_puller/github/); [tests/test_github_puller.py
 | PR review comments | REST or GraphQL | REST follows its flat collection. GraphQL closes both `reviewThreads` pagination and each thread's comment pagination before flattening unique comments. |
 | Reactions | REST or GraphQL when the reactable has a node ID; otherwise REST | An exact aggregate zero avoids the operation. Nonzero collections close pagination and are checked against the aggregate where available. |
 | PR commits | REST or GraphQL; no operation for an exact zero | GraphQL closes the full commit connection without the REST 250-entry cap. REST uses the PR endpoint through 250 and the exact `base.sha...head.sha` comparison above it. Either result must equal the PR-detail count. |
-| PR code snapshot | Fetch current repository branches and each selected `refs/pull/<number>/head` into the companion bare Git store. Pin the API-observed base/head and comparison objects under immutable archive refs. | A normal PR compares its unique merge-base with head. A PR with no common ancestor compares Git's empty tree with head, matching GitHub's all-files-added semantics. Multiple merge-bases abort rather than select an ambiguous base. |
+| PR code snapshot | Fetch current repository branches and each selected `refs/pull/<number>/head` into the companion bare Git store. Pin every API-observed object that remains reachable. | A complete snapshot uses the unique merge-base, or Git's empty tree for unrelated histories. If an API-named base/head was already unreachable, `comparison_kind` is `unavailable` and `unavailable_commits` identifies the missing SHA instead of inventing a diff. Multiple available merge-bases still abort as ambiguous. |
 | Requested reviewers | Reuse embedded users only when the PR detail contains a valid user list and an empty team list. | Any team or ambiguous embedded value selects the dedicated endpoint, whose team objects carry richer fields. |
 | Issues closed by a PR | Batch up to 100 selected PRs into one GraphQL request, include user-linked Issues, and follow every `closingIssuesReferences` cursor. | Each connection's `totalCount` must equal its unique returned nodes. Missing, duplicate, or malformed data aborts the run instead of becoming an empty relation. |
 | REST-backed per-parent JSON and complete lists | Conditional GET with the prior ETag | Validators are keyed by API root, API version, media type, path, and parameters, and are stored atomically with the exact record they validate. A reusable list needs an ETag on every page and a terminal page below 100 entries. Any changed page restarts complete pagination; a terminal full page is not cached, so 100→101 growth cannot hide. |
@@ -207,25 +207,27 @@ response because its base/head range is exact and its commit list can cross that
 The GraphQL commit connection has no corresponding 250-entry branch in the client;
 it follows every cursor and verifies the same advertised total.
 
-PR file content and file membership come from Git objects rather than GitHub's
+PR file content and file membership normally come from Git objects rather than GitHub's
 [3,000-file-limited PR collection](https://docs.github.com/en/rest/pulls/pulls#list-pull-requests-files).
-The bundle records stable `base_ref`, `head_ref`, and
-`comparison_ref` names plus their SHAs and `comparison_kind`. Running `git diff`
-between `comparison_ref` and `head_ref` reconstructs the complete code change even
-when it exceeds 3,000 files. Git fetch traffic consumes repository bandwidth but not
-the REST `core` or GraphQL primary-rate-limit buckets. See
+When `comparison_kind` is `merge_base` or `empty_tree`, the bundle records stable
+`base_ref`, `head_ref`, and `comparison_ref` names; running `git diff` between the
+comparison and head refs reconstructs the complete code change even beyond 3,000
+files. An `unavailable` manifest retains both API SHAs, every ref that could still be
+pinned, and the exact missing commit list, but has no `comparison_ref`. Git fetch
+traffic consumes repository bandwidth but not the REST `core` or GraphQL
+primary-rate-limit buckets. See
 [git-fetch](https://git-scm.com/docs/git-fetch),
 [git-update-ref](https://git-scm.com/docs/git-update-ref), and
 [git-diff](https://git-scm.com/docs/git-diff).
 
-Snapshot pinning requires the API-named base and head in the local object store. If
-either ref changed between batch prefetch and the PR-detail response, the store
-refreshes only the branch refs or PR head needed by that object and retries once. A
-required object still absent after that refresh aborts the task. The PR detail always
+Snapshot pinning first uses the repository branches and PR heads fetched for the
+current batch. A head that moved after prefetch receives one targeted refresh. If an
+API-named base or head is still absent, the store publishes the explicit partial
+manifest rather than blocking unrelated Issue/PR records. The PR detail always
 retains GitHub's `merge_commit_sha`; the Git manifest adds `merge_commit_ref` only
-when that commit is reachable in the local store. A merge commit left behind by a
-deleted target branch therefore remains an observed API fact without becoming a
-dangling Git ref or blocking the run.
+when that commit is reachable locally. Deleted or force-pushed history therefore
+remains an observed API fact without becoming a dangling Git ref or a fabricated code
+snapshot.
 
 Sources: [gh_puller/github/](../gh_puller/github/); [tests/test_github_git_store.py](../tests/test_github_git_store.py)
 
@@ -340,12 +342,12 @@ heads:
   they validate. Offline readers ignore it.
 
 The companion `DATABASE.git` directory is a bare repository bound to the same GitHub
-repository as SQLite. Archive-owned refs pin each observed PR base, head, comparison
-base, and available merge commit, so remote branch deletion or force-push cannot make
-an already published code snapshot unreachable. The comparison base is the unique
-merge-base for an ordinary PR and Git's empty tree for an unrelated-history PR. A
-merge SHA whose object was already unreachable at observation time remains in PR
-detail without an archive-owned merge ref.
+repository as SQLite. Archive-owned refs pin each reachable PR base, head, comparison
+base, and merge commit, so a complete published snapshot survives later branch
+deletion or force-push. The comparison base is the unique merge-base for an ordinary
+PR and Git's empty tree for an unrelated-history PR. Objects already unreachable at
+observation time produce a partial manifest; their API SHAs remain in SQLite without
+archive-owned refs.
 
 Git refs are durable before the referencing SQLite record is staged. A crash between
 those steps can leave extra unreachable-from-SQLite archive refs, but cannot publish a
@@ -390,9 +392,10 @@ and
 Git stores ordinary blob bytes, executable and symlink modes, tree membership, and
 commit topology. A Git LFS path remains its pointer blob unless LFS content is acquired
 separately, and a submodule remains a gitlink to an external commit. Linked attachments
-and facts that GitHub made unavailable before observation are outside the archive.
+and object content that GitHub no longer makes retrievable at observation time remain
+outside the archive even when an API response still names their SHA.
 A tombstone records a directly observed parent absence without discarding its last
-record. Archive schema 7 pairs this resource set with record schema 5.
+record. Archive schema 7 pairs this resource set with record schema 6.
 
 Sources: [gh_puller/github/](../gh_puller/github/); [tests/test_github_puller.py](../tests/test_github_puller.py); [tests/test_github_git_store.py](../tests/test_github_git_store.py)
 
@@ -407,8 +410,9 @@ HTML, ordering, or presentation.
 | --- | --- | --- |
 | Issue/PR title, raw Markdown body, author, timestamps, state, labels, assignees, and milestone | Yes | Only versions actually observed are retained; GitHub's complete edit history is not an API response. GitHub's server-generated `body_html` and `body_text` variants are not requested, so offline rendering is not byte-identical to GitHub's. |
 | Conversation comments, reactions, and observed timeline/events | Yes | A deletion or silent child change can remain unknown until another signal selects the parent. |
-| PR source and target repository/branch, draft and merge fields | Yes, from PR detail | Names describe the API observation; immutable snapshot refs identify the exact retained trees. |
-| PR commits, complete changed-file set, and code content | Yes, for a selected PR | `git diff comparison_ref head_ref` derives the tree change. Rename/copy heuristics and rendered patch layout depend on local Git options and need not be byte-identical to GitHub's web rendering. |
+| PR source and target repository/branch, draft and merge fields | Yes, from PR detail | Names and SHAs describe the API observation; immutable snapshot refs exist only for Git objects reachable then. |
+| PR commit metadata | Yes, for a selected PR | The API collection is independent of whether every named Git object remains fetchable. |
+| Complete changed-file set and code content | When `comparison_kind` is `merge_base` or `empty_tree` | `git diff comparison_ref head_ref` derives the tree change. An `unavailable` manifest identifies missing commits and makes no completeness claim. Rename/copy heuristics and rendered patch layout depend on local Git options and need not be byte-identical to GitHub's web rendering. |
 | Reviews and review comments | Yes, for a selected PR | Review-thread resolution, CI checks, workflow runs, and deployments are not fetched. |
 | Issue GitHub marks as closable by a selected PR | Yes, from `closing_issues_references` | The relation is GitHub's closing linkage; whether the PR merged and whether the change semantically fixed the Issue remain separate facts. |
 | Forward references written in title/body/comment text | The raw text can be parsed offline | Textual references may be ambiguous or point outside the repository. |
@@ -461,8 +465,8 @@ Folding versions in iterator order reconstructs every committed state. A
 `present=False` version is a tombstone whose retained summary and bundle remain
 available for mining.
 
-For a PR record, read `bundle["pull_request"]["git"]`, then pass its stable refs to
-the companion store:
+For a PR record, read `bundle["pull_request"]["git"]`. When `comparison_kind` is
+`merge_base` or `empty_tree`, pass its stable refs to the companion store:
 
 ```bash
 comparison_ref='refs/gh-puller/snapshots/pulls/7/comparison/COMPARISON_SHA'
@@ -473,6 +477,8 @@ git --git-dir archives/vllm.sqlite3.git diff \
 
 The same refs work with `git show`, `git ls-tree`, and other plumbing commands. They
 are archive identifiers, so consumers need neither the remote PR branch nor GitHub.
+For `comparison_kind="unavailable"`, inspect `unavailable_commits` and only use the
+base/head refs that are present; no complete changed-file set can be derived.
 
 Sources: [gh_puller/github/](../gh_puller/github/); [tests/test_github_puller.py](../tests/test_github_puller.py); [tests/test_github_git_store.py](../tests/test_github_git_store.py)
 
@@ -678,13 +684,14 @@ relations, same-second boundaries, future prefetch history, HTTP validator reuse
 independent primary-quota gates, capacity routing and alternate-transport fallback,
 REST/GraphQL stable-fact equivalence, complete GraphQL commit pagination, REST
 comparison fallback beyond 250 commits, more-than-3,000-file Git snapshots,
-unrelated-history PRs, force-push retention, pass-local progress, ref/API race
-recovery, zero-request idempotent reuse, observer failure isolation, TTY and JSON
-progress, rate-limit waits, current-head visibility, single- and multi-page conditional
-validation, 100→101 page growth, content deduplication, directly observed tombstones,
-cancellation, completion-order durable resume, concurrent duplicate calls, scheduler
-recovery, randomized observable Issue/PR and comment churn, silent-deletion best
-effort, schema validation, and request-saving shortcuts for selected records.
+unrelated-history PRs, partial snapshots for unreachable historical commits,
+force-push retention, pass-local progress, ref/API race recovery, zero-request
+idempotent reuse, observer failure isolation, TTY and JSON progress, rate-limit waits,
+current-head visibility, single- and multi-page conditional validation, 100→101 page
+growth, content deduplication, directly observed tombstones, cancellation,
+completion-order durable resume, concurrent duplicate calls, scheduler recovery,
+randomized observable Issue/PR and comment churn, silent-deletion best effort, schema
+validation, and request-saving shortcuts for selected records.
 
 The daemon tests additionally verify unit rendering, repeatable installation and
 uninstallation, archive preservation, database-scoped controls, repository-binding

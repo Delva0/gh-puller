@@ -39,7 +39,7 @@ if TYPE_CHECKING:
 _NUMBER_AT_END = re.compile(r"/(\d+)$")
 _CLOSING_REFERENCE_BATCH_SIZE = 100
 _CATALOG_ACCEPT = "application/vnd.github.raw+json"
-_BUNDLE_SCHEMA_VERSION = 5
+_BUNDLE_SCHEMA_VERSION = 6
 
 
 class IncompleteGitHubDataError(RuntimeError):

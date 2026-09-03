@@ -93,18 +93,19 @@ class GitObjectStore:
             )
 
     async def capture(self, number: int, pull: dict[str, Any]) -> dict[str, Any]:
-        """固定一个 PR 的精确 base/head Git 对象。
+        """固定一个 PR 当前可达的精确 Git 对象。
 
         Args:
             number: Repository-local PR number。
             pull: GitHub PR detail 原始对象。
 
         Returns:
-            固定的 base/head 与可直接交给 ``git diff`` 的比较基准引用。
-            API 声明的 merge commit 仅在对象已可达时一同固定。
+            base/head 都可达时返回可交给 ``git diff`` 的完整快照；
+            否则固定仍可达的对象并显式标记不可用的比较。API 声明的
+            merge commit 仅在对象已可达时一同固定。
 
         Raises:
-            GitStoreError: SHA 缺失、对象未取得或引用无法持久化。
+            GitStoreError: SHA 非法、可达历史存在多个 merge-base，或引用无法持久化。
         """
         base_sha = _nested_sha(pull, "base", number)
         head_sha = _nested_sha(pull, "head", number)
@@ -129,7 +130,16 @@ class GitObjectStore:
             if missing:
                 try:
                     await self._refresh_missing(number, base_sha, head_sha, missing)
+                    missing = await self._missing_commits(required)
                     pinnable_merge_sha = await self._available_commit(merge_sha)
+                    if missing:
+                        return await self._pin_partial_snapshot(
+                            prefix,
+                            base_sha,
+                            head_sha,
+                            pinnable_merge_sha,
+                            missing,
+                        )
                     return await self._pin_snapshot(
                         number,
                         prefix,
@@ -204,6 +214,36 @@ class GitObjectStore:
         await self._git("update-ref", "--stdin", input_text=commands)
         return result
 
+    async def _pin_partial_snapshot(
+        self,
+        prefix: str,
+        base_sha: str,
+        head_sha: str,
+        merge_sha: str | None,
+        missing: set[str],
+    ) -> dict[str, Any]:
+        refs = []
+        result: dict[str, Any] = {
+            "base_sha": base_sha,
+            "comparison_kind": "unavailable",
+            "head_sha": head_sha,
+            "unavailable_commits": sorted(missing),
+        }
+        for side, sha in (("base", base_sha), ("head", head_sha)):
+            if sha in missing:
+                continue
+            ref = f"{prefix}/{side}/{sha}"
+            refs.append((ref, sha))
+            result[f"{side}_ref"] = ref
+        if merge_sha is not None:
+            merge_ref = f"{prefix}/merge/{merge_sha}"
+            refs.append((merge_ref, merge_sha))
+            result |= {"merge_commit_ref": merge_ref, "merge_commit_sha": merge_sha}
+        commands = "".join(f"update {ref} {sha}\n" for ref, sha in refs)
+        if commands:
+            await self._git("update-ref", "--stdin", input_text=commands)
+        return result
+
     async def _missing_commits(self, shas: Sequence[str]) -> set[str]:
         missing = set()
         for sha in shas:
@@ -225,10 +265,12 @@ class GitObjectStore:
         missing: set[str],
     ) -> None:
         refspecs = []
-        if base_sha in missing:
+        if base_sha in missing and not self._branches_fetched:
             refspecs.append("+refs/heads/*:refs/gh-puller/remotes/heads/*")
         if head_sha in missing:
             refspecs.append(f"+refs/pull/{number}/head:refs/gh-puller/remotes/pulls/{number}/head")
+        if not refspecs:
+            return
         await self._git(
             "fetch",
             "--quiet",

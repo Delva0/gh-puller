@@ -198,6 +198,69 @@ async def test_git_store_keeps_snapshot_when_merge_commit_is_unreachable(tmp_pat
 
 
 @pytest.mark.asyncio
+async def test_git_store_marks_comparison_unavailable_when_base_is_unreachable(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    _, head = _source_repository(source, 1)
+    missing_base = "f" * 40
+    path = git_store_path(tmp_path / "facts.sqlite3")
+    store = GitObjectStore(path, "acme/widgets", str(source))
+    await store.prefetch([7])
+
+    snapshot = await store.capture(
+        7,
+        {
+            "base": {"sha": missing_base},
+            "head": {"sha": head},
+            "merge_commit_sha": head,
+            "merged": True,
+        },
+    )
+
+    assert snapshot == {
+        "base_sha": missing_base,
+        "comparison_kind": "unavailable",
+        "head_ref": f"refs/gh-puller/snapshots/pulls/7/head/{head}",
+        "head_sha": head,
+        "merge_commit_ref": f"refs/gh-puller/snapshots/pulls/7/merge/{head}",
+        "merge_commit_sha": head,
+        "unavailable_commits": [missing_base],
+    }
+    assert _stored_git(path, "rev-parse", snapshot["head_ref"]) == head
+
+
+@pytest.mark.asyncio
+async def test_git_store_marks_comparison_unavailable_when_api_head_is_unreachable(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    base, _ = _source_repository(source, 1)
+    missing_head = "e" * 40
+    path = git_store_path(tmp_path / "facts.sqlite3")
+    store = GitObjectStore(path, "acme/widgets", str(source))
+    await store.prefetch([7])
+
+    snapshot = await store.capture(
+        7,
+        {
+            "base": {"sha": base},
+            "head": {"sha": missing_head},
+            "merged": False,
+        },
+    )
+
+    assert snapshot == {
+        "base_ref": f"refs/gh-puller/snapshots/pulls/7/base/{base}",
+        "base_sha": base,
+        "comparison_kind": "unavailable",
+        "head_sha": missing_head,
+        "unavailable_commits": [missing_head],
+    }
+    assert _stored_git(path, "rev-parse", snapshot["base_ref"]) == base
+
+
+@pytest.mark.asyncio
 async def test_git_store_rejects_rebinding_to_another_repository(tmp_path: Path) -> None:
     source = tmp_path / "source"
     _source_repository(source, 1)

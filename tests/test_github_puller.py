@@ -831,7 +831,7 @@ async def test_cold_pull_preserves_raw_fields_and_publishes_target(tmp_path: Pat
     bundle = current[1].bundle
     catalog = current[1].summary
     assert bundle is not None
-    assert bundle["schema_version"] == 5
+    assert bundle["schema_version"] == 6
     assert bundle["issue"]["unknown_detail_field"] == [1, {"raw": "yes"}]
     assert bundle["issue_comments"][0]["future_field"] == {"kept": 1}
     assert bundle["timeline"][0]["rename"] == {"from": "a", "to": "b"}
