@@ -39,8 +39,10 @@ def _progress(**changes: object) -> monitor.ProgressState:
         run_id=1,
         catalog_seen=54_083,
         catalog_total=54_083,
+        catalog_complete=True,
+        objects_completed=224,
+        objects_total=51_549,
         bundles_completed=224,
-        bundles_total=51_549,
         issues_completed=117,
         pulls_completed=107,
         tombstones=0,
@@ -99,7 +101,7 @@ def test_table_prioritizes_target_items_progress_and_database(tmp_path: Path) ->
     assert "ITEMS" in output
     assert "54,083" in output
     assert "Wed 2026-09-02 13:37:49.940630 CST" in output
-    assert "bundles [----------] 224/51,549" in output
+    assert "objects [----------] 224/51,549" in output
     assert "5m00s remaining" in output
     assert str((tmp_path / "facts.sqlite3").resolve()) in output
     assert str((tmp_path / "facts.sqlite3.git").resolve()) in output
@@ -130,8 +132,10 @@ def test_detail_separates_current_items_from_unknown_catalog_denominator(tmp_pat
         phase="closing_catalog",
         catalog_seen=27_400,
         catalog_total=None,
+        catalog_complete=False,
+        objects_completed=100,
+        objects_total=None,
         bundles_completed=0,
-        bundles_total=None,
         issues_completed=0,
         pulls_completed=0,
         latest_number=None,
@@ -145,7 +149,8 @@ def test_detail_separates_current_items_from_unknown_catalog_denominator(tmp_pat
     )
 
     assert "ITEMS       54,083" in output
-    assert "PROGRESS    catalog 27,400/?" in output
+    assert "CATALOG     scanning 27,400/?" in output
+    assert "OBJECTS     objects 100/?" in output
     assert "DATABASE" in output
     assert "GIT STORE" in output
     assert str((tmp_path / "facts.sqlite3").resolve()) in output
@@ -162,6 +167,8 @@ def test_detail_shows_process_and_durable_run_progress(tmp_path: Path) -> None:
     assert "PID         1234" in output
     assert "TARGET T    Wed 2026-09-02 13:37:49.940630 CST" in output
     assert "ITEMS       54,083" in output
+    assert "CATALOG     complete 54,083" in output
+    assert "OBJECTS     objects [--------------------] 224/51,549" in output
     assert "STAGED      issues=117 pulls=107 tombstones=0" in output
     assert "LATEST      pull#2886" in output
     assert (
@@ -236,12 +243,36 @@ def test_latest_progress_ignores_raw_logs_and_keeps_quota_fields() -> None:
     assert progress is not None
     assert progress.phase == "closing_catalog"
     assert progress.catalog_seen == 200
+    assert not progress.catalog_complete
+    assert progress.objects_completed == 0
+    assert progress.objects_total is None
     assert progress.items == 54_083
     assert not hasattr(progress, "requests")
     assert progress.quotas == (
         RateQuota("core", 5_000, 4_498, _EVENT_AT + timedelta(hours=1)),
         RateQuota("graphql", 5_000, 4_997, _EVENT_AT + timedelta(minutes=30)),
     )
+
+
+def test_detail_separates_completed_catalog_from_initial_estimate(tmp_path: Path) -> None:
+    progress = _progress(
+        catalog_seen=54_276,
+        catalog_total=54_299,
+        catalog_complete=True,
+        objects_completed=230,
+        objects_total=54_276,
+        items=54_276,
+    )
+
+    output = monitor._render_detail(
+        _status(tmp_path / "facts.sqlite3", progress),
+        now=_EVENT_AT,
+        zone=_LOCAL,
+    )
+
+    assert "ITEMS       54,276" in output
+    assert "CATALOG     complete 54,276 (initial estimate 54,299)" in output
+    assert "OBJECTS     objects [--------------------] 230/54,276" in output
 
 
 def test_managed_writers_require_matching_path_identity(tmp_path: Path) -> None:
@@ -282,7 +313,6 @@ def test_collection_reads_systemd_and_latest_journal_event(
         "run_id": 7,
         "catalog_total": 100,
         "bundles_completed": 3,
-        "bundles_total": 10,
     }
 
     def output(command: list[str]) -> str:

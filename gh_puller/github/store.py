@@ -580,6 +580,28 @@ class SQLiteArchive:
         )
         return [_task(row, decode_summary=False) for row in rows]
 
+    async def task_progress(self, run_id: int) -> tuple[int, int]:
+        """读取活动 pass 已完成和全部 Issue/PR 任务数。
+
+        Args:
+            run_id: 当前 pending run。
+
+        Returns:
+            已完成任务数与全部任务数。
+        """
+        row = await _fetchone(
+            self._connection,
+            """
+            SELECT count(*) AS total, count(CASE WHEN completed = 1 THEN 1 END) AS completed
+            FROM pull_tasks
+            WHERE run_id = ?
+            """,
+            (run_id,),
+        )
+        if row is None:
+            raise RuntimeError("failed to read task progress")
+        return int(row["completed"]), int(row["total"])
+
     async def complete_task(
         self,
         run_id: int,

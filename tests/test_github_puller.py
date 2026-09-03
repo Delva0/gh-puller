@@ -555,7 +555,8 @@ async def test_cold_pull_reports_durable_catalog_and_bundles(tmp_path: Path) -> 
         if event.phase == "closing_catalog" and event.bundles_completed == 2
     ][-1]
     assert completed.catalog_seen == completed.catalog_total == 2
-    assert completed.bundles_total is None
+    assert completed.catalog_complete
+    assert completed.objects_completed == completed.objects_total == 2
     assert (completed.issues_completed, completed.pulls_completed) == (1, 1)
     assert (completed.latest_number, completed.latest_kind) == (2, "pull")
     assert events[-1].phase == "done"
@@ -1504,12 +1505,19 @@ async def test_interrupted_cold_pull_resumes_staged_bundles_without_publication(
     assert sum(call[1] == f"{_BASE}/issues/2/timeline" for call in api.calls) == 1
     assert set(await _current(archive)) == {1, 2, 3}
     assert len(await _runs(archive)) == 1
-    restored = next(event for event in events if event.phase == "closing_catalog" and event.bundles_completed == 2)
-    assert restored.bundles_total is None
+    restored = next(
+        event
+        for event in events
+        if event.phase == "closing_catalog"
+        and event.bundles_completed == 2
+        and event.objects_completed == 2
+    )
+    assert restored.catalog_complete
+    assert restored.objects_total == 3
     assert (restored.issues_completed, restored.pulls_completed) == (1, 1)
     assert (restored.latest_number, restored.latest_kind) == (2, "pull")
     assert events[-1].bundles_completed == 3
-    assert events[-1].bundles_total is None
+    assert events[-1].objects_completed == events[-1].objects_total == 3
 
 
 @pytest.mark.asyncio
@@ -3091,8 +3099,10 @@ def test_console_progress_uses_throttled_json_for_logs_and_a_tty_bar() -> None:
         target_at=_T0,
         catalog_seen=2,
         catalog_total=2,
+        catalog_complete=True,
+        objects_completed=1,
+        objects_total=2,
         bundles_completed=1,
-        bundles_total=2,
         issues_completed=1,
         latest_number=1,
         latest_kind="issue",
@@ -3107,8 +3117,23 @@ def test_console_progress_uses_throttled_json_for_logs_and_a_tty_bar() -> None:
     observer = ConsoleProgress(log, interval=10, tty=False, monotonic=lambda: next(ticks))
 
     observer(progress)
-    observer(replace(progress, event_at=_T0 + timedelta(seconds=1), bundles_completed=2))
-    observer(replace(progress, event_at=_T0 + timedelta(seconds=2), phase="done"))
+    observer(
+        replace(
+            progress,
+            event_at=_T0 + timedelta(seconds=1),
+            objects_completed=2,
+            bundles_completed=2,
+        ),
+    )
+    observer(
+        replace(
+            progress,
+            event_at=_T0 + timedelta(seconds=2),
+            phase="done",
+            objects_completed=2,
+            bundles_completed=2,
+        ),
+    )
 
     lines = [json.loads(line) for line in log.getvalue().splitlines()]
     assert len(lines) == 2
@@ -3133,9 +3158,10 @@ def test_console_progress_uses_throttled_json_for_logs_and_a_tty_bar() -> None:
     terminal = StringIO()
     tty = ConsoleProgress(terminal, interval=0, tty=True, monotonic=lambda: 0.0)
     tty(progress)
-    tty(replace(progress, phase="done", bundles_completed=2))
+    tty(replace(progress, phase="done", objects_completed=2, bundles_completed=2))
     rendered = terminal.getvalue()
-    assert "[##########----------] 1/2" in rendered
+    assert "objects=[##########----------] 1/2" in rendered
+    assert "objects=[####################] 2/2" in rendered
     assert "issues=1 pulls=0" in rendered
     assert "latest=issue#1" in rendered
     assert "core=4,993/5,000 graphql=4,998/5,000" in rendered

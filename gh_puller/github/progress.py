@@ -40,9 +40,11 @@ class PullProgress:
     pass_at: datetime | None = None  # Cutoff of the active observation pass.
     catalog_seen: int = 0  # Unique root rows durably discovered in the active pass.
     catalog_total: int | None = None  # Cold-start count estimate when available.
+    catalog_complete: bool = False  # True after the terminal catalog page is durable.
+    objects_completed: int = 0  # Durable discovery tasks completed in the active pass.
+    objects_total: int | None = None  # Exact task count once catalog discovery closes.
     items: int | None = None  # Current or cold-start estimated Issue/PR head count.
     bundles_completed: int = 0  # Durable bundles completed for the current run plan.
-    bundles_total: int | None = None  # Durable bundles plus remaining plan candidates.
     issues_completed: int = 0  # Completed Issue bundles in bundles_completed.
     pulls_completed: int = 0  # Completed pull-request bundles in bundles_completed.
     tombstones: int = 0  # Durable directly observed absences.
@@ -105,8 +107,10 @@ class _PullProgressTracker:
             pass_at=pass_at,
             catalog_seen=0,
             catalog_total=None,
+            catalog_complete=False,
+            objects_completed=0,
+            objects_total=None,
             bundles_completed=0,
-            bundles_total=None,
             issues_completed=0,
             pulls_completed=0,
             tombstones=0,
@@ -120,11 +124,33 @@ class _PullProgressTracker:
         if count is not None:
             self._emit(catalog_total=count, items=count)
 
-    def catalog_restore(self, count: int, total: int | None) -> None:
-        changes: dict[str, Any] = {"catalog_seen": count, "catalog_total": total}
+    def catalog_restore(
+        self,
+        count: int,
+        total: int | None,
+        *,
+        complete: bool,
+        objects_completed: int | None = None,
+        objects_total: int | None = None,
+    ) -> None:
+        changes: dict[str, Any] = {
+            "catalog_seen": count,
+            "catalog_total": total,
+            "catalog_complete": complete,
+        }
         if total is not None:
-            changes["items"] = total
+            changes["items"] = count if complete else total
+        if objects_completed is not None:
+            changes["objects_completed"] = objects_completed
+        if objects_total is not None:
+            changes["objects_total"] = objects_total
         self._emit(**changes)
+
+    def object_completed(self, request_count: int) -> None:
+        self._emit(
+            objects_completed=self._state.objects_completed + 1,
+            requests=self._run_requests(request_count),
+        )
 
     def restore_items(self, count: int) -> None:
         self._emit(items=count)
@@ -141,7 +167,6 @@ class _PullProgressTracker:
         latest_number, latest_kind = completed[-1] if completed else (None, None)
         self._emit(
             bundles_completed=len(completed),
-            bundles_total=None,
             issues_completed=issue_count,
             pulls_completed=len(completed) - issue_count,
             tombstones=sum(not present for _, _, present in staged),
@@ -179,6 +204,7 @@ class _PullProgressTracker:
         if items is not None and self._state.catalog_total is None:
             items += new_items
         self._emit(
+            objects_completed=self._state.objects_completed + len(completed),
             bundles_completed=self._state.bundles_completed + len(completed),
             issues_completed=self._state.issues_completed + issue_count,
             pulls_completed=self._state.pulls_completed + pull_count,
@@ -192,6 +218,7 @@ class _PullProgressTracker:
         items = self._state.items
         self._emit(
             items=None if items is None else max(items - 1, 0),
+            objects_completed=self._state.objects_completed + 1,
             tombstones=self._state.tombstones + 1,
             requests=self._run_requests(request_count),
         )
@@ -222,7 +249,9 @@ class _PullProgressTracker:
             run_id=run_id,
             catalog_seen=catalog_items,
             catalog_total=catalog_items,
+            catalog_complete=True,
             items=catalog_items,
+            objects_total=self._state.objects_completed,
             requests=requests,
             wait_seconds=None,
             reused=reused,
@@ -307,15 +336,19 @@ class ConsoleProgress:
 
 
 def _tty_line(progress: PullProgress) -> str:
-    completed = progress.bundles_completed
-    total = progress.bundles_total
+    completed = progress.objects_completed
+    total = progress.objects_total
     if total is None:
-        bar = "bundles=?"
+        bar = f"{completed:,}/?"
     else:
         width = 20
         filled = width if total == 0 else min(width, int(width * completed / total))
         bar = f"[{'#' * filled}{'-' * (width - filled)}] {completed:,}/{total:,}"
-    catalog = f"{progress.catalog_seen:,}/{_count(progress.catalog_total)}"
+    catalog = (
+        f"complete:{progress.catalog_seen:,}"
+        if progress.catalog_complete
+        else f"scanning:{progress.catalog_seen:,}/{_count(progress.catalog_total)}"
+    )
     latest = "-"
     if progress.latest_number is not None:
         latest = f"{progress.latest_kind}#{progress.latest_number}"
@@ -324,7 +357,8 @@ def _tty_line(progress: PullProgress) -> str:
     )
     wait = "" if progress.wait_seconds is None else f" wait={progress.wait_seconds:.1f}s"
     return (
-        f"{progress.phase}  {bar}  catalog={catalog} items={_count(progress.items)} "
+        f"{progress.phase}  objects={bar}  catalog={catalog} "
+        f"items={_count(progress.items)} "
         f"issues={progress.issues_completed:,} pulls={progress.pulls_completed:,} "
         f"tombstones={progress.tombstones:,} latest={latest} "
         f"requests={progress.requests:,} {quota}{wait}"

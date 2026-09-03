@@ -55,8 +55,10 @@ class ProgressState:
     run_id: int | None  # Durable run identity, if allocated.
     catalog_seen: int  # Unique root rows durably discovered in the active pass.
     catalog_total: int | None  # Cold-start count estimate when available.
+    catalog_complete: bool  # Terminal catalog page is durable.
+    objects_completed: int  # Durable discovery tasks completed in the active pass.
+    objects_total: int | None  # Exact task count after catalog discovery closes.
     bundles_completed: int  # Durable bundles completed for the current run plan.
-    bundles_total: int | None  # Durable bundles plus remaining plan candidates.
     issues_completed: int  # Issue bundles in bundles_completed.
     pulls_completed: int  # Pull-request bundles in bundles_completed.
     tombstones: int  # Durable directly observed absences.
@@ -196,8 +198,10 @@ def _latest_progress(output: str) -> ProgressState | None:
             run_id=_int(payload.get("run_id")),
             catalog_seen=_int(payload.get("catalog_seen")) or 0,
             catalog_total=_int(payload.get("catalog_total")),
+            catalog_complete=payload.get("catalog_complete") is True,
+            objects_completed=_int(payload.get("objects_completed")) or 0,
+            objects_total=_int(payload.get("objects_total")),
             bundles_completed=_int(payload.get("bundles_completed")) or 0,
-            bundles_total=_int(payload.get("bundles_total")),
             issues_completed=_int(payload.get("issues_completed")) or 0,
             pulls_completed=_int(payload.get("pulls_completed")) or 0,
             tombstones=_int(payload.get("tombstones")) or 0,
@@ -229,7 +233,8 @@ def _render_table(
         "TARGET T",
         "ITEMS",
         "PHASE",
-        "PROGRESS",
+        "CATALOG",
+        "OBJECTS",
         "QUOTA",
         "WAIT",
         "UPDATED",
@@ -245,7 +250,8 @@ def _render_table(
             _target(status.progress, zone),
             _items(status.progress),
             status.progress.phase if status.progress else "-",
-            _progress(status.progress, 10),
+            _catalog(status.progress),
+            _objects(status.progress, 10),
             _quota(status.progress, zone),
             _wait(status.progress, observed_at),
             _age(status.progress.event_at, observed_at) if status.progress else "-",
@@ -281,7 +287,8 @@ def _render_detail(
         ("TARGET T", _target(progress, zone)),
         ("ITEMS", _items(progress)),
         ("PHASE", progress.phase if progress else "-"),
-        ("PROGRESS", _progress(progress, 20)),
+        ("CATALOG", _catalog(progress)),
+        ("OBJECTS", _objects(progress, 20)),
         ("QUOTA", _quota(progress, zone)),
         ("STAGED", _staged(progress)),
         ("LATEST", _latest(progress)),
@@ -335,16 +342,23 @@ def _items(progress: ProgressState | None) -> str:
     return "?" if items is None else f"{items:,}"
 
 
-def _progress(progress: ProgressState | None, width: int) -> str:
+def _catalog(progress: ProgressState | None) -> str:
     if progress is None:
         return "-"
-    if progress.bundles_total is not None:
-        return _meter("bundles", progress.bundles_completed, progress.bundles_total, width)
-    if progress.catalog_seen or "catalog" in progress.phase or progress.phase == "done":
-        return _meter("catalog", progress.catalog_seen, progress.catalog_total, width)
-    if progress.wait_seconds is not None:
-        return f"wait {progress.wait_seconds:.1f}s"
-    return "-"
+    seen = f"{progress.catalog_seen:,}"
+    if progress.catalog_complete:
+        estimate = progress.catalog_total
+        if estimate is not None and estimate != progress.catalog_seen:
+            return f"complete {seen} (initial estimate {estimate:,})"
+        return f"complete {seen}"
+    estimate = "?" if progress.catalog_total is None else f"~{progress.catalog_total:,}"
+    return f"scanning {seen}/{estimate}"
+
+
+def _objects(progress: ProgressState | None, width: int) -> str:
+    if progress is None:
+        return "-"
+    return _meter("objects", progress.objects_completed, progress.objects_total, width)
 
 
 def _target(progress: ProgressState | None, zone: tzinfo | None = None) -> str:

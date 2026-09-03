@@ -383,7 +383,14 @@ class GitHubPuller:
             raise RuntimeError("another observation pass must finish first")
         if not state.prepared:
             state = await self._prepare_pass(api, archive, state, observed, progress)
-        progress.catalog_restore(state.catalog_items, state.expected_count)
+        completed, total = await archive.task_progress(run_id)
+        progress.catalog_restore(
+            state.catalog_items,
+            state.expected_count,
+            complete=state.catalog_complete,
+            objects_completed=completed,
+            objects_total=total if state.catalog_complete else None,
+        )
 
         changed = asyncio.Event()
         store_lock = asyncio.Lock()
@@ -504,9 +511,16 @@ class GitHubPuller:
             try:
                 async with store_lock:
                     state = await archive.stage_catalog_page(state.run_id, items, page.next_url)
+                    task_progress = await archive.task_progress(state.run_id) if state.catalog_complete else None
             except ValueError as exc:
                 raise IncompleteGitHubDataError(str(exc)) from exc
-            progress.catalog_restore(state.catalog_items, state.expected_count)
+            progress.catalog_restore(
+                state.catalog_items,
+                state.expected_count,
+                complete=state.catalog_complete,
+                objects_completed=None if task_progress is None else task_progress[0],
+                objects_total=None if task_progress is None else task_progress[1],
+            )
             changed.set()
             if page.next_url is None:
                 return
@@ -558,7 +572,13 @@ class GitHubPuller:
         for task in tasks:
             if task.created_at is not None and _parse_required_time(task.created_at) > cutoff:
                 async with store_lock:
-                    await archive.complete_task(run_id, task.number, task.summary_digest)
+                    completed = await archive.complete_task(
+                        run_id,
+                        task.number,
+                        task.summary_digest,
+                    )
+                if completed:
+                    progress.object_completed(api.request_count)
                 continue
             if (
                 task.summary is not None
@@ -566,7 +586,13 @@ class GitHubPuller:
                 and not _needs_refresh(heads.get(task.number), task.summary)
             ):
                 async with store_lock:
-                    await archive.complete_task(run_id, task.number, task.summary_digest)
+                    completed = await archive.complete_task(
+                        run_id,
+                        task.number,
+                        task.summary_digest,
+                    )
+                if completed:
+                    progress.object_completed(api.request_count)
                 continue
             selected.append(task)
         if selected:
@@ -629,7 +655,13 @@ class GitHubPuller:
                     raise
                 if previous is None:
                     async with store_lock:
-                        await archive.complete_task(run_id, task.number, task.summary_digest)
+                        completed = await archive.complete_task(
+                            run_id,
+                            task.number,
+                            task.summary_digest,
+                        )
+                    if completed:
+                        progress.object_completed(api.request_count)
                 else:
                     resource = StagedResource(
                         head=_absent_head(previous, observed_at),

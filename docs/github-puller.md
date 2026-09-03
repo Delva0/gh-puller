@@ -259,17 +259,19 @@ emitted immediately. The one committed `PullResult` remains JSON on stdout, so a
 supervisor can route progress and results independently. `--no-progress` disables
 stderr progress.
 
-The catalog counters describe the durable producer journal for the active pass.
-Bundle counters describe Issue/PR records already staged by its bounded consumer.
-Both counters resume from SQLite after a writer restart. The observer and `status`
-command remain out of band: only the writer performs that local read, then emits the
-resulting snapshot through the same progress stream.
+The catalog fields describe the durable producer journal for the active pass. Object
+counters describe durable Issue/PR tasks processed by its bounded consumer, including
+records fetched, safely reused, observed absent, or excluded because they are later
+than T. Both counters resume from SQLite after a writer restart. The observer and
+`status` command remain out of band: only the writer performs that local read, then
+emits the resulting snapshot through the same progress stream.
 
 | Field | Definition | Relationship to Issue/PR count |
 | --- | --- | --- |
 | `items` | Current locally observed Issue/PR heads, or the authenticated cold-start estimate before they are all materialized. | This drives `ITEMS` independently of active traversal progress. |
-| `catalog_seen / catalog_total` | Unique Issue/PR root rows durable in the active pass, divided by the cold-start estimate when available. | A warm delta normally has an unknown denominator because it deliberately avoids a full count or traversal. |
-| `bundles_completed / bundles_total` | Complete Issue/PR records durably staged in the current run. | The denominator remains unknown while producer and consumer are streaming; `issues_completed` and `pulls_completed` split the numerator by kind. |
+| `catalog_seen`, `catalog_total`, `catalog_complete` | Unique durable root rows, the initial cold-start estimate when available, and whether the terminal page is durable. | The estimate is not a completion condition because a live paginated traversal is not a snapshot. A warm delta has no full-repository estimate. |
+| `objects_completed / objects_total` | Durable Issue/PR tasks processed in the active pass. | The exact denominator becomes available when catalog production closes; before then it remains unknown rather than tracking a moving queue. |
+| `issues_completed`, `pulls_completed` | Selected records fetched and durably handled by kind. | These drive `STAGED`; their sum can be smaller than `objects_completed` because reusable and later-than-T tasks require no replacement record. |
 | `tombstones` | Parent absences directly observed while processing a selected parent. | Silent absence is not counted and does not alter the last observed head. |
 | `latest_number`, `latest_kind` | Most recently completed and durably staged parent. | Completion follows response time rather than parent number; gaps are ordinary concurrent work, not missing facts. |
 | `requests`, `quotas` | HTTP attempts accumulated by the run and the latest independently sampled GitHub quota buckets. | They measure API work, not objects; REST `core` uses request units while GraphQL uses points, so neither can be derived from the other. |
@@ -536,8 +538,10 @@ watch -n 1 scripts/github-puller-daemon.sh status archives/vllm.sqlite3
 The overview always includes the canonical `DATABASE`, companion `GIT STORE`, current
 target T, run, phase, event age, and `ITEMS`. `ITEMS` means the locally observed
 Issue-plus-PR head count, or the authenticated estimate during cold discovery; it is
-`?` until either is known. `PROGRESS` reports the active directory producer or
-Issue/PR consumer and keeps an unknown streaming denominator as `?`.
+`?` until either is known. `CATALOG` distinguishes a live scan from a durably complete
+terminal page and labels the cold-start count as an initial estimate. `OBJECTS`
+reports durable task completion; its denominator stays `?` until catalog production
+closes, then becomes the exact pass task count.
 `QUOTA` retains every resource bucket observed by the writer and shows each
 `remaining/limit` independently. Normal authenticated operation therefore displays
 both REST `core` and `graphql` after each has responded. Each bucket occupies one
