@@ -4,6 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 PROJECT_ROOT="$(realpath "$SCRIPT_DIR/..")"
 SYSTEMD_DIR="${GH_PULLER_SYSTEMD_DIR:-/etc/systemd/system}"
+POLKIT_RULES_DIR="${GH_PULLER_POLKIT_RULES_DIR:-/etc/polkit-1/rules.d}"
 SYSTEMCTL="${GH_PULLER_SYSTEMCTL:-systemctl}"
 JOURNALCTL="${GH_PULLER_JOURNALCTL:-journalctl}"
 SYSTEMD_ANALYZE="${GH_PULLER_SYSTEMD_ANALYZE:-systemd-analyze}"
@@ -20,8 +21,9 @@ Usage:
   github-puller-daemon.sh logs DATABASE
   github-puller-daemon.sh render OWNER/REPO DATABASE [PULLER_OPTIONS...]
 
-install writes and starts a system-level systemd service. uninstall removes only
-that service; the SQLite archive, Git object store, .env, environment, and source remain.
+install registers a disabled, inactive system-level systemd service. The service
+owner can then use start, stop, and restart without sudo. uninstall removes only
+the service and its control policy; archives, environments, and source remain.
 The schedule defaults to 1h; pass --interval DURATION after DATABASE to change it.
 EOF
 }
@@ -47,8 +49,13 @@ unit_name() {
     printf 'gh-puller-%s.service\n' "$(writer_id "$1")"
 }
 
+policy_name() {
+    printf '60-gh-puller-%s.rules\n' "$(writer_id "$1")"
+}
+
 require_system_access() {
-    if [[ "$SYSTEMD_DIR" == "/etc/systemd/system" && EUID -ne 0 ]]; then
+    if [[ ("$SYSTEMD_DIR" == "/etc/systemd/system" || \
+        "$POLKIT_RULES_DIR" == "/etc/polkit-1/rules.d") && EUID -ne 0 ]]; then
         fail "run this action with sudo"
     fi
 }
@@ -122,6 +129,32 @@ configured_value() {
     local key="$1"
     local path="$2"
     sed -n "s/^# gh-puller-$key=//p" "$path" | head -n 1
+}
+
+configured_service_user() {
+    local path="$1"
+    local user
+    user="$(configured_value user "$path")"
+    if [[ -z "$user" ]]; then
+        user="$(sed -n 's/^User=//p' "$path" | head -n 1)"
+    fi
+    printf '%s\n' "$user"
+}
+
+require_control_owner() {
+    local path="$1"
+    local owner
+    owner="$(configured_service_user "$path")"
+    [[ -n "$owner" ]] || fail "service has no owner; reinstall it with sudo"
+    if [[ EUID -ne 0 && "$(id -un)" != "$owner" ]]; then
+        fail "service belongs to $owner, not $(id -un)"
+    fi
+}
+
+policy_path_for_unit() {
+    local unit
+    unit="$(basename "$1")"
+    printf '%s/60-%s.rules\n' "$POLKIT_RULES_DIR" "${unit%.service}"
 }
 
 validate_unit_database() {
@@ -206,6 +239,7 @@ render_unit() {
     identity="$(writer_id "$destination")"
     printf '# gh-puller-repository=%s\n' "$repository"
     printf '# gh-puller-database=%s\n' "$destination"
+    printf '# gh-puller-user=%s\n' "$user"
     printf '[Unit]\n'
     printf 'Description=gh-puller writer for %s from %s\n' "$(unit_value "$destination")" "$repository"
     printf 'Wants=network-online.target\n'
@@ -236,6 +270,28 @@ render_unit() {
     printf 'SuccessExitStatus=143\n\n'
     printf '[Install]\n'
     printf 'WantedBy=multi-user.target\n'
+}
+
+policy_string() {
+    local value="$1"
+    value="${value//\\/\\\\}"
+    value="${value//\"/\\\"}"
+    printf '%s' "$value"
+}
+
+render_policy() {
+    local unit="$1"
+    local user="$2"
+    printf 'polkit.addRule(function(action, subject) {\n'
+    printf '    if (action.id == "org.freedesktop.systemd1.manage-units" &&\n'
+    printf '        subject.user == "%s" &&\n' "$(policy_string "$user")"
+    printf '        action.lookup("unit") == "%s") {\n' "$(policy_string "$unit")"
+    printf '        var verb = action.lookup("verb");\n'
+    printf '        if (verb == "start" || verb == "stop" || verb == "restart") {\n'
+    printf '            return polkit.Result.YES;\n'
+    printf '        }\n'
+    printf '    }\n'
+    printf '});\n'
 }
 
 render_for() {
@@ -286,6 +342,7 @@ case "$action" in
         destination="$(absolute_destination "$3")"
         unit="$(unit_name "$destination")"
         unit_path="$SYSTEMD_DIR/$unit"
+        policy_path="$POLKIT_RULES_DIR/$(policy_name "$destination")"
         user="$(service_user)"
         group="$(id -gn "$user")"
         uv="$(uv_binary "$user")"
@@ -305,24 +362,38 @@ case "$action" in
             [[ "$configured_database" == "$destination" ]] || fail "writer identity collision for $destination"
             [[ "$configured_repository" == "$repository" ]] || \
                 fail "database writer is configured for $configured_repository, not $repository"
+            configured_user="$(configured_service_user "$existing_path")"
+            [[ -z "$configured_user" || "$configured_user" == "$user" ]] || \
+                fail "database writer belongs to $configured_user, not $user"
         done
         mkdir -p "$SYSTEMD_DIR"
+        mkdir -p "$POLKIT_RULES_DIR"
         verify_dir="$(mktemp -d)"
         trap 'rm -r -- "$verify_dir"' EXIT
         render_unit "$repository" "$destination" "$user" "$group" "$uv" "${@:4}" >"$verify_dir/$unit"
+        render_policy "$unit" "$user" >"$verify_dir/$(basename "$policy_path")"
         "$SYSTEMD_ANALYZE" verify "$verify_dir/$unit"
-        install -m 0644 "$verify_dir/$unit" "$unit_path"
         for existing_path in "${existing_paths[@]}"; do
             [[ "$existing_path" == "$unit_path" ]] && continue
             existing_unit="$(basename "$existing_path")"
-            "$SYSTEMCTL" disable --now "$existing_unit" >/dev/null 2>&1 || true
-            rm -f -- "$existing_path"
+            "$SYSTEMCTL" disable --now "$existing_unit" >/dev/null
+        done
+        install -m 0644 "$verify_dir/$unit" "$unit_path"
+        install -m 0644 "$verify_dir/$(basename "$policy_path")" "$policy_path"
+        for existing_path in "${existing_paths[@]}"; do
+            existing_policy="$(policy_path_for_unit "$existing_path")"
+            if [[ "$existing_path" != "$unit_path" ]]; then
+                rm -f -- "$existing_path"
+            fi
+            if [[ "$existing_policy" != "$policy_path" ]]; then
+                rm -f -- "$existing_policy"
+            fi
         done
         "$SYSTEMCTL" daemon-reload
-        "$SYSTEMCTL" enable "$unit"
-        "$SYSTEMCTL" restart "$unit"
-        "$SYSTEMCTL" is-active --quiet "$unit"
-        printf 'Installed and started %s\n' "$unit"
+        "$SYSTEMCTL" disable --now "$unit" >/dev/null
+        "$SYSTEMCTL" reset-failed "$unit" >/dev/null 2>&1 || true
+        printf 'Installed %s (disabled, inactive)\n' "$unit"
+        printf 'Start:  %q start %q\n' "$0" "$destination"
         printf 'Status: %q status %q\n' "$0" "$destination"
         printf 'Logs:   %q logs %q\n' "$0" "$destination"
         ;;
@@ -341,6 +412,7 @@ case "$action" in
             existing_unit="$(basename "$existing_path")"
             "$SYSTEMCTL" disable --now "$existing_unit" >/dev/null 2>&1 || true
             rm -f -- "$existing_path"
+            rm -f -- "$(policy_path_for_unit "$existing_path")"
         done
         "$SYSTEMCTL" daemon-reload
         for existing_path in "${existing_paths[@]}"; do
@@ -351,9 +423,9 @@ case "$action" in
         ;;
     start|stop|restart)
         [[ $# -eq 2 ]] || fail "$action accepts only DATABASE"
-        require_system_access
         destination="$(absolute_destination "$2")"
         unit_path="$(resolve_managed_unit "$action" "$2" "$destination")"
+        require_control_owner "$unit_path"
         unit="$(basename "$unit_path")"
         "$SYSTEMCTL" "$action" "$unit"
         if [[ "$action" != "stop" ]]; then

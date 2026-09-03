@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import pwd
 import shutil
 import sqlite3
 import subprocess
@@ -14,6 +15,7 @@ import pytest
 _ROOT = Path(__file__).parents[1]
 _SCRIPT = _ROOT / "scripts/github-puller-daemon.sh"
 _REPOSITORY = "acme/widgets"
+_USER = pwd.getpwuid(os.getuid()).pw_name
 
 
 def _unit_for(database: Path) -> str:
@@ -26,6 +28,11 @@ def _full_digest_unit_for(database: Path) -> str:
     canonical = str(database.resolve())
     identity = hashlib.sha256(canonical.encode()).hexdigest()
     return f"gh-puller-{identity}.service"
+
+
+def _policy_for(environment: dict[str, str], database: Path) -> Path:
+    rules = Path(environment["GH_PULLER_POLKIT_RULES_DIR"])
+    return rules / f"60-{_unit_for(database).removesuffix('.service')}.rules"
 
 
 def _bind_archive(
@@ -49,12 +56,16 @@ def _write_managed_unit(
     repository: str = _REPOSITORY,
     *,
     full_digest: bool = False,
+    user: str = _USER,
 ) -> Path:
     units.mkdir(exist_ok=True)
     name = _full_digest_unit_for(database) if full_digest else _unit_for(database)
     unit = units / name
     unit.write_text(
-        f"# gh-puller-repository={repository}\n# gh-puller-database={database.resolve()}\n[Unit]\n",
+        f"# gh-puller-repository={repository}\n"
+        f"# gh-puller-database={database.resolve()}\n"
+        f"# gh-puller-user={user}\n"
+        f"[Service]\nUser={user}\n",
     )
     return unit
 
@@ -73,6 +84,7 @@ def _environment(tmp_path: Path) -> tuple[dict[str, str], Path, Path]:
         "GH_PULLER_JOURNALCTL": str(systemctl),
         "GH_PULLER_SYSTEMD_ANALYZE": "/usr/bin/true",
         "GH_PULLER_SYSTEMD_DIR": str(units),
+        "GH_PULLER_POLKIT_RULES_DIR": str(tmp_path / "polkit"),
         "GH_PULLER_SYSTEMCTL": str(systemctl),
         "GH_PULLER_TEST_SYSTEMCTL_LOG": str(log),
         "GH_PULLER_UV_BIN": uv,
@@ -116,6 +128,8 @@ def test_daemon_script_renders_database_scoped_service_contract(tmp_path: Path) 
     assert "User=root" not in rendered
     assert f"# gh-puller-repository={_REPOSITORY}" in rendered
     assert f"# gh-puller-database={canonical}" in rendered
+    assert f"# gh-puller-user={_USER}" in rendered
+    assert f"User={_USER}" in rendered
     assert f"WorkingDirectory={_ROOT}" in rendered
     assert f"SyslogIdentifier=gh-puller-{identity}" in rendered
     assert "run --frozen -m gh_puller.github schedule" in rendered
@@ -136,21 +150,32 @@ def test_install_is_idempotent_and_uninstall_preserves_archive(tmp_path: Path) -
 
     for argument in database_arguments:
         result = _run("install", _REPOSITORY, argument, environment=environment)
-        assert f"Installed and started {unit_name}" in result.stdout
+        assert f"Installed {unit_name} (disabled, inactive)" in result.stdout
+        assert f"Start:  {_SCRIPT} start {database.resolve()}" in result.stdout
         assert f"Status: {_SCRIPT} status {database.resolve()}" in result.stdout
         assert f"Logs:   {_SCRIPT} logs {database.resolve()}" in result.stdout
-        assert "Status: sudo" not in result.stdout
-        assert "Logs:   sudo" not in result.stdout
+        assert "sudo" not in result.stdout
 
     unit = units / unit_name
+    policy = _policy_for(environment, database)
     assert unit.is_file()
     assert unit.stat().st_mode & 0o777 == 0o644
     assert f'"{database.resolve()}"' in unit.read_text()
+    assert policy.is_file()
+    assert policy.stat().st_mode & 0o777 == 0o644
+    policy_text = policy.read_text()
+    assert 'action.id == "org.freedesktop.systemd1.manage-units"' in policy_text
+    assert f'subject.user == "{_USER}"' in policy_text
+    assert f'action.lookup("unit") == "{unit_name}"' in policy_text
+    assert 'verb == "start"' in policy_text
+    assert 'verb == "stop"' in policy_text
+    assert 'verb == "restart"' in policy_text
+    assert "manage-unit-files" not in policy_text
     install_calls = log.read_text().splitlines()
     assert install_calls.count("daemon-reload") == 2
-    assert install_calls.count(f"enable {unit_name}") == 2
-    assert install_calls.count(f"restart {unit_name}") == 2
-    assert install_calls.count(f"is-active --quiet {unit_name}") == 2
+    assert install_calls.count(f"disable --now {unit_name}") == 2
+    assert install_calls.count(f"reset-failed {unit_name}") == 2
+    assert not any(call.startswith(("enable ", "restart ", "start ")) for call in install_calls)
 
     for argument in reversed(database_arguments):
         result = _run("uninstall", argument, environment=environment)
@@ -160,10 +185,11 @@ def test_install_is_idempotent_and_uninstall_preserves_archive(tmp_path: Path) -
         )
 
     assert not unit.exists()
+    assert not policy.exists()
     assert database.read_bytes() == original
     calls = log.read_text().splitlines()
-    assert calls.count(f"disable --now {unit_name}") == 2
-    assert calls.count(f"reset-failed {unit_name}") == 2
+    assert calls.count(f"disable --now {unit_name}") == 4
+    assert calls.count(f"reset-failed {unit_name}") == 4
 
 
 def test_install_converges_full_digest_unit_to_canonical_short_name(tmp_path: Path) -> None:
@@ -171,16 +197,22 @@ def test_install_converges_full_digest_unit_to_canonical_short_name(tmp_path: Pa
     database = tmp_path / "facts.sqlite3"
     legacy = _write_managed_unit(units, database, full_digest=True)
     canonical = units / _unit_for(database)
+    rules = Path(environment["GH_PULLER_POLKIT_RULES_DIR"])
+    rules.mkdir()
+    legacy_policy = rules / f"60-{legacy.stem}.rules"
+    legacy_policy.write_text("legacy\n")
 
     result = _run("install", _REPOSITORY, str(database), environment=environment)
 
-    assert f"Installed and started {canonical.name}" in result.stdout
+    assert f"Installed {canonical.name} (disabled, inactive)" in result.stdout
     assert canonical.is_file()
     assert not legacy.exists()
+    assert _policy_for(environment, database).is_file()
+    assert not legacy_policy.exists()
     calls = log.read_text().splitlines()
     assert f"disable --now {legacy.name}" in calls
-    assert f"enable {canonical.name}" in calls
-    assert f"restart {canonical.name}" in calls
+    assert f"disable --now {canonical.name}" in calls
+    assert not any(call.startswith(("enable ", "restart ", "start ")) for call in calls)
 
 
 def test_same_repository_can_have_independent_database_writers(tmp_path: Path) -> None:
@@ -195,8 +227,9 @@ def test_same_repository_can_have_independent_database_writers(tmp_path: Path) -
     assert {path.name for path in units.iterdir()} == unit_names
     for database in databases:
         assert f'"{database.resolve()}"' in (units / _unit_for(database)).read_text()
+        assert _policy_for(environment, database).is_file()
     calls = log.read_text().splitlines()
-    assert {call.removeprefix("enable ") for call in calls if call.startswith("enable ")} == unit_names
+    assert not any(call.startswith(("enable ", "restart ", "start ")) for call in calls)
 
 
 def test_existing_writer_cannot_be_rebound_to_another_repository(tmp_path: Path) -> None:
@@ -219,6 +252,27 @@ def test_existing_writer_cannot_be_rebound_to_another_repository(tmp_path: Path)
     assert f"database writer is configured for {_REPOSITORY}" in result.stderr
     assert (units / unit_name).read_bytes() == unit_before
     assert log.read_text() == calls_before
+
+
+def test_existing_writer_cannot_be_rebound_to_another_user(tmp_path: Path) -> None:
+    environment, units, log = _environment(tmp_path)
+    database = tmp_path / "facts.sqlite3"
+    unit = _write_managed_unit(units, database, user="another-user")
+    original = unit.read_bytes()
+
+    result = _run(
+        "install",
+        _REPOSITORY,
+        str(database),
+        environment=environment,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert "database writer belongs to another-user" in result.stderr
+    assert unit.read_bytes() == original
+    assert not _policy_for(environment, database).exists()
+    assert not log.exists()
 
 
 def test_archive_repository_binding_rejects_wrong_writer(tmp_path: Path) -> None:
@@ -355,6 +409,23 @@ def test_control_action_resolves_existing_full_digest_unit(tmp_path: Path) -> No
     _run("stop", str(database), environment=environment)
 
     assert log.read_text().splitlines() == [f"stop {legacy.name}"]
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root may control every installed service")
+@pytest.mark.parametrize("action", ["start", "stop", "restart"])
+def test_runtime_control_rejects_non_owner(
+    tmp_path: Path,
+    action: str,
+) -> None:
+    environment, units, log = _environment(tmp_path)
+    database = tmp_path / "facts.sqlite3"
+    _write_managed_unit(units, database, user="another-user")
+
+    result = _run(action, str(database), environment=environment, check=False)
+
+    assert result.returncode == 2
+    assert f"service belongs to another-user, not {_USER}" in result.stderr
+    assert not log.exists()
 
 
 def test_status_without_database_lists_all_managed_writers(tmp_path: Path) -> None:
