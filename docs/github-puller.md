@@ -38,7 +38,8 @@ flowchart TD
     Full --> Journal["Atomically persist each page, tasks, and next cursor"]
     Delta --> Journal
     Journal --> Consume["Concurrently consume persisted Issue/PR tasks"]
-    Consume --> Kind{"PR task?"}
+    Consume --> API["Read named facts through quota-aware API operations"]
+    API --> Kind{"PR task?"}
     Kind -->|yes| Git["Fetch and pin PR Git objects"]
     Kind -->|no| Stage["Atomically stage the complete record"]
     Git --> Stage
@@ -145,9 +146,11 @@ counts. Its observed-change contract is:
 
 Once an Issue/PR is selected, the puller reads every page returned by each supported
 per-parent endpoint and checks identities, aggregate counts where meaningful, and
-pagination shape. A newly observed response is retained without projecting away
-unknown fields. This is lossless storage of observed data, not a claim that GitHub's
-APIs expose every web-page fact or every historical state.
+pagination shape. REST-backed facts retain unknown response fields. GraphQL-backed
+facts retain both the operation's stable mapping and its exact selected source nodes;
+GraphQL cannot expose fields absent from the query. This is lossless storage of data
+the operation actually observed, not a claim that GitHub's APIs expose every web-page
+fact or every historical state.
 
 This is a best-effort discovery boundary, not a perfect GitHub replica. “Source of
 truth” means downstream jobs need only the archive pair to reproduce every fact and
@@ -161,15 +164,35 @@ Sources: [gh_puller/github/](../gh_puller/github/); [tests/test_github_puller.py
 | Resource | Transport | Detectable consistency check |
 | --- | --- | --- |
 | Issue root | Reuse the unprojected raw-JSON REST catalog row. A signal-only parent uses the individual Issue endpoint. | Identity, kind, and timestamps must agree with the parent catalog state. |
-| Issue comments | Read the complete per-parent collection; skip the call only when the root has an exact zero and no repository signal selected the parent. | Comment identities must be unique. A repository signal overrides the zero shortcut. |
-| PR review comments | Read the complete per-parent collection; skip only on an exact zero with no repository signal. | Comment identities must be unique; a signal overrides the shortcut. |
-| Issue reactions | No collection request when detail reports `total_count == 0` | Zero is itself the complete collection; every nonzero or absent count still paginates and is checked against the aggregate. |
-| PR commits | No collection request when PR detail reports an exact zero. Counts through 250 use the PR-commits endpoint; larger PRs paginate the exact `base.sha...head.sha` comparison. | GitHub caps the PR endpoint at 250 commits. A comparison must contain exactly the advertised count with unique commit SHAs and a stable `total_commits` across pages. |
+| Issue/PR conversation comments | REST or GraphQL; skip the operation only when the root has an exact zero and no repository signal selected the parent. | Every selected transport closes its own pagination and comment identities must be unique. A repository signal overrides the zero shortcut. |
+| PR detail | REST or GraphQL | Both transports produce the stable fields used by the archive and Git snapshot. The GraphQL source node is retained separately from that mapping. |
+| PR reviews | REST or GraphQL | Every page is read, `totalCount` is stable, and node identities are unique on GraphQL. |
+| PR review comments | REST or GraphQL | REST follows its flat collection. GraphQL closes both `reviewThreads` pagination and each thread's comment pagination before flattening unique comments. |
+| Reactions | REST or GraphQL when the reactable has a node ID; otherwise REST | An exact aggregate zero avoids the operation. Nonzero collections close pagination and are checked against the aggregate where available. |
+| PR commits | REST or GraphQL; no operation for an exact zero | GraphQL closes the full commit connection without the REST 250-entry cap. REST uses the PR endpoint through 250 and the exact `base.sha...head.sha` comparison above it. Either result must equal the PR-detail count. |
 | PR code snapshot | Fetch current repository branches and each selected `refs/pull/<number>/head` into the companion bare Git store. Pin the API-observed base/head and comparison objects under immutable archive refs. | A normal PR compares its unique merge-base with head. A PR with no common ancestor compares Git's empty tree with head, matching GitHub's all-files-added semantics. Multiple merge-bases abort rather than select an ambiguous base. |
 | Requested reviewers | Reuse embedded users only when the PR detail contains a valid user list and an empty team list. | Any team or ambiguous embedded value selects the dedicated endpoint, whose team objects carry richer fields. |
 | Issues closed by a PR | Batch up to 100 selected PRs into one GraphQL request, include user-linked Issues, and follow every `closingIssuesReferences` cursor. | Each connection's `totalCount` must equal its unique returned nodes. Missing, duplicate, or malformed data aborts the run instead of becoming an empty relation. |
-| Eligible per-parent JSON and complete paginated lists | Conditional GET with the prior ETag | Validators are keyed by API root, API version, media type, path, and parameters, and are stored atomically with the exact bundle digest whose body they validate. A paginated list is reusable only when every page has an ETag and the terminal page has fewer than 100 entries. Every page must return `304 Not Modified`; any changed page restarts complete pagination. A terminal full page has no cache, so 100→101 growth cannot hide on a new page. Large-PR commit comparisons are fetched only when their parent is selected and do not use this validator cache. |
+| REST-backed per-parent JSON and complete lists | Conditional GET with the prior ETag | Validators are keyed by API root, API version, media type, path, and parameters, and are stored atomically with the exact record they validate. A reusable list needs an ETag on every page and a terminal page below 100 entries. Any changed page restarts complete pagination; a terminal full page is not cached, so 100→101 growth cannot hide. |
 | Timeline and events | Complete per-parent REST collections | Repository event responses have a different raw shape, so repository-wide responses cannot replace them. Their per-parent responses remain unprojected and use the conditional transport above when eligible. |
+
+The selectable rows are named operations in `client.py`; `puller.py` asks for a fact
+without choosing an API. With no reusable REST validator, the client compares each
+bucket's latest `remaining / limit` fraction and uses the larger one. A valid REST
+validator takes precedence while core is available because an authenticated `304`
+does not consume primary REST quota. A primary-limit response or an unrecoverable
+operation response tries the other implementation. If both primary buckets are
+blocked, the operation waits for the earlier reset. Secondary limiting remains a
+shared gate because changing API does not escape GitHub's
+[secondary rate limits](https://docs.github.com/en/graphql/overview/rate-limits-and-query-limits-for-the-graphql-api#about-secondary-rate-limits).
+
+The client learns quotas from ordinary response headers and does not spend a request
+polling `/rate_limit`. REST `core` requests and GraphQL points are different units;
+the reported headers, rather than HTTP-attempt count, remain authoritative. GraphQL
+connection queries can cost more than one point, and their returned remaining value
+feeds the next routing decision.
+
+Sources: [gh_puller/github/](../gh_puller/github/); [tests/test_github_puller.py](../tests/test_github_puller.py)
 
 Authenticated ETag requests that return 304 do not consume primary REST quota; they
 remain HTTP attempts and therefore remain included in the run's `requests` counter.
@@ -178,9 +201,11 @@ See GitHub's
 
 GitHub documents the 250-entry cap on
 [List commits on a pull request](https://docs.github.com/en/rest/pulls/pulls#list-commits-on-a-pull-request).
-For a larger selected PR, the puller uses the paginated
+For a larger selected PR routed through REST, the client uses the paginated
 [Compare two commits](https://docs.github.com/en/rest/commits/commits#compare-two-commits)
 response because its base/head range is exact and its commit list can cross that cap.
+The GraphQL commit connection has no corresponding 250-entry branch in the client;
+it follows every cursor and verifies the same advertised total.
 
 PR file content and file membership come from Git objects rather than GitHub's
 [3,000-file-limited PR collection](https://docs.github.com/en/rest/pulls/pulls#list-pull-requests-files).
@@ -201,39 +226,34 @@ never represented by a dangling archive ref.
 
 Sources: [gh_puller/github/](../gh_puller/github/); [tests/test_github_git_store.py](../tests/test_github_git_store.py)
 
-When the three REST discovery streams each fit on one page and nothing changed, one
-authenticated warm pass costs three REST attempts and no GraphQL query. The cost is
-independent of archive size. A future-T operation that performs both prefetch and
-closure normally costs six quiet REST attempts. Selected PRs add GraphQL
-`closingIssuesReferences` work. GitHub accounts the two primary budgets independently;
-see its
-[REST rate-limit reference](https://docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api)
-and
-[GraphQL rate-limit reference](https://docs.github.com/en/graphql/overview/rate-limits-and-query-limits-for-the-graphql-api).
+When the three discovery streams each fit on one page and nothing changed, an
+authenticated warm pass makes three REST requests, and the cost is independent of
+archive size. A future-T operation that performs both prefetch and closure normally
+makes six such requests. Only selected parents enter the per-parent operations;
+their reusable REST validators may then produce primary-quota-free `304` responses.
 
-For I ordinary Issues, P pull requests, and N = I + P, the authenticated cold-path
-minimum is easier to compare as separate primary-rate-limit buckets:
+For a cold archive with N Issue/PR parents, the fixed REST floor is the mixed catalog
+plus the per-parent timeline and event collections:
 
 ```text
-REST HTTP requests:    ceil(N / 100) + 2I + 4P
-GraphQL HTTP requests: 1 + B
+fixed REST operations: ceil(N / 100) + 2N
 ```
 
-The REST catalog and GraphQL count contribute the first term of their respective
-lines. An empty Issue still reads timeline and events. An empty PR additionally reads
-PR detail and reviews. The PR batch term reads the first page of every closing
-relation, where B is the number of nonempty selected-PR batches and each batch
-contains at most 100 PRs. A relation beyond 100 nodes adds cursor requests, while
-non-empty comments, reactions, commits, review teams, and pagination add their actual
-REST requests. A PR with K commits adds `ceil(K / 100)` REST requests; above 250 those
-requests are comparison pages instead of a knowingly capped PR collection. Git
-traffic is intentionally absent from both API-budget lines. On a warm pass, only
-selected PRs enter the GraphQL relation batches. GitHub's response headers remain
-authoritative for actual point consumption.
-See the
-[PullRequest GraphQL fields](https://docs.github.com/en/graphql/reference/pulls#pullrequest)
-and
-[GraphQL resource limits](https://docs.github.com/en/graphql/overview/rate-limits-and-query-limits-for-the-graphql-api).
+PR detail and reviews, nonempty conversation or review comments, reactions, and
+nonempty PR commits form the selectable load shared between the two primary buckets.
+Requested-reviewer fallback remains REST. Repository count and batched
+`closingIssuesReferences` remain GraphQL. Pagination adds work to the bucket selected
+for that operation; GraphQL reports points rather than request count. Git traffic is
+absent from both API budgets.
+
+This decomposition is intentionally not collapsed into one “requests per PR” number:
+the router changes the split as headers change, GraphQL query cost depends on its
+connections, and a prior ETag can make a REST validation free of primary quota.
+GitHub accounts the two primary budgets independently but applies documented shared
+secondary constraints. See the
+[REST rate-limit reference](https://docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api),
+[GraphQL rate-limit reference](https://docs.github.com/en/graphql/overview/rate-limits-and-query-limits-for-the-graphql-api),
+and [PullRequest GraphQL fields](https://docs.github.com/en/graphql/reference/pulls#pullrequest).
 
 Primary or secondary limiting follows GitHub's advertised recovery time, so a cold
 start may span quota windows while remaining one blocking `pull(T)` call. REST and
@@ -331,12 +351,25 @@ writer for the pair; SQLite uses WAL mode, foreign keys, and `synchronous=FULL`.
 Back up, move, or restore the database and its `.git` directory together.
 
 Each version retains an unprojected REST summary and one record containing all
-supported responses read for that Issue or PR. The GraphQL count projection is not
-stored. A selected PR does store projected `closingIssuesReferences` nodes and a Git
-snapshot manifest. Unknown REST JSON fields are preserved semantically. Issue records
-include detail, comments, comment reactions, timeline, events, and reactions. PR
-records additionally include PR detail, reviews, review comments and reactions,
-commit metadata, requested reviewers, closing-Issue references, and the Git manifest.
+supported facts read for that Issue or PR. The GraphQL count projection is not stored.
+For a selectable operation, the ordinary record fields use one stable shape
+regardless of transport. `api_sources` records `rest` or `graphql`; a GraphQL-backed
+fact additionally retains the exact selected source node under `raw`, while a
+REST-backed fact is already the unprojected value in the ordinary field. Tests run
+the same simulated state through both transports and require these stable fields to
+be equal after source evidence is removed.
+
+This transport equality is a stable-fact contract, not raw-schema identity. REST can
+return unknown fields without prior selection and those fields remain preserved when
+REST serves the operation. GraphQL returns only fields named by its query, so an
+unknown REST field cannot be manufactured on the GraphQL path; the selected GraphQL
+node is retained instead. Downstream code that needs source-specific fields must read
+`api_sources`, while transport-independent mining should use the stable record fields.
+
+Issue records include detail, comments, comment reactions, timeline, events, and
+reactions. PR records additionally include PR detail, reviews, review comments and
+reactions, commit metadata, requested reviewers, closing-Issue references, and the
+Git manifest.
 
 Aggregate fields and their enumerated collections remain separate facts. GitHub can
 retain an Issue `comments` or PR `review_comments` aggregate after comments are no
@@ -354,7 +387,7 @@ commit topology. A Git LFS path remains its pointer blob unless LFS content is a
 separately, and a submodule remains a gitlink to an external commit. Linked attachments
 and facts that GitHub made unavailable before observation are outside the archive.
 A tombstone records a directly observed parent absence without discarding its last
-record. Archive schema 7 pairs this resource set with record schema 4.
+record. Archive schema 7 pairs this resource set with record schema 5.
 
 Sources: [gh_puller/github/](../gh_puller/github/); [tests/test_github_puller.py](../tests/test_github_puller.py); [tests/test_github_git_store.py](../tests/test_github_git_store.py)
 
@@ -637,15 +670,16 @@ The suite covers raw-field retention, durable page/task/cursor recovery, concurr
 directory production and bounded Issue/PR consumption, expired-cursor directory
 replay with completed-record reuse, PR resources, batched and paginated closing-Issue
 relations, same-second boundaries, future prefetch history, HTTP validator reuse,
-250-entry PR-commit routing, complete large comparisons, more-than-3,000-file Git
-snapshots, unrelated-history PRs, force-push retention, pass-local progress,
-ref/API race recovery, zero-request idempotent reuse, observer failure isolation, TTY
-and JSON progress, rate-limit waits, current-head visibility, single- and multi-page
-conditional validation, 100→101 page growth, content deduplication, directly observed
-tombstones, cancellation, completion-order durable resume, concurrent duplicate
-calls, scheduler recovery, randomized observable Issue/PR and comment churn,
-silent-deletion best effort, schema validation, and request-saving shortcuts for
-selected records.
+independent primary-quota gates, capacity routing and alternate-transport fallback,
+REST/GraphQL stable-fact equivalence, complete GraphQL commit pagination, REST
+comparison fallback beyond 250 commits, more-than-3,000-file Git snapshots,
+unrelated-history PRs, force-push retention, pass-local progress, ref/API race
+recovery, zero-request idempotent reuse, observer failure isolation, TTY and JSON
+progress, rate-limit waits, current-head visibility, single- and multi-page conditional
+validation, 100→101 page growth, content deduplication, directly observed tombstones,
+cancellation, completion-order durable resume, concurrent duplicate calls, scheduler
+recovery, randomized observable Issue/PR and comment churn, silent-deletion best
+effort, schema validation, and request-saving shortcuts for selected records.
 
 The daemon tests additionally verify unit rendering, repeatable installation and
 uninstallation, archive preservation, database-scoped controls, repository-binding
