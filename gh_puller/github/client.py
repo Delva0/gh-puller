@@ -86,6 +86,41 @@ query PullRequestDetail($owner: String!, $repo: String!, $number: Int!) {
   }
 }
 """
+_PULL_REVIEWS = """
+query PullReviews($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
+  repository(owner: $owner, name: $repo) {
+    pullRequest(number: $number) {
+      number
+      reviews(first: 100, after: $cursor) {
+        totalCount
+        nodes {
+          id
+          fullDatabaseId
+          body
+          state
+          authorAssociation
+          submittedAt
+          createdAt
+          updatedAt
+          url
+          commit { oid }
+          author {
+            __typename
+            login
+            avatarUrl
+            url
+            ... on User { id databaseId name email isSiteAdmin }
+            ... on Organization { id databaseId name email }
+            ... on Bot { id databaseId }
+            ... on Mannequin { id databaseId email }
+          }
+        }
+        pageInfo { hasNextPage endCursor }
+      }
+    }
+  }
+}
+"""
 
 
 class _Transport(StrEnum):
@@ -361,6 +396,25 @@ class GitHubAPI:
         Raises:
             GitHubAPIError: 任一 200 响应不是 JSON 对象数组。
         """
+        return await self._paginate_cached(
+            path,
+            previous=previous,
+            cache=cache,
+            params=params,
+            page_observer=page_observer,
+            primary_wait=True,
+        )
+
+    async def _paginate_cached(
+        self,
+        path: str,
+        *,
+        previous: list[dict[str, Any]] | None,
+        cache: dict[str, Any] | None,
+        params: Mapping[str, Any] | None = None,
+        page_observer: Callable[[int], None] | None = None,
+        primary_wait: bool,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
         query = dict(params or {})
         query.setdefault("per_page", 100)
         key = self._cache_key(path, query, None, "page")
@@ -374,6 +428,7 @@ class GitHubAPI:
                     "GET",
                     str(page["url"]),
                     request_headers=headers,
+                    primary_wait=primary_wait,
                 )
                 if response.status_code != 304:
                     changed = index, response
@@ -396,20 +451,33 @@ class GitHubAPI:
                     "size": len(previous),
                 }
             if changed[0] == 0:
-                return await self._paginate_response(changed[1], key, page_observer)
+                return await self._paginate_response(
+                    changed[1],
+                    key,
+                    page_observer,
+                    primary_wait=primary_wait,
+                )
 
         response = await self._request(
             "GET",
             path,
             params=query,
+            primary_wait=primary_wait,
         )
-        return await self._paginate_response(response, key, page_observer)
+        return await self._paginate_response(
+            response,
+            key,
+            page_observer,
+            primary_wait=primary_wait,
+        )
 
     async def _paginate_response(
         self,
         response: httpx.Response,
         key: str,
         page_observer: Callable[[int], None] | None,
+        *,
+        primary_wait: bool,
     ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
         items: list[dict[str, Any]] = []
         pages: list[dict[str, Any]] = []
@@ -429,7 +497,11 @@ class GitHubAPI:
             next_url = response.links.get("next", {}).get("url")
             if not next_url:
                 break
-            response = await self._request("GET", next_url)
+            response = await self._request(
+                "GET",
+                next_url,
+                primary_wait=primary_wait,
+            )
         sizes = [int(page["size"]) for page in pages]
         if len(pages) == page_count and all(size == 100 for size in sizes[:-1]) and sizes[-1] < 100:
             return items, {"key": key, "pages": pages, "size": len(items)}
@@ -529,6 +601,59 @@ class GitHubAPI:
                 _Transport.GRAPHQL,
                 raw,
             )
+
+        return await self._either(rest, graphql, rest_cached=cache is not None)
+
+    async def pull_reviews(
+        self,
+        owner: str,
+        repo: str,
+        number: int,
+        *,
+        previous: list[dict[str, Any]] | None,
+        cache: dict[str, Any] | None,
+    ) -> GitHubResource:
+        """读取一个 PR 的完整 review 集合，并自动选择主配额池。
+
+        Args:
+            owner: 仓库 owner。
+            repo: 仓库名。
+            number: 仓库内 PR number。
+            previous: 与 cache 配对的上一版稳定集合；None 表示冷读取。
+            cache: 本操作先前返回的 REST 分页 validator。
+
+        Returns:
+            REST 兼容的稳定 review 集合、事实来源、来源原文与 validator。
+        """
+        if number < 1:
+            raise ValueError("number must be positive")
+        path = (
+            f"/repos/{quote(owner, safe='')}/{quote(repo, safe='')}/pulls/{number}/reviews"
+        )
+
+        async def rest(wait_primary: bool) -> GitHubResource:
+            value, updated = await self._paginate_cached(
+                path,
+                previous=previous,
+                cache=cache,
+                primary_wait=wait_primary,
+            )
+            return GitHubResource(value, _Transport.REST, value, updated)
+
+        async def graphql(wait_primary: bool) -> GitHubResource:
+            raw = await self._pull_connection(
+                _PULL_REVIEWS,
+                "reviews",
+                owner,
+                repo,
+                number,
+                primary_wait=wait_primary,
+            )
+            value = [
+                _rest_review(review, self._base_url, owner, repo, number)
+                for review in raw
+            ]
+            return GitHubResource(value, _Transport.GRAPHQL, raw)
 
         return await self._either(rest, graphql, rest_cached=cache is not None)
 
@@ -723,6 +848,55 @@ class GitHubAPI:
                 secondary_attempt += 1
                 continue
             raise GitHubAPIError(f"GitHub GraphQL error for {response.url}: {errors!r}")
+
+    async def _pull_connection(
+        self,
+        query: str,
+        field: str,
+        owner: str,
+        repo: str,
+        number: int,
+        *,
+        primary_wait: bool,
+    ) -> list[dict[str, Any]]:
+        items: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        cursor: str | None = None
+        expected: int | None = None
+        while True:
+            payload = await self._graphql(
+                query,
+                {"owner": owner, "repo": repo, "number": number, "cursor": cursor},
+                primary_wait=primary_wait,
+            )
+            pull = _graphql_pull(payload, number)
+            connection = _graphql_connection(pull, field, number)
+            total = connection["totalCount"]
+            if expected is None:
+                expected = total
+            elif expected != total:
+                raise GitHubAPIError(
+                    f"pull #{number} {field} count changed while paging",
+                )
+            for node in connection["nodes"]:
+                node_id = node.get("id")
+                if not isinstance(node_id, str) or not node_id or node_id in seen:
+                    raise GitHubAPIError(
+                        f"pull #{number} has invalid {field} identities",
+                    )
+                seen.add(node_id)
+                items.append(node)
+            page_info = connection["pageInfo"]
+            if not page_info["hasNextPage"]:
+                if len(items) != expected:
+                    raise GitHubAPIError(
+                        f"pull #{number} advertised {expected} {field}, got {len(items)}",
+                    )
+                return items
+            next_cursor = page_info["endCursor"]
+            if not isinstance(next_cursor, str) or not next_cursor or next_cursor == cursor:
+                raise GitHubAPIError(f"pull #{number} has an invalid {field} cursor")
+            cursor = next_cursor
 
     async def _request(
         self,
@@ -1082,6 +1256,29 @@ def _graphql_pull(payload: dict[str, Any], number: int) -> dict[str, Any]:
     return pull
 
 
+def _graphql_connection(
+    pull: dict[str, Any],
+    field: str,
+    number: int,
+) -> dict[str, Any]:
+    connection = pull.get(field)
+    if not isinstance(connection, dict):
+        raise GitHubAPIError(f"pull #{number} has no {field} connection")
+    nodes = connection.get("nodes")
+    total = connection.get("totalCount")
+    page_info = connection.get("pageInfo")
+    if (
+        not isinstance(nodes, list)
+        or any(not isinstance(node, dict) for node in nodes)
+        or type(total) is not int
+        or total < 0
+        or not isinstance(page_info, dict)
+        or type(page_info.get("hasNextPage")) is not bool
+    ):
+        raise GitHubAPIError(f"pull #{number} has invalid {field} pagination")
+    return connection
+
+
 def _rest_pull_detail(
     pull: dict[str, Any],
     base_url: str,
@@ -1146,6 +1343,38 @@ def _rest_pull_detail(
             "commits": {"href": f"{url}/commits"},
             "statuses": {"href": f"{api}/statuses/{head['sha']}"},
         },
+    }
+
+
+def _rest_review(
+    review: dict[str, Any],
+    base_url: str,
+    owner: str,
+    repo: str,
+    number: int,
+) -> dict[str, Any]:
+    pull_url = (
+        f"{base_url}/repos/{quote(owner, safe='')}/{quote(repo, safe='')}/pulls/{number}"
+    )
+    html_url = review["url"]
+    commit = review.get("commit")
+    return {
+        "id": _database_id(review.get("fullDatabaseId")),
+        "node_id": review["id"],
+        "user": _rest_actor(review.get("author")),
+        "body": review["body"],
+        "state": review["state"],
+        "html_url": html_url,
+        "pull_request_url": pull_url,
+        "author_association": review["authorAssociation"],
+        "_links": {
+            "html": {"href": html_url},
+            "pull_request": {"href": pull_url},
+        },
+        "submitted_at": review.get("submittedAt"),
+        "commit_id": commit.get("oid") if isinstance(commit, dict) else None,
+        "created_at": review["createdAt"],
+        "updated_at": review["updatedAt"],
     }
 
 

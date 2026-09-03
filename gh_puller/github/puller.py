@@ -113,6 +113,16 @@ class _API(Protocol):
         cache: dict[str, Any] | None,
     ) -> GitHubResource: ...
 
+    async def pull_reviews(
+        self,
+        owner: str,
+        repo: str,
+        number: int,
+        *,
+        previous: list[dict[str, Any]] | None,
+        cache: dict[str, Any] | None,
+    ) -> GitHubResource: ...
+
 
 class _GitStore(Protocol):
     async def prefetch(
@@ -953,12 +963,19 @@ class GitHubPuller:
         if not isinstance(pull, dict):
             raise IncompleteGitHubDataError(f"GitHub returned a non-object for {path}")
         _set_cache(http_cache, "detail", cache)
-        reviews, cache = await self._cached_page(
-            api,
-            f"{path}/reviews",
-            _list_field(previous, "reviews"),
-            _dict_field(previous_cache, "reviews"),
+        review_resource = await api.pull_reviews(
+            self._owner,
+            self._repo,
+            number,
+            previous=_list_field(previous, "reviews"),
+            cache=_dict_field(previous_cache, "reviews"),
         )
+        reviews = review_resource.value
+        cache = review_resource.cache
+        if not isinstance(reviews, list) or any(
+            not isinstance(review, dict) for review in reviews
+        ):
+            raise IncompleteGitHubDataError(f"GitHub returned invalid reviews for {path}")
         _set_cache(http_cache, "reviews", cache)
         if not force_comments and _is_zero_integer(pull.get("review_comments")):
             review_comments = []
@@ -1020,7 +1037,10 @@ class GitHubPuller:
             "git": git_snapshot,
             "requested_reviewers": requested_reviewers,
             "closing_issues_references": closing_references,
-            "api_sources": {"detail": _api_source(detail)},
+            "api_sources": {
+                "detail": _api_source(detail),
+                "reviews": _api_source(review_resource),
+            },
         }
         return result, http_cache or None
 

@@ -257,6 +257,22 @@ class FakeAPI:
         )
         return GitHubResource(value, "rest", value, updated)
 
+    async def pull_reviews(
+        self,
+        owner: str,
+        repo: str,
+        number: int,
+        *,
+        previous: list[dict[str, Any]] | None,
+        cache: dict[str, Any] | None,
+    ) -> GitHubResource:
+        value, updated = await self.paginate_cached(
+            f"/repos/{owner}/{repo}/pulls/{number}/reviews",
+            previous=previous,
+            cache=cache,
+        )
+        return GitHubResource(value, "rest", value, updated)
+
     async def closing_issue_references(
         self,
         owner: str,
@@ -427,6 +443,31 @@ def _graphql_pull(number: int = 7) -> dict[str, Any]:
         "comments": {"totalCount": 4},
         "commits": {"totalCount": 3},
         "futureGraphQLField": {"kept": True},
+    }
+
+
+def _graphql_review(number: int) -> dict[str, Any]:
+    return {
+        "id": f"review-{number}",
+        "fullDatabaseId": str(number),
+        "body": f"review {number}",
+        "state": "APPROVED",
+        "authorAssociation": "MEMBER",
+        "submittedAt": _iso(_T0 - timedelta(minutes=number)),
+        "createdAt": _iso(_T0 - timedelta(minutes=number + 1)),
+        "updatedAt": _iso(_T0 - timedelta(minutes=number)),
+        "url": f"https://github.test/acme/widgets/pull/7#pullrequestreview-{number}",
+        "commit": {"oid": f"{number:040x}"},
+        "author": {
+            "__typename": "User",
+            "id": f"user-{number}",
+            "databaseId": number + 100,
+            "login": f"reviewer-{number}",
+            "avatarUrl": f"https://avatars.test/{number}",
+            "url": f"https://github.test/reviewer-{number}",
+            "isSiteAdmin": False,
+        },
+        "futureGraphQLField": {"kept": number},
     }
 
 
@@ -692,7 +733,10 @@ async def test_pull_request_bundle_preserves_discussion_and_git_snapshot(tmp_pat
     assert pull["git"]["head_sha"] == "b" * 40
     assert pull["requested_reviewers"]["users"][0]["login"] == "alice"
     assert pull["closing_issues_references"] == [_closing_issue(11)]
-    assert pull["api_sources"] == {"detail": {"source": "rest"}}
+    assert pull["api_sources"] == {
+        "detail": {"source": "rest"},
+        "reviews": {"source": "rest"},
+    }
     assert {"files", "diff", "patch"}.isdisjoint(pull)
     assert git.prefetches == [[7]]
     assert git.captures == [7]
@@ -2428,6 +2472,75 @@ async def test_pull_detail_falls_back_when_preferred_graphql_quota_exhausts() ->
     assert result.source == "rest"
     assert result.value == rest
     assert clock.sleeps == []
+
+
+@pytest.mark.asyncio
+async def test_pull_reviews_graphql_paginates_and_preserves_source() -> None:
+    seen: list[dict[str, Any]] = []
+    reviews = [_graphql_review(71), _graphql_review(72)]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path != "/graphql":
+            return httpx.Response(
+                200,
+                headers=_quota_headers("core", 500),
+                json={"seed": True},
+                request=request,
+            )
+        body = json.loads(request.content)
+        seen.append(body)
+        cursor = body["variables"]["cursor"]
+        nodes = reviews[:1] if cursor is None else reviews[1:]
+        connection = {
+            "totalCount": 2,
+            "nodes": nodes,
+            "pageInfo": {
+                "hasNextPage": cursor is None,
+                "endCursor": "next-review" if cursor is None else None,
+            },
+        }
+        return httpx.Response(
+            200,
+            headers=_quota_headers("graphql", 4_900 - len(seen)),
+            json={
+                "data": {
+                    "repository": {
+                        "pullRequest": {"number": 7, "reviews": connection},
+                    },
+                },
+            },
+            request=request,
+        )
+
+    client = httpx.AsyncClient(
+        base_url="https://api.github.test",
+        transport=httpx.MockTransport(handler),
+    )
+    api = GitHubAPI(
+        token=str(id(client)),
+        client=client,
+        graphql_url="/graphql",
+        now=lambda: _T0,
+    )
+    try:
+        await api.get_json("/seed-core")
+        result = await api.pull_reviews(
+            "acme",
+            "widgets",
+            7,
+            previous=None,
+            cache=None,
+        )
+    finally:
+        await client.aclose()
+
+    assert [body["variables"]["cursor"] for body in seen] == [None, "next-review"]
+    assert result.source == "graphql"
+    assert result.raw == reviews
+    assert [review["id"] for review in result.value] == [71, 72]
+    assert result.value[0]["user"]["login"] == "reviewer-71"
+    assert result.value[0]["commit_id"] == f"{71:040x}"
+    assert result.value[0]["state"] == "APPROVED"
 
 
 @pytest.mark.asyncio
