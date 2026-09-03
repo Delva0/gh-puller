@@ -18,6 +18,7 @@ from datetime import UTC, datetime, tzinfo
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from .git_store import git_store_path
 from .progress import RateQuota
 
 if TYPE_CHECKING:
@@ -35,6 +36,7 @@ class ManagedWriter:
     identity: str  # Full database-path digest.
     repository: str  # Bound GitHub owner/repo.
     database: Path  # Canonical SQLite destination.
+    git_store: Path  # Database-derived bare Git object store.
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,6 +106,7 @@ def _managed_writers(systemd_dir: Path, database: Path | None = None) -> list[Ma
                 identity=identity,
                 repository=repository,
                 database=resolved,
+                git_store=git_store_path(resolved),
             ),
         )
     return writers
@@ -221,6 +224,7 @@ def _render_table(
         "STATE",
         "REPOSITORY",
         "DATABASE",
+        "GIT STORE",
         "RUN",
         "TARGET T",
         "ITEMS",
@@ -236,6 +240,7 @@ def _render_table(
             _service_label(status.service),
             status.writer.repository,
             str(status.writer.database),
+            str(status.writer.git_store),
             _show(status.progress.run_id if status.progress else None),
             _target(status.progress, zone),
             _items(status.progress),
@@ -269,6 +274,7 @@ def _render_detail(
         ("STATE", _service_detail(status.service)),
         ("REPOSITORY", status.writer.repository),
         ("DATABASE", str(status.writer.database)),
+        ("GIT STORE", str(status.writer.git_store)),
         ("PID", str(status.service.pid) if status.service.pid else "-"),
         ("RESTARTS", str(status.service.restarts)),
         ("RUN", _show(progress.run_id if progress else None)),

@@ -31,7 +31,7 @@ def _full_digest_unit_for(database: Path) -> str:
 def _bind_archive(
     database: Path,
     repository: str = _REPOSITORY,
-    schema: str = "5",
+    schema: str = "7",
 ) -> None:
     with sqlite3.connect(database) as connection:
         connection.execute(
@@ -154,7 +154,10 @@ def test_install_is_idempotent_and_uninstall_preserves_archive(tmp_path: Path) -
 
     for argument in reversed(database_arguments):
         result = _run("uninstall", argument, environment=environment)
-        assert "SQLite archives, .env, environments, and source files were preserved." in result.stdout
+        assert (
+            "SQLite archives, Git object stores, .env, environments, and source files were preserved."
+            in result.stdout
+        )
 
     assert not unit.exists()
     assert database.read_bytes() == original
@@ -333,6 +336,7 @@ def test_daemon_control_actions_address_database_writer(
     calls = log.read_text().splitlines()
     if action == "status":
         assert f"DATABASE    {database.resolve()}" in result.stdout
+        assert f"GIT STORE   {database.resolve()}.git" in result.stdout
         assert calls[0].startswith(f"show {unit_name} --property=ActiveState")
         assert calls[1] == f"--unit {unit_name} --output=cat --lines=512 --no-pager"
     elif action in {"start", "restart"}:

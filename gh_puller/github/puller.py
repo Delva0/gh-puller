@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
 from .client import GitHubAPI, GitHubAPIError, GitHubPage
+from .git_store import GitObjectStore, default_git_url, git_store_path
 from .progress import _PullProgressTracker
 from .store import (
     ArchivedRun,
@@ -39,6 +40,7 @@ _NUMBER_AT_END = re.compile(r"/(\d+)$")
 _CLOSING_REFERENCE_BATCH_SIZE = 100
 _CATALOG_ACCEPT = "application/vnd.github.raw+json"
 _PULL_COMMITS_LIMIT = 250
+_BUNDLE_SCHEMA_VERSION = 4
 
 
 class IncompleteGitHubDataError(RuntimeError):
@@ -57,17 +59,6 @@ class _API(Protocol):
         params: dict[str, Any] | None = None,
         accept: str | None = None,
     ) -> tuple[Any, dict[str, Any] | None]: ...
-
-    async def get_text(self, path: str, *, accept: str) -> str: ...
-
-    async def get_text_cached(
-        self,
-        path: str,
-        *,
-        accept: str,
-        previous: str | None,
-        cache: dict[str, Any] | None,
-    ) -> tuple[str, dict[str, Any] | None]: ...
 
     async def paginate(
         self,
@@ -113,6 +104,17 @@ class _API(Protocol):
     ) -> list[dict[str, Any]]: ...
 
 
+class _GitStore(Protocol):
+    async def prefetch(
+        self,
+        numbers: list[int],
+        *,
+        heartbeat: Callable[[], None] | None = None,
+    ) -> None: ...
+
+    async def capture(self, number: int, pull: dict[str, Any]) -> dict[str, Any]: ...
+
+
 @dataclass(frozen=True, slots=True)
 class GitHubPullConfig:
     repository: str  # GitHub owner/repo identity.
@@ -124,6 +126,7 @@ class GitHubPullConfig:
     concurrency: int = 4  # Concurrent item bundles; each bundle paginates serially.
     request_timeout: float = 30.0  # Per-request timeout in seconds.
     overlap_seconds: int = 2  # Replayed boundary for second-resolution GitHub timestamps.
+    git_url: str | None = None  # None uses repository's GitHub.com HTTPS URL.
 
     def __post_init__(self) -> None:
         parts = self.repository.split("/")
@@ -133,6 +136,8 @@ class GitHubPullConfig:
             raise ValueError("concurrency must be positive")
         if self.overlap_seconds < 1:
             raise ValueError("overlap_seconds must be positive")
+        if self.git_url is not None and not self.git_url:
+            raise ValueError("git_url cannot be empty")
         object.__setattr__(self, "destination", Path(self.destination))
 
 
@@ -157,6 +162,7 @@ class GitHubPuller:
     Args:
         config: 仓库、SQLite 事实库和请求策略。
         api: 测试或宿主提供的 GitHub API 读取对象。
+        git: 测试或宿主提供的持久化 Git 对象库。
         now: 在函数入口冻结默认目标及记录完成时刻的 UTC 时钟。
         sleep: 等待未来目标使用的异步等待函数。
         observer: 同步带外进度观察器；失败不影响事实拉取。
@@ -167,12 +173,14 @@ class GitHubPuller:
         config: GitHubPullConfig,
         *,
         api: _API | None = None,
+        git: _GitStore | None = None,
         now: Callable[[], datetime] = lambda: datetime.now(UTC),
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         observer: ProgressObserver | None = None,
     ) -> None:
         self.config = config
         self._api = api
+        self._git = git
         self._now = now
         self._sleep = sleep
         self._observer = observer
@@ -243,6 +251,7 @@ class GitHubPuller:
         progress: _PullProgressTracker,
     ) -> PullResult:
         api, owned = self._make_api(progress)
+        git = self._make_git()
         request_start = api.request_count
         accounted = False
         try:
@@ -254,6 +263,7 @@ class GitHubPuller:
                 if active is not None:
                     observed = await self._sync_pass(
                         api,
+                        git,
                         archive,
                         run.id,
                         _parse_required_time(active.cutoff_at),
@@ -266,6 +276,7 @@ class GitHubPuller:
                     if observed is None or now > observed:
                         observed = await self._sync_pass(
                             api,
+                            git,
                             archive,
                             run.id,
                             now,
@@ -285,6 +296,7 @@ class GitHubPuller:
                 if observed is None or target_at > observed:
                     await self._sync_pass(
                         api,
+                        git,
                         archive,
                         run.id,
                         target_at,
@@ -323,11 +335,8 @@ class GitHubPuller:
     def _make_api(self, progress: _PullProgressTracker) -> tuple[_API, bool]:
         if self._api is not None:
             return self._api, False
-        token = self.config.token
-        if token is None:
-            token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
         return GitHubAPI(
-            token=token,
+            token=_token(self.config.token),
             base_url=self.config.api_url,
             graphql_url=self.config.graphql_url,
             api_version=self.config.api_version,
@@ -335,9 +344,20 @@ class GitHubPuller:
             progress=progress.api_progress,
         ), True
 
+    def _make_git(self) -> _GitStore:
+        if self._git is not None:
+            return self._git
+        return GitObjectStore(
+            git_store_path(self.config.destination),
+            self.config.repository,
+            self.config.git_url or default_git_url(self.config.repository),
+            token=_token(self.config.token),
+        )
+
     async def _sync_pass(
         self,
         api: _API,
+        git: _GitStore,
         archive: SQLiteArchive,
         run_id: int,
         cutoff: datetime,
@@ -385,6 +405,7 @@ class GitHubPuller:
                 if tasks:
                     await self._consume_tasks(
                         api,
+                        git,
                         archive,
                         run_id,
                         heads,
@@ -405,6 +426,7 @@ class GitHubPuller:
                     break
                 await self._consume_tasks(
                     api,
+                    git,
                     archive,
                     run_id,
                     heads,
@@ -522,6 +544,7 @@ class GitHubPuller:
     async def _consume_tasks(
         self,
         api: _API,
+        git: _GitStore,
         archive: SQLiteArchive,
         run_id: int,
         heads: dict[int, StoredHead],
@@ -549,6 +572,7 @@ class GitHubPuller:
         if selected:
             await self._fetch_candidates(
                 api,
+                git,
                 archive,
                 run_id,
                 heads,
@@ -561,6 +585,7 @@ class GitHubPuller:
     async def _fetch_candidates(
         self,
         api: _API,
+        git: _GitStore,
         archive: SQLiteArchive,
         run_id: int,
         heads: dict[int, StoredHead],
@@ -652,6 +677,7 @@ class GitHubPuller:
             try:
                 bundle, http_cache = await self._fetch_bundle(
                     api,
+                    git,
                     summary,
                     previous_bundle,
                     previous_cache,
@@ -744,6 +770,12 @@ class GitHubPuller:
 
         for batch in _closing_reference_batches(sorted(indexed), kind):
             pull_numbers = [number for number in batch if kind(number) == "pull"]
+            if pull_numbers:
+                progress.git_fetch(len(pull_numbers))
+                try:
+                    await git.prefetch(pull_numbers, heartbeat=progress.git_heartbeat)
+                finally:
+                    progress.git_done()
             closing_references = (
                 await api.closing_issue_references(self._owner, self._repo, pull_numbers)
                 if pull_numbers
@@ -754,6 +786,7 @@ class GitHubPuller:
     async def _fetch_bundle(
         self,
         api: _API,
+        git: _GitStore,
         summary: dict[str, Any],
         previous: dict[str, Any] | None,
         previous_cache: dict[str, Any] | None,
@@ -826,7 +859,7 @@ class GitHubPuller:
             )
         _check_count(number, "issue reactions", issue.get("reactions"), reactions)
         bundle: dict[str, Any] = {
-            "schema_version": 2,
+            "schema_version": _BUNDLE_SCHEMA_VERSION,
             "repository": self.config.repository,
             "number": number,
             "kind": "pull" if "pull_request" in issue else "issue",
@@ -840,6 +873,7 @@ class GitHubPuller:
         if bundle["kind"] == "pull":
             pull, cache = await self._fetch_pull(
                 api,
+                git,
                 number,
                 _dict_field(previous, "pull_request"),
                 _dict_field(previous_cache, "pull_request"),
@@ -853,6 +887,7 @@ class GitHubPuller:
     async def _fetch_pull(
         self,
         api: _API,
+        git: _GitStore,
         number: int,
         previous: dict[str, Any] | None,
         previous_cache: dict[str, Any] | None,
@@ -907,16 +942,6 @@ class GitHubPuller:
                 _dict_field(previous_cache, "commits"),
             )
             _set_cache(http_cache, "commits", cache)
-        if _is_zero_integer(pull.get("changed_files")):
-            files = []
-        else:
-            files, cache = await self._cached_page(
-                api,
-                f"{path}/files",
-                _list_field(previous, "files"),
-                _dict_field(previous_cache, "files"),
-            )
-            _set_cache(http_cache, "files", cache)
         requested_reviewers = _embedded_review_requests(pull)
         if requested_reviewers is None:
             requested_reviewers, cache = await self._cached_json(
@@ -934,54 +959,21 @@ class GitHubPuller:
             _dict_field(previous_cache, "review_comment_reactions"),
         )
         _set_cache(http_cache, "review_comment_reactions", cache)
-        expected_files = pull.get("changed_files")
-        if isinstance(expected_files, int) and len(files) < expected_files:
-            raise IncompleteGitHubDataError(
-                f"pull #{number} advertised {expected_files} files, got {len(files)}",
-            )
         if isinstance(expected_commits, int) and len(commits) < expected_commits:
             raise IncompleteGitHubDataError(
                 f"pull #{number} advertised {expected_commits} commits, got {len(commits)}",
             )
-        commit_media_cache: dict[tuple[str, str], tuple[str | None, str | None]] = {}
-        diff, diff_fallback, cache = await self._pull_media(
-            api,
-            path,
-            commits,
-            primary="diff",
-            fallback="patch",
-            previous=_str_field(previous, "diff"),
-            validator=_dict_field(previous_cache, "diff"),
-            commit_cache=commit_media_cache,
-        )
-        _set_cache(http_cache, "diff", cache)
-        patch, patch_fallback, cache = await self._pull_media(
-            api,
-            path,
-            commits,
-            primary="patch",
-            fallback="diff",
-            previous=_str_field(previous, "patch"),
-            validator=_dict_field(previous_cache, "patch"),
-            commit_cache=commit_media_cache,
-        )
-        _set_cache(http_cache, "patch", cache)
+        git_snapshot = await git.capture(number, pull)
         result = {
             "detail": pull,
             "reviews": reviews,
             "review_comments": review_comments,
             "review_comment_reactions": review_reactions,
             "commits": commits,
-            "files": files,
+            "git": git_snapshot,
             "requested_reviewers": requested_reviewers,
             "closing_issues_references": closing_references,
-            "diff": diff,
-            "patch": patch,
         }
-        if diff_fallback is not None:
-            result["diff_fallback"] = diff_fallback
-        if patch_fallback is not None:
-            result["patch_fallback"] = patch_fallback
         return result, http_cache or None
 
     async def _cached_json(
@@ -1012,105 +1004,6 @@ class GitHubPuller:
             previous=previous,
             cache=cache,
         )
-
-    async def _pull_media(
-        self,
-        api: _API,
-        path: str,
-        commits: list[dict[str, Any]],
-        *,
-        primary: str,
-        fallback: str,
-        previous: str | None,
-        validator: dict[str, Any] | None,
-        commit_cache: dict[tuple[str, str], tuple[str | None, str | None]],
-    ) -> tuple[str | None, dict[str, Any] | None, dict[str, Any] | None]:
-        accept = f"application/vnd.github.{primary}"
-        try:
-            value, cache = await self._cached_text(
-                api,
-                path,
-                accept,
-                previous,
-                validator,
-            )
-        except GitHubAPIError as error:
-            parts = []
-            for commit in commits:
-                sha = commit.get("sha")
-                if not isinstance(sha, str) or not sha:
-                    raise IncompleteGitHubDataError("pull commit is missing sha") from error
-                parts.append(
-                    await self._commit_media(
-                        api,
-                        sha,
-                        primary=primary,
-                        fallback=fallback,
-                        cache=commit_cache,
-                    ),
-                )
-            if not parts:
-                raise
-            return None, {"error": str(error), "commits": parts}, None
-        else:
-            return value, None, cache
-
-    async def _cached_text(
-        self,
-        api: _API,
-        path: str,
-        accept: str,
-        previous: str | None,
-        cache: dict[str, Any] | None,
-    ) -> tuple[str, dict[str, Any] | None]:
-        return await api.get_text_cached(
-            path,
-            accept=accept,
-            previous=previous,
-            cache=cache,
-        )
-
-    async def _commit_media(
-        self,
-        api: _API,
-        sha: str,
-        *,
-        primary: str,
-        fallback: str,
-        cache: dict[tuple[str, str], tuple[str | None, str | None]],
-    ) -> dict[str, Any]:
-        value, error = await self._cached_commit_media(api, sha, primary, cache)
-        result = {"sha": sha, primary: value}
-        if error is None:
-            return result
-        result[f"{primary}_error"] = error
-        value, fallback_error = await self._cached_commit_media(api, sha, fallback, cache)
-        result[fallback] = value
-        if fallback_error is not None:
-            result[f"{fallback}_error"] = fallback_error
-            raise IncompleteGitHubDataError(
-                f"commit {sha} has no complete diff or patch representation",
-            )
-        return result
-
-    async def _cached_commit_media(
-        self,
-        api: _API,
-        sha: str,
-        media: str,
-        cache: dict[tuple[str, str], tuple[str | None, str | None]],
-    ) -> tuple[str | None, str | None]:
-        key = sha, media
-        if key not in cache:
-            path = f"{self._base}/commits/{sha}"
-            try:
-                cache[key] = (
-                    await api.get_text(path, accept=f"application/vnd.github.{media}"),
-                    None,
-                )
-            except GitHubAPIError as error:
-                cache[key] = None, str(error)
-        return cache[key]
 
     async def _reactions(
         self,
@@ -1437,6 +1330,10 @@ def _iso(value: datetime) -> str:
 
 def _iso_seconds(value: datetime) -> str:
     return value.astimezone(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def _token(configured: str | None) -> str | None:
+    return configured or os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
 
 
 @asynccontextmanager

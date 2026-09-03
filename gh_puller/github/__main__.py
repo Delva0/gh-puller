@@ -59,10 +59,11 @@ def _parser() -> argparse.ArgumentParser:
 
 def _add_common_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("repository", help="GitHub owner/repo")
-    parser.add_argument("destination", type=Path, help="SQLite raw-fact database")
+    parser.add_argument("destination", type=Path, help="SQLite metadata database; Git objects use DATABASE.git")
     parser.add_argument("--api-url", default="https://api.github.com")
     parser.add_argument("--graphql-url")
     parser.add_argument("--api-version", default="2022-11-28")
+    parser.add_argument("--git-url", help="Git remote URL (default: repository HTTPS URL on GitHub.com)")
     parser.add_argument("--concurrency", type=int, default=4)
     parser.add_argument("--request-timeout", type=float, default=30.0)
     parser.add_argument("--overlap-seconds", type=int, default=2)
@@ -94,6 +95,7 @@ def _config(args: argparse.Namespace) -> GitHubPullConfig:
         api_url=args.api_url,
         graphql_url=args.graphql_url,
         api_version=args.api_version,
+        git_url=args.git_url,
         concurrency=args.concurrency,
         request_timeout=args.request_timeout,
         overlap_seconds=args.overlap_seconds,

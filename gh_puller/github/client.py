@@ -190,54 +190,6 @@ class GitHubAPI:
             raise GitHubAPIError(f"GitHub returned invalid JSON for {response.url}") from exc
         return value, _response_cache(response, key)
 
-    async def get_text(self, path: str, *, accept: str) -> str:
-        """读取自定义 media type 的文本响应。
-
-        Args:
-            path: 相对 API 路径。
-            accept: 请求的 GitHub media type。
-
-        Returns:
-            未改写的响应文本。
-        """
-        return (await self._request("GET", path, accept=accept)).text
-
-    async def get_text_cached(
-        self,
-        path: str,
-        *,
-        accept: str,
-        previous: str | None,
-        cache: dict[str, Any] | None,
-    ) -> tuple[str, dict[str, Any] | None]:
-        """用 ETag 校验并读取一个自定义 media type 响应。
-
-        Args:
-            path: 相对 API 路径。
-            accept: 请求的 GitHub media type，也是 validator identity 的一部分。
-            previous: 与 cache 配对的完整旧文本；None 强制完整读取。
-            cache: 本客户端产生并与 previous 原子持久化的传输元数据。
-
-        Returns:
-            当前未改写文本及其传输元数据；304 精确复用 previous。
-        """
-        key = self._cache_key(path, None, accept, "text")
-        headers = _validator_headers(cache, key) if previous is not None else None
-        response = await self._request(
-            "GET",
-            path,
-            accept=accept,
-            request_headers=headers,
-        )
-        if response.status_code == 304:
-            if headers is None:
-                raise GitHubAPIError(f"GitHub returned unsolicited 304 for {response.url}")
-            updated = _response_cache(response, key, cache)
-            if updated is None:
-                raise GitHubAPIError(f"GitHub returned 304 without a validator for {response.url}")
-            return previous, updated
-        return response.text, _response_cache(response, key)
-
     async def get_page(
         self,
         path: str,

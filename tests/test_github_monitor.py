@@ -27,6 +27,7 @@ def _writer(database: Path, repository: str = "acme/widgets") -> monitor.Managed
         identity=identity,
         repository=repository,
         database=resolved,
+        git_store=monitor.git_store_path(resolved),
     )
 
 
@@ -101,6 +102,7 @@ def test_table_prioritizes_target_items_progress_and_database(tmp_path: Path) ->
     assert "bundles [----------] 224/51,549" in output
     assert "5m00s remaining" in output
     assert str((tmp_path / "facts.sqlite3").resolve()) in output
+    assert str((tmp_path / "facts.sqlite3.git").resolve()) in output
     assert "REQUEST" not in output
     assert "QUOTA" in output
     assert "core     4,498/5,000  reset Wed 2026-09-02 19:00:00 CST" in output
@@ -145,6 +147,7 @@ def test_detail_separates_current_items_from_unknown_catalog_denominator(tmp_pat
     assert "ITEMS       54,083" in output
     assert "PROGRESS    catalog 27,400/?" in output
     assert "DATABASE" in output
+    assert "GIT STORE" in output
     assert str((tmp_path / "facts.sqlite3").resolve()) in output
 
 

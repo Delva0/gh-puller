@@ -21,7 +21,7 @@ Usage:
   github-puller-daemon.sh render OWNER/REPO DATABASE [PULLER_OPTIONS...]
 
 install writes and starts a system-level systemd service. uninstall removes only
-that service; the SQLite archive, .env, virtual environment, and source tree remain.
+that service; the SQLite archive, Git object store, .env, environment, and source remain.
 The schedule defaults to 1h; pass --interval DURATION after DATABASE to change it.
 EOF
 }
@@ -112,7 +112,7 @@ with sqlite3.connect(uri, uri=True) as db:
         "SELECT key, value FROM archive_meta WHERE key IN (?, ?)",
         ("schema_version", "repository"),
     ))
-if metadata.get("schema_version") not in {"4", "5"} or "repository" not in metadata:
+if metadata.get("schema_version") not in {"4", "5", "6", "7"} or "repository" not in metadata:
     raise SystemExit(3)
 print(metadata["repository"])
 ' "$destination"
@@ -347,7 +347,7 @@ case "$action" in
             "$SYSTEMCTL" reset-failed "$(basename "$existing_path")" >/dev/null 2>&1 || true
         done
         printf 'Uninstalled %s\n' "$unit"
-        printf 'SQLite archives, .env, environments, and source files were preserved.\n'
+        printf 'SQLite archives, Git object stores, .env, environments, and source files were preserved.\n'
         ;;
     start|stop|restart)
         [[ $# -eq 2 ]] || fail "$action accepts only DATABASE"

@@ -1,25 +1,23 @@
 <details>
 <summary>Relevant sources</summary>
 
-The following source packages and files were used as context for this document:
-
 - [gh_puller/github/](../gh_puller/github/)
 - [scripts/github-puller-daemon.sh](../scripts/github-puller-daemon.sh)
+- [tests/test_github_git_store.py](../tests/test_github_git_store.py)
 - [tests/test_github_puller.py](../tests/test_github_puller.py)
 - [tests/test_github_cli.py](../tests/test_github_cli.py)
 - [tests/test_github_daemon.py](../tests/test_github_daemon.py)
 - [tests/test_github_monitor.py](../tests/test_github_monitor.py)
-
 </details>
 
 # GitHub raw fact archive
 
-`gh_puller.github` maintains one SQLite database as the durable source of truth for
-the GitHub Issue and pull-request facts it observes. A successful pull retains every
-distinct raw payload it obtains and publishes one run for each target T. Downstream
-jobs can read current state or rebuild the complete observed history without GitHub
-access. GitHub states that never reach a supported API response are outside this
-contract.
+`gh_puller.github` maintains an archive pair: one SQLite database for observed GitHub
+Issue and pull-request semantics, and a companion bare Git store at `DATABASE.git`
+for PR commit, tree, and blob objects. A successful pull publishes one run for each
+target T. Downstream jobs can reconstruct every retained API fact and PR code snapshot
+without network access. GitHub states that never reach a supported API response are
+outside this contract.
 
 Sources: [gh_puller/github/](../gh_puller/github/)
 
@@ -40,7 +38,11 @@ flowchart TD
     Full --> Journal["Atomically persist each page, tasks, and next cursor"]
     Delta --> Journal
     Journal --> Consume["Concurrently consume persisted Issue/PR tasks"]
-    Consume --> Closed{"Terminal page durable and task queue empty?"}
+    Consume --> Kind{"PR task?"}
+    Kind -->|yes| Git["Fetch and pin PR Git objects"]
+    Kind -->|no| Stage["Atomically stage the complete record"]
+    Git --> Stage
+    Stage --> Closed{"Terminal page durable and task queue empty?"}
     Closed -->|no| Journal
     Closed -->|yes| Publish["Atomically publish heads, run, T, and C"]
     Publish --> Read["Read current heads or replay all versions"]
@@ -96,7 +98,7 @@ their expected page hit rate is poor. Cross-run reuse instead occurs at the comp
 Issue/PR record and its atomically paired HTTP validators, where identity remains
 well defined.
 
-Sources: [gh_puller/github/puller.py](../gh_puller/github/puller.py); [gh_puller/github/store.py](../gh_puller/github/store.py); [tests/test_github_puller.py](../tests/test_github_puller.py)
+Sources: [gh_puller/github/](../gh_puller/github/); [tests/test_github_puller.py](../tests/test_github_puller.py)
 
 Let W be the preceding completed observation watermark. Every warm pass reads three
 incremental streams:
@@ -127,7 +129,7 @@ reuses all completed Issue/PR tasks. A repeated number with the same immutable I
 kind, and creation time is idempotent. A conflicting immutable identity aborts the
 pass instead of silently replacing one object with another.
 
-Sources: [gh_puller/github/puller.py](../gh_puller/github/puller.py); [gh_puller/github/store.py](../gh_puller/github/store.py); [tests/test_github_puller.py](../tests/test_github_puller.py)
+Sources: [gh_puller/github/](../gh_puller/github/); [tests/test_github_puller.py](../tests/test_github_puller.py)
 
 The puller deliberately does not run a warm full traversal or infer absence from
 counts. Its observed-change contract is:
@@ -148,9 +150,9 @@ unknown fields. This is lossless storage of observed data, not a claim that GitH
 APIs expose every web-page fact or every historical state.
 
 This is a best-effort discovery boundary, not a perfect GitHub replica. “Source of
-truth” means downstream jobs need only this database to reproduce every fact the
-puller successfully observed; it does not upgrade an unobservable GitHub state into
-an observed fact.
+truth” means downstream jobs need only the archive pair to reproduce every fact and
+code object the puller successfully observed; it does not upgrade an unobservable
+GitHub state into an observed fact.
 
 Sources: [gh_puller/github/](../gh_puller/github/); [tests/test_github_puller.py](../tests/test_github_puller.py)
 
@@ -163,11 +165,11 @@ Sources: [gh_puller/github/](../gh_puller/github/); [tests/test_github_puller.py
 | PR review comments | Read the complete per-parent collection; skip only on an exact zero with no repository signal. | Comment identities must be unique; a signal overrides the shortcut. |
 | Issue reactions | No collection request when detail reports `total_count == 0` | Zero is itself the complete collection; every nonzero or absent count still paginates and is checked against the aggregate. |
 | PR commits | No collection request when PR detail reports an exact zero. Counts through 250 use the PR-commits endpoint; larger PRs paginate the exact `base.sha...head.sha` comparison. | GitHub caps the PR endpoint at 250 commits. A comparison must contain exactly the advertised count with unique commit SHAs and a stable `total_commits` across pages. |
-| PR files | No collection request when PR detail reports an exact zero | Nonzero and absent counts still paginate; a returned collection shorter than `changed_files` aborts publication. |
+| PR code snapshot | Fetch current repository branches and each selected `refs/pull/<number>/head` into the companion bare Git store. Pin the API-observed base/head and comparison objects under immutable archive refs. | A normal PR compares its unique merge-base with head. A PR with no common ancestor compares Git's empty tree with head, matching GitHub's all-files-added semantics. Multiple merge-bases abort rather than select an ambiguous base. |
 | Requested reviewers | Reuse embedded users only when the PR detail contains a valid user list and an empty team list. | Any team or ambiguous embedded value selects the dedicated endpoint, whose team objects carry richer fields. |
 | Issues closed by a PR | Batch up to 100 selected PRs into one GraphQL request, include user-linked Issues, and follow every `closingIssuesReferences` cursor. | Each connection's `totalCount` must equal its unique returned nodes. Missing, duplicate, or malformed data aborts the run instead of becoming an empty relation. |
-| Eligible per-parent JSON, complete paginated lists, diff, and patch | Conditional GET with the prior ETag | Validators are keyed by API root, API version, media type, path, and parameters, and are stored atomically with the exact bundle digest whose body they validate. A paginated list is reusable only when every page has an ETag and the terminal page has fewer than 100 entries. Every page must return `304 Not Modified`; any changed page restarts complete pagination. A terminal full page has no cache, so 100→101 growth cannot hide on a new page. Large-PR comparisons are fetched only when their parent is selected and do not use this validator cache. |
-| Timeline, events, diff, and patch aggregation | No repository-wide consolidation | Repository event responses have a different raw shape, while diff and patch have independent lossless fallback rules. Their per-parent responses remain unprojected; eligible responses still use the conditional transport above. |
+| Eligible per-parent JSON and complete paginated lists | Conditional GET with the prior ETag | Validators are keyed by API root, API version, media type, path, and parameters, and are stored atomically with the exact bundle digest whose body they validate. A paginated list is reusable only when every page has an ETag and the terminal page has fewer than 100 entries. Every page must return `304 Not Modified`; any changed page restarts complete pagination. A terminal full page has no cache, so 100→101 growth cannot hide on a new page. Large-PR commit comparisons are fetched only when their parent is selected and do not use this validator cache. |
+| Timeline and events | Complete per-parent REST collections | Repository event responses have a different raw shape, so repository-wide responses cannot replace them. Their per-parent responses remain unprojected and use the conditional transport above when eligible. |
 
 Authenticated ETag requests that return 304 do not consume primary REST quota; they
 remain HTTP attempts and therefore remain included in the run's `requests` counter.
@@ -179,6 +181,19 @@ GitHub documents the 250-entry cap on
 For a larger selected PR, the puller uses the paginated
 [Compare two commits](https://docs.github.com/en/rest/commits/commits#compare-two-commits)
 response because its base/head range is exact and its commit list can cross that cap.
+
+PR file content and file membership come from Git objects rather than GitHub's
+[3,000-file-limited PR collection](https://docs.github.com/en/rest/pulls/pulls#list-pull-requests-files).
+The bundle records stable `base_ref`, `head_ref`, and
+`comparison_ref` names plus their SHAs and `comparison_kind`. Running `git diff`
+between `comparison_ref` and `head_ref` reconstructs the complete code change even
+when it exceeds 3,000 files. Git fetch traffic consumes repository bandwidth but not
+the REST `core` or GraphQL primary-rate-limit buckets. See
+[git-fetch](https://git-scm.com/docs/git-fetch),
+[git-update-ref](https://git-scm.com/docs/git-update-ref), and
+[git-diff](https://git-scm.com/docs/git-diff).
+
+Sources: [gh_puller/github/](../gh_puller/github/); [tests/test_github_git_store.py](../tests/test_github_git_store.py)
 
 When the three REST discovery streams each fit on one page and nothing changed, one
 authenticated warm pass costs three REST attempts and no GraphQL query. The cost is
@@ -194,31 +209,34 @@ For I ordinary Issues, P pull requests, and N = I + P, the authenticated cold-pa
 minimum is easier to compare as separate primary-rate-limit buckets:
 
 ```text
-REST HTTP requests:    ceil(N / 100) + 2I + 6P
+REST HTTP requests:    ceil(N / 100) + 2I + 4P
 GraphQL HTTP requests: 1 + B
 ```
 
 The REST catalog and GraphQL count contribute the first term of their respective
 lines. An empty Issue still reads timeline and events. An empty PR additionally reads
-PR detail, reviews, diff, and patch. The PR batch term reads the first page of every
-closing relation, where B is the number of nonempty selected-PR batches and each batch
+PR detail and reviews. The PR batch term reads the first page of every closing
+relation, where B is the number of nonempty selected-PR batches and each batch
 contains at most 100 PRs. A relation beyond 100 nodes adds cursor requests, while
-non-empty comments, reactions, commits, files, review teams, pagination, and media
-fallback add their actual REST requests. A PR with K commits adds `ceil(K / 100)`
-REST requests; above 250 those requests are comparison pages instead of a knowingly
-capped PR collection. On a warm pass, only selected PRs enter the GraphQL relation
-batches. GitHub's response headers remain authoritative for actual point consumption.
+non-empty comments, reactions, commits, review teams, and pagination add their actual
+REST requests. A PR with K commits adds `ceil(K / 100)` REST requests; above 250 those
+requests are comparison pages instead of a knowingly capped PR collection. Git
+traffic is intentionally absent from both API-budget lines. On a warm pass, only
+selected PRs enter the GraphQL relation batches. GitHub's response headers remain
+authoritative for actual point consumption.
 See the
 [PullRequest GraphQL fields](https://docs.github.com/en/graphql/reference/pulls#pullrequest)
 and
 [GraphQL resource limits](https://docs.github.com/en/graphql/overview/rate-limits-and-query-limits-for-the-graphql-api).
 
 Primary or secondary limiting follows GitHub's advertised recovery time, so a cold
-start may span quota windows while remaining one blocking `pull(T)` call. Network
-errors and HTTP 5xx responses retry the same request indefinitely with backoff capped
-at 30 seconds. Every accepted root page and its next cursor are already durable before
-the following page begins. Bundle work uses at most `concurrency` in-flight parent
-tasks. Results are consumed in completion order and each completed bundle is staged
+start may span quota windows while remaining one blocking `pull(T)` call. REST and
+GraphQL network errors and HTTP 5xx responses retry the same request indefinitely
+with backoff capped at 30 seconds. A failed Git command leaves the run pending; a
+service writer restarts it after its configured systemd delay. Every accepted root
+page and its next cursor are already durable before the following page begins. Each
+selected PR batch fetches Git refs before at most `concurrency` parent tasks run.
+Results are consumed in completion order and each completed record is staged
 immediately, so one slow parent neither holds the concurrency window nor prevents
 later work from becoming crash-recoverable. Public version iteration remains
 deterministic by run, parent number, and intra-parent observation order.
@@ -259,95 +277,97 @@ resulting snapshot through the same progress stream.
 A future-T operation has separate `prefetch_*` and `closing_*` phases. Each pass moves
 through concurrent directory production and Issue/PR materialization. The run
 identity, durable page cursor, staged records, and accumulated request count continue
-across restarts. A
-`rate_limit` event reports the wait duration and any known quota reset time without
-pretending that object progress moved; `retry_wait` distinguishes network and 5xx
+across restarts. `syncing_git` means the consumer is fetching the selected PR refs;
+`DETAIL pull_refs=N` is that batch's PR count. Heartbeats keep `UPDATED` current, but
+`STAGED pulls` advances only after refs are durable and complete PR records begin to
+commit. This phase does not change REST or GraphQL quota.
+
+A `rate_limit` event reports the wait duration and any known quota reset time without
+pretending that object progress moved; `retry_wait` distinguishes API network and 5xx
 backoff from quota exhaustion. An `error` event retains both the exception class and
 its message, so `status` exposes the object and invariant that stopped the writer.
 
 Sources: [gh_puller/github/](../gh_puller/github/); [tests/test_github_puller.py](../tests/test_github_puller.py); [tests/test_github_cli.py](../tests/test_github_cli.py)
 
-## SQLite is the fact boundary
+## The archive pair is the fact boundary
 
-The store separates invocation metadata, payload bytes, object observations, and
-current heads:
+SQLite separates invocation metadata, payload bytes, object observations, and current
+heads:
 
 - `pull_runs` records T, C, first start time, observation watermark, request count,
   and publication status. A unique index makes T the identity of both pending and
   committed runs.
 - `payload_blobs` stores canonical JSON compressed with zlib and addressed by its
-  SHA-256 digest. Identical summaries and bundles share one payload.
+  SHA-256 digest. Identical summaries and records share one payload.
 - `resource_versions` is an append-only observation log. Multiple different payloads
   observed during one future-T operation remain distinct versions.
 - `resource_heads` is the atomically maintained current state derived from the last
   committed version of each object.
-- `pull_passes` stores the active prefetch or closing cutoff, discovery mode, durable
-  page cursor, and producer counters.
-- `pull_tasks` stores raw root rows, comment-selected parent numbers, and completion
-  state until the pass closes.
-- `bundle_http_cache` stores discardable ETags keyed by the exact content-addressed
-  bundle they validate. It is transport state, is ignored by offline readers, and
-  can always be reconstructed by unconditional requests.
+- `pull_passes` and `pull_tasks` hold the durable traversal cursor, raw root rows, and
+  pending parent work until a pass closes.
+- `bundle_http_cache` holds discardable HTTP validators paired with the exact record
+  they validate. Offline readers ignore it.
 
-Versions belonging to a pending run are durable for recovery but invisible to
-`iter_runs`, `iter_versions`, and `iter_heads`. Finalization updates heads and changes
-the run to `committed` in one SQLite transaction. A process file lock enforces the
-single-writer contract; SQLite uses WAL mode, foreign keys, and
-`synchronous=FULL`.
+The companion `DATABASE.git` directory is a bare repository bound to the same GitHub
+repository as SQLite. Archive-owned refs pin each observed PR base, head, comparison
+base, and available merge commit, so remote branch deletion or force-push cannot make
+an already published code snapshot unreachable. The comparison base is the unique
+merge-base for an ordinary PR and Git's empty tree for an unrelated-history PR.
+
+Git refs are durable before the referencing SQLite record is staged. A crash between
+those steps can leave extra unreachable-from-SQLite archive refs, but cannot publish a
+record that names a missing object. Versions in a pending run remain invisible to
+`iter_runs`, `iter_versions`, and `iter_heads`. Finalization updates SQLite heads and
+changes the run to `committed` in one transaction. A process file lock enforces one
+writer for the pair; SQLite uses WAL mode, foreign keys, and `synchronous=FULL`.
+Back up, move, or restore the database and its `.git` directory together.
 
 Each version retains an unprojected REST summary and one record containing all
 supported responses read for that Issue or PR. The GraphQL count projection is not
-stored. A selected PR does store the projected `closingIssuesReferences` nodes,
-including each target Issue's global ID, repository identity, number, title, state,
-and URL. Unknown fields in REST JSON are preserved semantically. Issue records
+stored. A selected PR does store projected `closingIssuesReferences` nodes and a Git
+snapshot manifest. Unknown REST JSON fields are preserved semantically. Issue records
 include detail, comments, comment reactions, timeline, events, and reactions. PR
 records additionally include PR detail, reviews, review comments and reactions,
-commits, files, requested reviewers, closing-Issue references, diff, and patch.
-If GitHub rejects or persistently fails an aggregate PR diff or patch representation,
-the bundle records that failure and requests the same representation for every commit
-through GitHub's
-[Get a commit](https://docs.github.com/en/rest/commits/commits#get-a-commit)
-endpoint. If an individual representation is also unavailable, its error and the
-other raw representation are retained instead. Shared results are cached while both
-aggregate forms are resolved. The cold pull can then advance without claiming that an
-unavailable representation was returned.
+commit metadata, requested reviewers, closing-Issue references, and the Git manifest.
+
 Aggregate fields and their enumerated collections remain separate facts. GitHub can
 retain an Issue `comments` or PR `review_comments` aggregate after comments are no
-longer returned by per-parent REST enumeration. The archive preserves
-these comment aggregates and the complete per-parent responses instead of inventing
-rows. An exact zero avoids an empty collection request unless a repository signal
-selects the parent; a nonzero value always triggers enumeration and is not used to
-manufacture missing rows. Enumeration follows GitHub's
+longer returned by per-parent REST enumeration. The archive preserves these aggregates
+and the complete per-parent responses instead of inventing rows. An exact zero avoids
+an empty collection request unless a repository signal selects the parent; a nonzero
+value always triggers enumeration and is not used to manufacture missing rows.
+Enumeration follows GitHub's
 [list Issue comments endpoint](https://docs.github.com/en/rest/issues/comments#list-issue-comments)
 and
 [list review comments endpoint](https://docs.github.com/en/rest/pulls/comments#list-review-comments-on-a-pull-request).
-A tombstone records a directly observed absence without discarding the last bundle. The
-boundary excludes linked external attachments and facts that GitHub made unavailable
-before the archive first observed them.
 
-Archive schema 5 pairs this resource set with record schema 2. A schema 4 archive is
-migrated in place before pulling; other versions are rejected, so one file cannot
-silently mix records with different required fields.
+Git stores ordinary blob bytes, executable and symlink modes, tree membership, and
+commit topology. A Git LFS path remains its pointer blob unless LFS content is acquired
+separately, and a submodule remains a gitlink to an external commit. Linked attachments
+and facts that GitHub made unavailable before observation are outside the archive.
+A tombstone records a directly observed parent absence without discarding its last
+record. Archive schema 7 pairs this resource set with record schema 4.
 
-Sources: [gh_puller/github/](../gh_puller/github/); [tests/test_github_puller.py](../tests/test_github_puller.py)
+Sources: [gh_puller/github/](../gh_puller/github/); [tests/test_github_puller.py](../tests/test_github_puller.py); [tests/test_github_git_store.py](../tests/test_github_git_store.py)
 
 ## Offline page reconstruction boundary
 
-The database can rebuild the data-oriented part of an observed Issue or PR page, but
-it is not a browser-page mirror. “Rebuild” below means an offline model can derive the
-fact from stored responses; it does not promise GitHub's exact HTML, ordering, or
-presentation.
+The archive pair can rebuild the data-oriented part of an observed Issue or PR page,
+but it is not a browser-page mirror. “Rebuild” below means an offline model can derive
+the fact from stored responses and Git objects; it does not promise GitHub's exact
+HTML, ordering, or presentation.
 
 | Page or mining question | Available offline | Boundary |
 | --- | --- | --- |
 | Issue/PR title, raw Markdown body, author, timestamps, state, labels, assignees, and milestone | Yes | Only versions actually observed are retained; GitHub's complete edit history is not an API response. GitHub's server-generated `body_html` and `body_text` variants are not requested, so offline rendering is not byte-identical to GitHub's. |
 | Conversation comments, reactions, and observed timeline/events | Yes | A deletion or silent child change can remain unknown until another signal selects the parent. |
-| PR source and target repository/branch, draft and merge fields | Yes, from PR detail | Branch contents and the rest of the Git repository are outside this database. |
-| PR commits, changed files, reviews, review comments, aggregate diff, and patch | Yes, for a selected PR | CI checks, workflow runs, deployments, and review-thread resolution state are not fetched. |
+| PR source and target repository/branch, draft and merge fields | Yes, from PR detail | Names describe the API observation; immutable snapshot refs identify the exact retained trees. |
+| PR commits, complete changed-file set, and code content | Yes, for a selected PR | `git diff comparison_ref head_ref` derives the tree change. Rename/copy heuristics and rendered patch layout depend on local Git options and need not be byte-identical to GitHub's web rendering. |
+| Reviews and review comments | Yes, for a selected PR | Review-thread resolution, CI checks, workflow runs, and deployments are not fetched. |
 | Issue GitHub marks as closable by a selected PR | Yes, from `closing_issues_references` | The relation is GitHub's closing linkage; whether the PR merged and whether the change semantically fixed the Issue remain separate facts. |
 | Forward references written in title/body/comment text | The raw text can be parsed offline | Textual references may be ambiguous or point outside the repository. |
 | Reverse references to an Issue/PR | Partly, from observed timeline cross-reference events and locally parsed forward references | There is no repository-external reverse-reference crawl, and silent or unavailable events cannot be invented. |
-| Exact GitHub web page | No | Styling, live widgets, permission-dependent controls, avatars and attachment bytes, Projects fields, checks, and other page-only or unsupported API data are outside the archive. |
+| Exact GitHub web page | No | Styling, live widgets, permission-dependent controls, avatars and attachment bytes, Projects fields, checks, rendered diffs, and other page-only or unsupported API data are outside the archive. |
 
 This supports mining contributor activity from authors, assignees, commenters,
 reviewers, and commit identities; deriving explicit Issue-to-PR closing edges; and
@@ -395,7 +415,20 @@ Folding versions in iterator order reconstructs every committed state. A
 `present=False` version is a tombstone whose retained summary and bundle remain
 available for mining.
 
-Sources: [gh_puller/github/](../gh_puller/github/); [tests/test_github_puller.py](../tests/test_github_puller.py)
+For a PR record, read `bundle["pull_request"]["git"]`, then pass its stable refs to
+the companion store:
+
+```bash
+comparison_ref='refs/gh-puller/snapshots/pulls/7/comparison/COMPARISON_SHA'
+head_ref='refs/gh-puller/snapshots/pulls/7/head/HEAD_SHA'
+git --git-dir archives/vllm.sqlite3.git diff \
+  --name-status "$comparison_ref" "$head_ref"
+```
+
+The same refs work with `git show`, `git ls-tree`, and other plumbing commands. They
+are archive identifiers, so consumers need neither the remote PR branch nor GitHub.
+
+Sources: [gh_puller/github/](../gh_puller/github/); [tests/test_github_puller.py](../tests/test_github_puller.py); [tests/test_github_git_store.py](../tests/test_github_git_store.py)
 
 ## Run once or on a UTC-aligned interval
 
@@ -415,6 +448,10 @@ uv run -m gh_puller.github once vllm-project/vllm archives/vllm.sqlite3
 uv run -m gh_puller.github once vllm-project/vllm archives/vllm.sqlite3 \
   --target 2026-09-02T20:07:00+08:00
 ```
+
+The destination argument names SQLite; the command derives
+`archives/vllm.sqlite3.git` for Git objects. `--git-url` selects a GitHub Enterprise
+or mirror remote when the default `https://github.com/OWNER/REPO.git` is unsuitable.
 
 Run a UTC-aligned schedule. The interval is a positive integer followed by `s`, `m`,
 `h`, or `d`; its default is `1h`:
@@ -496,11 +533,11 @@ scripts/github-puller-daemon.sh status archives/vllm.sqlite3
 watch -n 1 scripts/github-puller-daemon.sh status archives/vllm.sqlite3
 ```
 
-The overview always includes the canonical `DATABASE`, current target T, run,
-phase, event age, and `ITEMS`. `ITEMS` means the locally observed Issue-plus-PR head
-count, or the authenticated estimate during cold discovery; it is `?` until either is
-known. `PROGRESS` reports the active directory producer or Issue/PR consumer and keeps
-an unknown streaming denominator as `?`.
+The overview always includes the canonical `DATABASE`, companion `GIT STORE`, current
+target T, run, phase, event age, and `ITEMS`. `ITEMS` means the locally observed
+Issue-plus-PR head count, or the authenticated estimate during cold discovery; it is
+`?` until either is known. `PROGRESS` reports the active directory producer or
+Issue/PR consumer and keeps an unknown streaming denominator as `?`.
 `QUOTA` retains every resource bucket observed by the writer and shows each
 `remaining/limit` independently. Normal authenticated operation therefore displays
 both REST `core` and `graphql` after each has responded. Each bucket occupies one
@@ -562,8 +599,8 @@ Sources: [gh_puller/github/](../gh_puller/github/); [tests/test_github_cli.py](.
 
 Uninstalling is symmetric and idempotent: it stops and disables the service, removes
 its unit, reloads systemd, and clears the unit's failed state. It deliberately keeps
-the SQLite archive, `.env`, virtual environment, source checkout, and their lock
-files:
+the SQLite database, companion Git store, `.env`, virtual environment, source
+checkout, and lock files:
 
 ```bash
 sudo scripts/github-puller-daemon.sh uninstall archives/vllm.sqlite3
@@ -577,11 +614,11 @@ Run the focused suite and lint from the repository root:
 
 ```bash
 uv run pytest -q \
-  tests/test_github_puller.py tests/test_github_cli.py \
+  tests/test_github_git_store.py tests/test_github_puller.py tests/test_github_cli.py \
   tests/test_github_daemon.py tests/test_github_monitor.py
 uvx ruff check \
   gh_puller/github \
-  tests/test_github_puller.py tests/test_github_cli.py \
+  tests/test_github_git_store.py tests/test_github_puller.py tests/test_github_cli.py \
   tests/test_github_daemon.py tests/test_github_monitor.py
 bash -n scripts/github-puller-daemon.sh
 ```
@@ -589,19 +626,19 @@ bash -n scripts/github-puller-daemon.sh
 The suite covers raw-field retention, durable page/task/cursor recovery, concurrent
 directory production and bounded Issue/PR consumption, expired-cursor directory
 replay with completed-record reuse, PR resources, batched and paginated closing-Issue
-relations, same-second boundaries, future prefetch history, diff/patch fallback and
-validator reuse, 250-entry PR-commit routing, complete large comparisons, pass-local
-progress, zero-request idempotent reuse, observer failure isolation, TTY and JSON
-progress, rate-limit waits, current-head visibility, single- and multi-page
-conditional validation, 100→101 page growth, content deduplication, directly observed
-tombstones, cancellation, completion-order durable resume, concurrent duplicate
-calls, scheduler recovery, randomized observable Issue/PR and comment churn,
-silent-deletion best effort, schema migration and rejection, and request-saving
-shortcuts for selected Issue/PR records.
+relations, same-second boundaries, future prefetch history, HTTP validator reuse,
+250-entry PR-commit routing, complete large comparisons, more-than-3,000-file Git
+snapshots, unrelated-history PRs, force-push retention, pass-local progress,
+zero-request idempotent reuse, observer failure isolation, TTY and JSON progress,
+rate-limit waits, current-head visibility, single- and multi-page conditional
+validation, 100→101 page growth, content deduplication, directly observed tombstones,
+cancellation, completion-order durable resume, concurrent duplicate calls, scheduler
+recovery, randomized observable Issue/PR and comment churn, silent-deletion best
+effort, schema validation, and request-saving shortcuts for selected records.
 
 The daemon tests additionally verify unit rendering, repeatable installation and
 uninstallation, archive preservation, database-scoped controls, repository-binding
 rejection, independent writers, service reconciliation, multi-writer status,
 phase-local progress, exact and unknown item counts, and stable watch output.
 
-Sources: [tests/test_github_puller.py](../tests/test_github_puller.py); [tests/test_github_cli.py](../tests/test_github_cli.py); [tests/test_github_daemon.py](../tests/test_github_daemon.py); [tests/test_github_monitor.py](../tests/test_github_monitor.py)
+Sources: [tests/test_github_git_store.py](../tests/test_github_git_store.py); [tests/test_github_puller.py](../tests/test_github_puller.py); [tests/test_github_cli.py](../tests/test_github_cli.py); [tests/test_github_daemon.py](../tests/test_github_daemon.py); [tests/test_github_monitor.py](../tests/test_github_monitor.py)

@@ -1,9 +1,9 @@
-"""持久化 GitHub 原始事实、拉取水位与离线版本流。
+"""持久化 GitHub 语义事实、拉取水位与离线版本流。
 
-SQLite 是本模块的唯一事实边界：未完成 run 可恢复但不进入公共读取流，committed
-run 中的内容寻址 payload 与对象版本足以在无网络条件下用已观测事实构建下游数据。
-与 bundle 摘要配对的 HTTP cache 可丢弃且不进入版本流。拉取算法与 GitHub HTTP
-契约分别见 puller 和 client。
+SQLite 保存 API 事实与执行状态；PR 代码对象属于配套 Git 对象库，见
+``gh_puller.github``。未完成 run 可恢复但不进入公共读取流。与 bundle 摘要配对的
+HTTP cache 可丢弃且不进入版本流。拉取算法与 GitHub HTTP 契约分别见 puller 和
+client。
 """
 
 from __future__ import annotations
@@ -18,7 +18,9 @@ from typing import TYPE_CHECKING, Any, Self
 
 import aiosqlite
 
-from .v5 import MIGRATE_V4, SCHEMA, VERSION
+from .v5 import MIGRATE_V4
+from .v6 import MIGRATE_V5
+from .v7 import MIGRATE_V6, SCHEMA, VERSION
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Iterable
@@ -865,10 +867,17 @@ class SQLiteArchive:
         )
         if repository is None or repository["value"] != self.repository:
             raise ValueError("archive belongs to a different GitHub repository")
-        if schema is None or schema["value"] not in {"4", VERSION}:
+        if schema is None or schema["value"] not in {"4", "5", "6", VERSION}:
             raise ValueError("unsupported GitHub archive schema")
         if schema["value"] == "4":
             await db.executescript(MIGRATE_V4)
+            await db.executescript(SCHEMA)
+            schema = {"value": "5"}
+        if schema["value"] == "5":
+            await db.executescript(MIGRATE_V5)
+            schema = {"value": "6"}
+        if schema["value"] == "6":
+            await db.executescript(MIGRATE_V6)
         await db.executescript(SCHEMA)
         await db.commit()
 

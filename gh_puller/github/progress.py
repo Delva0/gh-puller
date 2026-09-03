@@ -149,6 +149,19 @@ class _PullProgressTracker:
             latest_kind=latest_kind,
         )
 
+    def git_fetch(self, pulls: int) -> None:
+        self._emit(
+            phase="syncing_git",
+            wait_seconds=None,
+            detail=f"pull_refs={pulls}",
+        )
+
+    def git_heartbeat(self) -> None:
+        self._emit(phase="syncing_git")
+
+    def git_done(self) -> None:
+        self._emit(phase=self._work_phase, detail=None)
+
     def bundles_staged(
         self,
         resources: Iterable[tuple[int, str]],
