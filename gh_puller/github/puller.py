@@ -127,6 +127,16 @@ class _API(Protocol):
         cache: dict[str, Any] | None,
     ) -> GitHubResource: ...
 
+    async def pull_review_comments(
+        self,
+        owner: str,
+        repo: str,
+        number: int,
+        *,
+        previous: list[dict[str, Any]] | None,
+        cache: dict[str, Any] | None,
+    ) -> GitHubResource: ...
+
 
 class _GitStore(Protocol):
     async def prefetch(
@@ -981,15 +991,25 @@ class GitHubPuller:
         ):
             raise IncompleteGitHubDataError(f"GitHub returned invalid reviews for {path}")
         _set_cache(http_cache, "reviews", cache)
+        review_comment_resource: GitHubResource | None = None
         if not force_comments and _is_zero_integer(pull.get("review_comments")):
             review_comments = []
         else:
-            review_comments, cache = await self._cached_page(
-                api,
-                f"{path}/comments",
-                _list_field(previous, "review_comments"),
-                _dict_field(previous_cache, "review_comments"),
+            review_comment_resource = await api.pull_review_comments(
+                self._owner,
+                self._repo,
+                number,
+                previous=_list_field(previous, "review_comments"),
+                cache=_dict_field(previous_cache, "review_comments"),
             )
+            review_comments = review_comment_resource.value
+            cache = review_comment_resource.cache
+            if not isinstance(review_comments, list) or any(
+                not isinstance(comment, dict) for comment in review_comments
+            ):
+                raise IncompleteGitHubDataError(
+                    f"GitHub returned invalid review comments for {path}",
+                )
             _set_cache(http_cache, "review_comments", cache)
         review_comments = _canonical_comments(review_comments)
         expected_commits = pull.get("commits")
@@ -1043,6 +1063,8 @@ class GitHubPuller:
         }
         if commit_resource is not None:
             api_sources["commits"] = _api_source(commit_resource)
+        if review_comment_resource is not None:
+            api_sources["review_comments"] = _api_source(review_comment_resource)
         result = {
             "detail": pull,
             "reviews": reviews,

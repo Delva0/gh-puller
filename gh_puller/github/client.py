@@ -157,6 +157,76 @@ query PullCommits($owner: String!, $repo: String!, $number: Int!, $cursor: Strin
   }
 }
 """
+_REVIEW_COMMENT_FRAGMENT = """
+fragment ReviewCommentFields on PullRequestReviewComment {
+  id
+  fullDatabaseId
+  body
+  authorAssociation
+  createdAt
+  updatedAt
+  url
+  diffHunk
+  path
+  line
+  originalLine
+  originalStartLine
+  startLine
+  outdated
+  subjectType
+  state
+  commit { oid }
+  originalCommit { oid }
+  replyTo { fullDatabaseId }
+  pullRequestReview { fullDatabaseId }
+  reactions { totalCount }
+  author {
+    __typename
+    login
+    avatarUrl
+    url
+    ... on User { id databaseId name email isSiteAdmin }
+    ... on Organization { id databaseId name email }
+    ... on Bot { id databaseId }
+    ... on Mannequin { id databaseId email }
+  }
+}
+"""
+_PULL_REVIEW_COMMENTS = """
+query PullReviewComments($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
+  repository(owner: $owner, name: $repo) {
+    pullRequest(number: $number) {
+      number
+      reviewThreads(first: 100, after: $cursor) {
+        totalCount
+        nodes {
+          id
+          comments(first: 100) {
+            totalCount
+            nodes { ...ReviewCommentFields }
+            pageInfo { hasNextPage endCursor }
+          }
+        }
+        pageInfo { hasNextPage endCursor }
+      }
+    }
+  }
+}
+""" + _REVIEW_COMMENT_FRAGMENT
+_REVIEW_THREAD_COMMENTS = """
+query ReviewThreadComments($id: ID!, $cursor: String) {
+  node(id: $id) {
+    ... on PullRequestReviewThread {
+      id
+      comments(first: 100, after: $cursor) {
+        totalCount
+        nodes { ...ReviewCommentFields }
+        pageInfo { hasNextPage endCursor }
+      }
+    }
+  }
+}
+""" + _REVIEW_COMMENT_FRAGMENT
 
 
 class _Transport(StrEnum):
@@ -765,6 +835,57 @@ class GitHubAPI:
         rest_cached = expected <= 250 and cache is not None
         return await self._either(rest, graphql, rest_cached=rest_cached)
 
+    async def pull_review_comments(
+        self,
+        owner: str,
+        repo: str,
+        number: int,
+        *,
+        previous: list[dict[str, Any]] | None,
+        cache: dict[str, Any] | None,
+    ) -> GitHubResource:
+        """读取一个 PR 的完整 review-comment 集合，并自动选择主配额池。
+
+        Args:
+            owner: 仓库 owner。
+            repo: 仓库名。
+            number: 仓库内 PR number。
+            previous: 与 cache 配对的上一版稳定集合；None 表示冷读取。
+            cache: 本操作先前返回的 REST 分页 validator。
+
+        Returns:
+            REST 兼容的稳定 review-comment 集合、来源、来源原文与 validator。
+        """
+        if number < 1:
+            raise ValueError("number must be positive")
+        path = (
+            f"/repos/{quote(owner, safe='')}/{quote(repo, safe='')}/pulls/{number}/comments"
+        )
+
+        async def rest(wait_primary: bool) -> GitHubResource:
+            value, updated = await self._paginate_cached(
+                path,
+                previous=previous,
+                cache=cache,
+                primary_wait=wait_primary,
+            )
+            return GitHubResource(value, _Transport.REST, value, updated)
+
+        async def graphql(wait_primary: bool) -> GitHubResource:
+            raw = await self._graphql_review_comments(
+                owner,
+                repo,
+                number,
+                primary_wait=wait_primary,
+            )
+            value = [
+                _rest_review_comment(comment, self._base_url, owner, repo, number)
+                for comment in raw
+            ]
+            return GitHubResource(value, _Transport.GRAPHQL, raw)
+
+        return await self._either(rest, graphql, rest_cached=cache is not None)
+
     async def compare_commits(
         self,
         owner: str,
@@ -1027,6 +1148,128 @@ class GitHubAPI:
             if not isinstance(next_cursor, str) or not next_cursor or next_cursor == cursor:
                 raise GitHubAPIError(f"pull #{number} has an invalid {field} cursor")
             cursor = next_cursor
+
+    async def _graphql_review_comments(
+        self,
+        owner: str,
+        repo: str,
+        number: int,
+        *,
+        primary_wait: bool,
+    ) -> list[dict[str, Any]]:
+        comments: list[dict[str, Any]] = []
+        seen_comments: set[str] = set()
+        seen_threads: set[str] = set()
+        cursor: str | None = None
+        expected_threads: int | None = None
+        while True:
+            payload = await self._graphql(
+                _PULL_REVIEW_COMMENTS,
+                {"owner": owner, "repo": repo, "number": number, "cursor": cursor},
+                primary_wait=primary_wait,
+            )
+            pull = _graphql_pull(payload, number)
+            connection = _graphql_connection(pull, "reviewThreads", number)
+            total = connection["totalCount"]
+            if expected_threads is None:
+                expected_threads = total
+            elif expected_threads != total:
+                raise GitHubAPIError(
+                    f"pull #{number} reviewThreads count changed while paging",
+                )
+            for thread in connection["nodes"]:
+                thread_id = thread.get("id")
+                if (
+                    not isinstance(thread_id, str)
+                    or not thread_id
+                    or thread_id in seen_threads
+                ):
+                    raise GitHubAPIError(
+                        f"pull #{number} has invalid reviewThreads identities",
+                    )
+                seen_threads.add(thread_id)
+                page = _node_connection(thread, "comments", f"review thread {thread_id}")
+                thread_comments = await self._finish_node_connection(
+                    thread_id,
+                    page,
+                    primary_wait=primary_wait,
+                )
+                for comment in thread_comments:
+                    comment_id = comment.get("id")
+                    if (
+                        not isinstance(comment_id, str)
+                        or not comment_id
+                        or comment_id in seen_comments
+                    ):
+                        raise GitHubAPIError(
+                            f"pull #{number} has invalid review-comment identities",
+                        )
+                    seen_comments.add(comment_id)
+                    comments.append(comment)
+            page_info = connection["pageInfo"]
+            if not page_info["hasNextPage"]:
+                if len(seen_threads) != expected_threads:
+                    raise GitHubAPIError(
+                        f"pull #{number} advertised {expected_threads} reviewThreads, "
+                        f"got {len(seen_threads)}",
+                    )
+                return comments
+            next_cursor = page_info["endCursor"]
+            if not isinstance(next_cursor, str) or not next_cursor or next_cursor == cursor:
+                raise GitHubAPIError(f"pull #{number} has an invalid reviewThreads cursor")
+            cursor = next_cursor
+
+    async def _finish_node_connection(
+        self,
+        node_id: str,
+        first: dict[str, Any],
+        *,
+        primary_wait: bool,
+    ) -> list[dict[str, Any]]:
+        expected = first["totalCount"]
+        items = list(first["nodes"])
+        seen: set[str] = set()
+        for item in items:
+            item_id = item.get("id")
+            if not isinstance(item_id, str) or not item_id or item_id in seen:
+                raise GitHubAPIError(f"node {node_id} has invalid comment identities")
+            seen.add(item_id)
+        page_info = first["pageInfo"]
+        cursor = page_info["endCursor"]
+        while page_info["hasNextPage"]:
+            if not isinstance(cursor, str) or not cursor:
+                raise GitHubAPIError(f"node {node_id} has an invalid comments cursor")
+            payload = await self._graphql(
+                _REVIEW_THREAD_COMMENTS,
+                {"id": node_id, "cursor": cursor},
+                primary_wait=primary_wait,
+            )
+            node = payload.get("data", {}).get("node")
+            if not isinstance(node, dict) or node.get("id") != node_id:
+                raise GitHubAPIError(f"GitHub returned no matching review thread {node_id}")
+            page = _node_connection(node, "comments", f"review thread {node_id}")
+            if page["totalCount"] != expected:
+                raise GitHubAPIError(
+                    f"review thread {node_id} comment count changed while paging",
+                )
+            for item in page["nodes"]:
+                item_id = item.get("id")
+                if not isinstance(item_id, str) or not item_id or item_id in seen:
+                    raise GitHubAPIError(
+                        f"review thread {node_id} has invalid comment identities",
+                    )
+                seen.add(item_id)
+                items.append(item)
+            next_cursor = page["pageInfo"]["endCursor"]
+            if page["pageInfo"]["hasNextPage"] and next_cursor == cursor:
+                raise GitHubAPIError(f"node {node_id} repeated its comments cursor")
+            page_info = page["pageInfo"]
+            cursor = next_cursor
+        if len(items) != expected:
+            raise GitHubAPIError(
+                f"review thread {node_id} advertised {expected} comments, got {len(items)}",
+            )
+        return items
 
     async def _request(
         self,
@@ -1409,6 +1652,29 @@ def _graphql_connection(
     return connection
 
 
+def _node_connection(
+    node: dict[str, Any],
+    field: str,
+    context: str,
+) -> dict[str, Any]:
+    connection = node.get(field)
+    if not isinstance(connection, dict):
+        raise GitHubAPIError(f"{context} has no {field} connection")
+    nodes = connection.get("nodes")
+    total = connection.get("totalCount")
+    page_info = connection.get("pageInfo")
+    if (
+        not isinstance(nodes, list)
+        or any(not isinstance(item, dict) for item in nodes)
+        or type(total) is not int
+        or total < 0
+        or not isinstance(page_info, dict)
+        or type(page_info.get("hasNextPage")) is not bool
+    ):
+        raise GitHubAPIError(f"{context} has invalid {field} pagination")
+    return connection
+
+
 def _rest_pull_detail(
     pull: dict[str, Any],
     base_url: str,
@@ -1558,6 +1824,59 @@ def _rest_commit(
     }
 
 
+def _rest_review_comment(
+    comment: dict[str, Any],
+    base_url: str,
+    owner: str,
+    repo: str,
+    pull_number: int,
+) -> dict[str, Any]:
+    comment_id = _database_id(comment.get("fullDatabaseId"))
+    api = f"{base_url}/repos/{quote(owner, safe='')}/{quote(repo, safe='')}"
+    pull_url = f"{api}/pulls/{pull_number}"
+    review = comment.get("pullRequestReview")
+    reply = comment.get("replyTo")
+    commit = comment.get("commit")
+    original_commit = comment.get("originalCommit")
+    return {
+        "url": f"{api}/pulls/comments/{comment_id}",
+        "pull_request_review_id": (
+            _optional_database_id(review.get("fullDatabaseId"))
+            if isinstance(review, dict)
+            else None
+        ),
+        "id": comment_id,
+        "node_id": comment["id"],
+        "diff_hunk": comment["diffHunk"],
+        "path": comment["path"],
+        "commit_id": commit.get("oid") if isinstance(commit, dict) else None,
+        "original_commit_id": (
+            original_commit.get("oid") if isinstance(original_commit, dict) else None
+        ),
+        "user": _rest_actor(comment.get("author")),
+        "body": comment["body"],
+        "created_at": comment["createdAt"],
+        "updated_at": comment["updatedAt"],
+        "html_url": comment["url"],
+        "pull_request_url": pull_url,
+        "author_association": comment["authorAssociation"],
+        "in_reply_to_id": (
+            _optional_database_id(reply.get("fullDatabaseId"))
+            if isinstance(reply, dict)
+            else None
+        ),
+        "line": comment.get("line"),
+        "original_line": comment.get("originalLine"),
+        "original_start_line": comment.get("originalStartLine"),
+        "start_line": comment.get("startLine"),
+        "subject_type": str(comment["subjectType"]).lower(),
+        "reactions": {
+            "url": f"{api}/pulls/comments/{comment_id}/reactions",
+            "total_count": comment["reactions"]["totalCount"],
+        },
+    }
+
+
 def _rest_signature(value: Any) -> dict[str, Any] | None:
     if not isinstance(value, dict):
         return None
@@ -1628,6 +1947,10 @@ def _database_id(value: Any) -> int:
     if isinstance(value, str) and value.isdigit():
         return int(value)
     raise GitHubAPIError("GitHub returned an invalid database identity")
+
+
+def _optional_database_id(value: Any) -> int | None:
+    return None if value is None else _database_id(value)
 
 
 def _mergeable(value: Any) -> bool | None:
