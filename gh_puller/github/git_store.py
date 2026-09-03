@@ -107,66 +107,119 @@ class GitObjectStore:
         """
         base_sha = _nested_sha(pull, "base", number)
         head_sha = _nested_sha(pull, "head", number)
+        value = pull.get("merge_commit_sha")
+        merge_sha = value if pull.get("merged") is True and isinstance(value, str) and _SHA.fullmatch(value) else None
         prefix = f"refs/gh-puller/snapshots/pulls/{number}"
-        base_ref = f"{prefix}/base/{base_sha}"
-        head_ref = f"{prefix}/head/{head_sha}"
         async with self._lock:
             await self._prepare()
             try:
-                merge_bases = (
-                    await self._git(
-                        "merge-base",
-                        "--all",
-                        base_sha,
-                        head_sha,
-                        ok=(0, 1),
-                    )
-                ).splitlines()
-                if len(merge_bases) > 1:
-                    raise GitStoreError(f"pull #{number} has no unique merge base")
-                if merge_bases:
-                    comparison_kind = "merge_base"
-                    comparison_sha = merge_bases[0]
-                else:
-                    comparison_kind = "empty_tree"
-                    comparison_sha = await self._git(
-                        "hash-object",
-                        "-w",
-                        "-t",
-                        "tree",
-                        "--stdin",
-                        input_text="",
-                    )
-                    comparison_sha = comparison_sha.strip()
-                if _SHA.fullmatch(comparison_sha) is None:
-                    raise GitStoreError(f"pull #{number} has no valid comparison base")
-                comparison_ref = f"{prefix}/comparison/{comparison_sha}"
-                refs = [
-                    (base_ref, base_sha),
-                    (head_ref, head_sha),
-                    (comparison_ref, comparison_sha),
-                ]
-                result: dict[str, Any] = {
-                    "base_ref": base_ref,
-                    "base_sha": base_sha,
-                    "comparison_kind": comparison_kind,
-                    "comparison_ref": comparison_ref,
-                    "comparison_sha": comparison_sha,
-                    "head_ref": head_ref,
-                    "head_sha": head_sha,
-                }
-                merge_sha = pull.get("merge_commit_sha")
-                if pull.get("merged") is True and isinstance(merge_sha, str) and _SHA.fullmatch(merge_sha):
-                    merge_ref = f"{prefix}/merge/{merge_sha}"
-                    refs.append((merge_ref, merge_sha))
-                    result |= {"merge_commit_ref": merge_ref, "merge_commit_sha": merge_sha}
-                commands = "".join(f"update {ref} {sha}\n" for ref, sha in refs)
-                await self._git("update-ref", "--stdin", input_text=commands)
+                return await self._pin_snapshot(number, prefix, base_sha, head_sha, merge_sha)
             except GitStoreError as exc:
-                raise GitStoreError(
-                    f"pull #{number} Git objects do not match its API snapshot: {exc}",
-                ) from exc
+                failure = exc
+            required = (base_sha, head_sha) if merge_sha is None else (base_sha, head_sha, merge_sha)
+            missing = await self._missing_commits(required)
+            if missing:
+                try:
+                    await self._refresh_missing(number, base_sha, head_sha, merge_sha, missing)
+                    return await self._pin_snapshot(number, prefix, base_sha, head_sha, merge_sha)
+                except GitStoreError as exc:
+                    failure = exc
+            raise GitStoreError(
+                f"pull #{number} Git objects do not match its API snapshot: {failure}",
+            ) from failure
+
+    async def _pin_snapshot(
+        self,
+        number: int,
+        prefix: str,
+        base_sha: str,
+        head_sha: str,
+        merge_sha: str | None,
+    ) -> dict[str, Any]:
+        merge_bases = (
+            await self._git(
+                "merge-base",
+                "--all",
+                base_sha,
+                head_sha,
+                ok=(0, 1),
+            )
+        ).splitlines()
+        if len(merge_bases) > 1:
+            raise GitStoreError(f"pull #{number} has no unique merge base")
+        if merge_bases:
+            comparison_kind = "merge_base"
+            comparison_sha = merge_bases[0]
+        else:
+            comparison_kind = "empty_tree"
+            comparison_sha = (
+                await self._git(
+                    "hash-object",
+                    "-w",
+                    "-t",
+                    "tree",
+                    "--stdin",
+                    input_text="",
+                )
+            ).strip()
+        if _SHA.fullmatch(comparison_sha) is None:
+            raise GitStoreError(f"pull #{number} has no valid comparison base")
+        base_ref = f"{prefix}/base/{base_sha}"
+        head_ref = f"{prefix}/head/{head_sha}"
+        comparison_ref = f"{prefix}/comparison/{comparison_sha}"
+        refs = [
+            (base_ref, base_sha),
+            (head_ref, head_sha),
+            (comparison_ref, comparison_sha),
+        ]
+        result: dict[str, Any] = {
+            "base_ref": base_ref,
+            "base_sha": base_sha,
+            "comparison_kind": comparison_kind,
+            "comparison_ref": comparison_ref,
+            "comparison_sha": comparison_sha,
+            "head_ref": head_ref,
+            "head_sha": head_sha,
+        }
+        if merge_sha is not None:
+            merge_ref = f"{prefix}/merge/{merge_sha}"
+            refs.append((merge_ref, merge_sha))
+            result |= {"merge_commit_ref": merge_ref, "merge_commit_sha": merge_sha}
+        commands = "".join(f"update {ref} {sha}\n" for ref, sha in refs)
+        await self._git("update-ref", "--stdin", input_text=commands)
         return result
+
+    async def _missing_commits(self, shas: Sequence[str]) -> set[str]:
+        missing = set()
+        for sha in shas:
+            kind = await self._git("cat-file", "-t", f"{sha}^{{commit}}", ok=(0, 1, 128))
+            if kind.strip() != "commit":
+                missing.add(sha)
+        return missing
+
+    async def _refresh_missing(
+        self,
+        number: int,
+        base_sha: str,
+        head_sha: str,
+        merge_sha: str | None,
+        missing: set[str],
+    ) -> None:
+        refspecs = []
+        if base_sha in missing or (merge_sha is not None and merge_sha in missing):
+            refspecs.append("+refs/heads/*:refs/gh-puller/remotes/heads/*")
+        if head_sha in missing:
+            refspecs.append(f"+refs/pull/{number}/head:refs/gh-puller/remotes/pulls/{number}/head")
+        await self._git(
+            "fetch",
+            "--quiet",
+            "--no-tags",
+            "--no-write-fetch-head",
+            "origin",
+            *refspecs,
+        )
+        if refspecs and refspecs[0].startswith("+refs/heads/"):
+            self._branches_fetched = True
 
     async def _prepare(self) -> None:
         if self._ready:

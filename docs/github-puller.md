@@ -193,6 +193,12 @@ the REST `core` or GraphQL primary-rate-limit buckets. See
 [git-update-ref](https://git-scm.com/docs/git-update-ref), and
 [git-diff](https://git-scm.com/docs/git-diff).
 
+Snapshot pinning validates every API-named base, head, and merged commit against the
+local object store. If refs changed between batch prefetch and the PR-detail response,
+the store refreshes only the branch refs or PR head needed by the missing commit and
+retries pinning once. A commit still absent after that refresh aborts the task; it is
+never represented by a dangling archive ref.
+
 Sources: [gh_puller/github/](../gh_puller/github/); [tests/test_github_git_store.py](../tests/test_github_git_store.py)
 
 When the three REST discovery streams each fit on one page and nothing changed, one
@@ -633,12 +639,13 @@ replay with completed-record reuse, PR resources, batched and paginated closing-
 relations, same-second boundaries, future prefetch history, HTTP validator reuse,
 250-entry PR-commit routing, complete large comparisons, more-than-3,000-file Git
 snapshots, unrelated-history PRs, force-push retention, pass-local progress,
-zero-request idempotent reuse, observer failure isolation, TTY and JSON progress,
-rate-limit waits, current-head visibility, single- and multi-page conditional
-validation, 100→101 page growth, content deduplication, directly observed tombstones,
-cancellation, completion-order durable resume, concurrent duplicate calls, scheduler
-recovery, randomized observable Issue/PR and comment churn, silent-deletion best
-effort, schema validation, and request-saving shortcuts for selected records.
+ref/API race recovery, zero-request idempotent reuse, observer failure isolation, TTY
+and JSON progress, rate-limit waits, current-head visibility, single- and multi-page
+conditional validation, 100→101 page growth, content deduplication, directly observed
+tombstones, cancellation, completion-order durable resume, concurrent duplicate
+calls, scheduler recovery, randomized observable Issue/PR and comment churn,
+silent-deletion best effort, schema validation, and request-saving shortcuts for
+selected records.
 
 The daemon tests additionally verify unit rendering, repeatable installation and
 uninstallation, archive preservation, database-scoped controls, repository-binding

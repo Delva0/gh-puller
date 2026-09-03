@@ -149,6 +149,52 @@ async def test_git_store_keeps_old_head_after_remote_force_push(tmp_path: Path) 
 
 
 @pytest.mark.asyncio
+async def test_git_store_refreshes_refs_when_pull_merges_after_prefetch(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    base, head = _source_repository(source, 1)
+    _git(source, "branch", "feature", head)
+    _git(source, "reset", "--hard", base)
+    path = git_store_path(tmp_path / "facts.sqlite3")
+    store = GitObjectStore(path, "acme/widgets", str(source))
+    await store.prefetch([7])
+    _git(source, "merge", "--quiet", "--no-ff", "feature", "-m", "merge pull")
+    merge = _git(source, "rev-parse", "HEAD")
+
+    snapshot = await store.capture(
+        7,
+        {
+            "base": {"sha": base},
+            "head": {"sha": head},
+            "merge_commit_sha": merge,
+            "merged": True,
+        },
+    )
+
+    assert snapshot["merge_commit_sha"] == merge
+    assert _stored_git(path, "rev-parse", snapshot["merge_commit_ref"]) == merge
+
+
+@pytest.mark.asyncio
+async def test_git_store_rejects_api_commit_missing_after_targeted_refresh(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    base, head = _source_repository(source, 1)
+    path = git_store_path(tmp_path / "facts.sqlite3")
+    store = GitObjectStore(path, "acme/widgets", str(source))
+    await store.prefetch([7])
+
+    with pytest.raises(GitStoreError, match="nonexistent object"):
+        await store.capture(
+            7,
+            {
+                "base": {"sha": base},
+                "head": {"sha": head},
+                "merge_commit_sha": "f" * 40,
+                "merged": True,
+            },
+        )
+
+
+@pytest.mark.asyncio
 async def test_git_store_rejects_rebinding_to_another_repository(tmp_path: Path) -> None:
     source = tmp_path / "source"
     _source_repository(source, 1)
