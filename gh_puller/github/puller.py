@@ -39,7 +39,6 @@ if TYPE_CHECKING:
 _NUMBER_AT_END = re.compile(r"/(\d+)$")
 _CLOSING_REFERENCE_BATCH_SIZE = 100
 _CATALOG_ACCEPT = "application/vnd.github.raw+json"
-_PULL_COMMITS_LIMIT = 250
 _BUNDLE_SCHEMA_VERSION = 5
 
 
@@ -95,13 +94,18 @@ class _API(Protocol):
         numbers: list[int],
     ) -> dict[int, list[dict[str, Any]]]: ...
 
-    async def compare_commits(
+    async def pull_commits(
         self,
         owner: str,
         repo: str,
+        number: int,
+        *,
+        expected: int,
         base: str,
         head: str,
-    ) -> list[dict[str, Any]]: ...
+        previous: list[dict[str, Any]] | None,
+        cache: dict[str, Any] | None,
+    ) -> GitHubResource: ...
 
     async def pull_request(
         self,
@@ -989,22 +993,27 @@ class GitHubPuller:
             _set_cache(http_cache, "review_comments", cache)
         review_comments = _canonical_comments(review_comments)
         expected_commits = pull.get("commits")
+        commit_resource: GitHubResource | None = None
         if _is_zero_integer(expected_commits):
             commits = []
-        elif isinstance(expected_commits, int) and expected_commits > _PULL_COMMITS_LIMIT:
+        elif isinstance(expected_commits, int) and expected_commits > 0:
             base, head = _comparison_shas(pull, number)
-            commits = await api.compare_commits(self._owner, self._repo, base, head)
-            if len(commits) != expected_commits:
-                raise IncompleteGitHubDataError(
-                    f"pull #{number} advertised {expected_commits} commits, got {len(commits)}",
-                )
-        else:
-            commits, cache = await self._cached_page(
-                api,
-                f"{path}/commits",
-                _list_field(previous, "commits"),
-                _dict_field(previous_cache, "commits"),
+            commit_resource = await api.pull_commits(
+                self._owner,
+                self._repo,
+                number,
+                expected=expected_commits,
+                base=base,
+                head=head,
+                previous=_list_field(previous, "commits"),
+                cache=_dict_field(previous_cache, "commits"),
             )
+            commits = commit_resource.value
+            cache = commit_resource.cache
+            if not isinstance(commits, list) or any(
+                not isinstance(commit, dict) for commit in commits
+            ):
+                raise IncompleteGitHubDataError(f"GitHub returned invalid commits for {path}")
             _set_cache(http_cache, "commits", cache)
         requested_reviewers = _embedded_review_requests(pull)
         if requested_reviewers is None:
@@ -1028,6 +1037,12 @@ class GitHubPuller:
                 f"pull #{number} advertised {expected_commits} commits, got {len(commits)}",
             )
         git_snapshot = await git.capture(number, pull)
+        api_sources = {
+            "detail": _api_source(detail),
+            "reviews": _api_source(review_resource),
+        }
+        if commit_resource is not None:
+            api_sources["commits"] = _api_source(commit_resource)
         result = {
             "detail": pull,
             "reviews": reviews,
@@ -1037,10 +1052,7 @@ class GitHubPuller:
             "git": git_snapshot,
             "requested_reviewers": requested_reviewers,
             "closing_issues_references": closing_references,
-            "api_sources": {
-                "detail": _api_source(detail),
-                "reviews": _api_source(review_resource),
-            },
+            "api_sources": api_sources,
         }
         return result, http_cache or None
 

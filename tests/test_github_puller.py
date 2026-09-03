@@ -273,6 +273,28 @@ class FakeAPI:
         )
         return GitHubResource(value, "rest", value, updated)
 
+    async def pull_commits(
+        self,
+        owner: str,
+        repo: str,
+        number: int,
+        *,
+        expected: int,
+        base: str,
+        head: str,
+        previous: list[dict[str, Any]] | None,
+        cache: dict[str, Any] | None,
+    ) -> GitHubResource:
+        if expected > 250:
+            value = await self.compare_commits(owner, repo, base, head)
+            return GitHubResource(value, "rest", value)
+        value, updated = await self.paginate_cached(
+            f"/repos/{owner}/{repo}/pulls/{number}/commits",
+            previous=previous,
+            cache=cache,
+        )
+        return GitHubResource(value, "rest", value, updated)
+
     async def closing_issue_references(
         self,
         owner: str,
@@ -468,6 +490,53 @@ def _graphql_review(number: int) -> dict[str, Any]:
             "isSiteAdmin": False,
         },
         "futureGraphQLField": {"kept": number},
+    }
+
+
+def _graphql_commit(number: int) -> dict[str, Any]:
+    sha = f"{number:040x}"
+    parent = f"{number - 1:040x}"
+    user = {
+        "id": f"user-{number}",
+        "databaseId": number + 100,
+        "login": f"committer-{number}",
+        "avatarUrl": f"https://avatars.test/{number}",
+        "url": f"https://github.test/committer-{number}",
+        "isSiteAdmin": False,
+    }
+    return {
+        "id": f"pull-commit-{number}",
+        "url": f"https://github.test/acme/widgets/pull/7/commits/{sha}",
+        "commit": {
+            "id": f"commit-{number}",
+            "oid": sha,
+            "url": f"https://github.test/acme/widgets/commit/{sha}",
+            "message": f"commit {number}",
+            "authoredDate": _iso(_T0 - timedelta(minutes=number + 1)),
+            "committedDate": _iso(_T0 - timedelta(minutes=number)),
+            "additions": number,
+            "deletions": 1,
+            "changedFilesIfAvailable": 2,
+            "author": {
+                "name": f"Author {number}",
+                "email": f"author{number}@example.test",
+                "date": _iso(_T0 - timedelta(minutes=number + 1)),
+                "user": user,
+            },
+            "committer": {
+                "name": f"Committer {number}",
+                "email": f"committer{number}@example.test",
+                "date": _iso(_T0 - timedelta(minutes=number)),
+                "user": user,
+            },
+            "tree": {"oid": "f" * 40},
+            "parents": {
+                "totalCount": 1,
+                "nodes": [{"oid": parent}],
+                "pageInfo": {"hasNextPage": False, "endCursor": None},
+            },
+            "futureGraphQLField": {"kept": number},
+        },
     }
 
 
@@ -734,6 +803,7 @@ async def test_pull_request_bundle_preserves_discussion_and_git_snapshot(tmp_pat
     assert pull["requested_reviewers"]["users"][0]["login"] == "alice"
     assert pull["closing_issues_references"] == [_closing_issue(11)]
     assert pull["api_sources"] == {
+        "commits": {"source": "rest"},
         "detail": {"source": "rest"},
         "reviews": {"source": "rest"},
     }
@@ -2541,6 +2611,94 @@ async def test_pull_reviews_graphql_paginates_and_preserves_source() -> None:
     assert result.value[0]["user"]["login"] == "reviewer-71"
     assert result.value[0]["commit_id"] == f"{71:040x}"
     assert result.value[0]["state"] == "APPROVED"
+
+
+@pytest.mark.asyncio
+async def test_pull_commits_graphql_paginates_without_rest_cap() -> None:
+    seen: list[dict[str, Any]] = []
+    paths: list[str] = []
+    commits = [_graphql_commit(number) for number in range(1, 252)]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        paths.append(request.url.path)
+        if request.url.path != "/graphql":
+            return httpx.Response(
+                200,
+                headers=_quota_headers("core", 500),
+                json={"seed": True},
+                request=request,
+            )
+        body = json.loads(request.content)
+        seen.append(body)
+        cursor = body["variables"]["cursor"]
+        offset = 0 if cursor is None else int(cursor.removeprefix("commit-"))
+        nodes = commits[offset : offset + 100]
+        next_offset = offset + len(nodes)
+        has_next = next_offset < len(commits)
+        connection = {
+            "totalCount": len(commits),
+            "nodes": nodes,
+            "pageInfo": {
+                "hasNextPage": has_next,
+                "endCursor": f"commit-{next_offset}" if has_next else None,
+            },
+        }
+        return httpx.Response(
+            200,
+            headers=_quota_headers("graphql", 4_900 - len(seen)),
+            json={
+                "data": {
+                    "repository": {
+                        "pullRequest": {"number": 7, "commits": connection},
+                    },
+                },
+            },
+            request=request,
+        )
+
+    client = httpx.AsyncClient(
+        base_url="https://api.github.test",
+        transport=httpx.MockTransport(handler),
+    )
+    api = GitHubAPI(
+        token=str(id(client)),
+        client=client,
+        graphql_url="/graphql",
+        now=lambda: _T0,
+    )
+    try:
+        await api.get_json("/seed-core")
+        result = await api.pull_commits(
+            "acme",
+            "widgets",
+            7,
+            expected=251,
+            base="a" * 40,
+            head="b" * 40,
+            previous=None,
+            cache=None,
+        )
+    finally:
+        await client.aclose()
+
+    assert [body["variables"]["cursor"] for body in seen] == [
+        None,
+        "commit-100",
+        "commit-200",
+    ]
+    assert result.source == "graphql"
+    assert result.raw == commits
+    assert len(result.value) == 251
+    assert [commit["sha"] for commit in result.value[:2]] == [f"{1:040x}", f"{2:040x}"]
+    assert result.value[0]["commit"]["message"] == "commit 1"
+    assert result.value[0]["author"]["login"] == "committer-1"
+    assert result.value[0]["parents"] == [
+        {
+            "sha": f"{0:040x}",
+            "url": f"https://api.github.test/repos/acme/widgets/commits/{0:040x}",
+        },
+    ]
+    assert paths == ["/seed-core", "/graphql", "/graphql", "/graphql"]
 
 
 @pytest.mark.asyncio

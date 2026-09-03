@@ -121,6 +121,42 @@ query PullReviews($owner: String!, $repo: String!, $number: Int!, $cursor: Strin
   }
 }
 """
+_PULL_COMMITS = """
+query PullCommits($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
+  repository(owner: $owner, name: $repo) {
+    pullRequest(number: $number) {
+      number
+      commits(first: 100, after: $cursor) {
+        totalCount
+        nodes {
+          id
+          url
+          commit {
+            id
+            oid
+            url
+            message
+            authoredDate
+            committedDate
+            additions
+            deletions
+            changedFilesIfAvailable
+            author { name email date user { id databaseId login avatarUrl url isSiteAdmin } }
+            committer { name email date user { id databaseId login avatarUrl url isSiteAdmin } }
+            tree { oid }
+            parents(first: 100) {
+              totalCount
+              nodes { oid }
+              pageInfo { hasNextPage endCursor }
+            }
+          }
+        }
+        pageInfo { hasNextPage endCursor }
+      }
+    }
+  }
+}
+"""
 
 
 class _Transport(StrEnum):
@@ -657,6 +693,78 @@ class GitHubAPI:
 
         return await self._either(rest, graphql, rest_cached=cache is not None)
 
+    async def pull_commits(
+        self,
+        owner: str,
+        repo: str,
+        number: int,
+        *,
+        expected: int,
+        base: str,
+        head: str,
+        previous: list[dict[str, Any]] | None,
+        cache: dict[str, Any] | None,
+    ) -> GitHubResource:
+        """读取一个 PR 的完整 commit 集合，并自动选择主配额池。
+
+        Args:
+            owner: 仓库 owner。
+            repo: 仓库名。
+            number: 仓库内 PR number。
+            expected: PR detail 声明的 commit 总数。
+            base: REST comparison 回退使用的 base SHA。
+            head: REST comparison 回退使用的 head SHA。
+            previous: 与 cache 配对的上一版稳定集合；None 表示冷读取。
+            cache: 本操作先前返回的 REST 分页 validator。
+
+        Returns:
+            REST 兼容的稳定 commit 集合、事实来源、来源原文与 validator。
+        """
+        if number < 1 or expected < 1:
+            raise ValueError("number and expected must be positive")
+        path = (
+            f"/repos/{quote(owner, safe='')}/{quote(repo, safe='')}/pulls/{number}/commits"
+        )
+
+        async def rest(wait_primary: bool) -> GitHubResource:
+            if expected > 250:
+                value = await self._compare_commits(
+                    owner,
+                    repo,
+                    base,
+                    head,
+                    primary_wait=wait_primary,
+                )
+                _check_size(number, "commits", expected, value)
+                return GitHubResource(value, _Transport.REST, value)
+            value, updated = await self._paginate_cached(
+                path,
+                previous=previous,
+                cache=cache,
+                primary_wait=wait_primary,
+            )
+            _check_size(number, "commits", expected, value)
+            return GitHubResource(value, _Transport.REST, value, updated)
+
+        async def graphql(wait_primary: bool) -> GitHubResource:
+            raw = await self._pull_connection(
+                _PULL_COMMITS,
+                "commits",
+                owner,
+                repo,
+                number,
+                primary_wait=wait_primary,
+            )
+            value = [
+                _rest_commit(item, self._base_url, owner, repo, number)
+                for item in raw
+            ]
+            _check_size(number, "commits", expected, value)
+            return GitHubResource(value, _Transport.GRAPHQL, raw)
+
+        rest_cached = expected <= 250 and cache is not None
+        return await self._either(rest, graphql, rest_cached=rest_cached)
+
     async def compare_commits(
         self,
         owner: str,
@@ -678,6 +786,23 @@ class GitHubAPI:
         Raises:
             GitHubAPIError: 分页的总数、cursor 或 commit identity 不一致。
         """
+        return await self._compare_commits(
+            owner,
+            repo,
+            base,
+            head,
+            primary_wait=True,
+        )
+
+    async def _compare_commits(
+        self,
+        owner: str,
+        repo: str,
+        base: str,
+        head: str,
+        *,
+        primary_wait: bool,
+    ) -> list[dict[str, Any]]:
         path = (
             f"/repos/{quote(owner, safe='')}/{quote(repo, safe='')}/compare/"
             f"{quote(base, safe='')}...{quote(head, safe='')}"
@@ -688,7 +813,12 @@ class GitHubAPI:
         visited: set[str] = set()
         expected: int | None = None
         while True:
-            response = await self._request("GET", path, params=params)
+            response = await self._request(
+                "GET",
+                path,
+                params=params,
+                primary_wait=primary_wait,
+            )
             try:
                 payload = response.json()
             except json.JSONDecodeError as exc:
@@ -1378,6 +1508,71 @@ def _rest_review(
     }
 
 
+def _rest_commit(
+    item: dict[str, Any],
+    base_url: str,
+    owner: str,
+    repo: str,
+    pull_number: int,
+) -> dict[str, Any]:
+    commit = item.get("commit")
+    if not isinstance(commit, dict):
+        raise GitHubAPIError(f"pull #{pull_number} has an invalid commit node")
+    sha = commit.get("oid")
+    parents = commit.get("parents")
+    if not isinstance(sha, str) or not sha or not isinstance(parents, dict):
+        raise GitHubAPIError(f"pull #{pull_number} has incomplete commit data")
+    parent_nodes = parents.get("nodes")
+    if (
+        not isinstance(parent_nodes, list)
+        or any(not isinstance(parent, dict) for parent in parent_nodes)
+        or parents.get("totalCount") != len(parent_nodes)
+        or parents.get("pageInfo", {}).get("hasNextPage") is not False
+    ):
+        raise GitHubAPIError(f"pull #{pull_number} has incomplete commit parents")
+    api = f"{base_url}/repos/{quote(owner, safe='')}/{quote(repo, safe='')}"
+    tree = commit.get("tree")
+    tree_sha = tree.get("oid") if isinstance(tree, dict) else None
+    return {
+        "sha": sha,
+        "node_id": commit["id"],
+        "commit": {
+            "author": _rest_signature(commit.get("author")),
+            "committer": _rest_signature(commit.get("committer")),
+            "message": commit["message"],
+            "tree": {
+                "sha": tree_sha,
+                "url": None if tree_sha is None else f"{api}/git/trees/{tree_sha}",
+            },
+            "url": f"{api}/git/commits/{sha}",
+        },
+        "url": f"{api}/commits/{sha}",
+        "html_url": commit["url"],
+        "comments_url": f"{api}/commits/{sha}/comments",
+        "author": _rest_actor(_nested_value(commit, "author", "user")),
+        "committer": _rest_actor(_nested_value(commit, "committer", "user")),
+        "parents": [
+            {"sha": parent["oid"], "url": f"{api}/commits/{parent['oid']}"}
+            for parent in parent_nodes
+        ],
+    }
+
+
+def _rest_signature(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    return {
+        "name": value.get("name"),
+        "email": value.get("email"),
+        "date": value.get("date"),
+    }
+
+
+def _nested_value(value: dict[str, Any], first: str, second: str) -> Any:
+    nested = value.get(first)
+    return nested.get(second) if isinstance(nested, dict) else None
+
+
 def _rest_ref(pull: dict[str, Any], prefix: str, default_owner: str) -> dict[str, Any]:
     repository = pull.get(f"{prefix}Repository")
     name = pull.get(f"{prefix}RefName")
@@ -1443,6 +1638,18 @@ def _mergeable(value: Any) -> bool | None:
     if value == "UNKNOWN":
         return None
     raise GitHubAPIError("GitHub returned an invalid mergeable state")
+
+
+def _check_size(
+    number: int,
+    resource: str,
+    expected: int,
+    items: list[dict[str, Any]],
+) -> None:
+    if len(items) != expected:
+        raise GitHubAPIError(
+            f"pull #{number} advertised {expected} {resource}, got {len(items)}",
+        )
 
 
 def _validator_headers(cache: dict[str, Any] | None, key: str) -> dict[str, str] | None:
