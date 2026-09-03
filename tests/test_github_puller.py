@@ -62,7 +62,7 @@ class Clock:
 
 
 class FakeAPI:
-    def __init__(self) -> None:
+    def __init__(self, source: str = "rest") -> None:
         self.catalog: list[dict[str, Any]] = []
         self.json: dict[str, Any] = {}
         self.pages: dict[str, list[dict[str, Any]]] = {}
@@ -76,6 +76,7 @@ class FakeAPI:
         self.closing: dict[int, list[dict[str, Any]]] = {}
         self.comparisons: dict[tuple[str, str], list[dict[str, Any]]] = {}
         self.catalog_accepts: list[str | None] = []
+        self.source = source
 
     async def close(self) -> None:
         pass
@@ -255,7 +256,7 @@ class FakeAPI:
             previous=previous,
             cache=cache,
         )
-        return GitHubResource(value, "rest", value, updated)
+        return self._resource(value, updated)
 
     async def pull_reviews(
         self,
@@ -271,7 +272,7 @@ class FakeAPI:
             previous=previous,
             cache=cache,
         )
-        return GitHubResource(value, "rest", value, updated)
+        return self._resource(value, updated)
 
     async def pull_commits(
         self,
@@ -287,13 +288,13 @@ class FakeAPI:
     ) -> GitHubResource:
         if expected > 250:
             value = await self.compare_commits(owner, repo, base, head)
-            return GitHubResource(value, "rest", value)
+            return self._resource(value)
         value, updated = await self.paginate_cached(
             f"/repos/{owner}/{repo}/pulls/{number}/commits",
             previous=previous,
             cache=cache,
         )
-        return GitHubResource(value, "rest", value, updated)
+        return self._resource(value, updated)
 
     async def pull_review_comments(
         self,
@@ -309,7 +310,7 @@ class FakeAPI:
             previous=previous,
             cache=cache,
         )
-        return GitHubResource(value, "rest", value, updated)
+        return self._resource(value, updated)
 
     async def issue_comments(
         self,
@@ -325,7 +326,7 @@ class FakeAPI:
             previous=previous,
             cache=cache,
         )
-        return GitHubResource(value, "rest", value, updated)
+        return self._resource(value, updated)
 
     async def reactions(
         self,
@@ -340,7 +341,15 @@ class FakeAPI:
             previous=previous,
             cache=cache,
         )
-        return GitHubResource(value, "rest", value, updated)
+        return self._resource(value, updated)
+
+    def _resource(
+        self,
+        value: Any,
+        cache: dict[str, Any] | None = None,
+    ) -> GitHubResource:
+        raw = value if self.source == "rest" else {"native": deepcopy(value)}
+        return GitHubResource(value, self.source, raw, cache)
 
     async def closing_issue_references(
         self,
@@ -941,6 +950,102 @@ async def test_pull_request_bundle_preserves_discussion_and_git_snapshot(tmp_pat
     assert not any(call[1] == f"{pull_path}/files" for call in api.calls)
     assert (await _current(tmp_path / "archive"))[7].kind == "pull"
     assert not any(call[1] == f"{issue_path}/comments" for call in api.calls)
+
+
+@pytest.mark.asyncio
+async def test_rest_and_graphql_atomic_operations_publish_equal_stable_facts(
+    tmp_path: Path,
+) -> None:
+    def api_fixture(source: str) -> FakeAPI:
+        api = FakeAPI(source)
+        api.add_issue(7, pull=True)
+        issue_path = f"{_BASE}/issues/7"
+        pull_path = f"{_BASE}/pulls/7"
+        api.json[issue_path]["comments"] = 1
+        api.json[issue_path]["node_id"] = "parent-7"
+        api.pages[f"{issue_path}/comments"] = [
+            {
+                "id": 70,
+                "node_id": "issue-comment-70",
+                "body": "discussion",
+                "reactions": {"total_count": 1},
+            },
+        ]
+        api.pages[f"{_BASE}/issues/comments/70/reactions"] = [
+            {"id": 701, "content": "heart"},
+        ]
+        api.json[pull_path] = {
+            "id": 700,
+            "base": {"sha": "a" * 40},
+            "changed_files": 1,
+            "commits": 1,
+            "head": {"sha": "b" * 40},
+            "review_comments": 1,
+            "requested_reviewers": [],
+            "requested_teams": [],
+        }
+        api.pages[f"{pull_path}/reviews"] = [
+            {"id": 71, "state": "APPROVED", "body": "ship it"},
+        ]
+        api.pages[f"{pull_path}/comments"] = [
+            {
+                "id": 72,
+                "node_id": "review-comment-72",
+                "body": "nit",
+                "path": "a.py",
+                "reactions": {"total_count": 1},
+            },
+        ]
+        api.pages[f"{_BASE}/pulls/comments/72/reactions"] = [
+            {"id": 73, "content": "+1"},
+        ]
+        api.pages[f"{pull_path}/commits"] = [
+            {"sha": "c" * 40, "commit": {"message": "change"}},
+        ]
+        return api
+
+    bundles = []
+    for source in ("rest", "graphql"):
+        destination = tmp_path / f"{source}.sqlite3"
+        await _puller(
+            _config(destination),
+            api=api_fixture(source),
+            git=FakeGitStore(),
+            now=lambda: _T0,
+        ).pull(_T0)
+        bundle = (await _current(destination))[7].bundle
+        assert bundle is not None
+        bundles.append(bundle)
+
+    rest_bundle, graphql_bundle = map(deepcopy, bundles)
+    rest_sources = rest_bundle.pop("api_sources")
+    graphql_sources = graphql_bundle.pop("api_sources")
+    rest_pull_sources = rest_bundle["pull_request"].pop("api_sources")
+    graphql_pull_sources = graphql_bundle["pull_request"].pop("api_sources")
+
+    assert graphql_bundle == rest_bundle
+    assert set(graphql_sources) == set(rest_sources) == {
+        "issue_comments",
+        "issue_comment_reactions",
+    }
+    assert set(graphql_pull_sources) == set(rest_pull_sources) == {
+        "commits",
+        "detail",
+        "review_comments",
+        "review_comment_reactions",
+        "reviews",
+    }
+    def leaves(value: dict[str, Any]) -> list[dict[str, Any]]:
+        if "source" in value:
+            return [value]
+        return [leaf for child in value.values() for leaf in leaves(child)]
+
+    assert {item["source"] for item in leaves(rest_sources)} == {"rest"}
+    assert {item["source"] for item in leaves(rest_pull_sources)} == {"rest"}
+    assert {item["source"] for item in leaves(graphql_sources)} == {"graphql"}
+    assert {item["source"] for item in leaves(graphql_pull_sources)} == {"graphql"}
+    assert all("raw" in item for item in leaves(graphql_sources))
+    assert all("raw" in item for item in leaves(graphql_pull_sources))
 
 
 @pytest.mark.parametrize("commit_count", [250, 251, 413])
