@@ -163,9 +163,17 @@ class _GitStore(Protocol):
         numbers: list[int],
         *,
         heartbeat: Callable[[], None] | None = None,
+        retry: Callable[[float], None] | None = None,
     ) -> None: ...
 
-    async def capture(self, number: int, pull: dict[str, Any]) -> dict[str, Any]: ...
+    async def capture(
+        self,
+        number: int,
+        pull: dict[str, Any],
+        *,
+        heartbeat: Callable[[], None] | None = None,
+        retry: Callable[[float], None] | None = None,
+    ) -> dict[str, Any]: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -405,6 +413,7 @@ class GitHubPuller:
             self.config.repository,
             self.config.git_url or default_git_url(self.config.repository),
             token=_token(self.config.token),
+            sleep=self._sleep,
         )
 
     async def _sync_pass(
@@ -763,6 +772,7 @@ class GitHubPuller:
                 bundle, http_cache = await self._fetch_bundle(
                     api,
                     git,
+                    progress,
                     summary,
                     previous_bundle,
                     previous_cache,
@@ -858,7 +868,11 @@ class GitHubPuller:
             if pull_numbers:
                 progress.git_fetch(len(pull_numbers))
                 try:
-                    await git.prefetch(pull_numbers, heartbeat=progress.git_heartbeat)
+                    await git.prefetch(
+                        pull_numbers,
+                        heartbeat=progress.git_heartbeat,
+                        retry=progress.git_retry,
+                    )
                 finally:
                     progress.git_done()
             closing_references = (
@@ -872,6 +886,7 @@ class GitHubPuller:
         self,
         api: _API,
         git: _GitStore,
+        progress: _PullProgressTracker,
         summary: dict[str, Any],
         previous: dict[str, Any] | None,
         previous_cache: dict[str, Any] | None,
@@ -986,6 +1001,7 @@ class GitHubPuller:
             pull, cache = await self._fetch_pull(
                 api,
                 git,
+                progress,
                 number,
                 _dict_field(previous, "pull_request"),
                 _dict_field(previous_cache, "pull_request"),
@@ -1000,6 +1016,7 @@ class GitHubPuller:
         self,
         api: _API,
         git: _GitStore,
+        progress: _PullProgressTracker,
         number: int,
         previous: dict[str, Any] | None,
         previous_cache: dict[str, Any] | None,
@@ -1102,7 +1119,15 @@ class GitHubPuller:
             raise IncompleteGitHubDataError(
                 f"pull #{number} advertised {expected_commits} commits, got {len(commits)}",
             )
-        git_snapshot = await git.capture(number, pull)
+        try:
+            git_snapshot = await git.capture(
+                number,
+                pull,
+                heartbeat=progress.git_heartbeat,
+                retry=progress.git_retry,
+            )
+        finally:
+            progress.git_done()
         api_sources = {
             "detail": _api_source(detail),
             "reviews": _api_source(review_resource),

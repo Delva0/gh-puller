@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import asyncio
 import subprocess
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import pytest
 
+import gh_puller.github.git_store as git_store_module
 from gh_puller.github.git_store import GitObjectStore, GitStoreError, git_store_path
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
     from pathlib import Path
 
 
@@ -64,6 +67,10 @@ def _stored_git(path: Path, *arguments: str) -> str:
         text=True,
     )
     return result.stdout.strip()
+
+
+def _is_fetch(command: Sequence[str]) -> bool:
+    return len(command) > 3 and command[1] == "--git-dir" and command[3] == "fetch"
 
 
 @pytest.mark.asyncio
@@ -269,3 +276,134 @@ async def test_git_store_rejects_rebinding_to_another_repository(tmp_path: Path)
 
     with pytest.raises(GitStoreError, match="belongs to acme/widgets"):
         await GitObjectStore(path, "acme/other", str(source)).prefetch([7])
+
+
+@pytest.mark.asyncio
+async def test_git_store_removes_an_interrupted_fetch_pack_on_open(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    _source_repository(source, 1)
+    path = tmp_path / "facts.sqlite3.git"
+    await GitObjectStore(path, "acme/widgets", str(source)).prefetch([7])
+    temporary = path / "objects" / "pack" / "tmp_pack_interrupted"
+    temporary.write_bytes(b"incomplete")
+
+    await GitObjectStore(path, "acme/widgets", str(source)).prefetch([7])
+
+    assert not temporary.exists()
+
+
+@pytest.mark.asyncio
+async def test_git_fetch_retries_transient_transport_failures(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    _source_repository(source, 1)
+    real_command = git_store_module._command
+    attempts = 0
+    failed_pack = tmp_path / "facts.sqlite3.git" / "objects" / "pack" / "tmp_pack_failed"
+
+    async def flaky(command: Sequence[str], **kwargs: Any) -> str:
+        nonlocal attempts
+        if _is_fetch(command):
+            attempts += 1
+            if attempts <= 7:
+                failed_pack.write_bytes(b"incomplete")
+                raise GitStoreError(
+                    "git fetch failed: error: RPC failed; curl 56 GnuTLS recv error (-9)",
+                )
+        return await real_command(command, **kwargs)
+
+    waits: list[float] = []
+    reported: list[float] = []
+    heartbeats = 0
+
+    async def sleep(wait: float) -> None:
+        waits.append(wait)
+
+    def heartbeat() -> None:
+        nonlocal heartbeats
+        heartbeats += 1
+
+    monkeypatch.setattr(git_store_module, "_command", flaky)
+    store = GitObjectStore(
+        tmp_path / "facts.sqlite3.git",
+        "acme/widgets",
+        str(source),
+        sleep=sleep,
+    )
+
+    await store.prefetch([7], heartbeat=heartbeat, retry=reported.append)
+
+    assert attempts == 9
+    assert waits == [1, 2, 4, 8, 16, 30, 30]
+    assert reported == waits
+    assert heartbeats >= 7
+    assert not failed_pack.exists()
+
+
+@pytest.mark.asyncio
+async def test_git_fetch_does_not_retry_permanent_failures(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    _source_repository(source, 1)
+    real_command = git_store_module._command
+    attempts = 0
+
+    async def rejected(command: Sequence[str], **kwargs: Any) -> str:
+        nonlocal attempts
+        if _is_fetch(command):
+            attempts += 1
+            raise GitStoreError("git fetch failed: fatal: Authentication failed")
+        return await real_command(command, **kwargs)
+
+    waits: list[float] = []
+    monkeypatch.setattr(git_store_module, "_command", rejected)
+    store = GitObjectStore(
+        tmp_path / "facts.sqlite3.git",
+        "acme/widgets",
+        str(source),
+        sleep=asyncio.sleep,
+    )
+
+    with pytest.raises(GitStoreError, match="Authentication failed"):
+        await store.prefetch([7], retry=waits.append)
+
+    assert attempts == 1
+    assert waits == []
+
+
+@pytest.mark.asyncio
+async def test_git_fetch_retry_remains_cancellable(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    _source_repository(source, 1)
+    real_command = git_store_module._command
+    attempts = 0
+
+    async def disconnected(command: Sequence[str], **kwargs: Any) -> str:
+        nonlocal attempts
+        if _is_fetch(command):
+            attempts += 1
+            raise GitStoreError("git fetch failed: fatal: Failed to connect")
+        return await real_command(command, **kwargs)
+
+    async def cancel(_: float) -> None:
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(git_store_module, "_command", disconnected)
+    store = GitObjectStore(
+        tmp_path / "facts.sqlite3.git",
+        "acme/widgets",
+        str(source),
+        sleep=cancel,
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await store.prefetch([7])
+
+    assert attempts == 1

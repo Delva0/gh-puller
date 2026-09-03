@@ -410,12 +410,25 @@ class FakeGitStore:
         self.prefetches: list[list[int]] = []
         self.captures: list[int] = []
 
-    async def prefetch(self, numbers: list[int], *, heartbeat: Any = None) -> None:
+    async def prefetch(
+        self,
+        numbers: list[int],
+        *,
+        heartbeat: Any = None,
+        retry: Any = None,
+    ) -> None:
         self.prefetches.append(list(numbers))
         if heartbeat is not None:
             heartbeat()
 
-    async def capture(self, number: int, pull: dict[str, Any]) -> dict[str, Any]:
+    async def capture(
+        self,
+        number: int,
+        pull: dict[str, Any],
+        *,
+        heartbeat: Any = None,
+        retry: Any = None,
+    ) -> dict[str, Any]:
         self.captures.append(number)
         base = pull.get("base")
         head = pull.get("head")
@@ -1696,6 +1709,52 @@ async def test_observer_failure_cannot_change_pull_or_archive(tmp_path: Path) ->
 
 
 @pytest.mark.asyncio
+async def test_git_retry_is_observable_and_restores_the_work_phase(tmp_path: Path) -> None:
+    class RetryingGitStore(FakeGitStore):
+        async def prefetch(
+            self,
+            numbers: list[int],
+            *,
+            heartbeat: Any = None,
+            retry: Any = None,
+        ) -> None:
+            self.prefetches.append(list(numbers))
+            retry(4)
+            heartbeat()
+
+    api = FakeAPI()
+    api.add_issue(1, pull=True)
+    api.json[f"{_BASE}/pulls/1"] = {
+        "id": 10,
+        "changed_files": 0,
+        "commits": 0,
+        "review_comments": 0,
+    }
+    events: list[PullProgress] = []
+
+    await _puller(
+        _config(tmp_path / "archive"),
+        api=api,
+        git=RetryingGitStore(),
+        now=lambda: _T0,
+        observer=events.append,
+    ).pull(_T0)
+
+    retry_index = next(
+        index for index, event in enumerate(events) if event.detail == "git_transient_retry"
+    )
+    retry = events[retry_index]
+    resumed = events[retry_index + 1]
+    assert (retry.phase, retry.wait_seconds) == ("retry_wait", 4)
+    assert (resumed.phase, resumed.wait_seconds, resumed.detail) == (
+        "syncing_git",
+        None,
+        "pull_refs=1",
+    )
+    assert events[-1].phase == "done"
+
+
+@pytest.mark.asyncio
 async def test_idempotent_hit_does_not_construct_an_api_client(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -2386,11 +2445,23 @@ async def test_failed_git_capture_resumes_the_same_pull_task(tmp_path: Path) -> 
     class FailOnceGitStore(FakeGitStore):
         failed = False
 
-        async def capture(self, number: int, pull: dict[str, Any]) -> dict[str, Any]:
+        async def capture(
+            self,
+            number: int,
+            pull: dict[str, Any],
+            *,
+            heartbeat: Any = None,
+            retry: Any = None,
+        ) -> dict[str, Any]:
             if not self.failed:
                 self.failed = True
                 raise GitStoreError("injected Git failure")
-            return await super().capture(number, pull)
+            return await super().capture(
+                number,
+                pull,
+                heartbeat=heartbeat,
+                retry=retry,
+            )
 
     api = FakeAPI()
     git = FailOnceGitStore()

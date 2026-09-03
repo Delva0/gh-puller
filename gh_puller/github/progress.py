@@ -71,6 +71,7 @@ class _PullProgressTracker:
         self._observer = observer
         self._now = now
         self._work_phase = "starting"
+        self._git_detail: str | None = None
         self._api_start = 0
         self._carried_requests = 0
         self._state = PullProgress(
@@ -175,17 +176,30 @@ class _PullProgressTracker:
         )
 
     def git_fetch(self, pulls: int) -> None:
+        self._git_detail = f"pull_refs={pulls}"
         self._emit(
             phase="syncing_git",
             wait_seconds=None,
-            detail=f"pull_refs={pulls}",
+            detail=self._git_detail,
         )
 
     def git_heartbeat(self) -> None:
-        self._emit(phase="syncing_git")
+        self._emit(
+            phase="syncing_git",
+            wait_seconds=None,
+            detail=self._git_detail,
+        )
+
+    def git_retry(self, wait_seconds: float) -> None:
+        self._emit(
+            phase="retry_wait",
+            wait_seconds=wait_seconds,
+            detail="git_transient_retry",
+        )
 
     def git_done(self) -> None:
-        self._emit(phase=self._work_phase, detail=None)
+        self._git_detail = None
+        self._emit(phase=self._work_phase, wait_seconds=None, detail=None)
 
     def bundles_staged(
         self,

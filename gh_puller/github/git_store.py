@@ -8,16 +8,43 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import logging
 import os
 import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Sequence
+    from collections.abc import Awaitable, Callable, Sequence
 
 _SHA = re.compile(r"[0-9a-f]{40,64}\Z")
 _HEARTBEAT_SECONDS = 2.0
+_FETCH_RETRY_CEILING = 30.0
+_TRANSIENT_FETCH_STATUS = re.compile(
+    r"\bcurl (?:5|6|7|18|28|35|52|55|56|92)\b"
+    r"|(?:returned error|http code)[: ]+(?:408|429|5\d\d)\b",
+    re.IGNORECASE,
+)
+_TRANSIENT_FETCH_MARKERS = (
+    "connection closed",
+    "connection reset",
+    "connection timed out",
+    "could not resolve host",
+    "early eof",
+    "empty reply from server",
+    "failed to connect",
+    "gnutls recv error",
+    "http/2 stream",
+    "http/3 stream",
+    "network is unreachable",
+    "operation timed out",
+    "remote end hung up unexpectedly",
+    "rpc failed",
+    "send failure",
+    "tls connection was non-properly terminated",
+    "unexpected disconnect",
+)
+_LOG = logging.getLogger(__name__)
 
 
 class GitStoreError(RuntimeError):
@@ -32,6 +59,7 @@ class GitObjectStore:
         repository: 固定绑定的 GitHub ``owner/repo``。
         remote_url: Git fetch 使用的远端地址。
         token: HTTPS 远端的 GitHub token；不会写入 Git 配置。
+        sleep: 瞬时 Git 传输错误的可取消退避等待器。
     """
 
     def __init__(
@@ -41,11 +69,13 @@ class GitObjectStore:
         remote_url: str,
         *,
         token: str | None = None,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
         self.path = Path(path)
         self.repository = repository
         self.remote_url = remote_url
         self._token = token
+        self._sleep = sleep
         self._lock = asyncio.Lock()
         self._ready = False
         self._branches_fetched = False
@@ -55,12 +85,14 @@ class GitObjectStore:
         numbers: Sequence[int],
         *,
         heartbeat: Callable[[], None] | None = None,
+        retry: Callable[[float], None] | None = None,
     ) -> None:
         """批量取得随后将被固定的 PR refs。
 
         Args:
             numbers: 当前 API 消费批次中的 PR numbers。
             heartbeat: Git 网络操作未结束时周期调用的带外观察器。
+            retry: 瞬时 Git 传输错误发生时接收退避秒数的观察器。
         """
         selected = sorted(set(numbers))
         if not selected:
@@ -76,6 +108,7 @@ class GitObjectStore:
                     "origin",
                     "+refs/heads/*:refs/gh-puller/remotes/heads/*",
                     heartbeat=heartbeat,
+                    retry=retry,
                 )
                 self._branches_fetched = True
             refspecs = [
@@ -90,14 +123,24 @@ class GitObjectStore:
                 "origin",
                 *refspecs,
                 heartbeat=heartbeat,
+                retry=retry,
             )
 
-    async def capture(self, number: int, pull: dict[str, Any]) -> dict[str, Any]:
+    async def capture(
+        self,
+        number: int,
+        pull: dict[str, Any],
+        *,
+        heartbeat: Callable[[], None] | None = None,
+        retry: Callable[[float], None] | None = None,
+    ) -> dict[str, Any]:
         """固定一个 PR 当前可达的精确 Git 对象。
 
         Args:
             number: Repository-local PR number。
             pull: GitHub PR detail 原始对象。
+            heartbeat: 补取 Git 对象未结束时周期调用的带外观察器。
+            retry: 瞬时 Git 传输错误发生时接收退避秒数的观察器。
 
         Returns:
             base/head 都可达时返回可交给 ``git diff`` 的完整快照；
@@ -129,7 +172,14 @@ class GitObjectStore:
             missing = await self._missing_commits(required)
             if missing:
                 try:
-                    await self._refresh_missing(number, base_sha, head_sha, missing)
+                    await self._refresh_missing(
+                        number,
+                        base_sha,
+                        head_sha,
+                        missing,
+                        heartbeat=heartbeat,
+                        retry=retry,
+                    )
                     missing = await self._missing_commits(required)
                     pinnable_merge_sha = await self._available_commit(merge_sha)
                     if missing:
@@ -263,6 +313,9 @@ class GitObjectStore:
         base_sha: str,
         head_sha: str,
         missing: set[str],
+        *,
+        heartbeat: Callable[[], None] | None,
+        retry: Callable[[float], None] | None,
     ) -> None:
         refspecs = []
         if base_sha in missing and not self._branches_fetched:
@@ -278,6 +331,8 @@ class GitObjectStore:
             "--no-write-fetch-head",
             "origin",
             *refspecs,
+            heartbeat=heartbeat,
+            retry=retry,
         )
         if refspecs and refspecs[0].startswith("+refs/heads/"):
             self._branches_fetched = True
@@ -288,6 +343,7 @@ class GitObjectStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         if not self.path.exists():
             await _command(("git", "init", "--bare", str(self.path)), environment=self._environment())
+        _remove_temporary_packs(self.path)
         bare = await self._git("rev-parse", "--is-bare-repository")
         if bare.strip() != "true":
             raise GitStoreError(f"Git store is not bare: {self.path}")
@@ -309,15 +365,32 @@ class GitObjectStore:
         *arguments: str,
         input_text: str | None = None,
         heartbeat: Callable[[], None] | None = None,
+        retry: Callable[[float], None] | None = None,
         ok: tuple[int, ...] = (0,),
     ) -> str:
-        return await _command(
-            ("git", "--git-dir", str(self.path), *arguments),
-            environment=self._environment(),
-            input_text=input_text,
-            heartbeat=heartbeat,
-            ok=ok,
-        )
+        wait = 1.0
+        while True:
+            try:
+                return await _command(
+                    ("git", "--git-dir", str(self.path), *arguments),
+                    environment=self._environment(),
+                    input_text=input_text,
+                    heartbeat=heartbeat,
+                    ok=ok,
+                )
+            except GitStoreError as exc:
+                if arguments[0] != "fetch":
+                    raise
+                _remove_temporary_packs(self.path)
+                if not _is_transient_fetch_failure(exc):
+                    raise
+                _LOG.warning("%s; retrying in %.1fs", exc, wait)
+                if retry is not None:
+                    retry(wait)
+                await self._sleep(wait)
+                if heartbeat is not None:
+                    heartbeat()
+                wait = min(wait * 2, _FETCH_RETRY_CEILING)
 
     def _environment(self) -> dict[str, str]:
         environment = os.environ | {"GIT_TERMINAL_PROMPT": "0", "LC_ALL": "C"}
@@ -353,6 +426,21 @@ def default_git_url(repository: str) -> str:
         不含凭据的公开 Git URL。
     """
     return f"https://github.com/{repository}.git"
+
+
+def _is_transient_fetch_failure(error: GitStoreError) -> bool:
+    detail = str(error).casefold()
+    return any(marker in detail for marker in _TRANSIENT_FETCH_MARKERS) or bool(
+        _TRANSIENT_FETCH_STATUS.search(detail),
+    )
+
+
+def _remove_temporary_packs(path: Path) -> None:
+    for temporary in (path / "objects" / "pack").glob("tmp_pack_*"):
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError as exc:
+            _LOG.warning("Could not remove incomplete Git pack %s: %s", temporary, exc)
 
 
 def _nested_sha(pull: dict[str, Any], side: str, number: int) -> str:
