@@ -1,7 +1,7 @@
 """持久化 GitHub 原始事实、拉取水位与离线版本流。
 
 SQLite 是本模块的唯一事实边界：未完成 run 可恢复但不进入公共读取流，committed
-run 中的内容寻址 payload 与对象版本足以在无网络条件下重建任意下游数据。
+run 中的内容寻址 payload 与对象版本足以在无网络条件下用已观测事实构建下游数据。
 与 bundle 摘要配对的 HTTP cache 可丢弃且不进入版本流。拉取算法与 GitHub HTTP
 契约分别见 puller 和 client。
 """
@@ -21,7 +21,7 @@ import aiosqlite
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Iterable
 
-_SCHEMA_VERSION = "3"
+_SCHEMA_VERSION = "4"
 _CODEC = "zlib-json-v1"
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS archive_meta (
@@ -114,7 +114,7 @@ class StoredHead:
     created_at: str  # GitHub creation timestamp.
     updated_at: str  # GitHub root update timestamp.
     summary_digest: str  # Content-addressed raw catalog summary.
-    bundle_digest: str | None  # Content-addressed complete bundle.
+    bundle_digest: str | None  # Content-addressed Issue/PR observation record.
     present: bool  # Current catalog membership.
     missing_since: str | None  # First observed absence watermark.
 
@@ -142,7 +142,7 @@ class ArchivedVersion:
     present: bool  # False represents a tombstone.
     missing_since: str | None  # First target that certified absence.
     summary: dict[str, Any]  # Unprojected GitHub catalog response.
-    bundle: dict[str, Any] | None  # Complete last observed bundle.
+    bundle: dict[str, Any] | None  # Last observed Issue/PR record.
 
 
 @dataclass(frozen=True, slots=True)
@@ -155,7 +155,7 @@ class ArchivedHead:
     present: bool  # False represents the current tombstone.
     missing_since: str | None  # First target that certified absence.
     summary: dict[str, Any]  # Unprojected current catalog response.
-    bundle: dict[str, Any] | None  # Complete last observed bundle.
+    bundle: dict[str, Any] | None  # Last observed Issue/PR record.
 
 
 @dataclass(frozen=True, slots=True)
@@ -325,7 +325,7 @@ class SQLiteArchive:
             bundle_digest: committed 或当前 run staged head 引用的 bundle 摘要。
 
         Returns:
-            完整 bundle 与可丢弃的 HTTP validator 元数据；无摘要时均为 None。
+            已存记录与可丢弃的 HTTP validator 元数据；无摘要时均为 None。
         """
         if bundle_digest is None:
             return None, None
@@ -551,13 +551,6 @@ class SQLiteArchive:
             )
             await db.commit()
             return
-        if schema is not None and schema["value"] == "2":
-            await db.execute(
-                "UPDATE archive_meta SET value = ? WHERE key = 'schema_version'",
-                (_SCHEMA_VERSION,),
-            )
-            await db.commit()
-            schema = {"value": _SCHEMA_VERSION}
         if schema is None or schema["value"] != _SCHEMA_VERSION:
             raise ValueError("unsupported GitHub archive schema")
         if repository is None or repository["value"] != self.repository:

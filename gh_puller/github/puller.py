@@ -28,11 +28,12 @@ from .store import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable
+    from collections.abc import Awaitable, Callable, Iterator
 
     from .progress import ProgressObserver
 
 _NUMBER_AT_END = re.compile(r"/(\d+)$")
+_CLOSING_REFERENCE_BATCH_SIZE = 100
 
 
 class IncompleteGitHubDataError(RuntimeError):
@@ -82,6 +83,13 @@ class _API(Protocol):
     ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]: ...
 
     async def repository_item_count(self, owner: str, repo: str) -> int | None: ...
+
+    async def closing_issue_references(
+        self,
+        owner: str,
+        repo: str,
+        numbers: list[int],
+    ) -> dict[int, list[dict[str, Any]]]: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -518,6 +526,7 @@ class GitHubPuller:
     ) -> None:
         async def fetch(
             number: int,
+            closing_references: dict[int, list[dict[str, Any]]],
         ) -> tuple[
             int,
             dict[str, Any],
@@ -544,6 +553,7 @@ class GitHubPuller:
                 previous_cache,
                 catalog_issue=summary if stored_summary is not None else None,
                 force_comments=number in comment_signals,
+                closing_references=closing_references.get(number),
             )
             if stored_summary is None:
                 detail = bundle.get("issue")
@@ -553,41 +563,58 @@ class GitHubPuller:
                     stored_summary = detail
             return number, bundle, stored_summary, http_cache
 
-        numbers = iter(sorted(candidates))
-        completed: asyncio.Queue[asyncio.Task[Any]] = asyncio.Queue()
-        pending: set[asyncio.Task[Any]] = set()
+        async def fetch_batch(
+            batch: list[int],
+            closing_references: dict[int, list[dict[str, Any]]],
+        ) -> None:
+            numbers = iter(batch)
+            completed: asyncio.Queue[asyncio.Task[Any]] = asyncio.Queue()
+            pending: set[asyncio.Task[Any]] = set()
 
-        def start(number: int) -> None:
-            task = asyncio.create_task(fetch(number))
-            task.add_done_callback(completed.put_nowait)
-            pending.add(task)
+            def start(number: int) -> None:
+                task = asyncio.create_task(fetch(number, closing_references))
+                task.add_done_callback(completed.put_nowait)
+                pending.add(task)
 
-        for number in islice(numbers, self.config.concurrency):
-            start(number)
-        try:
-            while pending:
-                task = await completed.get()
-                pending.remove(task)
-                number, bundle, summary, http_cache = task.result()
-                old = heads.get(number)
-                head = _candidate_head(summary, old, bundle)
-                resource = StagedResource(
-                    head=head,
-                    observed_at=observed_at,
-                    summary=summary,
-                    bundle=bundle,
-                    http_cache=http_cache,
-                )
-                await archive.stage(run_id, (resource,))
-                progress.bundles_staged(((head.number, head.kind),), api.request_count)
-                next_number = next(numbers, None)
-                if next_number is not None:
-                    start(next_number)
-        except BaseException:
-            for task in pending:
-                task.cancel()
-            await asyncio.gather(*pending, return_exceptions=True)
-            raise
+            for number in islice(numbers, self.config.concurrency):
+                start(number)
+            try:
+                while pending:
+                    task = await completed.get()
+                    pending.remove(task)
+                    number, bundle, summary, http_cache = task.result()
+                    old = heads.get(number)
+                    head = _candidate_head(summary, old, bundle)
+                    resource = StagedResource(
+                        head=head,
+                        observed_at=observed_at,
+                        summary=summary,
+                        bundle=bundle,
+                        http_cache=http_cache,
+                    )
+                    await archive.stage(run_id, (resource,))
+                    progress.bundles_staged(((head.number, head.kind),), api.request_count)
+                    next_number = next(numbers, None)
+                    if next_number is not None:
+                        start(next_number)
+            except BaseException:
+                for task in pending:
+                    task.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
+                raise
+
+        def kind(number: int) -> str:
+            summary = summaries.get(number)
+            return heads[number].kind if summary is None else _kind(summary)
+
+        for batch in _closing_reference_batches(sorted(candidates), kind):
+            pull_numbers = [number for number in batch if kind(number) == "pull"]
+            closing_references = (
+                await api.closing_issue_references(self._owner, self._repo, pull_numbers)
+                if pull_numbers
+                else {}
+            )
+            await fetch_batch(batch, closing_references)
 
     async def _fetch_bundle(
         self,
@@ -598,6 +625,7 @@ class GitHubPuller:
         *,
         catalog_issue: dict[str, Any] | None,
         force_comments: bool,
+        closing_references: list[dict[str, Any]] | None,
     ) -> tuple[dict[str, Any], dict[str, Any] | None]:
         number = int(summary["number"])
         issue_path = f"{self._base}/issues/{number}"
@@ -663,7 +691,7 @@ class GitHubPuller:
             )
         _check_count(number, "issue reactions", issue.get("reactions"), reactions)
         bundle: dict[str, Any] = {
-            "schema_version": 1,
+            "schema_version": 2,
             "repository": self.config.repository,
             "number": number,
             "kind": "pull" if "pull_request" in issue else "issue",
@@ -681,6 +709,7 @@ class GitHubPuller:
                 _dict_field(previous, "pull_request"),
                 _dict_field(previous_cache, "pull_request"),
                 force_comments=force_comments,
+                closing_references=closing_references,
             )
             bundle["pull_request"] = pull
             _set_cache(http_cache, "pull_request", cache)
@@ -694,7 +723,10 @@ class GitHubPuller:
         previous_cache: dict[str, Any] | None,
         *,
         force_comments: bool,
+        closing_references: list[dict[str, Any]] | None,
     ) -> tuple[dict[str, Any], dict[str, Any] | None]:
+        if closing_references is None:
+            raise IncompleteGitHubDataError(f"pull #{number} has no closing issue references")
         path = f"{self._base}/pulls/{number}"
         http_cache: dict[str, Any] = {}
         pull, cache = await self._cached_json(
@@ -800,6 +832,7 @@ class GitHubPuller:
             "commits": commits,
             "files": files,
             "requested_reviewers": requested_reviewers,
+            "closing_issues_references": closing_references,
             "diff": diff,
             "patch": patch,
         }
@@ -1267,6 +1300,24 @@ def _same_head(head: StoredHead, item: dict[str, Any]) -> bool:
 
 def _kind(item: dict[str, Any]) -> str:
     return "pull" if "pull_request" in item else "issue"
+
+
+def _closing_reference_batches(
+    numbers: list[int],
+    kind: Callable[[int], str],
+) -> Iterator[list[int]]:
+    batch: list[int] = []
+    pulls = 0
+    for number in numbers:
+        is_pull = kind(number) == "pull"
+        if is_pull and pulls == _CLOSING_REFERENCE_BATCH_SIZE:
+            yield batch
+            batch = []
+            pulls = 0
+        batch.append(number)
+        pulls += is_pull
+    if batch:
+        yield batch
 
 
 def _sort_catalog(catalog: list[dict[str, Any]]) -> list[dict[str, Any]]:

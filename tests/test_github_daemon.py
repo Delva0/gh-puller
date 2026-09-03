@@ -31,7 +31,7 @@ def _full_digest_unit_for(database: Path) -> str:
 def _bind_archive(
     database: Path,
     repository: str = _REPOSITORY,
-    schema: str = "3",
+    schema: str = "4",
 ) -> None:
     with sqlite3.connect(database) as connection:
         connection.execute(
@@ -237,14 +237,23 @@ def test_archive_repository_binding_rejects_wrong_writer(tmp_path: Path) -> None
     assert not log.exists()
 
 
-def test_install_accepts_archive_awaiting_schema_upgrade(tmp_path: Path) -> None:
-    environment, units, _ = _environment(tmp_path)
+def test_install_rejects_incompatible_archive_schema(tmp_path: Path) -> None:
+    environment, units, log = _environment(tmp_path)
     database = tmp_path / "facts.sqlite3"
-    _bind_archive(database, schema="2")
+    _bind_archive(database, schema="3")
 
-    _run("install", _REPOSITORY, str(database), environment=environment)
+    result = _run(
+        "install",
+        _REPOSITORY,
+        str(database),
+        environment=environment,
+        check=False,
+    )
 
-    assert (units / _unit_for(database)).is_file()
+    assert result.returncode == 2
+    assert "database is not a valid gh-puller archive" in result.stderr
+    assert not units.exists()
+    assert not log.exists()
 
 
 def test_install_preserves_and_rejects_non_archive_database(tmp_path: Path) -> None:

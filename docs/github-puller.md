@@ -90,7 +90,7 @@ four discovery operations together:
 
 The overlap protects changes that share GitHub's second-resolution boundary. Root
 rows carry full replacement objects. Comment rows are only dirty-parent signals: the
-selected parent is subsequently read through its complete per-parent endpoints.
+selected parent is subsequently read through its supported per-parent endpoints.
 GitHub defines the two signal endpoints in
 [List issue comments for a repository](https://docs.github.com/en/rest/issues/comments#list-issue-comments-for-a-repository)
 and
@@ -122,7 +122,7 @@ silent child-resource change. Its discovery guarantees and limitations are:
 | Deleted Issue/PR previously observed by this database | Exact-count proof falls back to a stable full membership scan | A parent already unavailable before the first observation has no historical row to retain. |
 | Added or edited Issue comment | Repository Issue-comment delta | The selected parent is reread from its supported per-parent endpoints. |
 | Added or edited PR review comment | Repository PR-review-comment delta | The selected PR is reread from its supported per-parent endpoints. |
-| Deleted comment, reaction change, timeline/event change, review change, commit/file change, or reviewer change | Parent refresh after another observable signal | There is no deliberate repository-wide scan for these resources, so a change with no parent/comment signal may remain undiscovered. |
+| Deleted comment, reaction change, timeline/event change, review change, commit/file change, reviewer change, or PR closing relation change | Parent refresh after another observable signal | There is no deliberate repository-wide scan for these resources, so a change with no parent/comment signal may remain undiscovered. |
 | Multiple changes between observations | Latest supported endpoint response after selection | Intermediate states that disappear before an API response are not recoverable. |
 
 Once an Issue/PR is selected, the puller reads every page returned by each supported
@@ -141,6 +141,7 @@ APIs expose every web-page fact or every historical state.
 | Issue reactions | No collection request when detail reports `total_count == 0` | Zero is itself the complete collection; every nonzero or absent count still paginates and is checked against the aggregate. |
 | PR commits and files | No collection request when PR detail reports an exact zero | Nonzero and absent counts still paginate; a returned collection shorter than `commits` or `changed_files` aborts publication. |
 | Requested reviewers | Reuse embedded users only when the PR detail contains a valid user list and an empty team list. | Any team or ambiguous embedded value selects the dedicated endpoint, whose team objects carry richer fields. |
+| Issues closed by a PR | Batch up to 100 selected PRs into one GraphQL request, include user-linked Issues, and follow every `closingIssuesReferences` cursor. | Each connection's `totalCount` must equal its unique returned nodes. Missing, duplicate, or malformed data aborts the run instead of becoming an empty relation. |
 | Per-parent JSON, certified paginated lists, diff, and patch | Conditional GET with the prior ETag | Validators are keyed by API root, API version, media type, path, and parameters, and are stored atomically with the exact bundle digest whose body they validate. A paginated list is reusable only when every page has an ETag and the terminal page has fewer than 100 entries. Every page must return `304 Not Modified`; any changed page restarts complete pagination. A terminal full page has no cache, so 100→101 growth cannot hide on a new page. |
 | Timeline, events, diff, and patch aggregation | No repository-wide consolidation | Repository event responses have a different raw shape, while diff and patch have independent lossless fallback rules. Their per-parent responses remain unprojected; eligible responses still use the conditional transport above. |
 
@@ -159,16 +160,25 @@ and
 [GraphQL rate-limit reference](https://docs.github.com/en/graphql/overview/rate-limits-and-query-limits-for-the-graphql-api).
 
 For I ordinary Issues, P pull requests, and N = I + P, the authenticated cold-path
-minimum is:
+minimum is easier to compare as separate primary-rate-limit buckets:
 
 ```text
-ceil(N / 100) + 1 + 2I + 6P
+REST HTTP requests:    ceil(N / 100) + 2I + 6P
+GraphQL HTTP requests: 1 + ceil(P / 100)
 ```
 
-The first terms are the REST catalog and one GraphQL count. An empty Issue still reads
-timeline and events. An empty PR additionally reads PR detail, reviews, diff, and
-patch. Non-empty comments, reactions, commits, files, review teams, pagination, and
-media fallback add their actual requests.
+The REST catalog and GraphQL count contribute the first term of their respective
+lines. An empty Issue still reads timeline and events. An empty PR additionally reads
+PR detail, reviews, diff, and patch. The PR batch term reads the first page of every
+closing relation. A relation beyond 100 nodes adds cursor requests, while non-empty
+comments, reactions, commits, files, review teams, pagination, and media fallback add
+their actual REST requests. On a warm pass, only selected PRs enter the GraphQL
+relation batches. The query uses GitHub's documented maximum page size and stays well
+below its node limit; GitHub's response headers remain authoritative for actual point
+consumption. See the
+[PullRequest GraphQL fields](https://docs.github.com/en/graphql/reference/pulls#pullrequest)
+and
+[GraphQL resource limits](https://docs.github.com/en/graphql/overview/rate-limits-and-query-limits-for-the-graphql-api).
 
 Primary or secondary limiting waits outside the transient-retry budget, so a cold
 start may span quota windows while remaining one blocking `pull(T)` call. Bundle work
@@ -244,11 +254,14 @@ the run to `committed` in one SQLite transaction. A process file lock enforces t
 single-writer contract; SQLite uses WAL mode, foreign keys, and
 `synchronous=FULL`.
 
-Each version retains an unprojected REST summary and a complete Issue or PR bundle;
-GraphQL catalog projections are never stored as payloads. Unknown JSON fields are
-preserved semantically. Issue bundles include detail, comments, comment reactions,
-timeline, events, and reactions. PR bundles additionally include PR detail, reviews,
-review comments and reactions, commits, files, requested reviewers, diff, and patch.
+Each version retains an unprojected REST summary and one record containing all
+supported responses read for that Issue or PR. The GraphQL count projection is not
+stored. A selected PR does store the projected `closingIssuesReferences` nodes,
+including each target Issue's global ID, repository identity, number, title, state,
+and URL. Unknown fields in REST JSON are preserved semantically. Issue records
+include detail, comments, comment reactions, timeline, events, and reactions. PR
+records additionally include PR detail, reviews, review comments and reactions,
+commits, files, requested reviewers, closing-Issue references, diff, and patch.
 If GitHub rejects or persistently fails an aggregate PR diff or patch representation,
 the bundle records that failure and requests the same representation for every commit
 through GitHub's
@@ -270,6 +283,36 @@ and
 A tombstone records certified absence without discarding the last bundle. The
 boundary excludes linked external attachments and facts that GitHub made unavailable
 before the archive first observed them.
+
+Archive schema 4 pairs this resource set with record schema 2. Opening a database
+with another archive schema is rejected before pulling, so one file cannot silently
+mix records with different required fields.
+
+Sources: [gh_puller/github/](../gh_puller/github/); [tests/test_github_puller.py](../tests/test_github_puller.py)
+
+## Offline page reconstruction boundary
+
+The database can rebuild the data-oriented part of an observed Issue or PR page, but
+it is not a browser-page mirror. “Rebuild” below means an offline model can derive the
+fact from stored responses; it does not promise GitHub's exact HTML, ordering, or
+presentation.
+
+| Page or mining question | Available offline | Boundary |
+| --- | --- | --- |
+| Issue/PR title, body, rendered body variants returned by full-JSON REST, author, timestamps, state, labels, assignees, and milestone | Yes | Only versions actually observed are retained; GitHub's complete edit history is not an API response. |
+| Conversation comments, reactions, and observed timeline/events | Yes | A deletion or silent child change can remain unknown until another signal selects the parent. |
+| PR source and target repository/branch, draft and merge fields | Yes, from PR detail | Branch contents and the rest of the Git repository are outside this database. |
+| PR commits, changed files, reviews, review comments, aggregate diff, and patch | Yes, for a selected PR | CI checks, workflow runs, deployments, and review-thread resolution state are not fetched. |
+| Issue GitHub marks as closable by a selected PR | Yes, from `closing_issues_references` | The relation is GitHub's closing linkage; whether the PR merged and whether the change semantically fixed the Issue remain separate facts. |
+| Forward references written in title/body/comment text | The raw text can be parsed offline | Textual references may be ambiguous or point outside the repository. |
+| Reverse references to an Issue/PR | Partly, from observed timeline cross-reference events and locally parsed forward references | There is no repository-external reverse-reference crawl, and silent or unavailable events cannot be invented. |
+| Exact GitHub web page | No | Styling, live widgets, permission-dependent controls, avatars and attachment bytes, Projects fields, checks, and other page-only or unsupported API data are outside the archive. |
+
+This supports mining contributor activity from authors, assignees, commenters,
+reviewers, and commit identities; deriving explicit Issue-to-PR closing edges; and
+classifying bug-fix, draft, or work-in-progress records from labels and text. “Core
+developer”, “bug fix”, and similar conclusions remain downstream definitions rather
+than facts asserted by the puller.
 
 Sources: [gh_puller/github/](../gh_puller/github/); [tests/test_github_puller.py](../tests/test_github_puller.py)
 
@@ -315,9 +358,10 @@ Sources: [gh_puller/github/](../gh_puller/github/); [tests/test_github_puller.py
 
 ## Run once or on a UTC-aligned interval
 
-Production operation should provide an authenticated token through the process
-environment or the project-root `.env`. `GH_TOKEN` takes precedence over
-`GITHUB_TOKEN`:
+Production operation requires an authenticated token through the process environment
+or the project-root `.env`. `GH_TOKEN` takes precedence over `GITHUB_TOKEN`. A run
+that selects any PR needs GraphQL authentication for its closing-Issue relation;
+authentication also provides the production primary-rate-limit budget:
 
 ```dotenv
 GH_TOKEN=github_pat_your_token
@@ -497,14 +541,15 @@ uvx ruff check \
 bash -n scripts/github-puller-daemon.sh
 ```
 
-The suite covers raw-field retention, REST catalog certification and fallback, PR
-resources, same-second boundaries, future prefetch history, diff/patch fallback and
-validator reuse, pass-local progress, zero-request idempotent reuse, observer failure
-isolation, TTY and JSON progress, rate-limit waits, current-head visibility, single-
-and multi-page conditional validation, 100→101 page growth, content deduplication,
-tombstones, cancellation, completion-order durable resume, concurrent duplicate calls,
-scheduler recovery, randomized observable churn, parent-deletion fallback, and the
-request-saving shortcuts used while materializing selected Issue/PR records.
+The suite covers raw-field retention, REST parent-membership proof and fallback, PR
+resources, batched and paginated closing-Issue relations, same-second boundaries,
+future prefetch history, diff/patch fallback and validator reuse, pass-local progress,
+zero-request idempotent reuse, observer failure isolation, TTY and JSON progress,
+rate-limit waits, current-head visibility, single- and multi-page conditional
+validation, 100→101 page growth, content deduplication, tombstones, cancellation,
+completion-order durable resume, concurrent duplicate calls, scheduler recovery,
+randomized observable Issue/PR and comment churn, parent-deletion fallback, archive
+schema rejection, and request-saving shortcuts for selected Issue/PR records.
 
 The daemon tests additionally verify unit rendering, repeatable installation and
 uninstallation, archive preservation, database-scoped controls, repository-binding

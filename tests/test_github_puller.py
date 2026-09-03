@@ -73,6 +73,7 @@ class FakeAPI:
         self.on_request: Any = None
         self.reported_count: int | None = None
         self.count_available = True
+        self.closing: dict[int, list[dict[str, Any]]] = {}
 
     async def close(self) -> None:
         pass
@@ -207,6 +208,19 @@ class FakeAPI:
             return None
         return len(self.catalog) if self.reported_count is None else self.reported_count
 
+    async def closing_issue_references(
+        self,
+        owner: str,
+        repo: str,
+        numbers: list[int],
+    ) -> dict[int, list[dict[str, Any]]]:
+        self._called(
+            "closing",
+            "/graphql",
+            {"owner": owner, "repo": repo, "numbers": numbers},
+        )
+        return {number: deepcopy(self.closing.get(number, [])) for number in numbers}
+
     def add_issue(
         self,
         number: int,
@@ -254,6 +268,21 @@ def _iso(value: datetime) -> str:
 
 def _time(value: str) -> datetime:
     return datetime.fromisoformat(value)
+
+
+def _closing_issue(number: int, *, repository: str = "acme/widgets") -> dict[str, Any]:
+    return {
+        "id": f"issue-{repository}-{number}",
+        "number": number,
+        "title": f"closing issue {number}",
+        "state": "OPEN",
+        "url": f"https://github.test/{repository}/issues/{number}",
+        "repository": {
+            "id": f"repository-{repository}",
+            "nameWithOwner": repository,
+            "url": f"https://github.test/{repository}",
+        },
+    }
 
 
 def _config(path: Path, **kwargs: Any) -> GitHubPullConfig:
@@ -322,7 +351,15 @@ def _stored_heads(items: list[dict[str, Any]]) -> dict[int, StoredHead]:
 
 def _seed_churn_api(api: FakeAPI, size: int) -> None:
     for number in range(1, size + 1):
-        api.add_issue(number)
+        pull = number % 3 == 0
+        api.add_issue(number, pull=pull)
+        if pull:
+            api.json[f"{_BASE}/pulls/{number}"] = {
+                "id": number * 10,
+                "changed_files": 0,
+                "commits": 0,
+                "review_comments": 0,
+            }
         if number % 4:
             continue
         path = f"{_BASE}/issues/{number}"
@@ -347,7 +384,15 @@ def _apply_churn_epoch(
 ) -> None:
     api.catalog = [item for item in api.catalog if item["number"] not in deleted]
     for number in added:
-        api.add_issue(number, created_at=changed_at, updated_at=changed_at)
+        pull = number % 3 == 0
+        api.add_issue(number, created_at=changed_at, updated_at=changed_at, pull=pull)
+        if pull:
+            api.json[f"{_BASE}/pulls/{number}"] = {
+                "id": number * 10,
+                "changed_files": 0,
+                "commits": 0,
+                "review_comments": 0,
+            }
 
     signals: list[dict[str, Any]] = []
     for number, operation, comment_id in comment_operations:
@@ -368,6 +413,8 @@ def _apply_churn_epoch(
             summary = next(item for item in api.catalog if item["number"] == number)
             summary["updated_at"] = _iso(changed_at)
             api.json[path]["updated_at"] = _iso(changed_at)
+        if "pull_request" in api.json[path]:
+            api.closing[number] = [_closing_issue(comment_id)] if operation == "add" else []
         api.json[path]["comments"] = len(comments)
     api.pages[f"{_BASE}/issues/comments"] = signals
 
@@ -516,6 +563,7 @@ async def test_cold_pull_preserves_raw_fields_and_publishes_target(tmp_path: Pat
     bundle = current[1].bundle
     catalog = current[1].summary
     assert bundle is not None
+    assert bundle["schema_version"] == 2
     assert bundle["issue"]["unknown_detail_field"] == [1, {"raw": "yes"}]
     assert bundle["issue_comments"][0]["future_field"] == {"kept": 1}
     assert bundle["timeline"][0]["rename"] == {"from": "a", "to": "b"}
@@ -594,6 +642,7 @@ async def test_pull_request_bundle_preserves_all_discussion_and_diff_data(tmp_pa
     api.pages[f"{_BASE}/pulls/comments/72/reactions"] = [{"id": 73, "content": "+1"}]
     api.pages[f"{pull_path}/commits"] = [{"sha": "abc", "commit": {"message": "change"}}]
     api.pages[f"{pull_path}/files"] = [{"sha": "abc", "filename": "a.py", "patch": "@@"}]
+    api.closing[7] = [_closing_issue(11)]
     api.text[(pull_path, "application/vnd.github.diff")] = "diff --git a/a.py b/a.py\n"
     api.text[(pull_path, "application/vnd.github.patch")] = "From abc Mon Sep 17 00:00:00 2001\n"
 
@@ -611,10 +660,91 @@ async def test_pull_request_bundle_preserves_all_discussion_and_diff_data(tmp_pa
     assert pull["commits"][0]["commit"]["message"] == "change"
     assert pull["files"][0]["patch"] == "@@"
     assert pull["requested_reviewers"]["users"][0]["login"] == "alice"
+    assert pull["closing_issues_references"] == [_closing_issue(11)]
     assert pull["diff"].startswith("diff --git")
     assert pull["patch"].startswith("From abc")
     assert (await _current(tmp_path / "archive"))[7].kind == "pull"
     assert not any(call[1] == f"{issue_path}/comments" for call in api.calls)
+
+
+@pytest.mark.asyncio
+async def test_closing_issue_queries_pack_one_hundred_selected_pulls(tmp_path: Path) -> None:
+    api = FakeAPI()
+    for number in range(1, 203):
+        pull = number % 2 == 0
+        api.add_issue(number, pull=pull)
+        if pull:
+            api.json[f"{_BASE}/pulls/{number}"] = {
+                "id": number * 10,
+                "changed_files": 0,
+                "commits": 0,
+                "review_comments": 0,
+            }
+
+    result = await GitHubPuller(
+        _config(tmp_path / "archive", concurrency=32),
+        api=api,
+        now=lambda: _T0,
+    ).pull(_T0)
+
+    calls = [call for call in api.calls if call[0] == "closing"]
+    assert [len(call[2]["numbers"]) for call in calls] == [100, 1]
+    assert result.requests == 814
+
+
+@pytest.mark.asyncio
+async def test_quiet_pull_does_not_query_closing_issue_references(tmp_path: Path) -> None:
+    api = FakeAPI()
+    api.add_issue(2, pull=True)
+    api.json[f"{_BASE}/pulls/2"] = {
+        "id": 20,
+        "changed_files": 0,
+        "commits": 0,
+        "review_comments": 0,
+    }
+    clock = Clock(_T0)
+    puller = GitHubPuller(_config(tmp_path / "archive"), api=api, now=clock, sleep=clock.sleep)
+    await puller.pull(_T0)
+    call_start = len(api.calls)
+    clock.current += timedelta(hours=1)
+
+    result = await puller.pull(clock.current)
+
+    assert result.requests == 4
+    assert not any(call[0] == "closing" for call in api.calls[call_start:])
+
+
+@pytest.mark.asyncio
+async def test_missing_closing_issue_result_aborts_publication(tmp_path: Path) -> None:
+    class MissingClosingAPI(FakeAPI):
+        async def closing_issue_references(
+            self,
+            owner: str,
+            repo: str,
+            numbers: list[int],
+        ) -> dict[int, list[dict[str, Any]]]:
+            self._called(
+                "closing",
+                "/graphql",
+                {"owner": owner, "repo": repo, "numbers": numbers},
+            )
+            return {}
+
+    api = MissingClosingAPI()
+    api.add_issue(2, pull=True)
+    api.json[f"{_BASE}/pulls/2"] = {
+        "id": 20,
+        "changed_files": 0,
+        "commits": 0,
+        "review_comments": 0,
+    }
+    archive = tmp_path / "archive"
+
+    with pytest.raises(IncompleteGitHubDataError, match="has no closing issue references"):
+        await GitHubPuller(_config(archive), api=api, now=lambda: _T0).pull(_T0)
+
+    assert await _runs(archive) == []
+    assert await _versions(archive) == []
 
 
 @pytest.mark.asyncio
@@ -1018,8 +1148,11 @@ async def test_large_random_observable_issue_and_comment_churn(tmp_path: Path) -
     next_comment = 1_000_000
     added_total = 0
     deleted_total = 0
+    added_pulls = 0
+    deleted_pulls = 0
     comment_additions = 0
     comment_deletions = 0
+    pull_comment_operations = 0
     fast_epochs = 0
     fallback_epochs = 0
     for epoch in range(1, 21):
@@ -1032,6 +1165,7 @@ async def test_large_random_observable_issue_and_comment_churn(tmp_path: Path) -
         operations: list[tuple[int, str, int]] = []
         for number in selected:
             comments = api.pages.get(f"{_BASE}/issues/{number}/comments", [])
+            pull_comment_operations += number % 3 == 0
             if comments and rng.random() < 0.5:
                 comment = rng.choice(comments)
                 operations.append((number, "delete", int(comment["id"])))
@@ -1044,6 +1178,8 @@ async def test_large_random_observable_issue_and_comment_churn(tmp_path: Path) -
         next_number += len(added)
         added_total += len(added)
         deleted_total += len(deleted)
+        added_pulls += sum(number % 3 == 0 for number in added)
+        deleted_pulls += sum(number % 3 == 0 for number in deleted)
         _apply_churn_epoch(
             api,
             deleted=deleted,
@@ -1085,12 +1221,20 @@ async def test_large_random_observable_issue_and_comment_churn(tmp_path: Path) -
             assert [(item["id"], item["body"]) for item in bundle["issue_comments"]] == [
                 (item["id"], item["body"]) for item in expected_comments
             ]
+            if number % 3 == 0:
+                assert bundle["pull_request"]["closing_issues_references"] == api.closing.get(
+                    number,
+                    [],
+                )
         assert all(not heads[number].present for number in deleted)
 
     assert (added_total, deleted_total) == (60, 20)
+    assert added_pulls > 0
+    assert deleted_pulls > 0
     assert comment_additions + comment_deletions == 240
     assert comment_additions > 0
     assert comment_deletions > 0
+    assert pull_comment_operations > 0
     assert (fast_epochs, fallback_epochs) == (10, 10)
     assert len(api.catalog) == 136
     assert len(await _runs(archive)) == 21
@@ -1787,6 +1931,158 @@ async def test_graphql_repository_count_is_exact_and_authenticated() -> None:
 
 
 @pytest.mark.asyncio
+async def test_graphql_closing_issue_references_batch_and_paginate() -> None:
+    seen: list[dict[str, Any]] = []
+    issue_11 = _closing_issue(11)
+    issue_12 = _closing_issue(12)
+    issue_13 = _closing_issue(13, repository="other/project")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        seen.append(body)
+        if len(seen) == 1:
+            repository = {
+                "p0": {
+                    "number": 7,
+                    "closingIssuesReferences": {
+                        "totalCount": 2,
+                        "nodes": [issue_11],
+                        "pageInfo": {"hasNextPage": True, "endCursor": "cursor-7"},
+                    },
+                },
+                "p1": {
+                    "number": 9,
+                    "closingIssuesReferences": {
+                        "totalCount": 1,
+                        "nodes": [issue_12],
+                        "pageInfo": {"hasNextPage": False, "endCursor": None},
+                    },
+                },
+            }
+        else:
+            repository = {
+                "p0": {
+                    "number": 7,
+                    "closingIssuesReferences": {
+                        "totalCount": 2,
+                        "nodes": [issue_13],
+                        "pageInfo": {"hasNextPage": False, "endCursor": None},
+                    },
+                },
+            }
+        return httpx.Response(200, json={"data": {"repository": repository}}, request=request)
+
+    client = httpx.AsyncClient(base_url="https://api.github.test", transport=httpx.MockTransport(handler))
+    api = GitHubAPI(token=str(id(client)), client=client, graphql_url="/graphql")
+    try:
+        result = await api.closing_issue_references("acme", "widgets", [7, 9])
+    finally:
+        await client.aclose()
+
+    assert result == {7: [issue_11, issue_13], 9: [issue_12]}
+    assert seen[0]["variables"] == {
+        "owner": "acme",
+        "repo": "widgets",
+        "number0": 7,
+        "cursor0": None,
+        "number1": 9,
+        "cursor1": None,
+    }
+    assert seen[1]["variables"] == {
+        "owner": "acme",
+        "repo": "widgets",
+        "number0": 7,
+        "cursor0": "cursor-7",
+    }
+    assert "p1: pullRequest(number: $number1)" in seen[0]["query"]
+    assert "first: 100" in seen[0]["query"]
+    assert "excludeUserLinked: false" in seen[0]["query"]
+    assert api.request_count == 2
+
+
+@pytest.mark.asyncio
+async def test_graphql_closing_issue_references_accept_one_hundred_aliases() -> None:
+    seen: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        seen.append(body)
+        repository = {
+            f"p{index}": {
+                "number": number,
+                "closingIssuesReferences": {
+                    "totalCount": 0,
+                    "nodes": [],
+                    "pageInfo": {"hasNextPage": False, "endCursor": None},
+                },
+            }
+            for index, number in enumerate(range(1, 101))
+        }
+        return httpx.Response(200, json={"data": {"repository": repository}}, request=request)
+
+    client = httpx.AsyncClient(base_url="https://api.github.test", transport=httpx.MockTransport(handler))
+    api = GitHubAPI(token=str(id(client)), client=client, graphql_url="/graphql")
+    try:
+        assert await api.closing_issue_references("acme", "widgets", list(range(1, 101))) == {
+            number: [] for number in range(1, 101)
+        }
+        with pytest.raises(ValueError, match="at most 100"):
+            await api.closing_issue_references("acme", "widgets", list(range(1, 102)))
+    finally:
+        await client.aclose()
+
+    assert seen[0]["query"].count(": pullRequest(number:") == 100
+    assert api.request_count == 1
+
+
+@pytest.mark.asyncio
+async def test_graphql_closing_issue_references_reject_incomplete_page() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "data": {
+                    "repository": {
+                        "p0": {
+                            "number": 7,
+                            "closingIssuesReferences": {
+                                "totalCount": 2,
+                                "nodes": [_closing_issue(11)],
+                                "pageInfo": {"hasNextPage": False, "endCursor": None},
+                            },
+                        },
+                    },
+                },
+            },
+            request=request,
+        )
+
+    client = httpx.AsyncClient(base_url="https://api.github.test", transport=httpx.MockTransport(handler))
+    api = GitHubAPI(token=str(id(client)), client=client, graphql_url="/graphql")
+    try:
+        with pytest.raises(GitHubAPIError, match="advertised 2 closing issues, got 1"):
+            await api.closing_issue_references("acme", "widgets", [7])
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_graphql_closing_issue_references_require_authentication() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        pytest.fail(f"unexpected request: {request.url}")
+
+    client = httpx.AsyncClient(base_url="https://api.github.test", transport=httpx.MockTransport(handler))
+    api = GitHubAPI(client=client, graphql_url="/graphql")
+    try:
+        with pytest.raises(GitHubAPIError, match="require GitHub authentication"):
+            await api.closing_issue_references("acme", "widgets", [7])
+    finally:
+        await client.aclose()
+
+    assert api.request_count == 0
+
+
+@pytest.mark.asyncio
 async def test_quota_progress_keeps_rest_and_graphql_buckets() -> None:
     progress = []
 
@@ -2325,36 +2621,31 @@ async def test_payload_blobs_are_compressed_and_content_addressed(tmp_path: Path
 
 
 @pytest.mark.asyncio
-async def test_existing_fact_archive_adds_discardable_http_cache_on_open(tmp_path: Path) -> None:
+async def test_incompatible_fact_archive_schema_is_rejected(tmp_path: Path) -> None:
     api = FakeAPI()
     api.add_issue(1)
     archive = tmp_path / "archive"
-    clock = Clock(_T0)
-    puller = GitHubPuller(_config(archive), api=api, now=clock, sleep=clock.sleep)
-    await puller.pull(_T0)
+    await GitHubPuller(_config(archive), api=api, now=lambda: _T0).pull(_T0)
 
     db = await aiosqlite.connect(archive)
     try:
-        await db.execute("DROP TABLE bundle_http_cache")
         await db.execute(
-            "UPDATE archive_meta SET value = '2' WHERE key = 'schema_version'",
+            "UPDATE archive_meta SET value = '3' WHERE key = 'schema_version'",
         )
         await db.commit()
     finally:
         await db.close()
-    clock.current += timedelta(hours=1)
-    await puller.pull(clock.current)
 
-    meta = await _rows(
-        archive,
-        "SELECT value FROM archive_meta WHERE key = 'schema_version'",
-    )
-    tables = await _rows(
-        archive,
-        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'bundle_http_cache'",
-    )
-    assert meta == [{"value": "3"}]
-    assert tables == [{"name": "bundle_http_cache"}]
+    with pytest.raises(ValueError, match="unsupported GitHub archive schema"):
+        await GitHubPuller(
+            _config(archive),
+            api=api,
+            now=lambda: _T0 + timedelta(hours=1),
+        ).pull(_T0 + timedelta(hours=1))
+
+    assert await _rows(archive, "SELECT value FROM archive_meta WHERE key = 'schema_version'") == [
+        {"value": "3"},
+    ]
 
 
 def test_console_progress_uses_throttled_json_for_logs_and_a_tty_bar() -> None:

@@ -112,7 +112,7 @@ with sqlite3.connect(uri, uri=True) as db:
         "SELECT key, value FROM archive_meta WHERE key IN (?, ?)",
         ("schema_version", "repository"),
     ))
-if metadata.get("schema_version") not in {"2", "3"} or "repository" not in metadata:
+if metadata.get("schema_version") != "4" or "repository" not in metadata:
     raise SystemExit(3)
 print(metadata["repository"])
 ' "$destination"
