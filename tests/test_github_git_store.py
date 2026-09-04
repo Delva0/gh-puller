@@ -280,7 +280,9 @@ async def test_git_store_marks_comparison_unavailable_when_api_head_is_unreachab
 async def test_upstream_sync_publishes_native_refs_and_pins_removed_tips(tmp_path: Path) -> None:
     source = tmp_path / "source"
     base, _ = _source_repository(source, 1)
+    _git(source, "branch", "same-tip", base)
     _git(source, "tag", "v1", base)
+    _git(source, "tag", "same-object", base)
     path = git_store_path(tmp_path / "facts.sqlite3")
 
     await GitObjectStore(path, "acme/widgets", str(source)).sync_upstream()

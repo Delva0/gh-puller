@@ -426,19 +426,19 @@ class GitObjectStore:
                 "refs/tags",
             )
         ).splitlines()
-        updates = []
+        updates = {}
         for line in lines:
             ref, sha = line.rsplit(" ", 1)
             if _SHA.fullmatch(sha) is None:
                 raise GitStoreError(f"upstream ref has invalid object ID: {ref}")
             kind = "heads" if ref.startswith("refs/heads/") else "tags"
             archive_ref = upstream_ref(kind, sha)
-            updates.append((archive_ref, sha))
+            updates[archive_ref] = sha
         if updates:
             await self._git(
                 "update-ref",
                 "--stdin",
-                input_text="".join(f"update {ref} {sha}\n" for ref, sha in updates),
+                input_text="".join(f"update {ref} {sha}\n" for ref, sha in updates.items()),
             )
 
     async def _set_head(
