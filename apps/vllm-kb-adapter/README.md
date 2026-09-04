@@ -1,8 +1,8 @@
 # vllm-kb adapter
 
 面向 vllm-kb 的版本化 MCP 转发层。它不修改 `apps/gh-puller-mcp`，公开
-`/gh-puller/graph` 单端点，并只暴露清单中的 `search_graph`、`trace_path`、
-`detect_changes`、`query_graph`。
+`/gh-puller/graph` 单端点，并只暴露清单中的 `search_graph`、`search_code`、
+`trace_path`、`query_graph`、`get_architecture`、`detect_changes`。
 
 ## 运行模型
 
@@ -94,10 +94,10 @@ vllm-kb 配置指向适配层，而不是内部 gh-puller-mcp：
 
 ## 接口语义
 
-- `tools/list` 仅返回四个清单工具，并在其参数结构中加入可选 `version`；
+- `tools/list` 仅返回六个清单工具，并在其参数结构中加入可选 `version`；
   `detect_changes` 另外要求 `diff`。
-- `search_graph`、`trace_path`、`query_graph` 会绑定目标版本的内部索引，强制请求结构化 JSON，
-  并把 `cols`/`rows`/`groups` 压缩表展开成对象行。
+- 六个工具都会绑定目标版本的内部索引。适配层把搜索、追踪、查询与架构结果中的
+  `cols`/`rows`/`groups` 压缩表展开成对象行。
 - `detect_changes(scope="files")` 只解析 unified Git diff。
 - `detect_changes(scope="impact")` 用 diff 的旧侧文件和行号选择基准快照中的符号，按固定 hop
   遍历 `CALLS` 边，并排除所有变更 seed。`inbound` 表示调用方影响面，`outbound` 表示依赖面，

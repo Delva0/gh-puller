@@ -57,6 +57,42 @@ def test_normalize_trace_and_query_tables() -> None:
     assert query["structuredContent"]["rows"] == [{"qn": "pkg.f", "count": 2}]
 
 
+def test_normalize_new_tool_tables() -> None:
+    search = normalize_result(
+        "search_code",
+        _result(
+            {
+                "cols": ["qn", "file"],
+                "rows": [["pkg.f", "pkg/f.py"]],
+                "raw_matches": {
+                    "cols": ["file", "line"],
+                    "rows": [["pkg/f.py", 3]],
+                },
+            },
+        ),
+    )
+    architecture = normalize_result(
+        "get_architecture",
+        _result(
+            {
+                "project": "project",
+                "clusters": {
+                    "cols": ["label", "member_count"],
+                    "rows": [["core", 4]],
+                },
+            },
+        ),
+    )
+
+    assert search["structuredContent"]["rows"] == [{"qn": "pkg.f", "file": "pkg/f.py"}]
+    assert search["structuredContent"]["raw_matches"]["rows"] == [
+        {"file": "pkg/f.py", "line": 3},
+    ]
+    assert architecture["structuredContent"]["clusters"] == [
+        {"label": "core", "member_count": 4},
+    ]
+
+
 def test_preserve_tool_error() -> None:
     result = {"content": [], "isError": True}
 

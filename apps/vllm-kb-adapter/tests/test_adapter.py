@@ -78,6 +78,16 @@ class FakeUpstream:
                     "rows": rows,
                 },
             )
+        if name == "get_architecture":
+            return _envelope(
+                {
+                    "project": arguments["project"],
+                    "clusters": {
+                        "cols": ["label", "member_count"],
+                        "rows": [["core", 4]],
+                    },
+                },
+            )
         return _envelope(
             {
                 "cols": ["qn", "label"],
@@ -160,6 +170,62 @@ async def test_forwarded_call_resolves_explicit_rc_version(registry: SnapshotReg
 
     assert upstream.calls[0][1]["project"] == "vllm-kb-vllm-ascend-0.23.0"
     assert "version" not in upstream.calls[0][1]
+
+
+@pytest.mark.asyncio
+async def test_new_checklist_tools_bind_snapshot_and_request_structured_format(
+    registry: SnapshotRegistry,
+) -> None:
+    upstream = FakeUpstream()
+    adapter = Adapter(registry, upstream)
+
+    search = await adapter.handle(
+        _call(
+            "search_code",
+            {
+                "project": VLLM_ASCEND_PROJECT,
+                "version": "v0.23.0",
+                "pattern": "DispatchFFNCombine",
+                "mode": "full",
+            },
+        ),
+    )
+    architecture = await adapter.handle(
+        _call(
+            "get_architecture",
+            {
+                "project": VLLM_ASCEND_PROJECT,
+                "version": "v0.23.0",
+                "aspects": ["clusters"],
+            },
+        ),
+    )
+
+    assert upstream.calls == [
+        (
+            "search_code",
+            {
+                "project": "vllm-kb-vllm-ascend-0.23.0",
+                "pattern": "DispatchFFNCombine",
+                "mode": "full",
+                "format": "json",
+            },
+        ),
+        (
+            "get_architecture",
+            {
+                "project": "vllm-kb-vllm-ascend-0.23.0",
+                "aspects": ["clusters"],
+                "format": "json",
+            },
+        ),
+    ]
+    assert search["result"]["structuredContent"]["rows"] == [
+        {"qn": "pkg.result", "label": "Function"},
+    ]
+    assert architecture["result"]["structuredContent"]["clusters"] == [
+        {"label": "core", "member_count": 4},
+    ]
 
 
 @pytest.mark.asyncio
@@ -252,9 +318,9 @@ async def test_tool_and_json_rpc_validation(registry: SnapshotRegistry) -> None:
     unavailable = await adapter.handle(
         _call("search_graph", {"project": VLLM_PROJECT, "version": "1.0.0"}),
     )
-    extra_tool = await adapter.handle(_call("search_code", {"project": VLLM_PROJECT}))
+    extra_tool = await adapter.handle(_call("get_code_snippet", {"project": VLLM_PROJECT}))
 
     assert invalid["error"]["code"] == -32600
     assert unknown_method["error"]["code"] == -32601
     assert unavailable["result"]["isError"] is True
-    assert extra_tool["result"]["structuredContent"] == {"error": "unknown tool: search_code"}
+    assert extra_tool["result"]["structuredContent"] == {"error": "unknown tool: get_code_snippet"}

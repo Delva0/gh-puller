@@ -1,6 +1,6 @@
 """Implement the scoped vllm-kb MCP contract over versioned graph indexes.
 
-Only tools/list and the four checklist tools are public. Index mutation stays
+Only tools/list and the six checklist tools are public. Index mutation stays
 in the offline prebuild workflow; online calls resolve an already-built graph.
 """
 
@@ -21,7 +21,15 @@ from vllm_kb_adapter.normalize import normalize_result
 from vllm_kb_adapter.snapshots import RegistryError, Snapshot, SnapshotRegistry
 from vllm_kb_adapter.upstream import MCPUpstream, structured_content, tool_error_text
 
-CHECKLIST_TOOLS = ("search_graph", "trace_path", "detect_changes", "query_graph")
+CHECKLIST_TOOLS = (
+    "search_graph",
+    "search_code",
+    "trace_path",
+    "query_graph",
+    "get_architecture",
+    "detect_changes",
+)
+_JSON_FORMAT_TOOLS = frozenset(("search_graph", "search_code", "trace_path", "query_graph", "get_architecture"))
 _IMPACT_CEILING = 5000
 _MAX_CHANGED_FILES = 128
 _MAX_DEPTH = 10
@@ -93,7 +101,8 @@ class Adapter:
         forwarded = dict(arguments)
         forwarded.pop("version", None)
         forwarded["project"] = snapshot.index_name
-        forwarded["format"] = "json"
+        if name in _JSON_FORMAT_TOOLS:
+            forwarded["format"] = "json"
         result = await self.upstream.call_tool(name, forwarded)
         return normalize_result(name, result)
 

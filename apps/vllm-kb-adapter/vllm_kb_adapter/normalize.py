@@ -22,12 +22,14 @@ def normalize_result(tool: str, result: dict[str, Any]) -> dict[str, Any]:
     if data is None:
         return result
     normalized = deepcopy(data)
-    if tool == "search_graph":
+    if tool in {"search_graph", "search_code"}:
         normalized = _normalize_search(normalized)
     elif tool == "trace_path":
         normalized = _normalize_trace(normalized)
     elif tool == "query_graph" and _is_table(normalized):
         normalized["rows"] = _table_rows(normalized)
+    elif tool == "get_architecture":
+        normalized = _normalize_architecture(normalized)
     envelope = dict(result)
     text = json.dumps(normalized, ensure_ascii=False, separators=(",", ":"))
     envelope["content"] = [{"type": "text", "text": text}]
@@ -41,12 +43,14 @@ def _normalize_search(data: dict[str, Any]) -> dict[str, Any]:
         data["rows"] = _table_rows(data)
     elif isinstance(data.get("groups"), list):
         data["rows"] = _flatten_grouped_table(data)
-    semantic = data.get("semantic_results")
-    if isinstance(semantic, dict):
-        if _is_table(semantic):
-            semantic["rows"] = _table_rows(semantic)
-        elif isinstance(semantic.get("groups"), list):
-            semantic["rows"] = _flatten_grouped_table(semantic)
+    for key in ("semantic_results", "raw_matches"):
+        nested = data.get(key)
+        if not isinstance(nested, dict):
+            continue
+        if _is_table(nested):
+            nested["rows"] = _table_rows(nested)
+        elif isinstance(nested.get("groups"), list):
+            nested["rows"] = _flatten_grouped_table(nested)
     return data
 
 
@@ -57,6 +61,13 @@ def _normalize_trace(data: dict[str, Any]) -> dict[str, Any]:
             data[key] = _flatten_grouped_table(value)
     if "next_cursor" in data and "next" not in data:
         data["next"] = data["next_cursor"]
+    return data
+
+
+def _normalize_architecture(data: dict[str, Any]) -> dict[str, Any]:
+    for key, value in data.items():
+        if isinstance(value, dict) and _is_table(value):
+            data[key] = _table_rows(value)
     return data
 
 
