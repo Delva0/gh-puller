@@ -56,6 +56,7 @@ _QUOTA_RESET_JITTER_SECONDS = 5
 _TRANSIENT_DELAYS = (1, 2, 4, 8, 16, 30)
 _TRANSPORT_RESET_ATTEMPTS = len(_TRANSIENT_DELAYS)
 _LIMIT_RECHECK_SECONDS = 30
+_CORE_AUX_RESOURCE = "core_aux"
 
 
 class _Transport(StrEnum):
@@ -345,7 +346,6 @@ class GitHubAPI:
         params: Mapping[str, Any] | None = None,
         page_observer: Callable[[int], None] | None = None,
         primary_wait: bool,
-        resource: str = "core",
     ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
         query = dict(params or {})
         query.setdefault("per_page", 100)
@@ -360,7 +360,6 @@ class GitHubAPI:
                     "GET",
                     str(page["url"]),
                     request_headers=headers,
-                    resource=resource,
                     primary_wait=primary_wait,
                 )
                 if response.status_code != 304:
@@ -389,14 +388,12 @@ class GitHubAPI:
                     key,
                     page_observer,
                     primary_wait=primary_wait,
-                    resource=resource,
                 )
 
         response = await self._request(
             "GET",
             path,
             params=query,
-            resource=resource,
             primary_wait=primary_wait,
         )
         return await self._paginate_response(
@@ -404,7 +401,6 @@ class GitHubAPI:
             key,
             page_observer,
             primary_wait=primary_wait,
-            resource=resource,
         )
 
     async def _paginate_response(
@@ -414,7 +410,6 @@ class GitHubAPI:
         page_observer: Callable[[int], None] | None,
         *,
         primary_wait: bool,
-        resource: str,
     ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
         items: list[dict[str, Any]] = []
         pages: list[dict[str, Any]] = []
@@ -437,7 +432,6 @@ class GitHubAPI:
             response = await self._request(
                 "GET",
                 next_url,
-                resource=resource,
                 primary_wait=primary_wait,
             )
         sizes = [int(page["size"]) for page in pages]
@@ -797,7 +791,6 @@ class GitHubAPI:
                 previous=previous,
                 cache=cache,
                 primary_wait=wait_primary,
-                resource="reactions",
             )
             return GitHubResource(value, _Transport.REST, value, updated)
 
@@ -821,7 +814,7 @@ class GitHubAPI:
             rest,
             graphql,
             rest_cached=cache is not None,
-            rest_resource="reactions",
+            rest_resource=_CORE_AUX_RESOURCE,
         )
 
     async def compare_commits(
@@ -1321,6 +1314,7 @@ class GitHubAPI:
         resource: str = "core",
         primary_wait: bool = True,
     ) -> httpx.Response:
+        resource = _rate_resource(path, resource)
         transient_attempt = 0
         transport_attempt = 0
         secondary_attempt = 0
@@ -1668,6 +1662,16 @@ class GitHubAPI:
         if "retry-after" in response.headers:
             return True
         return "rate limit" in response.text.lower() or "abuse detection" in response.text.lower()
+
+
+def _rate_resource(path: str, default: str) -> str:
+    """Map REST routes that GitHub accounts in a distinct core-header window."""
+    if default != "core":
+        return default
+    endpoint = path.partition("?")[0].rstrip("/")
+    if endpoint.endswith(("/reactions", "/requested_reviewers")):
+        return _CORE_AUX_RESOURCE
+    return default
 
 
 def _decode_page(response: httpx.Response) -> list[dict[str, Any]]:

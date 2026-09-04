@@ -1288,23 +1288,23 @@ async def test_quota_progress_keeps_rest_and_graphql_buckets() -> None:
 
 
 @pytest.mark.asyncio
-async def test_rest_reactions_keep_their_effective_quota_separate_from_core() -> None:
+async def test_auxiliary_rest_routes_keep_their_effective_quota_separate_from_core() -> None:
     clock = Clock(_T0)
     progress = []
     core_reset = int((_T0 + timedelta(seconds=2)).timestamp())
-    reactions_reset = int((_T0 + timedelta(hours=2)).timestamp())
+    auxiliary_reset = int((_T0 + timedelta(hours=2)).timestamp())
 
     def handler(request: httpx.Request) -> httpx.Response:
-        reaction = request.url.path.endswith("/reactions")
+        auxiliary = request.url.path.endswith(("/reactions", "/requested_reviewers"))
         return httpx.Response(
             200,
             headers={
                 "x-ratelimit-limit": "5000",
-                "x-ratelimit-remaining": "4900" if reaction else "0",
-                "x-ratelimit-reset": str(reactions_reset if reaction else core_reset),
+                "x-ratelimit-remaining": "4899" if auxiliary else "0",
+                "x-ratelimit-reset": str(auxiliary_reset if auxiliary else core_reset),
                 "x-ratelimit-resource": "core",
             },
-            json=[] if reaction else {"ok": True},
+            json=[] if request.url.path.endswith("/reactions") else {"ok": True},
             request=request,
         )
 
@@ -1326,14 +1326,18 @@ async def test_rest_reactions_keep_their_effective_quota_separate_from_core() ->
             previous=None,
             cache=None,
         )
+        reviewers = await api.get_json(
+            "/repos/acme/widgets/pulls/7/requested_reviewers",
+        )
     finally:
         await client.aclose()
 
     assert result.value == []
+    assert reviewers == {"ok": True}
     assert clock.sleeps == []
     assert progress[-1].quotas == (
         RateQuota("core", 5_000, 0, _T0 + timedelta(seconds=2)),
-        RateQuota("reactions", 5_000, 4_900, _T0 + timedelta(hours=2)),
+        RateQuota("core_aux", 5_000, 4_899, _T0 + timedelta(hours=2)),
     )
 
 
