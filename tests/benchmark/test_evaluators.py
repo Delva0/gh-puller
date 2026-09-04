@@ -1,9 +1,8 @@
-"""benchmark evaluator 迁移后的本地测试(零网络 / 零 token)。
+"""Verify benchmark evaluators without network access or paid tokens.
 
-两个评测器本体是半抽象基类,这里用最小子类挂接扩展点,并把后端调用
-(ClaudeCode.result / httpx)全部置换为假实现:
-- claude judge:成功路径(result → coerce)与降级路径(RuntimeError / JSON 解析失败);
-- llm judge:HTTP 成功、nudge 重试(第二次追加提示)、耗尽降级;并断言请求体逐字节直连一致。
+Minimal subclasses provide the abstract extension points. Fake ClaudeCode and HTTP
+backends cover successful coercion, failure degradation, retry nudges, and exact
+request payload forwarding.
 """
 
 import asyncio
@@ -22,7 +21,7 @@ from gh_puller.benchmark.evaluators import ClaudeEvaluator, LLMEvaluator
 
 @pytest_asyncio.fixture(autouse=True)
 async def _monitor_cleanup():
-    """评测器走真实 OpenAI.result/ClaudeCode.result:撤 ws/otel;文件落盘默认重定向(conftest tmp)。"""
+    """Clear monitoring endpoints after evaluator calls use the real result wrappers."""
     yield
     agent.configure(ws_urls=[], otel_urls=[])
     await asyncio.sleep(0.01)
@@ -48,7 +47,7 @@ class _MiniLLM(LLMEvaluator):
 
 
 # ---------------------------------------------------------------------------
-# Claude 评测器
+# Claude evaluator
 # ---------------------------------------------------------------------------
 
 GOOD_VERDICT = '{"dimensions": {"code_essence": 8}, "overall": 7, "reason": "ok"}'
@@ -72,7 +71,7 @@ async def test_claude_judge_success(monkeypatch):
     judge = _MiniClaude()
     r = await judge.evaluate("q", "ref", "ans")
     assert r["overall"] == 7
-    assert calls == [("", None, "judge:claude"), ("", "judge q", "")]  # 会话名在 session();载荷在 result()
+    assert calls == [("", None, "judge:claude"), ("", "judge q", "")]  # Session owns the name; result owns the payload.
 
 
 @pytest.mark.asyncio
@@ -99,7 +98,7 @@ async def test_claude_judge_degrades_on_error_and_bad_json(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# LLM 评测器
+# LLM evaluator
 # ---------------------------------------------------------------------------
 
 
@@ -115,7 +114,7 @@ class _FakeResponse:
 
 
 class _FakeSSERes:
-    """形似流式响应:把预设响应整体包成一条 SSE delta(llm result 内部走流式端点)。"""
+    """Wrap a complete canned response in one SSE delta for the streaming adapter."""
 
     def __init__(self, resp):
         self._resp = resp
@@ -124,16 +123,16 @@ class _FakeSSERes:
         pass
 
     async def aiter_lines(self):
-        # 预设响应是完整形式(message.content)→ 包成一条 delta(适配器只读 delta.content)
+        # The adapter consumes delta content, while fixtures store complete messages.
         content = self._resp.json()["choices"][0]["message"]["content"]
         yield "data: " + json.dumps({"choices": [{"delta": {"content": content}}]})
         yield "data: [DONE]"
 
 
 class _FakeHttpClient:
-    """形似 httpx.AsyncClient 的假客户端:捕获请求体,按 index 返回预设响应。"""
+    """Capture request bodies and return canned responses like httpx.AsyncClient."""
 
-    posts: ClassVar[list[tuple[str, dict, dict]]] = []  # 类级共享桶(测试整体替换后逐请求追加)
+    posts: ClassVar[list[tuple[str, dict, dict]]] = []  # Each test replaces this shared request log.
     responses: ClassVar[list[_FakeResponse]] = []
 
     def __init__(self, timeout=None):
@@ -145,11 +144,11 @@ class _FakeHttpClient:
     async def __aexit__(self, *exc):
         return False
 
-    async def post(self, url, json, headers, timeout=None):  # noqa: ASYNC109 - 与 httpx.post 同形,timeout 名属契约
+    async def post(self, url, json, headers, timeout=None):  # noqa: ASYNC109 - Match the httpx contract.
         _FakeHttpClient.posts.append((url, json, headers))
         return _FakeHttpClient.responses.pop(0)
 
-    def stream(self, method, url, json, headers, timeout=None):  # 同步(与 httpx 同形:返回 async CM)
+    def stream(self, method, url, json, headers, timeout=None):  # Return an async context manager like httpx.
         type(self).posts.append((url, json, headers))
         resp = type(self).responses.pop(0)
 
@@ -181,14 +180,14 @@ async def test_llm_judge_success(monkeypatch):
     assert r["overall"] == 7
     url, body, headers = posts[0]
     assert url == "http://j/chat/completions"
-    # body 与 payload 逐字节一致(+result 内部流式抽取注入 stream=True)
+    # The result wrapper adds only the stream flag to the forwarded payload.
     assert body == {"model": "m", "messages": [{"role": "user", "content": "q"}], "stream": True}
     assert headers["Authorization"].startswith("Bearer")
 
 
 @pytest.mark.asyncio
 async def test_llm_judge_retry_nudge_then_success(monkeypatch):
-    """首次解析失败 → 第二次调用追加 nudge 提示后成功。"""
+    """Append the retry nudge after the first parse failure, then succeed."""
     posts = _fake_httpx(monkeypatch)
     _FakeHttpClient.responses = [
         _FakeResponse({"choices": [{"message": {"content": "garbage"}}]}),
@@ -213,4 +212,4 @@ async def test_llm_judge_exhausted_degrades(monkeypatch):
     judge = _MiniLLM(url="http://j", model="m")
     r = await judge.evaluate("q", "ref", "ans")
     assert r["overall"] == 0 and "评测失败" in r["reason"]
-    assert len(posts) == 2  # 耗尽后降级,不再发第三次请求
+    assert len(posts) == 2  # Exhaustion degrades without issuing a third request.

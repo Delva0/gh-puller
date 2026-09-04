@@ -1,16 +1,14 @@
-"""wiki 任务 runtime 包装(server/tasks.py)的本地测试。
+"""Test the WebUI wiki-task runtime without model calls.
 
-不调 Claude agent(不依赖 API key / CLI):
-- 环境变量要求:ANTHROPIC_API_KEY 不设;DEEPWIKI_ROOT 指向临时目录(见 tests/conftest.py)。
-- 覆盖:调度机(join 去重/缓存胜/续跑恢复/按 target 隔离)、主流程(索引→结构→页面→
-  成品缓存,离线:生成函数全部 monkeypatch 或缓存文件预置)、页级并发与错误占位。
-- 引擎契约/纯函数/生成协议测试仍在根 tests/test_deepwiki.py。
+The suite covers task joining, cache precedence, resume recovery, target isolation,
+page concurrency, placeholder failures, and the index-to-cache workflow. Generation
+functions are patched or satisfied by prewritten cache files, and ``tests/conftest.py``
+routes artifacts to a temporary root. Engine-level contracts live in the root
+``tests/deepwiki`` suite.
 
-patch 约定:tasks 自身模块全局(tasks.generate_repo_wiki / tasks._WIKI_TASK_TTL_SECONDS /
-tasks._generate_page_with_retry / tasks._WIKI_PAGE_CONCURRENCY / tasks.determine_structure
-等经门面 import 的引擎函数)与 tasks.registry.* 直指 server;引擎 patch 位点为其
-属主子模块(deepwiki.wiki._produce_file / 主流程函数);建图 patch 位点在 generators 模块
-(generators._run_index);空选型 = 引擎内建 cc(缺省生成器已迁 webui 边界,不读 env)。
+Patch facade-bound functions through ``tasks``, engine-owned generation through
+``deepwiki.wiki``, and indexing through ``generators``. An empty target selects the
+engine's built-in CC generator.
 """
 
 import asyncio
@@ -42,7 +40,7 @@ import generators
 import tasks
 
 # ---------------------------------------------------------------------------
-# 测试辅助(与根 tests 同名拷贝;根保留一份供缓存 IO 原语测试用)
+# Test helpers
 # ---------------------------------------------------------------------------
 
 
@@ -73,12 +71,12 @@ def _make_request(owner: str, repo: str) -> dict:
 
 
 def _digest_of(choice: "dict | None") -> str:
-    """选型 dict → 稳定摘要(测试与实现共用一个函数)。"""
+    """Return the stable generator digest shared with production code."""
     return generator_digest((choice or {}).get("generator"), (choice or {}).get("generator_config"))
 
 
 def _proj(request) -> str:
-    """散装参数测试辅助:请求的 repo 键(type_owner_repo)。"""
+    """Return the repository key represented by a request mapping."""
     return deepwiki.repo_key_of(request["type"], request["owner"], request["repo"])
 
 
@@ -95,12 +93,12 @@ _STRUCT_XML = """<wiki_structure>
 
 
 # ---------------------------------------------------------------------------
-# 主流程编排(离线)。
+# Offline workflow orchestration
 # ---------------------------------------------------------------------------
 
 
 def test_pending_pages_subtracts_done():
-    """纯函数:按结构顺序去掉已完成页;done 含不存在 id 时原样返回。"""
+    """Remove completed pages in structure order and ignore unknown completed IDs."""
     structure = _make_structure(["p1", "p2", "p3"])
     assert [p.id for p in tasks._pending_pages(structure, {"p1": _make_page("p1")})] == ["p2", "p3"]
     assert tasks._pending_pages(structure, {p.id: _make_page(p.id) for p in structure.pages}) == []
@@ -109,7 +107,7 @@ def test_pending_pages_subtracts_done():
 
 @pytest.mark.asyncio
 async def test_generate_pages_concurrency_bounded(monkeypatch):
-    """页级并发:Semaphore 调用时读模块全局,并发=4 时同时至多 4 个在途页。"""
+    """Read the page concurrency limit at call time and cap in-flight work at four."""
     active = 0
     max_active = 0
 
@@ -134,15 +132,16 @@ async def test_generate_pages_concurrency_bounded(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# 调度机(join/缓存胜/续跑/按 target 隔离)
+# Scheduling, cache precedence, resume, and target isolation
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
 async def test_registry_resume_restores_task(monkeypatch):
-    """同仓库再次提交:命中落盘状态 → resumed=True,复用结构/进度恢复;state 快照胜出。
+    """Restore structure and progress from a persisted snapshot on resubmission.
 
-    提交明文凭证入请求、落盘状态剥离(仅公开 target),续跑时合并当前提交凭证。
+    Persisted public target fields take precedence, while credentials come from the
+    current submission and never enter the snapshot.
     """
     structure = _make_structure(["p1", "p2", "p3"])
     state = {
@@ -168,9 +167,9 @@ async def test_registry_resume_restores_task(monkeypatch):
 
     key = f"local_resume-io_demo@{digest}"
     fresh = _make_request("resume-io", "demo")
-    fresh["comprehensive"] = False  # 与首次不一致:落盘快照应胜出
+    fresh["comprehensive"] = False  # The persisted request must take precedence.
     fresh["target"] = {"generator": "llm", "generator_config": {
-        "provider": "openai", "model": "m1",  # 公开部分与落盘快照同轨(digest 匹配)
+        "provider": "openai", "model": "m1",  # Public fields match the snapshot digest.
         "api_key": "sk-live-1", "base_url": "https://custom/v1"}}
     try:
         res = await tasks.registry.submit(tasks.WikiTask.from_wiki_request(fresh))
@@ -183,7 +182,7 @@ async def test_registry_resume_restores_task(monkeypatch):
         assert task.pages_done == 2
         assert task.submitted_at == 9876543210
         assert task.request["comprehensive"] is True
-        # 续跑合并凭证:公开部分取自落盘快照,凭证来自当前提交(object 类)
+        # Resume combines persisted public fields with current object-target credentials.
         assert task.request["target"]["generator_config"]["api_key"] == "sk-live-1"
         assert task.request["target"]["generator_config"]["base_url"] == "https://custom/v1"
         assert task.request["target"]["generator_config"]["provider"] == "openai"
@@ -192,14 +191,15 @@ async def test_registry_resume_restores_task(monkeypatch):
     finally:
         await tasks.registry.remove(key)
         await delete_resume_state("resume-io", "demo", "local", "en", digest=digest)
-        await asyncio.sleep(0.25)  # 让 TTL 移除计时器自然结束,避免挂起的任务告警
+        await asyncio.sleep(0.25)  # Let TTL cleanup finish without pending-task warnings.
 
 
 @pytest.mark.asyncio
 async def test_resume_isolated_by_target(monkeypatch):
-    """续跑按公开 target 摘要隔离:同 repo 切 generator(如 cc → llm)即换状态文件。
+    """Isolate resume snapshots by the public target digest.
 
-    旧快照不复活;新目标全新一代(不进同一队列)。
+    Changing generators creates a fresh task instead of reviving or joining another
+    target's snapshot.
     """
     state = {
         "version": 1,
@@ -211,7 +211,7 @@ async def test_resume_isolated_by_target(monkeypatch):
         "submitted_at": 424242,
         "error": None,
     }
-    digest_cc = generator_digest(None, None)  # 空 target → env 缺省 cc
+    digest_cc = generator_digest(None, None)  # An empty target selects the CC default.
     assert await write_resume_state("gen-switch", "demo", "local", "en", state, digest=digest_cc) is True
 
     async def fake_generate(task):
@@ -221,7 +221,7 @@ async def test_resume_isolated_by_target(monkeypatch):
     monkeypatch.setattr(tasks, "_WIKI_TASK_TTL_SECONDS", 0.2)
     key_cc = f"local_gen-switch_demo@{digest_cc}"
     try:
-        # 同 target(env 缺省 cc)提交:命中旧快照 → 续跑
+        # Resubmitting the same default target resumes its snapshot.
         res_ok = await tasks.registry.submit(
             tasks.WikiTask.from_wiki_request(_make_request("gen-switch", "demo")),
         )
@@ -231,7 +231,7 @@ async def test_resume_isolated_by_target(monkeypatch):
         assert task_ok.status == TaskStatus.COMPLETED
         await tasks.registry.remove(key_cc)
 
-        # 显式 llm target:新摘要 → 全新一代;cc 状态文件仍在(按目标隔离共存)
+        # An explicit LLM target starts fresh while the CC snapshot remains isolated.
         res = await tasks.registry.submit(
             tasks.WikiTask.from_wiki_request(
                 {**_make_request("gen-switch", "demo"), "target": {"generator": "llm"}},
@@ -240,10 +240,10 @@ async def test_resume_isolated_by_target(monkeypatch):
         assert res.created is True
         assert res.resumed is False
         cc_state_path = resume_state_path("gen-switch", "demo", "local", "en", digest=digest_cc)
-        assert os.path.exists(cc_state_path)  # noqa: ASYNC240 - 测试内同步盘操作,开销极小
+        assert os.path.exists(cc_state_path)  # noqa: ASYNC240 - Tiny synchronous test I/O.
         key_llm = "local_gen-switch_demo@" + generator_digest(
             "llm", None)
-        # 任务键 = repo 键 + target 摘要(与 cc 槽位隔离)
+        # A target digest namespaces each repository task slot.
         task = tasks.registry.get(key_llm)
         assert task.key != key_cc
         await task.task
@@ -253,14 +253,15 @@ async def test_resume_isolated_by_target(monkeypatch):
         await tasks.registry.remove("local_gen-switch_demo@" + generator_digest(
             "llm", None))
         await delete_resume_state("gen-switch", "demo", "local", "en", digest=digest_cc)
-        await asyncio.sleep(0.25)  # 让 TTL 移除计时器自然结束,避免挂起的任务告警
+        await asyncio.sleep(0.25)  # Let TTL cleanup finish without pending-task warnings.
 
 
 @pytest.mark.asyncio
 async def test_cache_hit_respects_target(monkeypatch, tmp_path):
-    """成品缓存按公开 target 身份校验:同轨(generator + generator_config 整体)才命中。
+    """Match completed caches against the complete public target identity.
 
-    换 generator(同 repo)即另一份缓存,不否定旧成品、全新重新生成。
+    A generator change starts a new cache generation without invalidating the existing
+    artifact for the other target.
     """
     cfg = tmp_path / "settings.json"
     cfg.write_text("{}", encoding="utf-8")
@@ -289,7 +290,7 @@ async def test_cache_hit_respects_target(monkeypatch, tmp_path):
     monkeypatch.setattr(tasks, "_WIKI_TASK_TTL_SECONDS", 0.2)
     key_cc = f"local_gen-cache_demo@{digest_cc}"
     try:
-        # 同轨(同 config_path):缓存命中,不运行
+        # The same configuration path identifies a cache hit without execution.
         res_ok = await tasks.registry.submit(
             tasks.WikiTask.from_wiki_request(
                 {**_make_request("gen-cache", "demo"), "target": cc_target},
@@ -299,7 +300,7 @@ async def test_cache_hit_respects_target(monkeypatch, tmp_path):
         assert res_ok.status == TaskStatus.COMPLETED
         assert calls == []
 
-        # 换 target(llm):新摘要 → 不命中,重新生成;旧 cc 成品不被复用也不被删除
+        # The LLM target misses and regenerates without reusing or deleting the CC cache.
         res = await tasks.registry.submit(
             tasks.WikiTask.from_wiki_request(
                 {**_make_request("gen-cache", "demo"),
@@ -308,7 +309,7 @@ async def test_cache_hit_respects_target(monkeypatch, tmp_path):
         )
         assert res.from_cache is False
         assert res.created is True
-        # llm 任务走自己摘要的注册表槽位(cc 键无新任务)
+        # The LLM task occupies its own digest-scoped registry slot.
         assert tasks.registry.get(key_cc) is None
         task_llm = tasks.registry.get("local_gen-cache_demo@" + generator_digest(
             "llm", None))
@@ -321,17 +322,17 @@ async def test_cache_hit_respects_target(monkeypatch, tmp_path):
         await tasks.registry.remove("local_gen-cache_demo@" + generator_digest(
             "llm", None))
         await delete_wiki_cache("gen-cache", "demo", "local", "en", digest=digest_cc)
-        await asyncio.sleep(0.25)  # 让 TTL 移除计时器自然结束,避免挂起的任务告警
+        await asyncio.sleep(0.25)  # Let TTL cleanup finish without pending-task warnings.
 
 
 # ---------------------------------------------------------------------------
-# 生成器管道(离线:缓存文件预置 / 执行全 monkeypatch)
+# Offline generator pipeline with prewritten caches and patched execution
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
 async def test_determine_structure_single_pipeline(monkeypatch):
-    """结构确定 = 单一主流程函数(tasks 经门面 import 的绑定;失败上抛使任务 FAILED)。"""
+    """Use one facade-bound structure function and propagate failures to the task."""
     calls = []
 
     async def fake_determine(**kwargs):
@@ -344,12 +345,12 @@ async def test_determine_structure_single_pipeline(monkeypatch):
 
     await tasks._determine_structure(task, _prepared(), None)
     assert calls == ["determine"]
-    assert task.default_branch == "main"  # 结构确定时记录分支
+    assert task.default_branch == "main"  # Structure resolution records the branch.
 
 
 @pytest.mark.asyncio
 async def test_determine_structure_skips_when_file_exists(monkeypatch):
-    """结构续跑:structure.md 已存在则直接解析,不启动生成器。"""
+    """Parse an existing structure file during resume without starting a generator."""
     request = _make_request("cc-struct", "demo")
     struct_path = _generator_cache_structure_path(
         _proj(request), request["target"].get("generator"), request["target"].get("generator_config"),
@@ -390,7 +391,7 @@ async def test_registry_shutdown_cancels_owned_tasks():
 
 @pytest.mark.asyncio
 async def test_determine_structure_calls_generator_no_inline(tmp_path, monkeypatch):
-    """结构走生成器并读回文件;提示词不内联任何文件内容,仓库由生成器自读。"""
+    """Generate and read the structure file without embedding repository contents."""
     (tmp_path / "src").mkdir()
     (tmp_path / "src" / "a.py").write_text("SECRET_CODE_BODY", encoding="utf-8")
     (tmp_path / "README.md").write_text("SECRET_README_BODY", encoding="utf-8")
@@ -405,7 +406,7 @@ async def test_determine_structure_calls_generator_no_inline(tmp_path, monkeypat
         captured["prompt"] = prompt
         captured["run_id"] = run_id
         Path(out_path).parent.mkdir(parents=True, exist_ok=True)
-        Path(out_path).write_text(_STRUCT_XML, encoding="utf-8")  # noqa: ASYNC240 - 测试桩内同步盘操作,开销极小
+        Path(out_path).write_text(_STRUCT_XML, encoding="utf-8")  # noqa: ASYNC240 - Tiny synchronous stub I/O.
         return _STRUCT_XML
 
     monkeypatch.setattr(deepwiki.wiki, "_produce_file", fake_produce)
@@ -417,15 +418,15 @@ async def test_determine_structure_calls_generator_no_inline(tmp_path, monkeypat
         language=request["language"], run_id=_proj(request),
     )
     assert [p.id for p in s.pages] == ["p1", "p2", "p3"]
-    assert "<file_tree>" not in captured["prompt"]  # 文件树/README 不再内联进提示词
+    assert "<file_tree>" not in captured["prompt"]  # Prompts do not inline the tree or README.
     assert "SECRET_CODE_BODY" not in captured["prompt"]
     assert "SECRET_README_BODY" not in captured["prompt"]
-    assert captured["run_id"] == _proj(request)  # 任务级会话组关联
+    assert captured["run_id"] == _proj(request)  # The task key groups the generator session.
 
 
 @pytest.mark.asyncio
 async def test_page_skips_when_file_exists(monkeypatch):
-    """页续跑:page_<id>.md 已存在则直接读回(文件为权威),不启动生成器。"""
+    """Treat an existing page file as authoritative during resume."""
     request = _make_request("cc-page", "demo")
     out = _generator_cache_page_path(
         _proj(request), "p1", request["target"].get("generator"), request["target"].get("generator_config"),
@@ -445,7 +446,7 @@ async def test_page_skips_when_file_exists(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_page_calls_generator_and_reads_file(monkeypatch):
-    """页走生成器落盘后读回;提示词只给路径并含写盘指令,不内联文件内容。"""
+    """Read a generated page from disk without embedding file contents in its prompt."""
     request = _make_request("cc-page2", "demo")
     captured = {}
 
@@ -453,7 +454,7 @@ async def test_page_calls_generator_and_reads_file(monkeypatch):
         captured["prompt"] = prompt
         captured["run_id"] = run_id
         Path(out_path).parent.mkdir(parents=True, exist_ok=True)
-        Path(out_path).write_text("## PB-REAL\n\ncontent\n", encoding="utf-8")  # noqa: ASYNC240 - 测试桩内同步盘操作,开销极小
+        Path(out_path).write_text("## PB-REAL\n\ncontent\n", encoding="utf-8")  # noqa: ASYNC240 - Tiny synchronous stub I/O.
         return "## PB-REAL\n\ncontent\n"
 
     monkeypatch.setattr(deepwiki.wiki, "_produce_file", fake_produce)
@@ -467,7 +468,7 @@ async def test_page_calls_generator_and_reads_file(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_generate_page_with_retry_exhausted_writes_placeholder(tmp_path, monkeypatch):
-    """重试耗尽:返回错误占位页且缓存文件落盘(占位文本不经格式化,续跑可跳过)。"""
+    """Persist an unformatted error placeholder after retries are exhausted."""
     request = _make_request("retry-io", "demo")
 
     async def boom(*args, **kwargs):
@@ -513,9 +514,10 @@ async def test_generate_page_with_retry_does_not_restart_after_cancellation(monk
 
 @pytest.mark.asyncio
 async def test_generate_repo_wiki_assemble_and_resume(tmp_path, monkeypatch):
-    """端到端(离线):structure/全部页文件预落盘 → 零生成器调用完成。
+    """Complete the offline workflow entirely from prewritten structure and page files.
 
-    JSON 正文与文件一致、taskstate 清理、页面完成数按文件水合。
+    Cached JSON mirrors the files, resume state is removed, and page progress is
+    hydrated from disk.
     """
     repo_dir = tmp_path / "repo"
     repo_dir.mkdir()
@@ -526,12 +528,12 @@ async def test_generate_repo_wiki_assemble_and_resume(tmp_path, monkeypatch):
         "repo": "demo", "language": "en", "target": {}, "token": None,
         "comprehensive": True,
     }
-    # 预置假索引(与 generators._cbm_cache_dir/project_name 命名对齐:索引 db 即 ready)
+    # A project-named database marks the fake index as ready.
     fake_repo = Repo(str(repo_dir), "local")
     cdir = generators._cbm_cache_dir()
     cdir.mkdir(parents=True, exist_ok=True)
     (cdir / f"{generators.project_name(fake_repo)}.db").touch()
-    # 预置结构 + 全部页面缓存文件(路径指纹按运行形态:runtime_config 注入面;同循环内一致)
+    # Runtime configuration participates consistently in every prewritten cache path.
     gc = generators.runtime_config(
         request["target"].get("generator"), request["target"].get("generator_config"), repo=fake_repo,
     )
@@ -558,11 +560,11 @@ async def test_generate_repo_wiki_assemble_and_resume(tmp_path, monkeypatch):
     assert cache_path.exists()
     data = json.loads(cache_path.read_text(encoding="utf-8"))
     assert set(data["generated_pages"]) == {"p1", "p2", "p3"}
-    assert data["generator"] == "cc"  # 成品缓存只记公开 target,无凭证字段
-    assert data["generator_config"] == {}  # 身份 = generator_config 原样(公开形态;无凭证)
+    assert data["generator"] == "cc"  # Completed caches store only the public target.
+    assert data["generator_config"] == {}  # Public generator configuration defines identity.
     assert "api_key" not in json.dumps(data) and "base_url" not in json.dumps(data)
     for pid in ("p1", "p2", "p3"):
         assert f"{pid}-REAL" in data["generated_pages"][pid]["content"]
     resume_path = Path(resume_state_path("local", "demo", "local", "en", digest=digest))
-    assert not resume_path.exists()  # noqa: ASYNC240 - 测试内同步盘操作,开销极小
+    assert not resume_path.exists()  # noqa: ASYNC240 - Tiny synchronous test I/O.
     assert task.pages_done == 3

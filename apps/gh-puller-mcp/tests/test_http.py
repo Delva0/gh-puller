@@ -20,6 +20,7 @@ import time
 import urllib.request
 from pathlib import Path
 
+import pytest
 from starlette.testclient import TestClient
 
 from gh_puller_mcp.server import ServerConfig, build_server
@@ -135,6 +136,7 @@ def post(port: int, path: str, payload: dict) -> dict:
         return json.loads(response.read())
 
 
+@pytest.mark.integration
 def test_http_cli_smoke_real_socket(shim) -> None:
     port = free_port()
     env = os.environ.copy()

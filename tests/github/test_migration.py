@@ -1,4 +1,4 @@
-"""Verify local archive migration, resumability, and public Git/SQL identities."""
+"""Test local archive migration, resumability, and public Git/SQL identities."""
 
 from __future__ import annotations
 

@@ -1,4 +1,4 @@
-"""验证 PR Git 对象归档的完整差异、固定引用与仓库绑定。"""
+"""Verify complete PR Git diffs, pinned references, and repository binding."""
 
 from __future__ import annotations
 

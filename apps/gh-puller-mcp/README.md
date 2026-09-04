@@ -67,10 +67,14 @@ No tool declares `outputSchema` (deliberate: the C server omits it to keep `stru
 ## Tests
 
 ```bash
-uv --directory apps/gh-puller-mcp run pytest -q   # unit + wire e2e + oracle parity vs the real binary
+uv --directory apps/gh-puller-mcp run pytest -q
+GH_PULLER_MCP_ORACLE_BINARY=/path/to/codebase-memory-mcp \
+GH_PULLER_MCP_C_SOURCE=/path/to/mcp.c \
+uv --directory apps/gh-puller-mcp run pytest -q -m e2e
 ```
 
-`tests/test_manifest.py` also re-extracts the tool table from the C source (when the checkout exists) and asserts byte equality against the baked-in manifest.
+The default command is deterministic and excludes process-level E2E tests. The E2E command compares the Python server
+with the configured oracle binary and re-extracts the tool table from the explicitly pinned C source.
 
 ## Manual smoke
 

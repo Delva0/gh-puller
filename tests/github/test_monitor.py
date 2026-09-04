@@ -1,4 +1,4 @@
-"""Verify read-only rendering of managed GitHub writer progress."""
+"""Test read-only rendering of managed GitHub writer progress."""
 
 from __future__ import annotations
 

@@ -1,7 +1,8 @@
 """Opt-in real-backend tests for every Agent adapter and its persisted event flow.
 
-Set ``GH_PULLER_REAL_TESTS=1`` to run tests that may spawn local agents or consume
-provider tokens. Each test writes monitor data only under its pytest temporary path.
+Run ``GH_PULLER_REAL_TESTS=1 uv run pytest -q -m real tests/real`` for checks that may
+spawn local agents or consume provider tokens. Monitor data stays under pytest's
+temporary path.
 """
 import asyncio
 import json
@@ -22,10 +23,13 @@ MODEL_CODEX = "gpt-5.6-luna"
 # The OpenAI-compatible route defaults to the low-cost DeepSeek endpoint.
 LLM_BASE_URL = os.environ.get("OPENAI_BASE_URL", "https://api.deepseek.com/v1")
 
-pytestmark = pytest.mark.skipif(
-    os.environ.get("GH_PULLER_REAL_TESTS") != "1",
-    reason="real backends require GH_PULLER_REAL_TESTS=1 and may consume tokens",
-)
+pytestmark = [
+    pytest.mark.real,
+    pytest.mark.skipif(
+        os.environ.get("GH_PULLER_REAL_TESTS") != "1",
+        reason="real backends require GH_PULLER_REAL_TESTS=1 and may consume tokens",
+    ),
+]
 
 
 @pytest_asyncio.fixture(autouse=True)

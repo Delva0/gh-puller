@@ -1,4 +1,4 @@
-"""Verify database-scoped systemd writer installation and control."""
+"""Test database-scoped systemd writer installation and control."""
 
 from __future__ import annotations
 

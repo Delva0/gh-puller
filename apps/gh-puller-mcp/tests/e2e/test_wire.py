@@ -17,6 +17,8 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = pytest.mark.e2e
+
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 INIT_PARAMS = {

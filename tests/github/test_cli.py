@@ -1,4 +1,4 @@
-"""GitHub CLI 的固定间隔调度、恢复、输出与信号退出测试。"""
+"""Verify GitHub CLI interval scheduling, recovery, output, and signal shutdown."""
 
 from __future__ import annotations
 

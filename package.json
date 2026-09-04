@@ -2,5 +2,10 @@
   "name": "gh-puller",
   "version": "0.1.0",
   "private": true,
-  "packageManager": "pnpm@11.22.0"
+  "packageManager": "pnpm@11.22.0",
+  "scripts": {
+    "test": "pnpm run test:python && pnpm run test:web",
+    "test:python": "uv run pytest -q && uv --directory apps/agent-monitor/server run pytest -q && uv --directory apps/deepwiki-webui/server run pytest -q && uv --directory apps/gh-puller-mcp run pytest -q && uv --directory apps/vllm-kb-adapter run pytest -q",
+    "test:web": "pnpm --filter agent-monitor --filter deepwiki-webui --filter @gh-puller/ui test"
+  }
 }

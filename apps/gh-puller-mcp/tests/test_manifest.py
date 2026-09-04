@@ -1,21 +1,13 @@
-"""Manifest fidelity tests: the verbatim codebase-memory-mcp surface data.
+"""Test the baked codebase-memory-mcp manifest with deterministic assertions.
 
-Self-contained assertions cover every field. A gate test (@C_SOURCE_AVAILABLE)
-re-extracts the TOOLS table and instructions from the C source byte-for-byte and
-compares against the baked-in manifest, so any transcription drift is caught.
+The opt-in source parity contract lives in ``e2e/test_manifest_source.py``.
 """
 
 from __future__ import annotations
 
 import json
-import re
-from pathlib import Path
-
-import pytest
 
 from gh_puller_mcp import manifest
-
-C_SOURCE = Path("/home/delva/projects/codebase-memory-mcp/src/mcp/mcp.c")
 
 EXPECTED_ORDER = [
     "index_repository",
@@ -125,74 +117,3 @@ def test_prompts_static_surface() -> None:
     assert explore.template.startswith('Explore project "%s" to answer: %s\n\n')
     assert review.template.startswith('Review change impact in project "%s" for: %s\n\n')
     assert review.template.endswith("do not modify files.")
-
-
-# ── byte-level re-extraction gate against the C source (this machine only) ──
-
-_LIT = re.compile(r'"((?:\\.|[^"\\])*)"')
-
-
-def _unescape(s: str) -> str:
-    out: list[str] = []
-    i = 0
-    while i < len(s):
-        c = s[i]
-        if c == "\\" and i + 1 < len(s):
-            nxt = s[i + 1]
-            out.append({"n": "\n", "t": "\t", "r": "\r", '"': '"', "\\": "\\"}.get(nxt, "\\" + nxt))
-            i += 2
-        else:
-            out.append(c)
-            i += 1
-    return "".join(out)
-
-
-def _extract_tools(source_text: str) -> list[dict[str, str]]:
-    lines = source_text.splitlines()
-    body = "\n".join(lines[375:701])
-    m = re.search(r"TOOLS\[\]\s*=\s*\{(.*)\};", body, re.DOTALL)
-    assert m, "TOOLS table not found"
-    tools = []
-    for entry in re.split(r"}\s*,\s*[\n\r]+\s*\{", m.group(1)):
-        text = entry.strip()
-        if not text:
-            continue
-        name_m = re.match(r'\{?\s*"([a-z_][a-z_0-9]*)"\s*,\s*', text)
-        assert name_m, text[:80]
-        name = name_m.group(1)
-        lits = [_unescape(x) for x in _LIT.findall(text[name_m.end():])]
-        schema_i = next((i for i, s in enumerate(lits) if s.startswith('{"type"')), None)
-        assert schema_i is not None, name
-        tools.append({
-            "name": name,
-            "title": lits[0],
-            "description": "".join(lits[1:schema_i]),
-            "input_schema": "".join(lits[schema_i:]),
-        })
-    return tools
-
-
-def _extract_instructions(source_text: str) -> dict[str, str]:
-    out: dict[str, str] = {}
-    for key, name in [("all", "MCP_SERVER_INSTRUCTIONS"), ("analysis", "MCP_ANALYSIS_SERVER_INSTRUCTIONS"),
-                      ("scout", "MCP_SCOUT_SERVER_INSTRUCTIONS")]:
-        pattern = rf'static const char {name}\[\]\s*=\s*((?:"(?:\\.|[^"\\])*"\s*)+);'
-        m = re.search(pattern, source_text, re.DOTALL)
-        assert m, name
-        out[key] = "".join(_unescape(x) for x in _LIT.findall(m.group(1)))
-    return out
-
-
-@pytest.mark.skipif(not C_SOURCE.exists(), reason="C source checkout not present")
-def test_manifest_matches_c_source() -> None:
-    source_text = C_SOURCE.read_text(encoding="utf-8")
-    tools = _extract_tools(source_text)
-    assert [t["name"] for t in tools] == [t.name for t in manifest.TOOLS]
-    for fresh, baked in zip(tools, manifest.TOOLS, strict=True):
-        assert fresh["title"] == baked.title, fresh["name"]
-        assert fresh["description"] == baked.description, fresh["name"]
-        assert fresh["input_schema"] == baked.input_schema, fresh["name"]
-    instructions = _extract_instructions(source_text)
-    assert instructions["all"] == manifest.INSTRUCTIONS_ALL
-    assert instructions["analysis"] == manifest.INSTRUCTIONS_ANALYSIS
-    assert instructions["scout"] == manifest.INSTRUCTIONS_SCOUT

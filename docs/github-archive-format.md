@@ -6,8 +6,8 @@
 - [gh_puller/github/git_store.py](../gh_puller/github/git_store.py)
 - [gh_puller/github/store.py](../gh_puller/github/store.py)
 - [gh_puller/github/v8/migrate.py](../gh_puller/github/v8/migrate.py)
-- [tests/test_github_git_store.py](../tests/test_github_git_store.py)
-- [tests/test_github_migration.py](../tests/test_github_migration.py)
+- [tests/github/test_git_store.py](../tests/github/test_git_store.py)
+- [tests/github/test_migration.py](../tests/github/test_migration.py)
 </details>
 
 # GitHub archive format
@@ -46,7 +46,7 @@ cannot remove an object already referenced by a committed observation. A failed 
 may leave additional safe Git objects or refs, but public SQLite readers continue to
 see the last committed run.
 
-Sources: [gh_puller/github/git_store.py](../gh_puller/github/git_store.py); [gh_puller/github/store.py](../gh_puller/github/store.py); [tests/test_github_migration.py](../tests/test_github_migration.py)
+Sources: [gh_puller/github/git_store.py](../gh_puller/github/git_store.py); [gh_puller/github/store.py](../gh_puller/github/store.py); [tests/github/test_migration.py](../tests/github/test_migration.py)
 
 ## SQLite contract
 
@@ -78,7 +78,7 @@ rows and two PR ref paths. An actual hash collision cannot be represented as two
 objects under one Git object ID; normal identical-SHA reuse means the commit object
 is byte-identical.
 
-Sources: [gh_puller/github/v8/schema.py](../gh_puller/github/v8/schema.py); [gh_puller/github/archive_format.py](../gh_puller/github/archive_format.py); [tests/test_github_puller.py](../tests/test_github_puller.py)
+Sources: [gh_puller/github/v8/schema.py](../gh_puller/github/v8/schema.py); [gh_puller/github/archive_format.py](../gh_puller/github/archive_format.py); [tests/github/](../tests/github/)
 
 ## Git contract
 
@@ -113,7 +113,7 @@ already in the managed upstream object graph. This avoids redundant transfer for
 ordinary merge while retaining original histories for squash, rebase, open, and
 closed-unmerged PRs.
 
-Sources: [gh_puller/github/archive_format.py](../gh_puller/github/archive_format.py); [gh_puller/github/git_store.py](../gh_puller/github/git_store.py); [tests/test_github_git_store.py](../tests/test_github_git_store.py)
+Sources: [gh_puller/github/archive_format.py](../gh_puller/github/archive_format.py); [gh_puller/github/git_store.py](../gh_puller/github/git_store.py); [tests/github/test_git_store.py](../tests/github/test_git_store.py)
 
 ## PR history evidence
 
@@ -138,7 +138,7 @@ evidence to invent an exact original-to-rewritten commit mapping.
 | `empty_tree` | Base and head have unrelated histories, so `comparison_ref` is an empty tree. |
 | `unavailable` | A required object was unreachable and no complete code comparison is claimed. |
 
-Sources: [gh_puller/github/git_store.py](../gh_puller/github/git_store.py); [gh_puller/github/archive_format.py](../gh_puller/github/archive_format.py); [tests/test_github_git_store.py](../tests/test_github_git_store.py)
+Sources: [gh_puller/github/git_store.py](../gh_puller/github/git_store.py); [gh_puller/github/archive_format.py](../gh_puller/github/archive_format.py); [tests/github/test_git_store.py](../tests/github/test_git_store.py)
 
 ## Native downstream access
 
@@ -193,7 +193,7 @@ Native `log`, `show`, `diff`, `blame`, `merge-base`, branching, worktrees, and n
 object plumbing remain available. Git LFS payloads, submodule repositories, external
 attachments, and unavailable remote objects are outside the bare object's contents.
 
-Sources: [gh_puller/github/git_store.py](../gh_puller/github/git_store.py); [tests/test_github_git_store.py](../tests/test_github_git_store.py)
+Sources: [gh_puller/github/git_store.py](../gh_puller/github/git_store.py); [tests/github/test_git_store.py](../tests/github/test_git_store.py)
 
 ## Format migration
 
@@ -212,4 +212,4 @@ Migration fails immediately if another writer holds the archive lock. Its order 
 permanent Git refs, SQLite payload and relation transaction, validation, then cleanup
 of writer-private source refs. A retry safely completes an interrupted attempt.
 
-Sources: [gh_puller/github/v8/migrate.py](../gh_puller/github/v8/migrate.py); [tests/test_github_migration.py](../tests/test_github_migration.py); [gh_puller/github/__main__.py](../gh_puller/github/__main__.py)
+Sources: [gh_puller/github/v8/migrate.py](../gh_puller/github/v8/migrate.py); [tests/github/test_migration.py](../tests/github/test_migration.py); [gh_puller/github/__main__.py](../gh_puller/github/__main__.py)

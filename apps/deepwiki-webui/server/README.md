@@ -32,4 +32,4 @@ uv --directory apps/deepwiki-webui/server run uvicorn app:app --port 8001
   gh-puller-mcp 工具桌由本目录 `generators.py` 经 `runtime_config` 注入 generator_config
   (引擎 adapter 只做白名单透传);工具桌档位 scout(只读正查面),变更面(index_repository 等)
   仅服务器进程内建图使用
-- 契约测试：`uv run pytest`（`tests/test_app.py`，不调用 Claude agent）
+- 契约测试：`uv --directory apps/deepwiki-webui/server run pytest`（`tests/test_app.py`，不调用 Claude agent）

@@ -7,8 +7,8 @@ The following source packages and files were used as context for this document:
 - [apps/agent-monitor/server/](../apps/agent-monitor/server/)
 - [apps/agent-monitor/web/](../apps/agent-monitor/web/)
 - [tests/test_event_taxonomy.py](../tests/test_event_taxonomy.py)
-- [tests/test_agent.py](../tests/test_agent.py)
-- [tests/test_agent_real.py](../tests/test_agent_real.py)
+- [tests/agent/](../tests/agent/)
+- [tests/real/test_agent_backends.py](../tests/real/test_agent_backends.py)
 
 </details>
 
@@ -81,7 +81,7 @@ means that a schema exists but is unavailable. `mcp` keeps one MCP contribution 
 and `skill_list` records the catalog exposed to the Agent. Transport commands, credentials,
 and other launch configuration remain Agent configuration rather than Context.
 
-Sources: [gh_puller/agent/](../gh_puller/agent/); [tests/test_event_taxonomy.py](../tests/test_event_taxonomy.py); [tests/test_agent.py](../tests/test_agent.py)
+Sources: [gh_puller/agent/](../gh_puller/agent/); [tests/test_event_taxonomy.py](../tests/test_event_taxonomy.py); [tests/agent/](../tests/agent/)
 
 ## Inference Items
 
@@ -114,7 +114,7 @@ A request or response may report an effective model or provider when the backend
 exposes it. Neither field is required, and a single Agent session may use different
 models across requests.
 
-Sources: [gh_puller/agent/](../gh_puller/agent/); [tests/test_event_taxonomy.py](../tests/test_event_taxonomy.py); [tests/test_agent.py](../tests/test_agent.py)
+Sources: [gh_puller/agent/](../gh_puller/agent/); [tests/test_event_taxonomy.py](../tests/test_event_taxonomy.py); [tests/agent/](../tests/agent/)
 
 ## Semantic markers
 
@@ -142,7 +142,7 @@ async with agent.session(session_name="example"):
     second = await agent.result("Which word did I ask you to remember?")
 ```
 
-Sources: [gh_puller/agent/](../gh_puller/agent/); [tests/test_agent.py](../tests/test_agent.py); [tests/test_agent_real.py](../tests/test_agent_real.py)
+Sources: [gh_puller/agent/](../gh_puller/agent/); [tests/agent/](../tests/agent/); [tests/real/test_agent_backends.py](../tests/real/test_agent_backends.py)
 
 ## Monitor flow
 
@@ -178,14 +178,15 @@ uv --directory apps/agent-monitor/server run uvicorn app:app --port 8765
 ```
 
 ```bash
-uv run pytest -q tests/test_event_taxonomy.py tests/test_agent.py
+uv run pytest -q tests/test_event_taxonomy.py tests/agent
 uv --directory apps/agent-monitor/server run pytest -q
 pnpm --dir apps/agent-monitor/web typecheck
 pnpm --dir apps/agent-monitor/web test
 ```
 
-Set `GH_PULLER_REAL_TESTS=1` to include `tests/test_agent_real.py`. Histories retain
+Run `GH_PULLER_REAL_TESTS=1 uv run pytest -q -m real tests/real` to include real
+backend checks. Histories retain
 prompts, outputs, tool data, and non-credential configuration; protect the history
 directory and WebSocket endpoint accordingly.
 
-Sources: [tests/test_event_taxonomy.py](../tests/test_event_taxonomy.py); [tests/test_agent.py](../tests/test_agent.py); [tests/test_agent_real.py](../tests/test_agent_real.py); [apps/agent-monitor/server/](../apps/agent-monitor/server/); [apps/agent-monitor/web/](../apps/agent-monitor/web/)
+Sources: [tests/test_event_taxonomy.py](../tests/test_event_taxonomy.py); [tests/agent/](../tests/agent/); [tests/real/test_agent_backends.py](../tests/real/test_agent_backends.py); [apps/agent-monitor/server/](../apps/agent-monitor/server/); [apps/agent-monitor/web/](../apps/agent-monitor/web/)

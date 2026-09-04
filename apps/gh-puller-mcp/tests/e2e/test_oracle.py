@@ -1,9 +1,8 @@
-"""Oracle parity test: the Python re-implementation vs the real codebase-memory-mcp server.
+"""Compare the Python implementation with a real codebase-memory-mcp server.
 
-Runs unconditionally against the real binary on this machine (spawned as its
-stdio MCP server next to `python -m gh_puller_mcp`), fed the same newline-framed
-request sequence and compared SEMANTICALLY (dict-equality after normalizing the
-documented SDK divergences).
+The selected e2e test starts both stdio servers, sends the same newline-framed request
+sequence, and compares their payloads semantically after normalizing documented SDK
+divergences. Supply the oracle through ``GH_PULLER_MCP_ORACLE_BINARY`` or ``PATH``.
 
 The wire serialization of the mcp SDK puts keys in its own (alphabetical) order
 and advertises an extra `experimental` capability, so byte equality with the
@@ -24,7 +23,9 @@ from pathlib import Path
 
 import pytest
 
-BINARY = shutil.which("codebase-memory-mcp") or "/home/delva/.local/bin/codebase-memory-mcp"
+pytestmark = pytest.mark.e2e
+
+BINARY = os.environ.get("GH_PULLER_MCP_ORACLE_BINARY") or shutil.which("codebase-memory-mcp")
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 _INIT_PARAMS = {
@@ -33,8 +34,14 @@ _INIT_PARAMS = {
     "clientInfo": {"name": "oracle-probe", "version": "0.0.1"},
 }
 
-if not Path(BINARY).exists():  # fail loudly, never skip: the oracle IS the parity acceptance
-    pytest.fail(f"codebase-memory-mcp 二进制不可用: {BINARY}")
+@pytest.fixture(scope="module")
+def oracle_binary() -> str:
+    if not BINARY:
+        pytest.fail("set GH_PULLER_MCP_ORACLE_BINARY or install codebase-memory-mcp")
+    path = Path(BINARY)
+    if not path.is_file():
+        pytest.fail(f"GH_PULLER_MCP_ORACLE_BINARY is not a file: {path}")
+    return str(path)
 
 
 class MCPLineClient:
@@ -110,8 +117,8 @@ def _replicate(profile: str | None) -> list[str]:
 
 
 @pytest.mark.parametrize("profile", [None, "analysis", "scout"])
-def test_oracle_sequence(profile: str | None) -> None:
-    real = MCPLineClient([BINARY] + (["--tool-profile", profile] if profile else []))
+def test_oracle_sequence(profile: str | None, oracle_binary: str) -> None:
+    real = MCPLineClient([oracle_binary] + (["--tool-profile", profile] if profile else []))
     ours = MCPLineClient(_replicate(profile))
     try:
         # ── handshake ──

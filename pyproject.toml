@@ -82,4 +82,9 @@ dev = [
 # 约定单独跑);裸 `uv run pytest` 会连带收集 apps/archive/playground 的 tests,
 # 触发 pytest_plugins 非顶层等 collection 错误。
 [tool.pytest.ini_options]
+addopts = "-m 'not real'"
+markers = [
+    "integration: deterministic tests crossing process, socket, or storage boundaries",
+    "real: opt-in tests requiring local agents, credentials, or paid providers",
+]
 testpaths = ["tests"]

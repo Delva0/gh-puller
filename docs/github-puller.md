@@ -3,11 +3,11 @@
 
 - [gh_puller/github/](../gh_puller/github/)
 - [scripts/github-puller-daemon.sh](../scripts/github-puller-daemon.sh)
-- [tests/test_github_git_store.py](../tests/test_github_git_store.py)
-- [tests/test_github_puller.py](../tests/test_github_puller.py)
-- [tests/test_github_cli.py](../tests/test_github_cli.py)
-- [tests/test_github_daemon.py](../tests/test_github_daemon.py)
-- [tests/test_github_monitor.py](../tests/test_github_monitor.py)
+- [tests/github/test_git_store.py](../tests/github/test_git_store.py)
+- [tests/github/](../tests/github/)
+- [tests/github/test_cli.py](../tests/github/test_cli.py)
+- [tests/github/test_daemon.py](../tests/github/test_daemon.py)
+- [tests/github/test_monitor.py](../tests/github/test_monitor.py)
 </details>
 
 # GitHub raw fact archive
@@ -70,7 +70,7 @@ incremental signal. The detection boundary is defined below.
 The pull protocol does not round or interpret T. UTC boundary alignment belongs only
 to the configurable CLI scheduler.
 
-Sources: [gh_puller/github/](../gh_puller/github/); [tests/test_github_puller.py](../tests/test_github_puller.py); [tests/test_github_cli.py](../tests/test_github_cli.py)
+Sources: [gh_puller/github/](../gh_puller/github/); [tests/github/](../tests/github/); [tests/github/test_cli.py](../tests/github/test_cli.py)
 
 ## Incremental observation and parent membership
 
@@ -99,7 +99,7 @@ their expected page hit rate is poor. Cross-run reuse instead occurs at the comp
 Issue/PR record and its atomically paired HTTP validators, where identity remains
 well defined.
 
-Sources: [gh_puller/github/](../gh_puller/github/); [tests/test_github_puller.py](../tests/test_github_puller.py)
+Sources: [gh_puller/github/](../gh_puller/github/); [tests/github/](../tests/github/)
 
 Let W be the preceding completed observation watermark. Every warm pass reads three
 incremental streams:
@@ -130,7 +130,7 @@ reuses all completed Issue/PR tasks. A repeated number with the same immutable I
 kind, and creation time is idempotent. A conflicting immutable identity aborts the
 pass instead of silently replacing one object with another.
 
-Sources: [gh_puller/github/](../gh_puller/github/); [tests/test_github_puller.py](../tests/test_github_puller.py)
+Sources: [gh_puller/github/](../gh_puller/github/); [tests/github/](../tests/github/)
 
 The puller deliberately does not run a warm full traversal or infer absence from
 counts. Its observed-change contract is:
@@ -157,7 +157,7 @@ truth” means downstream jobs need only the archive pair to reproduce every fac
 code object the puller successfully observed; it does not upgrade an unobservable
 GitHub state into an observed fact.
 
-Sources: [gh_puller/github/](../gh_puller/github/); [tests/test_github_puller.py](../tests/test_github_puller.py)
+Sources: [gh_puller/github/](../gh_puller/github/); [tests/github/](../tests/github/)
 
 ## Resource transport and detectable consistency
 
@@ -192,7 +192,7 @@ the reported headers, rather than HTTP-attempt count, remain authoritative. Grap
 connection queries can cost more than one point, and their returned remaining value
 feeds the next routing decision.
 
-Sources: [gh_puller/github/](../gh_puller/github/); [tests/test_github_puller.py](../tests/test_github_puller.py)
+Sources: [gh_puller/github/](../gh_puller/github/); [tests/github/](../tests/github/)
 
 Authenticated ETag requests that return 304 do not consume primary REST quota; they
 remain HTTP attempts and therefore remain included in the run's `requests` counter.
@@ -229,7 +229,7 @@ when that commit is reachable locally. Deleted or force-pushed history therefore
 remains an observed API fact without becoming a dangling Git ref or a fabricated code
 snapshot.
 
-Sources: [gh_puller/github/](../gh_puller/github/); [tests/test_github_git_store.py](../tests/test_github_git_store.py)
+Sources: [gh_puller/github/](../gh_puller/github/); [tests/github/test_git_store.py](../tests/github/test_git_store.py)
 
 When the three discovery streams each fit on one page and nothing changed, an
 authenticated warm pass makes three REST requests, and the cost is independent of
@@ -272,7 +272,7 @@ immediately, so one slow parent neither holds the concurrency window nor prevent
 later work from becoming crash-recoverable. Public version iteration remains
 deterministic by run, parent number, and intra-parent observation order.
 
-Sources: [gh_puller/github/](../gh_puller/github/); [tests/test_github_puller.py](../tests/test_github_puller.py)
+Sources: [gh_puller/github/](../gh_puller/github/); [tests/github/](../tests/github/)
 
 ## Progress is out of band
 
@@ -320,7 +320,7 @@ pretending that object progress moved; `retry_wait` distinguishes API network an
 backoff from quota exhaustion. An `error` event retains both the exception class and
 its message, so `status` exposes the object and invariant that stopped the writer.
 
-Sources: [gh_puller/github/](../gh_puller/github/); [tests/test_github_puller.py](../tests/test_github_puller.py); [tests/test_github_cli.py](../tests/test_github_cli.py)
+Sources: [gh_puller/github/](../gh_puller/github/); [tests/github/](../tests/github/); [tests/github/test_cli.py](../tests/github/test_cli.py)
 
 ## The archive pair is the fact boundary
 
@@ -397,7 +397,7 @@ outside the archive even when an API response still names their SHA.
 A tombstone records a directly observed parent absence without discarding its last
 record. Archive schema 7 pairs this resource set with record schema 6.
 
-Sources: [gh_puller/github/](../gh_puller/github/); [tests/test_github_puller.py](../tests/test_github_puller.py); [tests/test_github_git_store.py](../tests/test_github_git_store.py)
+Sources: [gh_puller/github/](../gh_puller/github/); [tests/github/](../tests/github/); [tests/github/test_git_store.py](../tests/github/test_git_store.py)
 
 ## Offline page reconstruction boundary
 
@@ -425,7 +425,7 @@ classifying bug-fix, draft, or work-in-progress records from labels and text. �
 developer”, “bug fix”, and similar conclusions remain downstream definitions rather
 than facts asserted by the puller.
 
-Sources: [gh_puller/github/](../gh_puller/github/); [tests/test_github_puller.py](../tests/test_github_puller.py)
+Sources: [gh_puller/github/](../gh_puller/github/); [tests/github/](../tests/github/)
 
 ## Offline reads
 
@@ -480,7 +480,7 @@ are archive identifiers, so consumers need neither the remote PR branch nor GitH
 For `comparison_kind="unavailable"`, inspect `unavailable_commits` and only use the
 base/head refs that are present; no complete changed-file set can be derived.
 
-Sources: [gh_puller/github/](../gh_puller/github/); [tests/test_github_puller.py](../tests/test_github_puller.py); [tests/test_github_git_store.py](../tests/test_github_git_store.py)
+Sources: [gh_puller/github/](../gh_puller/github/); [tests/github/](../tests/github/); [tests/github/test_git_store.py](../tests/github/test_git_store.py)
 
 ## Run once or on a UTC-aligned interval
 
@@ -524,7 +524,7 @@ observations that were never made. A restart finishes the database-wide pending 
 before calculating another target. A lifecycle lock rejects a second scheduler for
 the same database; `SIGINT` and `SIGTERM` cancel the active operation.
 
-Sources: [gh_puller/github/](../gh_puller/github/); [tests/test_github_cli.py](../tests/test_github_cli.py)
+Sources: [gh_puller/github/](../gh_puller/github/); [tests/github/test_cli.py](../tests/github/test_cli.py)
 
 ## Unattended Linux service
 
@@ -623,7 +623,7 @@ Supplying an `OWNER/REPO` or a database without a managed unit to `status`, `log
 `start`, `stop`, or `restart` fails immediately instead of following an unrelated
 hash unit.
 
-Sources: [scripts/github-puller-daemon.sh](../scripts/github-puller-daemon.sh); [gh_puller/github/](../gh_puller/github/); [tests/test_github_monitor.py](../tests/test_github_monitor.py)
+Sources: [scripts/github-puller-daemon.sh](../scripts/github-puller-daemon.sh); [gh_puller/github/](../gh_puller/github/); [tests/github/test_monitor.py](../tests/github/test_monitor.py)
 
 The service can be installed while a foreground pull owns the archive lock. It reads
 the pending key, waits behind that writer, and then takes one of two equivalent paths:
@@ -649,7 +649,7 @@ sequenceDiagram
 The archive lock prevents simultaneous writers during takeover, while durable staging
 and the idempotency key avoid restarting completed bundles in a cold pull from zero.
 
-Sources: [gh_puller/github/](../gh_puller/github/); [tests/test_github_cli.py](../tests/test_github_cli.py)
+Sources: [gh_puller/github/](../gh_puller/github/); [tests/github/test_cli.py](../tests/github/test_cli.py)
 
 Uninstalling is symmetric and idempotent: it stops and disables the service, removes
 its unit, reloads systemd, and clears the unit's failed state. It deliberately keeps
@@ -660,20 +660,15 @@ checkout, and lock files:
 sudo scripts/github-puller-daemon.sh uninstall archives/vllm.sqlite3
 ```
 
-Sources: [scripts/github-puller-daemon.sh](../scripts/github-puller-daemon.sh); [tests/test_github_daemon.py](../tests/test_github_daemon.py)
+Sources: [scripts/github-puller-daemon.sh](../scripts/github-puller-daemon.sh); [tests/github/test_daemon.py](../tests/github/test_daemon.py)
 
 ## Verify the contract
 
 Run the focused suite and lint from the repository root:
 
 ```bash
-uv run pytest -q \
-  tests/test_github_git_store.py tests/test_github_puller.py tests/test_github_cli.py \
-  tests/test_github_daemon.py tests/test_github_monitor.py
-uvx ruff check \
-  gh_puller/github \
-  tests/test_github_git_store.py tests/test_github_puller.py tests/test_github_cli.py \
-  tests/test_github_daemon.py tests/test_github_monitor.py
+uv run pytest -q tests/github
+uvx ruff check gh_puller/github tests/github
 bash -n scripts/github-puller-daemon.sh
 ```
 
@@ -698,4 +693,4 @@ uninstallation, archive preservation, database-scoped controls, repository-bindi
 rejection, independent writers, service reconciliation, multi-writer status,
 phase-local progress, exact and unknown item counts, and stable watch output.
 
-Sources: [tests/test_github_git_store.py](../tests/test_github_git_store.py); [tests/test_github_puller.py](../tests/test_github_puller.py); [tests/test_github_cli.py](../tests/test_github_cli.py); [tests/test_github_daemon.py](../tests/test_github_daemon.py); [tests/test_github_monitor.py](../tests/test_github_monitor.py)
+Sources: [tests/github/test_git_store.py](../tests/github/test_git_store.py); [tests/github/](../tests/github/); [tests/github/test_cli.py](../tests/github/test_cli.py); [tests/github/test_daemon.py](../tests/github/test_daemon.py); [tests/github/test_monitor.py](../tests/github/test_monitor.py)

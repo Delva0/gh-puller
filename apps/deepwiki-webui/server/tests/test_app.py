@@ -1,18 +1,13 @@
-"""gh_puller.deepwiki 后端契约的 HTTP 端点测试(引擎在 gh_puller,见根 tests/test_deepwiki.py)。
+"""Test HTTP endpoints implementing the gh_puller.deepwiki backend contract.
 
-不调 Claude agent(不依赖 API key / CLI):
-- 环境变量要求:ANTHROPIC_API_KEY 不设;DEEPWIKI_ROOT 指向临时目录(见文件头)。
-- 覆盖:契约端点 smoke(prepare 走 _run_index 假面,断言入参与就绪翻转)、
-  未索引的错误语义(chat 425 / codemap NDJSON error)。
+The engine contract lives under the root ``tests/deepwiki`` suite. These tests avoid
+Claude credentials and CLI calls by replacing index execution and routing DeepWiki
+artifacts to a temporary root before importing the application.
 """
 
 import json
 import os
-import tempfile
 import time
-
-# envs 在模块导入时单点读取 —— 必须在 import gh_puller.deepwiki 前把产物根指向临时目录
-os.environ.setdefault("DEEPWIKI_ROOT", tempfile.mkdtemp(prefix="deepwiki-app-test-"))
 
 from fastapi.testclient import TestClient
 from gh_puller.utils import Repo, TaskStatus
@@ -23,7 +18,7 @@ from app import app as server_app
 
 
 def _write_corpus(root) -> str:
-    """构造最小本地仓库(带 utils 子包,纳入代码 AST 提取)。"""
+    """Create a minimal local repository whose utility module participates in indexing."""
     d = root / "corpus"
     d.mkdir()
     (d / "app.py").write_text(
@@ -39,7 +34,7 @@ def _client():
 
 
 # ---------------------------------------------------------------------------
-# 契约端点 smoke(无仓库时)
+# Contract endpoint smoke checks without a repository
 # ---------------------------------------------------------------------------
 
 
@@ -56,10 +51,10 @@ def test_lang_config():
 
 
 def test_generators_config():
-    """统一 target 配置:注册表直出(generators/default target);凭证不出现。
+    """Expose registry-derived target configuration without credentials.
 
-    generator → generator_config 契约:configKind 分 file(cc/dsh/codex/opencode,
-    configDefault);defaultTarget.generator_config 按默认 generator 的 kind 给出(cc = config_path)。
+    File-backed generators expose ``configKind`` and ``configDefault``. The default
+    target follows the default generator's configuration shape.
     """
     cfg = _client().get("/generators/config").json()
     assert [g["id"] for g in cfg["generators"]] == ["cc", "dsh", "codex", "opencode"]
@@ -69,7 +64,7 @@ def test_generators_config():
     assert by_id["codex"]["configKind"] == "file"
     assert by_id["opencode"]["configKind"] == "file"
     assert by_id["cc"]["configDefault"] is not None  # ~/.claude/settings.json
-    assert by_id["cc"]["providers"] == []  # file 类不再暴露 provider 选择
+    assert by_id["cc"]["providers"] == []  # File-backed generators expose no provider choice.
     assert by_id["codex"]["capability"] == "responses"
     assert by_id["opencode"]["capability"] == "opencode-cli"
     assert by_id["opencode"]["configDefault"] is None
@@ -77,7 +72,7 @@ def test_generators_config():
     assert cfg["providers"] == []
     assert cfg["defaultGenerator"] == "cc"
     assert cfg["defaultTarget"]["generator"] == "cc"
-    # file 类默认 generator → generator_config = {"config_path": ...}
+    # The default file-backed generator supplies its configuration path.
     assert "config_path" in cfg["defaultTarget"]["generator_config"]
     blob = json.dumps(cfg)
     assert "api_key" not in blob and "base_url" not in blob and "KEY" not in blob[:200]
@@ -112,7 +107,7 @@ def test_wiki_cache_empty():
 
 
 def test_wiki_task_submit_and_get_contract(tmp_path, monkeypatch):
-    """POST /wiki/tasks 契约(server registry):created 提交 → 后台调度 → GET 轮询至 completed。"""
+    """Submit a registered task, schedule it, and poll it through completion."""
     async def fake_generate(task):
         task.status = TaskStatus.COMPLETED
 
@@ -137,7 +132,7 @@ def test_wiki_task_submit_and_get_contract(tmp_path, monkeypatch):
     assert got is not None and got.status_code == 200
     assert got.json()["status"] == "completed"
     assert "pages_total" in got.json()
-    time.sleep(0.3)  # 让 TTL 移除计时器自然收尾,不留终端任务
+    time.sleep(0.3)  # Let TTL cleanup finish so no terminal task remains scheduled.
 
 
 def test_wiki_task_submit_invalid_target_400():
@@ -182,7 +177,7 @@ def test_chat_validation_400():
 
 
 def test_codemap_not_indexed_425(tmp_path):
-    """codemap 端点同式守卫(决策:补 _require_indexed;与 chat 425 对称)。"""
+    """Guard the codemap endpoint with the same 425 response as chat."""
     raw = str(tmp_path / "empty_src")
     os.makedirs(raw)
     r = _client().post(
@@ -194,12 +189,12 @@ def test_codemap_not_indexed_425(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# /repo/prepare:本地小仓库索引保障(SSE 事件流 + 索引 db 落盘;建图面经 _run_index 假面)
+# Local repository preparation through SSE and a stubbed index runner
 # ---------------------------------------------------------------------------
 
 
 def test_prepare_local_repo(tmp_path, monkeypatch):
-    """prepare → ensure_index._run_index(index_repository 参数面)→ db 落盘 → ready 翻转。"""
+    """Persist the index database and report readiness after repository preparation."""
     raw = _write_corpus(tmp_path)
     repo = Repo(raw, "local")
     seen = {}
@@ -213,18 +208,18 @@ def test_prepare_local_repo(tmp_path, monkeypatch):
     assert r.status_code == 200
     assert "event: done" in r.text
     assert "data: ok" in r.text
-    # 建图入参 = 仓库克隆路径(fast 建图经 index_repository;源目录零残留)
+    # Indexing receives the repository path and leaves no graph artifacts in the source.
     assert str(seen["repo"].save_path) == os.path.abspath(raw)
     assert (generators._cbm_cache_dir() / f"{generators.project_name(repo)}.db").exists()
     assert not os.path.exists(os.path.join(raw, "graphify-out"))
-    # 索引后就绪探针翻转
+    # The readiness probe changes only after the index database appears.
     assert _client().get(
         "/repo/index/status", params={"repo_url": raw, "type": "local"},
     ).json() == {"ready": True}
 
 
 def test_prepare_idempotent(tmp_path, monkeypatch):
-    """已索引再次 prepare → ready 事件短路,不重跑 _run_index。"""
+    """Short-circuit repeated preparation when the repository is already indexed."""
     raw = _write_corpus(tmp_path)
     c = _client()
 

@@ -26,6 +26,11 @@ dev = [
 ]
 
 [tool.pytest.ini_options]
+addopts = "-m 'not e2e'"
+markers = [
+    "e2e: process-level protocol tests requiring executables or external state",
+    "integration: deterministic tests crossing process, socket, or storage boundaries",
+]
 testpaths = ["tests"]
 pythonpath = ["."]
 

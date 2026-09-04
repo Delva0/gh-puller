@@ -1,9 +1,8 @@
-"""generators._call_tool 的真实客户端形状测试(gh-puller-mcp 真服务器 + 后端 shim)。
+"""Test the real MCP client shape against gh-puller-mcp and a backend shim.
 
-锁住的是 mcp SDK 客户端的调用形态:stdio 短连接 + 显式 initialize + 信封解析
-(isError → RuntimeError / structuredContent 解析)。后端二进制经
-GH_PULLER_MCP_BINARY 指向本文件提供的 shim(与 gh-puller-mcp tests 同式);
-无 uv 环境则跳过(gh-puller-mcp 未装,不属本 app 契约)。
+The contract covers a short-lived stdio connection, explicit initialization, error
+mapping, and structured-content parsing. ``GH_PULLER_MCP_BINARY`` points the server at
+the local shim; environments without uv skip because server installation is external.
 """
 
 import json
@@ -33,7 +32,7 @@ _ERR_ENVELOPE = {
 
 
 def _shim(tmp_path, *, raise_on: str | None = None) -> str:
-    """可执行 Python 脚本冒充 C 二进制(codebase-memory-mcp cli --json <tool>)。"""
+    """Create an executable shim for the codebase-memory JSON CLI."""
     body = textwrap.dedent(f"""
         import json, sys
         tool = sys.argv[-1]
@@ -55,7 +54,7 @@ async def test_call_tool_search_graph_shim(tmp_path, monkeypatch):
         pytest.skip("uv 不可用(gh-puller-mcp 经 uv 启动)")
     monkeypatch.setenv("GH_PULLER_MCP_BINARY", _shim(tmp_path))
     data = await generators._call_mcp_tool("search_graph", {"project": "p", "query": "f"})
-    # 信封 structuredContent 解析 → 工具形状(dict 直出)
+    # The MCP envelope unwraps structured content into the tool result mapping.
     assert data["cols"] == ["qn", "label", "file", "lines", "rank"]
     assert data["rows"][0][2] == "demo.py" and data["rows"][0][3] == "3-7"
 
