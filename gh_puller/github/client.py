@@ -52,6 +52,7 @@ if TYPE_CHECKING:
 _LOG = logging.getLogger(__name__)
 _DEFAULT_ACCEPT = "application/vnd.github.full+json"
 _GRAPHQL_PAGE_SIZE = 100
+_QUOTA_RESET_JITTER_SECONDS = 5
 _TRANSIENT_DELAYS = (1, 2, 4, 8, 16, 30)
 
 
@@ -1425,12 +1426,12 @@ class GitHubAPI:
         attempt: int,
         resource: str,
     ) -> None:
-        wait = self._rate_limit_wait(response, attempt)
+        wait, wait_source = self._rate_limit_wait(response, attempt, resource)
         blocked_until = self._now().timestamp() + wait
         primary = response.headers.get("x-ratelimit-remaining") == "0"
+        bucket = response.headers.get("x-ratelimit-resource", resource)
         async with self._gate_lock:
             if primary:
-                bucket = response.headers.get("x-ratelimit-resource", resource)
                 self._primary_blocked_until[bucket] = max(
                     self._primary_blocked_until.get(bucket, 0.0),
                     blocked_until,
@@ -1440,13 +1441,26 @@ class GitHubAPI:
                     self._secondary_blocked_until,
                     blocked_until,
                 )
-        _LOG.warning("GitHub rate limited %s; retrying in %.1fs", response.url, wait)
         detail = "primary_rate_limit" if primary else "secondary_rate_limit"
+        effective_reset = self._primary_reset(response, resource) if primary else None
+        _LOG.warning(
+            "GitHub %s: resource=%s status=%d remaining=%s reset=%s "
+            "effective_reset=%s retry_after=%s wait_source=%s wait=%.1fs url=%s",
+            detail,
+            bucket,
+            response.status_code,
+            response.headers.get("x-ratelimit-remaining", "-"),
+            response.headers.get("x-ratelimit-reset", "-"),
+            "-" if effective_reset is None else f"{effective_reset:.0f}",
+            response.headers.get("retry-after", "-"),
+            wait_source,
+            wait,
+            response.url,
+        )
         self._emit_progress(wait_seconds=wait, detail=detail)
         await self._sleep(wait)
         async with self._gate_lock:
             if primary:
-                bucket = response.headers.get("x-ratelimit-resource", resource)
                 if self._primary_blocked_until.get(bucket) == blocked_until:
                     self._primary_blocked_until.pop(bucket, None)
             elif self._secondary_blocked_until == blocked_until:
@@ -1455,9 +1469,8 @@ class GitHubAPI:
     def _remember_primary_limit(self, response: httpx.Response, resource: str) -> None:
         if response.headers.get("x-ratelimit-remaining") != "0":
             return
-        try:
-            reset = float(response.headers["x-ratelimit-reset"])
-        except (KeyError, ValueError):
+        reset = self._primary_reset(response, resource)
+        if reset is None:
             return
         bucket = response.headers.get("x-ratelimit-resource", resource)
         self._primary_blocked_until[bucket] = max(
@@ -1474,19 +1487,17 @@ class GitHubAPI:
         if resource is None:
             return
         previous = self._quotas.get(resource)
-        if (
-            previous is not None
-            and reset_at is not None
-            and previous.reset_at is not None
-            and reset_at < previous.reset_at
-        ):
-            return
-        new_window = previous is None or (
-            reset_at is not None and (previous.reset_at is None or reset_at > previous.reset_at)
-        )
-        if new_window:
+        if previous is None:
             self._quotas[resource] = RateQuota(resource, limit, remaining, reset_at)
             return
+        if reset_at is not None and previous.reset_at is not None:
+            reset_delta = (reset_at - previous.reset_at).total_seconds()
+            if reset_delta < -_QUOTA_RESET_JITTER_SECONDS:
+                return
+            if reset_delta > _QUOTA_RESET_JITTER_SECONDS:
+                self._quotas[resource] = RateQuota(resource, limit, remaining, reset_at)
+                return
+            reset_at = max(reset_at, previous.reset_at)
         self._quotas[resource] = RateQuota(
             resource,
             limit if limit is not None else previous.limit,
@@ -1499,6 +1510,16 @@ class GitHubAPI:
             ),
             reset_at if reset_at is not None else previous.reset_at,
         )
+
+    def _primary_reset(self, response: httpx.Response, resource: str) -> float | None:
+        bucket = response.headers.get("x-ratelimit-resource", resource)
+        quota = self._quotas.get(bucket)
+        if quota is not None and quota.remaining == 0 and quota.reset_at is not None:
+            return quota.reset_at.timestamp()
+        try:
+            return float(response.headers["x-ratelimit-reset"])
+        except (KeyError, ValueError):
+            return None
 
     def _emit_progress(
         self,
@@ -1519,25 +1540,27 @@ class GitHubAPI:
         except Exception:
             self._progress = None
 
-    def _rate_limit_wait(self, response: httpx.Response, attempt: int) -> float:
+    def _rate_limit_wait(
+        self,
+        response: httpx.Response,
+        attempt: int,
+        resource: str,
+    ) -> tuple[float, str]:
         retry_after = response.headers.get("retry-after")
         if retry_after:
             try:
-                return max(float(retry_after), 1.0)
+                return max(float(retry_after), 1.0), "retry_after"
             except ValueError:
                 try:
                     retry_at = parsedate_to_datetime(retry_after).astimezone(UTC)
                 except (TypeError, ValueError):
                     pass
                 else:
-                    return max((retry_at - self._now()).total_seconds(), 1.0)
-        reset = response.headers.get("x-ratelimit-reset")
-        if response.headers.get("x-ratelimit-remaining") == "0" and reset:
-            try:
-                return max(float(reset) - self._now().timestamp() + 1, 1.0)
-            except ValueError:
-                pass
-        return min(60 * 2**attempt, 900)
+                    return max((retry_at - self._now()).total_seconds(), 1.0), "retry_after"
+        reset = self._primary_reset(response, resource)
+        if response.headers.get("x-ratelimit-remaining") == "0" and reset is not None:
+            return max(reset - self._now().timestamp() + 1, 1.0), "reset"
+        return min(60 * 2**attempt, 900), "backoff"
 
     @staticmethod
     def _is_rate_limited(response: httpx.Response) -> bool:

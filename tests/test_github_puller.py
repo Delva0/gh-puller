@@ -2673,7 +2673,7 @@ async def test_naive_target_is_rejected_before_archive_creation(tmp_path: Path) 
 
 
 @pytest.mark.asyncio
-async def test_rate_limit_waits_asynchronously() -> None:
+async def test_rate_limit_waits_asynchronously(caplog: pytest.LogCaptureFixture) -> None:
     clock = Clock(_T0)
     progress = []
     responses = [
@@ -2715,6 +2715,57 @@ async def test_rate_limit_waits_asynchronously() -> None:
         ("secondary_rate_limit", 4),
     ]
     assert waits[0].quotas == (RateQuota("core", 5000, 0, _T0 + timedelta(seconds=2)),)
+    assert "primary_rate_limit: resource=core status=403" in caplog.text
+    assert "wait_source=reset wait=3.0s" in caplog.text
+    assert "secondary_rate_limit: resource=core status=429" in caplog.text
+    assert "wait_source=retry_after wait=4.0s" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_primary_limit_uses_the_conservative_jittered_reset() -> None:
+    clock = Clock(_T0)
+    progress = []
+    responses = [
+        (
+            200,
+            {
+                "x-ratelimit-limit": "5000",
+                "x-ratelimit-remaining": "10",
+                "x-ratelimit-reset": str(int(_T0.timestamp()) + 4),
+                "x-ratelimit-resource": "core",
+            },
+        ),
+        (
+            403,
+            {
+                "x-ratelimit-limit": "5000",
+                "x-ratelimit-remaining": "0",
+                "x-ratelimit-reset": str(int(_T0.timestamp()) + 2),
+                "x-ratelimit-resource": "core",
+            },
+        ),
+        (200, {}),
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        status, headers = responses.pop(0)
+        return httpx.Response(status, headers=headers, json={"ok": True}, request=request)
+
+    client = httpx.AsyncClient(
+        base_url="https://api.github.test",
+        transport=httpx.MockTransport(handler),
+    )
+    api = GitHubAPI(client=client, sleep=clock.sleep, now=clock, progress=progress.append)
+    try:
+        await api.get_json("/quota-sample")
+        await api.get_json("/limited")
+    finally:
+        await client.aclose()
+
+    assert clock.sleeps == [5]
+    assert progress[-1].quotas == (
+        RateQuota("core", 5_000, 0, _T0 + timedelta(seconds=4)),
+    )
 
 
 @pytest.mark.asyncio
@@ -4031,6 +4082,43 @@ async def test_concurrent_quota_responses_never_move_backward() -> None:
         await client.aclose()
 
     assert progress[-1].quotas == (RateQuota("core", 5_000, 4_999, _T0 + timedelta(hours=2)),)
+
+
+@pytest.mark.asyncio
+async def test_quota_reset_jitter_keeps_conservative_remaining() -> None:
+    progress = []
+    reset = int((_T0 + timedelta(hours=1)).timestamp())
+    responses = [(3_325, reset), (4_447, reset + 2), (3_317, reset - 1)]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        remaining, response_reset = responses.pop(0)
+        return httpx.Response(
+            200,
+            headers={
+                "x-ratelimit-limit": "5000",
+                "x-ratelimit-remaining": str(remaining),
+                "x-ratelimit-reset": str(response_reset),
+                "x-ratelimit-resource": "core",
+            },
+            json={"ok": True},
+            request=request,
+        )
+
+    client = httpx.AsyncClient(
+        base_url="https://api.github.test",
+        transport=httpx.MockTransport(handler),
+    )
+    api = GitHubAPI(client=client, progress=progress.append)
+    try:
+        await api.get_json("/first")
+        await api.get_json("/later-reset")
+        await api.get_json("/earlier-reset")
+    finally:
+        await client.aclose()
+
+    assert progress[-1].quotas == (
+        RateQuota("core", 5_000, 3_317, datetime.fromtimestamp(reset + 2, UTC)),
+    )
 
 
 @pytest.mark.asyncio
