@@ -32,6 +32,7 @@ _TRANSIENT_FETCH_MARKERS = (
     "could not resolve host",
     "early eof",
     "empty reply from server",
+    "error decoding the received tls packet",
     "failed to connect",
     "gnutls recv error",
     "http/2 stream",

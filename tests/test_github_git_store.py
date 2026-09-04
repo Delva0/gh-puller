@@ -315,7 +315,8 @@ async def test_git_fetch_retries_transient_transport_failures(
             if attempts <= 7:
                 failed_pack.write_bytes(b"incomplete")
                 raise GitStoreError(
-                    "git fetch failed: error: RPC failed; curl 56 GnuTLS recv error (-9)",
+                    "git fetch failed: gnutls_handshake() failed: "
+                    "Error decoding the received TLS packet.",
                 )
         return await real_command(command, **kwargs)
 
