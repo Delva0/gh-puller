@@ -345,6 +345,7 @@ class GitHubAPI:
         params: Mapping[str, Any] | None = None,
         page_observer: Callable[[int], None] | None = None,
         primary_wait: bool,
+        resource: str = "core",
     ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
         query = dict(params or {})
         query.setdefault("per_page", 100)
@@ -359,6 +360,7 @@ class GitHubAPI:
                     "GET",
                     str(page["url"]),
                     request_headers=headers,
+                    resource=resource,
                     primary_wait=primary_wait,
                 )
                 if response.status_code != 304:
@@ -387,12 +389,14 @@ class GitHubAPI:
                     key,
                     page_observer,
                     primary_wait=primary_wait,
+                    resource=resource,
                 )
 
         response = await self._request(
             "GET",
             path,
             params=query,
+            resource=resource,
             primary_wait=primary_wait,
         )
         return await self._paginate_response(
@@ -400,6 +404,7 @@ class GitHubAPI:
             key,
             page_observer,
             primary_wait=primary_wait,
+            resource=resource,
         )
 
     async def _paginate_response(
@@ -409,6 +414,7 @@ class GitHubAPI:
         page_observer: Callable[[int], None] | None,
         *,
         primary_wait: bool,
+        resource: str,
     ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
         items: list[dict[str, Any]] = []
         pages: list[dict[str, Any]] = []
@@ -431,6 +437,7 @@ class GitHubAPI:
             response = await self._request(
                 "GET",
                 next_url,
+                resource=resource,
                 primary_wait=primary_wait,
             )
         sizes = [int(page["size"]) for page in pages]
@@ -790,6 +797,7 @@ class GitHubAPI:
                 previous=previous,
                 cache=cache,
                 primary_wait=wait_primary,
+                resource="reactions",
             )
             return GitHubResource(value, _Transport.REST, value, updated)
 
@@ -809,7 +817,12 @@ class GitHubAPI:
                 raw,
             )
 
-        return await self._either(rest, graphql, rest_cached=cache is not None)
+        return await self._either(
+            rest,
+            graphql,
+            rest_cached=cache is not None,
+            rest_resource="reactions",
+        )
 
     async def compare_commits(
         self,
@@ -1016,7 +1029,11 @@ class GitHubAPI:
                 return payload
             if self._is_rate_limited(response):
                 if response.headers.get("x-ratelimit-remaining") == "0":
-                    self._remember_quota(response, primary_exhausted=True)
+                    self._remember_quota(
+                        response,
+                        "graphql",
+                        primary_exhausted=True,
+                    )
                     self._emit_progress()
                 primary = self._remember_primary_limit(response, "graphql")
                 if not primary_wait and primary:
@@ -1337,7 +1354,7 @@ class GitHubAPI:
             transport_attempt = 0
             rate_limited = response.status_code in {403, 429} and self._is_rate_limited(response)
             primary = rate_limited and response.headers.get("x-ratelimit-remaining") == "0"
-            self._remember_quota(response, primary_exhausted=primary)
+            self._remember_quota(response, resource, primary_exhausted=primary)
             self._emit_progress()
             if rate_limited:
                 primary = self._remember_primary_limit(response, resource)
@@ -1413,12 +1430,13 @@ class GitHubAPI:
         graphql: Callable[[bool], Awaitable[GitHubResource]],
         *,
         rest_cached: bool,
+        rest_resource: str = "core",
     ) -> GitHubResource:
         operations = {
             _Transport.REST: rest,
             _Transport.GRAPHQL: graphql,
         }
-        order = self._transport_order(rest_cached)
+        order = self._transport_order(rest_cached, rest_resource)
         limited: set[_Transport] = set()
         failures: list[GitHubAPIError] = []
         for transport in order:
@@ -1431,31 +1449,34 @@ class GitHubAPI:
         if limited:
             transport = next(
                 transport
-                for transport in self._transport_order(rest_cached)
+                for transport in self._transport_order(rest_cached, rest_resource)
                 if transport in limited
             )
             return await operations[transport](True)
         raise failures[0]
 
-    def _transport_order(self, rest_cached: bool) -> tuple[_Transport, _Transport]:
+    def _transport_order(
+        self,
+        rest_cached: bool,
+        rest_resource: str,
+    ) -> tuple[_Transport, _Transport]:
         if not self._authenticated:
             return _Transport.REST, _Transport.GRAPHQL
         # NOTE: Do not prioritize an earlier reset in isolation. Flexible calls share
         # each quota with transport-only calls whose future demand is unknown here.
-        rest_capacity = self._quota_capacity(_Transport.REST)
+        rest_capacity = self._quota_capacity(rest_resource)
         if rest_cached and rest_capacity > 0:
             return _Transport.REST, _Transport.GRAPHQL
-        graphql_capacity = self._quota_capacity(_Transport.GRAPHQL)
+        graphql_capacity = self._quota_capacity("graphql")
         if rest_capacity > graphql_capacity:
             return _Transport.REST, _Transport.GRAPHQL
         if rest_capacity == graphql_capacity == 0 and self._quota_wait(
-            _Transport.REST,
-        ) < self._quota_wait(_Transport.GRAPHQL):
+            rest_resource,
+        ) < self._quota_wait("graphql"):
             return _Transport.REST, _Transport.GRAPHQL
         return _Transport.GRAPHQL, _Transport.REST
 
-    def _quota_capacity(self, transport: _Transport) -> float:
-        resource = "core" if transport is _Transport.REST else "graphql"
+    def _quota_capacity(self, resource: str) -> float:
         quota = self._quotas.get(resource)
         if quota is None or quota.remaining is None or quota.limit in {None, 0}:
             return 1.0
@@ -1463,8 +1484,7 @@ class GitHubAPI:
             return 1.0
         return quota.remaining / quota.limit
 
-    def _quota_wait(self, transport: _Transport) -> float:
-        resource = "core" if transport is _Transport.REST else "graphql"
+    def _quota_wait(self, resource: str) -> float:
         quota = self._quotas.get(resource)
         if quota is None or quota.reset_at is None:
             return 0.0
@@ -1485,7 +1505,7 @@ class GitHubAPI:
             primary=primary,
         )
         blocked_until = self._now().timestamp() + wait
-        bucket = response.headers.get("x-ratelimit-resource", resource)
+        bucket = resource
         async with self._gate_lock:
             if primary:
                 self._primary_blocked_until[bucket] = max(
@@ -1517,7 +1537,7 @@ class GitHubAPI:
         await self._wait_for_limit(bucket, primary_wait=True, report=False)
 
     def _remember_primary_limit(self, response: httpx.Response, resource: str) -> bool:
-        bucket = response.headers.get("x-ratelimit-resource", resource)
+        bucket = resource
         remaining = _integer_header(response, "x-ratelimit-remaining")
         if remaining is None:
             return False
@@ -1540,6 +1560,7 @@ class GitHubAPI:
     def _remember_quota(
         self,
         response: httpx.Response,
+        resource: str,
         *,
         primary_exhausted: bool = False,
     ) -> None:
@@ -1547,9 +1568,6 @@ class GitHubAPI:
         remaining = _integer_header(response, "x-ratelimit-remaining")
         reset = _integer_header(response, "x-ratelimit-reset")
         reset_at = None if reset is None else datetime.fromtimestamp(reset, UTC)
-        resource = response.headers.get("x-ratelimit-resource")
-        if resource is None:
-            return
         # Quota-free conditional hits can advertise a separate positive window.
         if response.status_code == 304:
             return
@@ -1591,7 +1609,7 @@ class GitHubAPI:
         )
 
     def _primary_reset(self, response: httpx.Response, resource: str) -> float | None:
-        bucket = response.headers.get("x-ratelimit-resource", resource)
+        bucket = resource
         quota = self._quotas.get(bucket)
         if quota is not None and quota.remaining == 0 and quota.reset_at is not None:
             return quota.reset_at.timestamp()

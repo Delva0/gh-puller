@@ -1288,6 +1288,56 @@ async def test_quota_progress_keeps_rest_and_graphql_buckets() -> None:
 
 
 @pytest.mark.asyncio
+async def test_rest_reactions_keep_their_effective_quota_separate_from_core() -> None:
+    clock = Clock(_T0)
+    progress = []
+    core_reset = int((_T0 + timedelta(seconds=2)).timestamp())
+    reactions_reset = int((_T0 + timedelta(hours=2)).timestamp())
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        reaction = request.url.path.endswith("/reactions")
+        return httpx.Response(
+            200,
+            headers={
+                "x-ratelimit-limit": "5000",
+                "x-ratelimit-remaining": "4900" if reaction else "0",
+                "x-ratelimit-reset": str(reactions_reset if reaction else core_reset),
+                "x-ratelimit-resource": "core",
+            },
+            json=[] if reaction else {"ok": True},
+            request=request,
+        )
+
+    client = httpx.AsyncClient(
+        base_url="https://api.github.test",
+        transport=httpx.MockTransport(handler),
+    )
+    api = GitHubAPI(
+        client=client,
+        sleep=clock.sleep,
+        now=clock,
+        progress=progress.append,
+    )
+    try:
+        await api.get_json("/core")
+        result = await api.reactions(
+            "/repos/acme/widgets/issues/7/reactions",
+            None,
+            previous=None,
+            cache=None,
+        )
+    finally:
+        await client.aclose()
+
+    assert result.value == []
+    assert clock.sleeps == []
+    assert progress[-1].quotas == (
+        RateQuota("core", 5_000, 0, _T0 + timedelta(seconds=2)),
+        RateQuota("reactions", 5_000, 4_900, _T0 + timedelta(hours=2)),
+    )
+
+
+@pytest.mark.asyncio
 async def test_anonymous_repository_discovery_uses_no_graphql_quota() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         pytest.fail(f"unexpected request: {request.url}")
