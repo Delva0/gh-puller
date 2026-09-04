@@ -54,6 +54,7 @@ _DEFAULT_ACCEPT = "application/vnd.github.full+json"
 _GRAPHQL_PAGE_SIZE = 100
 _QUOTA_RESET_JITTER_SECONDS = 5
 _TRANSIENT_DELAYS = (1, 2, 4, 8, 16, 30)
+_TRANSPORT_RESET_ATTEMPTS = len(_TRANSIENT_DELAYS)
 
 
 class _Transport(StrEnum):
@@ -90,7 +91,8 @@ class GitHubAPI:
         graphql_url: GraphQL API 地址；None 从 REST 根地址推导。
         api_version: 发送到 ``X-GitHub-Api-Version`` 的版本。
         timeout: 单次请求超时秒数。
-        client: 测试或宿主注入的 ``httpx.AsyncClient``。
+        client: 测试或宿主注入的 ``httpx.AsyncClient``；其生命周期和传输恢复
+            由调用方负责。
         sleep: 限流与退避使用的异步等待函数。
         now: 计算限流恢复时刻使用的 UTC 时钟。
         progress: HTTP 尝试、配额与等待的同步带外观察器。
@@ -116,15 +118,14 @@ class GitHubAPI:
         }
         if token:
             headers["Authorization"] = f"Bearer {token}"
-        self._client = client or httpx.AsyncClient(
-            base_url=base_url.rstrip("/"),
-            follow_redirects=True,
-            headers=headers,
-            timeout=timeout,
-        )
+        self._client_base_url = base_url.rstrip("/")
+        self._client_headers = headers
+        self._client_timeout = timeout
+        self._owns_client = client is None
+        self._client = client or self._new_owned_client()
         if client:
             self._client.headers.update(headers)
-        self._owns_client = client is None
+        self._client_lock = asyncio.Lock()
         self._base_url = str(self._client.base_url).rstrip("/")
         self._authenticated = bool(token or self._client.headers.get("Authorization"))
         self._graphql_url = graphql_url or _graphql_endpoint(base_url)
@@ -141,6 +142,23 @@ class GitHubAPI:
         """关闭由本对象创建的 HTTP client；注入的 client 由调用方管理。"""
         if self._owns_client:
             await self._client.aclose()
+
+    def _new_owned_client(self) -> httpx.AsyncClient:
+        return httpx.AsyncClient(
+            base_url=self._client_base_url,
+            follow_redirects=True,
+            headers=self._client_headers,
+            timeout=self._client_timeout,
+        )
+
+    async def _reset_owned_client(self, failed: httpx.AsyncClient) -> None:
+        """Replace one failed transport generation without duplicating concurrent resets."""
+        async with self._client_lock:
+            if self._client is not failed:
+                return
+            self._client = self._new_owned_client()
+            await failed.aclose()
+            _LOG.warning("Recreated GitHub HTTP client after repeated transport failures")
 
     async def get_json(
         self,
@@ -1280,29 +1298,36 @@ class GitHubAPI:
         primary_wait: bool = True,
     ) -> httpx.Response:
         transient_attempt = 0
+        transport_attempt = 0
         secondary_attempt = 0
         while True:
             await self._wait_for_limit(resource, primary_wait=primary_wait)
             headers = dict(request_headers or {})
             if accept:
                 headers["Accept"] = accept
+            client = self._client
             try:
                 self.request_count += 1
-                response = await self._client.request(
+                response = await client.request(
                     method,
                     path,
                     params=params,
                     headers=headers or None,
                     json=json_body,
                 )
-            except httpx.RequestError:
+            except httpx.RequestError as exc:
                 transient_attempt += 1
+                transport_attempt += 1
+                if self._owns_client and transport_attempt >= _TRANSPORT_RESET_ATTEMPTS:
+                    await self._reset_owned_client(client)
+                    transport_attempt = 0
                 await self._wait_transient(
                     transient_attempt,
-                    f"GitHub request failed: {path}",
+                    f"GitHub request failed: {path}: {type(exc).__name__}: {exc}",
                 )
                 continue
 
+            transport_attempt = 0
             self._remember_quota(response)
             self._emit_progress()
             if response.status_code in {403, 429} and self._is_rate_limited(response):

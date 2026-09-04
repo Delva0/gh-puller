@@ -10,6 +10,7 @@ from typing import Any
 import httpx
 import pytest
 
+import gh_puller.github.client as client_module
 from gh_puller.github import (
     GitHubAPI,
     GitHubAPIError,
@@ -165,6 +166,62 @@ async def test_transient_failures_retry_in_place_until_the_page_succeeds() -> No
     waits = [event for event in progress if event.wait_seconds is not None]
     assert [event.wait_seconds for event in waits] == clock.sleeps
     assert {event.detail for event in waits} == {"transient_retry"}
+
+
+@pytest.mark.asyncio
+async def test_concurrent_requests_share_recovery_from_a_poisoned_transport(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    real_client = httpx.AsyncClient
+    clients: list[httpx.AsyncClient] = []
+
+    def factory(
+        *,
+        base_url: str,
+        follow_redirects: bool,
+        headers: dict[str, str],
+        timeout: float,
+    ) -> httpx.AsyncClient:
+        generation = len(clients)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if generation == 0:
+                raise httpx.ConnectError("poisoned connection pool", request=request)
+            return httpx.Response(200, json={"ok": True}, request=request)
+
+        client = real_client(
+            base_url=base_url,
+            follow_redirects=follow_redirects,
+            headers=headers,
+            timeout=timeout,
+            transport=httpx.MockTransport(handler),
+        )
+        clients.append(client)
+        return client
+
+    monkeypatch.setattr(client_module.httpx, "AsyncClient", factory)
+    sleeps: list[float] = []
+
+    async def sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        await asyncio.sleep(0)
+
+    api = GitHubAPI(sleep=sleep)
+    try:
+        assert await asyncio.gather(
+            api.get_json("/first"),
+            api.get_json("/second"),
+        ) == [{"ok": True}, {"ok": True}]
+    finally:
+        await api.close()
+
+    assert len(clients) == 2
+    assert all(client.is_closed for client in clients)
+    assert api.request_count == 13
+    assert sleeps == [1, 1, 2, 2, 4, 4, 8, 8, 16, 16, 30]
+    assert "ConnectError: poisoned connection pool" in caplog.text
+    assert "Recreated GitHub HTTP client" in caplog.text
 
 
 @pytest.mark.asyncio
