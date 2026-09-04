@@ -1499,6 +1499,104 @@ async def test_concurrent_quota_responses_never_move_backward() -> None:
 
 
 @pytest.mark.asyncio
+async def test_stale_zero_quota_response_cannot_restore_an_old_gate() -> None:
+    clock = Clock(_T0)
+    current_reset = int((_T0 + timedelta(hours=2)).timestamp())
+    stale_reset = int((_T0 + timedelta(hours=1)).timestamp())
+    responses = [
+        (4_999, current_reset),
+        (0, stale_reset),
+        (4_998, current_reset),
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        remaining, reset = responses.pop(0)
+        return httpx.Response(
+            200,
+            headers={
+                "x-ratelimit-limit": "5000",
+                "x-ratelimit-remaining": str(remaining),
+                "x-ratelimit-reset": str(reset),
+                "x-ratelimit-resource": "core",
+            },
+            json={"ok": True},
+            request=request,
+        )
+
+    client = httpx.AsyncClient(
+        base_url="https://api.github.test",
+        transport=httpx.MockTransport(handler),
+    )
+    api = GitHubAPI(client=client, sleep=clock.sleep, now=clock)
+    try:
+        await api.get_json("/current")
+        await api.get_json("/stale")
+        await api.get_json("/next")
+    finally:
+        await client.aclose()
+
+    assert clock.sleeps == []
+    assert responses == []
+
+
+@pytest.mark.asyncio
+async def test_new_quota_window_releases_an_existing_waiter() -> None:
+    available_started = asyncio.Event()
+    release_available = asyncio.Event()
+    wait_started = asyncio.Event()
+    release_wait = asyncio.Event()
+    sleeps: list[float] = []
+    old_reset = int((_T0 + timedelta(hours=1)).timestamp())
+    new_reset = int((_T0 + timedelta(hours=2)).timestamp())
+
+    async def sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        wait_started.set()
+        await release_wait.wait()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/available-slow":
+            available_started.set()
+            await release_available.wait()
+            remaining, reset = 4_999, new_reset
+        elif request.url.path == "/exhausted":
+            remaining, reset = 0, old_reset
+        else:
+            remaining, reset = 4_998, new_reset
+        return httpx.Response(
+            200,
+            headers={
+                "x-ratelimit-limit": "5000",
+                "x-ratelimit-remaining": str(remaining),
+                "x-ratelimit-reset": str(reset),
+                "x-ratelimit-resource": "core",
+            },
+            json={"ok": True},
+            request=request,
+        )
+
+    client = httpx.AsyncClient(
+        base_url="https://api.github.test",
+        transport=httpx.MockTransport(handler),
+    )
+    api = GitHubAPI(client=client, sleep=sleep, now=lambda: _T0)
+    try:
+        available = asyncio.create_task(api.get_json("/available-slow"))
+        await available_started.wait()
+        await api.get_json("/exhausted")
+        blocked = asyncio.create_task(api.get_json("/next"))
+        await wait_started.wait()
+        release_available.set()
+        await available
+        release_wait.set()
+        assert await blocked == {"ok": True}
+    finally:
+        await client.aclose()
+
+    assert sleeps == [30]
+
+
+@pytest.mark.asyncio
 async def test_quota_reset_jitter_keeps_conservative_remaining() -> None:
     progress = []
     reset = int((_T0 + timedelta(hours=1)).timestamp())
