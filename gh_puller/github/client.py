@@ -1015,6 +1015,9 @@ class GitHubAPI:
             if not errors:
                 return payload
             if self._is_rate_limited(response):
+                if response.headers.get("x-ratelimit-remaining") == "0":
+                    self._remember_quota(response, primary_exhausted=True)
+                    self._emit_progress()
                 primary = self._remember_primary_limit(response, "graphql")
                 if not primary_wait and primary:
                     raise _PrimaryRateLimitError("graphql")
@@ -1332,9 +1335,11 @@ class GitHubAPI:
                 continue
 
             transport_attempt = 0
-            self._remember_quota(response)
+            rate_limited = response.status_code in {403, 429} and self._is_rate_limited(response)
+            primary = rate_limited and response.headers.get("x-ratelimit-remaining") == "0"
+            self._remember_quota(response, primary_exhausted=primary)
             self._emit_progress()
-            if response.status_code in {403, 429} and self._is_rate_limited(response):
+            if rate_limited:
                 primary = self._remember_primary_limit(response, resource)
                 if not primary_wait and primary:
                     raise _PrimaryRateLimitError(resource)
@@ -1346,7 +1351,8 @@ class GitHubAPI:
                 )
                 secondary_attempt += 1
                 continue
-            self._remember_primary_limit(response, resource)
+            if response.status_code != 304:
+                self._remember_primary_limit(response, resource)
             if response.status_code >= 500:
                 transient_attempt += 1
                 await self._wait_transient(
@@ -1531,7 +1537,12 @@ class GitHubAPI:
         )
         return True
 
-    def _remember_quota(self, response: httpx.Response) -> None:
+    def _remember_quota(
+        self,
+        response: httpx.Response,
+        *,
+        primary_exhausted: bool = False,
+    ) -> None:
         limit = _integer_header(response, "x-ratelimit-limit")
         remaining = _integer_header(response, "x-ratelimit-remaining")
         reset = _integer_header(response, "x-ratelimit-reset")
@@ -1539,7 +1550,22 @@ class GitHubAPI:
         resource = response.headers.get("x-ratelimit-resource")
         if resource is None:
             return
+        # Quota-free conditional hits can advertise a separate positive window.
+        if response.status_code == 304:
+            return
         previous = self._quotas.get(resource)
+        # An actual denial outranks optimistic samples from concurrent responses.
+        if primary_exhausted:
+            if previous is not None:
+                limit = limit if limit is not None else previous.limit
+                if reset_at is None:
+                    reset_at = previous.reset_at
+                elif previous.reset_at is not None and abs(
+                    (reset_at - previous.reset_at).total_seconds(),
+                ) <= _QUOTA_RESET_JITTER_SECONDS:
+                    reset_at = max(reset_at, previous.reset_at)
+            self._quotas[resource] = RateQuota(resource, limit, remaining, reset_at)
+            return
         if previous is None:
             self._quotas[resource] = RateQuota(resource, limit, remaining, reset_at)
             return

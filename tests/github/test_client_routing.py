@@ -1351,6 +1351,72 @@ async def test_graphql_rate_limit_waits_and_retries() -> None:
 
 
 @pytest.mark.asyncio
+async def test_graphql_primary_error_overrides_newer_success_snapshot() -> None:
+    clock = Clock(_T0)
+    current_reset = int((_T0 + timedelta(hours=2)).timestamp())
+    stale_reset = int((_T0 + timedelta(seconds=2)).timestamp())
+    responses = [
+        httpx.Response(
+            200,
+            headers=_quota_headers("graphql", 4_999)
+            | {"x-ratelimit-reset": str(current_reset)},
+            json={
+                "data": {
+                    "repository": {
+                        "issues": {"totalCount": 1},
+                        "pullRequests": {"totalCount": 2},
+                    },
+                },
+            },
+        ),
+        httpx.Response(
+            200,
+            headers=_quota_headers("graphql", 0)
+            | {"x-ratelimit-reset": str(stale_reset)},
+            json={"errors": [{"message": "API rate limit exceeded"}]},
+        ),
+        httpx.Response(
+            200,
+            headers=_quota_headers("graphql", 4_998)
+            | {"x-ratelimit-reset": str(current_reset)},
+            json={
+                "data": {
+                    "repository": {
+                        "issues": {"totalCount": 3},
+                        "pullRequests": {"totalCount": 5},
+                    },
+                },
+            },
+        ),
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        response = responses.pop(0)
+        response.request = request
+        return response
+
+    client = httpx.AsyncClient(
+        base_url="https://api.github.test",
+        transport=httpx.MockTransport(handler),
+    )
+    api = GitHubAPI(
+        token=str(id(client)),
+        client=client,
+        graphql_url="/graphql",
+        sleep=clock.sleep,
+        now=clock,
+    )
+    try:
+        assert await api.repository_item_count("acme", "widgets") == 3
+        assert await api.repository_item_count("acme", "widgets") == 8
+    finally:
+        await client.aclose()
+
+    assert clock.sleeps == [3]
+    assert responses == []
+
+
+@pytest.mark.asyncio
 async def test_successful_last_quota_response_gates_the_next_request() -> None:
     clock = Clock(_T0)
     progress = []
@@ -1536,6 +1602,120 @@ async def test_stale_zero_quota_response_cannot_restore_an_old_gate() -> None:
         await client.aclose()
 
     assert clock.sleeps == []
+    assert responses == []
+
+
+@pytest.mark.asyncio
+async def test_conditional_response_cannot_report_primary_quota_recovery() -> None:
+    clock = Clock(_T0)
+    conditional_started = asyncio.Event()
+    release_conditional = asyncio.Event()
+    progress = []
+    exhausted_reset = int((_T0 + timedelta(seconds=2)).timestamp())
+    conditional_reset = int((_T0 + timedelta(hours=1)).timestamp())
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/cached" and "if-none-match" not in request.headers:
+            return httpx.Response(
+                200,
+                headers={"etag": '"cached"'},
+                json={"value": "old"},
+                request=request,
+            )
+        if request.url.path == "/cached":
+            conditional_started.set()
+            await release_conditional.wait()
+            return httpx.Response(
+                304,
+                headers={
+                    "etag": '"cached"',
+                    "x-ratelimit-limit": "5000",
+                    "x-ratelimit-remaining": "4999",
+                    "x-ratelimit-reset": str(conditional_reset),
+                    "x-ratelimit-resource": "core",
+                },
+                request=request,
+            )
+        if request.url.path == "/last":
+            return httpx.Response(
+                200,
+                headers={
+                    "x-ratelimit-limit": "5000",
+                    "x-ratelimit-remaining": "0",
+                    "x-ratelimit-reset": str(exhausted_reset),
+                    "x-ratelimit-resource": "core",
+                },
+                json={"ok": True},
+                request=request,
+            )
+        return httpx.Response(200, json={"ok": True}, request=request)
+
+    client = httpx.AsyncClient(
+        base_url="https://api.github.test",
+        transport=httpx.MockTransport(handler),
+    )
+    api = GitHubAPI(
+        client=client,
+        sleep=clock.sleep,
+        now=clock,
+        progress=progress.append,
+    )
+    try:
+        previous, cache = await api.get_json_cached("/cached", previous=None, cache=None)
+        conditional = asyncio.create_task(
+            api.get_json_cached("/cached", previous=previous, cache=cache),
+        )
+        await conditional_started.wait()
+        await api.get_json("/last")
+        release_conditional.set()
+        assert await conditional == (previous, cache)
+        await api.get_json("/next")
+    finally:
+        await client.aclose()
+
+    assert clock.sleeps == [3]
+    assert progress[-1].quotas == (
+        RateQuota("core", 5_000, 0, _T0 + timedelta(seconds=2)),
+    )
+
+
+@pytest.mark.asyncio
+async def test_primary_error_overrides_newer_success_snapshot() -> None:
+    clock = Clock(_T0)
+    current_reset = int((_T0 + timedelta(hours=2)).timestamp())
+    stale_reset = int((_T0 + timedelta(seconds=2)).timestamp())
+    responses = [
+        (200, 4_999, current_reset),
+        (403, 0, stale_reset),
+        (200, 4_998, current_reset),
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        status, remaining, reset = responses.pop(0)
+        return httpx.Response(
+            status,
+            headers={
+                "x-ratelimit-limit": "5000",
+                "x-ratelimit-remaining": str(remaining),
+                "x-ratelimit-reset": str(reset),
+                "x-ratelimit-resource": "core",
+            },
+            json={"message": "rate limit exceeded"} if status == 403 else {"ok": True},
+            request=request,
+        )
+
+    client = httpx.AsyncClient(
+        base_url="https://api.github.test",
+        transport=httpx.MockTransport(handler),
+    )
+    api = GitHubAPI(client=client, sleep=clock.sleep, now=clock)
+    try:
+        await api.get_json("/current")
+        assert await api.get_json("/stale-then-current") == {"ok": True}
+    finally:
+        await client.aclose()
+
+    assert clock.sleeps == [3]
     assert responses == []
 
 
