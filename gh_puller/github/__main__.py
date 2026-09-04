@@ -67,7 +67,7 @@ def _add_common_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--graphql-url")
     parser.add_argument("--api-version", default="2022-11-28")
     parser.add_argument("--git-url", help="Git remote URL (default: repository HTTPS URL on GitHub.com)")
-    parser.add_argument("--concurrency", type=int, default=4)
+    parser.add_argument("--concurrency", type=int, default=8)
     parser.add_argument("--request-timeout", type=float, default=30.0)
     parser.add_argument("--overlap-seconds", type=int, default=2)
     parser.add_argument("--no-progress", action="store_true", help="disable progress on stderr")

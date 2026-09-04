@@ -198,7 +198,7 @@ class GitHubPullConfig:
     api_url: str = "https://api.github.com"  # REST root, including Enterprise roots.
     graphql_url: str | None = None  # None derives GitHub's GraphQL endpoint from api_url.
     api_version: str = "2022-11-28"  # Version sent to GitHub's versioned REST API.
-    concurrency: int = 4  # Concurrent item bundles; each bundle paginates serially.
+    concurrency: int = 8  # Concurrent item bundles; each bundle paginates serially.
     request_timeout: float = 30.0  # Per-request timeout in seconds.
     overlap_seconds: int = 2  # Replayed boundary for second-resolution GitHub timestamps.
     git_url: str | None = None  # None uses repository's GitHub.com HTTPS URL.

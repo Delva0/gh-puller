@@ -105,6 +105,7 @@ def test_parser_accepts_configurable_schedule_interval() -> None:
     )
 
     assert args.interval == timedelta(minutes=90)
+    assert cli._config(args).concurrency == 8
 
 
 def test_parser_accepts_an_archive_only_migration_command() -> None:
