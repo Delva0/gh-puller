@@ -1392,6 +1392,8 @@ class GitHubAPI:
     def _transport_order(self, rest_cached: bool) -> tuple[_Transport, _Transport]:
         if not self._authenticated:
             return _Transport.REST, _Transport.GRAPHQL
+        # NOTE: Do not prioritize an earlier reset in isolation. Flexible calls share
+        # each quota with transport-only calls whose future demand is unknown here.
         rest_capacity = self._quota_capacity(_Transport.REST)
         if rest_cached and rest_capacity > 0:
             return _Transport.REST, _Transport.GRAPHQL
