@@ -7,10 +7,8 @@
 from __future__ import annotations
 
 import asyncio
-import fcntl
 import os
 import re
-from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from itertools import islice
@@ -24,6 +22,7 @@ from .git_store import (
     default_git_url,
     git_store_path,
 )
+from .locking import archive_lock
 from .progress import _PullProgressTracker
 from .store import (
     ArchivedRun,
@@ -37,7 +36,7 @@ from .store import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable, Iterator
+    from collections.abc import Awaitable, Callable, Iterator, Mapping
 
     from .progress import ProgressObserver
 
@@ -46,7 +45,7 @@ _CLOSING_REFERENCE_BATCH_SIZE = 100
 _GIT_PREFETCH_BATCH_SIZE = 8
 _GIT_DEFER_RETRY_CEILING = 30.0
 _CATALOG_ACCEPT = "application/vnd.github.raw+json"
-_BUNDLE_SCHEMA_VERSION = 6
+_BUNDLE_SCHEMA_VERSION = 7
 
 
 class IncompleteGitHubDataError(RuntimeError):
@@ -165,9 +164,16 @@ class _API(Protocol):
 
 
 class _GitStore(Protocol):
+    async def sync_upstream(
+        self,
+        *,
+        heartbeat: Callable[[], None] | None = None,
+        retry: Callable[[float], None] | None = None,
+    ) -> None: ...
+
     async def prefetch(
         self,
-        numbers: list[int],
+        pulls: Mapping[int, dict[str, Any]],
         *,
         heartbeat: Callable[[], None] | None = None,
         retry: Callable[[float], None] | None = None,
@@ -278,7 +284,7 @@ class GitHubPuller:
         progress.phase("waiting_lock")
         try:
             async with (
-                _archive_lock(self.config.destination),
+                archive_lock(self.config.destination),
                 SQLiteArchive(
                     self.config.destination,
                     self.config.repository,
@@ -451,6 +457,14 @@ class GitHubPuller:
             )
         elif (state.name, state.cutoff_at) != (pass_name, _iso(cutoff)):
             raise RuntimeError("another observation pass must finish first")
+        progress.git_sync()
+        try:
+            await git.sync_upstream(
+                heartbeat=progress.git_heartbeat,
+                retry=progress.git_retry,
+            )
+        finally:
+            progress.git_done()
         if not state.prepared:
             state = await self._prepare_pass(api, archive, state, observed, progress)
         completed, total = await archive.task_progress(run_id)
@@ -716,19 +730,26 @@ class GitHubPuller:
             tuple[dict[str, Any] | None, dict[str, Any] | None],
         ] = {}
         root_caches: dict[int, dict[str, Any]] = {}
+
+        async def previous_state(
+            number: int,
+        ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+            if number in previous_states:
+                return previous_states[number]
+            previous = heads.get(number)
+            state = (None, None)
+            if previous is not None:
+                async with store_lock:
+                    state = await archive.load_bundle_state(previous.bundle_digest)
+            previous_states[number] = state
+            return state
+
         for task in tasks:
             previous = heads.get(task.number)
             if task.number in summaries or (previous is not None and previous.kind == "issue"):
                 continue
             issue_path = f"{self._base}/issues/{task.number}"
-            previous_bundle = None
-            previous_cache = None
-            if previous is not None:
-                async with store_lock:
-                    previous_bundle, previous_cache = await archive.load_bundle_state(
-                        previous.bundle_digest,
-                    )
-                previous_states[task.number] = previous_bundle, previous_cache
+            previous_bundle, previous_cache = await previous_state(task.number)
             try:
                 summary, root_cache = await self._cached_json(
                     api,
@@ -786,12 +807,7 @@ class GitHubPuller:
                 summary = _minimal_summary(heads.get(number))
             stored_summary = summary if number in preloaded else None
             previous = heads.get(number)
-            previous_bundle, previous_cache = previous_states.get(number, (None, None))
-            if previous is not None and number not in previous_states:
-                async with store_lock:
-                    previous_bundle, previous_cache = await archive.load_bundle_state(
-                        previous.bundle_digest,
-                    )
+            previous_bundle, previous_cache = await previous_state(number)
             try:
                 bundle, http_cache = await self._fetch_bundle(
                     api,
@@ -803,6 +819,7 @@ class GitHubPuller:
                     catalog_issue=summary if stored_summary is not None else None,
                     force_comments=indexed[number].force_comments,
                     closing_references=closing_references.get(number),
+                    pull_detail=pull_details.get(number),
                 )
             except GitHubAPIError as exc:
                 if not _is_parent_absence(exc, f"{self._base}/issues/{number}"):
@@ -888,6 +905,33 @@ class GitHubPuller:
             return heads[number].kind if summary is None else _kind(summary)
 
         deferred: set[int] = set()
+        pull_details: dict[int, GitHubResource] = {}
+
+        async def preload_pull(number: int) -> None:
+            if number in pull_details:
+                return
+            previous_bundle, previous_cache = await previous_state(number)
+            resource = await api.pull_request(
+                self._owner,
+                self._repo,
+                number,
+                previous=_dict_field(_dict_field(previous_bundle, "pull_request"), "detail"),
+                cache=_dict_field(_dict_field(previous_cache, "pull_request"), "detail"),
+            )
+            if not isinstance(resource.value, dict):
+                raise IncompleteGitHubDataError(
+                    f"GitHub returned a non-object for {self._base}/pulls/{number}",
+                )
+            pull_details[number] = resource
+
+        async def preload_pulls(numbers: list[int]) -> None:
+            semaphore = asyncio.Semaphore(self.config.concurrency)
+
+            async def bounded(number: int) -> None:
+                async with semaphore:
+                    await preload_pull(number)
+
+            await asyncio.gather(*(bounded(number) for number in numbers))
 
         async def prefetch_and_fetch(
             batch: list[int],
@@ -895,11 +939,12 @@ class GitHubPuller:
         ) -> None:
             pull_numbers = [number for number in batch if kind(number) == "pull"]
             if pull_numbers:
+                await preload_pulls(pull_numbers)
                 progress.git_fetch(len(pull_numbers))
                 transient_failure = False
                 try:
                     await git.prefetch(
-                        pull_numbers,
+                        {number: pull_details[number].value for number in pull_numbers},
                         heartbeat=progress.git_heartbeat,
                         retry=progress.git_retry,
                         retry_transient=False,
@@ -954,6 +999,7 @@ class GitHubPuller:
         catalog_issue: dict[str, Any] | None,
         force_comments: bool,
         closing_references: list[dict[str, Any]] | None,
+        pull_detail: GitHubResource | None,
     ) -> tuple[dict[str, Any], dict[str, Any] | None]:
         number = int(summary["number"])
         issue_path = f"{self._base}/issues/{number}"
@@ -1067,6 +1113,7 @@ class GitHubPuller:
                 _dict_field(previous_cache, "pull_request"),
                 force_comments=force_comments,
                 closing_references=closing_references,
+                detail_resource=pull_detail,
             )
             bundle["pull_request"] = pull
             _set_cache(http_cache, "pull_request", cache)
@@ -1083,18 +1130,21 @@ class GitHubPuller:
         *,
         force_comments: bool,
         closing_references: list[dict[str, Any]] | None,
+        detail_resource: GitHubResource | None,
     ) -> tuple[dict[str, Any], dict[str, Any] | None]:
         if closing_references is None:
             raise IncompleteGitHubDataError(f"pull #{number} has no closing issue references")
         path = f"{self._base}/pulls/{number}"
         http_cache: dict[str, Any] = {}
-        detail = await api.pull_request(
-            self._owner,
-            self._repo,
-            number,
-            previous=_dict_field(previous, "detail"),
-            cache=_dict_field(previous_cache, "detail"),
-        )
+        detail = detail_resource
+        if detail is None:
+            detail = await api.pull_request(
+                self._owner,
+                self._repo,
+                number,
+                previous=_dict_field(previous, "detail"),
+                cache=_dict_field(previous_cache, "detail"),
+            )
         pull = detail.value
         cache = detail.cache
         if not isinstance(pull, dict):
@@ -1591,21 +1641,3 @@ def _iso_seconds(value: datetime) -> str:
 
 def _token(configured: str | None) -> str | None:
     return configured or os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
-
-
-@asynccontextmanager
-async def _archive_lock(destination: Path):
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    lock_path = destination.parent / f".{destination.name}.lock"
-    file = lock_path.open("a+")
-    try:
-        while True:
-            try:
-                fcntl.flock(file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                break
-            except BlockingIOError:
-                await asyncio.sleep(0.1)
-        yield
-    finally:
-        fcntl.flock(file.fileno(), fcntl.LOCK_UN)
-        file.close()

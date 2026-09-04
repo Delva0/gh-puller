@@ -15,6 +15,7 @@ import pytest
 from gh_puller.github import PullResult
 from gh_puller.github import __main__ as cli
 from gh_puller.github.store import SQLiteArchive, schedule_state
+from gh_puller.github.v8.migrate import MigrationResult
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -104,6 +105,13 @@ def test_parser_accepts_configurable_schedule_interval() -> None:
     )
 
     assert args.interval == timedelta(minutes=90)
+
+
+def test_parser_accepts_an_archive_only_migration_command() -> None:
+    args = cli._parser().parse_args(["migrate", "/tmp/widgets.sqlite3"])
+
+    assert args.command == "migrate"
+    assert str(args.destination) == "/tmp/widgets.sqlite3"
 
 
 @pytest.mark.parametrize("value", ["0s", "1.5h", "hour", "-1h"])
@@ -201,6 +209,23 @@ def test_emit_writes_machine_readable_result(capsys: pytest.CaptureFixture[str])
         "requests": 7,
         "run_id": 42,
         "target_at": "2026-09-02T12:00:00Z",
+    }
+
+
+def test_emit_writes_machine_readable_migration_result(
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "archive.sqlite3"
+
+    cli._emit_migration(MigrationResult(database, "acme/widgets", 7, 11, True))
+
+    assert json.loads(capsys.readouterr().out) == {
+        "bundles": 7,
+        "changed": True,
+        "database": str(database),
+        "refs": 11,
+        "repository": "acme/widgets",
     }
 
 

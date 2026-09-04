@@ -1,6 +1,12 @@
-"""提供第六版 GitHub SQLite schema 与一次性前序版本迁移。"""
+"""Define the public SQLite schema paired with the initial Git layout.
 
-VERSION = "6"
+The schema stores observation facts, resumable writer state, and a relational index
+over PR Git manifests. Raw GitHub payloads remain content-addressed canonical JSON;
+the companion bare repository owns commit, tree, and blob objects.
+"""
+
+VERSION = "8"
+GIT_LAYOUT_VERSION = "0"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS archive_meta (
@@ -105,10 +111,63 @@ CREATE TABLE IF NOT EXISTS pull_tasks (
 
 CREATE INDEX IF NOT EXISTS pull_tasks_pending
 ON pull_tasks(run_id, catalog_member, completed, id);
-"""
 
-MIGRATE_V5 = """
-BEGIN IMMEDIATE;
-UPDATE archive_meta SET value = '6' WHERE key = 'schema_version' AND value = '5';
-COMMIT;
+CREATE TABLE IF NOT EXISTS git_pull_snapshots (
+    bundle_digest TEXT PRIMARY KEY REFERENCES payload_blobs(digest),
+    number INTEGER NOT NULL,
+    merged INTEGER NOT NULL CHECK (merged IN (0, 1)),
+    base_sha TEXT NOT NULL,
+    head_sha TEXT NOT NULL,
+    comparison_kind TEXT NOT NULL
+        CHECK (comparison_kind IN ('merge_base', 'empty_tree', 'unavailable')),
+    comparison_sha TEXT,
+    base_ref TEXT,
+    head_ref TEXT,
+    comparison_ref TEXT,
+    landing_sha TEXT,
+    landing_ref TEXT,
+    history_preserved INTEGER CHECK (history_preserved IN (0, 1)),
+    CHECK (landing_ref IS NULL OR landing_sha IS NOT NULL)
+) WITHOUT ROWID;
+
+CREATE INDEX IF NOT EXISTS git_pull_snapshots_number
+ON git_pull_snapshots(number, bundle_digest);
+
+CREATE TABLE IF NOT EXISTS git_pull_commits (
+    bundle_digest TEXT NOT NULL REFERENCES git_pull_snapshots(bundle_digest),
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    sha TEXT NOT NULL,
+    PRIMARY KEY(bundle_digest, ordinal)
+) WITHOUT ROWID;
+
+CREATE VIEW IF NOT EXISTS current_pull_git AS
+SELECT
+    h.number,
+    h.present,
+    h.bundle_digest,
+    g.merged,
+    g.base_sha,
+    g.head_sha,
+    g.comparison_kind,
+    g.comparison_sha,
+    g.base_ref,
+    g.head_ref,
+    g.comparison_ref,
+    g.landing_sha,
+    g.landing_ref,
+    g.history_preserved
+FROM resource_heads AS h
+JOIN git_pull_snapshots AS g ON g.bundle_digest = h.bundle_digest
+WHERE h.kind = 'pull';
+
+CREATE VIEW IF NOT EXISTS current_pull_commits AS
+SELECT
+    h.number,
+    h.present,
+    h.bundle_digest,
+    c.ordinal,
+    c.sha
+FROM resource_heads AS h
+JOIN git_pull_commits AS c ON c.bundle_digest = h.bundle_digest
+WHERE h.kind = 'pull';
 """

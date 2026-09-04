@@ -78,7 +78,7 @@ class WriterStatus:
 
 
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="python -m gh_puller.github.monitor")
+    parser = argparse.ArgumentParser(prog="uv run -m gh_puller.github.monitor")
     parser.add_argument("--systemd-dir", type=Path, required=True)
     parser.add_argument("--systemctl", required=True)
     parser.add_argument("--journalctl", required=True)

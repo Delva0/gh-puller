@@ -38,7 +38,7 @@ def _policy_for(environment: dict[str, str], database: Path) -> Path:
 def _bind_archive(
     database: Path,
     repository: str = _REPOSITORY,
-    schema: str = "7",
+    schema: str = "8",
 ) -> None:
     with sqlite3.connect(database) as connection:
         connection.execute(
@@ -46,7 +46,11 @@ def _bind_archive(
         )
         connection.executemany(
             "INSERT INTO archive_meta(key, value) VALUES (?, ?)",
-            (("schema_version", schema), ("repository", repository)),
+            (
+                ("schema_version", schema),
+                ("git_layout_version", "0"),
+                ("repository", repository),
+            ),
         )
 
 

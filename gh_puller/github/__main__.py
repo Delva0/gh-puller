@@ -22,6 +22,7 @@ from dotenv import load_dotenv
 from .progress import ConsoleProgress
 from .puller import GitHubPullConfig, GitHubPuller, PullResult
 from .store import schedule_state
+from .v8.migrate import MigrationResult, migrate_archive
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator, Sequence
@@ -38,7 +39,7 @@ _INTERVAL_UNITS = {
 
 
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="python -m gh_puller.github")
+    parser = argparse.ArgumentParser(prog="uv run -m gh_puller.github")
     commands = parser.add_subparsers(dest="command", required=True)
 
     once = commands.add_parser("once", help="pull once to an optional RFC 3339 target")
@@ -54,6 +55,8 @@ def _parser() -> argparse.ArgumentParser:
         metavar="DURATION",
         help="UTC-aligned cadence such as 30m, 1h, or 1d (default: 1h)",
     )
+    migrate = commands.add_parser("migrate", help="migrate a stopped archive pair in place")
+    migrate.add_argument("destination", type=Path, help="SQLite archive to migrate")
     return parser
 
 
@@ -103,6 +106,9 @@ def _config(args: argparse.Namespace) -> GitHubPullConfig:
 
 
 async def _dispatch(args: argparse.Namespace) -> None:
+    if args.command == "migrate":
+        _emit_migration(await migrate_archive(args.destination))
+        return
     observer = None if args.no_progress else ConsoleProgress()
     puller = GitHubPuller(_config(args), observer=observer)
     if args.command == "once":
@@ -192,6 +198,17 @@ def _emit(result: PullResult) -> None:
         "requests": result.requests,
         "run_id": result.run_id,
         "target_at": result.target_at.isoformat().replace("+00:00", "Z"),
+    }
+    print(json.dumps(payload, ensure_ascii=False, sort_keys=True), flush=True)
+
+
+def _emit_migration(result: MigrationResult) -> None:
+    payload = {
+        "bundles": result.bundles,
+        "changed": result.changed,
+        "database": str(result.database),
+        "refs": result.refs,
+        "repository": result.repository,
     }
     print(json.dumps(payload, ensure_ascii=False, sort_keys=True), flush=True)
 

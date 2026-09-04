@@ -116,10 +116,14 @@ from pathlib import Path
 uri = f"{Path(sys.argv[1]).resolve().as_uri()}?mode=ro"
 with sqlite3.connect(uri, uri=True) as db:
     metadata = dict(db.execute(
-        "SELECT key, value FROM archive_meta WHERE key IN (?, ?)",
-        ("schema_version", "repository"),
+        "SELECT key, value FROM archive_meta WHERE key IN (?, ?, ?)",
+        ("schema_version", "git_layout_version", "repository"),
     ))
-if metadata.get("schema_version") not in {"4", "5", "6", "7"} or "repository" not in metadata:
+if (
+    metadata.get("schema_version") != "8"
+    or metadata.get("git_layout_version") != "0"
+    or "repository" not in metadata
+):
     raise SystemExit(3)
 print(metadata["repository"])
 ' "$destination"

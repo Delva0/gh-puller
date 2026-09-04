@@ -183,6 +183,14 @@ class _PullProgressTracker:
             detail=self._git_detail,
         )
 
+    def git_sync(self) -> None:
+        self._git_detail = "upstream"
+        self._emit(
+            phase="syncing_git",
+            wait_seconds=None,
+            detail=self._git_detail,
+        )
+
     def git_heartbeat(self) -> None:
         self._emit(
             phase="syncing_git",

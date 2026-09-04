@@ -18,9 +18,8 @@ from typing import TYPE_CHECKING, Any, Self
 
 import aiosqlite
 
-from .v5 import MIGRATE_V4
-from .v6 import MIGRATE_V5
-from .v7 import MIGRATE_V6, SCHEMA, VERSION
+from .archive_format import PullGitSnapshot, pull_git_snapshot
+from .v8 import GIT_LAYOUT_VERSION, SCHEMA, VERSION
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Collection, Iterable
@@ -895,7 +894,11 @@ class SQLiteArchive:
             await db.executescript(SCHEMA)
             await db.executemany(
                 "INSERT INTO archive_meta(key, value) VALUES (?, ?)",
-                (("schema_version", VERSION), ("repository", self.repository)),
+                (
+                    ("schema_version", VERSION),
+                    ("git_layout_version", GIT_LAYOUT_VERSION),
+                    ("repository", self.repository),
+                ),
             )
             await db.commit()
             return
@@ -907,19 +910,22 @@ class SQLiteArchive:
             db,
             "SELECT value FROM archive_meta WHERE key = 'repository'",
         )
+        git_layout = await _fetchone(
+            db,
+            "SELECT value FROM archive_meta WHERE key = 'git_layout_version'",
+        )
         if repository is None or repository["value"] != self.repository:
             raise ValueError("archive belongs to a different GitHub repository")
-        if schema is None or schema["value"] not in {"4", "5", "6", VERSION}:
-            raise ValueError("unsupported GitHub archive schema")
-        if schema["value"] == "4":
-            await db.executescript(MIGRATE_V4)
-            await db.executescript(SCHEMA)
-            schema = {"value": "5"}
-        if schema["value"] == "5":
-            await db.executescript(MIGRATE_V5)
-            schema = {"value": "6"}
-        if schema["value"] == "6":
-            await db.executescript(MIGRATE_V6)
+        if schema is None or schema["value"] != VERSION:
+            raise ValueError(
+                "unsupported GitHub archive schema; run "
+                f"'uv run -m gh_puller.github migrate {self.path}'",
+            )
+        if git_layout is None or git_layout["value"] != GIT_LAYOUT_VERSION:
+            raise ValueError(
+                "unsupported GitHub Git layout; run "
+                f"'uv run -m gh_puller.github migrate {self.path}'",
+            )
         await db.executescript(SCHEMA)
         await db.commit()
 
@@ -1219,6 +1225,7 @@ async def _stage_resources(
             summary_digest = await _put_json(db, resource.summary)
         if resource.bundle is not None:
             bundle_digest = await _put_json(db, resource.bundle)
+            await _put_pull_git_index(db, bundle_digest, resource.bundle)
             if resource.http_cache is not None:
                 await _put_http_cache(db, bundle_digest, resource.http_cache)
         if summary_digest != head.summary_digest or bundle_digest != head.bundle_digest:
@@ -1244,6 +1251,54 @@ async def _stage_resources(
             """,
             (run_id, resource.observed_at, *_head_values(head)),
         )
+
+
+async def _put_pull_git_index(
+    db: aiosqlite.Connection,
+    bundle_digest: str,
+    bundle: dict[str, Any],
+) -> None:
+    snapshot = pull_git_snapshot(bundle_digest, bundle)
+    if snapshot is None:
+        return
+    await db.execute(
+        """
+        INSERT OR IGNORE INTO git_pull_snapshots(
+            bundle_digest, number, merged, base_sha, head_sha,
+            comparison_kind, comparison_sha, base_ref, head_ref,
+            comparison_ref, landing_sha, landing_ref, history_preserved
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        _pull_git_values(snapshot),
+    )
+    await db.executemany(
+        """
+        INSERT OR IGNORE INTO git_pull_commits(bundle_digest, ordinal, sha)
+        VALUES (?, ?, ?)
+        """,
+        (
+            (snapshot.bundle_digest, ordinal, sha)
+            for ordinal, sha in enumerate(snapshot.commits)
+        ),
+    )
+
+
+def _pull_git_values(snapshot: PullGitSnapshot) -> tuple[Any, ...]:
+    return (
+        snapshot.bundle_digest,
+        snapshot.number,
+        int(snapshot.merged),
+        snapshot.base_sha,
+        snapshot.head_sha,
+        snapshot.comparison_kind,
+        snapshot.comparison_sha,
+        snapshot.base_ref,
+        snapshot.head_ref,
+        snapshot.comparison_ref,
+        snapshot.landing_sha,
+        snapshot.landing_ref,
+        None if snapshot.history_preserved is None else int(snapshot.history_preserved),
+    )
 
 
 async def _current_head(

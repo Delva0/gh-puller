@@ -1,7 +1,8 @@
-"""持久化 PR 代码对象并生成可离线解析的 Git 快照引用。
+"""持久化上游仓库与 PR 代码对象并生成可离线解析的 Git 引用。
 
 本模块管理与 SQLite 事实库一一对应的 bare Git 对象库。GitHub 讨论语义由
-puller 拉取；本模块只保存目标仓库及 PR refs 可达的 commit、tree 与 blob。
+puller 拉取；本模块保存标准上游 refs、不可变历史 pins，以及 PR refs 可达的
+commit、tree 与 blob。它不提供工作区或下游派生写入。
 """
 
 from __future__ import annotations
@@ -14,8 +15,11 @@ import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from .archive_format import pull_ref, pull_staging_ref, upstream_ref
+from .v8 import GIT_LAYOUT_VERSION
+
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable, Sequence
+    from collections.abc import Awaitable, Callable, Mapping, Sequence
 
 _SHA = re.compile(r"[0-9a-f]{40,64}\Z")
 _HEARTBEAT_SECONDS = 2.0
@@ -25,6 +29,7 @@ _TRANSIENT_FETCH_STATUS = re.compile(
     r"|(?:returned error|http code)[: ]+(?:408|429|5\d\d)\b",
     re.IGNORECASE,
 )
+_MISSING_PULL_REF = re.compile(r"couldn't find remote ref refs/pull/(\d+)/head", re.IGNORECASE)
 _TRANSIENT_FETCH_MARKERS = (
     "connection closed",
     "connection reset",
@@ -83,11 +88,27 @@ class GitObjectStore:
         self._sleep = sleep
         self._lock = asyncio.Lock()
         self._ready = False
-        self._branches_fetched = False
+        self._upstream_synced = False
+
+    async def sync_upstream(
+        self,
+        *,
+        heartbeat: Callable[[], None] | None = None,
+        retry: Callable[[float], None] | None = None,
+    ) -> None:
+        """同步并固定当前上游 branches 与 tags。
+
+        Args:
+            heartbeat: Git 网络操作未结束时周期调用的带外观察器。
+            retry: 瞬时 Git 传输错误发生时接收退避秒数的观察器。
+        """
+        async with self._lock:
+            await self._prepare()
+            await self._sync_upstream(heartbeat=heartbeat, retry=retry, force=True)
 
     async def prefetch(
         self,
-        numbers: Sequence[int],
+        pulls: Mapping[int, dict[str, Any]],
         *,
         heartbeat: Callable[[], None] | None = None,
         retry: Callable[[float], None] | None = None,
@@ -96,43 +117,45 @@ class GitObjectStore:
         """批量取得随后将被固定的 PR refs。
 
         Args:
-            numbers: 当前 API 消费批次中的 PR numbers。
+            pulls: 当前 API 消费批次中 PR number 到 detail 对象的映射。
             heartbeat: Git 网络操作未结束时周期调用的带外观察器。
             retry: 瞬时 Git 传输错误发生时接收退避秒数的观察器。
             retry_transient: 为 False 时将 PR ref 的瞬时失败交还调用方拆批。
         """
-        selected = sorted(set(numbers))
+        selected = sorted(pulls)
         if not selected:
             return
         async with self._lock:
             await self._prepare()
-            if not self._branches_fetched:
-                await self._git(
-                    "fetch",
-                    "--quiet",
-                    "--no-tags",
-                    "--no-write-fetch-head",
-                    "origin",
-                    "+refs/heads/*:refs/gh-puller/remotes/heads/*",
-                    heartbeat=heartbeat,
-                    retry=retry,
-                )
-                self._branches_fetched = True
-            refspecs = [
-                f"+refs/pull/{number}/head:refs/gh-puller/remotes/pulls/{number}/head"
-                for number in selected
-            ]
-            await self._git(
-                "fetch",
-                "--quiet",
-                "--no-tags",
-                "--no-write-fetch-head",
-                "origin",
-                *refspecs,
-                heartbeat=heartbeat,
-                retry=retry,
-                retry_transient=retry_transient,
+            await self._sync_upstream(heartbeat=heartbeat, retry=retry)
+            missing = await self._missing_commits(
+                tuple(_nested_sha(pulls[number], "head", number) for number in selected),
             )
+            pending = {
+                number: f"+refs/pull/{number}/head:{pull_staging_ref(number)}"
+                for number in selected
+                if _nested_sha(pulls[number], "head", number) in missing
+            }
+            while pending:
+                try:
+                    await self._git(
+                        "fetch",
+                        "--quiet",
+                        "--no-tags",
+                        "--no-write-fetch-head",
+                        "origin",
+                        *pending.values(),
+                        heartbeat=heartbeat,
+                        retry=retry,
+                        retry_transient=retry_transient,
+                    )
+                except GitStoreError as exc:
+                    unavailable = _missing_pull_numbers(exc)
+                    if not unavailable.intersection(pending):
+                        raise
+                    pending = {number: refspec for number, refspec in pending.items() if number not in unavailable}
+                else:
+                    return
 
     async def capture(
         self,
@@ -153,7 +176,7 @@ class GitObjectStore:
         Returns:
             base/head 都可达时返回可交给 ``git diff`` 的完整快照；
             否则固定仍可达的对象并显式标记不可用的比较。API 声明的
-            merge commit 仅在对象已可达时一同固定。
+            landing 仅在对象已可达时一同固定。
 
         Raises:
             GitStoreError: SHA 非法、可达历史存在多个 merge-base，或引用无法持久化。
@@ -161,18 +184,17 @@ class GitObjectStore:
         base_sha = _nested_sha(pull, "base", number)
         head_sha = _nested_sha(pull, "head", number)
         value = pull.get("merge_commit_sha")
-        merge_sha = value if pull.get("merged") is True and isinstance(value, str) and _SHA.fullmatch(value) else None
-        prefix = f"refs/gh-puller/snapshots/pulls/{number}"
+        landing_sha = value if pull.get("merged") is True and isinstance(value, str) and _SHA.fullmatch(value) else None
         async with self._lock:
             await self._prepare()
-            pinnable_merge_sha = await self._available_commit(merge_sha)
+            await self._sync_upstream(heartbeat=heartbeat, retry=retry)
+            pinnable_landing_sha = await self._available_commit(landing_sha)
             try:
                 return await self._pin_snapshot(
                     number,
-                    prefix,
                     base_sha,
                     head_sha,
-                    pinnable_merge_sha,
+                    pinnable_landing_sha,
                 )
             except GitStoreError as exc:
                 failure = exc
@@ -189,21 +211,20 @@ class GitObjectStore:
                         retry=retry,
                     )
                     missing = await self._missing_commits(required)
-                    pinnable_merge_sha = await self._available_commit(merge_sha)
+                    pinnable_landing_sha = await self._available_commit(landing_sha)
                     if missing:
                         return await self._pin_partial_snapshot(
-                            prefix,
+                            number,
                             base_sha,
                             head_sha,
-                            pinnable_merge_sha,
+                            pinnable_landing_sha,
                             missing,
                         )
                     return await self._pin_snapshot(
                         number,
-                        prefix,
                         base_sha,
                         head_sha,
-                        pinnable_merge_sha,
+                        pinnable_landing_sha,
                     )
                 except GitStoreError as exc:
                     failure = exc
@@ -214,10 +235,9 @@ class GitObjectStore:
     async def _pin_snapshot(
         self,
         number: int,
-        prefix: str,
         base_sha: str,
         head_sha: str,
-        merge_sha: str | None,
+        landing_sha: str | None,
     ) -> dict[str, Any]:
         merge_bases = (
             await self._git(
@@ -247,9 +267,9 @@ class GitObjectStore:
             ).strip()
         if _SHA.fullmatch(comparison_sha) is None:
             raise GitStoreError(f"pull #{number} has no valid comparison base")
-        base_ref = f"{prefix}/base/{base_sha}"
-        head_ref = f"{prefix}/head/{head_sha}"
-        comparison_ref = f"{prefix}/comparison/{comparison_sha}"
+        base_ref = pull_ref(number, "bases", base_sha)
+        head_ref = pull_ref(number, "heads", head_sha)
+        comparison_ref = pull_ref(number, "comparisons", comparison_sha)
         refs = [
             (base_ref, base_sha),
             (head_ref, head_sha),
@@ -264,20 +284,27 @@ class GitObjectStore:
             "head_ref": head_ref,
             "head_sha": head_sha,
         }
-        if merge_sha is not None:
-            merge_ref = f"{prefix}/merge/{merge_sha}"
-            refs.append((merge_ref, merge_sha))
-            result |= {"merge_commit_ref": merge_ref, "merge_commit_sha": merge_sha}
+        if landing_sha is not None:
+            landing_ref = pull_ref(number, "landings", landing_sha)
+            refs.append((landing_ref, landing_sha))
+            result |= {
+                "history_preserved": await self._is_ancestor(head_sha, landing_sha),
+                "landing_ref": landing_ref,
+                "landing_sha": landing_sha,
+            }
+        else:
+            result["history_preserved"] = None
         commands = "".join(f"update {ref} {sha}\n" for ref, sha in refs)
         await self._git("update-ref", "--stdin", input_text=commands)
+        await self._delete_ref(pull_staging_ref(number))
         return result
 
     async def _pin_partial_snapshot(
         self,
-        prefix: str,
+        number: int,
         base_sha: str,
         head_sha: str,
-        merge_sha: str | None,
+        landing_sha: str | None,
         missing: set[str],
     ) -> dict[str, Any]:
         refs = []
@@ -287,19 +314,26 @@ class GitObjectStore:
             "head_sha": head_sha,
             "unavailable_commits": sorted(missing),
         }
-        for side, sha in (("base", base_sha), ("head", head_sha)):
+        for side, plural, sha in (("base", "bases", base_sha), ("head", "heads", head_sha)):
             if sha in missing:
                 continue
-            ref = f"{prefix}/{side}/{sha}"
+            ref = pull_ref(number, plural, sha)
             refs.append((ref, sha))
             result[f"{side}_ref"] = ref
-        if merge_sha is not None:
-            merge_ref = f"{prefix}/merge/{merge_sha}"
-            refs.append((merge_ref, merge_sha))
-            result |= {"merge_commit_ref": merge_ref, "merge_commit_sha": merge_sha}
+        if landing_sha is not None:
+            landing_ref = pull_ref(number, "landings", landing_sha)
+            refs.append((landing_ref, landing_sha))
+            result |= {
+                "history_preserved": None if head_sha in missing else await self._is_ancestor(head_sha, landing_sha),
+                "landing_ref": landing_ref,
+                "landing_sha": landing_sha,
+            }
+        else:
+            result["history_preserved"] = None
         commands = "".join(f"update {ref} {sha}\n" for ref, sha in refs)
         if commands:
             await self._git("update-ref", "--stdin", input_text=commands)
+        await self._delete_ref(pull_staging_ref(number))
         return result
 
     async def _missing_commits(self, shas: Sequence[str]) -> set[str]:
@@ -315,6 +349,15 @@ class GitObjectStore:
             return None
         return None if await self._missing_commits((sha,)) else sha
 
+    async def _is_ancestor(self, ancestor: str, descendant: str) -> bool:
+        merge_base = await self._git(
+            "merge-base",
+            ancestor,
+            descendant,
+            ok=(0, 1),
+        )
+        return merge_base.strip() == ancestor
+
     async def _refresh_missing(
         self,
         number: int,
@@ -326,24 +369,104 @@ class GitObjectStore:
         retry: Callable[[float], None] | None,
     ) -> None:
         refspecs = []
-        if base_sha in missing and not self._branches_fetched:
-            refspecs.append("+refs/heads/*:refs/gh-puller/remotes/heads/*")
         if head_sha in missing:
-            refspecs.append(f"+refs/pull/{number}/head:refs/gh-puller/remotes/pulls/{number}/head")
+            refspecs.append(
+                f"+refs/pull/{number}/head:{pull_staging_ref(number)}",
+            )
         if not refspecs:
             return
+        try:
+            await self._git(
+                "fetch",
+                "--quiet",
+                "--no-tags",
+                "--no-write-fetch-head",
+                "origin",
+                *refspecs,
+                heartbeat=heartbeat,
+                retry=retry,
+            )
+        except GitStoreError as exc:
+            if number not in _missing_pull_numbers(exc):
+                raise
+
+    async def _sync_upstream(
+        self,
+        *,
+        heartbeat: Callable[[], None] | None,
+        retry: Callable[[float], None] | None,
+        force: bool = False,
+    ) -> None:
+        if self._upstream_synced and not force:
+            return
+        await self._pin_upstream_refs()
         await self._git(
             "fetch",
             "--quiet",
-            "--no-tags",
+            "--atomic",
+            "--prune",
+            "--prune-tags",
             "--no-write-fetch-head",
             "origin",
-            *refspecs,
+            "+refs/heads/*:refs/heads/*",
+            "+refs/tags/*:refs/tags/*",
             heartbeat=heartbeat,
             retry=retry,
         )
-        if refspecs and refspecs[0].startswith("+refs/heads/"):
-            self._branches_fetched = True
+        await self._pin_upstream_refs()
+        await self._set_head(heartbeat=heartbeat, retry=retry)
+        self._upstream_synced = True
+
+    async def _pin_upstream_refs(self) -> None:
+        lines = (
+            await self._git(
+                "for-each-ref",
+                "--format=%(refname) %(objectname)",
+                "refs/heads",
+                "refs/tags",
+            )
+        ).splitlines()
+        updates = []
+        for line in lines:
+            ref, sha = line.rsplit(" ", 1)
+            if _SHA.fullmatch(sha) is None:
+                raise GitStoreError(f"upstream ref has invalid object ID: {ref}")
+            kind = "heads" if ref.startswith("refs/heads/") else "tags"
+            archive_ref = upstream_ref(kind, sha)
+            updates.append((archive_ref, sha))
+        if updates:
+            await self._git(
+                "update-ref",
+                "--stdin",
+                input_text="".join(f"update {ref} {sha}\n" for ref, sha in updates),
+            )
+
+    async def _set_head(
+        self,
+        *,
+        heartbeat: Callable[[], None] | None,
+        retry: Callable[[float], None] | None,
+    ) -> None:
+        current = (await self._git("symbolic-ref", "-q", "HEAD", ok=(0, 1))).strip()
+        if current and not await self._missing_commits((current,)):
+            return
+        advertised = await self._git(
+            "ls-remote",
+            "--symref",
+            "origin",
+            "HEAD",
+            heartbeat=heartbeat,
+            retry=retry,
+        )
+        for line in advertised.splitlines():
+            if line.startswith("ref: refs/heads/") and line.endswith("\tHEAD"):
+                ref = line.removeprefix("ref: ").removesuffix("\tHEAD")
+                if not await self._missing_commits((ref,)):
+                    await self._git("symbolic-ref", "HEAD", ref)
+                    return
+
+    async def _delete_ref(self, ref: str) -> None:
+        await self._git("update-ref", "-d", ref)
 
     async def _prepare(self) -> None:
         if self._ready:
@@ -355,11 +478,16 @@ class GitObjectStore:
         bare = await self._git("rev-parse", "--is-bare-repository")
         if bare.strip() != "true":
             raise GitStoreError(f"Git store is not bare: {self.path}")
-        bound = await self._git("config", "--get", "gh-puller.repository", ok=(0, 1))
+        bound = await self._git("config", "--get", "github-archive.repository", ok=(0, 1))
         if bound.strip() and bound.strip() != self.repository:
             raise GitStoreError(f"Git store belongs to {bound.strip()}, not {self.repository}")
         if not bound.strip():
-            await self._git("config", "gh-puller.repository", self.repository)
+            await self._git("config", "github-archive.repository", self.repository)
+        layout = await self._git("config", "--get", "github-archive.layoutVersion", ok=(0, 1))
+        if layout.strip() and layout.strip() != GIT_LAYOUT_VERSION:
+            raise GitStoreError(f"unsupported Git archive layout {layout.strip()}")
+        if not layout.strip():
+            await self._git("config", "github-archive.layoutVersion", GIT_LAYOUT_VERSION)
         remote = await self._git("remote", "get-url", "origin", ok=(0, 2))
         if remote.strip() and remote.strip() != self.remote_url:
             raise GitStoreError(f"Git store origin is {remote.strip()}, not {self.remote_url}")
@@ -388,7 +516,7 @@ class GitObjectStore:
                     ok=ok,
                 )
             except GitStoreError as exc:
-                if arguments[0] != "fetch":
+                if arguments[0] not in {"fetch", "ls-remote"}:
                     raise
                 _remove_temporary_packs(self.path)
                 if not _is_transient_fetch_failure(exc):
@@ -450,6 +578,10 @@ def _is_transient_fetch_failure(error: GitStoreError) -> bool:
     return any(marker in detail for marker in _TRANSIENT_FETCH_MARKERS) or bool(
         _TRANSIENT_FETCH_STATUS.search(detail),
     )
+
+
+def _missing_pull_numbers(error: GitStoreError) -> set[int]:
+    return {int(number) for number in _MISSING_PULL_REF.findall(str(error))}
 
 
 def _remove_temporary_packs(path: Path) -> None:

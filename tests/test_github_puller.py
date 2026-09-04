@@ -37,7 +37,6 @@ from gh_puller.github import (
 )
 from gh_puller.github.client import GitHubPage, GitHubResource
 from gh_puller.github.git_store import TransientGitStoreError
-from gh_puller.github.store import SQLiteArchive
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -410,17 +409,29 @@ class FakeGitStore:
     def __init__(self) -> None:
         self.prefetches: list[list[int]] = []
         self.captures: list[int] = []
+        self.syncs = 0
+
+    async def sync_upstream(
+        self,
+        *,
+        heartbeat: Any = None,
+        retry: Any = None,
+    ) -> None:
+        del retry
+        self.syncs += 1
+        if heartbeat is not None:
+            heartbeat()
 
     async def prefetch(
         self,
-        numbers: list[int],
+        pulls: dict[int, dict[str, Any]],
         *,
         heartbeat: Any = None,
         retry: Any = None,
         retry_transient: bool = True,
     ) -> None:
         del retry_transient
-        self.prefetches.append(list(numbers))
+        self.prefetches.append(list(pulls))
         if heartbeat is not None:
             heartbeat()
 
@@ -437,15 +448,16 @@ class FakeGitStore:
         head = pull.get("head")
         base_sha = base.get("sha") if isinstance(base, dict) else "0" * 40
         head_sha = head.get("sha") if isinstance(head, dict) else f"{number:040x}"
-        prefix = f"refs/gh-puller/snapshots/pulls/{number}"
+        prefix = f"refs/github-archive/pulls/{number}"
         return {
-            "base_ref": f"{prefix}/base/{base_sha}",
+            "base_ref": f"{prefix}/bases/{base_sha}",
             "base_sha": base_sha,
             "comparison_kind": "merge_base",
-            "comparison_ref": f"{prefix}/comparison/{base_sha}",
+            "comparison_ref": f"{prefix}/comparisons/{base_sha}",
             "comparison_sha": base_sha,
-            "head_ref": f"{prefix}/head/{head_sha}",
+            "head_ref": f"{prefix}/heads/{head_sha}",
             "head_sha": head_sha,
+            "history_preserved": None,
         }
 
 
@@ -847,7 +859,7 @@ async def test_cold_pull_preserves_raw_fields_and_publishes_target(tmp_path: Pat
     bundle = current[1].bundle
     catalog = current[1].summary
     assert bundle is not None
-    assert bundle["schema_version"] == 6
+    assert bundle["schema_version"] == 7
     assert bundle["issue"]["unknown_detail_field"] == [1, {"raw": "yes"}]
     assert bundle["issue_comments"][0]["future_field"] == {"kept": 1}
     assert bundle["timeline"][0]["rename"] == {"from": "a", "to": "b"}
@@ -933,7 +945,7 @@ async def test_pull_request_bundle_preserves_discussion_and_git_snapshot(tmp_pat
         {"id": 72, "body": "nit", "path": "a.py", "reactions": {"total_count": 1}},
     ]
     api.pages[f"{_BASE}/pulls/comments/72/reactions"] = [{"id": 73, "content": "+1"}]
-    api.pages[f"{pull_path}/commits"] = [{"sha": "abc", "commit": {"message": "change"}}]
+    api.pages[f"{pull_path}/commits"] = [{"sha": "c" * 40, "commit": {"message": "change"}}]
     api.closing[7] = [_closing_issue(11)]
 
     await _puller(_config(tmp_path / "archive"), api=api, git=git, now=lambda: _T0).pull(_T0)
@@ -965,6 +977,25 @@ async def test_pull_request_bundle_preserves_discussion_and_git_snapshot(tmp_pat
     assert git.captures == [7]
     assert not any(call[1] == f"{pull_path}/files" for call in api.calls)
     assert (await _current(tmp_path / "archive"))[7].kind == "pull"
+    assert await _rows(
+        tmp_path / "archive",
+        """
+        SELECT number, base_sha, head_sha, comparison_kind, history_preserved
+        FROM current_pull_git
+        """,
+    ) == [
+        {
+            "number": 7,
+            "base_sha": "a" * 40,
+            "head_sha": "b" * 40,
+            "comparison_kind": "merge_base",
+            "history_preserved": None,
+        },
+    ]
+    assert await _rows(
+        tmp_path / "archive",
+        "SELECT number, ordinal, sha FROM current_pull_commits",
+    ) == [{"number": 7, "ordinal": 0, "sha": "c" * 40}]
     assert not any(call[1] == f"{issue_path}/comments" for call in api.calls)
 
 
@@ -1083,8 +1114,8 @@ async def test_pull_commit_transport_crosses_the_documented_250_limit(
     ]
     api.json[pull_path] = {
         "id": 700,
-        "base": {"sha": "base-sha"},
-        "head": {"sha": "head-sha"},
+        "base": {"sha": "a" * 40},
+        "head": {"sha": "b" * 40},
         "changed_files": 0,
         "commits": commit_count,
         "review_comments": 0,
@@ -1092,7 +1123,7 @@ async def test_pull_commit_transport_crosses_the_documented_250_limit(
     if commit_count <= 250:
         api.pages[f"{pull_path}/commits"] = commits
     else:
-        api.comparisons["base-sha", "head-sha"] = commits
+        api.comparisons["a" * 40, "b" * 40] = commits
 
     await _puller(
         _config(tmp_path / "archive"),
@@ -1130,13 +1161,13 @@ async def test_large_pull_comparison_mismatch_resumes_the_same_task(tmp_path: Pa
     commits = [{"sha": f"{index:040x}"} for index in range(251)]
     api.json[pull_path] = {
         "id": 700,
-        "base": {"sha": "base-sha"},
-        "head": {"sha": "head-sha"},
+        "base": {"sha": "a" * 40},
+        "head": {"sha": "b" * 40},
         "changed_files": 0,
         "commits": 251,
         "review_comments": 0,
     }
-    api.comparisons["base-sha", "head-sha"] = commits
+    api.comparisons["a" * 40, "b" * 40] = commits
     archive = tmp_path / "archive"
     events: list[PullProgress] = []
     puller = _puller(
@@ -1237,7 +1268,7 @@ async def test_transient_git_ref_is_isolated_deferred_and_eventually_staged(
 
         async def prefetch(
             self,
-            numbers: list[int],
+            pulls: dict[int, dict[str, Any]],
             *,
             heartbeat: Any = None,
             retry: Any = None,
@@ -1245,7 +1276,8 @@ async def test_transient_git_ref_is_isolated_deferred_and_eventually_staged(
         ) -> None:
             del retry
             assert not retry_transient
-            self.prefetches.append(list(numbers))
+            numbers = list(pulls)
+            self.prefetches.append(numbers)
             if heartbeat is not None:
                 heartbeat()
             if 6 not in numbers:
@@ -1301,13 +1333,14 @@ async def test_completed_git_batches_survive_a_later_permanent_failure(
     class FailingGitStore(FakeGitStore):
         async def prefetch(
             self,
-            numbers: list[int],
+            pulls: dict[int, dict[str, Any]],
             *,
             heartbeat: Any = None,
             retry: Any = None,
             retry_transient: bool = True,
         ) -> None:
             del heartbeat, retry, retry_transient
+            numbers = list(pulls)
             self.prefetches.append(list(numbers))
             if 9 in numbers:
                 raise GitStoreError("permanent pull ref failure")
@@ -1835,7 +1868,14 @@ async def test_repeated_idempotency_key_returns_the_committed_run(tmp_path: Path
     api.add_issue(1)
     archive = tmp_path / "archive"
     events: list[PullProgress] = []
-    puller = _puller(_config(archive), api=api, now=lambda: _T0, observer=events.append)
+    git = FakeGitStore()
+    puller = _puller(
+        _config(archive),
+        api=api,
+        git=git,
+        now=lambda: _T0,
+        observer=events.append,
+    )
     first = await puller.pull(_T0)
     calls = len(api.calls)
     events.clear()
@@ -1844,6 +1884,7 @@ async def test_repeated_idempotency_key_returns_the_committed_run(tmp_path: Path
 
     assert repeated == first
     assert len(api.calls) == calls
+    assert git.syncs == 1
     runs = await _runs(archive)
     assert [run.target_at for run in runs] == [_iso(_T0)]
     assert [run.changed_items for run in runs] == [1]
@@ -1881,14 +1922,14 @@ async def test_git_retry_is_observable_and_restores_the_work_phase(tmp_path: Pat
     class RetryingGitStore(FakeGitStore):
         async def prefetch(
             self,
-            numbers: list[int],
+            pulls: dict[int, dict[str, Any]],
             *,
             heartbeat: Any = None,
             retry: Any = None,
             retry_transient: bool = True,
         ) -> None:
             del retry_transient
-            self.prefetches.append(list(numbers))
+            self.prefetches.append(list(pulls))
             retry(4)
             heartbeat()
 
@@ -4568,125 +4609,6 @@ async def test_payload_blobs_are_compressed_and_content_addressed(tmp_path: Path
 
 
 @pytest.mark.asyncio
-async def test_v4_archive_migrates_to_v7_without_rebuilding_committed_facts(tmp_path: Path) -> None:
-    api = FakeAPI()
-    api.add_issue(1)
-    archive = tmp_path / "archive"
-    clock = Clock(_T0)
-    puller = _puller(_config(archive), api=api, now=clock, sleep=clock.sleep)
-    await puller.pull(_T0)
-    db = await aiosqlite.connect(archive)
-    try:
-        await db.execute("DROP TABLE pull_tasks")
-        await db.execute("DROP TABLE pull_passes")
-        await db.execute(
-            "UPDATE archive_meta SET value = '4' WHERE key = 'schema_version'",
-        )
-        await db.commit()
-    finally:
-        await db.close()
-    clock.current += timedelta(hours=1)
-
-    result = await puller.pull(clock.current)
-
-    assert result.changed_items == 0
-    assert (await _current(archive))[1].bundle is not None
-    assert await _rows(
-        archive,
-        "SELECT value FROM archive_meta WHERE key = 'schema_version'",
-    ) == [{"value": "7"}]
-    tables = await _rows(
-        archive,
-        "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'pull_%'",
-    )
-    assert {row["name"] for row in tables} == {"pull_passes", "pull_runs", "pull_tasks"}
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("schema_version", ["5", "6"])
-async def test_prior_migration_requeues_pending_resources_without_resetting_catalog(
-    tmp_path: Path,
-    schema_version: str,
-) -> None:
-    api = FakeAPI()
-    api.add_issue(1, pull=True)
-    api.add_issue(2)
-    api.json[f"{_BASE}/pulls/1"] = {
-        "id": 10,
-        "changed_files": 0,
-        "commits": 0,
-        "review_comments": 0,
-    }
-    archive = tmp_path / "archive"
-    await _puller(_config(archive), api=api, now=lambda: _T0).pull(_T0)
-    db = await aiosqlite.connect(archive)
-    try:
-        cursor = await db.execute(
-            """
-            INSERT INTO pull_runs(target_at, started_at, observed_until, status)
-            VALUES (?, ?, ?, 'pending')
-            """,
-            (_iso(_T0 + timedelta(hours=1)), _iso(_T0), _iso(_T0)),
-        )
-        run_id = int(cursor.lastrowid)
-        await db.execute(
-            """
-            INSERT INTO pull_passes(
-                run_id, name, cutoff_at, mode, prepared, catalog_started,
-                catalog_complete, next_url, catalog_pages, catalog_items
-            ) VALUES (?, 'closing', ?, 'delta', 1, 1, 0, 'cursor-2', 1, 100)
-            """,
-            (run_id, _iso(_T0 + timedelta(hours=1))),
-        )
-        await db.execute(
-            """
-            INSERT INTO pull_tasks(
-                run_id, number, github_id, kind, created_at, updated_at,
-                summary_digest, catalog_member, completed
-            )
-            SELECT ?, number, github_id, kind, created_at, updated_at,
-                summary_digest, 1, 1
-            FROM resource_heads
-            """,
-            (run_id,),
-        )
-        await db.execute(
-            """
-            INSERT INTO resource_versions(
-                run_id, observed_at, number, github_id, kind, created_at, updated_at,
-                summary_digest, bundle_digest, present, missing_since
-            )
-            SELECT ?, ?, number, github_id, kind, created_at, updated_at,
-                summary_digest, bundle_digest, present, missing_since
-            FROM resource_heads
-            """,
-            (run_id, _iso(_T0)),
-        )
-        await db.execute(
-            "UPDATE archive_meta SET value = ? WHERE key = 'schema_version'",
-            (schema_version,),
-        )
-        await db.commit()
-    finally:
-        await db.close()
-
-    async with SQLiteArchive(archive, "acme/widgets"):
-        pass
-
-    assert await _rows(archive, "SELECT value FROM archive_meta WHERE key = 'schema_version'") == [
-        {"value": "7"},
-    ]
-    assert await _rows(archive, "SELECT number, completed FROM pull_tasks ORDER BY number") == [
-        {"number": 1, "completed": 0},
-        {"number": 2, "completed": 0},
-    ]
-    assert await _rows(archive, "SELECT next_url, catalog_items FROM pull_passes") == [
-        {"next_url": "cursor-2", "catalog_items": 100},
-    ]
-    assert await _rows(archive, "SELECT number FROM resource_versions WHERE run_id = ?", (run_id,)) == []
-
-
-@pytest.mark.asyncio
 async def test_incompatible_fact_archive_schema_is_rejected(tmp_path: Path) -> None:
     api = FakeAPI()
     api.add_issue(1)
@@ -4696,7 +4618,7 @@ async def test_incompatible_fact_archive_schema_is_rejected(tmp_path: Path) -> N
     db = await aiosqlite.connect(archive)
     try:
         await db.execute(
-            "UPDATE archive_meta SET value = '3' WHERE key = 'schema_version'",
+            "UPDATE archive_meta SET value = '7' WHERE key = 'schema_version'",
         )
         await db.commit()
     finally:
@@ -4710,7 +4632,7 @@ async def test_incompatible_fact_archive_schema_is_rejected(tmp_path: Path) -> N
         ).pull(_T0 + timedelta(hours=1))
 
     assert await _rows(archive, "SELECT value FROM archive_meta WHERE key = 'schema_version'") == [
-        {"value": "3"},
+        {"value": "7"},
     ]
 
 
