@@ -1,7 +1,8 @@
 """GitHub Issue/PR 原始事实的增量观测归档。
 
 “拉取到目标时刻 T”表示在 T 到达后完成一次最终观测，不承诺 T 的历史快照，也不
-承诺发现 GitHub 未通过父对象或评论变化信号暴露的更新；实际完成时刻 C 单独记录。
+承诺发现 GitHub 未通过父对象或评论变化信号暴露的更新。调用时刻 C 在首次 await
+前确定，未指定 T 时令 T = C；实际完成时刻单独记录。
 每个 T 首次成功时原子发布一个 SQLite run，重试返回原 run；限流、网络错误和 HTTP
 5xx 在当前调用内等待恢复，取消或不可恢复错误留下可续跑的 pending run。可检测的不
 完整响应不推进水位。归档由 SQLite 语义事实库和同名 ``.git`` 对象库组成：前者
@@ -10,8 +11,8 @@ PR 的原始 head、比较基点与可用 landing Git 对象。
 静默删除保留为最后一次观测状态。``iter_versions`` 可完全离线重建已观测历史，
 ``iter_heads`` 可直接读取当前状态。
 
-拉取算法、恢复语义和可执行入口见 ``docs/github-puller.md``；公共 SQLite/Git
-格式见 ``docs/github-archive-format.md``。
+拉取算法、恢复语义、公共 SQLite/Git 格式和可执行入口见
+``docs/github-puller.md``。
 """
 
 from .client import GitHubAPI, GitHubAPIError
