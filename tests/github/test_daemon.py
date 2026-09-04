@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-_ROOT = Path(__file__).parents[1]
+_ROOT = Path(__file__).parents[2]
 _SCRIPT = _ROOT / "scripts/github-puller-daemon.sh"
 _REPOSITORY = "acme/widgets"
 _USER = pwd.getpwuid(os.getuid()).pw_name
