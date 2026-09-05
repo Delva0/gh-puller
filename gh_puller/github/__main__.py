@@ -22,7 +22,7 @@ from dotenv import load_dotenv
 from .progress import ConsoleProgress
 from .puller import GitHubPullConfig, GitHubPuller, PullResult
 from .store import schedule_state
-from .v8.migrate import MigrationResult, migrate_archive
+from .v9 import MigrationResult, migrate_archive
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator, Sequence
@@ -204,10 +204,8 @@ def _emit(result: PullResult) -> None:
 
 def _emit_migration(result: MigrationResult) -> None:
     payload = {
-        "bundles": result.bundles,
         "changed": result.changed,
         "database": str(result.database),
-        "refs": result.refs,
         "repository": result.repository,
     }
     print(json.dumps(payload, ensure_ascii=False, sort_keys=True), flush=True)

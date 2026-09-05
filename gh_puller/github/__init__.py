@@ -25,9 +25,19 @@ from .puller import (
     PullResult,
     incremental_pull,
 )
-from .store import ArchivedHead, ArchivedRun, ArchivedVersion, iter_heads, iter_runs, iter_versions
+from .store import (
+    ArchivedFact,
+    ArchivedHead,
+    ArchivedRun,
+    ArchivedVersion,
+    iter_facts,
+    iter_heads,
+    iter_runs,
+    iter_versions,
+)
 
 __all__ = [
+    "ArchivedFact",
     "ArchivedHead",
     "ArchivedRun",
     "ArchivedVersion",
@@ -44,6 +54,7 @@ __all__ = [
     "RateQuota",
     "git_store_path",
     "incremental_pull",
+    "iter_facts",
     "iter_heads",
     "iter_runs",
     "iter_versions",

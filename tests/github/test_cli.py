@@ -15,7 +15,7 @@ import pytest
 from gh_puller.github import PullResult
 from gh_puller.github import __main__ as cli
 from gh_puller.github.store import SQLiteArchive, schedule_state
-from gh_puller.github.v8.migrate import MigrationResult
+from gh_puller.github.v9 import MigrationResult
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -219,13 +219,11 @@ def test_emit_writes_machine_readable_migration_result(
 ) -> None:
     database = tmp_path / "archive.sqlite3"
 
-    cli._emit_migration(MigrationResult(database, "acme/widgets", 7, 11, True))
+    cli._emit_migration(MigrationResult(database, "acme/widgets", True))
 
     assert json.loads(capsys.readouterr().out) == {
-        "bundles": 7,
         "changed": True,
         "database": str(database),
-        "refs": 11,
         "repository": "acme/widgets",
     }
 

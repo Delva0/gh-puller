@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, Any, Self
 import aiosqlite
 
 from .archive_format import PullGitSnapshot, pull_git_snapshot
-from .v8 import GIT_LAYOUT_VERSION, SCHEMA, VERSION
+from .v9 import GIT_LAYOUT_VERSION, SCHEMA, VERSION
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Collection, Iterable
@@ -89,12 +89,26 @@ class StoredHead:
 
 
 @dataclass(frozen=True, slots=True)
+class StagedFact:
+    fact_kind: str  # Versioned supplemental fact family.
+    schema_version: int  # Payload contract version within the fact family.
+    subject_key: str  # Stable identity within the fact family.
+    resource_number: int | None  # Related Issue/PR number, when applicable.
+    source_digest: str | None  # Payload digest from which this observation derives.
+    observed_from: str  # Start of the actual API or Git read window.
+    observed_until: str  # End of the actual API or Git read window.
+    status: str  # Coverage result for this observation.
+    payload: dict[str, Any]  # Canonical source facts and coverage evidence.
+
+
+@dataclass(frozen=True, slots=True)
 class StagedResource:
     head: StoredHead  # State to publish with the run.
     observed_at: str  # Pass watermark associated with this observation.
     summary: dict[str, Any] | None  # None reuses head.summary_digest.
     bundle: dict[str, Any] | None  # None reuses head.bundle_digest.
     http_cache: dict[str, Any] | None = None  # Recoverable transport metadata for bundle.
+    facts: tuple[StagedFact, ...] = ()  # Independently versioned observations to publish.
 
 
 @dataclass(frozen=True, slots=True)
@@ -137,6 +151,70 @@ class ArchivedRun:
     request_count: int  # HTTP attempts accumulated across recovery.
     changed_items: int  # Object versions or tombstones published.
     catalog_items: int  # Objects present after publication.
+
+
+@dataclass(frozen=True, slots=True)
+class ArchivedFact:
+    id: int  # Global replay cursor.
+    batch_id: int  # Atomic publication unit.
+    batch_kind: str  # pull, backfill, or refresh.
+    pull_run_id: int | None  # Normal pull publication identity.
+    job_id: int | None  # Backfill or refresh publication identity.
+    task_id: int | None  # Backfill or refresh work identity.
+    published_at: str  # Batch publication time.
+    ordinal: int  # Stable position inside the batch.
+    fact_kind: str  # Supplemental fact family.
+    schema_version: int  # Payload contract version within the family.
+    subject_key: str  # Stable identity within the family.
+    resource_number: int | None  # Related Issue/PR number, when applicable.
+    source_digest: str | None  # Payload digest from which this observation derives.
+    observed_from: str  # Start of the actual read window.
+    observed_until: str  # End of the actual read window.
+    status: str  # Coverage result for this observation.
+    payload: dict[str, Any]  # Canonical source facts and coverage evidence.
+
+
+@dataclass(frozen=True, slots=True)
+class FactTaskSpec:
+    fact_kind: str  # Versioned supplemental fact family.
+    subject_key: str  # Stable identity within the fact family.
+    resource_number: int | None  # Related Issue/PR number, when applicable.
+    source_digest: str | None  # Existing payload that selected this task.
+
+
+@dataclass(frozen=True, slots=True)
+class FactTask:
+    id: int  # Durable job-local work identity.
+    job_id: int  # Owning backfill or refresh job.
+    fact_kind: str  # Versioned supplemental fact family.
+    subject_key: str  # Stable identity within the fact family.
+    resource_number: int | None  # Related Issue/PR number, when applicable.
+    source_digest: str | None  # Existing payload that selected this task.
+    completed: bool  # A terminal observation attempt was published.
+    outcome: str | None  # Published coverage status; None while pending.
+    attempts: int  # Worker starts persisted across recovery.
+    last_error: str | None  # Most recent retryable execution error.
+
+
+@dataclass(frozen=True, slots=True)
+class FactJob:
+    id: int  # Durable backfill or explicit-refresh identity.
+    job_key: str  # Caller-supplied idempotency key.
+    kind: str  # backfill or refresh.
+    target_at: str  # Requested observation target.
+    requested_at: str  # First request time.
+    completed_at: str | None  # Time all scoped tasks reached an outcome.
+    status: str  # pending or complete.
+    scope_digest: str  # Canonical coverage-scope payload identity.
+    scope: dict[str, Any]  # Fact versions, resource cutoff, and requested targets.
+    total_tasks: int  # Frozen task population.
+    completed_tasks: int  # Tasks with a published terminal attempt.
+
+
+@dataclass(frozen=True, slots=True)
+class StagedTaskFact:
+    task_id: int  # Durable task receiving this result.
+    fact: StagedFact  # Complete attempt to publish.
 
 
 @dataclass(frozen=True, slots=True)
@@ -695,6 +773,309 @@ class SQLiteArchive:
             raise
         return True
 
+    async def stage_facts(self, run_id: int, facts: Iterable[StagedFact]) -> None:
+        """Durably stage supplemental observations for a normal pull.
+
+        Args:
+            run_id: Current pending pull run.
+            facts: Complete observation attempts to publish with that run.
+        """
+        db = self._connection
+        await db.execute("BEGIN IMMEDIATE")
+        try:
+            await _stage_facts(db, run_id, facts)
+            await db.commit()
+        except BaseException:
+            await db.rollback()
+            raise
+
+    async def start_fact_job(
+        self,
+        job_key: str,
+        kind: str,
+        target_at: str,
+        requested_at: str,
+        scope: dict[str, Any],
+        tasks: Iterable[FactTaskSpec],
+    ) -> FactJob:
+        """Create or resume one immutable backfill or refresh scope.
+
+        Args:
+            job_key: Idempotency identity; a new observation uses a new key.
+            kind: ``backfill`` or ``refresh``.
+            target_at: Requested observation target for this job.
+            requested_at: First request time.
+            scope: Explicit fact-set versions, resource cutoff, and selected targets.
+            tasks: Frozen work items covered by the scope.
+
+        Returns:
+            The existing identical job or a newly durable job.
+
+        Raises:
+            RuntimeError: Another fact job is pending.
+            ValueError: The key already names a different immutable scope.
+        """
+        definitions = tuple(sorted(tasks, key=lambda task: (task.fact_kind, task.subject_key)))
+        identities = {(task.fact_kind, task.subject_key) for task in definitions}
+        if len(identities) != len(definitions):
+            raise ValueError("fact task identities must be unique within a job")
+        db = self._connection
+        await db.execute("BEGIN IMMEDIATE")
+        try:
+            scope_digest = await _put_json(db, scope)
+            existing = await _fact_job_by_key(db, job_key)
+            if existing is not None:
+                await _verify_fact_job(db, existing, kind, target_at, scope_digest, definitions)
+                await db.commit()
+                return _fact_job(existing)
+            pending = await _fetchone(db, "SELECT id FROM fact_jobs WHERE status = 'pending'")
+            if pending is not None:
+                raise RuntimeError(f"fact job {pending['id']} must finish first")
+            complete = not definitions
+            cursor = await db.execute(
+                """
+                INSERT INTO fact_jobs(
+                    job_key, kind, target_at, requested_at, completed_at, status,
+                    scope_payload_digest, total_tasks, completed_tasks
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
+                """,
+                (
+                    job_key,
+                    kind,
+                    target_at,
+                    requested_at,
+                    requested_at if complete else None,
+                    "complete" if complete else "pending",
+                    scope_digest,
+                    len(definitions),
+                ),
+            )
+            job_id = int(cursor.lastrowid)
+            await db.executemany(
+                """
+                INSERT INTO fact_tasks(
+                    job_id, fact_kind, subject_key, resource_number, source_digest
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    (
+                        job_id,
+                        task.fact_kind,
+                        task.subject_key,
+                        task.resource_number,
+                        task.source_digest,
+                    )
+                    for task in definitions
+                ),
+            )
+            await db.commit()
+        except BaseException:
+            await db.rollback()
+            raise
+        row = await _fact_job_by_id(db, job_id)
+        if row is None:
+            raise RuntimeError("fact job disappeared after creation")
+        return _fact_job(row)
+
+    async def fact_job(self, job_id: int) -> FactJob:
+        """Read one durable supplemental-fact job.
+
+        Args:
+            job_id: Backfill or refresh job identity.
+
+        Returns:
+            Job scope and independently tracked task completion.
+
+        Raises:
+            KeyError: The job does not exist.
+        """
+        row = await _fact_job_by_id(self._connection, job_id)
+        if row is None:
+            raise KeyError(job_id)
+        return _fact_job(row)
+
+    async def take_fact_tasks(self, job_id: int, limit: int = 100) -> list[FactTask]:
+        """Start a recoverable batch of pending fact tasks.
+
+        Args:
+            job_id: Pending backfill or refresh job.
+            limit: Maximum tasks returned in durable ID order.
+
+        Returns:
+            Pending tasks with their incremented attempt counts.
+        """
+        if limit < 1:
+            raise ValueError("fact task limit must be positive")
+        db = self._connection
+        await db.execute("BEGIN IMMEDIATE")
+        try:
+            job = await _fetchone(db, "SELECT status FROM fact_jobs WHERE id = ?", (job_id,))
+            if job is None:
+                raise KeyError(job_id)
+            if job["status"] == "complete":
+                await db.commit()
+                return []
+            rows = await _fetchall(
+                db,
+                """
+                SELECT * FROM fact_tasks
+                WHERE job_id = ? AND completed = 0
+                ORDER BY id
+                LIMIT ?
+                """,
+                (job_id, limit),
+            )
+            await db.executemany(
+                "UPDATE fact_tasks SET attempts = attempts + 1, last_error = NULL WHERE id = ?",
+                ((int(row["id"]),) for row in rows),
+            )
+            await db.commit()
+        except BaseException:
+            await db.rollback()
+            raise
+        return [_fact_task(row, attempts=int(row["attempts"]) + 1) for row in rows]
+
+    async def record_fact_task_error(self, job_id: int, task_id: int, error: str) -> None:
+        """Persist a retryable task error without publishing a fact result.
+
+        Args:
+            job_id: Pending backfill or refresh job.
+            task_id: Incomplete task identity.
+            error: Concise diagnostic for status reporting.
+
+        Raises:
+            KeyError: The named pending task does not exist.
+        """
+        cursor = await self._connection.execute(
+            """
+            UPDATE fact_tasks SET last_error = ?
+            WHERE id = ? AND job_id = ? AND completed = 0
+            """,
+            (error, task_id, job_id),
+        )
+        if cursor.rowcount != 1:
+            await self._connection.rollback()
+            raise KeyError(task_id)
+        await self._connection.commit()
+
+    async def publish_fact_batch(
+        self,
+        job_id: int,
+        published_at: str,
+        results: Iterable[StagedTaskFact],
+    ) -> FactJob:
+        """Atomically publish completed job tasks as one replay unit.
+
+        Args:
+            job_id: Backfill or refresh job receiving the results.
+            published_at: Actual batch publication time.
+            results: One terminal observation attempt per durable task.
+
+        Returns:
+            Updated job progress and completion state.
+
+        Raises:
+            KeyError: A result does not belong to the job.
+            ValueError: A result changes its task identity.
+        """
+        staged = tuple(results)
+        if len({result.task_id for result in staged}) != len(staged):
+            raise ValueError("a fact task can appear only once per batch")
+        db = self._connection
+        await db.execute("BEGIN IMMEDIATE")
+        try:
+            job = await _fetchone(db, "SELECT * FROM fact_jobs WHERE id = ?", (job_id,))
+            if job is None:
+                raise KeyError(job_id)
+            pending: list[tuple[aiosqlite.Row, StagedFact]] = []
+            for result in staged:
+                task = await _fetchone(
+                    db,
+                    "SELECT * FROM fact_tasks WHERE id = ? AND job_id = ?",
+                    (result.task_id, job_id),
+                )
+                if task is None:
+                    raise KeyError(result.task_id)
+                fact = result.fact
+                if (task["fact_kind"], task["subject_key"], task["resource_number"]) != (
+                    fact.fact_kind,
+                    fact.subject_key,
+                    fact.resource_number,
+                ):
+                    raise ValueError(f"fact result changes task {result.task_id} identity")
+                if not bool(task["completed"]):
+                    pending.append((task, fact))
+            if not pending:
+                await db.commit()
+                return await self.fact_job(job_id)
+            cursor = await db.execute(
+                """
+                INSERT INTO fact_batches(kind, job_id, published_at, fact_count)
+                VALUES (?, ?, ?, ?)
+                """,
+                (job["kind"], job_id, published_at, len(pending)),
+            )
+            batch_id = int(cursor.lastrowid)
+            for ordinal, (task, fact) in enumerate(pending):
+                payload_digest = await _put_json(db, fact.payload)
+                await _insert_fact_version(
+                    db,
+                    batch_id,
+                    ordinal,
+                    int(task["id"]),
+                    fact.fact_kind,
+                    fact.schema_version,
+                    fact.subject_key,
+                    fact.resource_number,
+                    fact.source_digest,
+                    fact.observed_from,
+                    fact.observed_until,
+                    fact.status,
+                    payload_digest,
+                )
+                await db.execute(
+                    """
+                    UPDATE fact_tasks
+                    SET completed = 1, outcome = ?
+                    WHERE id = ?
+                    """,
+                    (fact.status, task["id"]),
+                )
+            progress = await _fetchone(
+                db,
+                """
+                SELECT count(*) AS total,
+                    count(CASE WHEN completed = 1 THEN 1 END) AS completed
+                FROM fact_tasks WHERE job_id = ?
+                """,
+                (job_id,),
+            )
+            if progress is None:
+                raise RuntimeError("failed to summarize fact job")
+            completed = int(progress["completed"])
+            total = int(progress["total"])
+            await db.execute(
+                """
+                UPDATE fact_jobs
+                SET completed_tasks = ?, status = ?, completed_at = ?
+                WHERE id = ?
+                """,
+                (
+                    completed,
+                    "complete" if completed == total else "pending",
+                    published_at if completed == total else None,
+                    job_id,
+                ),
+            )
+            await db.commit()
+        except BaseException:
+            await db.rollback()
+            raise
+        row = await _fact_job_by_id(db, job_id)
+        if row is None:
+            raise RuntimeError("fact job disappeared after publication")
+        return _fact_job(row)
+
     async def finish_pass(self, run_id: int, observed_until: str) -> None:
         """原子闭合 pass、推进 staged 水位并清理途径状态。
 
@@ -877,6 +1258,7 @@ class SQLiteArchive:
             )
             if cursor.rowcount != 1:
                 raise RuntimeError("pending pull changed while finalizing")
+            await _publish_run_facts(db, run_id, completed_at)
             await db.commit()
         except BaseException:
             await db.rollback()
@@ -1116,6 +1498,72 @@ async def iter_runs(path: Path) -> AsyncIterator[ArchivedRun]:
         await db.close()
 
 
+async def iter_facts(
+    path: Path,
+    *,
+    after: int = 0,
+) -> AsyncIterator[ArchivedFact]:
+    """Stream published supplemental observations in stable replay order.
+
+    Args:
+        path: SQLite fact archive.
+        after: Exclusive ``ArchivedFact.id`` cursor; zero starts from the beginning.
+
+    Yields:
+        Published observations with their atomic batch and source identity.
+    """
+    db = await aiosqlite.connect(_readonly_uri(Path(path)), uri=True)
+    db.row_factory = aiosqlite.Row
+    try:
+        cursor = await db.execute(
+            """
+            SELECT
+                v.*, b.kind AS batch_kind, b.pull_run_id, b.job_id, b.published_at,
+                p.codec, p.raw_size, p.payload
+            FROM fact_versions AS v
+            JOIN fact_batches AS b ON b.id = v.batch_id
+            LEFT JOIN pull_runs AS r ON r.id = b.pull_run_id
+            JOIN payload_blobs AS p ON p.digest = v.payload_digest
+            WHERE v.id > ? AND (b.pull_run_id IS NULL OR r.status = 'committed')
+            ORDER BY v.id
+            """,
+            (after,),
+        )
+        async for row in cursor:
+            payload = _decode_row(
+                str(row["payload_digest"]),
+                str(row["codec"]),
+                int(row["raw_size"]),
+                bytes(row["payload"]),
+            )
+            if not isinstance(payload, dict):
+                raise TypeError(f"fact payload {row['payload_digest']} is not a JSON object")
+            yield ArchivedFact(
+                id=int(row["id"]),
+                batch_id=int(row["batch_id"]),
+                batch_kind=str(row["batch_kind"]),
+                pull_run_id=None if row["pull_run_id"] is None else int(row["pull_run_id"]),
+                job_id=None if row["job_id"] is None else int(row["job_id"]),
+                task_id=None if row["task_id"] is None else int(row["task_id"]),
+                published_at=str(row["published_at"]),
+                ordinal=int(row["ordinal"]),
+                fact_kind=str(row["fact_kind"]),
+                schema_version=int(row["schema_version"]),
+                subject_key=str(row["subject_key"]),
+                resource_number=(
+                    None if row["resource_number"] is None else int(row["resource_number"])
+                ),
+                source_digest=None if row["source_digest"] is None else str(row["source_digest"]),
+                observed_from=str(row["observed_from"]),
+                observed_until=str(row["observed_until"]),
+                status=str(row["status"]),
+                payload=payload,
+            )
+        await cursor.close()
+    finally:
+        await db.close()
+
+
 async def _put_json(db: aiosqlite.Connection, value: Any) -> str:
     raw = _json_bytes(value)
     digest = hashlib.sha256(raw).hexdigest()
@@ -1240,6 +1688,7 @@ async def _stage_resources(
                 present=head.present,
                 missing_since=head.missing_since,
             )
+        await _stage_facts(db, run_id, resource.facts)
         if await _current_head(db, run_id, head.number) == head:
             continue
         await db.execute(
@@ -1251,6 +1700,246 @@ async def _stage_resources(
             """,
             (run_id, resource.observed_at, *_head_values(head)),
         )
+
+
+async def _stage_facts(
+    db: aiosqlite.Connection,
+    run_id: int,
+    facts: Iterable[StagedFact],
+) -> None:
+    run = await _fetchone(db, "SELECT status FROM pull_runs WHERE id = ?", (run_id,))
+    if run is None or run["status"] != "pending":
+        raise RuntimeError("supplemental facts require a pending pull")
+    for fact in facts:
+        payload_digest = await _put_json(db, fact.payload)
+        await db.execute(
+            """
+            INSERT OR IGNORE INTO pending_fact_versions(
+                run_id, fact_kind, schema_version, subject_key, resource_number,
+                source_digest, observed_from, observed_until, status, payload_digest
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                run_id,
+                fact.fact_kind,
+                fact.schema_version,
+                fact.subject_key,
+                fact.resource_number,
+                fact.source_digest,
+                fact.observed_from,
+                fact.observed_until,
+                fact.status,
+                payload_digest,
+            ),
+        )
+
+
+async def _publish_run_facts(
+    db: aiosqlite.Connection,
+    run_id: int,
+    published_at: str,
+) -> None:
+    rows = await _fetchall(
+        db,
+        "SELECT * FROM pending_fact_versions WHERE run_id = ? ORDER BY id",
+        (run_id,),
+    )
+    if not rows:
+        return
+    cursor = await db.execute(
+        """
+        INSERT INTO fact_batches(kind, pull_run_id, published_at, fact_count)
+        VALUES ('pull', ?, ?, ?)
+        """,
+        (run_id, published_at, len(rows)),
+    )
+    batch_id = int(cursor.lastrowid)
+    for ordinal, row in enumerate(rows):
+        await _insert_fact_version(
+            db,
+            batch_id,
+            ordinal,
+            None,
+            str(row["fact_kind"]),
+            int(row["schema_version"]),
+            str(row["subject_key"]),
+            None if row["resource_number"] is None else int(row["resource_number"]),
+            None if row["source_digest"] is None else str(row["source_digest"]),
+            str(row["observed_from"]),
+            str(row["observed_until"]),
+            str(row["status"]),
+            str(row["payload_digest"]),
+        )
+    await db.execute("DELETE FROM pending_fact_versions WHERE run_id = ?", (run_id,))
+
+
+async def _insert_fact_version(
+    db: aiosqlite.Connection,
+    batch_id: int,
+    ordinal: int,
+    task_id: int | None,
+    fact_kind: str,
+    schema_version: int,
+    subject_key: str,
+    resource_number: int | None,
+    source_digest: str | None,
+    observed_from: str,
+    observed_until: str,
+    status: str,
+    payload_digest: str,
+) -> None:
+    cursor = await db.execute(
+        """
+        INSERT INTO fact_versions(
+            batch_id, task_id, ordinal, fact_kind, schema_version, subject_key,
+            resource_number, source_digest, observed_from, observed_until,
+            status, payload_digest
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            batch_id,
+            task_id,
+            ordinal,
+            fact_kind,
+            schema_version,
+            subject_key,
+            resource_number,
+            source_digest,
+            observed_from,
+            observed_until,
+            status,
+            payload_digest,
+        ),
+    )
+    version_id = int(cursor.lastrowid)
+    successful = version_id if status in {"complete", "null"} else None
+    await db.execute(
+        """
+        INSERT INTO fact_heads(
+            fact_kind, subject_key, latest_version_id, successful_version_id
+        ) VALUES (?, ?, ?, ?)
+        ON CONFLICT(fact_kind, subject_key) DO UPDATE SET
+            latest_version_id = excluded.latest_version_id,
+            successful_version_id = coalesce(
+                excluded.successful_version_id,
+                fact_heads.successful_version_id
+            )
+        """,
+        (fact_kind, subject_key, version_id, successful),
+    )
+
+
+async def _fact_job_by_id(
+    db: aiosqlite.Connection,
+    job_id: int,
+) -> aiosqlite.Row | None:
+    return await _fetchone(
+        db,
+        """
+        SELECT
+            j.*, p.codec AS scope_codec, p.raw_size AS scope_size,
+            p.payload AS scope_payload
+        FROM fact_jobs AS j
+        JOIN payload_blobs AS p ON p.digest = j.scope_payload_digest
+        WHERE j.id = ?
+        """,
+        (job_id,),
+    )
+
+
+async def _fact_job_by_key(
+    db: aiosqlite.Connection,
+    job_key: str,
+) -> aiosqlite.Row | None:
+    return await _fetchone(
+        db,
+        """
+        SELECT
+            j.*, p.codec AS scope_codec, p.raw_size AS scope_size,
+            p.payload AS scope_payload
+        FROM fact_jobs AS j
+        JOIN payload_blobs AS p ON p.digest = j.scope_payload_digest
+        WHERE j.job_key = ?
+        """,
+        (job_key,),
+    )
+
+
+async def _verify_fact_job(
+    db: aiosqlite.Connection,
+    row: aiosqlite.Row,
+    kind: str,
+    target_at: str,
+    scope_digest: str,
+    definitions: tuple[FactTaskSpec, ...],
+) -> None:
+    if (row["kind"], row["target_at"], row["scope_payload_digest"]) != (
+        kind,
+        target_at,
+        scope_digest,
+    ):
+        raise ValueError("fact job key already names a different scope")
+    tasks = await _fetchall(
+        db,
+        """
+        SELECT fact_kind, subject_key, resource_number, source_digest
+        FROM fact_tasks WHERE job_id = ?
+        ORDER BY fact_kind, subject_key
+        """,
+        (row["id"],),
+    )
+    stored = tuple(
+        FactTaskSpec(
+            fact_kind=str(task["fact_kind"]),
+            subject_key=str(task["subject_key"]),
+            resource_number=(
+                None if task["resource_number"] is None else int(task["resource_number"])
+            ),
+            source_digest=(None if task["source_digest"] is None else str(task["source_digest"])),
+        )
+        for task in tasks
+    )
+    if stored != definitions:
+        raise ValueError("fact job key already names a different task population")
+
+
+def _fact_job(row: aiosqlite.Row) -> FactJob:
+    scope = _decode_row(
+        str(row["scope_payload_digest"]),
+        str(row["scope_codec"]),
+        int(row["scope_size"]),
+        bytes(row["scope_payload"]),
+    )
+    if not isinstance(scope, dict):
+        raise TypeError("fact job scope is not a JSON object")
+    return FactJob(
+        id=int(row["id"]),
+        job_key=str(row["job_key"]),
+        kind=str(row["kind"]),
+        target_at=str(row["target_at"]),
+        requested_at=str(row["requested_at"]),
+        completed_at=None if row["completed_at"] is None else str(row["completed_at"]),
+        status=str(row["status"]),
+        scope_digest=str(row["scope_payload_digest"]),
+        scope=scope,
+        total_tasks=int(row["total_tasks"]),
+        completed_tasks=int(row["completed_tasks"]),
+    )
+
+
+def _fact_task(row: aiosqlite.Row, *, attempts: int | None = None) -> FactTask:
+    return FactTask(
+        id=int(row["id"]),
+        job_id=int(row["job_id"]),
+        fact_kind=str(row["fact_kind"]),
+        subject_key=str(row["subject_key"]),
+        resource_number=None if row["resource_number"] is None else int(row["resource_number"]),
+        source_digest=None if row["source_digest"] is None else str(row["source_digest"]),
+        completed=bool(row["completed"]),
+        outcome=None if row["outcome"] is None else str(row["outcome"]),
+        attempts=int(row["attempts"]) if attempts is None else attempts,
+        last_error=None if row["last_error"] is None else str(row["last_error"]),
+    )
 
 
 async def _put_pull_git_index(
