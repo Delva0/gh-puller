@@ -5,12 +5,13 @@ runtime configuration injection. Fake registered adapters avoid SDK construction
 while a temporary CBM cache makes filesystem readiness checks deterministic.
 """
 
+import json
 from pathlib import Path
 
 import pytest
 from gh_puller.agent import AGENTS
 from gh_puller.agent.adapters.codex import codex_home_setup
-from gh_puller.agent.adapters.dsh import dsh_cordis_path
+from gh_puller.agent.adapters.dsh import dsh_patch_path
 from gh_puller.deepwiki.utils import adapt_generator
 from gh_puller.utils import Repo
 
@@ -102,23 +103,27 @@ def test_adapter_chain_gets_injected_graphify_config(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_dsh_cordis_isolation_and_graphify():
-    """Isolate the built-in DSH profile and inject tools only through this layer.
+def test_dsh_profile_patch_isolates_persistence_and_injects_graph_tools(tmp_path):
+    """Keep DSH state scoped while injecting tools only through this layer.
 
-    Workspace context, skills, and local tools remain disabled. The default profile
-    contains no tool server; ``_gh_puller_mcp`` is the sole injection point.
+    The shipped ``sdk-minimal`` profile owns the isolated agent tree;
+    ``_gh_puller_mcp`` is the sole MCP injection point.
     """
-    text = Path(dsh_cordis_path()).read_text(encoding="utf-8")
-    assert "workspaceContext: false" in text
-    assert "includeHarnessIdentity: false" in text
-    assert "includeRuntimeContext: false" in text
-    assert "toolBash: false" in text and "toolJobs: false" in text
-    assert "goals: false" in text
-    assert "mcp-gh-puller" not in text  # runtime_config owns MCP injection.
-    with_mcp = Path(dsh_cordis_path(generators._gh_puller_mcp("dsh"))).read_text(encoding="utf-8")
-    assert "- id: mcp-gh-puller" in with_mcp
-    assert "serverName: gh_puller" in with_mcp
-    assert "gh_puller_mcp" in with_mcp and "--tool-profile" in with_mcp
+    path = dsh_patch_path(
+        session_root=str(tmp_path / "sessions"),
+        mcp_servers=generators._gh_puller_mcp("dsh"),
+        cwd=str(tmp_path),
+    )
+    rows = json.loads(Path(path).read_text(encoding="utf-8"))
+    assert rows[0] == {
+        "id": "sessions",
+        "config": {"root": str(tmp_path / "sessions"), "compression": "none"},
+    }
+    mcp = rows[1]["insert"][0]
+    assert mcp["id"] == "mcp-gh-puller"
+    assert mcp["config"]["serverName"] == "gh_puller"
+    assert "gh_puller_mcp" in mcp["config"]["args"]
+    assert "--tool-profile" in mcp["config"]["args"]
 
 
 def test_codex_home_isolation_and_graphify(tmp_path):

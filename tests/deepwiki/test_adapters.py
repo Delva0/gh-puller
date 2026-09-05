@@ -46,6 +46,8 @@ def test_dsh_options_config(monkeypatch, tmp_path):
     repo = Repo(str(tmp_path), "local")
     monkeypatch.setitem(AGENTS, "dsh", _FakeGenerator)
     monkeypatch.setattr(_FakeGenerator, "generator", "dsh")
+    monkeypatch.setattr(deepwiki_utils.envs, "DSH_HOME", str(tmp_path / "dsh-home"))
+    monkeypatch.setattr(deepwiki_utils.envs, "DSH_BIN", "/opt/dsh")
     fake_mcp = [{"id": "fake", "command": "x"}]
     cfg = adapt_generator(
         **_gen_kwargs({"generator": "dsh", "generator_config": {"mcp_servers": fake_mcp}}),
@@ -54,6 +56,8 @@ def test_dsh_options_config(monkeypatch, tmp_path):
     assert cfg["cwd"] == str(tmp_path)
     assert "model" not in cfg  # File-backed models are not part of the request contract.
     assert "api_key" not in cfg and "base_url" not in cfg
+    assert cfg["dsh_home"] == str(tmp_path / "dsh-home")
+    assert cfg["dsh_bin"] == "/opt/dsh"
     assert cfg["session_root"].endswith("dsh-sessions")
     assert "dsh-runtime" in cfg["runtime_cwd"]  # Runtime state stays outside the task checkout.
     assert cfg["system_prompt"] == "sys"  # The adapter maps this concept to DSH_SYSTEM_PROMPT.

@@ -17,7 +17,9 @@ benchmark 评测相关 key 见文末分节。
 
 import os
 
-# ---- dsh 运行隔离(非凭证) ----
+# ---- DSH process locations ----
+DSH_HOME = os.path.expanduser(os.environ.get("DSH_HOME", "~/.gh-puller/dsh-home"))
+DSH_BIN = os.path.expanduser(os.environ.get("DSH_BIN", ""))
 DSH_SESSION_ROOT = os.path.expanduser(os.environ.get("DSH_SESSION_ROOT", "~/.gh-puller/dsh-sessions"))
 # runtime 进程 cwd(也是它读取 .env 的加载点):必须远离任务 checkout —— 仓库自带
 # .env(可含 DEEPSEEK_*/其它字面键)会注入子进程(隔离链上唯一真实泄漏口,runtime_cwd

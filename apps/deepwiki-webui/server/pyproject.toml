@@ -26,12 +26,17 @@ url = "https://pypi.org/simple"
 
 [tool.uv.sources]
 gh-puller = { path = "../../..", editable = true }
+deepseek-harness-sdk = { path = "../../../../deepseek-harness/python/sdk", editable = true }
+deepseek-harness-runtime-bin = { path = "../../../../deepseek-harness/python/sdk-runtime", editable = true }
 
 [dependency-groups]
 dev = [
     "httpx",
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
+]
+dsh = [
+    "deepseek-harness-sdk",
 ]
 
 [tool.pytest.ini_options]

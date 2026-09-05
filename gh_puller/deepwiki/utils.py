@@ -201,7 +201,8 @@ def adapt_generator(generator: str | None = None, *, generator_config: dict | No
       cwd, once caused the exec process to write docs into gh-puller);
       generator_cache_write_mode (generator-cache persistence, wiki structure/
       pages) adds Write/add_dirs/acceptEdits, default opens only Read/Grep/Glob.
-    - dsh: session_root/runtime_cwd + system_prompt → composed persona.
+    - dsh: explicit home, optional local CLI, isolated sessions/runtime cwd, and
+      system prompt are supplied to the SDK profile.
 
     One instance = one conversation (fresh construction per retry/stage; the SDK
     object is assembled at construction time).
@@ -217,6 +218,9 @@ def adapt_generator(generator: str | None = None, *, generator_config: dict | No
         options = {**resolved, "system_prompt": system_prompt}
     elif gid == "dsh":
         options: dict[str, Any] = dict(resolved)
+        options.setdefault("dsh_home", envs.DSH_HOME)
+        if envs.DSH_BIN:
+            options.setdefault("dsh_bin", envs.DSH_BIN)
         options.update({
             "session_root": envs.DSH_SESSION_ROOT,
             "runtime_cwd": envs.DSH_RUNTIME_CWD,  # .env 加载点越过任务 checkout(见 envs)

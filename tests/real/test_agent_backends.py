@@ -17,6 +17,13 @@ from gh_puller import agent
 from gh_puller.agent.events import fold_state
 
 DSH_MODEL = os.environ.get("DSH_MODEL", "deepseek-v4-flash")
+DSH_BIN = os.environ.get("DSH_BIN")
+DSH_HOME = os.path.expanduser(os.environ.get("DSH_HOME", "~/.dsh"))
+DSH_PROFILE = os.environ.get("DSH_PROFILE", "sdk")
+DSH_PROVIDER = os.environ.get("DSH_PROVIDER", "deepseek-official")
+DSH_RUNTIME_CWD = (
+    os.path.expanduser(value) if (value := os.environ.get("DSH_RUNTIME_CWD")) else None
+)
 LLM_MODEL = os.environ.get("LLM_MODEL", "deepseek-v4-flash")
 MODEL_CODEX = "gpt-5.6-luna"
 
@@ -154,30 +161,43 @@ async def test_llm_stream_real(tmp_path):
     _assert_flow(await _read_single_session(tmp_path), "llm")
 
 
-@pytest.mark.skip(
-    reason="the DSH SDK stdio runtime is unavailable in this development environment",
-)
 @pytest.mark.asyncio
 async def test_dsh_stream_real(tmp_path):
-    """Run DSH through its SDK-managed runtime and credentials."""
+    """Run DSH through its local CLI, profile-owned credentials, and real model."""
+    if not DSH_BIN:
+        pytest.skip("DSH_BIN must name a local dsh executable")
+
     work = tmp_path / "work"
     work.mkdir()
     sessions = tmp_path / "dsh-sessions"
     sessions.mkdir()
     agent.configure(file_dir=str(tmp_path), ws_urls=[], otel_urls=[])
     config = {
-        "provider": "deepseek-official",
+        "provider": DSH_PROVIDER,
         "model": DSH_MODEL,
         "cwd": str(work),
+        "dsh_home": DSH_HOME,
+        "dsh_bin": DSH_BIN,
+        "profile": DSH_PROFILE,
         "session_root": str(sessions),
-        "max_tokens": 1024,
+        "system_prompt": "简短回答用户。",
+        "max_tokens": 256,
+        "request_timeout_seconds": 180,
     }
+    if DSH_RUNTIME_CWD:
+        config["runtime_cwd"] = DSH_RUNTIME_CWD
     subject = agent.Dsh(config)
     async with subject.session(session_name="real:dsh", run_id="r-dsh"):
-        parts = await _collect(subject.stream("你好"))
-    print("dsh response:", "".join(parts))
-    assert "".join(parts) != "", "DSH should emit text deltas"
-    _assert_flow(await _read_single_session(tmp_path), "dsh")
+        first = await _collect(subject.stream("你好，请记住代号“蓝鲸”。"))
+        second = await _collect(subject.stream("刚才让你记住的代号是什么？"))
+    print("dsh responses:", "".join(first), "|", "".join(second))
+    assert "".join(first) != "", "DSH should emit text deltas"
+    assert "蓝鲸" in "".join(second), "DSH should retain the native conversation"
+    events = await _read_single_session(tmp_path)
+    system = [item for item in fold_state(events)["context"]
+              if item["type"] == "message" and item.get("role") == "system"]
+    assert "简短回答用户" in _text_of(system), "DSH should apply the configured persona"
+    _assert_flow(events, "dsh")
 
 
 @pytest.mark.asyncio

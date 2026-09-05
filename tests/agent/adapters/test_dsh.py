@@ -1,13 +1,16 @@
 """Test the DeepSeek Harness Agent adapter contract."""
 
 import asyncio
+import json
 import sys
 import types
+from pathlib import Path
 from typing import ClassVar
 
 import pytest
 
 from gh_puller import agent
+from gh_puller.agent.adapters.dsh import dsh_fields
 from gh_puller.agent.context import instruction, tool_defs
 from gh_puller.agent.events import fold_state, function_call_item, reasoning_item, text_message
 from tests.agent._support import (
@@ -90,6 +93,70 @@ def _dsh_events(value: str) -> list[dict]:
     ]
 
 
+def test_dsh_fields_use_profile_api_and_generated_patch(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("CBM_CACHE_DIR", "/tmp/cbm")
+    user_patch = tmp_path / "user.patch.yml"
+    fields = dsh_fields({
+        "provider": "p",
+        "model": "m",
+        "reasoning_effort": "max",
+        "system_prompt": "system",
+        "cwd": str(tmp_path),
+        "dsh_home": str(tmp_path / "home"),
+        "dsh_bin": "/opt/dsh",
+        "session_root": str(tmp_path / "sessions"),
+        "mcp_servers": [{
+            "id": "mcp-graph",
+            "serverName": "graph",
+            "command": "uv",
+            "args": ["run", "serve"],
+            "env_vars": ["CBM_CACHE_DIR"],
+        }],
+        "patches": [str(user_patch)],
+    })
+
+    assert fields["profile"] == "sdk-minimal"
+    assert fields["reasoning_effort"] == "max"
+    assert fields["env"] == {"DSH_SYSTEM_PROMPT": "system"}
+    assert fields["dsh_bin"] == "/opt/dsh"
+    assert fields["patches"][1] == str(user_patch)
+    rows = json.loads(Path(fields["patches"][0]).read_text(encoding="utf-8"))
+    assert rows[0] == {
+        "id": "sessions",
+        "config": {"root": str(tmp_path / "sessions"), "compression": "none"},
+    }
+    assert rows[1]["insert"] == [{
+        "id": "mcp-graph",
+        "name": "@deepseek-ai/dsh-mcp-client",
+        "config": {
+            "serverName": "graph",
+            "transport": "stdio",
+            "failOnStartupError": True,
+            "reconnect": {"enabled": False},
+            "command": "uv",
+            "args": ["run", "serve"],
+            "cwd": str(tmp_path),
+            "env": {"CBM_CACHE_DIR": "/tmp/cbm"},
+        },
+    }]
+
+
+def test_dsh_fields_patch_full_profile_persona(tmp_path) -> None:
+    fields = dsh_fields({
+        "profile": "sdk",
+        "system_prompt": "project persona",
+        "env": {"DSH_SYSTEM_PROMPT": "explicit persona"},
+        "dsh_home": str(tmp_path / "home"),
+    })
+
+    rows = json.loads(Path(fields["patches"][0]).read_text(encoding="utf-8"))
+    assert fields["env"]["DSH_SYSTEM_PROMPT"] == "explicit persona"
+    assert rows == [{
+        "id": "system-prompt",
+        "config": {"persona": "explicit persona"},
+    }]
+
+
 @pytest.mark.asyncio
 async def test_dsh_is_retained_as_multi_turn_adapter(monkeypatch, tmp_path) -> None:
     _install_dsh(monkeypatch, [_dsh_events("a1"), _dsh_events("a2")])
@@ -101,7 +168,7 @@ async def test_dsh_is_retained_as_multi_turn_adapter(monkeypatch, tmp_path) -> N
     events = await _capture(tmp_path)
     subject = agent.Dsh({
         "provider": "p", "model": "m", "system_prompt": "system",
-        "cordis": "/tmp/fake.yml",
+        "dsh_home": str(tmp_path / "dsh-home"),
     })
     async with subject.session(session="dsh/s"):
         assert await _collect(subject.stream("q1")) == "a1"
@@ -162,7 +229,7 @@ async def test_dsh_normalizes_model_tools_before_local_activity(monkeypatch, tmp
 
     monkeypatch.setattr(asyncio, "to_thread", immediate)
     events = await _capture(tmp_path)
-    subject = agent.Dsh({"provider": "p", "model": "m", "cordis": "/tmp/fake.yml"})
+    subject = agent.Dsh({"provider": "p", "model": "m", "dsh_home": str(tmp_path / "dsh-home")})
     async with subject.session(session="dsh/tool"):
         assert await _collect(subject.stream("q")) == ""
     await _settle()
@@ -228,7 +295,7 @@ async def test_dsh_surface_replacement_becomes_context_set(monkeypatch, tmp_path
 
     monkeypatch.setattr(asyncio, "to_thread", immediate)
     events = await _capture(tmp_path)
-    subject = agent.Dsh({"provider": "p", "model": "m", "cordis": "/tmp/fake.yml"})
+    subject = agent.Dsh({"provider": "p", "model": "m", "dsh_home": str(tmp_path / "dsh-home")})
     async with subject.session(session="dsh/replace"):
         assert await _collect(subject.stream("old question")) == ""
     await _settle()

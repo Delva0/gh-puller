@@ -1,8 +1,16 @@
-"""Configure DeepSeek Harness and adapt its native event model to canonical events."""
+"""Adapt DeepSeek Harness profiles and native session events.
+
+DSH owns process launch, profile composition, persistence, and tool execution. This
+adapter supplies only public Python SDK options plus an invocation patch for the
+repository-scoped persistence and MCP rows, then projects root-session notifications
+into the canonical Agent event language.
+"""
 
 import asyncio
 import contextlib
 import hashlib
+import json
+import os
 import tempfile
 from pathlib import Path
 from typing import TypedDict
@@ -21,152 +29,158 @@ from ..events import (
 
 
 class DshConfig(TypedDict, total=False):
-    """dsh runtime config: keys are DeepSeekHarness kwargs names (see __init__.py)."""
+    """Public DSH SDK options plus Agent-owned prompt, persistence, and MCP inputs."""
 
     provider: str
     model: str
+    reasoning_effort: str
     system_prompt: str
     max_tokens: int
     cwd: str
     runtime_cwd: str
+    dsh_home: str
     session_root: str
-    env: dict
-    cordis: str  # composition file path (missing → built-in isolated composition)
+    profile: str
+    patches: tuple[str, ...] | list[str]
+    env: dict[str, str]
     mcp_servers: list[dict]
     base_url: str
     api_key: str
-    runtime_bin: str
-    launch_args_override: list[str]
+    dsh_bin: str
+    initialize_timeout_seconds: float
     request_timeout_seconds: float
     shutdown_timeout_seconds: float
 
 
 def dsh_fields(config: dict) -> dict:
-    """DshConfig → DeepSeekHarness constructor kwargs (key names passthrough).
+    """Map Agent configuration to public ``DeepSeekHarness`` keyword options.
 
-    DeepSeekHarnessConfig is a dataclass (no model_dump) and
-    DeepSeekHarness.__init__(config=None, **kwargs) type-errors when both are
-    passed — kwargs only; system_prompt is the single key-aware mapping
-    (→ env.DSH_SYSTEM_PROMPT, existing env key wins); no cordis → built-in
-    isolated composition (see dsh_cordis_path).
+    Args:
+        config: Complete DSH Agent configuration. Explicit invocation patches run
+            after the generated persistence and MCP patch.
+
+    Returns:
+        SDK keyword options with ``system_prompt`` mapped to the child environment.
     """
-    names = ("provider", "model", "max_tokens", "cwd", "runtime_cwd", "session_root",
-             "env", "runtime_bin", "launch_args_override",
-             "request_timeout_seconds", "shutdown_timeout_seconds", "base_url", "api_key",
-             "cordis")
+    names = (
+        "provider", "model", "reasoning_effort", "max_tokens", "cwd", "runtime_cwd",
+        "dsh_home", "env", "base_url", "api_key", "dsh_bin", "initialize_timeout_seconds",
+        "request_timeout_seconds", "shutdown_timeout_seconds",
+    )
     fields = {k: v for k, v in ((k, config.get(k)) for k in names) if v is not None}
+    env = dict(fields.get("env") or {})
     if config.get("system_prompt"):
-        env = dict(fields.get("env") or {})
         env.setdefault("DSH_SYSTEM_PROMPT", config["system_prompt"])
+    if env:
         fields["env"] = env
-    fields.setdefault("cordis", dsh_cordis_path(config.get("mcp_servers")))
+    profile = config.get("profile") or "sdk-minimal"
+    fields["profile"] = profile
+    patches = []
+    system_prompt = env.get("DSH_SYSTEM_PROMPT")
+    if config.get("session_root") or config.get("mcp_servers") or (
+        system_prompt and profile != "sdk-minimal"
+    ):
+        patches.append(dsh_patch_path(
+            session_root=config.get("session_root"),
+            mcp_servers=config.get("mcp_servers"),
+            profile=profile,
+            cwd=config.get("cwd"),
+            system_prompt=system_prompt,
+        ))
+    patches.extend(config.get("patches") or ())
+    if patches:
+        fields["patches"] = tuple(patches)
     return fields
 
 
 def dsh_harness(config: dict):
-    """Build the optional DSH SDK client from normalized fields."""
+    """Build the optional DSH SDK client from normalized fields.
+
+    Args:
+        config: Complete DSH Agent configuration.
+
+    Returns:
+        A reusable synchronous ``DeepSeekHarness`` instance.
+    """
     from deepseek_harness import DeepSeekHarness  # Lazy optional SDK import.
 
-    return DeepSeekHarness(**dsh_fields(config))
+    fields = dsh_fields(config)
+    for name in ("runtime_cwd", "dsh_home"):
+        if path := fields.get(name):
+            Path(path).expanduser().mkdir(mode=0o700, parents=True, exist_ok=True)
+    return DeepSeekHarness(**fields)
 
 
-_DSH_CORDIS_FILE: str | None = None
+def _dsh_mcp_row(spec: dict, cwd: str | None) -> dict:
+    """Build one DSH MCP client row from the shared subprocess description."""
+    transport = spec.get("transport") or "stdio"
+    config = {
+        "serverName": spec.get("serverName") or spec.get("id") or "mcp-server",
+        "transport": transport,
+        "failOnStartupError": spec.get("failOnStartupError", True),
+        "reconnect": spec.get("reconnect", {"enabled": False}),
+    }
+    if transport == "stdio":
+        config.update({
+            "command": spec.get("command") or "python3",
+            "args": list(spec.get("args") or []),
+        })
+        if workdir := spec.get("cwd") or cwd:
+            config["cwd"] = str(Path(workdir).expanduser().resolve())
+        env = dict(spec.get("env") or {})
+        env.update({name: os.environ[name] for name in spec.get("env_vars") or [] if name in os.environ})
+        if env:
+            config["env"] = env
+    else:
+        config["url"] = spec.get("url") or ""
+        if spec.get("headers"):
+            config["headers"] = dict(spec["headers"])
+    if spec.get("toolCallTimeoutMs") is not None:
+        config["toolCallTimeoutMs"] = spec["toolCallTimeoutMs"]
+    return {
+        "id": spec.get("id") or f"mcp-{config['serverName']}",
+        "name": "@deepseek-ai/dsh-mcp-client",
+        "config": config,
+    }
 
 
-def dsh_cordis_path(mcp_servers: list[dict] | None = None) -> str:
-    """Return a content-addressed isolated Cordis composition path."""
-    global _DSH_CORDIS_FILE
-    if mcp_servers is None:
-        if _DSH_CORDIS_FILE is None:
-            _DSH_CORDIS_FILE = _dsh_cordis_write(None)
-        return _DSH_CORDIS_FILE
-    return _dsh_cordis_write(mcp_servers)
+def dsh_patch_path(*, session_root: str | None = None,
+                   mcp_servers: list[dict] | None = None,
+                   profile: str = "sdk-minimal", cwd: str | None = None,
+                   system_prompt: str | None = None) -> str:
+    """Write a content-addressed DSH invocation patch.
 
+    Args:
+        session_root: Optional uncompressed JSONL persistence root.
+        mcp_servers: Shared MCP server descriptions to insert into the profile.
+        profile: Selected DSH profile, which determines its persistence row id.
+        cwd: Agent workspace used as the default stdio MCP working directory.
+        system_prompt: Persona override for profiles built on ``dsh-base``.
 
-def _dsh_cordis_write(mcp_servers: list[dict] | None) -> str:
-    """Write the minimal composition plus injected MCP servers once per content hash."""
-    # SHA-1 is a cache key, not a security primitive.
-    digest = hashlib.sha1(_DSH_CORDIS_YAML.encode()).hexdigest()[:8]  # noqa: S324
-    text = _DSH_CORDIS_YAML
-    for spec in mcp_servers or []:
-        text = _dsh_mcp_section(spec) + text
-        digest = hashlib.sha1((digest + repr(sorted(spec.items()))).encode()).hexdigest()[:8]  # noqa: S324
-    path = Path(tempfile.gettempdir()) / "gh-puller" / f"dsh-cordis-{digest}.yml"
-    path.parent.mkdir(parents=True, exist_ok=True)
+    Returns:
+        Absolute path to a stable JSON-form patch file.
+    """
+    rows = []
+    if session_root:
+        rows.append({
+            "id": "sessions" if profile == "sdk-minimal" else "session-persistence-jsonl",
+            "config": {
+                "root": str(Path(session_root).expanduser().resolve()),
+                "compression": "none",
+            },
+        })
+    if system_prompt and profile != "sdk-minimal":
+        rows.append({"id": "system-prompt", "config": {"persona": system_prompt}})
+    if mcp_servers:
+        rows.append({"insert": [_dsh_mcp_row(spec, cwd) for spec in mcp_servers]})
+    compact = json.dumps(rows, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    digest = hashlib.sha256(compact.encode()).hexdigest()[:12]
+    path = Path(tempfile.gettempdir()) / "gh-puller" / "dsh" / f"adapter-{digest}.patch.json"
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     if not path.exists():
-        path.write_text(text, encoding="utf-8")
+        path.write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
+        path.chmod(0o600)
     return str(path)
-
-
-def _dsh_mcp_section(spec: dict) -> str:
-    """Render one generic local MCP server as a Cordis YAML section."""
-    args = " ".join(f"'{a}'" for a in spec.get("args") or [])
-    return (
-        f"- id: {spec.get('id', 'mcp-server')}\n"
-        f"  name: '@deepseek-ai/dsh-mcp-client'\n"
-        f"  config:\n"
-        f"    serverName: {spec.get('serverName', '')}\n"
-        f"    transport: stdio\n"
-        f"    command: {spec.get('command', 'python3')}\n"
-        f"    args: [{args}]\n"
-        f"    cwd: !!js process.env.DSH_CWD ?? process.cwd()\n"
-        f"    failOnStartupError: true\n"
-        f"    reconnect:\n      enabled: false\n"
-    )
-
-
-# The composition disables ambient context, skills, built-in tools, and MCP discovery.
-_DSH_CORDIS_YAML = """- id: sdk-jsonrpc-server
-  name: '@deepseek-ai/dsh-sdk-jsonrpc-server'
-  config:
-    maxTokensAsSuccess: false
-- id: llm-deepseek
-  name: '@deepseek-ai/dsh-llm-deepseek'
-- id: sandbox
-  name: '@deepseek-ai/dsh-sandbox-local'
-- id: sandbox-policy
-  name: '@deepseek-ai/dsh-sandbox-policy'
-  config:
-    mode: danger-full-access
-    workspaceRoot: !!js process.env.DSH_CWD ?? process.cwd()
-- id: subprocess
-  name: '@deepseek-ai/dsh-subprocess-local'
-- id: pty
-  name: '@deepseek-ai/dsh-terminal'
-- id: terminal-bash
-  name: '@deepseek-ai/dsh-terminal-bash'
-  config:
-    timeoutMs: 300000
-- id: fs-local
-  name: '@deepseek-ai/dsh-fs-local'
-  config:
-    cwd: !!js process.env.DSH_CWD ?? process.cwd()
-- id: agent-spine
-  name: '@deepseek-ai/dsh-agent-spine-demo'
-  config:
-    includeHarnessIdentity: false
-    includeRuntimeContext: false
-    persona: !!js process.env.DSH_SYSTEM_PROMPT ?? 'You are a helpful software engineer assistant.'
-    workspaceContext: false
-    skills:
-      enabled: false
-    toolBash: false
-    toolJobs: false
-    goals: false
-- id: persistent-bash
-  name: '@deepseek-ai/dsh-tool-bash-persistent'
-  config:
-    timeoutMs: 300000
-- id: str-replace-editor
-  name: '@deepseek-ai/dsh-tool-str-replace-editor'
-  config:
-    maxOutputChars: 16000
-- id: sessions
-  name: '@deepseek-ai/dsh-session-persistence-jsonl'
-  config:
-    root: !!js process.env.DSH_SESSION_ROOT ?? './.sessions'
-    compression: none
-"""
 
 
 def _dsh_session_id(session: str) -> str:
