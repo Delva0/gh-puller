@@ -1,7 +1,7 @@
-"""将 systemd 状态与 journald 进度事件投影为只读写者状态。
+"""将 systemd、journald 与 SQLite 发布进度投影为只读写者状态。
 
-本模块只观察由 daemon installer 管理的 unit，不打开 SQLite、不访问 GitHub，
-也不把运维状态写回事实库。进度事件契约见 progress，服务身份契约见运维脚本。
+本模块只观察由 daemon installer 管理的 unit，不访问 GitHub，也不把运维状态写回
+事实库。普通拉取进度来自 journald，补采进度从 SQLite 持久任务只读恢复。
 """
 
 from __future__ import annotations
@@ -11,8 +11,10 @@ import hashlib
 import json
 import os
 import re
+import sqlite3
 import subprocess
 import sys
+import zlib
 from dataclasses import dataclass
 from datetime import UTC, datetime, tzinfo
 from pathlib import Path
@@ -72,10 +74,32 @@ class ProgressState:
 
 
 @dataclass(frozen=True, slots=True)
+class FactJobState:
+    id: int  # Durable maintenance job identity.
+    kind: str  # backfill or refresh.
+    status: str  # pending or complete.
+    target_at: datetime  # Requested observation target.
+    resource_cutoff: int | None  # Frozen published resource-version boundary.
+    fact_cutoff: int | None  # Frozen preexisting supplemental-fact boundary.
+    fact_sets: tuple[tuple[str, int], ...]  # Requested family/schema contracts.
+    completed_tasks: int  # Tasks with a terminal primary result.
+    total_tasks: int  # Frozen missing-work population.
+    task_outcomes: tuple[tuple[str, int], ...]  # Primary result counts by status.
+    fact_outcomes: tuple[tuple[str, str, int], ...]  # Published facts by family/status.
+    next_task: tuple[str, str, int] | None  # Family, subject, and attempt count.
+    latest_fact: tuple[str, str, str] | None  # Family, subject, and latest status.
+    latest_success: tuple[str, str] | None  # Family and subject of latest successful fact.
+    updated_at: datetime  # Latest durable request or batch publication.
+    last_error: str | None  # Retryable error on the next pending task.
+
+
+@dataclass(frozen=True, slots=True)
 class WriterStatus:
     writer: ManagedWriter  # Static installer configuration.
     service: ServiceState  # Current systemd process state.
     progress: ProgressState | None  # Latest valid progress journal event.
+    maintenance: FactJobState | None = None  # Latest durable supplemental job.
+    archive_error: str | None = None  # Read-only supplemental-status failure.
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -140,25 +164,30 @@ def _collect(
     systemctl: str,
     journalctl: str,
 ) -> list[WriterStatus]:
-    return [
-        WriterStatus(
-            writer=writer,
-            service=_service_state(systemctl, writer.unit),
-            progress=_latest_progress(
-                _output(
-                    [
-                        journalctl,
-                        "--unit",
-                        writer.unit,
-                        "--output=cat",
-                        f"--lines={_JOURNAL_LINES}",
-                        "--no-pager",
-                    ],
+    statuses = []
+    for writer in writers:
+        maintenance, error = _fact_job_status(writer.database)
+        statuses.append(
+            WriterStatus(
+                writer=writer,
+                service=_service_state(systemctl, writer.unit),
+                progress=_latest_progress(
+                    _output(
+                        [
+                            journalctl,
+                            "--unit",
+                            writer.unit,
+                            "--output=cat",
+                            f"--lines={_JOURNAL_LINES}",
+                            "--no-pager",
+                        ],
+                    ),
                 ),
+                maintenance=maintenance,
+                archive_error=error,
             ),
         )
-        for writer in writers
-    ]
+    return statuses
 
 
 def _service_state(systemctl: str, unit: str) -> ServiceState:
@@ -226,6 +255,164 @@ def _latest_progress(output: str) -> ProgressState | None:
     return None
 
 
+def _fact_job_status(database: Path) -> tuple[FactJobState | None, str | None]:
+    if not database.is_file():
+        return None, None
+    connection: sqlite3.Connection | None = None
+    try:
+        connection = sqlite3.connect(f"{database.resolve().as_uri()}?mode=ro", uri=True)
+        connection.row_factory = sqlite3.Row
+        table = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'fact_jobs'",
+        ).fetchone()
+        if table is None:
+            return None, None
+        row = connection.execute(
+            """
+            SELECT j.*, p.codec, p.raw_size, p.payload
+            FROM fact_jobs AS j
+            JOIN payload_blobs AS p ON p.digest = j.scope_payload_digest
+            ORDER BY j.id DESC
+            LIMIT 1
+            """,
+        ).fetchone()
+        if row is None:
+            return None, None
+        scope = _scope_payload(row)
+        task_outcomes = tuple(
+            (str(item["outcome"]), int(item["count"]))
+            for item in connection.execute(
+                """
+                SELECT coalesce(outcome, 'pending') AS outcome, count(*) AS count
+                FROM fact_tasks WHERE job_id = ?
+                GROUP BY coalesce(outcome, 'pending')
+                ORDER BY outcome
+                """,
+                (row["id"],),
+            )
+        )
+        fact_outcomes = tuple(
+            (str(item["fact_kind"]), str(item["status"]), int(item["count"]))
+            for item in connection.execute(
+                """
+                SELECT v.fact_kind, v.status, count(*) AS count
+                FROM fact_versions AS v
+                JOIN fact_batches AS b ON b.id = v.batch_id
+                WHERE b.job_id = ?
+                GROUP BY v.fact_kind, v.status
+                ORDER BY v.fact_kind, v.status
+                """,
+                (row["id"],),
+            )
+        )
+        pending = connection.execute(
+            """
+            SELECT fact_kind, subject_key, attempts, last_error
+            FROM fact_tasks
+            WHERE job_id = ? AND completed = 0
+            ORDER BY id
+            LIMIT 1
+            """,
+            (row["id"],),
+        ).fetchone()
+        latest = connection.execute(
+            """
+            SELECT v.fact_kind, v.subject_key, v.status, b.published_at
+            FROM fact_versions AS v
+            JOIN fact_batches AS b ON b.id = v.batch_id
+            WHERE b.job_id = ?
+            ORDER BY v.id DESC
+            LIMIT 1
+            """,
+            (row["id"],),
+        ).fetchone()
+        success = connection.execute(
+            """
+            SELECT v.fact_kind, v.subject_key
+            FROM fact_versions AS v
+            JOIN fact_batches AS b ON b.id = v.batch_id
+            WHERE b.job_id = ? AND v.status IN ('complete', 'null')
+            ORDER BY v.id DESC
+            LIMIT 1
+            """,
+            (row["id"],),
+        ).fetchone()
+        target_at = _required_time(row["target_at"], "fact job target")
+        updated = row["requested_at"] if latest is None else latest["published_at"]
+        updated_at = _required_time(updated, "fact job update")
+        fact_sets = scope.get("fact_sets")
+        versions = (
+            ()
+            if not isinstance(fact_sets, dict)
+            else tuple(
+                (str(kind), int(version))
+                for kind, version in sorted(fact_sets.items())
+                if isinstance(version, int) and not isinstance(version, bool)
+            )
+        )
+        return (
+            FactJobState(
+                id=int(row["id"]),
+                kind=str(row["kind"]),
+                status=str(row["status"]),
+                target_at=target_at,
+                resource_cutoff=_int(scope.get("resource_version_cutoff")),
+                fact_cutoff=_int(scope.get("fact_version_cutoff")),
+                fact_sets=versions,
+                completed_tasks=int(row["completed_tasks"]),
+                total_tasks=int(row["total_tasks"]),
+                task_outcomes=task_outcomes,
+                fact_outcomes=fact_outcomes,
+                next_task=(
+                    None
+                    if pending is None
+                    else (
+                        str(pending["fact_kind"]),
+                        str(pending["subject_key"]),
+                        int(pending["attempts"]),
+                    )
+                ),
+                latest_fact=(
+                    None
+                    if latest is None
+                    else (
+                        str(latest["fact_kind"]),
+                        str(latest["subject_key"]),
+                        str(latest["status"]),
+                    )
+                ),
+                latest_success=(None if success is None else (str(success["fact_kind"]), str(success["subject_key"]))),
+                updated_at=updated_at,
+                last_error=None if pending is None or pending["last_error"] is None else str(pending["last_error"]),
+            ),
+            None,
+        )
+    except (json.JSONDecodeError, OSError, sqlite3.Error, TypeError, ValueError, zlib.error) as exc:
+        return None, f"{type(exc).__name__}: {exc}"
+    finally:
+        if connection is not None:
+            connection.close()
+
+
+def _scope_payload(row: sqlite3.Row) -> dict[str, object]:
+    if row["codec"] != "zlib-json-v1":
+        raise ValueError(f"unsupported scope codec {row['codec']}")
+    raw = zlib.decompress(bytes(row["payload"]))
+    if len(raw) != int(row["raw_size"]):
+        raise ValueError("fact job scope has an invalid size")
+    value = json.loads(raw)
+    if not isinstance(value, dict):
+        raise TypeError("fact job scope is not an object")
+    return value
+
+
+def _required_time(value: object, context: str) -> datetime:
+    parsed = _time(value)
+    if parsed is None:
+        raise ValueError(f"{context} is invalid")
+    return parsed
+
+
 def _render_table(
     statuses: Sequence[WriterStatus],
     now: datetime | None = None,
@@ -279,6 +466,10 @@ def _render_detail(
         rows.append(("WAIT", _wait(progress, observed_at)))
     if progress and progress.detail:
         rows.append(("DETAIL", progress.detail))
+    if status.maintenance is not None:
+        rows.extend(_maintenance_rows(status.maintenance, observed_at, zone))
+    if status.archive_error is not None:
+        rows.append(("ARCHIVE", status.archive_error))
     width = max(len(key) for key, _ in rows)
     lines = []
     for key, value in rows:
@@ -288,11 +479,58 @@ def _render_detail(
     return "\n".join(lines)
 
 
-def _overview_line(values: Sequence[str]) -> str:
-    cells = (
-        f"{_fit(value, width):<{width}}"
-        for value, width in zip(values, _OVERVIEW_WIDTHS, strict=True)
+def _maintenance_rows(
+    job: FactJobState,
+    now: datetime,
+    zone: tzinfo | None,
+) -> list[tuple[str, str]]:
+    rows = [
+        ("FACT JOB", f"{job.kind}#{job.id} {job.status}"),
+        ("FACT TARGET", _local_time(job.target_at, zone)),
+        ("FACT SCOPE", _fact_scope(job)),
+        ("FACT TASKS", _meter("tasks", job.completed_tasks, job.total_tasks, 20)),
+        ("FACT RESULTS", _count_pairs(job.task_outcomes)),
+        ("FACT DATA", _fact_counts(job.fact_outcomes)),
+    ]
+    if job.next_task is not None:
+        kind, subject, attempts = job.next_task
+        rows.append(("FACT NEXT", f"{kind} {subject} attempt={attempts}"))
+    if job.latest_fact is not None:
+        kind, subject, outcome = job.latest_fact
+        rows.append(("FACT LATEST", f"{kind} {subject} {outcome}"))
+    if job.latest_success is not None:
+        rows.append(("FACT SUCCESS", " ".join(job.latest_success)))
+    rows.append(
+        (
+            "FACT UPDATED",
+            f"{_local_time(job.updated_at, zone)}; {_age(job.updated_at, now)} ago",
+        ),
     )
+    if job.last_error is not None:
+        rows.append(("FACT ERROR", job.last_error))
+    return rows
+
+
+def _fact_scope(job: FactJobState) -> str:
+    cutoffs = []
+    if job.resource_cutoff is not None:
+        cutoffs.append(f"resources<={job.resource_cutoff:,}")
+    if job.fact_cutoff is not None:
+        cutoffs.append(f"facts<={job.fact_cutoff:,}")
+    versions = ", ".join(f"{kind}@{version}" for kind, version in job.fact_sets)
+    return "; ".join((*cutoffs, versions))
+
+
+def _count_pairs(items: tuple[tuple[str, int], ...]) -> str:
+    return "-" if not items else " ".join(f"{key}={value:,}" for key, value in items)
+
+
+def _fact_counts(items: tuple[tuple[str, str, int], ...]) -> str:
+    return "-" if not items else "\n".join(f"{kind} {status}={count:,}" for kind, status, count in items)
+
+
+def _overview_line(values: Sequence[str]) -> str:
+    cells = (f"{_fit(value, width):<{width}}" for value, width in zip(values, _OVERVIEW_WIDTHS, strict=True))
     return " ".join(cells).rstrip()
 
 
@@ -300,7 +538,7 @@ def _fit(value: str, width: int) -> str:
     if len(value) <= width:
         return value
     left = (width - 1) // 2
-    return f"{value[:left]}…{value[-(width - left - 1):]}"
+    return f"{value[:left]}…{value[-(width - left - 1) :]}"
 
 
 def _short_service(service: ServiceState) -> str:

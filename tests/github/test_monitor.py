@@ -9,8 +9,11 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta, timezone
 from typing import TYPE_CHECKING
 
+import pytest
+
 from gh_puller.github import monitor
 from gh_puller.github.progress import RateQuota
+from gh_puller.github.store import SQLiteArchive
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -198,10 +201,75 @@ def test_detail_shows_the_actionable_error_message(tmp_path: Path) -> None:
         zone=_LOCAL,
     )
 
-    assert (
-        "DETAIL      IncompleteGitHubDataError: pull #7 advertised 251 commits, got 250"
-        in output
+    assert "DETAIL      IncompleteGitHubDataError: pull #7 advertised 251 commits, got 250" in output
+
+
+def test_detail_separates_fact_task_completion_from_data_availability(tmp_path: Path) -> None:
+    job = monitor.FactJobState(
+        id=3,
+        kind="backfill",
+        status="pending",
+        target_at=_EVENT_AT,
+        resource_cutoff=42,
+        fact_cutoff=7,
+        fact_sets=(("commit-object", 1), ("commit-references", 1)),
+        completed_tasks=8,
+        total_tasks=10,
+        task_outcomes=(("complete", 8), ("pending", 2)),
+        fact_outcomes=(
+            ("commit-object", "complete", 5),
+            ("commit-object", "unavailable", 2),
+            ("commit-references", "complete", 8),
+        ),
+        next_task=("commit-references", "bundle:abc", 2),
+        latest_fact=("commit-object", "commit:def", "unavailable"),
+        latest_success=("commit-references", "bundle:def"),
+        updated_at=_EVENT_AT - timedelta(seconds=4),
+        last_error="GitStoreError: disconnected",
     )
+    status = replace(_status(tmp_path / "facts.sqlite3"), maintenance=job)
+
+    output = monitor._render_detail(
+        status,
+        now=_EVENT_AT,
+        zone=_LOCAL,
+    )
+
+    assert "FACT JOB      backfill#3 pending" in output
+    assert "FACT SCOPE    resources<=42; facts<=7; commit-object@1, commit-references@1" in output
+    assert "FACT TASKS    tasks [################----] 8/10" in output
+    assert "FACT RESULTS  complete=8 pending=2" in output
+    assert "commit-object unavailable=2" in output
+    assert "FACT NEXT     commit-references bundle:abc attempt=2" in output
+    assert "FACT ERROR    GitStoreError: disconnected" in output
+
+
+@pytest.mark.asyncio
+async def test_fact_status_is_recovered_from_sqlite_without_journal(tmp_path: Path) -> None:
+    database = tmp_path / "facts.sqlite3"
+    scope = {
+        "fact_sets": {"git-refs": 1},
+        "resource_version_cutoff": 9,
+        "fact_version_cutoff": 4,
+    }
+    async with SQLiteArchive(database, "acme/widgets") as archive:
+        await archive.start_fact_job(
+            "backfill:test",
+            "backfill",
+            "2026-09-02T10:00:00Z",
+            "2026-09-02T10:00:00Z",
+            scope,
+            (),
+        )
+
+    status, error = monitor._fact_job_status(database)
+
+    assert error is None
+    assert status is not None
+    assert status.kind == "backfill"
+    assert status.status == "complete"
+    assert status.resource_cutoff == 9
+    assert status.fact_sets == (("git-refs", 1),)
 
 
 def test_quota_keeps_unknown_fields_explicit() -> None:

@@ -22,6 +22,14 @@ class CommitReference:
     source_id: str | int | None  # Stable GitHub source identity when present.
 
 
+@dataclass(frozen=True, slots=True)
+class CommitReferenceSource:
+    kind: str  # bundle or independently published supplemental fact family.
+    digest: str  # Content identity of the source payload.
+    resource_number: int | None  # Related Issue/PR number.
+    references: tuple[CommitReference, ...]  # Ordered structured fields in the source.
+
+
 def bundle_commit_references(bundle: dict[str, Any]) -> tuple[CommitReference, ...]:
     """Extract all contract-defined commit fields from one historical bundle.
 

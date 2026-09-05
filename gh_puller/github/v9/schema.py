@@ -89,8 +89,7 @@ ON fact_versions(fact_kind, subject_key, id);
 CREATE INDEX IF NOT EXISTS fact_versions_resource
 ON fact_versions(resource_number, id) WHERE resource_number IS NOT NULL;
 
-CREATE UNIQUE INDEX IF NOT EXISTS one_fact_version_per_task
-ON fact_versions(task_id) WHERE task_id IS NOT NULL;
+DROP INDEX IF EXISTS one_fact_version_per_task;
 
 CREATE TABLE IF NOT EXISTS fact_heads (
     fact_kind TEXT NOT NULL,

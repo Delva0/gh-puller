@@ -133,9 +133,7 @@ async def test_fact_publication_is_atomic_replayable_and_keeps_success(tmp_path:
         await archive.prepare_pass(run.id, (), 1)
         await archive.stage_catalog_page(
             run.id,
-            (
-                CatalogItem(7, 70, "issue", _T0, _T0, _resource(_T0, ()).summary or {}),
-            ),
+            (CatalogItem(7, 70, "issue", _T0, _T0, _resource(_T0, ()).summary or {}),),
             None,
         )
         task = (await archive.pending_catalog_tasks(run.id))[0]
@@ -172,8 +170,7 @@ async def test_fact_publication_is_atomic_replayable_and_keeps_success(tmp_path:
             "SELECT version_id, status FROM current_facts WHERE fact_kind = 'issue-relations'",
         ).fetchone()
         latest = connection.execute(
-            "SELECT version_id, status FROM latest_fact_attempts "
-            "WHERE fact_kind = 'issue-relations'",
+            "SELECT version_id, status FROM latest_fact_attempts WHERE fact_kind = 'issue-relations'",
         ).fetchone()
     assert current == (1, "complete")
     assert latest == (3, "failed")
@@ -196,14 +193,17 @@ async def test_fact_job_is_idempotent_resumable_and_publishes_batches(tmp_path: 
         job = await archive.start_fact_job("baseline:42", "backfill", _T0, _T0, scope, specs)
         assert job.status == "pending"
         assert (job.completed_tasks, job.total_tasks) == (0, 2)
-        assert await archive.start_fact_job(
-            "baseline:42",
-            "backfill",
-            _T0,
-            _T1,
-            scope,
-            reversed(specs),
-        ) == job
+        assert (
+            await archive.start_fact_job(
+                "baseline:42",
+                "backfill",
+                _T0,
+                _T1,
+                scope,
+                reversed(specs),
+            )
+            == job
+        )
         with pytest.raises(ValueError, match="different scope"):
             await archive.start_fact_job(
                 "baseline:42",
@@ -225,9 +225,19 @@ async def test_fact_job_is_idempotent_resumable_and_publishes_batches(tmp_path: 
             task.id,
             _fact("issue-relations", "issue:7", _T0, "complete", {"blocking": []}),
         )
-        job = await archive.publish_fact_batch(job.id, _T0, (first,))
+        derived = StagedTaskFact(
+            task.id,
+            _fact(
+                "commit-references",
+                "bundle:abc",
+                _T0,
+                "complete",
+                {"references": []},
+            ),
+        )
+        job = await archive.publish_fact_batch(job.id, _T0, (first, derived))
         assert (job.status, job.completed_tasks) == ("pending", 1)
-        assert await archive.publish_fact_batch(job.id, _T0, (first,)) == job
+        assert await archive.publish_fact_batch(job.id, _T0, (first, derived)) == job
 
         task = (await archive.take_fact_tasks(job.id, 1))[0]
         second = StagedTaskFact(
@@ -253,8 +263,9 @@ async def test_fact_job_is_idempotent_resumable_and_publishes_batches(tmp_path: 
     assert [(fact.id, fact.batch_kind, fact.job_id) for fact in facts] == [
         (1, "backfill", job.id),
         (2, "backfill", job.id),
+        (3, "backfill", job.id),
     ]
     assert all(fact.task_id is not None for fact in facts)
     with sqlite3.connect(database) as connection:
         assert connection.execute("SELECT count(*) FROM fact_batches").fetchone()[0] == 2
-        assert connection.execute("SELECT count(*) FROM current_facts").fetchone()[0] == 1
+        assert connection.execute("SELECT count(*) FROM current_facts").fetchone()[0] == 2

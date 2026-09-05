@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 from .client import GitHubAPI, GitHubAPIError, GitHubPage, GitHubResource
 from .commit_references import (
     CommitReference,
+    CommitReferenceSource,
     bundle_commit_references,
     review_thread_commit_references,
 )
@@ -491,31 +492,7 @@ class GitHubPuller:
             )
         elif (state.name, state.cutoff_at) != (pass_name, _iso(cutoff)):
             raise RuntimeError("another observation pass must finish first")
-        progress.git_sync()
-        refs_observed_from = _iso(self._now())
-        try:
-            refs = await git.sync_upstream(
-                heartbeat=progress.git_heartbeat,
-                retry=progress.git_retry,
-            )
-        finally:
-            progress.git_done()
-        await archive.stage_facts(
-            run_id,
-            (
-                StagedFact(
-                    fact_kind="git-refs",
-                    schema_version=_GIT_REFS_FACT_VERSION,
-                    subject_key="repository",
-                    resource_number=None,
-                    source_digest=None,
-                    observed_from=refs_observed_from,
-                    observed_until=_iso(self._now()),
-                    status="complete",
-                    payload={"operation": "GitRefObservation", "raw": refs},
-                ),
-            ),
-        )
+        await archive.stage_facts(run_id, (await self._git_refs_fact(git, progress),))
         if not state.prepared:
             state = await self._prepare_pass(api, archive, state, observed, progress)
         completed, total = await archive.task_progress(run_id)
@@ -772,9 +749,7 @@ class GitHubPuller:
         store_lock: asyncio.Lock,
     ) -> set[int]:
         indexed = {task.number: task for task in tasks}
-        summaries = {
-            task.number: task.summary for task in tasks if task.summary is not None
-        }
+        summaries = {task.number: task.summary for task in tasks if task.summary is not None}
         preloaded = set(summaries)
         previous_states: dict[
             int,
@@ -887,7 +862,9 @@ class GitHubPuller:
                 if previous is None or previous.summary_digest != json_digest(detail):
                     stored_summary = detail
             source_digest = json_digest(bundle)
-            facts = tuple(replace(fact, source_digest=source_digest) for fact in facts)
+            facts = tuple(
+                replace(fact, source_digest=source_digest) if fact.source_digest is None else fact for fact in facts
+            )
             return number, bundle, stored_summary, http_cache, facts
 
         async def fetch_batch(
@@ -1026,13 +1003,9 @@ class GitHubPuller:
             kind,
             _CLOSING_REFERENCE_BATCH_SIZE,
         ):
-            closing_pulls = [
-                number for number in closing_batch if kind(number) == "pull"
-            ]
+            closing_pulls = [number for number in closing_batch if kind(number) == "pull"]
             closing_references = (
-                await api.closing_issue_references(self._owner, self._repo, closing_pulls)
-                if closing_pulls
-                else {}
+                await api.closing_issue_references(self._owner, self._repo, closing_pulls) if closing_pulls else {}
             )
             for batch in _pull_batches(
                 closing_batch,
@@ -1082,9 +1055,7 @@ class GitHubPuller:
             )
             comments = comment_resource.value
             cache = comment_resource.cache
-            if not isinstance(comments, list) or any(
-                not isinstance(comment, dict) for comment in comments
-            ):
+            if not isinstance(comments, list) or any(not isinstance(comment, dict) for comment in comments):
                 raise IncompleteGitHubDataError(
                     f"GitHub returned invalid issue comments for {issue_path}",
                 )
@@ -1116,9 +1087,7 @@ class GitHubPuller:
             )
             reactions = reaction_resource.value
             cache = reaction_resource.cache
-            if not isinstance(reactions, list) or any(
-                not isinstance(reaction, dict) for reaction in reactions
-            ):
+            if not isinstance(reactions, list) or any(not isinstance(reaction, dict) for reaction in reactions):
                 raise IncompleteGitHubDataError(
                     f"GitHub returned invalid reactions for {issue_path}",
                 )
@@ -1218,17 +1187,11 @@ class GitHubPuller:
         )
         reviews = review_resource.value
         cache = review_resource.cache
-        if not isinstance(reviews, list) or any(
-            not isinstance(review, dict) for review in reviews
-        ):
+        if not isinstance(reviews, list) or any(not isinstance(review, dict) for review in reviews):
             raise IncompleteGitHubDataError(f"GitHub returned invalid reviews for {path}")
         _set_cache(http_cache, "reviews", cache)
-        thread_fact, review_comment_resource, review_comments = (
-            await self._review_threads_fact(api, number)
-        )
-        if review_comments is None and (
-            force_comments or not _is_zero_integer(pull.get("review_comments"))
-        ):
+        thread_fact, review_comment_resource, review_comments = await self._review_threads_fact(api, number)
+        if review_comments is None and (force_comments or not _is_zero_integer(pull.get("review_comments"))):
             review_comment_resource = await api.pull_review_comments(
                 self._owner,
                 self._repo,
@@ -1266,9 +1229,7 @@ class GitHubPuller:
             )
             commits = commit_resource.value
             cache = commit_resource.cache
-            if not isinstance(commits, list) or any(
-                not isinstance(commit, dict) for commit in commits
-            ):
+            if not isinstance(commits, list) or any(not isinstance(commit, dict) for commit in commits):
                 raise IncompleteGitHubDataError(f"GitHub returned invalid commits for {path}")
             _set_cache(http_cache, "commits", cache)
         requested_reviewers = _embedded_review_requests(pull)
@@ -1348,9 +1309,7 @@ class GitHubPuller:
         if not isinstance(value, dict):
             raise IncompleteGitHubDataError(f"pull #{number} has invalid review thread facts")
         comments = value.get("review_comments")
-        if not isinstance(comments, list) or any(
-            not isinstance(comment, dict) for comment in comments
-        ):
+        if not isinstance(comments, list) or any(not isinstance(comment, dict) for comment in comments):
             raise IncompleteGitHubDataError(f"pull #{number} has invalid thread comments")
         observed_until = _iso(self._now())
         fact = StagedFact(
@@ -1371,6 +1330,32 @@ class GitHubPuller:
             },
         )
         return fact, resource, comments
+
+    async def _git_refs_fact(
+        self,
+        git: _GitStore,
+        progress: _PullProgressTracker,
+    ) -> StagedFact:
+        observed_from = _iso(self._now())
+        progress.git_sync()
+        try:
+            refs = await git.sync_upstream(
+                heartbeat=progress.git_heartbeat,
+                retry=progress.git_retry,
+            )
+        finally:
+            progress.git_done()
+        return StagedFact(
+            fact_kind="git-refs",
+            schema_version=_GIT_REFS_FACT_VERSION,
+            subject_key="repository",
+            resource_number=None,
+            source_digest=None,
+            observed_from=observed_from,
+            observed_until=_iso(self._now()),
+            status="complete",
+            payload={"operation": "GitRefObservation", "raw": refs},
+        )
 
     async def _issue_relations_fact(self, api: _API, number: int) -> StagedFact:
         observed_from = _iso(self._now())
@@ -1416,22 +1401,36 @@ class GitHubPuller:
     ) -> tuple[StagedFact, ...]:
         number = int(bundle["number"])
         sources = [
-            ("bundle", json_digest(bundle), bundle_commit_references(bundle)),
+            CommitReferenceSource(
+                "bundle",
+                json_digest(bundle),
+                number,
+                bundle_commit_references(bundle),
+            ),
         ]
         sources.extend(
-            (
+            CommitReferenceSource(
                 "review-threads",
                 json_digest(fact.payload),
+                number,
                 review_thread_commit_references(fact.payload),
             )
             for fact in parent_facts
             if fact.fact_kind == "review-threads" and fact.status == "complete"
         )
-        by_sha: dict[str, list[tuple[str, str, CommitReference]]] = {}
-        for source_kind, source_digest, references in sources:
-            for reference in references:
+        return await self._commit_source_facts(git, progress, sources)
+
+    async def _commit_source_facts(
+        self,
+        git: _GitStore,
+        progress: _PullProgressTracker,
+        sources: list[CommitReferenceSource],
+    ) -> tuple[StagedFact, ...]:
+        by_sha: dict[str, list[tuple[CommitReferenceSource, CommitReference]]] = {}
+        for source in sources:
+            for reference in source.references:
                 by_sha.setdefault(reference.sha, []).append(
-                    (source_kind, source_digest, reference),
+                    (source, reference),
                 )
         observed_from = _iso(self._now())
         retention: dict[str, dict[str, Any]] = {}
@@ -1459,47 +1458,44 @@ class GitHubPuller:
             StagedFact(
                 fact_kind="commit-references",
                 schema_version=_COMMIT_REFERENCES_FACT_VERSION,
-                subject_key=f"{source_kind}:{source_digest}",
-                resource_number=number,
-                source_digest=source_digest,
+                subject_key=f"{source.kind}:{source.digest}",
+                resource_number=source.resource_number,
+                source_digest=source.digest,
                 observed_from=observed_from,
                 observed_until=observed_until,
                 status="complete",
                 payload={
                     "operation": "StructuredCommitReferenceScan",
                     "repository": self.config.repository,
-                    "source_kind": source_kind,
-                    "source_digest": source_digest,
-                    "references": [_reference_payload(reference) for reference in references],
+                    "source_kind": source.kind,
+                    "source_digest": source.digest,
+                    "references": [_reference_payload(reference) for reference in source.references],
                 },
             )
-            for source_kind, source_digest, references in sources
+            for source in sources
         )
         objects = tuple(
             StagedFact(
                 fact_kind="commit-object",
                 schema_version=_COMMIT_OBJECT_FACT_VERSION,
                 subject_key=f"commit:{sha}",
-                resource_number=number,
+                resource_number=_common_resource_number(by_sha[sha]),
                 source_digest=None,
                 observed_from=observed_from,
                 observed_until=observed_until,
-                status=(
-                    "complete"
-                    if retention[sha]["status"] == "available"
-                    else retention[sha]["status"]
-                ),
+                status=("complete" if retention[sha]["status"] == "available" else retention[sha]["status"]),
                 payload={
                     "operation": "GitCommitRetention",
                     "repository": self.config.repository,
                     "result": retention[sha],
                     "referenced_by": [
                         {
-                            "source_kind": source_kind,
-                            "source_digest": source_digest,
+                            "resource_number": source.resource_number,
+                            "source_payload_kind": source.kind,
+                            "source_payload_digest": source.digest,
                             **_reference_payload(reference),
                         }
-                        for source_kind, source_digest, reference in by_sha[sha]
+                        for source, reference in by_sha[sha]
                     ],
                 },
             )
@@ -1566,9 +1562,7 @@ class GitHubPuller:
             )
             reactions = resource.value
             cache = resource.cache
-            if not isinstance(reactions, list) or any(
-                not isinstance(reaction, dict) for reaction in reactions
-            ):
+            if not isinstance(reactions, list) or any(not isinstance(reaction, dict) for reaction in reactions):
                 raise IncompleteGitHubDataError(
                     f"GitHub returned invalid reactions for comment {comment_id}",
                 )
@@ -1731,6 +1725,13 @@ def _reference_payload(reference: CommitReference) -> dict[str, Any]:
     }
 
 
+def _common_resource_number(
+    references: list[tuple[CommitReferenceSource, CommitReference]],
+) -> int | None:
+    numbers = {source.resource_number for source, _ in references}
+    return numbers.pop() if len(numbers) == 1 else None
+
+
 def _canonical_comments(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     seen: set[int] = set()
     for item in items:
@@ -1843,11 +1844,7 @@ def _absent_head(previous: StoredHead, observed_at: str) -> StoredHead:
 
 
 def _is_parent_absence(error: GitHubAPIError, path: str) -> bool:
-    return (
-        error.status_code in {404, 410}
-        and error.url is not None
-        and error.url.rstrip("/").endswith(path)
-    )
+    return error.status_code in {404, 410} and error.url is not None and error.url.rstrip("/").endswith(path)
 
 
 def _minimal_summary(head: StoredHead | None) -> dict[str, Any]:

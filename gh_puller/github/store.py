@@ -22,7 +22,7 @@ from .archive_format import PullGitSnapshot, pull_git_snapshot
 from .v9 import GIT_LAYOUT_VERSION, SCHEMA, VERSION
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Collection, Iterable
+    from collections.abc import AsyncIterator, Collection, Iterable, Mapping
 
 _CODEC = "zlib-json-v1"
 
@@ -209,6 +209,19 @@ class FactJob:
     scope: dict[str, Any]  # Fact versions, resource cutoff, and requested targets.
     total_tasks: int  # Frozen task population.
     completed_tasks: int  # Tasks with a published terminal attempt.
+
+
+@dataclass(frozen=True, slots=True)
+class FactPlan:
+    scope: dict[str, Any]  # Immutable coverage definition and population evidence.
+    tasks: tuple[FactTaskSpec, ...]  # Missing observations frozen into the job.
+
+
+@dataclass(frozen=True, slots=True)
+class FactParent:
+    number: int  # Repository-local Issue/PR number.
+    kind: str  # issue or pull.
+    bundle_digest: str | None  # Latest published historical bundle, when available.
 
 
 @dataclass(frozen=True, slots=True)
@@ -638,11 +651,7 @@ class SQLiteArchive:
             """,
             (run_id, 100 + len(exclude)),
         )
-        return [
-            _task(row, decode_summary=True)
-            for row in rows
-            if int(row["number"]) not in exclude
-        ][:100]
+        return [_task(row, decode_summary=True) for row in rows if int(row["number"]) not in exclude][:100]
 
     async def pending_signal_tasks(
         self,
@@ -671,11 +680,7 @@ class SQLiteArchive:
             """,
             (run_id, 100 + len(exclude)),
         )
-        return [
-            _task(row, decode_summary=False)
-            for row in rows
-            if int(row["number"]) not in exclude
-        ][:100]
+        return [_task(row, decode_summary=False) for row in rows if int(row["number"]) not in exclude][:100]
 
     async def task_progress(self, run_id: int) -> tuple[int, int]:
         """读取活动 pass 已完成和全部 Issue/PR 任务数。
@@ -815,7 +820,7 @@ class SQLiteArchive:
             RuntimeError: Another fact job is pending.
             ValueError: The key already names a different immutable scope.
         """
-        definitions = tuple(sorted(tasks, key=lambda task: (task.fact_kind, task.subject_key)))
+        definitions = tuple(sorted(tasks, key=_fact_task_sort_key))
         identities = {(task.fact_kind, task.subject_key) for task in definitions}
         if len(identities) != len(definitions):
             raise ValueError("fact task identities must be unique within a job")
@@ -894,6 +899,277 @@ class SQLiteArchive:
             raise KeyError(job_id)
         return _fact_job(row)
 
+    async def pending_fact_job(self) -> FactJob | None:
+        """Read the single resumable supplemental job, if one exists."""
+        row = await _fetchone(
+            self._connection,
+            "SELECT id FROM fact_jobs WHERE status = 'pending'",
+        )
+        return None if row is None else await self.fact_job(int(row["id"]))
+
+    async def fact_job_by_key(self, job_key: str) -> FactJob | None:
+        """Read a supplemental job by its caller idempotency key.
+
+        Args:
+            job_key: Immutable job identity.
+
+        Returns:
+            Matching job, or None when the key has not been used.
+        """
+        row = await _fact_job_by_key(self._connection, job_key)
+        return None if row is None else _fact_job(row)
+
+    async def latest_fact_job(self, kind: str) -> FactJob | None:
+        """Read the most recently created job of one maintenance kind.
+
+        Args:
+            kind: backfill or refresh.
+
+        Returns:
+            Latest matching job, or None before the first operation.
+        """
+        row = await _fetchone(
+            self._connection,
+            "SELECT id FROM fact_jobs WHERE kind = ? ORDER BY id DESC LIMIT 1",
+            (kind,),
+        )
+        return None if row is None else await self.fact_job(int(row["id"]))
+
+    async def backfill_plan(self, fact_sets: Mapping[str, int]) -> FactPlan:
+        """Freeze missing supplemental coverage over the published archive.
+
+        Args:
+            fact_sets: Fact family to schema-version mapping requested by the job.
+
+        Returns:
+            Exact resource/fact cutoffs, population evidence, and missing tasks.
+
+        Raises:
+            RuntimeError: A normal pull is pending or no resource version is published.
+        """
+        await self.ensure_maintenance_ready()
+        db = self._connection
+        resource = await _fetchone(
+            db,
+            """
+            SELECT max(v.id) AS cutoff
+            FROM resource_versions AS v
+            JOIN pull_runs AS r ON r.id = v.run_id AND r.status = 'committed'
+            """,
+        )
+        resource_cutoff = 0 if resource is None or resource["cutoff"] is None else int(resource["cutoff"])
+        if resource_cutoff == 0:
+            raise RuntimeError("backfill requires at least one published resource version")
+        fact = await _fetchone(db, "SELECT coalesce(max(id), 0) AS cutoff FROM fact_versions")
+        fact_cutoff = 0 if fact is None else int(fact["cutoff"])
+        parents = await _fetchall(
+            db,
+            """
+            SELECT number, kind, bundle_digest
+            FROM resource_heads
+            ORDER BY number, kind
+            """,
+        )
+        bundles = await _fetchall(
+            db,
+            """
+            SELECT v.bundle_digest, min(v.number) AS number
+            FROM resource_versions AS v
+            JOIN pull_runs AS r ON r.id = v.run_id AND r.status = 'committed'
+            WHERE v.id <= ? AND v.bundle_digest IS NOT NULL
+            GROUP BY v.bundle_digest
+            ORDER BY v.bundle_digest
+            """,
+            (resource_cutoff,),
+        )
+        thread_sources = await _fetchall(
+            db,
+            """
+            SELECT v.payload_digest, min(v.resource_number) AS number
+            FROM fact_versions AS v
+            WHERE v.id <= ? AND v.fact_kind = 'review-threads'
+                AND v.status = 'complete'
+            GROUP BY v.payload_digest
+            ORDER BY v.payload_digest
+            """,
+            (fact_cutoff,),
+        )
+        population: list[FactTaskSpec] = []
+        if "review-threads" in fact_sets:
+            population.extend(
+                FactTaskSpec(
+                    "review-threads",
+                    f"pull:{row['number']}",
+                    int(row["number"]),
+                    None if row["bundle_digest"] is None else str(row["bundle_digest"]),
+                )
+                for row in parents
+                if row["kind"] == "pull"
+            )
+        if "issue-relations" in fact_sets:
+            population.extend(
+                FactTaskSpec(
+                    "issue-relations",
+                    f"issue:{row['number']}",
+                    int(row["number"]),
+                    None if row["bundle_digest"] is None else str(row["bundle_digest"]),
+                )
+                for row in parents
+                if row["kind"] == "issue"
+            )
+        if "commit-references" in fact_sets:
+            population.extend(
+                FactTaskSpec(
+                    "commit-references",
+                    f"bundle:{row['bundle_digest']}",
+                    int(row["number"]),
+                    str(row["bundle_digest"]),
+                )
+                for row in bundles
+            )
+            population.extend(
+                FactTaskSpec(
+                    "commit-references",
+                    f"review-threads:{row['payload_digest']}",
+                    None if row["number"] is None else int(row["number"]),
+                    str(row["payload_digest"]),
+                )
+                for row in thread_sources
+            )
+        if "git-refs" in fact_sets:
+            population.append(FactTaskSpec("git-refs", "repository", None, None))
+        population.sort(key=_fact_task_sort_key)
+        covered_rows = await _fetchall(
+            db,
+            "SELECT fact_kind, subject_key, schema_version FROM current_facts",
+        )
+        covered = {(str(row["fact_kind"]), str(row["subject_key"]), int(row["schema_version"])) for row in covered_rows}
+        tasks = tuple(
+            item for item in population if (item.fact_kind, item.subject_key, fact_sets[item.fact_kind]) not in covered
+        )
+        counts = {kind: sum(item.fact_kind == kind for item in population) for kind in sorted(fact_sets)}
+        scope = {
+            "operation": "SupplementalFactBackfill",
+            "repository": self.repository,
+            "resource_version_cutoff": resource_cutoff,
+            "fact_version_cutoff": fact_cutoff,
+            "fact_sets": dict(sorted(fact_sets.items())),
+            "population": {
+                "counts": counts,
+                "digest": json_digest(
+                    [
+                        [
+                            item.fact_kind,
+                            item.subject_key,
+                            item.resource_number,
+                            item.source_digest,
+                        ]
+                        for item in population
+                    ],
+                ),
+                "total": len(population),
+            },
+            "preexisting_coverage": len(population) - len(tasks),
+            "scheduled_tasks": len(tasks),
+        }
+        return FactPlan(scope, tasks)
+
+    async def ensure_maintenance_ready(self) -> None:
+        """Reject maintenance while an unpublished normal pull exists."""
+        pending = await _fetchone(
+            self._connection,
+            "SELECT id FROM pull_runs WHERE status = 'pending'",
+        )
+        if pending is not None:
+            raise RuntimeError(f"pending pull {pending['id']} must finish before maintenance")
+
+    async def fact_parent(self, number: int) -> FactParent:
+        """Read one published parent selected for explicit refresh.
+
+        Args:
+            number: Repository-local Issue/PR number.
+
+        Returns:
+            Published kind and latest bundle identity.
+
+        Raises:
+            KeyError: The parent has never been published.
+        """
+        row = await _fetchone(
+            self._connection,
+            "SELECT number, kind, bundle_digest FROM resource_heads WHERE number = ?",
+            (number,),
+        )
+        if row is None:
+            raise KeyError(number)
+        return FactParent(
+            number=int(row["number"]),
+            kind=str(row["kind"]),
+            bundle_digest=None if row["bundle_digest"] is None else str(row["bundle_digest"]),
+        )
+
+    async def fact_payload(self, digest: str) -> dict[str, Any]:
+        """Decode one content-addressed JSON object used by a fact task.
+
+        Args:
+            digest: Existing payload identity.
+
+        Returns:
+            Decoded JSON object after digest and size verification.
+
+        Raises:
+            KeyError: No payload has this identity.
+            TypeError: The payload is not a JSON object.
+        """
+        row = await _fetchone(
+            self._connection,
+            "SELECT codec, raw_size, payload FROM payload_blobs WHERE digest = ?",
+            (digest,),
+        )
+        if row is None:
+            raise KeyError(digest)
+        payload = _decode_row(digest, str(row["codec"]), int(row["raw_size"]), bytes(row["payload"]))
+        if not isinstance(payload, dict):
+            raise TypeError(f"fact source {digest} is not a JSON object")
+        return payload
+
+    async def current_fact_payload(
+        self,
+        fact_kind: str,
+        subject_key: str,
+    ) -> tuple[str, dict[str, Any]] | None:
+        """Read the last successful payload for one supplemental subject.
+
+        Args:
+            fact_kind: Supplemental fact family.
+            subject_key: Stable identity within that family.
+
+        Returns:
+            Payload digest and decoded object, or None without a successful attempt.
+        """
+        row = await _fetchone(
+            self._connection,
+            """
+            SELECT v.payload_digest, p.codec, p.raw_size, p.payload
+            FROM current_facts AS v
+            JOIN payload_blobs AS p ON p.digest = v.payload_digest
+            WHERE v.fact_kind = ? AND v.subject_key = ?
+            """,
+            (fact_kind, subject_key),
+        )
+        if row is None:
+            return None
+        digest = str(row["payload_digest"])
+        payload = _decode_row(
+            digest,
+            str(row["codec"]),
+            int(row["raw_size"]),
+            bytes(row["payload"]),
+        )
+        if not isinstance(payload, dict):
+            raise TypeError(f"fact payload {digest} is not a JSON object")
+        return digest, payload
+
     async def take_fact_tasks(self, job_id: int, limit: int = 100) -> list[FactTask]:
         """Start a recoverable batch of pending fact tasks.
 
@@ -969,7 +1245,8 @@ class SQLiteArchive:
         Args:
             job_id: Backfill or refresh job receiving the results.
             published_at: Actual batch publication time.
-            results: One terminal observation attempt per durable task.
+            results: A primary observation and any derived observations for each
+                durable task. Exactly one result must retain the task identity.
 
         Returns:
             Updated job progress and completion state.
@@ -979,32 +1256,37 @@ class SQLiteArchive:
             ValueError: A result changes its task identity.
         """
         staged = tuple(results)
-        if len({result.task_id for result in staged}) != len(staged):
-            raise ValueError("a fact task can appear only once per batch")
+        grouped: dict[int, list[StagedFact]] = {}
+        for result in staged:
+            grouped.setdefault(result.task_id, []).append(result.fact)
         db = self._connection
         await db.execute("BEGIN IMMEDIATE")
         try:
             job = await _fetchone(db, "SELECT * FROM fact_jobs WHERE id = ?", (job_id,))
             if job is None:
                 raise KeyError(job_id)
-            pending: list[tuple[aiosqlite.Row, StagedFact]] = []
-            for result in staged:
+            pending: list[tuple[aiosqlite.Row, list[StagedFact], StagedFact]] = []
+            for task_id, facts in grouped.items():
                 task = await _fetchone(
                     db,
                     "SELECT * FROM fact_tasks WHERE id = ? AND job_id = ?",
-                    (result.task_id, job_id),
+                    (task_id, job_id),
                 )
                 if task is None:
-                    raise KeyError(result.task_id)
-                fact = result.fact
-                if (task["fact_kind"], task["subject_key"], task["resource_number"]) != (
-                    fact.fact_kind,
-                    fact.subject_key,
-                    fact.resource_number,
-                ):
-                    raise ValueError(f"fact result changes task {result.task_id} identity")
+                    raise KeyError(task_id)
+                primary = [
+                    fact
+                    for fact in facts
+                    if (fact.fact_kind, fact.subject_key, fact.resource_number)
+                    == (task["fact_kind"], task["subject_key"], task["resource_number"])
+                ]
+                if len(primary) != 1:
+                    raise ValueError(f"fact task {task_id} requires exactly one primary result")
+                identities = [(fact.fact_kind, fact.subject_key) for fact in facts]
+                if len(set(identities)) != len(identities):
+                    raise ValueError(f"fact task {task_id} repeats a fact identity")
                 if not bool(task["completed"]):
-                    pending.append((task, fact))
+                    pending.append((task, facts, primary[0]))
             if not pending:
                 await db.commit()
                 return await self.fact_job(job_id)
@@ -1013,33 +1295,41 @@ class SQLiteArchive:
                 INSERT INTO fact_batches(kind, job_id, published_at, fact_count)
                 VALUES (?, ?, ?, ?)
                 """,
-                (job["kind"], job_id, published_at, len(pending)),
+                (
+                    job["kind"],
+                    job_id,
+                    published_at,
+                    sum(len(facts) for _, facts, _ in pending),
+                ),
             )
             batch_id = int(cursor.lastrowid)
-            for ordinal, (task, fact) in enumerate(pending):
-                payload_digest = await _put_json(db, fact.payload)
-                await _insert_fact_version(
-                    db,
-                    batch_id,
-                    ordinal,
-                    int(task["id"]),
-                    fact.fact_kind,
-                    fact.schema_version,
-                    fact.subject_key,
-                    fact.resource_number,
-                    fact.source_digest,
-                    fact.observed_from,
-                    fact.observed_until,
-                    fact.status,
-                    payload_digest,
-                )
+            ordinal = 0
+            for task, facts, primary in pending:
+                for fact in facts:
+                    payload_digest = await _put_json(db, fact.payload)
+                    await _insert_fact_version(
+                        db,
+                        batch_id,
+                        ordinal,
+                        int(task["id"]),
+                        fact.fact_kind,
+                        fact.schema_version,
+                        fact.subject_key,
+                        fact.resource_number,
+                        fact.source_digest,
+                        fact.observed_from,
+                        fact.observed_until,
+                        fact.status,
+                        payload_digest,
+                    )
+                    ordinal += 1
                 await db.execute(
                     """
                     UPDATE fact_tasks
                     SET completed = 1, outcome = ?
                     WHERE id = ?
                     """,
-                    (fact.status, task["id"]),
+                    (primary.status, task["id"]),
                 )
             progress = await _fetchone(
                 db,
@@ -1099,11 +1389,7 @@ class SQLiteArchive:
                 """,
                 (run_id,),
             )
-            if (
-                state is None
-                or not bool(state["catalog_complete"])
-                or int(state["pending"]) != 0
-            ):
+            if state is None or not bool(state["catalog_complete"]) or int(state["pending"]) != 0:
                 raise RuntimeError("observation pass still has unfinished discovery work")
             await db.execute(
                 "UPDATE pull_runs SET observed_until = ? WHERE id = ? AND status = 'pending'",
@@ -1300,13 +1586,11 @@ class SQLiteArchive:
             raise ValueError("archive belongs to a different GitHub repository")
         if schema is None or schema["value"] != VERSION:
             raise ValueError(
-                "unsupported GitHub archive schema; run "
-                f"'uv run -m gh_puller.github migrate {self.path}'",
+                f"unsupported GitHub archive schema; run 'uv run -m gh_puller.github migrate {self.path}'",
             )
         if git_layout is None or git_layout["value"] != GIT_LAYOUT_VERSION:
             raise ValueError(
-                "unsupported GitHub Git layout; run "
-                f"'uv run -m gh_puller.github migrate {self.path}'",
+                f"unsupported GitHub Git layout; run 'uv run -m gh_puller.github migrate {self.path}'",
             )
         await db.executescript(SCHEMA)
         await db.commit()
@@ -1550,9 +1834,7 @@ async def iter_facts(
                 fact_kind=str(row["fact_kind"]),
                 schema_version=int(row["schema_version"]),
                 subject_key=str(row["subject_key"]),
-                resource_number=(
-                    None if row["resource_number"] is None else int(row["resource_number"])
-                ),
+                resource_number=(None if row["resource_number"] is None else int(row["resource_number"])),
                 source_digest=None if row["source_digest"] is None else str(row["source_digest"]),
                 observed_from=str(row["observed_from"]),
                 observed_until=str(row["observed_until"]),
@@ -1884,7 +2166,7 @@ async def _verify_fact_job(
         """
         SELECT fact_kind, subject_key, resource_number, source_digest
         FROM fact_tasks WHERE job_id = ?
-        ORDER BY fact_kind, subject_key
+        ORDER BY id
         """,
         (row["id"],),
     )
@@ -1892,15 +2174,24 @@ async def _verify_fact_job(
         FactTaskSpec(
             fact_kind=str(task["fact_kind"]),
             subject_key=str(task["subject_key"]),
-            resource_number=(
-                None if task["resource_number"] is None else int(task["resource_number"])
-            ),
+            resource_number=(None if task["resource_number"] is None else int(task["resource_number"])),
             source_digest=(None if task["source_digest"] is None else str(task["source_digest"])),
         )
         for task in tasks
     )
     if stored != definitions:
         raise ValueError("fact job key already names a different task population")
+
+
+def _fact_task_sort_key(task: FactTaskSpec) -> tuple[int, str]:
+    priority = {
+        "commit-references": 0,
+        "review-threads": 1,
+        "issue-relations": 2,
+        "commit-object": 3,
+        "git-refs": 4,
+    }
+    return priority.get(task.fact_kind, 3), task.subject_key
 
 
 def _fact_job(row: aiosqlite.Row) -> FactJob:
@@ -1965,10 +2256,7 @@ async def _put_pull_git_index(
         INSERT OR IGNORE INTO git_pull_commits(bundle_digest, ordinal, sha)
         VALUES (?, ?, ?)
         """,
-        (
-            (snapshot.bundle_digest, ordinal, sha)
-            for ordinal, sha in enumerate(snapshot.commits)
-        ),
+        ((snapshot.bundle_digest, ordinal, sha) for ordinal, sha in enumerate(snapshot.commits)),
     )
 
 

@@ -115,6 +115,39 @@ def test_parser_accepts_an_archive_only_migration_command() -> None:
     assert str(args.destination) == "/tmp/widgets.sqlite3"
 
 
+def test_parser_accepts_backfill_and_targeted_refresh() -> None:
+    backfill = cli._parser().parse_args(
+        ["backfill", "acme/widgets", "/tmp/widgets", "--fact", "reviews"],
+    )
+    refresh = cli._parser().parse_args(
+        [
+            "refresh",
+            "acme/widgets",
+            "/tmp/widgets",
+            "--pull",
+            "7",
+            "--issue",
+            "8",
+            "--commit",
+            "a" * 40,
+            "--fact",
+            "commits",
+            "--batch-size",
+            "4",
+            "--target",
+            "2026-09-02T20:00:00+08:00",
+        ],
+    )
+
+    assert backfill.fact_groups == ["reviews"]
+    assert refresh.pull == [7]
+    assert refresh.issue == [8]
+    assert refresh.commit == ["a" * 40]
+    assert refresh.fact_groups == ["commits"]
+    assert refresh.batch_size == 4
+    assert refresh.target == _T0
+
+
 @pytest.mark.parametrize("value", ["0s", "1.5h", "hour", "-1h"])
 def test_parser_rejects_invalid_schedule_interval(value: str) -> None:
     with pytest.raises(SystemExit):

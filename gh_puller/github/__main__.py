@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any
 
 from dotenv import load_dotenv
 
+from .maintenance import FACT_GROUPS, GitHubFactMaintainer, MaintenanceResult
 from .progress import ConsoleProgress
 from .puller import GitHubPullConfig, GitHubPuller, PullResult
 from .store import schedule_state
@@ -55,6 +56,24 @@ def _parser() -> argparse.ArgumentParser:
         metavar="DURATION",
         help="UTC-aligned cadence such as 30m, 1h, or 1d (default: 1h)",
     )
+
+    backfill = commands.add_parser(
+        "backfill",
+        help="complete missing supplemental facts over a frozen published scope",
+    )
+    _add_common_arguments(backfill)
+    _add_maintenance_arguments(backfill)
+
+    refresh = commands.add_parser(
+        "refresh",
+        help="actively observe supplemental facts for selected Issues and PRs",
+    )
+    _add_common_arguments(refresh)
+    _add_maintenance_arguments(refresh)
+    refresh.add_argument("--pull", type=_positive_int, action="append", default=[])
+    refresh.add_argument("--issue", type=_positive_int, action="append", default=[])
+    refresh.add_argument("--commit", action="append", default=[])
+
     migrate = commands.add_parser("migrate", help="migrate a stopped archive pair in place")
     migrate.add_argument("destination", type=Path, help="SQLite archive to migrate")
     return parser
@@ -73,6 +92,18 @@ def _add_common_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--no-progress", action="store_true", help="disable progress on stderr")
 
 
+def _add_maintenance_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--target", type=_parse_time)
+    parser.add_argument(
+        "--fact",
+        dest="fact_groups",
+        choices=FACT_GROUPS,
+        action="append",
+        help="supplemental fact group; repeat to select multiple (default: all)",
+    )
+    parser.add_argument("--batch-size", type=_positive_int, default=8)
+
+
 def _parse_time(value: str) -> datetime:
     try:
         parsed = datetime.fromisoformat(value)
@@ -89,6 +120,16 @@ def _parse_interval(value: str) -> timedelta:
         raise argparse.ArgumentTypeError("interval must be a positive integer followed by s, m, h, or d")
     amount, unit = match.groups()
     return int(amount) * _INTERVAL_UNITS[unit]
+
+
+def _positive_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("value must be a positive integer") from exc
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("value must be a positive integer")
+    return parsed
 
 
 def _config(args: argparse.Namespace) -> GitHubPullConfig:
@@ -110,6 +151,26 @@ async def _dispatch(args: argparse.Namespace) -> None:
         _emit_migration(await migrate_archive(args.destination))
         return
     observer = None if args.no_progress else ConsoleProgress()
+    if args.command in {"backfill", "refresh"}:
+        maintainer = GitHubFactMaintainer(_config(args), observer=observer)
+        groups = FACT_GROUPS if args.fact_groups is None else args.fact_groups
+        if args.command == "backfill":
+            result = await maintainer.backfill(
+                args.target,
+                fact_groups=groups,
+                batch_size=args.batch_size,
+            )
+        else:
+            result = await maintainer.refresh(
+                args.target,
+                pulls=args.pull,
+                issues=args.issue,
+                commits=args.commit,
+                fact_groups=groups,
+                batch_size=args.batch_size,
+            )
+        _emit_maintenance(result)
+        return
     puller = GitHubPuller(_config(args), observer=observer)
     if args.command == "once":
         _emit(await puller.pull(args.target))
@@ -207,6 +268,19 @@ def _emit_migration(result: MigrationResult) -> None:
         "changed": result.changed,
         "database": str(result.database),
         "repository": result.repository,
+    }
+    print(json.dumps(payload, ensure_ascii=False, sort_keys=True), flush=True)
+
+
+def _emit_maintenance(result: MaintenanceResult) -> None:
+    payload = {
+        "completed_at": result.completed_at.isoformat().replace("+00:00", "Z"),
+        "completed_tasks": result.completed_tasks,
+        "job_id": result.job_id,
+        "job_key": result.job_key,
+        "kind": result.kind,
+        "target_at": result.target_at.isoformat().replace("+00:00", "Z"),
+        "total_tasks": result.total_tasks,
     }
     print(json.dumps(payload, ensure_ascii=False, sort_keys=True), flush=True)
 
