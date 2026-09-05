@@ -1,18 +1,13 @@
-"""deepwiki 引擎共用 helper(generator 选型/判等/凭证规则簇 + 域内日志 + repo 键)。
+"""Provide shared generator infrastructure for the DeepWiki engine.
 
-规划格局(按功能为主线):wiki/chat/codemap 三个功能模块各自收编本功能专用
-helper;跨功能通用 helper 归本模块,由功能模块经本模块**属性调用**(调用时取;
-monkeypatch 位点打在本模块,不得 from-import 后裸名调用)。
+A generator selection comprises an adapter identifier and its configuration
+mapping as supplied. The entire credential-free mapping defines selection
+identity; callers remove credentials before using it in persisted state.
 
-本模块 sdk-free / 零工具假设:生成器装配只做选型收敛 + 白名单透传,工具配置/
-工具指引文本全部由上层经 generator_config 覆盖构造参数注入,本层不假设
-任何工具由上层提供(图知识在 webui 组装层,见包 docstring)。生成器契约类型
-(AGENTS/RequestFailedError)保留(生成器依赖的定义来源)。
-
-术语:引擎内部一律说 generator;函数签名统一为 generator + generator_config
-两个散装参数;wire 字段 "target" 只在 app 层,拆分/解析经 resolve_generator
-唯一知识源。envs 保持模块对象绑定 + 属性调用(调用时取;测试 monkeypatch/
-强刷活性)。对外函数无下划线前缀(常数与纯内部 helper 除外)。
+Feature modules own feature-specific policy, and application layers inject tool
+configuration. This module assumes no tools, imports no generator SDK directly,
+and reads environment settings through module bindings so refreshes and test
+patches remain visible.
 """
 
 import hashlib
@@ -21,29 +16,35 @@ import os
 from functools import partial
 from typing import Any
 
-from .. import envs  # 模块对象绑定:属性一律调用时取(patch/强刷活性)
+from .. import envs  # Keep patches and refreshed environment values visible.
 from ..agent import AGENTS, RequestFailedError
 from ..utils import Repo
 from ..utils import _log as _utils_log
 
-# 进度日志走 stderr(人类可读诊断,机器结果走调用方);prefix 固定 [deepwiki]
+# Human-readable progress uses stderr; callers own machine-readable output.
 log = partial(_utils_log, prefix="deepwiki")
 
 
-# ---------------------------------------------------------------------------
-# generator 选型(解析 / 判等身份 / 凭证落盘规则;唯一知识源)
-# ---------------------------------------------------------------------------
+# --- Generator selection ---
 
 
-def resolve_generator(generator: str | None = None, generator_config: dict | None = None,
+def resolve_generator(generator: str | None = None,
+                      generator_config: dict | None = None,
                       get_env=None) -> tuple[str, dict]:
-    """Generator selection → (generator id, config as-given); empty selection = engine default cc.
+    """Resolve a generator selection without interpreting its configuration.
 
-    Selection is this function's only job: generator_config passes through
-    untouched (key names, path spelling and defaults are the upper-layer boundary,
-    see webui runtime_config); unknown ids raise. "Default generator" is an
-    upper-layer (webui) policy injected at the apps/deepwiki-webui/server/app.py
-    boundary (DEEPWIKI_GENERATOR) — the engine never reads env for selection.
+    Args:
+        generator: Adapter identifier. An empty selection uses the engine's ``cc``
+            default.
+        generator_config: Configuration to copy with keys, paths, and defaults
+            unchanged.
+        get_env: Reserved compatibility hook; ignored.
+
+    Returns:
+        The resolved adapter identifier and copied configuration.
+
+    Raises:
+        ValueError: The adapter identifier is unknown.
     """
     gen_id = generator or "cc"
     if gen_id not in AGENTS:
@@ -52,49 +53,71 @@ def resolve_generator(generator: str | None = None, generator_config: dict | Non
 
 
 def generator_identity(generator_id: str, resolved: dict) -> str:
-    """Equality identity (no credentials): the generator_config as-given.
+    """Serialize a credential-free configuration for equality checks.
 
-    The engine never picks a key out of generator_config — the whole dict is the
-    selection (credentials stripped by the caller); key naming and the
-    public/native forms are upper-layer knowledge (see webui runtime_config).
+    Args:
+        generator_id: Resolved adapter identifier paired with the serialized
+            configuration by callers.
+        resolved: Configuration whose entire key set and values define identity.
+
+    Returns:
+        A deterministic JSON representation of the configuration.
     """
     return json.dumps(resolved, sort_keys=True, ensure_ascii=False)
 
 
 def repo_key_of(repo_type: str, owner: str, repo: str) -> str:
-    """repo 键(type_owner_repo;与任务注册键/生成器缓存目录前缀同式)。"""
+    """Build the repository key shared by task and cache namespaces.
+
+    Args:
+        repo_type: Repository provider or source kind.
+        owner: Repository owner.
+        repo: Repository name.
+
+    Returns:
+        The stable ``type_owner_repo`` key.
+    """
     return f"{repo_type}_{owner}_{repo}"
 
 
-# ---------------------------------------------------------------------------
-# 判等摘要族(digest 是选型判等身份的 8-hex 摘要,
-# 任务 id / 续跑状态 / 成品缓存路径共用同一判等。图产物路径与索引就绪
-# 属图知识 — 在 apps/deepwiki-webui/server/generators.py)
-# ---------------------------------------------------------------------------
+# --- Selection identity ---
 
 
-def generator_digest(generator: str | None = None, generator_config: dict | None = None,
+def generator_digest(generator: str | None = None,
+                     generator_config: dict | None = None,
                      get_env=None) -> str:
-    """Stable digest (8 hex) of the identity above (no credentials).
+    """Build the stable short digest used to isolate selection state.
 
-    Identity = generator + generator_config as-given (whole-dict equality, no
-    field-type knowledge). Shared by task ids / resume state / finished-cache
-    paths: different selections under the same repo and language can coexist and
-    never cross-use each other.
+    Args:
+        generator: Adapter identifier following :func:`resolve_generator`
+            defaults.
+        generator_config: Credential-free selection configuration; see the module
+            contract.
+        get_env: Reserved compatibility hook forwarded to selection resolution.
+
+    Returns:
+        An eight-character hexadecimal fingerprint.
     """
     generator_id, resolved = resolve_generator(generator, generator_config, get_env)
     return _generator_digest_of(generator_id, resolved)
 
 
 def _generator_digest_of(generator_id: str, resolved: dict) -> str:
-    # sha1 仅作生成器身份指纹(缓存摘要),非安全用途
+    # SHA-1 is a compact cache fingerprint, not a security primitive.
     return hashlib.sha1(  # noqa: S324
         f"{generator_id}|{generator_identity(generator_id, resolved)}".encode(),
     ).hexdigest()[:8]
 
 
 def cache_identity(cache: dict) -> tuple[str, str]:
-    """Identity recorded in a finished cache (generator + whole generator_config, same semantics as generator_identity)."""
+    """Read selection identity from a finished cache.
+
+    Args:
+        cache: Finished-cache payload containing generator selection fields.
+
+    Returns:
+        The adapter identifier and serialized whole-configuration identity.
+    """
     generator_id = cache.get("generator") or ""
     resolved = cache.get("generator_config") or {}
     return generator_id, generator_identity(generator_id, resolved)
@@ -102,15 +125,21 @@ def cache_identity(cache: dict) -> tuple[str, str]:
 
 def cache_generator_matches(cache: dict, generator: str | None = None,
                             generator_config: dict | None = None) -> bool:
-    """Whether a finished cache matches the given selection (second check after digest isolation; guards hand-renamed files)."""
+    """Check a cache selection after path-level digest isolation.
+
+    Args:
+        cache: Finished-cache payload to validate.
+        generator: Requested adapter identifier.
+        generator_config: Requested credential-free selection configuration.
+
+    Returns:
+        Whether the recorded and requested selections are identical.
+    """
     generator_id, resolved = resolve_generator(generator, generator_config)
     return cache_identity(cache) == (generator_id, generator_identity(generator_id, resolved))
 
 
-# ---------------------------------------------------------------------------
-# 提示词共性常量(跨功能:wiki/chat/codemap 共用;
-# 语言展示表 _LANGUAGE_NAMES 仅 HTTP 层用时,已在 apps/deepwiki-webui/server/app.py)
-# ---------------------------------------------------------------------------
+# --- Shared prompt context ---
 
 _LANGUAGE_NAMES_RAW = {
     "en": "English",
@@ -127,7 +156,14 @@ _LANGUAGE_NAMES_RAW = {
 
 
 def language_name(language: str) -> str:
-    """语言名(缺省 English;未知语言也回退 English,与原 lang.json 语义一致)。"""
+    """Resolve the display name for a prompt language.
+
+    Args:
+        language: Language code from the request boundary.
+
+    Returns:
+        The display name, or English for an unknown code.
+    """
     return _LANGUAGE_NAMES_RAW.get(language, "English")
 
 
@@ -173,7 +209,15 @@ This file contains...
 
 
 def prompt_fmt(repo: Repo, *, language: str = "en") -> dict:
-    """提示词格式化用的公共字段(repo 域对象 + 语言散装)。"""
+    """Build the common template context for feature prompts.
+
+    Args:
+        repo: Repository domain object supplying identity and location fields.
+        language: Requested response-language code; an empty value uses English.
+
+    Returns:
+        Repository and language fields for prompt formatting.
+    """
     return {
         "repo_type": repo.repo_type,
         "repo_url": repo.repo_url,
@@ -182,33 +226,38 @@ def prompt_fmt(repo: Repo, *, language: str = "en") -> dict:
     }
 
 
-# ---------------------------------------------------------------------------
-# 装配(适配器构造入口 adapter;上层经 generator_config 注入工具配置,
-# 本层零 SDK/零工具假设)
-# ---------------------------------------------------------------------------
+# --- Adapter assembly ---
 
 
 def adapt_generator(generator: str | None = None, *, generator_config: dict | None = None,
             system_prompt: str = "", repo: Repo | None = None,
             generator_cache_dir: str | None = None, generator_cache_write_mode: bool = False):
-    """generator → adapter instance (converged construction entry; ≈ AGENTS[gid](config)).
+    """Construct a fresh adapter conversation with engine-owned defaults.
 
-    generator_config passes through untouched; this layer only adds engine-base
-    keys (system_prompt / cwd / tool-desk assembly) — key-set selection belongs
-    to the generator files (config contract: the key set IS the parse-layer
-    whitelist semantics). Engine-layer injection notes:
-    - cc: cwd pinned to the repo root when repo is given (SDK default = process
-      cwd, once caused the exec process to write docs into gh-puller);
-      generator_cache_write_mode (generator-cache persistence, wiki structure/
-      pages) adds Write/add_dirs/acceptEdits, default opens only Read/Grep/Glob.
-    - dsh: explicit home, optional local CLI, isolated sessions/runtime cwd, and
-      system prompt are supplied to the SDK profile.
+    The configured user prompt precedes the task prompt. Repository context pins
+    adapter working directories. Claude sessions ignore local settings, and cache
+    persistence grants their engine-owned write access. DSH runtime locations
+    come from the environment contract.
 
-    One instance = one conversation (fresh construction per retry/stage; the SDK
-    object is assembled at construction time).
+    Args:
+        generator: Adapter identifier following :func:`resolve_generator`
+            defaults.
+        generator_config: Adapter-specific configuration copied before common
+            engine fields are applied.
+        system_prompt: Task prompt appended after any configured user prompt.
+        repo: Repository context used to pin the adapter working directory.
+        generator_cache_dir: Directory exposed to Claude cache-writing sessions.
+        generator_cache_write_mode: Whether Claude may persist generated cache
+            artifacts.
+
+    Returns:
+        A newly constructed adapter for one conversation.
+
+    Raises:
+        ValueError: The adapter identifier is unknown.
     """
     gid, resolved = resolve_generator(generator, generator_config)
-    # 拼接:generator_config 传入的 system_prompt(用户级)在前,参数 system_prompt(task 级)追加在后
+    # Preserve user-prompt precedence over the task-specific prompt.
     if resolved.get("system_prompt"):
         system_prompt = (
             f"{resolved['system_prompt']}\n\n{system_prompt}"
@@ -223,8 +272,8 @@ def adapt_generator(generator: str | None = None, *, generator_config: dict | No
             options.setdefault("dsh_bin", envs.DSH_BIN)
         options.update({
             "session_root": envs.DSH_SESSION_ROOT,
-            "runtime_cwd": envs.DSH_RUNTIME_CWD,  # .env 加载点越过任务 checkout(见 envs)
-            "system_prompt": system_prompt,  # → 组合 persona(dsh_fields 映射,空则缺省)
+            "runtime_cwd": envs.DSH_RUNTIME_CWD,  # Keep .env discovery outside task checkouts; see envs.
+            "system_prompt": system_prompt,
         })
         if repo is not None:
             options["cwd"] = os.path.abspath(repo.save_path)
@@ -232,7 +281,7 @@ def adapt_generator(generator: str | None = None, *, generator_config: dict | No
         options = dict(resolved)
         options.update({
             "system_prompt": system_prompt,
-            "sandbox": "full_access",  # 高自由度缺省(镜像 dsh danger-full-access;可覆写)
+            "sandbox": "full_access",  # Match the high-autonomy DSH default.
             "approval_mode": "auto_review",
         })
         if repo is not None:
@@ -241,20 +290,20 @@ def adapt_generator(generator: str | None = None, *, generator_config: dict | No
         options = dict(resolved)
         options.update({
             "system_prompt": system_prompt,
-            "auto": True,  # 无头缺省:权限未明拒即自动批准(防 resolved auto=False 静默关)
+            "auto": True,  # Prevent headless sessions from stalling on unresolved permissions.
         })
         if repo is not None:
             options["cwd"] = os.path.abspath(repo.save_path)
-    else:  # cc
+    else:
         options = dict(resolved)
         options.update({
             "system_prompt": system_prompt,
             "include_partial_messages": True,
-            "setting_sources": [],  # 完全隔离本地 claude 配置(用户级 MCP/skills/hooks 不掺入生成会话)
+            "setting_sources": [],  # Isolate local Claude MCP, skill, and hook settings.
         })
         if repo is not None:
             options["cwd"] = os.path.abspath(repo.save_path)
-            tools = ["Read", "Grep", "Glob", *list(resolved.get("allowed_tools") or [])]  # app 注入工具名
+            tools = ["Read", "Grep", "Glob", *list(resolved.get("allowed_tools") or [])]
             if generator_cache_write_mode:
                 if generator_cache_dir:
                     options["add_dirs"] = [os.path.abspath(generator_cache_dir)]
@@ -265,8 +314,14 @@ def adapt_generator(generator: str | None = None, *, generator_config: dict | No
 
 
 def failure(exc: Exception) -> Exception:
-    """RequestFailedError → RuntimeError("generator 执行失败: ...") (public message); everything else is returned as-is."""
+    """Normalize adapter failures for public callers.
 
+    Args:
+        exc: Error raised by an adapter operation.
+
+    Returns:
+        A public RuntimeError for RequestFailedError, or the original error.
+    """
     if isinstance(exc, RequestFailedError):
         return RuntimeError(f"generator 执行失败: {exc.detail}")
     return exc
