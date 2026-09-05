@@ -75,6 +75,12 @@ class _PrimaryRateLimitError(RuntimeError):
         self.resource = resource
 
 
+class _GraphQLResponseError(GitHubAPIError):
+    def __init__(self, errors: Any, url: str) -> None:
+        super().__init__(f"GitHub GraphQL error for {url}: {errors!r}", url=url)
+        self.errors = errors
+
+
 @dataclass(frozen=True, slots=True)
 class GitHubPage:
     items: list[dict[str, Any]]  # Validated raw objects from one REST page.
@@ -740,7 +746,21 @@ class GitHubAPI:
             raise ValueError("number must be positive")
         if not self._authenticated:
             raise GitHubAPIError("review threads require GitHub authentication")
-        raw = await self._graphql_review_threads(owner, repo, number, primary_wait=True)
+        try:
+            raw = await self._graphql_review_threads(
+                owner,
+                repo,
+                number,
+                primary_wait=True,
+            )
+        except _GraphQLResponseError as exc:
+            if not _graphql_field_missing(exc, "pullRequest"):
+                raise
+            raise GitHubAPIError(
+                f"GitHub returned no pull request #{number}",
+                status_code=404,
+                url=exc.url,
+            ) from exc
         comments = [
             comment
             for thread in raw["nodes"]
@@ -781,7 +801,16 @@ class GitHubAPI:
             raise ValueError("number must be positive")
         if not self._authenticated:
             raise GitHubAPIError("issue relations require GitHub authentication")
-        raw = await self._graphql_issue_relations(owner, repo, number)
+        try:
+            raw = await self._graphql_issue_relations(owner, repo, number)
+        except _GraphQLResponseError as exc:
+            if not _graphql_field_missing(exc, "issue"):
+                raise
+            raise GitHubAPIError(
+                f"GitHub returned no issue #{number}",
+                status_code=404,
+                url=exc.url,
+            ) from exc
         return GitHubResource(raw, _Transport.GRAPHQL, raw)
 
     async def issue_comments(
@@ -1111,7 +1140,7 @@ class GitHubAPI:
                 )
                 secondary_attempt += 1
                 continue
-            raise GitHubAPIError(f"GitHub GraphQL error for {response.url}: {errors!r}")
+            raise _GraphQLResponseError(errors, str(response.url))
 
     async def _pull_connection(
         self,
@@ -1853,6 +1882,19 @@ def _rate_resource(path: str, default: str) -> str:
     if endpoint.endswith(("/reactions", "/requested_reviewers")):
         return _CORE_AUX_RESOURCE
     return default
+
+
+def _graphql_field_missing(error: _GraphQLResponseError, field: str) -> bool:
+    errors = error.errors
+    if not isinstance(errors, list) or not errors:
+        return False
+    for item in errors:
+        if not isinstance(item, dict) or item.get("type") != "NOT_FOUND":
+            return False
+        path = item.get("path")
+        if not isinstance(path, list) or path != ["repository", field]:
+            return False
+    return True
 
 
 def _decode_page(response: httpx.Response) -> list[dict[str, Any]]:

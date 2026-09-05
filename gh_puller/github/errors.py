@@ -10,8 +10,9 @@ class GitHubAPIError(RuntimeError):
 
     Args:
         message: 面向操作者的失败说明。
-        status_code: HTTP 失败状态；本地验证或 GraphQL 失败时为 None。
-        url: 失败 HTTP request 的最终 URL；本地验证或 GraphQL 结构失败时为 None。
+        status_code: HTTP 状态或原子操作映射的等价状态；本地验证和未分类的
+            GraphQL 失败为 None。
+        url: 失败 HTTP request 的最终 URL；本地验证失败时为 None。
     """
 
     def __init__(

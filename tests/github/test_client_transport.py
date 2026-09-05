@@ -13,6 +13,50 @@ from gh_puller.github.client import GitHubPage
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("operation", "field", "message"),
+    [
+        ("pull_review_threads", "pullRequest", "pull request #7"),
+        ("issue_relations", "issue", "issue #7"),
+    ],
+)
+async def test_graphql_parent_not_found_maps_to_resource_absence(
+    operation: str,
+    field: str,
+    message: str,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "data": {"repository": {field: None}},
+                "errors": [
+                    {
+                        "type": "NOT_FOUND",
+                        "path": ["repository", field],
+                        "message": "missing",
+                    },
+                ],
+            },
+            request=request,
+        )
+
+    client = httpx.AsyncClient(
+        base_url="https://api.github.test",
+        transport=httpx.MockTransport(handler),
+    )
+    api = GitHubAPI(token=str(id(client)), client=client, graphql_url="/graphql")
+    try:
+        with pytest.raises(GitHubAPIError, match=message) as caught:
+            await getattr(api, operation)("acme", "widgets", 7)
+    finally:
+        await client.aclose()
+
+    assert caught.value.status_code == 404
+    assert caught.value.url == "https://api.github.test/graphql"
+
+
+@pytest.mark.asyncio
 async def test_rest_page_exposes_the_opaque_next_cursor_without_following_it() -> None:
     seen: list[str] = []
 

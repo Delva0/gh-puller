@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any
 import pytest
 
 from gh_puller.github.client import GitHubResource
+from gh_puller.github.errors import GitHubAPIError
 from gh_puller.github.observations import (
     ObservationArchive,
     iter_current_facts,
@@ -32,6 +33,7 @@ _SHA_B = "b" * 40
 class _API:
     def __init__(self) -> None:
         self.calls: list[tuple[str, int]] = []
+        self.missing_pulls: set[int] = set()
 
     async def pull_review_threads(
         self,
@@ -41,6 +43,8 @@ class _API:
     ) -> GitHubResource:
         assert f"{owner}/{repo}" == _REPOSITORY
         self.calls.append(("threads", number))
+        if number in self.missing_pulls:
+            raise GitHubAPIError("not found", status_code=404)
         raw = {
             "nodes": [
                 {
@@ -228,6 +232,36 @@ async def test_pending_catalog_resumes_after_a_durable_page(
             "SELECT discovery_pages, discovered_items FROM sync_cycles",
         ).fetchone() == (2, 101)
         assert connection.execute("SELECT COUNT(*) FROM sync_tasks").fetchone()[0] == 104
+
+
+@pytest.mark.asyncio
+async def test_missing_legacy_pull_publishes_unavailable_live_fact(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "v9.sqlite3"
+    destination = tmp_path / "facts.sqlite3"
+    _source_archive(source)
+    api = _API()
+    api.missing_pulls.add(2)
+    importer = V9Importer(
+        V9ImportConfig(source, destination, _REPOSITORY, concurrency=2),
+        api=api,
+        git=_Git(),
+        now=lambda: _MIGRATION_TIME,
+    )
+
+    await importer.migrate()
+
+    facts = [
+        fact
+        async for fact in iter_current_facts(
+            destination,
+            family="pull-review-threads",
+            subject_key="pull:2",
+        )
+    ]
+    assert len(facts) == 1
+    assert facts[0].coverage == "unavailable"
 
 
 def _source_archive(path: Path) -> None:
