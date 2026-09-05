@@ -9,7 +9,7 @@ from __future__ import annotations
 import asyncio
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from itertools import islice
 from pathlib import Path
@@ -30,6 +30,7 @@ from .store import (
     PullPass,
     PullTask,
     SQLiteArchive,
+    StagedFact,
     StagedResource,
     StoredHead,
     json_digest,
@@ -46,6 +47,8 @@ _GIT_PREFETCH_BATCH_SIZE = 8
 _GIT_DEFER_RETRY_CEILING = 30.0
 _CATALOG_ACCEPT = "application/vnd.github.raw+json"
 _BUNDLE_SCHEMA_VERSION = 7
+_REVIEW_THREADS_FACT_VERSION = 1
+_ISSUE_RELATIONS_FACT_VERSION = 1
 
 
 class IncompleteGitHubDataError(RuntimeError):
@@ -141,6 +144,20 @@ class _API(Protocol):
         *,
         previous: list[dict[str, Any]] | None,
         cache: dict[str, Any] | None,
+    ) -> GitHubResource: ...
+
+    async def pull_review_threads(
+        self,
+        owner: str,
+        repo: str,
+        number: int,
+    ) -> GitHubResource: ...
+
+    async def issue_relations(
+        self,
+        owner: str,
+        repo: str,
+        number: int,
     ) -> GitHubResource: ...
 
     async def issue_comments(
@@ -801,6 +818,7 @@ class GitHubPuller:
             dict[str, Any] | None,
             dict[str, Any] | None,
             dict[str, Any] | None,
+            tuple[StagedFact, ...],
         ]:
             summary = summaries.get(number)
             if summary is None:
@@ -809,7 +827,7 @@ class GitHubPuller:
             previous = heads.get(number)
             previous_bundle, previous_cache = await previous_state(number)
             try:
-                bundle, http_cache = await self._fetch_bundle(
+                bundle, http_cache, facts = await self._fetch_bundle(
                     api,
                     git,
                     progress,
@@ -824,7 +842,7 @@ class GitHubPuller:
             except GitHubAPIError as exc:
                 if not _is_parent_absence(exc, f"{self._base}/issues/{number}"):
                     raise
-                return number, None, None, None
+                return number, None, None, None, ()
             if number in root_caches:
                 http_cache = dict(http_cache or {})
                 http_cache["issue"] = root_caches[number]
@@ -834,7 +852,9 @@ class GitHubPuller:
                     raise IncompleteGitHubDataError(f"issue #{number} bundle has no root object")
                 if previous is None or previous.summary_digest != json_digest(detail):
                     stored_summary = detail
-            return number, bundle, stored_summary, http_cache
+            source_digest = json_digest(bundle)
+            facts = tuple(replace(fact, source_digest=source_digest) for fact in facts)
+            return number, bundle, stored_summary, http_cache, facts
 
         async def fetch_batch(
             batch: list[int],
@@ -855,7 +875,7 @@ class GitHubPuller:
                 while pending:
                     task = await completed.get()
                     pending.remove(task)
-                    number, bundle, summary, http_cache = task.result()
+                    number, bundle, summary, http_cache, facts = task.result()
                     old = heads.get(number)
                     if bundle is None:
                         if old is None:
@@ -871,6 +891,7 @@ class GitHubPuller:
                         summary=summary,
                         bundle=bundle,
                         http_cache=http_cache,
+                        facts=facts,
                     )
                     discovery = indexed[number]
                     async with store_lock:
@@ -1000,7 +1021,7 @@ class GitHubPuller:
         force_comments: bool,
         closing_references: list[dict[str, Any]] | None,
         pull_detail: GitHubResource | None,
-    ) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    ) -> tuple[dict[str, Any], dict[str, Any] | None, tuple[StagedFact, ...]]:
         number = int(summary["number"])
         issue_path = f"{self._base}/issues/{number}"
         http_cache: dict[str, Any] = {}
@@ -1103,8 +1124,9 @@ class GitHubPuller:
             "issue_comment_reactions": comment_reactions,
             "api_sources": api_sources,
         }
+        facts: tuple[StagedFact, ...]
         if bundle["kind"] == "pull":
-            pull, cache = await self._fetch_pull(
+            pull, cache, facts = await self._fetch_pull(
                 api,
                 git,
                 progress,
@@ -1117,7 +1139,9 @@ class GitHubPuller:
             )
             bundle["pull_request"] = pull
             _set_cache(http_cache, "pull_request", cache)
-        return bundle, http_cache or None
+        else:
+            facts = (await self._issue_relations_fact(api, number),)
+        return bundle, http_cache or None, facts
 
     async def _fetch_pull(
         self,
@@ -1131,7 +1155,7 @@ class GitHubPuller:
         force_comments: bool,
         closing_references: list[dict[str, Any]] | None,
         detail_resource: GitHubResource | None,
-    ) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    ) -> tuple[dict[str, Any], dict[str, Any] | None, tuple[StagedFact, ...]]:
         if closing_references is None:
             raise IncompleteGitHubDataError(f"pull #{number} has no closing issue references")
         path = f"{self._base}/pulls/{number}"
@@ -1164,10 +1188,12 @@ class GitHubPuller:
         ):
             raise IncompleteGitHubDataError(f"GitHub returned invalid reviews for {path}")
         _set_cache(http_cache, "reviews", cache)
-        review_comment_resource: GitHubResource | None = None
-        if not force_comments and _is_zero_integer(pull.get("review_comments")):
-            review_comments = []
-        else:
+        thread_fact, review_comment_resource, review_comments = (
+            await self._review_threads_fact(api, number)
+        )
+        if review_comments is None and (
+            force_comments or not _is_zero_integer(pull.get("review_comments"))
+        ):
             review_comment_resource = await api.pull_review_comments(
                 self._owner,
                 self._repo,
@@ -1184,6 +1210,8 @@ class GitHubPuller:
                     f"GitHub returned invalid review comments for {path}",
                 )
             _set_cache(http_cache, "review_comments", cache)
+        elif review_comments is None:
+            review_comments = []
         review_comments = _canonical_comments(review_comments)
         expected_commits = pull.get("commits")
         commit_resource: GitHubResource | None = None
@@ -1259,7 +1287,90 @@ class GitHubPuller:
             "closing_issues_references": closing_references,
             "api_sources": api_sources,
         }
-        return result, http_cache or None
+        return result, http_cache or None, (thread_fact,)
+
+    async def _review_threads_fact(
+        self,
+        api: _API,
+        number: int,
+    ) -> tuple[StagedFact, GitHubResource | None, list[dict[str, Any]] | None]:
+        observed_from = _iso(self._now())
+        try:
+            resource = await api.pull_review_threads(self._owner, self._repo, number)
+        except GitHubAPIError as exc:
+            fact = _failed_fact(
+                "review-threads",
+                _REVIEW_THREADS_FACT_VERSION,
+                f"pull:{number}",
+                number,
+                observed_from,
+                _iso(self._now()),
+                "PullReviewThreads",
+                exc,
+            )
+            return fact, None, None
+        value = resource.value
+        if not isinstance(value, dict):
+            raise IncompleteGitHubDataError(f"pull #{number} has invalid review thread facts")
+        comments = value.get("review_comments")
+        if not isinstance(comments, list) or any(
+            not isinstance(comment, dict) for comment in comments
+        ):
+            raise IncompleteGitHubDataError(f"pull #{number} has invalid thread comments")
+        observed_until = _iso(self._now())
+        fact = StagedFact(
+            fact_kind="review-threads",
+            schema_version=_REVIEW_THREADS_FACT_VERSION,
+            subject_key=f"pull:{number}",
+            resource_number=number,
+            source_digest=None,
+            observed_from=observed_from,
+            observed_until=observed_until,
+            status="complete",
+            payload={
+                "operation": "PullReviewThreads",
+                "repository": self.config.repository,
+                "pull_number": number,
+                "source": resource.source,
+                "raw": resource.raw,
+            },
+        )
+        return fact, resource, comments
+
+    async def _issue_relations_fact(self, api: _API, number: int) -> StagedFact:
+        observed_from = _iso(self._now())
+        try:
+            resource = await api.issue_relations(self._owner, self._repo, number)
+        except GitHubAPIError as exc:
+            return _failed_fact(
+                "issue-relations",
+                _ISSUE_RELATIONS_FACT_VERSION,
+                f"issue:{number}",
+                number,
+                observed_from,
+                _iso(self._now()),
+                "IssueRelations",
+                exc,
+            )
+        if not isinstance(resource.value, dict):
+            raise IncompleteGitHubDataError(f"issue #{number} has invalid relation facts")
+        return StagedFact(
+            fact_kind="issue-relations",
+            schema_version=_ISSUE_RELATIONS_FACT_VERSION,
+            subject_key=f"issue:{number}",
+            resource_number=number,
+            source_digest=None,
+            observed_from=observed_from,
+            observed_until=_iso(self._now()),
+            status="complete",
+            payload={
+                "operation": "IssueRelations",
+                "repository": self.config.repository,
+                "issue_number": number,
+                "source": resource.source,
+                "raw": resource.raw,
+            },
+        )
 
     async def _cached_json(
         self,
@@ -1443,6 +1554,37 @@ def _api_source(resource: GitHubResource) -> dict[str, Any]:
     if resource.source != "rest":
         source["raw"] = resource.raw
     return source
+
+
+def _failed_fact(
+    fact_kind: str,
+    schema_version: int,
+    subject_key: str,
+    resource_number: int,
+    observed_from: str,
+    observed_until: str,
+    operation: str,
+    error: GitHubAPIError,
+) -> StagedFact:
+    return StagedFact(
+        fact_kind=fact_kind,
+        schema_version=schema_version,
+        subject_key=subject_key,
+        resource_number=resource_number,
+        source_digest=None,
+        observed_from=observed_from,
+        observed_until=observed_until,
+        status="forbidden" if error.status_code in {401, 403} else "failed",
+        payload={
+            "operation": operation,
+            "error": {
+                "type": type(error).__name__,
+                "message": str(error),
+                "status_code": error.status_code,
+                "url": error.url,
+            },
+        },
+    )
 
 
 def _canonical_comments(items: list[dict[str, Any]]) -> list[dict[str, Any]]:

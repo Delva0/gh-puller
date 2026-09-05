@@ -34,6 +34,34 @@ def graphql_parent(payload: dict[str, Any], number: int) -> dict[str, Any]:
     return parent
 
 
+def graphql_issue(payload: dict[str, Any], number: int) -> dict[str, Any]:
+    try:
+        repository = payload["data"]["repository"]
+        issue = repository["issue"]
+    except (KeyError, TypeError) as exc:
+        raise GitHubAPIError(f"GitHub returned incomplete issue #{number}") from exc
+    if not isinstance(issue, dict) or issue.get("number") != number:
+        raise GitHubAPIError(f"GitHub returned no matching issue #{number}")
+    return issue
+
+
+def check_issue_reference(issue: dict[str, Any], context: str) -> None:
+    repository = issue.get("repository")
+    if (
+        not isinstance(issue.get("id"), str)
+        or not issue["id"]
+        or type(issue.get("number")) is not int
+        or issue["number"] < 1
+        or not isinstance(issue.get("url"), str)
+        or not isinstance(repository, dict)
+        or not isinstance(repository.get("id"), str)
+        or not isinstance(repository.get("nameWithOwner"), str)
+        or "/" not in repository["nameWithOwner"]
+        or not isinstance(repository.get("url"), str)
+    ):
+        raise GitHubAPIError(f"{context} has an invalid Issue identity")
+
+
 def graphql_connection(
     pull: dict[str, Any],
     field: str,

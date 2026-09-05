@@ -181,6 +181,26 @@ query PullReviewComments($owner: String!, $repo: String!, $number: Int!, $cursor
         totalCount
         nodes {
           id
+          diffSide
+          isOutdated
+          isResolved
+          line
+          originalLine
+          originalStartLine
+          path
+          startDiffSide
+          startLine
+          subjectType
+          resolvedBy {
+            id
+            databaseId
+            login
+            name
+            email
+            avatarUrl
+            url
+            isSiteAdmin
+          }
           comments(first: 100) {
             totalCount
             nodes { ...ReviewCommentFields }
@@ -193,6 +213,80 @@ query PullReviewComments($owner: String!, $repo: String!, $number: Int!, $cursor
   }
 }
 """ + _REVIEW_COMMENT_FRAGMENT
+
+_ISSUE_REFERENCE_FRAGMENT = """
+fragment IssueReferenceFields on Issue {
+  id
+  fullDatabaseId
+  number
+  url
+  state
+  title
+  repository { id nameWithOwner url }
+}
+"""
+
+ISSUE_RELATIONS = """
+query IssueRelations($owner: String!, $repo: String!, $number: Int!) {
+  repository(owner: $owner, name: $repo) {
+    issue(number: $number) {
+      ...IssueReferenceFields
+      parent { ...IssueReferenceFields }
+      subIssues(first: 100) {
+        totalCount
+        nodes { ...IssueReferenceFields }
+        pageInfo { hasNextPage endCursor }
+      }
+      blockedBy(first: 100) {
+        totalCount
+        nodes { ...IssueReferenceFields }
+        pageInfo { hasNextPage endCursor }
+      }
+      blocking(first: 100) {
+        totalCount
+        nodes { ...IssueReferenceFields }
+        pageInfo { hasNextPage endCursor }
+      }
+    }
+  }
+}
+""" + _ISSUE_REFERENCE_FRAGMENT
+
+ISSUE_RELATION_PAGES = """
+query IssueRelationPages(
+  $id: ID!,
+  $subIssuesCursor: String,
+  $blockedByCursor: String,
+  $blockingCursor: String,
+  $includeSubIssues: Boolean!,
+  $includeBlockedBy: Boolean!,
+  $includeBlocking: Boolean!
+) {
+  node(id: $id) {
+    ... on Issue {
+      id
+      subIssues(first: 100, after: $subIssuesCursor)
+        @include(if: $includeSubIssues) {
+        totalCount
+        nodes { ...IssueReferenceFields }
+        pageInfo { hasNextPage endCursor }
+      }
+      blockedBy(first: 100, after: $blockedByCursor)
+        @include(if: $includeBlockedBy) {
+        totalCount
+        nodes { ...IssueReferenceFields }
+        pageInfo { hasNextPage endCursor }
+      }
+      blocking(first: 100, after: $blockingCursor)
+        @include(if: $includeBlocking) {
+        totalCount
+        nodes { ...IssueReferenceFields }
+        pageInfo { hasNextPage endCursor }
+      }
+    }
+  }
+}
+""" + _ISSUE_REFERENCE_FRAGMENT
 
 REVIEW_THREAD_COMMENTS = """
 query ReviewThreadComments($id: ID!, $cursor: String) {

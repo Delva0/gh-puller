@@ -16,6 +16,7 @@ from gh_puller.github import (
     ArchivedHead,
     ArchivedRun,
     ArchivedVersion,
+    GitHubAPIError,
     GitHubPullConfig,
     GitHubPuller,
     iter_heads,
@@ -60,6 +61,10 @@ class FakeAPI:
         self.reported_count: int | None = None
         self.count_available = True
         self.closing: dict[int, list[dict[str, Any]]] = {}
+        self.review_threads: dict[int, list[dict[str, Any]]] = {}
+        self.issue_relation_sets: dict[int, dict[str, Any]] = {}
+        self.review_thread_errors: dict[int, GitHubAPIError] = {}
+        self.issue_relation_errors: dict[int, GitHubAPIError] = {}
         self.comparisons: dict[tuple[str, str], list[dict[str, Any]]] = {}
         self.catalog_accepts: list[str | None] = []
         self.source = source
@@ -297,6 +302,78 @@ class FakeAPI:
             cache=cache,
         )
         return self._resource(value, updated)
+
+    async def pull_review_threads(
+        self,
+        owner: str,
+        repo: str,
+        number: int,
+    ) -> GitHubResource:
+        if number in self.review_thread_errors:
+            raise self.review_thread_errors[number]
+        path = f"/repos/{owner}/{repo}/pulls/{number}/comments"
+        comments = deepcopy(self.pages.get(path, []))
+        threads = deepcopy(self.review_threads.get(number))
+        if threads is None:
+            threads = [
+                {
+                    "id": f"review-thread-{comment['id']}",
+                    "comments": {"totalCount": 1, "nodes": [deepcopy(comment)]},
+                    "diffSide": None,
+                    "isOutdated": False,
+                    "isResolved": False,
+                    "line": comment.get("line"),
+                    "originalLine": comment.get("original_line"),
+                    "originalStartLine": comment.get("original_start_line"),
+                    "path": comment.get("path"),
+                    "resolvedBy": None,
+                    "startDiffSide": None,
+                    "startLine": comment.get("start_line"),
+                    "subjectType": comment.get("subject_type", "LINE"),
+                }
+                for comment in comments
+            ]
+        self._called("review_threads", "/graphql", {"owner": owner, "repo": repo, "number": number})
+        raw = {"totalCount": len(threads), "nodes": threads}
+        return GitHubResource(
+            {"review_comments": comments, "threads": raw},
+            "graphql",
+            raw,
+        )
+
+    async def issue_relations(
+        self,
+        owner: str,
+        repo: str,
+        number: int,
+    ) -> GitHubResource:
+        if number in self.issue_relation_errors:
+            raise self.issue_relation_errors[number]
+        self._called("issue_relations", "/graphql", {"owner": owner, "repo": repo, "number": number})
+        raw = deepcopy(self.issue_relation_sets.get(number))
+        if raw is None:
+            summary = next(item for item in self.catalog if item["number"] == number)
+            issue = {
+                "id": summary.get("node_id", f"issue-{number}"),
+                "fullDatabaseId": str(summary["id"]),
+                "number": number,
+                "url": f"https://github.test/{owner}/{repo}/issues/{number}",
+                "state": "OPEN",
+                "title": summary["title"],
+                "repository": {
+                    "id": f"repository-{owner}-{repo}",
+                    "nameWithOwner": f"{owner}/{repo}",
+                    "url": f"https://github.test/{owner}/{repo}",
+                },
+            }
+            raw = {
+                "issue": issue,
+                "parent": None,
+                "subIssues": {"totalCount": 0, "nodes": []},
+                "blockedBy": {"totalCount": 0, "nodes": []},
+                "blocking": {"totalCount": 0, "nodes": []},
+            }
+        return GitHubResource(raw, "graphql", raw)
 
     async def issue_comments(
         self,

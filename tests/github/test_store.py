@@ -38,7 +38,7 @@ async def test_payload_blobs_are_compressed_and_content_addressed(tmp_path: Path
         "SELECT digest, codec, raw_size, length(payload) AS stored_size FROM payload_blobs",
     )
     versions = await _rows(archive, "SELECT id FROM resource_versions")
-    assert len(blobs) == 2
+    assert len(blobs) == 3
     assert len(versions) == 1
     assert {row["codec"] for row in blobs} == {"zlib-json-v1"}
     assert all(len(row["digest"]) == 64 for row in blobs)

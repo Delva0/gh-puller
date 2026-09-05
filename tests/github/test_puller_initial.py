@@ -6,6 +6,7 @@ import json
 import math
 import random
 import re
+import sqlite3
 from copy import deepcopy
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any
@@ -13,9 +14,11 @@ from typing import TYPE_CHECKING, Any
 import pytest
 
 from gh_puller.github import (
+    GitHubAPIError,
     GitStoreError,
     IncompleteGitHubDataError,
     PullProgress,
+    iter_facts,
 )
 from gh_puller.github.git_store import TransientGitStoreError
 
@@ -112,6 +115,115 @@ async def test_cold_pull_preserves_raw_fields_and_publishes_target(tmp_path: Pat
 
 
 @pytest.mark.asyncio
+async def test_selected_parents_publish_complete_supplemental_facts(tmp_path: Path) -> None:
+    database = tmp_path / "archive"
+    api = FakeAPI()
+    api.add_issue(1)
+    api.add_issue(2, pull=True)
+    api.issue_relation_sets[1] = {
+        "issue": {"id": "issue-1", "number": 1},
+        "parent": None,
+        "subIssues": {"totalCount": 0, "nodes": []},
+        "blockedBy": {"totalCount": 0, "nodes": []},
+        "blocking": {"totalCount": 0, "nodes": []},
+    }
+    api.json[f"{_BASE}/pulls/2"] = {
+        "id": 20,
+        "base": {"sha": "a" * 40},
+        "changed_files": 1,
+        "commits": 1,
+        "head": {"sha": "b" * 40},
+        "review_comments": 1,
+    }
+    comment = {
+        "id": 21,
+        "body": "move this check",
+        "path": "src/worker.py",
+        "reactions": {"total_count": 0},
+    }
+    api.pages[f"{_BASE}/pulls/2/comments"] = [comment]
+    api.pages[f"{_BASE}/pulls/2/commits"] = [
+        {"sha": "c" * 40, "commit": {"message": "change"}},
+    ]
+    api.review_threads[2] = [
+        {
+            "id": "thread-2",
+            "path": "src/worker.py",
+            "diffSide": "RIGHT",
+            "isResolved": False,
+            "comments": {"totalCount": 1, "nodes": [comment]},
+        },
+    ]
+
+    await _puller(_config(database), api=api, git=FakeGitStore(), now=lambda: _T0).pull(_T0)
+
+    facts = [fact async for fact in iter_facts(database)]
+    assert {(fact.fact_kind, fact.subject_key, fact.status) for fact in facts} == {
+        ("issue-relations", "issue:1", "complete"),
+        ("review-threads", "pull:2", "complete"),
+    }
+    assert len({fact.batch_id for fact in facts}) == 1
+    relations = next(fact for fact in facts if fact.fact_kind == "issue-relations")
+    threads = next(fact for fact in facts if fact.fact_kind == "review-threads")
+    assert relations.payload["raw"]["subIssues"] == {"totalCount": 0, "nodes": []}
+    assert threads.payload["raw"]["nodes"][0]["comments"]["nodes"] == [comment]
+    heads = await _rows(database, "SELECT number, bundle_digest FROM resource_heads")
+    digests = {row["number"]: row["bundle_digest"] for row in heads}
+    assert relations.source_digest == digests[1]
+    assert threads.source_digest == digests[2]
+
+
+@pytest.mark.asyncio
+async def test_thread_failure_publishes_attempt_without_replacing_success(tmp_path: Path) -> None:
+    database = tmp_path / "archive"
+    api = FakeAPI()
+    summary = api.add_issue(2, pull=True)
+    api.json[f"{_BASE}/pulls/2"] = {
+        "id": 20,
+        "base": {"sha": "a" * 40},
+        "changed_files": 0,
+        "commits": 0,
+        "head": {"sha": "b" * 40},
+        "review_comments": 1,
+    }
+    api.pages[f"{_BASE}/pulls/2/comments"] = [
+        {"id": 21, "body": "nit", "path": "a.py", "reactions": {"total_count": 0}},
+    ]
+    clock = Clock(_T0)
+    puller = _puller(_config(database), api=api, git=FakeGitStore(), now=clock, sleep=clock.sleep)
+    await puller.pull(_T0)
+
+    clock.current += timedelta(hours=1)
+    summary["updated_at"] = _iso(clock.current - timedelta(minutes=1))
+    api.review_thread_errors[2] = GitHubAPIError(
+        "review threads are forbidden",
+        status_code=403,
+        url="https://api.github.test/graphql",
+    )
+    await puller.pull(clock.current)
+
+    facts = [
+        fact
+        async for fact in iter_facts(database)
+        if fact.fact_kind == "review-threads"
+    ]
+    assert [fact.status for fact in facts] == ["complete", "forbidden"]
+    with sqlite3.connect(database) as connection:
+        current = connection.execute(
+            "SELECT version_id, status FROM current_facts WHERE fact_kind = 'review-threads'",
+        ).fetchone()
+        latest = connection.execute(
+            "SELECT version_id, status FROM latest_fact_attempts "
+            "WHERE fact_kind = 'review-threads'",
+        ).fetchone()
+    assert current == (facts[0].id, "complete")
+    assert latest == (facts[1].id, "forbidden")
+    bundle = (await _current(database))[2].bundle
+    assert bundle is not None
+    assert bundle["pull_request"]["api_sources"]["review_comments"]["source"] == "rest"
+
+
+@pytest.mark.asyncio
 async def test_cold_pull_reports_durable_catalog_and_bundles(tmp_path: Path) -> None:
     api = FakeAPI()
     api.add_issue(1)
@@ -193,10 +305,14 @@ async def test_pull_request_bundle_preserves_discussion_and_git_snapshot(tmp_pat
     assert pull["git"]["head_sha"] == "b" * 40
     assert pull["requested_reviewers"]["users"][0]["login"] == "alice"
     assert pull["closing_issues_references"] == [_closing_issue(11)]
-    assert pull["api_sources"] == {
+    sources = dict(pull["api_sources"])
+    review_comment_source = sources.pop("review_comments")
+    assert review_comment_source["source"] == "graphql"
+    assert review_comment_source["raw"]["totalCount"] == 1
+    assert review_comment_source["raw"]["nodes"][0]["id"] == "review-thread-72"
+    assert sources == {
         "commits": {"source": "rest"},
         "detail": {"source": "rest"},
-        "review_comments": {"source": "rest"},
         "review_comment_reactions": {"72": {"source": "rest"}},
         "reviews": {"source": "rest"},
     }
@@ -316,7 +432,7 @@ async def test_rest_and_graphql_atomic_operations_publish_equal_stable_facts(
         return [leaf for child in value.values() for leaf in leaves(child)]
 
     assert {item["source"] for item in leaves(rest_sources)} == {"rest"}
-    assert {item["source"] for item in leaves(rest_pull_sources)} == {"rest"}
+    assert {item["source"] for item in leaves(rest_pull_sources)} == {"rest", "graphql"}
     assert {item["source"] for item in leaves(graphql_sources)} == {"graphql"}
     assert {item["source"] for item in leaves(graphql_pull_sources)} == {"graphql"}
     assert all("raw" in item for item in leaves(graphql_sources))
@@ -455,7 +571,7 @@ async def test_closing_issue_queries_batch_selected_pulls_per_catalog_page(tmp_p
 
     calls = [call for call in api.calls if call[0] == "closing"]
     assert [len(call[2]["numbers"]) for call in calls] == [50, 50, 1]
-    assert result.requests == 613
+    assert result.requests == 815
 
 
 @pytest.mark.asyncio

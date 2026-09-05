@@ -834,7 +834,7 @@ async def test_pull_commits_graphql_paginates_without_rest_cap() -> None:
 
 
 @pytest.mark.asyncio
-async def test_pull_review_comments_graphql_closes_both_pagination_levels() -> None:
+async def test_pull_review_threads_graphql_closes_both_pagination_levels() -> None:
     seen: list[dict[str, Any]] = []
     comments = [_graphql_review_comment(number) for number in (81, 82, 83)]
 
@@ -872,6 +872,17 @@ async def test_pull_review_comments_graphql_closes_both_pagination_levels() -> N
                             [
                                 {
                                     "id": "thread-1",
+                                    "diffSide": "RIGHT",
+                                    "isOutdated": False,
+                                    "isResolved": True,
+                                    "line": 81,
+                                    "originalLine": 80,
+                                    "originalStartLine": None,
+                                    "path": "src/example.py",
+                                    "resolvedBy": {"id": "user-1", "login": "maintainer"},
+                                    "startDiffSide": None,
+                                    "startLine": None,
+                                    "subjectType": "LINE",
                                     "comments": connection(
                                         [comments[0]],
                                         2,
@@ -894,6 +905,17 @@ async def test_pull_review_comments_graphql_closes_both_pagination_levels() -> N
                             [
                                 {
                                     "id": "thread-2",
+                                    "diffSide": None,
+                                    "isOutdated": True,
+                                    "isResolved": False,
+                                    "line": None,
+                                    "originalLine": None,
+                                    "originalStartLine": None,
+                                    "path": "README.md",
+                                    "resolvedBy": None,
+                                    "startDiffSide": None,
+                                    "startLine": None,
+                                    "subjectType": "FILE",
                                     "comments": connection([comments[2]], 1, None),
                                 },
                             ],
@@ -922,13 +944,7 @@ async def test_pull_review_comments_graphql_closes_both_pagination_levels() -> N
     )
     try:
         await api.get_json("/seed-core")
-        result = await api.pull_review_comments(
-            "acme",
-            "widgets",
-            7,
-            previous=None,
-            cache=None,
-        )
+        result = await api.pull_review_threads("acme", "widgets", 7)
     finally:
         await client.aclose()
 
@@ -938,11 +954,243 @@ async def test_pull_review_comments_graphql_closes_both_pagination_levels() -> N
         {"owner": "acme", "repo": "widgets", "number": 7, "cursor": "next-thread"},
     ]
     assert result.source == "graphql"
-    assert result.raw == comments
-    assert [comment["id"] for comment in result.value] == [81, 82, 83]
-    assert result.value[0]["pull_request_review_id"] == 71
-    assert result.value[0]["path"] == "src/example.py"
-    assert result.value[0]["reactions"]["total_count"] == 1
+    assert result.raw["totalCount"] == 2
+    assert [thread["id"] for thread in result.raw["nodes"]] == ["thread-1", "thread-2"]
+    assert result.raw["nodes"][0]["isResolved"] is True
+    assert result.raw["nodes"][0]["diffSide"] == "RIGHT"
+    assert result.raw["nodes"][0]["comments"] == {
+        "totalCount": 2,
+        "nodes": comments[:2],
+    }
+    review_comments = result.value["review_comments"]
+    assert [comment["id"] for comment in review_comments] == [81, 82, 83]
+    assert review_comments[0]["pull_request_review_id"] == 71
+    assert review_comments[0]["path"] == "src/example.py"
+    assert review_comments[0]["reactions"]["total_count"] == 1
+    assert {"diffSide", "isResolved", "originalStartLine", "resolvedBy"} <= set(
+        seen[0]["query"].split(),
+    )
+
+
+@pytest.mark.asyncio
+async def test_pull_review_threads_rejects_inner_count_change() -> None:
+    comment = _graphql_review_comment(81)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        if "ReviewThreadComments" in body["query"]:
+            data = {
+                "node": {
+                    "id": "thread-1",
+                    "comments": {
+                        "totalCount": 3,
+                        "nodes": [_graphql_review_comment(82)],
+                        "pageInfo": {"hasNextPage": False, "endCursor": None},
+                    },
+                },
+            }
+        else:
+            data = {
+                "repository": {
+                    "pullRequest": {
+                        "number": 7,
+                        "reviewThreads": {
+                            "totalCount": 1,
+                            "nodes": [
+                                {
+                                    "id": "thread-1",
+                                    "comments": {
+                                        "totalCount": 2,
+                                        "nodes": [comment],
+                                        "pageInfo": {
+                                            "hasNextPage": True,
+                                            "endCursor": "comments-next",
+                                        },
+                                    },
+                                },
+                            ],
+                            "pageInfo": {"hasNextPage": False, "endCursor": None},
+                        },
+                    },
+                },
+            }
+        return httpx.Response(
+            200,
+            headers=_quota_headers("graphql", 4_900),
+            json={"data": data},
+            request=request,
+        )
+
+    client = httpx.AsyncClient(
+        base_url="https://api.github.test",
+        transport=httpx.MockTransport(handler),
+    )
+    api = GitHubAPI(token=str(id(client)), client=client, graphql_url="/graphql")
+    try:
+        with pytest.raises(GitHubAPIError, match="comment count changed"):
+            await api.pull_review_threads("acme", "widgets", 7)
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_issue_relations_graphql_preserves_order_and_cross_repository_identity() -> None:
+    seen: list[dict[str, Any]] = []
+
+    def reference(number: int, repository: str = "acme/widgets") -> dict[str, Any]:
+        return {
+            "id": f"issue-{repository}-{number}",
+            "fullDatabaseId": str(number * 10),
+            "number": number,
+            "url": f"https://github.test/{repository}/issues/{number}",
+            "state": "CLOSED",
+            "title": f"issue {number}",
+            "repository": {
+                "id": f"repository-{repository}",
+                "nameWithOwner": repository,
+                "url": f"https://github.test/{repository}",
+            },
+        }
+
+    def connection(
+        nodes: list[dict[str, Any]],
+        total: int,
+        cursor: str | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "totalCount": total,
+            "nodes": nodes,
+            "pageInfo": {"hasNextPage": cursor is not None, "endCursor": cursor},
+        }
+
+    root = reference(7)
+    parent = reference(1, "other/project")
+    sub_issues = [reference(8), reference(9, "fork/widgets")]
+    blocker = reference(3)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        seen.append(body)
+        if "IssueRelationPages" in body["query"]:
+            data = {
+                "node": {
+                    "id": root["id"],
+                    "subIssues": connection(sub_issues[1:], 2),
+                },
+            }
+        else:
+            data = {
+                "repository": {
+                    "issue": root
+                    | {
+                        "parent": parent,
+                        "subIssues": connection(sub_issues[:1], 2, "sub-next"),
+                        "blockedBy": connection([], 0),
+                        "blocking": connection([blocker], 1),
+                    },
+                },
+            }
+        return httpx.Response(
+            200,
+            headers=_quota_headers("graphql", 4_900 - len(seen)),
+            json={"data": data},
+            request=request,
+        )
+
+    client = httpx.AsyncClient(
+        base_url="https://api.github.test",
+        transport=httpx.MockTransport(handler),
+    )
+    api = GitHubAPI(token=str(id(client)), client=client, graphql_url="/graphql")
+    try:
+        result = await api.issue_relations("acme", "widgets", 7)
+    finally:
+        await client.aclose()
+
+    assert result.source == "graphql"
+    assert result.raw["issue"] == root
+    assert result.raw["parent"] == parent
+    assert result.raw["subIssues"] == {"totalCount": 2, "nodes": sub_issues}
+    assert result.raw["blockedBy"] == {"totalCount": 0, "nodes": []}
+    assert result.raw["blocking"] == {"totalCount": 1, "nodes": [blocker]}
+    assert seen[1]["variables"] == {
+        "id": root["id"],
+        "subIssuesCursor": "sub-next",
+        "blockedByCursor": None,
+        "blockingCursor": None,
+        "includeSubIssues": True,
+        "includeBlockedBy": False,
+        "includeBlocking": False,
+    }
+
+
+@pytest.mark.parametrize("mutation", ["duplicate", "count"])
+@pytest.mark.asyncio
+async def test_issue_relations_rejects_inconsistent_continuation(mutation: str) -> None:
+    def reference(number: int) -> dict[str, Any]:
+        return {
+            "id": f"issue-{number}",
+            "fullDatabaseId": str(number * 10),
+            "number": number,
+            "url": f"https://github.test/acme/widgets/issues/{number}",
+            "state": "OPEN",
+            "title": f"issue {number}",
+            "repository": {
+                "id": "repository-acme-widgets",
+                "nameWithOwner": "acme/widgets",
+                "url": "https://github.test/acme/widgets",
+            },
+        }
+
+    def connection(nodes: list[dict[str, Any]], total: int, more: bool) -> dict[str, Any]:
+        return {
+            "totalCount": total,
+            "nodes": nodes,
+            "pageInfo": {"hasNextPage": more, "endCursor": "next" if more else None},
+        }
+
+    root = reference(7)
+    first = reference(8)
+    second = first if mutation == "duplicate" else reference(9)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        if "IssueRelationPages" in body["query"]:
+            data = {
+                "node": {
+                    "id": root["id"],
+                    "subIssues": connection([second], 3 if mutation == "count" else 2, False),
+                },
+            }
+        else:
+            data = {
+                "repository": {
+                    "issue": root
+                    | {
+                        "parent": None,
+                        "subIssues": connection([first], 2, True),
+                        "blockedBy": connection([], 0, False),
+                        "blocking": connection([], 0, False),
+                    },
+                },
+            }
+        return httpx.Response(
+            200,
+            headers=_quota_headers("graphql", 4_900),
+            json={"data": data},
+            request=request,
+        )
+
+    client = httpx.AsyncClient(
+        base_url="https://api.github.test",
+        transport=httpx.MockTransport(handler),
+    )
+    api = GitHubAPI(token=str(id(client)), client=client, graphql_url="/graphql")
+    try:
+        with pytest.raises(GitHubAPIError, match=r"count changed|duplicate"):
+            await api.issue_relations("acme", "widgets", 7)
+    finally:
+        await client.aclose()
 
 
 @pytest.mark.asyncio

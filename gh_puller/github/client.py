@@ -20,8 +20,10 @@ import httpx
 
 from .errors import GitHubAPIError
 from .facts import (
+    check_issue_reference,
     check_size,
     graphql_connection,
+    graphql_issue,
     graphql_parent,
     graphql_pull,
     node_connection,
@@ -35,6 +37,8 @@ from .facts import (
 from .progress import APIProgress, RateQuota
 from .queries import (
     ISSUE_COMMENTS,
+    ISSUE_RELATION_PAGES,
+    ISSUE_RELATIONS,
     PULL_COMMITS,
     PULL_REQUEST_DETAIL,
     PULL_REVIEW_COMMENTS,
@@ -57,6 +61,7 @@ _TRANSIENT_DELAYS = (1, 2, 4, 8, 16, 30)
 _TRANSPORT_RESET_ATTEMPTS = len(_TRANSIENT_DELAYS)
 _LIMIT_RECHECK_SECONDS = 30
 _CORE_AUX_RESOURCE = "core_aux"
+_ISSUE_RELATION_FIELDS = ("subIssues", "blockedBy", "blocking")
 
 
 class _Transport(StrEnum):
@@ -712,6 +717,73 @@ class GitHubAPI:
 
         return await self._either(rest, graphql, rest_cached=cache is not None)
 
+    async def pull_review_threads(
+        self,
+        owner: str,
+        repo: str,
+        number: int,
+    ) -> GitHubResource:
+        """Read the complete native review-thread hierarchy through GraphQL.
+
+        Args:
+            owner: Repository owner.
+            repo: Repository name.
+            number: Repository-local PR number.
+
+        Returns:
+            Complete source-native threads and REST-compatible flattened comments.
+
+        Raises:
+            GitHubAPIError: Authentication is absent or either pagination level is invalid.
+        """
+        if number < 1:
+            raise ValueError("number must be positive")
+        if not self._authenticated:
+            raise GitHubAPIError("review threads require GitHub authentication")
+        raw = await self._graphql_review_threads(owner, repo, number, primary_wait=True)
+        comments = [
+            comment
+            for thread in raw["nodes"]
+            for comment in thread["comments"]["nodes"]
+        ]
+        return GitHubResource(
+            {
+                "review_comments": [
+                    rest_review_comment(comment, self._base_url, owner, repo, number)
+                    for comment in comments
+                ],
+                "threads": raw,
+            },
+            _Transport.GRAPHQL,
+            raw,
+        )
+
+    async def issue_relations(
+        self,
+        owner: str,
+        repo: str,
+        number: int,
+    ) -> GitHubResource:
+        """Read one Issue's complete native hierarchy and dependency relations.
+
+        Args:
+            owner: Repository owner.
+            repo: Repository name.
+            number: Repository-local Issue number.
+
+        Returns:
+            Parent plus ordered sub-issue, blocked-by, and blocking collections.
+
+        Raises:
+            GitHubAPIError: Authentication is absent or a relation page is inconsistent.
+        """
+        if number < 1:
+            raise ValueError("number must be positive")
+        if not self._authenticated:
+            raise GitHubAPIError("issue relations require GitHub authentication")
+        raw = await self._graphql_issue_relations(owner, repo, number)
+        return GitHubResource(raw, _Transport.GRAPHQL, raw)
+
     async def issue_comments(
         self,
         owner: str,
@@ -1143,7 +1215,27 @@ class GitHubAPI:
         *,
         primary_wait: bool,
     ) -> list[dict[str, Any]]:
-        comments: list[dict[str, Any]] = []
+        threads = await self._graphql_review_threads(
+            owner,
+            repo,
+            number,
+            primary_wait=primary_wait,
+        )
+        return [
+            comment
+            for thread in threads["nodes"]
+            for comment in thread["comments"]["nodes"]
+        ]
+
+    async def _graphql_review_threads(
+        self,
+        owner: str,
+        repo: str,
+        number: int,
+        *,
+        primary_wait: bool,
+    ) -> dict[str, Any]:
+        threads: list[dict[str, Any]] = []
         seen_comments: set[str] = set()
         seen_threads: set[str] = set()
         cursor: str | None = None
@@ -1191,7 +1283,12 @@ class GitHubAPI:
                             f"pull #{number} has invalid review-comment identities",
                         )
                     seen_comments.add(comment_id)
-                    comments.append(comment)
+                completed = {key: value for key, value in thread.items() if key != "comments"}
+                completed["comments"] = {
+                    "totalCount": len(thread_comments),
+                    "nodes": thread_comments,
+                }
+                threads.append(completed)
             page_info = connection["pageInfo"]
             if not page_info["hasNextPage"]:
                 if len(seen_threads) != expected_threads:
@@ -1199,11 +1296,95 @@ class GitHubAPI:
                         f"pull #{number} advertised {expected_threads} reviewThreads, "
                         f"got {len(seen_threads)}",
                     )
-                return comments
+                return {"totalCount": expected_threads, "nodes": threads}
             next_cursor = page_info["endCursor"]
             if not isinstance(next_cursor, str) or not next_cursor or next_cursor == cursor:
                 raise GitHubAPIError(f"pull #{number} has an invalid reviewThreads cursor")
             cursor = next_cursor
+
+    async def _graphql_issue_relations(
+        self,
+        owner: str,
+        repo: str,
+        number: int,
+    ) -> dict[str, Any]:
+        payload = await self._graphql(
+            ISSUE_RELATIONS,
+            {"owner": owner, "repo": repo, "number": number},
+        )
+        issue = graphql_issue(payload, number)
+        check_issue_reference(issue, f"issue #{number}")
+        parent = issue.get("parent")
+        if parent is not None:
+            if not isinstance(parent, dict):
+                raise GitHubAPIError(f"issue #{number} has an invalid parent")
+            check_issue_reference(parent, f"issue #{number} parent")
+        issue_id = str(issue["id"])
+        nodes: dict[str, list[dict[str, Any]]] = {
+            field: [] for field in _ISSUE_RELATION_FIELDS
+        }
+        totals: dict[str, int] = {}
+        seen_nodes: dict[str, set[str]] = {
+            field: set() for field in _ISSUE_RELATION_FIELDS
+        }
+        seen_cursors: dict[str, set[str]] = {
+            field: set() for field in _ISSUE_RELATION_FIELDS
+        }
+        cursors: dict[str, str] = {}
+        for field in _ISSUE_RELATION_FIELDS:
+            connection = node_connection(issue, field, f"issue #{number}")
+            totals[field] = int(connection["totalCount"])
+            cursor = _append_issue_relation_page(
+                number,
+                field,
+                connection,
+                totals[field],
+                nodes[field],
+                seen_nodes[field],
+                seen_cursors[field],
+            )
+            if cursor is not None:
+                cursors[field] = cursor
+        while cursors:
+            variables = {
+                "id": issue_id,
+                "subIssuesCursor": cursors.get("subIssues"),
+                "blockedByCursor": cursors.get("blockedBy"),
+                "blockingCursor": cursors.get("blocking"),
+                "includeSubIssues": "subIssues" in cursors,
+                "includeBlockedBy": "blockedBy" in cursors,
+                "includeBlocking": "blocking" in cursors,
+            }
+            payload = await self._graphql(ISSUE_RELATION_PAGES, variables)
+            page_issue = payload.get("data", {}).get("node")
+            if not isinstance(page_issue, dict) or page_issue.get("id") != issue_id:
+                raise GitHubAPIError(f"GitHub returned no matching issue node {issue_id}")
+            active = tuple(cursors)
+            for field in active:
+                connection = node_connection(page_issue, field, f"issue #{number}")
+                cursor = _append_issue_relation_page(
+                    number,
+                    field,
+                    connection,
+                    totals[field],
+                    nodes[field],
+                    seen_nodes[field],
+                    seen_cursors[field],
+                )
+                if cursor is None:
+                    cursors.pop(field)
+                else:
+                    cursors[field] = cursor
+        root = {key: value for key, value in issue.items() if key not in _ISSUE_RELATION_FIELDS}
+        root.pop("parent", None)
+        return {
+            "issue": root,
+            "parent": parent,
+            **{
+                field: {"totalCount": totals[field], "nodes": nodes[field]}
+                for field in _ISSUE_RELATION_FIELDS
+            },
+        }
 
     async def _finish_node_connection(
         self,
@@ -1761,6 +1942,38 @@ def _closing_issue_id(node: dict[str, Any], pull_number: int) -> str:
     return str(node["id"])
 
 
+def _append_issue_relation_page(
+    number: int,
+    field: str,
+    connection: dict[str, Any],
+    expected: int,
+    result: list[dict[str, Any]],
+    seen_nodes: set[str],
+    seen_cursors: set[str],
+) -> str | None:
+    if connection["totalCount"] != expected:
+        raise GitHubAPIError(f"issue #{number} {field} count changed while paging")
+    for node in connection["nodes"]:
+        check_issue_reference(node, f"issue #{number} {field}")
+        node_id = str(node["id"])
+        if node_id in seen_nodes:
+            raise GitHubAPIError(f"issue #{number} has duplicate {field} member {node_id}")
+        seen_nodes.add(node_id)
+        result.append(node)
+    if len(result) > expected:
+        raise GitHubAPIError(f"issue #{number} returned too many {field} members")
+    page_info = connection["pageInfo"]
+    if not page_info["hasNextPage"]:
+        if len(result) != expected:
+            raise GitHubAPIError(
+                f"issue #{number} advertised {expected} {field} members, got {len(result)}",
+            )
+        return None
+    cursor = page_info.get("endCursor")
+    if not isinstance(cursor, str) or not cursor or cursor in seen_cursors:
+        raise GitHubAPIError(f"issue #{number} has an invalid {field} cursor")
+    seen_cursors.add(cursor)
+    return cursor
 
 
 def _validator_headers(cache: dict[str, Any] | None, key: str) -> dict[str, str] | None:

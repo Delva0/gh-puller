@@ -181,7 +181,7 @@ async def test_quiet_increment_cost_is_three_requests_independent_of_catalog_siz
     puller = _puller(_config(archive), api=api, now=clock, sleep=clock.sleep)
     cold = await puller.pull(_T0)
     baseline = math.ceil(catalog_size / 100) + 5 * catalog_size
-    expected = math.ceil(catalog_size / 100) + 1 + 2 * catalog_size
+    expected = math.ceil(catalog_size / 100) + 1 + 3 * catalog_size
     assert cold.requests == expected
     assert cold.requests < baseline
     assert sum(
