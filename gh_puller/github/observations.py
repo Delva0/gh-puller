@@ -295,6 +295,44 @@ class ObservationArchive:
         )
         return None if row is None else _time(str(row["value"]))
 
+    async def seed_discovery_checkpoint(self, checkpoint: datetime) -> datetime:
+        """Set the initial discovery boundary before the first sync cycle.
+
+        Args:
+            checkpoint: Conservative source boundary chosen by an explicit importer.
+
+        Returns:
+            The existing or newly stored checkpoint. A newer checkpoint is never moved
+            backward by a repeated migration.
+
+        Raises:
+            RuntimeError: A sync cycle exists before initial seeding.
+        """
+        value = _iso(checkpoint)
+        db = self._connection
+        await db.execute("BEGIN IMMEDIATE")
+        try:
+            row = await _fetchone(
+                db,
+                "SELECT value FROM archive_meta WHERE key = 'discovery_checkpoint'",
+            )
+            if row is None:
+                cycles = await _fetchone(db, "SELECT COUNT(*) AS count FROM sync_cycles")
+                if cycles is None or int(cycles["count"]) != 0:
+                    raise RuntimeError("discovery checkpoint must be seeded before sync")
+                await db.execute(
+                    "INSERT INTO archive_meta(key, value) VALUES ('discovery_checkpoint', ?)",
+                    (value,),
+                )
+                stored = value
+            else:
+                stored = str(row["value"])
+            await db.commit()
+        except BaseException:
+            await db.rollback()
+            raise
+        return _time(stored)
+
     async def discovery_item(
         self,
         cycle_id: int,
