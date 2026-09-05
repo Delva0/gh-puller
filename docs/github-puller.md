@@ -2,401 +2,360 @@
 <summary>Relevant sources</summary>
 
 - [gh_puller/github/](../gh_puller/github/)
-- [scripts/github-puller-daemon.sh](../scripts/github-puller-daemon.sh)
+- [scripts/](../scripts/)
 - [tests/github/](../tests/github/)
 </details>
 
-# GitHub raw fact archive
+# GitHub observation archive
 
-`gh_puller.github` turns the observable Issue and pull-request state of one GitHub
-repository into an offline archive. SQLite retains API facts and their observation
-history; a companion bare Git store retains the reachable code objects needed to
-reconstruct PR snapshots. The pair is designed for replay and mining, not as a copy
-of GitHub's web pages or as a historical snapshot service.
+`gh_puller.github` records the observable Issue, pull-request, and Git state of one
+GitHub repository as an offline source of truth. SQLite holds immutable semantic
+observations and resumable writer state. A repository-bound bare Git store holds the
+code objects named by those observations.
 
-The two stores form one archive boundary: a consumer needs neither GitHub API access
-nor live PR branches to read a committed observation.
+The archive is a faithful record of what its supported source operations observed.
+It is not a claim that GitHub exposes every state transition, nor an attempt to
+reproduce the GitHub web application.
 
-Sources: [gh_puller/github/](../gh_puller/github/); [tests/github/](../tests/github/)
+## Observation model
 
-## Discovery boundary
+The public data unit is a **fact observation**: one semantically closed source read
+for a stable `(family, subject_key)` identity. Examples include the comments of
+Issue 7, the review threads of PR 12, and the native branch/tag map of the repository.
+A fact contains:
 
-A full pass traverses GitHub's repository Issue catalog in descending creation
-order. That catalog contains both ordinary Issues and pull requests. A delta pass
-starts from the previous committed watermark `W` and uses a configurable overlap
-around GitHub's second-resolution timestamps.
-
-The catalog is a traversal for one pass, not a permanent directory that every run
-must rebuild. It covers the whole repository during a cold pass and only the root
-delta during a warm pass. `catalog complete` means that this traversal's terminal
-page is durable; it does not mean that the run has published.
-
-Each later pass combines three repository-wide signals:
-
-| Signal | Parent selected for refresh | Detection boundary |
-| --- | --- | --- |
-| Issue/PR root delta since `W - overlap` | The returned Issue or PR | GitHub must expose the parent through the catalog's `since` behavior. |
-| Issue-comment delta since `W - overlap` | The comment's Issue or PR | The complete supported parent record is reread; the comment row is only a signal. |
-| PR-review-comment delta since `W - overlap` | The comment's PR | The complete supported PR record is reread; the comment row is only a signal. |
-| No repository-wide signal | Nothing | Silent deletion and child-only changes can remain represented by the last observed record. |
-
-The puller does not use a count change to infer membership and does not perform a
-warm full traversal. If a selected parent directly returns 404 or 410, the new
-version is a tombstone while its last summary and bundle remain available. Changes
-that never select a parent—including some deletions, reactions, timeline events, and
-other child updates—cannot be invented after the fact.
-
-Once a parent is selected, the puller follows every page of each supported operation
-and rejects detectable inconsistencies such as changing totals, duplicate identities,
-or cyclic pagination. REST-backed data preserves unprojected response fields.
-Operations served through GraphQL retain both a transport-independent mapping and
-the exact selected source node under `api_sources`; GraphQL cannot preserve fields
-that were not part of its query.
-
-This is therefore lossless storage of facts the puller actually observed, within its
-supported operations. It is not a claim that every GitHub state transition is
-observable.
-
-Sources: [gh_puller/github/](../gh_puller/github/); [tests/github/](../tests/github/)
-
-## Durable pass
-
-A pass journals each catalog page, its opaque next cursor, and the resulting parent
-tasks in one SQLite transaction. A bounded consumer starts after the first page is
-durable and stages completed parent records as they finish. The catalog can continue
-ahead of slower per-parent reads without making uncommitted work public.
-
-After interruption, the same target restores the active cursor and task queue.
-Completed records are reused. If GitHub rejects a resumed catalog cursor with 404,
-410, or 422, only that traversal restarts; already completed parent work remains
-usable. A pass closes only after the terminal catalog page and every persisted task
-are complete.
-
-Git refs required by a PR record are made durable before SQLite stages that record.
-Finalization then publishes the run, versions, and current heads in one SQLite
-transaction. A process lock allows only one writer for an archive pair, while
-readers continue to see the last committed state.
-
-Sources: [gh_puller/github/](../gh_puller/github/); [tests/github/](../tests/github/)
-
-## Archive format
-
-For a destination named `DATABASE`, the canonical archive is one pair:
-
-```text
-DATABASE       SQLite observations, versions, and PR-to-commit relations
-DATABASE.git   Bare Git repository containing upstream and retained PR objects
-```
-
-SQLite is the publication boundary, while the Git repository supplies code objects
-named by published SQLite rows. A public row never names a Git ref before that ref
-resolves to its stated object. A failed run may leave additional safe Git objects or
-refs, but readers continue to see the last committed SQLite run. The pair is
-repository-bound and must be moved, backed up, and restored together.
-
-Sources: [gh_puller/github/](../gh_puller/github/); [tests/github/](../tests/github/)
-
-### SQLite relations
-
-`archive_meta` binds the database to one `owner/repo`. Schema version `9` is paired
-with Git layout `0`. Raw summaries and complete selected-parent bundles are canonical
-JSON compressed with zlib and addressed by the SHA-256 digest of their uncompressed
-bytes.
-
-The stable downstream relations are:
-
-| Relation | Meaning |
+| Field | Meaning |
 | --- | --- |
-| `pull_runs` | Committed targets, first-call and completion times, and run statistics. |
-| `resource_heads` | Latest published Issue/PR state, including directly observed tombstones. |
-| `resource_versions` | Append-only published changes linked to their run. |
-| `payload_blobs` | Lossless observed JSON payloads addressed by digest. |
-| `fact_batches` and `fact_versions` | Atomic, replay-ordered supplemental observations. |
-| `fact_heads` | Latest attempt and last successful version identities by fact subject. |
-| `current_facts` and `latest_fact_attempts` | Read-only successful and attempted fact heads. |
-| `git_pull_snapshots` | One Git evidence manifest for each distinct PR bundle. |
-| `git_pull_commits` | Ordered API-observed PR commits; one SHA may belong to several PRs. |
-| `current_pull_git` | Current PR heads joined to their Git evidence manifests. |
-| `current_pull_commits` | Current PR heads joined to their ordered commit lists. |
+| `family`, `schema_version`, `subject_key` | Versioned semantic identity. |
+| `resource_number` | Related repository Issue/PR number, when applicable. |
+| `observed_from`, `observed_until` | Real clock interval enclosing the complete source operation. |
+| `coverage` | What conclusion that operation supports. |
+| `origin` | `api`, `git`, `derived`, or `import`. |
+| `payload_digest`, `payload` | Content-addressed JSON evidence and its decoded value. |
+| `source_digest` | Source payload for a derived fact, when applicable. |
+| `published_at` | Time the closed observation became durable in SQLite. |
 
-`bundle_http_cache`, `pull_passes`, `pull_tasks`, `fact_jobs`, and `fact_tasks` are
-writer recovery or coverage state. They may be inspected operationally, but
-downstream mining must not treat them as published GitHub facts.
+One multi-page collection has one observation window; fields inside the same source
+response do not receive invented per-field timestamps. Derived facts inherit the
+window of their source. Later observations append rows instead of rewriting history.
 
-Git object IDs are content identities, not PR- or repository-scoped identifiers.
-Two PRs that name the same SHA share one byte-identical Git object while retaining
-separate SQL relation rows and PR ref paths.
+`payload["value"]` is the stable operation result. `payload["raw"]` retains the
+source-native JSON used to produce it. REST operations therefore retain unprojected
+response fields. GraphQL operations retain every selected node and field, but cannot
+retain fields absent from their query. `payload["cache"]`, when present, pairs HTTP
+validators with the value that they validate; a valid `304` reuses those bytes while
+creating a new, honestly timed observation.
 
-Sources: [gh_puller/github/](../gh_puller/github/); [tests/github/](../tests/github/)
+Sources: [gh_puller/github/observations.py](../gh_puller/github/observations.py); [gh_puller/github/syncer.py](../gh_puller/github/syncer.py)
 
-### Git refs
+### Time and offline queries
 
-Current upstream refs use Git's native namespaces:
+There is no repository-wide target timestamp or atomic run snapshot. Facts close and
+become readable independently, which preserves the finest time precision available
+from the source operation.
 
-```text
-refs/heads/<branch>                         current upstream branch
-refs/tags/<tag>                             current upstream tag
-```
+The three read views answer different questions:
 
-Immutable archive evidence uses a repository-name-independent namespace:
-
-```text
-refs/github-archive/upstream/heads/<sha>     retained observed branch tip
-refs/github-archive/upstream/tags/<sha>      retained observed tag
-
-refs/github-archive/pulls/<n>/bases/<sha>        API-observed PR base
-refs/github-archive/pulls/<n>/heads/<sha>        API-observed original PR head
-refs/github-archive/pulls/<n>/comparisons/<sha>  persisted diff origin
-refs/github-archive/pulls/<n>/landings/<sha>     available merged result
-
-refs/github-archive/commits/<sha>                structured commit reference
-```
-
-`refs/github-archive/staging/*` is mutable writer state and is not a public identity.
-Layout `0` has no `v0` path component. An incompatible namespace begins at
-`refs/github-archive/v1/*`; additive changes retain the unversioned layout.
-
-At the start of each observation pass, the archive synchronizes all upstream
-branches and tags. It fetches a selected PR ref only when the API-observed head is
-not already in that managed upstream graph. Direct upstream pushes and ordinary
-merges therefore arrive through native refs, while original histories for squash,
-rebase, open, and closed-unmerged PRs remain separately pinned when reachable.
-
-Sources: [gh_puller/github/](../gh_puller/github/); [tests/github/](../tests/github/)
-
-### PR history evidence
-
-Each selected PR records a manifest under `bundle["pull_request"]["git"]` and a
-relational projection in `git_pull_snapshots`. `history_preserved` is an ancestry
-proof, not a guessed merge-method label:
-
-| Value | Proven statement |
+| Reader | Result |
 | --- | --- |
-| `1` | The observed original PR head is an ancestor of the available landing commit. |
-| `0` | Both objects are available, but that ancestry does not hold. |
-| `NULL` | No landing proof applies or enough objects are unavailable. |
+| `iter_observations(..., after=N)` | Immutable publication stream after a stable integer cursor. |
+| `iter_current_facts(...)` | Latest actual observation for each selected fact identity. |
+| `iter_facts_as_of(..., at=T)` | Latest observation per identity with `observed_until <= T`. |
 
-A false value is compatible with squash, rebase, or another rewritten landing. The
-archive retains the original head DAG and landing endpoint independently; it does
-not invent an exact mapping between original and rewritten commits.
-
-`comparison_kind` defines offline diff behavior:
-
-| Value | Diff origin |
-| --- | --- |
-| `merge_base` | `comparison_ref` is the unique merge base of retained base and head. |
-| `empty_tree` | Base and head have unrelated histories, so `comparison_ref` is an empty tree. |
-| `unavailable` | A required object was unreachable and no complete code comparison is claimed. |
-
-Snapshot refs protect reachable base, head, comparison, and landing objects from
-later branch deletion, force-push, or Git garbage collection. SQLite still retains
-API SHAs for unreachable objects. Git LFS data, submodule contents, linked
-attachments, and objects outside the repository's reachable Git history are not
-downloaded.
-
-Sources: [gh_puller/github/](../gh_puller/github/); [tests/github/](../tests/github/)
-
-## Reconstruction boundary
-
-Offline reconstruction means deriving a fact from committed API responses and pinned
-Git objects. It does not mean reproducing GitHub's presentation:
-
-| Question | Available offline | Limit |
-| --- | --- | --- |
-| Current observed Issue/PR state | Yes, from current heads | A silent absence remains at its last observed state. |
-| Observed changes over time | Yes, from committed versions | Intermediate states that disappeared before an API response were never observed. |
-| PR changed files and code | Yes for `merge_base` and `empty_tree` manifests | An `unavailable` manifest is explicitly partial. |
-| Discussion and supported Issue/PR relations | Yes, from bundles and supplemental observations | Unsupported reverse references are not inferred. |
-| Exact GitHub web page | No | Rendering, permission-dependent controls, live widgets, and external attachment bytes are outside the archive. |
-
-Sources: [gh_puller/github/](../gh_puller/github/); [tests/github/](../tests/github/)
-
-## Offline access
-
-Downstream jobs need no project-specific SDK: the stable boundary is ordinary SQL
-and native Git. The package nevertheless provides small read-only iterators for
-common scans. `iter_heads` reads committed current state without replaying history:
+An as-of result is therefore a time-bounded collection of independently observed
+facts, not proof that all returned facts coexisted at one instant. Missing facts mean
+“not observed by that boundary,” not an empty GitHub value.
 
 ```python
+from datetime import UTC, datetime
 from pathlib import Path
 
-from gh_puller.github import iter_heads
+from gh_puller.github import iter_facts_as_of
 
 
-async def current_titles(database: Path) -> dict[int, str]:
-    return {
-        head.number: head.summary["title"]
-        async for head in iter_heads(database, present_only=True)
-    }
+async def issue_state_at(database: Path, at: datetime):
+    return [
+        fact
+        async for fact in iter_facts_as_of(
+            database,
+            at.astimezone(UTC),
+            subject_key="issue:7",
+        )
+    ]
 ```
 
-`iter_versions` yields every committed object change and directly observed
-tombstone in deterministic run and parent order. `iter_runs` yields the committed
-run metadata, including target, first-call and completion times, request attempts,
-and published object counts. `iter_facts` replays supplemental observations from a
-stable exclusive cursor. All four readers open SQLite read-only.
+### Coverage
 
-Inspect one PR's current Git manifest and ordered commits directly:
+Coverage describes one attempted source operation:
 
-```bash
-uv run -m sqlite3 archives/repository.sqlite3 \
-  'SELECT * FROM current_pull_git WHERE number = 7;'
+| Value | Supported conclusion |
+| --- | --- |
+| `complete` | The operation closed all declared pages or Git evidence; an empty value may be complete. |
+| `null` | The source explicitly returned null for the declared contract. |
+| `partial` | The payload identifies a known incomplete subset. |
+| `forbidden` | The active GitHub identity could not read the source. |
+| `unavailable` | The checked API or Git paths could not supply the source. |
 
-uv run -m sqlite3 archives/repository.sqlite3 \
-  'SELECT ordinal, sha FROM current_pull_commits WHERE number = 7 ORDER BY ordinal;'
+Transport errors and detectably malformed or truncated responses do not produce a
+fact. They leave a retryable task instead. By contrast, a conclusive `403` or `404`
+can produce a `forbidden` or `unavailable` observation. Current and as-of readers
+return the latest conclusion, including a non-complete one; consumers that require
+complete data must filter `coverage` explicitly.
+
+## Archived facts
+
+When an Issue or PR is selected, the writer observes every applicable supported
+family rather than only the signal that selected it:
+
+| Families | Archived evidence |
+| --- | --- |
+| `issue` | Issue/PR root fields, actors, labels, milestone, state, counts, and unknown REST fields. |
+| `issue-comments`, `issue-events`, `issue-timeline` | Complete supported conversation and event collections. |
+| `issue-reactions`, `issue-comment-reactions` | Parent and per-comment reactions. |
+| `issue-relations` | Parent, sub-Issues, blocked-by, and blocking GraphQL relations for an Issue. |
+| `pull` | PR detail including base/head repositories, branches, SHAs, merge state, and change counts. |
+| `pull-reviews`, `pull-review-threads`, `pull-review-comments` | Reviews plus native thread membership, resolution, position, and comments. |
+| `pull-review-comment-reactions`, `pull-requested-reviewers` | Review-comment reactions and requested users/teams. |
+| `pull-commits`, `pull-closing-issues` | Ordered PR commits and Issues that GitHub says the PR closes. |
+| `pull-git` | Retained base/head/comparison/landing Git evidence for one PR observation. |
+| `commit-references`, `commit-object` | Exact structured commit-field paths and verified Git-object availability. |
+| `git-refs` | Native branch/tag map, default branch, and symbolic `HEAD`. |
+
+`catalog-item` may occur in explicitly imported archives to preserve a source catalog
+record that was distinct from its parent detail. It is not a separate live discovery
+promise.
+
+Structured commit extraction follows only contract-defined commit fields in PR
+commits, reviews, review comments and threads, timeline entries, and events. It does
+not guess commit identities from prose, URLs, or arbitrary hexadecimal strings.
+
+### Reconstruction boundary
+
+| Downstream question | What the archive provides | Boundary |
+| --- | --- | --- |
+| Rebuild an observed Issue/PR discussion | Root, comments, reviews, threads, events, reactions, and relations | Only supported fields and observed states. |
+| Find core developers or bug/WIP work | Actor, association, label, review, event, and merge evidence | The mining definition belongs to the downstream job. |
+| Relate Issues and PRs | Explicit Issue relations, closing-Issue references, timeline/events, and structured commit links | Unsupported reverse references are not inferred. |
+| Recover a PR's source and target | Base/head repository, branch and SHA plus pinned Git evidence | A source object may be explicitly unavailable. |
+| Inspect changed code | Normal Git `show`, `diff`, `log`, `merge-base`, and object plumbing | Git LFS bytes, submodule contents, attachments, and unreachable objects are outside the promise. |
+| Reproduce a GitHub page exactly | No | Rendering, permission-dependent controls, external assets, and live widgets are not archived. |
+
+## Discovery and synchronization
+
+`sync()` is asynchronous but does not return until one operational cycle completes.
+The cycle exists only to recover discovery and work; it is not a public version or a
+publication barrier.
+
+```mermaid
+flowchart TD
+    Call["sync() freezes cycle start S"] --> Resume{"Active cycle?"}
+    Resume -- "yes" --> Durable["Resume cursor and pending tasks"]
+    Resume -- "no, cold" --> Cold["Issue/PR catalog: newest to oldest"]
+    Resume -- "no, warm" --> Signals["Root and comment signals since W - overlap"]
+    Cold --> Page["Persist one catalog page and its tasks"]
+    Signals --> Page
+    Page --> Consume["Observe selected parents concurrently"]
+    Consume --> Publish["Publish each closed fact immediately"]
+    Publish --> More{"More pages or tasks?"}
+    More -- "yes" --> Page
+    More -- "no" --> Checkpoint["Advance discovery checkpoint W to S"]
+    Durable --> Consume
 ```
 
-The bare store remains a normal Git repository. List current upstream history or
-every retained object reachable through archive evidence:
+### Cold start
 
-```bash
-git --git-dir archives/repository.sqlite3.git rev-list --branches --tags
-git --git-dir archives/repository.sqlite3.git rev-list --all
+With no committed discovery checkpoint, the writer traverses GitHub's combined
+Issue/PR catalog in descending creation order. Each page and its parent tasks are
+committed before consumption. The current producer/consumer unit is one page: up to
+100 catalog entries become durable, their parent operations run with bounded
+concurrency, and then discovery proceeds to the next page.
+
+If the process stops, the next call resumes the stored next-page URL and unfinished
+tasks. It does not restart the catalog at page one. Facts whose source operations
+already closed remain public and are not fetched again merely because the cycle is
+incomplete.
+
+### Warm synchronization
+
+Let `W` be the last completed cycle's discovery checkpoint. A new cycle combines:
+
+- Issue/PR roots returned by the repository catalog since `W - overlap`;
+- Issue conversation comments returned since the same boundary;
+- PR review comments returned since the same boundary.
+
+Comment feeds are discovery signals: the writer then reobserves the complete
+supported parent, not just the returned comment. Timestamp overlap makes equal and
+second-resolution boundary values harmless; task and publication identities remove
+duplicates within the cycle.
+
+The cycle start `S` is fixed before network work. The checkpoint advances from `W`
+to `S` only after discovery reaches its terminal page and every task is complete.
+Facts read while a long cycle runs keep their actual later observation windows. The
+next cycle still starts from `S`, so work occurring during the preceding cycle is not
+discarded by advancing to its completion time.
+
+Sources: [gh_puller/github/syncer.py](../gh_puller/github/syncer.py); [tests/github/test_syncer.py](../tests/github/test_syncer.py)
+
+### Discovery limits
+
+GitHub does not provide a repository-wide change feed for every child collection.
+The writer therefore uses a deliberate best-effort boundary:
+
+- a silently deleted Issue or PR may remain at its last observation;
+- deleted or edited comments, reactions, reviews, review threads, timeline events,
+  requested reviewers, and Issue relations may remain stale when no supported signal
+  selects their parent;
+- states that appear and disappear between source reads were never observed;
+- permission-hidden or API-unsupported fields cannot be reconstructed;
+- GitHub pagination can prove a read internally consistent, but cannot turn these
+  missing discovery signals into a complete historical clone.
+
+The writer does not fall back to an expensive full repository scan when counts look
+suspicious. Once a parent is selected by a supported signal, however, every promised
+family is reobserved and detectable pagination inconsistencies fail the task instead
+of silently truncating it.
+
+### Failure, idempotency, and rate limits
+
+A catalog page, task definition, fact batch, and task completion are each committed
+at their own safe boundary. Publication keys make a retried source operation return
+the original rows or reject a conflicting definition. The archive lock permits one
+writer per canonical database; unrelated databases may be written concurrently and
+consume independent shares of the same GitHub account quota.
+
+Transient HTTP and Git failures retry with bounded exponential backoff. Primary and
+secondary rate limits wait inside the active async call and recheck periodically, so
+the caller remains blocked until completion or cancellation. When an atomic client
+operation has equivalent REST and GraphQL implementations, the client chooses using
+their latest known relative capacity and tries the other transport when appropriate.
+Transport-specific operations remain on their required quota.
+
+## SQLite and Git archive pair
+
+For a destination named `DATABASE`, the archive boundary is:
+
+```text
+DATABASE       SQLite facts, observation history, and recovery state
+DATABASE.git   Repository-bound bare Git object store by default
 ```
 
-Use refs returned by SQLite directly with Git:
+`archive_meta` binds schema version 10, repository identity, Git layout 0, and the
+absolute Git-store path. Moving only one member breaks that binding. Back up or move
+the pair together, or pass the bound path explicitly with `--git-destination`.
+
+The durable SQLite relations are grouped by responsibility:
+
+| Relations | Responsibility |
+| --- | --- |
+| `fact_observations`, `fact_batches`, `payload_blobs` | Immutable facts, atomic publication order, and compressed canonical JSON. |
+| `fact_heads`, `current_facts`, `fact_records` | Latest-by-observation-time identities and joined encoded payload records. |
+| `sync_cycles`, `discovery_items`, `discovery_signals`, `sync_tasks` | Recoverable writer state; not GitHub facts. |
+| `fact_schemas`, `archive_meta` | Format registry and archive binding. |
+
+### Git evidence
+
+Current upstream branches and tags use native refs. Before updating them, the writer
+pins their old tips so a force-push or deletion cannot erase previously observed
+history:
+
+```text
+refs/heads/<branch>
+refs/tags/<tag>
+refs/github-archive/upstream/heads/<sha>
+refs/github-archive/upstream/tags/<sha>
+```
+
+PR and structured-commit evidence uses repository-name-independent immutable refs:
+
+```text
+refs/github-archive/pulls/<n>/bases/<sha>
+refs/github-archive/pulls/<n>/heads/<sha>
+refs/github-archive/pulls/<n>/comparisons/<sha>
+refs/github-archive/pulls/<n>/landings/<sha>
+refs/github-archive/commits/<sha>
+```
+
+The upstream repository is synchronized once per cycle. If a PR head is already in
+that graph, no separate PR fetch is needed. Otherwise the writer fetches the original
+PR head, which preserves open and closed-unmerged histories as well as pre-squash or
+pre-rebase commits when GitHub still exposes them. Batched PR fetches start at
+`--git-batch-size` and recursively split on transient transfer failure.
+
+`comparison_kind=merge_base` names the unique merge base for an offline PR diff.
+`empty_tree` represents unrelated histories. `unavailable` records which required
+objects could not be obtained without claiming a complete diff. A landing ref is
+recorded when GitHub identifies a merged result and that object is available;
+`history_preserved` says whether the original head is its ancestor, not which merge
+button was used.
+
+The store is ordinary bare Git and uses Git's content-addressed object namespace.
+Different PRs that name the same commit share the same object while SQLite preserves
+their separate relationships.
+
+Sources: [gh_puller/github/git_store.py](../gh_puller/github/git_store.py); [gh_puller/github/archive_format.py](../gh_puller/github/archive_format.py)
+
+### Direct offline use
+
+The public Python readers decode payloads without network access. SQL and native Git
+remain the stable, unrestricted downstream boundary, so specialized mining can build
+new databases without a thick project SDK.
 
 ```bash
+git --git-dir archives/repository.sqlite3.git show COMMIT_SHA
 git --git-dir archives/repository.sqlite3.git diff \
   refs/github-archive/pulls/7/comparisons/COMPARISON_SHA \
   refs/github-archive/pulls/7/heads/HEAD_SHA
-
-git --git-dir archives/repository.sqlite3.git show HEAD_SHA
+git --git-dir archives/repository.sqlite3.git rev-list --all
 ```
 
-For unrestricted modification, clone the canonical store and work on the copy:
+Clone the canonical bare store before adding downstream refs or changing Git data:
 
 ```bash
 git clone --mirror archives/repository.sqlite3.git derived/repository.git
-git --git-dir derived/repository.git branch experiment HEAD_SHA
+git --git-dir derived/repository.git branch experiment COMMIT_SHA
 ```
 
-A normal working clone can import the archive namespace explicitly:
+SQLite readers may freely query or copy the database, but only the archive writer
+should mutate the canonical pair.
 
-```bash
-git clone archives/repository.sqlite3.git derived/repository
-git -C derived/repository fetch origin \
-  '+refs/github-archive/*:refs/github-archive/*'
-```
+## Running the writer
 
-Native `log`, `show`, `diff`, `blame`, `merge-base`, branching, worktrees, and object
-plumbing remain available. The canonical pair remains single-writer; its clones and
-derived databases are freely writable.
-
-Sources: [gh_puller/github/](../gh_puller/github/); [tests/github/](../tests/github/)
-
-## Supplemental fact maintenance
-
-Review threads, Issue relations, structured commit references, Git object
-availability, and ref-map history have independent observation and failure
-boundaries. Their storage contract, coverage states, historical backfill, targeted
-refresh, and offline replay are defined in [GitHub supplemental
-facts](github-supplemental-facts.md).
-
-Maintenance publishes independent atomic fact batches and never advances the normal
-discovery watermark. It shares the archive writer lock with ordinary runs, so a
-stopped scheduler can leave its pending run durable while a backfill or targeted
-refresh operates on the last published resource cutoff.
-
-## Pull operation
-
-The CLI reads `GH_TOKEN`, then `GITHUB_TOKEN`, from the environment or the
-project-root `.env`. Use an authenticated token for production pulls; selected PRs
-require GraphQL access for their closing-Issue relation.
+The CLI loads `.env`, prefers `GH_TOKEN` over `GITHUB_TOKEN`, writes progress to
+stderr, and emits completed-cycle JSON to stdout. Use an authenticated token for a
+production archive:
 
 ```dotenv
 GH_TOKEN=github_pat_your_token
 ```
 
-Progress is written to stderr. A TTY receives a compact progress line; redirected
-stderr receives JSON Lines. On success, stdout contains one JSON `PullResult`.
-`--no-progress` suppresses stderr progress.
-
-Sources: [gh_puller/github/](../gh_puller/github/); [tests/github/](../tests/github/)
-
-### One observation run
-
-An observation run is the pending-or-committed publication unit identified by the
-normalized UTC target `T`. A call to `GitHubPuller.pull(T)` creates, resumes, or
-returns that unit. The function freezes its call time `C` before the first `await`;
-when the target is omitted, `T = C`. An explicit target must include a timezone.
-
-`T` says when the puller must have reached its final observation pass. It is not a
-request for GitHub's state as it existed at `T`. Facts returned while the operation
-runs may be newer, so the archive records the actual `completed_at` separately.
-
-The previous committed watermark `W` determines the first pass. With no `W`, the
-run performs a full catalog pass. When `T` advances beyond an existing `W`, it
-performs a delta pass from `W`, including the configured timestamp overlap. A target
-at or before `W` is already covered and needs no discovery pass. Whether an advancing
-`T` is past or future does not change the full-versus-delta choice.
-
-```mermaid
-flowchart TD
-    Call["pull(T) at C"] --> Existing{"Committed run for T?"}
-    Existing -- "Yes" --> Return["Return the committed run"]
-    Existing -- "No" --> Pending["Create or resume pending run"]
-    Pending --> Watermark{"Committed W exists?"}
-    Watermark -- "No" --> Full["Full catalog pass"]
-    Watermark -- "Yes" --> Advance{"T advances beyond W?"}
-    Advance -- "No" --> Publish["Finalize run at T"]
-    Advance -- "Yes" --> Delta["Delta pass from W"]
-    Full --> Future{"T is later than C?"}
-    Delta --> Future
-    Future -- "No" --> Publish["Finalize run at T"]
-    Future -- "Yes" --> Persist["Persist first pass"]
-    Persist --> Wait["Wait until T"]
-    Wait --> Closing["Closing delta pass"]
-    Closing --> Publish
-```
-
-For a fresh, already reached `T`, the first needed pass is also the closing pass. For
-a fresh `T > C`, the first needed pass uses `C` as its cutoff and becomes durable
-before the call waits. At `T`, a closing delta pass covers the remaining interval
-and finalizes the same run. The asynchronous call does not return during that wait;
-a retry first restores any durable pass described above.
-
-The first successful call publishes the run. Another call with the same target
-returns that run without making an HTTP request.
-
-A run becomes visible to public readers only after finalization. Cancellation,
-detectable truncation, Git failure, or an unrecoverable API response leaves durable
-work pending and publishes no partial version. Retrying the same target resumes that
-run. Rate limits, network failures, and HTTP 5xx responses wait or retry inside the
-active call while remaining cancellable.
-
-When a selected parent is read, applicable supplemental facts are staged with it and
-become visible in the same run. This does not broaden repository discovery; use the
-targeted refresh operation documented above for research objects whose child-only
-changes may not select their parent.
-
-Run from the repository root with `T = C`:
+Run or resume one cycle:
 
 ```bash
 uv run -m gh_puller.github once \
   vllm-project/vllm archives/vllm.sqlite3
 ```
 
-An explicit target must be an RFC 3339 timestamp with an offset:
+The equivalent library call is asynchronous and blocks the task until the cycle
+completes:
 
-```bash
-uv run -m gh_puller.github once \
-  vllm-project/vllm archives/vllm.sqlite3 \
-  --target 2026-09-02T20:07:00+08:00
+```python
+import asyncio
+from pathlib import Path
+
+from gh_puller.github import GitHubSyncConfig, sync
+
+
+async def main() -> None:
+    await sync(GitHubSyncConfig("vllm-project/vllm", Path("archives/vllm.sqlite3")))
+
+
+asyncio.run(main())
 ```
 
-The destination names SQLite; the companion Git path is derived automatically.
-`--git-url` can select a GitHub Enterprise or mirror remote when the default
-GitHub.com HTTPS URL is unsuitable.
-
-Sources: [gh_puller/github/](../gh_puller/github/); [tests/github/](../tests/github/)
-
-### Scheduled writer
-
-`schedule` is a target-selection loop around [one observation
-run](#one-observation-run), not a separate discovery algorithm. It chooses targets
-aligned to the UTC Unix epoch. The interval is a positive integer followed by `s`,
-`m`, `h`, or `d`, and defaults to `1h`:
+`schedule` invokes the same operation immediately, then after each completion waits
+for the next UTC Unix-epoch-aligned interval boundary. The boundary controls only
+invocation time; it never changes an observation timestamp. Missed boundaries are
+not fabricated as empty cycles.
 
 ```bash
 uv run -m gh_puller.github schedule \
@@ -404,102 +363,55 @@ uv run -m gh_puller.github schedule \
   --interval 1h
 ```
 
-The next target follows the archive state:
+The interval is a positive integer followed by `s`, `m`, `h`, or `d`. Other relevant
+controls are `--concurrency`, `--git-batch-size`, `--overlap-seconds`,
+`--request-timeout`, `--git-url`, `--git-destination`, and `--no-progress`.
 
-| State | Selected `T` | Consequence |
-| --- | --- | --- |
-| A pending run exists | Its existing target | Resume its durable pass and tasks. |
-| No run has committed | Latest reached boundary | Start the archive with a full pass. |
-| The writer is behind | Latest reached boundary | Coalesce missed boundaries without inventing intermediate observations. |
-| The writer is caught up | Boundary after the committed target | Start the next run immediately; it waits inside `pull(T)` if the boundary is still in the future. |
+### Managed Linux service
 
-After each run commits, the loop makes the same choice again. Consequently, a
-healthy hourly writer normally starts the next run before the hour, performs its
-initial delta work, and blocks until the boundary for its closing pass. A restart
-resumes the archive-wide pending target before selecting a new one. A schedule lock
-rejects a second scheduler for the same database, while the archive lock enforces
-the single-writer rule across entry points.
+The systemd helper binds one service to the canonical database path. Its 12-character
+writer ID is the prefix of the SHA-256 digest of that path; the repository is service
+configuration, not part of writer identity. Different databases may have independent
+writers, including writers for the same repository. The archive lock prevents two
+entry points from writing one database.
 
-Sources: [gh_puller/github/](../gh_puller/github/); [tests/github/](../tests/github/)
-
-### Managed service
-
-`scripts/github-puller-daemon.sh` runs the scheduled writer above as a systemd
-service. Systemd supplies installation, process supervision, and restart behavior;
-it does not change target selection or observation semantics. Each service manages
-one canonical database path. It is Linux-only. Use `render` to inspect the generated
-unit without installing it:
-
-```bash
-scripts/github-puller-daemon.sh render \
-  vllm-project/vllm archives/vllm.sqlite3 \
-  --interval 30m
-```
-
-`install` requires system privileges. It binds the writer to the repository,
-database path, and an ordinary service owner; `GH_PULLER_SERVICE_USER` selects that
-owner explicitly, otherwise a sudo invocation uses `SUDO_USER`. It also installs a
-per-unit polkit rule that allows only the bound owner to start, stop, or restart that
-unit. Registration, removal, and boot enablement remain privileged.
-
-Installation is idempotent but deliberately leaves the unit disabled and inactive.
-Options after the database are persisted as `schedule` arguments:
+`install` is privileged because it creates a system unit and a narrowly scoped polkit
+rule. It registers the service disabled and inactive. The bound non-root service user
+can then start, stop, or restart it without `sudo`:
 
 ```bash
 sudo scripts/github-puller-daemon.sh install \
   vllm-project/vllm archives/vllm.sqlite3 \
-  --interval 30m --concurrency 8
+  --interval 1h --concurrency 8
+
 scripts/github-puller-daemon.sh start archives/vllm.sqlite3
+scripts/github-puller-daemon.sh stop archives/vllm.sqlite3
+scripts/github-puller-daemon.sh restart archives/vllm.sqlite3
 ```
 
-Reinstalling updates the registration and leaves it stopped. It rejects repository,
-database-identity, or owner rebinding; changing the owner requires uninstalling and
-installing again. Different canonical database paths create independent writers,
-even for the same repository.
+`GH_PULLER_SERVICE_USER` selects the owner; under ordinary `sudo`, `SUDO_USER` is the
+default. Reinstalling updates the unit but leaves it stopped. It rejects repository,
+database, or owner rebinding.
 
-The bound owner can control the writer without `sudo`; these actions do not enable
-it at boot:
+List writers in a narrow table, then inspect one database or writer ID in detail:
 
 ```bash
 scripts/github-puller-daemon.sh status
 scripts/github-puller-daemon.sh status archives/vllm.sqlite3
+scripts/github-puller-daemon.sh status 0123456789ab
 scripts/github-puller-daemon.sh logs archives/vllm.sqlite3
-scripts/github-puller-daemon.sh stop archives/vllm.sqlite3
-scripts/github-puller-daemon.sh start archives/vllm.sqlite3
-scripts/github-puller-daemon.sh restart archives/vllm.sqlite3
 ```
 
-`status` without a database lists managed writers; with a database it combines
-systemd state and journald progress with read-only durable fact-job status from
-SQLite. `logs` prints recent messages and follows new output. A started unit resumes
-pending work under the same archive lock and restarts one minute after an unexpected
-exit.
+The detail view combines systemd and journald with read-only SQLite state. Its quota
+values are the latest response headers already observed by the writer; status makes
+no GitHub request. Durable discovery, parent, task, fact, checkpoint, and last-error
+state remains visible even when no process is running.
 
-`uninstall` stops and disables the unit, removes its unit file and control policy,
-and leaves the SQLite archive, Git store, `.env`, environments, and source checkout
-untouched:
+`uninstall` removes only the unit and control policy. SQLite, Git objects, `.env`, the
+environment, and source tree remain:
 
 ```bash
 sudo scripts/github-puller-daemon.sh uninstall archives/vllm.sqlite3
 ```
 
-Sources: [scripts/github-puller-daemon.sh](../scripts/github-puller-daemon.sh); [gh_puller/github/](../gh_puller/github/); [tests/github/](../tests/github/)
-
-### Format migration
-
-`migrate` upgrades a stopped schema-7 archive pair to schema 8 and Git layout 0.
-The operation is local and network-free. It preserves pending pass cursors,
-completed tasks, staged versions, and HTTP validators, and it is idempotent when the
-archive is already current.
-
-```bash
-scripts/github-puller-daemon.sh stop archives/repository.sqlite3
-uv run -m gh_puller.github migrate archives/repository.sqlite3
-scripts/github-puller-daemon.sh start archives/repository.sqlite3
-```
-
-Migration refuses to run while another writer holds the archive lock. It publishes
-and validates permanent Git refs before the SQLite transaction exposes their new
-payload identities and relational indexes, so an interrupted attempt can be retried.
-
-Sources: [gh_puller/github/](../gh_puller/github/); [tests/github/](../tests/github/)
+Sources: [scripts/github-puller-daemon.sh](../scripts/github-puller-daemon.sh); [gh_puller/github/monitor.py](../gh_puller/github/monitor.py)

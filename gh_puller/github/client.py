@@ -83,7 +83,7 @@ class GitHubPage:
 
 @dataclass(frozen=True, slots=True)
 class GitHubResource:
-    value: Any  # Stable operation shape consumed by the puller.
+    value: Any  # Stable operation shape consumed by the syncer.
     source: str  # API transport that produced raw.
     raw: Any  # Exact source-native data selected by the operation.
     cache: dict[str, Any] | None = None  # REST validators paired with value.

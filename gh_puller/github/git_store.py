@@ -1,7 +1,7 @@
 """持久化上游仓库与 PR 代码对象并生成可离线解析的 Git 引用。
 
 本模块管理与 SQLite 事实库一一对应的 bare Git 对象库。GitHub 讨论语义由
-puller 拉取；本模块保存标准上游 refs、不可变历史 pins，以及 PR refs 可达的
+syncer 拉取；本模块保存标准上游 refs、不可变历史 pins，以及 PR refs 可达的
 commit、tree 与 blob。它不提供工作区或下游派生写入。
 """
 
