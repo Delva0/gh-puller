@@ -15,8 +15,8 @@ import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from .archive_format import pull_ref, pull_staging_ref, upstream_ref
-from .v8 import GIT_LAYOUT_VERSION
+from .archive_format import commit_ref, pull_ref, pull_staging_ref, upstream_ref
+from .v9 import GIT_LAYOUT_VERSION
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Mapping, Sequence
@@ -30,6 +30,12 @@ _TRANSIENT_FETCH_STATUS = re.compile(
     re.IGNORECASE,
 )
 _MISSING_PULL_REF = re.compile(r"couldn't find remote ref refs/pull/(\d+)/head", re.IGNORECASE)
+_UNAVAILABLE_COMMIT_MARKERS = (
+    "not our ref",
+    "server does not allow request for unadvertised object",
+    "couldn't find remote ref",
+    "remote ref does not exist",
+)
 _TRANSIENT_FETCH_MARKERS = (
     "connection closed",
     "connection reset",
@@ -89,13 +95,14 @@ class GitObjectStore:
         self._lock = asyncio.Lock()
         self._ready = False
         self._upstream_synced = False
+        self._symbolic_head: str | None = None
 
     async def sync_upstream(
         self,
         *,
         heartbeat: Callable[[], None] | None = None,
         retry: Callable[[float], None] | None = None,
-    ) -> None:
+    ) -> dict[str, Any]:
         """同步并固定当前上游 branches 与 tags。
 
         Args:
@@ -105,6 +112,98 @@ class GitObjectStore:
         async with self._lock:
             await self._prepare()
             await self._sync_upstream(heartbeat=heartbeat, retry=retry, force=True)
+            return await self._ref_observation()
+
+    async def retain_commits(
+        self,
+        shas: Sequence[str],
+        *,
+        heartbeat: Callable[[], None] | None = None,
+        retry: Callable[[float], None] | None = None,
+    ) -> dict[str, dict[str, Any]]:
+        """Pin complete Git objects named by structured API fields.
+
+        Args:
+            shas: Distinct commit object IDs to verify and retain.
+            heartbeat: Git network operation progress observer.
+            retry: Transient Git transport retry observer.
+
+        Returns:
+            Per-SHA availability, immutable ref, acquisition path, and failure evidence.
+
+        Raises:
+            GitStoreError: Input is invalid or Git fails without proving unavailability.
+        """
+        selected = tuple(dict.fromkeys(shas))
+        if len(selected) != len(shas) or any(_SHA.fullmatch(sha) is None for sha in selected):
+            raise ValueError("shas must contain unique Git object IDs")
+        if not selected:
+            return {}
+        async with self._lock:
+            await self._prepare()
+            await self._sync_upstream(heartbeat=heartbeat, retry=retry)
+            missing = await self._missing_commits(selected)
+            fetched: set[str] = set()
+            unavailable: dict[str, str] = {}
+            for sha in selected:
+                if sha not in missing:
+                    continue
+                staging_ref = _commit_staging_ref(sha)
+                try:
+                    await self._git(
+                        "fetch",
+                        "--quiet",
+                        "--no-tags",
+                        "--no-write-fetch-head",
+                        "origin",
+                        f"+{sha}:{staging_ref}",
+                        heartbeat=heartbeat,
+                        retry=retry,
+                    )
+                except GitStoreError as exc:
+                    if not _is_unavailable_commit_failure(exc):
+                        raise
+                    unavailable[sha] = str(exc)
+                else:
+                    if sha in await self._missing_commits((sha,)):
+                        unavailable[sha] = "fetch completed without the requested commit"
+                    else:
+                        fetched.add(sha)
+            available = [sha for sha in selected if sha not in unavailable]
+            for sha in available:
+                if sha in await self._missing_commits((sha,)):
+                    unavailable[sha] = "commit is absent from the full Git object store"
+                    continue
+                tree = await self._git("cat-file", "-t", f"{sha}^{{tree}}", ok=(0, 1, 128))
+                if tree.strip() != "tree":
+                    unavailable[sha] = "commit tree is unavailable"
+            available = [sha for sha in selected if sha not in unavailable]
+            if available:
+                await self._git(
+                    "update-ref",
+                    "--stdin",
+                    input_text="".join(f"update {commit_ref(sha)} {sha}\n" for sha in available),
+                )
+            for sha in selected:
+                await self._delete_ref(_commit_staging_ref(sha))
+            return {
+                sha: (
+                    {
+                        "sha": sha,
+                        "status": "available",
+                        "ref": commit_ref(sha),
+                        "obtained": "fetched" if sha in fetched else "existing",
+                        "verification": "commit-and-root-tree",
+                    }
+                    if sha not in unavailable
+                    else {
+                        "sha": sha,
+                        "status": "unavailable",
+                        "reason": unavailable[sha],
+                    }
+                )
+                for sha in selected
+            }
 
     async def prefetch(
         self,
@@ -417,6 +516,41 @@ class GitObjectStore:
         await self._set_head(heartbeat=heartbeat, retry=retry)
         self._upstream_synced = True
 
+    async def _ref_observation(self) -> dict[str, Any]:
+        lines = (
+            await self._git(
+                "for-each-ref",
+                "--format=%(refname) %(objectname) %(*objectname)",
+                "refs/heads",
+                "refs/tags",
+            )
+        ).splitlines()
+        refs = []
+        for line in lines:
+            fields = line.split()
+            if len(fields) not in {2, 3}:
+                raise GitStoreError("Git returned an invalid native ref record")
+            ref, oid, *peeled = fields
+            if _SHA.fullmatch(oid) is None or (
+                peeled and _SHA.fullmatch(peeled[0]) is None
+            ):
+                raise GitStoreError(f"upstream ref has invalid object ID: {ref}")
+            item = {"name": ref, "oid": oid}
+            if ref.startswith("refs/tags/"):
+                item["peeled_oid"] = peeled[0] if peeled else oid
+            refs.append(item)
+        symbolic_head = self._symbolic_head
+        return {
+            "repository": self.repository,
+            "symbolic_head": symbolic_head,
+            "default_branch": (
+                symbolic_head.removeprefix("refs/heads/")
+                if symbolic_head is not None and symbolic_head.startswith("refs/heads/")
+                else None
+            ),
+            "refs": refs,
+        }
+
     async def _pin_upstream_refs(self) -> None:
         lines = (
             await self._git(
@@ -447,9 +581,6 @@ class GitObjectStore:
         heartbeat: Callable[[], None] | None,
         retry: Callable[[float], None] | None,
     ) -> None:
-        current = (await self._git("symbolic-ref", "-q", "HEAD", ok=(0, 1))).strip()
-        if current and not await self._missing_commits((current,)):
-            return
         advertised = await self._git(
             "ls-remote",
             "--symref",
@@ -458,12 +589,14 @@ class GitObjectStore:
             heartbeat=heartbeat,
             retry=retry,
         )
+        self._symbolic_head = None
         for line in advertised.splitlines():
             if line.startswith("ref: refs/heads/") and line.endswith("\tHEAD"):
                 ref = line.removeprefix("ref: ").removesuffix("\tHEAD")
+                self._symbolic_head = ref
                 if not await self._missing_commits((ref,)):
                     await self._git("symbolic-ref", "HEAD", ref)
-                    return
+                return
 
     async def _delete_ref(self, ref: str) -> None:
         await self._git("update-ref", "-d", ref)
@@ -488,6 +621,11 @@ class GitObjectStore:
             raise GitStoreError(f"unsupported Git archive layout {layout.strip()}")
         if not layout.strip():
             await self._git("config", "github-archive.layoutVersion", GIT_LAYOUT_VERSION)
+        if (self.path / "shallow").exists():
+            raise GitStoreError(f"Git store is shallow: {self.path}")
+        partial = await self._git("config", "--get", "extensions.partialClone", ok=(0, 1))
+        if partial.strip():
+            raise GitStoreError(f"Git store is partial: {self.path}")
         remote = await self._git("remote", "get-url", "origin", ok=(0, 2))
         if remote.strip() and remote.strip() != self.remote_url:
             raise GitStoreError(f"Git store origin is {remote.strip()}, not {self.remote_url}")
@@ -582,6 +720,15 @@ def _is_transient_fetch_failure(error: GitStoreError) -> bool:
 
 def _missing_pull_numbers(error: GitStoreError) -> set[int]:
     return {int(number) for number in _MISSING_PULL_REF.findall(str(error))}
+
+
+def _is_unavailable_commit_failure(error: GitStoreError) -> bool:
+    detail = str(error).casefold()
+    return any(marker in detail for marker in _UNAVAILABLE_COMMIT_MARKERS)
+
+
+def _commit_staging_ref(sha: str) -> str:
+    return f"refs/github-archive/staging/commits/{sha}"
 
 
 def _remove_temporary_packs(path: Path) -> None:

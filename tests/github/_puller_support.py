@@ -472,18 +472,48 @@ class FakeGitStore:
     def __init__(self) -> None:
         self.prefetches: list[list[int]] = []
         self.captures: list[int] = []
+        self.retentions: list[list[str]] = []
         self.syncs = 0
+        self.ref_observation: dict[str, Any] = {
+            "repository": "acme/widgets",
+            "symbolic_head": "refs/heads/main",
+            "default_branch": "main",
+            "refs": [],
+        }
 
     async def sync_upstream(
         self,
         *,
         heartbeat: Any = None,
         retry: Any = None,
-    ) -> None:
+    ) -> dict[str, Any]:
         del retry
         self.syncs += 1
         if heartbeat is not None:
             heartbeat()
+        return deepcopy(self.ref_observation)
+
+    async def retain_commits(
+        self,
+        shas: list[str],
+        *,
+        heartbeat: Any = None,
+        retry: Any = None,
+    ) -> dict[str, dict[str, Any]]:
+        del retry
+        self.retentions.append(shas)
+        if heartbeat is not None:
+            heartbeat()
+        return {
+            sha: {
+                "sha": sha,
+                "status": "available",
+                "ref": f"refs/github-archive/commits/{sha}",
+                "obtained": "existing",
+                "verification": "commit-and-root-tree",
+            }
+            for sha in shas
+        }
 
     async def prefetch(
         self,

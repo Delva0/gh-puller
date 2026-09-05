@@ -282,14 +282,25 @@ async def test_upstream_sync_publishes_native_refs_and_pins_removed_tips(tmp_pat
     base, _ = _source_repository(source, 1)
     _git(source, "branch", "same-tip", base)
     _git(source, "tag", "v1", base)
+    _git(source, "tag", "-a", "annotated", base, "-m", "annotated")
     _git(source, "tag", "same-object", base)
     path = git_store_path(tmp_path / "facts.sqlite3")
 
-    await GitObjectStore(path, "acme/widgets", str(source)).sync_upstream()
+    first = await GitObjectStore(path, "acme/widgets", str(source)).sync_upstream()
 
     assert _stored_git(path, "rev-parse", "refs/heads/main") == base
     assert _stored_git(path, "rev-parse", "refs/tags/v1") == base
     assert _stored_git(path, "rev-parse", f"refs/github-archive/upstream/heads/{base}") == base
+    refs = {item["name"]: item for item in first["refs"]}
+    assert first["symbolic_head"] == "refs/heads/main"
+    assert first["default_branch"] == "main"
+    assert refs["refs/tags/v1"] == {
+        "name": "refs/tags/v1",
+        "oid": base,
+        "peeled_oid": base,
+    }
+    assert refs["refs/tags/annotated"]["oid"] != base
+    assert refs["refs/tags/annotated"]["peeled_oid"] == base
     _git(source, "checkout", "--quiet", "--orphan", "replacement")
     _git(source, "rm", "--quiet", "-rf", ".")
     (source / "replacement.txt").write_text("replacement\n")
@@ -301,7 +312,7 @@ async def test_upstream_sync_publishes_native_refs_and_pins_removed_tips(tmp_pat
     _git(source, "update-ref", "-d", "refs/heads/replacement")
     _git(source, "tag", "-d", "v1")
 
-    await GitObjectStore(path, "acme/widgets", str(source)).sync_upstream()
+    second = await GitObjectStore(path, "acme/widgets", str(source)).sync_upstream()
     _stored_git(path, "gc", "--prune=now")
 
     assert _stored_git(path, "rev-parse", "refs/heads/main") == replacement
@@ -309,6 +320,34 @@ async def test_upstream_sync_publishes_native_refs_and_pins_removed_tips(tmp_pat
     assert _stored_git(path, "cat-file", "-t", base) == "commit"
     assert _stored_git(path, "rev-parse", f"refs/github-archive/upstream/heads/{base}") == base
     assert _stored_git(path, "rev-parse", f"refs/github-archive/upstream/heads/{replacement}") == replacement
+    assert second["symbolic_head"] is None
+    assert "refs/tags/v1" not in {item["name"] for item in second["refs"]}
+
+
+@pytest.mark.asyncio
+async def test_structured_commit_retention_pins_fetchable_objects_and_reports_missing(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    base, head = _source_repository(source, 1)
+    path = git_store_path(tmp_path / "facts.sqlite3")
+    store = GitObjectStore(path, "acme/widgets", str(source))
+
+    retained = await store.retain_commits((base, head, "f" * 40))
+
+    assert retained[base]["status"] == "available"
+    assert retained[base]["obtained"] == "existing"
+    assert retained[head]["status"] == "available"
+    assert retained[head]["obtained"] == "fetched"
+    assert retained["f" * 40]["status"] == "unavailable"
+    _git(source, "update-ref", "-d", "refs/pull/7/head")
+    for ref in ("refs/heads/main", "refs/tags/v1"):
+        _stored_git(path, "update-ref", "-d", ref)
+    _stored_git(path, "reflog", "expire", "--expire=now", "--all")
+    _stored_git(path, "gc", "--prune=now")
+
+    assert _stored_git(path, "cat-file", "-t", retained[head]["ref"]) == "commit"
+    assert _stored_git(path, "show", f"{retained[head]['ref']}:changes/0000.txt") == "0"
 
 
 @pytest.mark.asyncio

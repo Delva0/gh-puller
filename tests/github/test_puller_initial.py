@@ -118,6 +118,7 @@ async def test_cold_pull_preserves_raw_fields_and_publishes_target(tmp_path: Pat
 async def test_selected_parents_publish_complete_supplemental_facts(tmp_path: Path) -> None:
     database = tmp_path / "archive"
     api = FakeAPI()
+    git = FakeGitStore()
     api.add_issue(1)
     api.add_issue(2, pull=True)
     api.issue_relation_sets[1] = {
@@ -151,22 +152,40 @@ async def test_selected_parents_publish_complete_supplemental_facts(tmp_path: Pa
             "path": "src/worker.py",
             "diffSide": "RIGHT",
             "isResolved": False,
-            "comments": {"totalCount": 1, "nodes": [comment]},
+            "comments": {
+                "totalCount": 1,
+                "nodes": [
+                    comment
+                    | {
+                        "id": "review-comment-21",
+                        "commit": {"oid": "d" * 40},
+                        "originalCommit": {"oid": "e" * 40},
+                    },
+                ],
+            },
         },
     ]
 
-    await _puller(_config(database), api=api, git=FakeGitStore(), now=lambda: _T0).pull(_T0)
+    await _puller(_config(database), api=api, git=git, now=lambda: _T0).pull(_T0)
 
     facts = [fact async for fact in iter_facts(database)]
-    assert {(fact.fact_kind, fact.subject_key, fact.status) for fact in facts} == {
+    observed = {(fact.fact_kind, fact.subject_key, fact.status) for fact in facts}
+    assert {
         ("issue-relations", "issue:1", "complete"),
         ("review-threads", "pull:2", "complete"),
-    }
+        ("git-refs", "repository", "complete"),
+        ("commit-object", f"commit:{'c' * 40}", "complete"),
+        ("commit-object", f"commit:{'d' * 40}", "complete"),
+        ("commit-object", f"commit:{'e' * 40}", "complete"),
+    } <= observed
     assert len({fact.batch_id for fact in facts}) == 1
     relations = next(fact for fact in facts if fact.fact_kind == "issue-relations")
     threads = next(fact for fact in facts if fact.fact_kind == "review-threads")
     assert relations.payload["raw"]["subIssues"] == {"totalCount": 0, "nodes": []}
-    assert threads.payload["raw"]["nodes"][0]["comments"]["nodes"] == [comment]
+    assert threads.payload["raw"]["nodes"][0]["comments"]["nodes"][0]["id"] == "review-comment-21"
+    scans = [fact for fact in facts if fact.fact_kind == "commit-references"]
+    assert sorted(len(fact.payload["references"]) for fact in scans) == [0, 1, 2]
+    assert git.retentions == [["c" * 40, "d" * 40, "e" * 40]]
     heads = await _rows(database, "SELECT number, bundle_digest FROM resource_heads")
     digests = {row["number"]: row["bundle_digest"] for row in heads}
     assert relations.source_digest == digests[1]

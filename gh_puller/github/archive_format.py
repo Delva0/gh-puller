@@ -54,6 +54,17 @@ def upstream_ref(kind: str, sha: str) -> str:
     return f"{GIT_REF_PREFIX}/upstream/{kind}/{sha}"
 
 
+def commit_ref(sha: str) -> str:
+    """Return a permanent pin for one structured commit reference.
+
+    Args:
+        sha: Git commit object ID named by an archived API field.
+    """
+    if _SHA.fullmatch(sha) is None:
+        raise ValueError("invalid commit evidence ref")
+    return f"{GIT_REF_PREFIX}/commits/{sha}"
+
+
 @dataclass(frozen=True, slots=True)
 class PullGitSnapshot:
     bundle_digest: str  # Canonical bundle identity.

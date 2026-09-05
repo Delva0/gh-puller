@@ -16,8 +16,14 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
 from .client import GitHubAPI, GitHubAPIError, GitHubPage, GitHubResource
+from .commit_references import (
+    CommitReference,
+    bundle_commit_references,
+    review_thread_commit_references,
+)
 from .git_store import (
     GitObjectStore,
+    GitStoreError,
     TransientGitStoreError,
     default_git_url,
     git_store_path,
@@ -49,6 +55,9 @@ _CATALOG_ACCEPT = "application/vnd.github.raw+json"
 _BUNDLE_SCHEMA_VERSION = 7
 _REVIEW_THREADS_FACT_VERSION = 1
 _ISSUE_RELATIONS_FACT_VERSION = 1
+_COMMIT_REFERENCES_FACT_VERSION = 1
+_COMMIT_OBJECT_FACT_VERSION = 1
+_GIT_REFS_FACT_VERSION = 1
 
 
 class IncompleteGitHubDataError(RuntimeError):
@@ -186,7 +195,15 @@ class _GitStore(Protocol):
         *,
         heartbeat: Callable[[], None] | None = None,
         retry: Callable[[float], None] | None = None,
-    ) -> None: ...
+    ) -> dict[str, Any]: ...
+
+    async def retain_commits(
+        self,
+        shas: list[str],
+        *,
+        heartbeat: Callable[[], None] | None = None,
+        retry: Callable[[float], None] | None = None,
+    ) -> dict[str, dict[str, Any]]: ...
 
     async def prefetch(
         self,
@@ -475,13 +492,30 @@ class GitHubPuller:
         elif (state.name, state.cutoff_at) != (pass_name, _iso(cutoff)):
             raise RuntimeError("another observation pass must finish first")
         progress.git_sync()
+        refs_observed_from = _iso(self._now())
         try:
-            await git.sync_upstream(
+            refs = await git.sync_upstream(
                 heartbeat=progress.git_heartbeat,
                 retry=progress.git_retry,
             )
         finally:
             progress.git_done()
+        await archive.stage_facts(
+            run_id,
+            (
+                StagedFact(
+                    fact_kind="git-refs",
+                    schema_version=_GIT_REFS_FACT_VERSION,
+                    subject_key="repository",
+                    resource_number=None,
+                    source_digest=None,
+                    observed_from=refs_observed_from,
+                    observed_until=_iso(self._now()),
+                    status="complete",
+                    payload={"operation": "GitRefObservation", "raw": refs},
+                ),
+            ),
+        )
         if not state.prepared:
             state = await self._prepare_pass(api, archive, state, observed, progress)
         completed, total = await archive.task_progress(run_id)
@@ -1141,6 +1175,7 @@ class GitHubPuller:
             _set_cache(http_cache, "pull_request", cache)
         else:
             facts = (await self._issue_relations_fact(api, number),)
+        facts += await self._commit_reference_facts(git, progress, bundle, facts)
         return bundle, http_cache or None, facts
 
     async def _fetch_pull(
@@ -1372,6 +1407,106 @@ class GitHubPuller:
             },
         )
 
+    async def _commit_reference_facts(
+        self,
+        git: _GitStore,
+        progress: _PullProgressTracker,
+        bundle: dict[str, Any],
+        parent_facts: tuple[StagedFact, ...],
+    ) -> tuple[StagedFact, ...]:
+        number = int(bundle["number"])
+        sources = [
+            ("bundle", json_digest(bundle), bundle_commit_references(bundle)),
+        ]
+        sources.extend(
+            (
+                "review-threads",
+                json_digest(fact.payload),
+                review_thread_commit_references(fact.payload),
+            )
+            for fact in parent_facts
+            if fact.fact_kind == "review-threads" and fact.status == "complete"
+        )
+        by_sha: dict[str, list[tuple[str, str, CommitReference]]] = {}
+        for source_kind, source_digest, references in sources:
+            for reference in references:
+                by_sha.setdefault(reference.sha, []).append(
+                    (source_kind, source_digest, reference),
+                )
+        observed_from = _iso(self._now())
+        retention: dict[str, dict[str, Any]] = {}
+        if by_sha:
+            progress.git_sync()
+            try:
+                retention = await git.retain_commits(
+                    sorted(by_sha),
+                    heartbeat=progress.git_heartbeat,
+                    retry=progress.git_retry,
+                )
+            except GitStoreError as exc:
+                retention = {
+                    sha: {
+                        "sha": sha,
+                        "status": "failed",
+                        "error": {"type": type(exc).__name__, "message": str(exc)},
+                    }
+                    for sha in by_sha
+                }
+            finally:
+                progress.git_done()
+        observed_until = _iso(self._now())
+        scans = tuple(
+            StagedFact(
+                fact_kind="commit-references",
+                schema_version=_COMMIT_REFERENCES_FACT_VERSION,
+                subject_key=f"{source_kind}:{source_digest}",
+                resource_number=number,
+                source_digest=source_digest,
+                observed_from=observed_from,
+                observed_until=observed_until,
+                status="complete",
+                payload={
+                    "operation": "StructuredCommitReferenceScan",
+                    "repository": self.config.repository,
+                    "source_kind": source_kind,
+                    "source_digest": source_digest,
+                    "references": [_reference_payload(reference) for reference in references],
+                },
+            )
+            for source_kind, source_digest, references in sources
+        )
+        objects = tuple(
+            StagedFact(
+                fact_kind="commit-object",
+                schema_version=_COMMIT_OBJECT_FACT_VERSION,
+                subject_key=f"commit:{sha}",
+                resource_number=number,
+                source_digest=None,
+                observed_from=observed_from,
+                observed_until=observed_until,
+                status=(
+                    "complete"
+                    if retention[sha]["status"] == "available"
+                    else retention[sha]["status"]
+                ),
+                payload={
+                    "operation": "GitCommitRetention",
+                    "repository": self.config.repository,
+                    "result": retention[sha],
+                    "referenced_by": [
+                        {
+                            "source_kind": source_kind,
+                            "source_digest": source_digest,
+                            **_reference_payload(reference),
+                        }
+                        for source_kind, source_digest, reference in by_sha[sha]
+                    ],
+                },
+            )
+            for sha in sorted(by_sha)
+        )
+        return (*scans, *objects)
+
     async def _cached_json(
         self,
         api: _API,
@@ -1585,6 +1720,15 @@ def _failed_fact(
             },
         },
     )
+
+
+def _reference_payload(reference: CommitReference) -> dict[str, Any]:
+    return {
+        "sha": reference.sha,
+        "field_path": reference.field_path,
+        "source_kind": reference.source_kind,
+        "source_id": reference.source_id,
+    }
 
 
 def _canonical_comments(items: list[dict[str, Any]]) -> list[dict[str, Any]]:

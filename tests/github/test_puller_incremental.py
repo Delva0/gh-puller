@@ -14,6 +14,7 @@ from gh_puller.github import (
     GitHubAPIError,
     GitStoreError,
     PullProgress,
+    iter_facts,
     iter_heads,
 )
 
@@ -204,6 +205,37 @@ async def test_quiet_increment_cost_is_three_requests_independent_of_catalog_siz
     root_call = next(call for call in discovery if call[1] == f"{_BASE}/issues")
     assert root_call[2]["sort"] == "updated"
     assert root_call[2]["since"] == _iso(_T0 - timedelta(seconds=2))
+
+
+@pytest.mark.asyncio
+async def test_quiet_increment_publishes_a_new_discrete_git_ref_observation(tmp_path: Path) -> None:
+    api = FakeAPI()
+    api.add_issue(1)
+    git = FakeGitStore()
+    archive = tmp_path / "archive"
+    clock = Clock(_T0)
+    puller = _puller(_config(archive), api=api, git=git, now=clock, sleep=clock.sleep)
+    await puller.pull(_T0)
+    git.ref_observation |= {
+        "symbolic_head": "refs/heads/release",
+        "default_branch": "release",
+        "refs": [{"name": "refs/heads/release", "oid": "a" * 40}],
+    }
+    clock.current += timedelta(hours=1)
+
+    await puller.pull(clock.current)
+
+    facts = [
+        fact
+        async for fact in iter_facts(archive)
+        if fact.fact_kind == "git-refs"
+    ]
+    assert [fact.payload["raw"]["default_branch"] for fact in facts] == [
+        "main",
+        "release",
+    ]
+    assert facts[0].batch_id != facts[1].batch_id
+    assert len(await _versions(archive)) == 1
 
 
 @pytest.mark.asyncio
