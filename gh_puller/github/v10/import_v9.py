@@ -41,7 +41,7 @@ from ..observations import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator, Sequence
+    from collections.abc import AsyncIterator, Callable, Iterator, Sequence
 
 _CORE_BATCH_SIZE = 25
 _REFERENCE_BATCH_SIZE = 100
@@ -395,14 +395,8 @@ class V9Importer:
         Returns:
             Number of distinct structured commit IDs in migration scope.
         """
-        sources = {
-            fact.payload_digest: fact
-            async for fact in iter_observations(self.config.destination)
-            if fact.family in _REFERENCE_FAMILIES
-            and fact.coverage is Coverage.COMPLETE
-        }
         shas: set[str] = set()
-        for chunk in _chunks(tuple(sources.values()), _REFERENCE_BATCH_SIZE):
+        async for chunk in _reference_source_batches(self.config.destination):
             key = _batch_key(
                 "v9-references",
                 ((fact.id, fact.payload_digest) for fact in chunk),
@@ -716,6 +710,27 @@ def _pending_page(cursor: str) -> int:
     if page < 0:
         raise RuntimeError("imported discovery cursor is invalid")
     return page
+
+
+async def _reference_source_batches(
+    path: Path,
+) -> AsyncIterator[tuple[FactObservation, ...]]:
+    seen: set[str] = set()
+    batch: list[FactObservation] = []
+    for family in sorted(_REFERENCE_FAMILIES):
+        async for fact in iter_observations(path, family=family):
+            if (
+                fact.coverage is not Coverage.COMPLETE
+                or fact.payload_digest in seen
+            ):
+                continue
+            seen.add(fact.payload_digest)
+            batch.append(fact)
+            if len(batch) == _REFERENCE_BATCH_SIZE:
+                yield tuple(batch)
+                batch.clear()
+    if batch:
+        yield tuple(batch)
 
 
 def _resource_facts(

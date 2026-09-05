@@ -14,10 +14,14 @@ import pytest
 from gh_puller.github.client import GitHubResource
 from gh_puller.github.errors import GitHubAPIError
 from gh_puller.github.observations import (
+    Coverage,
+    FactObservation,
     ObservationArchive,
+    Origin,
     iter_current_facts,
     iter_observations,
 )
+from gh_puller.github.v10 import import_v9 as migration
 from gh_puller.github.v10.import_v9 import V9ImportConfig, V9Importer
 
 if TYPE_CHECKING:
@@ -262,6 +266,65 @@ async def test_missing_legacy_pull_publishes_unavailable_live_fact(
     ]
     assert len(facts) == 1
     assert facts[0].coverage == "unavailable"
+
+
+@pytest.mark.asyncio
+async def test_reference_sources_yield_before_reading_the_next_batch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    released = False
+
+    async def observations(
+        _path: Path,
+        *,
+        after: int = 0,
+        family: str | None = None,
+        subject_key: str | None = None,
+    ):
+        del after, subject_key
+        if family != "pull-commits":
+            return
+        for identity in range(1, 4):
+            if identity == 3 and not released:
+                raise AssertionError("reader consumed beyond one bounded batch")
+            yield _reference_observation(identity)
+
+    monkeypatch.setattr(migration, "iter_observations", observations)
+    monkeypatch.setattr(migration, "_REFERENCE_BATCH_SIZE", 2)
+    batches = migration._reference_source_batches(tmp_path / "unused.sqlite3")
+
+    first = await anext(batches)
+    assert [fact.id for fact in first] == [1, 2]
+    released = True
+    second = await anext(batches)
+    assert [fact.id for fact in second] == [3]
+    with pytest.raises(StopAsyncIteration):
+        await anext(batches)
+
+
+def _reference_observation(identity: int) -> FactObservation:
+    return FactObservation(
+        id=identity,
+        batch_id=identity,
+        publication_key=f"source:{identity}",
+        batch_kind="import",
+        cycle_id=None,
+        task_id=None,
+        published_at=_MIGRATION_TIME,
+        ordinal=0,
+        family="pull-commits",
+        schema_version=1,
+        subject_key=f"pull:{identity}",
+        resource_number=identity,
+        source_digest=None,
+        origin=Origin.IMPORT,
+        observed_from=_MIGRATION_TIME,
+        observed_until=_MIGRATION_TIME,
+        coverage=Coverage.COMPLETE,
+        payload_digest=f"{identity:064x}",
+        payload={"value": []},
+    )
 
 
 def _source_archive(path: Path) -> None:
