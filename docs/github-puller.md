@@ -98,7 +98,7 @@ Sources: [gh_puller/github/](../gh_puller/github/); [tests/github/](../tests/git
 
 ### SQLite relations
 
-`archive_meta` binds the database to one `owner/repo`. Schema version `8` is paired
+`archive_meta` binds the database to one `owner/repo`. Schema version `9` is paired
 with Git layout `0`. Raw summaries and complete selected-parent bundles are canonical
 JSON compressed with zlib and addressed by the SHA-256 digest of their uncompressed
 bytes.
@@ -111,14 +111,17 @@ The stable downstream relations are:
 | `resource_heads` | Latest published Issue/PR state, including directly observed tombstones. |
 | `resource_versions` | Append-only published changes linked to their run. |
 | `payload_blobs` | Lossless observed JSON payloads addressed by digest. |
+| `fact_batches` and `fact_versions` | Atomic, replay-ordered supplemental observations. |
+| `fact_heads` | Latest attempt and last successful version identities by fact subject. |
+| `current_facts` and `latest_fact_attempts` | Read-only successful and attempted fact heads. |
 | `git_pull_snapshots` | One Git evidence manifest for each distinct PR bundle. |
 | `git_pull_commits` | Ordered API-observed PR commits; one SHA may belong to several PRs. |
 | `current_pull_git` | Current PR heads joined to their Git evidence manifests. |
 | `current_pull_commits` | Current PR heads joined to their ordered commit lists. |
 
-`bundle_http_cache`, `pull_passes`, and `pull_tasks` are writer recovery state. They
-may be inspected operationally, but downstream mining must not treat them as
-published facts.
+`bundle_http_cache`, `pull_passes`, `pull_tasks`, `fact_jobs`, and `fact_tasks` are
+writer recovery or coverage state. They may be inspected operationally, but
+downstream mining must not treat them as published GitHub facts.
 
 Git object IDs are content identities, not PR- or repository-scoped identifiers.
 Two PRs that name the same SHA share one byte-identical Git object while retaining
@@ -145,6 +148,8 @@ refs/github-archive/pulls/<n>/bases/<sha>        API-observed PR base
 refs/github-archive/pulls/<n>/heads/<sha>        API-observed original PR head
 refs/github-archive/pulls/<n>/comparisons/<sha>  persisted diff origin
 refs/github-archive/pulls/<n>/landings/<sha>     available merged result
+
+refs/github-archive/commits/<sha>                structured commit reference
 ```
 
 `refs/github-archive/staging/*` is mutable writer state and is not a public identity.
@@ -201,7 +206,7 @@ Git objects. It does not mean reproducing GitHub's presentation:
 | Current observed Issue/PR state | Yes, from current heads | A silent absence remains at its last observed state. |
 | Observed changes over time | Yes, from committed versions | Intermediate states that disappeared before an API response were never observed. |
 | PR changed files and code | Yes for `merge_base` and `empty_tree` manifests | An `unavailable` manifest is explicitly partial. |
-| Discussion and supported PR relations | Yes, from stored parent bundles | Unsupported or repository-external reverse references are not crawled. |
+| Discussion and supported Issue/PR relations | Yes, from bundles and supplemental observations | Unsupported reverse references are not inferred. |
 | Exact GitHub web page | No | Rendering, permission-dependent controls, live widgets, and external attachment bytes are outside the archive. |
 
 Sources: [gh_puller/github/](../gh_puller/github/); [tests/github/](../tests/github/)
@@ -228,7 +233,8 @@ async def current_titles(database: Path) -> dict[int, str]:
 `iter_versions` yields every committed object change and directly observed
 tombstone in deterministic run and parent order. `iter_runs` yields the committed
 run metadata, including target, first-call and completion times, request attempts,
-and published object counts. All three readers open SQLite read-only.
+and published object counts. `iter_facts` replays supplemental observations from a
+stable exclusive cursor. All four readers open SQLite read-only.
 
 Inspect one PR's current Git manifest and ordered commits directly:
 
@@ -278,6 +284,19 @@ plumbing remain available. The canonical pair remains single-writer; its clones 
 derived databases are freely writable.
 
 Sources: [gh_puller/github/](../gh_puller/github/); [tests/github/](../tests/github/)
+
+## Supplemental fact maintenance
+
+Review threads, Issue relations, structured commit references, Git object
+availability, and ref-map history have independent observation and failure
+boundaries. Their storage contract, coverage states, historical backfill, targeted
+refresh, and offline replay are defined in [GitHub supplemental
+facts](github-supplemental-facts.md).
+
+Maintenance publishes independent atomic fact batches and never advances the normal
+discovery watermark. It shares the archive writer lock with ordinary runs, so a
+stopped scheduler can leave its pending run durable while a backfill or targeted
+refresh operates on the last published resource cutoff.
 
 ## Pull operation
 
@@ -345,6 +364,11 @@ detectable truncation, Git failure, or an unrecoverable API response leaves dura
 work pending and publishes no partial version. Retrying the same target resumes that
 run. Rate limits, network failures, and HTTP 5xx responses wait or retry inside the
 active call while remaining cancellable.
+
+When a selected parent is read, applicable supplemental facts are staged with it and
+become visible in the same run. This does not broaden repository discovery; use the
+targeted refresh operation documented above for research objects whose child-only
+changes may not select their parent.
 
 Run from the repository root with `T = C`:
 
@@ -446,9 +470,10 @@ scripts/github-puller-daemon.sh restart archives/vllm.sqlite3
 ```
 
 `status` without a database lists managed writers; with a database it combines
-systemd state with the latest structured progress event from journald. `logs`
-prints recent messages and follows new output. A started unit resumes pending work
-under the same archive lock and restarts one minute after an unexpected exit.
+systemd state and journald progress with read-only durable fact-job status from
+SQLite. `logs` prints recent messages and follows new output. A started unit resumes
+pending work under the same archive lock and restarts one minute after an unexpected
+exit.
 
 `uninstall` stops and disables the unit, removes its unit file and control policy,
 and leaves the SQLite archive, Git store, `.env`, environments, and source checkout

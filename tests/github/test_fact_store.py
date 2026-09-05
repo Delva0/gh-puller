@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+import zlib
 from typing import TYPE_CHECKING
 
 import pytest
@@ -269,3 +270,65 @@ async def test_fact_job_is_idempotent_resumable_and_publishes_batches(tmp_path: 
     with sqlite3.connect(database) as connection:
         assert connection.execute("SELECT count(*) FROM fact_batches").fetchone()[0] == 2
         assert connection.execute("SELECT count(*) FROM current_facts").fetchone()[0] == 2
+
+
+@pytest.mark.asyncio
+async def test_late_publication_cannot_replace_a_newer_fact_observation(tmp_path: Path) -> None:
+    database = tmp_path / "archive.sqlite3"
+    old = _fact(
+        "issue-relations",
+        "issue:7",
+        _T0,
+        "complete",
+        {"blocking": ["old"]},
+    )
+    new = _fact(
+        "issue-relations",
+        "issue:7",
+        _T1,
+        "complete",
+        {"blocking": ["new"]},
+    )
+    async with SQLiteArchive(database, _REPOSITORY) as archive:
+        run = await archive.start_run(_T0, _T0)
+        await archive.start_pass(run.id, "closing", _T0, "full")
+        await archive.prepare_pass(run.id, (), 1)
+        resource = _resource(_T0, (old,))
+        await archive.stage_catalog_page(
+            run.id,
+            (CatalogItem(7, 70, "issue", _T0, _T0, resource.summary or {}),),
+            None,
+        )
+        task = (await archive.pending_catalog_tasks(run.id))[0]
+        assert await archive.stage_task(run.id, 7, task.summary_digest, resource)
+        await archive.finish_pass(run.id, _T0)
+
+        job = await archive.start_fact_job(
+            "refresh:newer",
+            "refresh",
+            _T1,
+            _T1,
+            {"fact_sets": {"issue-relations": 1}},
+            (FactTaskSpec("issue-relations", "issue:7", 7, None),),
+        )
+        fact_task = (await archive.take_fact_tasks(job.id))[0]
+        await archive.publish_fact_batch(
+            job.id,
+            _T1,
+            (StagedTaskFact(fact_task.id, new),),
+        )
+        await archive.finalize(run.id, _T1)
+
+    facts = [fact async for fact in iter_facts(database)]
+    assert [fact.payload["blocking"] for fact in facts] == [["new"], ["old"]]
+    with sqlite3.connect(database) as connection:
+        current = connection.execute(
+            """
+            SELECT p.payload
+            FROM current_facts AS f
+            JOIN payload_blobs AS p ON p.digest = f.payload_digest
+            WHERE f.fact_kind = 'issue-relations'
+            """,
+        ).fetchone()
+    assert current is not None
+    assert b"new" in zlib.decompress(current[0])

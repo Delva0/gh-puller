@@ -120,7 +120,7 @@ with sqlite3.connect(uri, uri=True) as db:
         ("schema_version", "git_layout_version", "repository"),
     ))
 if (
-    metadata.get("schema_version") != "8"
+    metadata.get("schema_version") not in {"8", "9"}
     or metadata.get("git_layout_version") != "0"
     or "repository" not in metadata
 ):

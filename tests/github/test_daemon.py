@@ -144,10 +144,14 @@ def test_daemon_script_renders_database_scoped_service_contract(tmp_path: Path) 
     assert "WantedBy=multi-user.target" in rendered
 
 
-def test_install_is_idempotent_and_uninstall_preserves_archive(tmp_path: Path) -> None:
+@pytest.mark.parametrize("schema", ["8", "9"])
+def test_install_is_idempotent_and_uninstall_preserves_archive(
+    tmp_path: Path,
+    schema: str,
+) -> None:
     environment, units, log = _environment(tmp_path)
     database = tmp_path / "widgets.sqlite3"
-    _bind_archive(database)
+    _bind_archive(database, schema=schema)
     original = database.read_bytes()
     unit_name = _unit_for(database)
     database_arguments = (str(database), os.path.relpath(database, _ROOT))

@@ -945,9 +945,8 @@ class SQLiteArchive:
             Exact resource/fact cutoffs, population evidence, and missing tasks.
 
         Raises:
-            RuntimeError: A normal pull is pending or no resource version is published.
+            RuntimeError: No resource version has been published.
         """
-        await self.ensure_maintenance_ready()
         db = self._connection
         resource = await _fetchone(
             db,
@@ -1073,15 +1072,6 @@ class SQLiteArchive:
             "scheduled_tasks": len(tasks),
         }
         return FactPlan(scope, tasks)
-
-    async def ensure_maintenance_ready(self) -> None:
-        """Reject maintenance while an unpublished normal pull exists."""
-        pending = await _fetchone(
-            self._connection,
-            "SELECT id FROM pull_runs WHERE status = 'pending'",
-        )
-        if pending is not None:
-            raise RuntimeError(f"pending pull {pending['id']} must finish before maintenance")
 
     async def fact_parent(self, number: int) -> FactParent:
         """Read one published parent selected for explicit refresh.
@@ -2070,6 +2060,20 @@ async def _insert_fact_version(
     status: str,
     payload_digest: str,
 ) -> None:
+    head = await _fetchone(
+        db,
+        """
+        SELECT
+            h.latest_version_id, h.successful_version_id,
+            latest.observed_until AS latest_observed_until,
+            successful.observed_until AS successful_observed_until
+        FROM fact_heads AS h
+        JOIN fact_versions AS latest ON latest.id = h.latest_version_id
+        LEFT JOIN fact_versions AS successful ON successful.id = h.successful_version_id
+        WHERE h.fact_kind = ? AND h.subject_key = ?
+        """,
+        (fact_kind, subject_key),
+    )
     cursor = await db.execute(
         """
         INSERT INTO fact_versions(
@@ -2094,7 +2098,16 @@ async def _insert_fact_version(
         ),
     )
     version_id = int(cursor.lastrowid)
-    successful = version_id if status in {"complete", "null"} else None
+    observation = _fact_time(observed_until)
+    latest_id = version_id
+    successful_id = version_id if status in {"complete", "null"} else None
+    if head is not None:
+        if observation < _fact_time(str(head["latest_observed_until"])):
+            latest_id = int(head["latest_version_id"])
+        if head["successful_version_id"] is not None and (
+            successful_id is None or observation < _fact_time(str(head["successful_observed_until"]))
+        ):
+            successful_id = int(head["successful_version_id"])
     await db.execute(
         """
         INSERT INTO fact_heads(
@@ -2102,13 +2115,17 @@ async def _insert_fact_version(
         ) VALUES (?, ?, ?, ?)
         ON CONFLICT(fact_kind, subject_key) DO UPDATE SET
             latest_version_id = excluded.latest_version_id,
-            successful_version_id = coalesce(
-                excluded.successful_version_id,
-                fact_heads.successful_version_id
-            )
+            successful_version_id = excluded.successful_version_id
         """,
-        (fact_kind, subject_key, version_id, successful),
+        (fact_kind, subject_key, latest_id, successful_id),
     )
+
+
+def _fact_time(value: str) -> datetime:
+    parsed = datetime.fromisoformat(value)
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError("fact observation time must include a timezone")
+    return parsed
 
 
 async def _fact_job_by_id(

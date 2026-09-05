@@ -107,7 +107,7 @@ class GitHubFactMaintainer:
             冻结 scope 对应的已完成作业；重复调用会恢复或复用同一 scope。
 
         Raises:
-            RuntimeError: 普通 pull 尚未发布，或另一事实作业占用写者。
+            RuntimeError: 尚无已发布资源，或另一事实作业占用写者。
             ValueError: 事实集合、目标或批大小无效。
         """
         requested_at = _as_utc(self._now())
@@ -175,7 +175,7 @@ class GitHubFactMaintainer:
 
         Raises:
             KeyError: 指定 parent 尚未进入已发布归档。
-            RuntimeError: 普通 pull 尚未发布，或另一事实作业占用写者。
+            RuntimeError: 另一事实作业占用写者。
             ValueError: 选择、目标或批大小无效。
         """
         requested_at = _as_utc(self._now())
@@ -209,7 +209,6 @@ class GitHubFactMaintainer:
                 _match_pending(pending, "refresh", request, target if target is not None else None)
                 await self._wait_until(_parse_time(pending.target_at))
                 return await self._run_job(archive, pending, batch_size)
-            await archive.ensure_maintenance_ready()
             existing = await archive.fact_job_by_key(job_key)
             if existing is not None:
                 return _result(existing)
@@ -348,7 +347,15 @@ class GitHubFactMaintainer:
                     detail=f"job={job.id} completed={job.completed_tasks}/{job.total_tasks}",
                 )
                 try:
-                    results = await self._task_results(archive, tasks, api, git, progress)
+                    fact_sets = job.scope.get("fact_sets", {})
+                    results = await self._task_results(
+                        archive,
+                        tasks,
+                        api,
+                        git,
+                        progress,
+                        retain_references=isinstance(fact_sets, dict) and "commit-references" in fact_sets,
+                    )
                 except BaseException as exc:
                     if isinstance(exc, asyncio.CancelledError):
                         raise
@@ -371,34 +378,38 @@ class GitHubFactMaintainer:
         api: Any,
         git: Any,
         progress: _PullProgressTracker,
+        *,
+        retain_references: bool,
     ) -> tuple[StagedTaskFact, ...]:
         facts: dict[int, list[StagedFact]] = {task.id: [] for task in tasks}
         sources: list[tuple[int, CommitReferenceSource]] = []
         parent_sources: dict[int, CommitReferenceSource] = {}
+        semaphore = asyncio.Semaphore(self.config.concurrency)
 
         async def read_parent(task: FactTask) -> None:
             try:
-                if task.fact_kind == "review-threads":
-                    fact, _, _ = await self._puller._review_threads_fact(
-                        api,
-                        _resource_number(task),
-                    )
-                    fact = replace(fact, source_digest=task.source_digest)
-                    facts[task.id].append(fact)
-                    if fact.status == "complete":
-                        digest = json_digest(fact.payload)
-                        parent_sources[task.id] = CommitReferenceSource(
-                            "review-threads",
-                            digest,
-                            task.resource_number,
-                            review_thread_commit_references(fact.payload),
+                async with semaphore:
+                    if task.fact_kind == "review-threads":
+                        fact, _, _ = await self._puller._review_threads_fact(
+                            api,
+                            _resource_number(task),
                         )
-                elif task.fact_kind == "issue-relations":
-                    fact = await self._puller._issue_relations_fact(
-                        api,
-                        _resource_number(task),
-                    )
-                    facts[task.id].append(replace(fact, source_digest=task.source_digest))
+                        fact = replace(fact, source_digest=task.source_digest)
+                        facts[task.id].append(fact)
+                        if fact.status == "complete" and retain_references:
+                            digest = json_digest(fact.payload)
+                            parent_sources[task.id] = CommitReferenceSource(
+                                "review-threads",
+                                digest,
+                                task.resource_number,
+                                review_thread_commit_references(fact.payload),
+                            )
+                    elif task.fact_kind == "issue-relations":
+                        fact = await self._puller._issue_relations_fact(
+                            api,
+                            _resource_number(task),
+                        )
+                        facts[task.id].append(replace(fact, source_digest=task.source_digest))
             except Exception as exc:
                 facts[task.id].append(_failed_task_fact(task, self._now(), exc))
 
