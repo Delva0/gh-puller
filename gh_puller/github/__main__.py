@@ -1,7 +1,6 @@
-"""提供 GitHub 归档的一次性与固定间隔调度命令。
+"""提供 GitHub 观测归档的一次同步、周期调度与显式旧库导入命令。
 
-本模块只负责 CLI、调度恢复和结构化运行结果；拉取契约见 ``gh_puller.github``，
-算法与运维说明见 ``docs/github-puller.md``。
+调度只决定何时调用同步器；事实时间始终来自实际 source read，不会被调度边界改写。
 """
 
 from __future__ import annotations
@@ -19,14 +18,11 @@ from typing import TYPE_CHECKING, Any
 
 from dotenv import load_dotenv
 
-from .maintenance import FACT_GROUPS, GitHubFactMaintainer, MaintenanceResult
 from .progress import ConsoleProgress
-from .puller import GitHubPullConfig, GitHubPuller, PullResult
-from .store import schedule_state
-from .v9 import MigrationResult, migrate_archive
+from .syncer import GitHubSyncConfig, GitHubSyncer, SyncResult
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator, Sequence
+    from collections.abc import Awaitable, Callable, Iterator, Sequence
 
 _DEFAULT_INTERVAL = timedelta(hours=1)
 _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
@@ -43,12 +39,11 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="uv run -m gh_puller.github")
     commands = parser.add_subparsers(dest="command", required=True)
 
-    once = commands.add_parser("once", help="pull once to an optional RFC 3339 target")
-    _add_common_arguments(once)
-    once.add_argument("--target", type=_parse_time)
+    once = commands.add_parser("once", help="run or resume one sync cycle")
+    _add_sync_arguments(once)
 
-    schedule = commands.add_parser("schedule", help="pull on UTC-aligned fixed intervals")
-    _add_common_arguments(schedule)
+    schedule = commands.add_parser("schedule", help="sync on fixed UTC intervals")
+    _add_sync_arguments(schedule)
     schedule.add_argument(
         "--interval",
         type=_parse_interval,
@@ -57,67 +52,42 @@ def _parser() -> argparse.ArgumentParser:
         help="UTC-aligned cadence such as 30m, 1h, or 1d (default: 1h)",
     )
 
-    backfill = commands.add_parser(
-        "backfill",
-        help="complete missing supplemental facts over a frozen published scope",
+    migration = commands.add_parser(
+        "import-v9",
+        help="import one stopped v9 archive into a separate current archive",
     )
-    _add_common_arguments(backfill)
-    _add_maintenance_arguments(backfill)
-
-    refresh = commands.add_parser(
-        "refresh",
-        help="actively observe supplemental facts for selected Issues and PRs",
-    )
-    _add_common_arguments(refresh)
-    _add_maintenance_arguments(refresh)
-    refresh.add_argument("--pull", type=_positive_int, action="append", default=[])
-    refresh.add_argument("--issue", type=_positive_int, action="append", default=[])
-    refresh.add_argument("--commit", action="append", default=[])
-
-    migrate = commands.add_parser("migrate", help="migrate a stopped archive pair in place")
-    migrate.add_argument("destination", type=Path, help="SQLite archive to migrate")
+    migration.add_argument("repository", help="GitHub owner/repo")
+    migration.add_argument("source", type=Path, help="stopped v9 SQLite archive")
+    migration.add_argument("destination", type=Path, help="new SQLite archive")
+    _add_source_arguments(migration)
     return parser
 
 
-def _add_common_arguments(parser: argparse.ArgumentParser) -> None:
+def _add_sync_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("repository", help="GitHub owner/repo")
-    parser.add_argument("destination", type=Path, help="SQLite metadata database; Git objects use DATABASE.git")
-    parser.add_argument("--api-url", default="https://api.github.com")
-    parser.add_argument("--graphql-url")
-    parser.add_argument("--api-version", default="2022-11-28")
-    parser.add_argument("--git-url", help="Git remote URL (default: repository HTTPS URL on GitHub.com)")
-    parser.add_argument("--concurrency", type=int, default=8)
-    parser.add_argument("--request-timeout", type=float, default=30.0)
-    parser.add_argument("--overlap-seconds", type=int, default=2)
+    parser.add_argument("destination", type=Path, help="SQLite observation archive")
+    _add_source_arguments(parser)
+    parser.add_argument("--git-batch-size", type=_positive_int, default=8)
+    parser.add_argument("--overlap-seconds", type=_positive_int, default=2)
     parser.add_argument("--no-progress", action="store_true", help="disable progress on stderr")
 
 
-def _add_maintenance_arguments(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--target", type=_parse_time)
-    parser.add_argument(
-        "--fact",
-        dest="fact_groups",
-        choices=FACT_GROUPS,
-        action="append",
-        help="supplemental fact group; repeat to select multiple (default: all)",
-    )
-    parser.add_argument("--batch-size", type=_positive_int, default=8)
-
-
-def _parse_time(value: str) -> datetime:
-    try:
-        parsed = datetime.fromisoformat(value)
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError("target must be an RFC 3339 timestamp") from exc
-    if parsed.tzinfo is None or parsed.utcoffset() is None:
-        raise argparse.ArgumentTypeError("target must include a timezone")
-    return parsed.astimezone(UTC)
+def _add_source_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--api-url", default="https://api.github.com")
+    parser.add_argument("--graphql-url")
+    parser.add_argument("--api-version", default="2022-11-28")
+    parser.add_argument("--git-url", help="Git remote URL")
+    parser.add_argument("--git-destination", type=Path, help="bare Git object store")
+    parser.add_argument("--concurrency", type=_positive_int, default=8)
+    parser.add_argument("--request-timeout", type=float, default=30.0)
 
 
 def _parse_interval(value: str) -> timedelta:
     match = _INTERVAL.fullmatch(value)
     if match is None:
-        raise argparse.ArgumentTypeError("interval must be a positive integer followed by s, m, h, or d")
+        raise argparse.ArgumentTypeError(
+            "interval must be a positive integer followed by s, m, h, or d",
+        )
     amount, unit = match.groups()
     return int(amount) * _INTERVAL_UNITS[unit]
 
@@ -132,83 +102,81 @@ def _positive_int(value: str) -> int:
     return parsed
 
 
-def _config(args: argparse.Namespace) -> GitHubPullConfig:
-    return GitHubPullConfig(
+def _config(args: argparse.Namespace) -> GitHubSyncConfig:
+    return GitHubSyncConfig(
         repository=args.repository,
         destination=args.destination,
         api_url=args.api_url,
         graphql_url=args.graphql_url,
         api_version=args.api_version,
         git_url=args.git_url,
+        git_destination=args.git_destination,
         concurrency=args.concurrency,
+        git_batch_size=args.git_batch_size,
         request_timeout=args.request_timeout,
         overlap_seconds=args.overlap_seconds,
     )
 
 
 async def _dispatch(args: argparse.Namespace) -> None:
-    if args.command == "migrate":
-        _emit_migration(await migrate_archive(args.destination))
+    if args.command == "import-v9":
+        from .v10.import_v9 import V9ImportConfig, V9Importer
+
+        result = await V9Importer(
+            V9ImportConfig(
+                source=args.source,
+                destination=args.destination,
+                repository=args.repository,
+                api_url=args.api_url,
+                graphql_url=args.graphql_url,
+                api_version=args.api_version,
+                git_url=args.git_url,
+                git_destination=args.git_destination,
+                concurrency=args.concurrency,
+                request_timeout=args.request_timeout,
+            ),
+        ).migrate()
+        _emit_import(result)
         return
     observer = None if args.no_progress else ConsoleProgress()
-    if args.command in {"backfill", "refresh"}:
-        maintainer = GitHubFactMaintainer(_config(args), observer=observer)
-        groups = FACT_GROUPS if args.fact_groups is None else args.fact_groups
-        if args.command == "backfill":
-            result = await maintainer.backfill(
-                args.target,
-                fact_groups=groups,
-                batch_size=args.batch_size,
-            )
-        else:
-            result = await maintainer.refresh(
-                args.target,
-                pulls=args.pull,
-                issues=args.issue,
-                commits=args.commit,
-                fact_groups=groups,
-                batch_size=args.batch_size,
-            )
-        _emit_maintenance(result)
-        return
-    puller = GitHubPuller(_config(args), observer=observer)
+    syncer = GitHubSyncer(_config(args), observer=observer)
     if args.command == "once":
-        _emit(await puller.pull(args.target))
+        _emit(await syncer.sync())
         return
     with _schedule_lock(args.destination):
-        await _run_schedule(puller, args.destination, args.interval)
+        await _run_schedule(syncer, args.interval)
 
 
 async def _run_schedule(
-    puller: GitHubPuller,
-    destination: Path,
+    syncer: GitHubSyncer,
     interval: timedelta,
     *,
     now: Callable[[], datetime] = lambda: datetime.now(UTC),
-    emit: Callable[[PullResult], None] | None = None,
-    max_runs: int | None = None,
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    emit: Callable[[SyncResult], None] | None = None,
+    max_cycles: int | None = None,
 ) -> None:
+    """Synchronize immediately, then at each following UTC interval boundary.
+
+    Args:
+        syncer: Repository-bound synchronization operation.
+        interval: Positive UTC-aligned invocation cadence.
+        now: Scheduler clock; it does not timestamp facts.
+        sleep: Interruptible boundary wait.
+        emit: Completed-cycle sink; None writes CLI JSON.
+        max_cycles: Test boundary; None schedules forever.
+    """
     if interval <= timedelta(0):
         raise ValueError("interval must be positive")
     sink = _emit if emit is None else emit
-    runs = 0
-    if max_runs is not None and runs >= max_runs:
-        return
-    state = await schedule_state(destination)
-    committed = None if state.committed_target is None else _parse_time(state.committed_target)
-    if state.pending_target is not None:
-        pending = _parse_time(state.pending_target)
-        sink(await puller.pull(pending))
-        runs += 1
-        committed = pending if committed is None else max(committed, pending)
-        if max_runs is not None and runs >= max_runs:
+    completed = 0
+    while max_cycles is None or completed < max_cycles:
+        sink(await syncer.sync())
+        completed += 1
+        if max_cycles is not None and completed >= max_cycles:
             return
-    while max_runs is None or runs < max_runs:
-        target = _scheduled_target(committed, _utc(now()), interval)
-        result = await puller.pull(target)
-        sink(result)
-        committed = target
-        runs += 1
+        current = _utc(now())
+        await sleep(max((_next_boundary(current, interval) - current).total_seconds(), 0.0))
 
 
 @contextmanager
@@ -220,69 +188,53 @@ def _schedule_lock(destination: Path) -> Iterator[None]:
         try:
             fcntl.flock(file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
-            raise RuntimeError(f"scheduled puller already runs for {destination}") from exc
+            raise RuntimeError(f"scheduled sync already runs for {destination}") from exc
         yield
     finally:
         fcntl.flock(file.fileno(), fcntl.LOCK_UN)
         file.close()
 
 
-def _scheduled_target(
-    committed: datetime | None,
-    now: datetime,
-    interval: timedelta,
-) -> datetime:
-    due = _floor_interval(now, interval)
-    if committed is None:
-        return due
-    following = _floor_interval(committed, interval) + interval
-    return max(due, following)
-
-
-def _floor_interval(value: datetime, interval: timedelta) -> datetime:
+def _next_boundary(value: datetime, interval: timedelta) -> datetime:
     elapsed = _utc(value) - _EPOCH
-    return _EPOCH + (elapsed // interval) * interval
+    return _EPOCH + (elapsed // interval + 1) * interval
 
 
 def _utc(value: datetime) -> datetime:
     if value.tzinfo is None or value.utcoffset() is None:
-        raise ValueError("clock must be timezone-aware")
+        raise ValueError("clock must include a timezone")
     return value.astimezone(UTC)
 
 
-def _emit(result: PullResult) -> None:
+def _emit(result: SyncResult) -> None:
     payload: dict[str, Any] = {
-        "catalog_items": result.catalog_items,
-        "changed_items": result.changed_items,
-        "completed_at": result.completed_at.isoformat().replace("+00:00", "Z"),
-        "lag_seconds": result.lag_seconds,
+        "checkpoint_from": _optional_time(result.checkpoint_from),
+        "completed_at": _time(result.completed_at),
+        "cycle_id": result.cycle_id,
+        "discovered_items": result.discovered_items,
         "requests": result.requests,
-        "run_id": result.run_id,
-        "target_at": result.target_at.isoformat().replace("+00:00", "Z"),
+        "started_at": _time(result.started_at),
     }
     print(json.dumps(payload, ensure_ascii=False, sort_keys=True), flush=True)
 
 
-def _emit_migration(result: MigrationResult) -> None:
+def _emit_import(result: Any) -> None:
     payload = {
-        "changed": result.changed,
-        "database": str(result.database),
-        "repository": result.repository,
+        "checkpoint": _time(result.checkpoint),
+        "live_facts": result.live_facts,
+        "referenced_commits": result.referenced_commits,
+        "resources": result.resources,
+        "supplemental_facts": result.supplemental_facts,
     }
     print(json.dumps(payload, ensure_ascii=False, sort_keys=True), flush=True)
 
 
-def _emit_maintenance(result: MaintenanceResult) -> None:
-    payload = {
-        "completed_at": result.completed_at.isoformat().replace("+00:00", "Z"),
-        "completed_tasks": result.completed_tasks,
-        "job_id": result.job_id,
-        "job_key": result.job_key,
-        "kind": result.kind,
-        "target_at": result.target_at.isoformat().replace("+00:00", "Z"),
-        "total_tasks": result.total_tasks,
-    }
-    print(json.dumps(payload, ensure_ascii=False, sort_keys=True), flush=True)
+def _optional_time(value: datetime | None) -> str | None:
+    return None if value is None else _time(value)
+
+
+def _time(value: datetime) -> str:
+    return _utc(value).isoformat().replace("+00:00", "Z")
 
 
 async def _run_with_signals(args: argparse.Namespace) -> int:
@@ -314,17 +266,16 @@ async def _run_with_signals(args: argparse.Namespace) -> int:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """运行 GitHub 归档命令。
+    """Run a GitHub archive command.
 
     Args:
-        argv: 不含程序名的参数；None 使用当前进程参数。
+        argv: Arguments without the program name; None uses process arguments.
 
     Returns:
-        成功为 0；SIGINT 为 130；SIGTERM 为 143。
+        Zero on completion, 130 for SIGINT, or 143 for SIGTERM.
     """
     load_dotenv()
-    args = _parser().parse_args(argv)
-    return asyncio.run(_run_with_signals(args))
+    return asyncio.run(_run_with_signals(_parser().parse_args(argv)))
 
 
 if __name__ == "__main__":

@@ -1,94 +1,72 @@
-"""Test GitHub pull progress rendering."""
+"""Test disposable JSON and terminal sync progress."""
 
 from __future__ import annotations
 
 import json
-from dataclasses import replace
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from io import StringIO
 
-from gh_puller.github import (
+from gh_puller.github.progress import (
+    APIProgress,
     ConsoleProgress,
-    PullProgress,
     RateQuota,
-)
-from tests.github._puller_support import (
-    _T0,
-    _iso,
+    SyncProgress,
+    _SyncProgressTracker,
 )
 
+_T0 = datetime(2026, 9, 5, 10, tzinfo=UTC)
 
-def test_console_progress_uses_throttled_json_for_logs_and_a_tty_bar() -> None:
-    progress = PullProgress(
+
+def test_console_progress_emits_new_journal_contract_without_snapshot_fields() -> None:
+    stream = StringIO()
+    progress = SyncProgress(
         event_at=_T0,
-        phase="closing_bundles",
-        target_at=_T0,
-        catalog_seen=2,
-        catalog_total=2,
-        catalog_complete=True,
-        objects_completed=1,
-        objects_total=2,
-        bundles_completed=1,
-        issues_completed=1,
-        latest_number=1,
-        latest_kind="issue",
-        requests=7,
-        quotas=(
-            RateQuota("core", 5000, 4993, _T0 + timedelta(hours=1)),
-            RateQuota("graphql", 5000, 4998, _T0 + timedelta(minutes=30)),
-        ),
-    )
-    log = StringIO()
-    ticks = iter((0.0, 0.1, 0.2))
-    observer = ConsoleProgress(log, interval=10, tty=False, monotonic=lambda: next(ticks))
-
-    observer(progress)
-    observer(
-        replace(
-            progress,
-            event_at=_T0 + timedelta(seconds=1),
-            objects_completed=2,
-            bundles_completed=2,
-        ),
-    )
-    observer(
-        replace(
-            progress,
-            event_at=_T0 + timedelta(seconds=2),
-            phase="done",
-            objects_completed=2,
-            bundles_completed=2,
-        ),
+        phase="rate_limit",
+        cycle_id=2,
+        checkpoint_from=_T0 - timedelta(hours=1),
+        requests=50,
+        quotas=(RateQuota("core", 5_000, 0, _T0 + timedelta(minutes=5)),),
+        wait_seconds=300,
+        detail="core_rate_limit",
     )
 
-    lines = [json.loads(line) for line in log.getvalue().splitlines()]
-    assert len(lines) == 2
-    assert lines[0]["type"] == "github_pull_progress"
-    assert lines[0]["event_at"] == _iso(_T0)
-    assert lines[0]["quotas"] == [
-        {
-            "resource": "core",
-            "limit": 5000,
-            "remaining": 4993,
-            "reset_at": _iso(_T0 + timedelta(hours=1)),
-        },
-        {
-            "resource": "graphql",
-            "limit": 5000,
-            "remaining": 4998,
-            "reset_at": _iso(_T0 + timedelta(minutes=30)),
-        },
-    ]
-    assert lines[1]["phase"] == "done"
+    ConsoleProgress(stream, tty=False)(progress)
 
-    terminal = StringIO()
-    tty = ConsoleProgress(terminal, interval=0, tty=True, monotonic=lambda: 0.0)
-    tty(progress)
-    tty(replace(progress, phase="done", objects_completed=2, bundles_completed=2))
-    rendered = terminal.getvalue()
-    assert "objects=[##########----------] 1/2" in rendered
-    assert "objects=[####################] 2/2" in rendered
-    assert "issues=1 pulls=0" in rendered
-    assert "latest=issue#1" in rendered
-    assert "core=4,993/5,000 graphql=4,998/5,000" in rendered
-    assert rendered.endswith("\n")
+    payload = json.loads(stream.getvalue())
+    assert payload["type"] == "github_sync_progress"
+    assert payload["cycle_id"] == 2
+    assert payload["checkpoint_from"] == "2026-09-05T09:00:00Z"
+    assert payload["quotas"][0]["resource"] == "core"
+    assert "target_at" not in payload
+    assert "run_id" not in payload
+
+
+def test_tracker_combines_resumed_and_current_process_requests() -> None:
+    events = []
+    tracker = _SyncProgressTracker(events.append, lambda: _T0)
+    tracker.start()
+    tracker.bind(4, _T0 - timedelta(hours=1), 70, 10)
+
+    tracker.api_progress(
+        APIProgress(
+            request_count=13,
+            quotas=(RateQuota("graphql", 5_000, 4_900, _T0 + timedelta(hours=1)),),
+        ),
+    )
+    tracker.done(73)
+
+    assert events[-2].requests == 73
+    assert events[-1].phase == "idle"
+    assert events[-1].requests == 73
+
+
+def test_tty_progress_finishes_idle_and_error_lines() -> None:
+    stream = StringIO()
+    console = ConsoleProgress(stream, tty=True, interval=60)
+
+    console(SyncProgress(_T0, "starting"))
+    console(SyncProgress(_T0, "idle", cycle_id=1))
+
+    assert "starting" in stream.getvalue()
+    assert "idle" in stream.getvalue()
+    assert stream.getvalue().endswith("\n")

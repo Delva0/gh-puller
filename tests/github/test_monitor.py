@@ -1,24 +1,27 @@
-"""Test read-only rendering of managed GitHub writer progress."""
+"""Test read-only rendering of managed observation-writer progress."""
 
 from __future__ import annotations
 
 import hashlib
 import json
 import os
-from dataclasses import replace
 from datetime import UTC, datetime, timedelta, timezone
-from typing import TYPE_CHECKING
+from pathlib import Path
 
 import pytest
 
 from gh_puller.github import monitor
+from gh_puller.github.observations import (
+    Coverage,
+    DiscoveryItemDraft,
+    FactDraft,
+    ObservationArchive,
+    Origin,
+    TaskDraft,
+)
 from gh_puller.github.progress import RateQuota
-from gh_puller.github.store import SQLiteArchive
 
-if TYPE_CHECKING:
-    from pathlib import Path
-
-_EVENT_AT = datetime(2026, 9, 2, 10, 0, tzinfo=UTC)
+_EVENT_AT = datetime(2026, 9, 5, 10, tzinfo=UTC)
 _LOCAL = timezone(timedelta(hours=8), "CST")
 
 
@@ -26,386 +29,210 @@ def _writer(database: Path, repository: str = "acme/widgets") -> monitor.Managed
     resolved = database.resolve()
     identity = hashlib.sha256(os.fsencode(resolved)).hexdigest()
     return monitor.ManagedWriter(
-        unit=f"gh-puller-{identity[:12]}.service",
-        identity=identity,
-        repository=repository,
-        database=resolved,
-        git_store=monitor.git_store_path(resolved),
+        f"gh-puller-{identity[:12]}.service",
+        identity,
+        repository,
+        resolved,
     )
 
 
 def _progress(**changes: object) -> monitor.ProgressState:
-    state = monitor.ProgressState(
-        event_at=_EVENT_AT,
-        phase="closing_bundles",
-        target_at="2026-09-02T05:37:49.940630Z",
-        run_id=1,
-        catalog_seen=54_083,
-        catalog_total=54_083,
-        catalog_complete=True,
-        objects_completed=224,
-        objects_total=51_549,
-        bundles_completed=224,
-        issues_completed=117,
-        pulls_completed=107,
-        tombstones=0,
-        latest_number=2886,
-        latest_kind="pull",
-        quotas=(
-            RateQuota("core", 5_000, 4_498, _EVENT_AT + timedelta(hours=1)),
-            RateQuota("graphql", 5_000, 4_997, _EVENT_AT + timedelta(minutes=30)),
+    values = {
+        "event_at": _EVENT_AT,
+        "phase": "fetching",
+        "cycle_id": 3,
+        "checkpoint_from": _EVENT_AT - timedelta(hours=1),
+        "requests": 41,
+        "quotas": (
+            RateQuota("core", 5_000, 4_200, _EVENT_AT + timedelta(hours=1)),
+            RateQuota("graphql", 5_000, 4_800, _EVENT_AT + timedelta(minutes=30)),
         ),
-        wait_seconds=None,
-        detail=None,
-        items=54_083,
+        "wait_seconds": None,
+        "detail": None,
+    }
+    values.update(changes)
+    return monitor.ProgressState(**values)
+
+
+def _archive(database: Path) -> monitor.ArchiveState:
+    return monitor.ArchiveState(
+        git_store=Path(f"{database}.git").resolve(),
+        checkpoint=_EVENT_AT - timedelta(hours=1),
+        cycle_id=3,
+        cycle_status="active",
+        cycle_started=_EVENT_AT,
+        cycle_completed=None,
+        discovery_pages=12,
+        discovered_items=1_200,
+        discovery_complete=False,
+        tasks_completed=700,
+        tasks_total=1_202,
+        parents_completed=699,
+        parents_total=1_200,
+        observations=8_500,
+        current_facts=7_900,
+        requests=40,
+        latest=("issue-comments", "issue:42", _EVENT_AT),
+        updated_at=_EVENT_AT,
+        last_error=None,
     )
-    return replace(state, **changes)
 
 
-def _status(database: Path, progress: monitor.ProgressState | None = None) -> monitor.WriterStatus:
+def _status(database: Path) -> monitor.WriterStatus:
     return monitor.WriterStatus(
-        writer=_writer(database),
-        service=monitor.ServiceState(active="active", sub="running", pid=1234, restarts=0),
-        progress=_progress() if progress is None else progress,
+        _writer(database),
+        monitor.ServiceState("active", "running", 1234, 0),
+        _progress(),
+        _archive(database),
     )
-
-
-def _write_unit(
-    database: Path,
-    units: Path,
-    repository: str = "acme/widgets",
-    *,
-    full_digest: bool = False,
-) -> Path:
-    writer = _writer(database, repository)
-    units.mkdir(exist_ok=True)
-    unit = f"gh-puller-{writer.identity}.service" if full_digest else writer.unit
-    path = units / unit
-    path.write_text(
-        f"# gh-puller-repository={repository}\n# gh-puller-database={database.resolve()}\n[Unit]\n",
-    )
-    return path
 
 
 def test_table_is_a_compact_writer_overview(tmp_path: Path) -> None:
-    progress = _progress(
-        phase="rate_limit",
-        wait_seconds=600.0,
-        detail="primary_rate_limit",
-    )
+    status = _status(tmp_path / "facts.sqlite3")
 
-    output = monitor._render_table(
-        [_status(tmp_path / "facts.sqlite3", progress)],
-        now=_EVENT_AT + timedelta(minutes=5),
-    )
+    output = monitor._render_table([status], now=_EVENT_AT + timedelta(minutes=5))
 
     lines = output.splitlines()
     assert lines[0].split() == ["ID", "ST", "REPO", "DB", "PHASE", "DONE", "UPDATED"]
     assert "up" in lines[1]
     assert "acme/widgets" in lines[1]
     assert "facts.sqlite3" in lines[1]
-    assert "quota" in lines[1]
-    assert "224/51.5k" in lines[1]
+    assert "699/1.2k" in lines[1]
     assert lines[1].endswith("5m")
     assert max(map(len, lines)) <= 79
-    for omitted in ("GIT STORE", "RUN", "TARGET T", "ITEMS", "CATALOG", "QUOTA", "WAIT"):
+    for omitted in ("GIT", "CYCLE", "CHECKPOINT", "QUOTA", "REQUESTS"):
         assert omitted not in lines[0]
 
 
-def test_table_truncates_long_identifiers_to_79_columns(tmp_path: Path) -> None:
-    database = tmp_path / "a-very-long-github-archive-name.sqlite3"
-    status = _status(database)
-    status = replace(
-        status,
-        writer=_writer(database, "extraordinarily-long-owner/extraordinarily-long-repository"),
-    )
-
-    output = monitor._render_table([status], now=_EVENT_AT)
-
-    assert "…" in output
-    assert max(map(len, output.splitlines())) <= 79
-
-
-def test_table_output_is_stable_for_external_watch(tmp_path: Path) -> None:
-    statuses = [_status(tmp_path / "facts.sqlite3")]
-
-    first = monitor._render_table(statuses, now=_EVENT_AT + timedelta(seconds=5))
-    second = monitor._render_table(statuses, now=_EVENT_AT + timedelta(seconds=5))
-
-    assert first == second
-    assert "\x1b" not in first
-
-
-def test_detail_separates_current_items_from_unknown_catalog_denominator(tmp_path: Path) -> None:
-    progress = _progress(
-        phase="closing_catalog",
-        catalog_seen=27_400,
-        catalog_total=None,
-        catalog_complete=False,
-        objects_completed=100,
-        objects_total=None,
-        bundles_completed=0,
-        issues_completed=0,
-        pulls_completed=0,
-        latest_number=None,
-        latest_kind=None,
-    )
+def test_detail_combines_durable_work_and_disposable_quota(tmp_path: Path) -> None:
+    database = tmp_path / "facts.sqlite3"
 
     output = monitor._render_detail(
-        _status(tmp_path / "facts.sqlite3", progress),
-        now=_EVENT_AT,
-        zone=_LOCAL,
-    )
-
-    assert "ITEMS       54,083" in output
-    assert "CATALOG     scanning 27,400/?" in output
-    assert "OBJECTS     objects 100/?" in output
-    assert "DATABASE" in output
-    assert "GIT STORE" in output
-    assert str((tmp_path / "facts.sqlite3").resolve()) in output
-
-
-def test_detail_shows_process_and_durable_run_progress(tmp_path: Path) -> None:
-    output = monitor._render_detail(
-        _status(tmp_path / "facts.sqlite3"),
+        _status(database),
         now=_EVENT_AT + timedelta(seconds=3),
         zone=_LOCAL,
     )
 
     assert "STATE       running (active=active, sub=running)" in output
-    assert "PID         1234" in output
-    assert "TARGET T    Wed 2026-09-02 13:37:49.940630 CST" in output
-    assert "ITEMS       54,083" in output
-    assert "CATALOG     complete 54,083" in output
-    assert "OBJECTS     objects [--------------------] 224/51,549" in output
-    assert "STAGED      issues=117 pulls=107 tombstones=0" in output
-    assert "LATEST      pull#2886" in output
+    assert f"DATABASE    {database.resolve()}" in output
+    assert f"GIT STORE   {database.resolve()}.git" in output
+    assert "CYCLE       3 active since Sat 2026-09-05 18:00:00 CST" in output
+    assert "DISCOVERY   scanning pages=12 items=1,200" in output
+    assert "PARENTS     parents [###########---------] 699/1,200" in output
+    assert "TASKS       tasks [###########---------] 700/1,202" in output
+    assert "FACTS       current=7,900 observations=8,500" in output
+    assert "LATEST      issue-comments issue:42" in output
     assert (
-        "QUOTA       core     4,498/5,000  reset Wed 2026-09-02 19:00:00 CST\n"
-        "            graphql  4,997/5,000  reset Wed 2026-09-02 18:30:00 CST"
+        "QUOTA       core     4,200/5,000  reset Sat 2026-09-05 19:00:00 CST\n"
+        "            graphql  4,800/5,000  reset Sat 2026-09-05 18:30:00 CST"
     ) in output
-    assert "UPDATED     Wed 2026-09-02 18:00:00 CST; 3s ago" in output
-    assert "PASS" not in output
-    assert "SERIES" not in output
+    assert "UPDATED     Sat 2026-09-05 18:00:00 CST; 3s ago" in output
+    assert "TARGET" not in output
+    assert "RUN" not in output
 
 
-def test_detail_shows_the_actionable_error_message(tmp_path: Path) -> None:
-    progress = _progress(
-        phase="error",
-        detail="IncompleteGitHubDataError: pull #7 advertised 251 commits, got 250",
-    )
-
-    output = monitor._render_detail(
-        _status(tmp_path / "facts.sqlite3", progress),
-        now=_EVENT_AT,
-        zone=_LOCAL,
-    )
-
-    assert "DETAIL      IncompleteGitHubDataError: pull #7 advertised 251 commits, got 250" in output
-
-
-def test_detail_separates_fact_task_completion_from_data_availability(tmp_path: Path) -> None:
-    job = monitor.FactJobState(
-        id=3,
-        kind="backfill",
-        status="pending",
-        target_at=_EVENT_AT,
-        resource_cutoff=42,
-        fact_cutoff=7,
-        fact_sets=(("commit-object", 1), ("commit-references", 1)),
-        completed_tasks=8,
-        total_tasks=10,
-        task_outcomes=(("complete", 8), ("pending", 2)),
-        fact_outcomes=(
-            ("commit-object", "complete", 5),
-            ("commit-object", "unavailable", 2),
-            ("commit-references", "complete", 8),
-        ),
-        next_task=("commit-references", "bundle:abc", 2),
-        latest_fact=("commit-object", "commit:def", "unavailable"),
-        latest_success=("commit-references", "bundle:def"),
-        updated_at=_EVENT_AT - timedelta(seconds=4),
-        last_error="GitStoreError: disconnected",
-    )
-    status = replace(_status(tmp_path / "facts.sqlite3"), maintenance=job)
-
-    output = monitor._render_detail(
-        status,
-        now=_EVENT_AT,
-        zone=_LOCAL,
-    )
-
-    assert "FACT JOB      backfill#3 pending" in output
-    assert "FACT SCOPE    resources<=42; facts<=7; commit-object@1, commit-references@1" in output
-    assert "FACT TASKS    tasks [################----] 8/10" in output
-    assert "FACT RESULTS  complete=8 pending=2" in output
-    assert "commit-object unavailable=2" in output
-    assert "FACT NEXT     commit-references bundle:abc attempt=2" in output
-    assert "FACT ERROR    GitStoreError: disconnected" in output
-
-
-@pytest.mark.asyncio
-async def test_fact_status_is_recovered_from_sqlite_without_journal(tmp_path: Path) -> None:
-    database = tmp_path / "facts.sqlite3"
-    scope = {
-        "fact_sets": {"git-refs": 1},
-        "resource_version_cutoff": 9,
-        "fact_version_cutoff": 4,
-    }
-    async with SQLiteArchive(database, "acme/widgets") as archive:
-        await archive.start_fact_job(
-            "backfill:test",
-            "backfill",
-            "2026-09-02T10:00:00Z",
-            "2026-09-02T10:00:00Z",
-            scope,
-            (),
-        )
-
-    status, error = monitor._fact_job_status(database)
-
-    assert error is None
-    assert status is not None
-    assert status.kind == "backfill"
-    assert status.status == "complete"
-    assert status.resource_cutoff == 9
-    assert status.fact_sets == (("git-refs", 1),)
-
-
-def test_quota_keeps_unknown_fields_explicit() -> None:
-    progress = _progress(quotas=(RateQuota("core", None, None, None),))
-
-    assert monitor._quota(progress, _LOCAL) == "core  ?/?  reset ?"
-
-
-def test_latest_progress_ignores_raw_logs_and_keeps_quota_fields() -> None:
-    old = {
-        "type": "github_pull_progress",
-        "event_at": "2026-09-02T09:59:00Z",
-        "phase": "starting",
-        "target_at": "2026-09-02T05:37:49Z",
-        "run_id": 1,
-    }
-    latest = {
-        "type": "github_pull_progress",
-        "event_at": "2026-09-02T10:00:00Z",
-        "phase": "closing_catalog",
-        "target_at": "2026-09-02T05:37:49Z",
-        "run_id": 1,
-        "catalog_seen": 200,
-        "items": 54_083,
-        "requests": 24_946,
+def test_latest_progress_ignores_unrelated_journal_lines() -> None:
+    event = {
+        "type": "github_sync_progress",
+        "event_at": "2026-09-05T10:00:00Z",
+        "phase": "rate_limit",
+        "cycle_id": 3,
+        "checkpoint_from": "2026-09-05T09:00:00Z",
+        "requests": 41,
+        "wait_seconds": 30,
+        "detail": "core_rate_limit",
         "quotas": [
             {
                 "resource": "core",
                 "limit": 5_000,
-                "remaining": 4_498,
-                "reset_at": "2026-09-02T11:00:00Z",
-            },
-            {
-                "resource": "graphql",
-                "limit": 5_000,
-                "remaining": 4_997,
-                "reset_at": "2026-09-02T10:30:00Z",
+                "remaining": 0,
+                "reset_at": "2026-09-05T11:00:00Z",
             },
         ],
     }
-    output = "\n".join((json.dumps(old), "Traceback: diagnostic", json.dumps(latest)))
 
-    progress = monitor._latest_progress(output)
+    progress = monitor._latest_progress(
+        "\n".join((json.dumps({"type": "old"}), "traceback", json.dumps(event))),
+    )
 
     assert progress is not None
-    assert progress.phase == "closing_catalog"
-    assert progress.catalog_seen == 200
-    assert not progress.catalog_complete
-    assert progress.objects_completed == 0
-    assert progress.objects_total is None
-    assert progress.items == 54_083
-    assert not hasattr(progress, "requests")
+    assert progress.phase == "rate_limit"
+    assert progress.requests == 41
     assert progress.quotas == (
-        RateQuota("core", 5_000, 4_498, _EVENT_AT + timedelta(hours=1)),
-        RateQuota("graphql", 5_000, 4_997, _EVENT_AT + timedelta(minutes=30)),
+        RateQuota("core", 5_000, 0, _EVENT_AT + timedelta(hours=1)),
     )
 
 
-def test_detail_separates_completed_catalog_from_initial_estimate(tmp_path: Path) -> None:
-    progress = _progress(
-        catalog_seen=54_276,
-        catalog_total=54_299,
-        catalog_complete=True,
-        objects_completed=230,
-        objects_total=54_276,
-        items=54_276,
-    )
+@pytest.mark.asyncio
+async def test_archive_progress_is_recovered_without_journal(tmp_path: Path) -> None:
+    database = tmp_path / "facts.sqlite3"
+    git_store = tmp_path / "objects.git"
+    summary = {
+        "id": 10,
+        "number": 1,
+        "created_at": "2026-09-01T00:00:00Z",
+        "updated_at": "2026-09-05T09:00:00Z",
+    }
+    async with ObservationArchive(database, "acme/widgets", git_store) as archive:
+        cycle = await archive.start_cycle(_EVENT_AT)
+        cursor = await archive.begin_discovery(cycle.id, "/page/1")
+        assert cursor == "/page/1"
+        await archive.save_discovery_page(
+            cycle.id,
+            cursor,
+            None,
+            (
+                DiscoveryItemDraft(1, "issue", _EVENT_AT, _EVENT_AT, summary),
+                DiscoveryItemDraft(2, "issue", _EVENT_AT, _EVENT_AT, summary | {"id": 20, "number": 2}),
+            ),
+            (
+                TaskDraft("parent:1", "parent", "issue:1", {"number": 1}, 1),
+                TaskDraft("parent:2", "parent", "issue:2", {"number": 2}, 2),
+            ),
+        )
+        first, second = await archive.take_tasks(cycle.id, 2)
+        await archive.publish(
+            "sync:test:1",
+            "sync",
+            _EVENT_AT,
+            (
+                FactDraft(
+                    "issue",
+                    "issue:1",
+                    _EVENT_AT,
+                    _EVENT_AT,
+                    Coverage.COMPLETE,
+                    Origin.API,
+                    {"value": summary},
+                    resource_number=1,
+                ),
+            ),
+            cycle_id=cycle.id,
+            task_id=first.id,
+        )
+        await archive.record_task_error(second.id, "GitHubAPIError: transient")
 
-    output = monitor._render_detail(
-        _status(tmp_path / "facts.sqlite3", progress),
-        now=_EVENT_AT,
-        zone=_LOCAL,
-    )
+    state, error = monitor._archive_state(database)
 
-    assert "ITEMS       54,276" in output
-    assert "CATALOG     complete 54,276 (initial estimate 54,299)" in output
-    assert "OBJECTS     objects [--------------------] 230/54,276" in output
+    assert error is None
+    assert state is not None
+    assert state.git_store == git_store.resolve()
+    assert state.discovery_complete
+    assert (state.parents_completed, state.parents_total) == (1, 2)
+    assert (state.observations, state.current_facts) == (1, 1)
+    assert state.last_error == "GitHubAPIError: transient"
+    assert state.latest is not None and state.latest[:2] == ("issue", "issue:1")
 
 
-def test_managed_writers_require_matching_path_identity(tmp_path: Path) -> None:
+def test_managed_writers_accept_database_or_short_identity(tmp_path: Path) -> None:
     units = tmp_path / "units"
-    first = tmp_path / "a.sqlite3"
-    second = tmp_path / "b.sqlite3"
-    third = tmp_path / "c.sqlite3"
-    _write_unit(first, units)
-    _write_unit(second, units, "acme/other")
-    _write_unit(third, units, "acme/legacy", full_digest=True)
-    (units / f"gh-puller-{'0' * 64}.service").write_text(
-        f"# gh-puller-repository=acme/invalid\n# gh-puller-database={first.resolve()}\n",
-    )
-    (units / "gh-puller-acme-legacy.service").write_text("[Unit]\n")
-
-    writers = monitor._managed_writers(units)
-    selected = monitor._managed_writers(units, second)
-    selected_by_id = monitor._managed_writers(
-        units,
-        writer_id=_writer(second).identity[:12],
+    database = tmp_path / "facts.sqlite3"
+    writer = _writer(database)
+    units.mkdir()
+    (units / writer.unit).write_text(
+        f"# gh-puller-repository={writer.repository}\n"
+        f"# gh-puller-database={writer.database}\n",
     )
 
-    assert {writer.database for writer in writers} == {
-        first.resolve(),
-        second.resolve(),
-        third.resolve(),
-    }
-    assert [writer.database for writer in selected] == [second.resolve()]
-    assert [writer.database for writer in selected_by_id] == [second.resolve()]
-
-
-def test_collection_reads_systemd_and_latest_journal_event(
-    tmp_path: Path,
-    monkeypatch: object,
-) -> None:
-    writer = _writer(tmp_path / "facts.sqlite3")
-    commands: list[list[str]] = []
-    event = {
-        "type": "github_pull_progress",
-        "event_at": "2026-09-02T10:00:00Z",
-        "phase": "closing_bundles",
-        "target_at": "2026-09-02T05:37:49Z",
-        "run_id": 7,
-        "catalog_total": 100,
-        "bundles_completed": 3,
-    }
-
-    def output(command: list[str]) -> str:
-        commands.append(command)
-        if command[0] == "systemctl-test":
-            return "ActiveState=active\nSubState=running\nMainPID=42\nNRestarts=2\n"
-        return json.dumps(event)
-
-    monkeypatch.setattr(monitor, "_output", output)
-
-    statuses = monitor._collect([writer], "systemctl-test", "journalctl-test")
-
-    assert statuses[0].service == monitor.ServiceState("active", "running", 42, 2)
-    assert statuses[0].progress is not None
-    assert statuses[0].progress.run_id == 7
-    assert commands[0][:3] == ["systemctl-test", "show", writer.unit]
-    assert commands[1][:3] == ["journalctl-test", "--unit", writer.unit]
+    assert monitor._managed_writers(units, database)[0].database == database.resolve()
+    assert monitor._managed_writers(units, writer_id=writer.identity[:12])[0] == writer

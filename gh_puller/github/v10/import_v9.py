@@ -1,10 +1,10 @@
 """Import one stopped version-nine archive into fine-grained observations.
 
 The importer is an explicit one-time bridge, not a runtime compatibility path. It
-keeps each selected legacy bundle losslessly, projects its current fields without
-network access, observes missing review threads and Issue relations at real current
-times, verifies structured commit objects in the managed Git store, and seeds a
-conservative discovery checkpoint only after all stages finish.
+projects every stored collection from each selected legacy resource, observes
+missing review threads and Issue relations at real current times, verifies
+structured commit objects in the managed Git store, and seeds a conservative
+discovery checkpoint only after all stages finish.
 
 Legacy bundle projections use the migration execution time and ``origin=import``.
 This deliberately records the operator-approved assumed-unchanged migration policy;
@@ -158,6 +158,7 @@ class V9Importer:
                 async with ObservationArchive(
                     self.config.destination,
                     self.config.repository,
+                    self._git_destination(),
                 ) as archive:
                     core = await self.import_core(source, archive, resources)
                     supplemental = await self.import_supplemental(source, archive)
@@ -471,14 +472,16 @@ class V9Importer:
     def _make_git(self) -> Any:
         if self._git is not None:
             return self._git
-        destination = self.config.git_destination or git_store_path(self.config.source)
         self._git = GitObjectStore(
-            destination,
+            self._git_destination(),
             self.config.repository,
             self.config.git_url or default_git_url(self.config.repository),
             token=_token(self.config.token),
         )
         return self._git
+
+    def _git_destination(self) -> Path:
+        return self.config.git_destination or git_store_path(self.config.source)
 
 
 def _open_source(path: Path, repository: str) -> sqlite3.Connection:

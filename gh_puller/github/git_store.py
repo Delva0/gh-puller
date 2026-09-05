@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from .archive_format import commit_ref, pull_ref, pull_staging_ref, upstream_ref
-from .v9 import GIT_LAYOUT_VERSION
+from .v10 import GIT_LAYOUT_VERSION
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Mapping, Sequence

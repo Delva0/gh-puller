@@ -164,14 +164,23 @@ class ObservationArchive:
     Args:
         path: 新格式 SQLite 文件路径；父目录按需创建。
         repository: 此数据库固定绑定的 GitHub ``owner/repo``。
+        git_store: 配套 bare Git 对象库；None 使用 ``PATH.git``。
     """
 
-    def __init__(self, path: Path, repository: str) -> None:
+    def __init__(
+        self,
+        path: Path,
+        repository: str,
+        git_store: Path | None = None,
+    ) -> None:
         owner, separator, repo = repository.partition("/")
         if not separator or not owner or not repo or "/" in repo:
             raise ValueError("repository must be 'owner/repo'")
         self.path = Path(path)
         self.repository = repository
+        self.git_store = (
+            Path(f"{self.path}.git") if git_store is None else Path(git_store)
+        ).resolve()
         self._db: aiosqlite.Connection | None = None
 
     async def __aenter__(self) -> Self:
@@ -872,6 +881,7 @@ class ObservationArchive:
                 (
                     ("schema_version", VERSION),
                     ("git_layout_version", GIT_LAYOUT_VERSION),
+                    ("git_store", str(self.git_store)),
                     ("repository", self.repository),
                 ),
             )
@@ -891,6 +901,8 @@ class ObservationArchive:
             raise ValueError("archive belongs to another GitHub repository")
         if metadata.get("git_layout_version") != GIT_LAYOUT_VERSION:
             raise ValueError("unsupported GitHub Git layout")
+        if metadata.get("git_store") != str(self.git_store):
+            raise ValueError("archive belongs to another Git object store")
         schemas = {
             str(row["family"]): int(row["version"])
             for row in await _fetchall(db, "SELECT family, version FROM fact_schemas")

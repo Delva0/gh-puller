@@ -43,6 +43,7 @@ from .observations import (
     SyncTask,
     TaskDraft,
 )
+from .progress import ProgressObserver, _SyncProgressTracker
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Mapping, Sequence
@@ -260,6 +261,24 @@ class SyncResult:
     requests: int
 
 
+async def sync(
+    config: GitHubSyncConfig,
+    *,
+    observer: ProgressObserver | None = None,
+) -> SyncResult:
+    """Run or resume one repository synchronization.
+
+    Args:
+        config: Repository, archive destinations, and request policy.
+        observer: Disposable out-of-band progress receiver.
+
+    Returns:
+        Completed operational cycle metadata. Facts become visible individually before
+        the cycle finishes.
+    """
+    return await GitHubSyncer(config, observer=observer).sync()
+
+
 class GitHubSyncer:
     """执行一个可随时调用并阻塞到完成的增量同步操作。
 
@@ -269,6 +288,7 @@ class GitHubSyncer:
         git: 测试或宿主注入的 Git 对象库。
         now: 记录实际读取窗口和 cycle 边界的时区时钟。
         sleep: Git 网络重试使用的异步等待函数。
+        observer: 不参与事实发布的同步进度接收器。
     """
 
     def __init__(
@@ -279,12 +299,15 @@ class GitHubSyncer:
         git: _GitStore | None = None,
         now: Callable[[], datetime] = lambda: datetime.now(UTC),
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        observer: ProgressObserver | None = None,
     ) -> None:
         self.config = config
         self._api = api
         self._git = git
         self._now = now
         self._sleep = sleep
+        self._observer = observer
+        self._progress = _SyncProgressTracker(observer, now)
         self._owner, self._repo = config.repository.split("/", 1)
         self._base = f"/repos/{self._owner}/{self._repo}"
         self._store_lock = asyncio.Lock()
@@ -301,35 +324,56 @@ class GitHubSyncer:
             GitHubAPIError: GitHub rejects an operation without a coverage conclusion.
             GitStoreError: Required Git evidence cannot be safely retained.
         """
-        invoked_at = _utc(self._now())
-        async with (
-            archive_lock(self.config.destination),
-            ObservationArchive(self.config.destination, self.config.repository) as archive,
-        ):
-            cycle = await archive.start_cycle(invoked_at)
-            api, owned = self._make_api()
-            git = self._make_git()
-            request_start = api.request_count
-            accounted = False
-            try:
-                await self._sync_cycle(api, git, archive, cycle)
-                await archive.add_requests(cycle.id, api.request_count - request_start)
-                accounted = True
-                completed_at = _utc(self._now())
-                completed = await archive.complete_cycle(cycle.id, completed_at)
-                return SyncResult(
-                    cycle_id=completed.id,
-                    started_at=completed.started_at,
-                    completed_at=completed_at,
-                    checkpoint_from=completed.checkpoint_from,
-                    discovered_items=completed.discovered_items,
-                    requests=completed.request_count,
+        self._progress = _SyncProgressTracker(self._observer, self._now)
+        self._progress.start()
+        try:
+            invoked_at = _utc(self._now())
+            async with (
+                archive_lock(self.config.destination),
+                ObservationArchive(
+                    self.config.destination,
+                    self.config.repository,
+                    self._git_destination(),
+                ) as archive,
+            ):
+                cycle = await archive.start_cycle(invoked_at)
+                api, owned = self._make_api()
+                git = self._make_git()
+                request_start = api.request_count
+                self._progress.bind(
+                    cycle.id,
+                    cycle.checkpoint_from,
+                    cycle.request_count,
+                    request_start,
                 )
-            finally:
-                if not accounted:
+                accounted = False
+                try:
+                    await self._sync_cycle(api, git, archive, cycle)
                     await archive.add_requests(cycle.id, api.request_count - request_start)
-                if owned:
-                    await api.close()
+                    accounted = True
+                    completed_at = _utc(self._now())
+                    completed = await archive.complete_cycle(cycle.id, completed_at)
+                    result = SyncResult(
+                        cycle_id=completed.id,
+                        started_at=completed.started_at,
+                        completed_at=completed_at,
+                        checkpoint_from=completed.checkpoint_from,
+                        discovered_items=completed.discovered_items,
+                        requests=completed.request_count,
+                    )
+                    self._progress.done(result.requests)
+                    return result
+                finally:
+                    if not accounted:
+                        await archive.add_requests(
+                            cycle.id,
+                            api.request_count - request_start,
+                        )
+                    if owned:
+                        await api.close()
+        except Exception as exc:
+            self._progress.error(exc)
+            raise
 
     def _make_api(self) -> tuple[_API, bool]:
         if self._api is not None:
@@ -341,6 +385,9 @@ class GitHubSyncer:
                 graphql_url=self.config.graphql_url,
                 api_version=self.config.api_version,
                 timeout=self.config.request_timeout,
+                sleep=self._sleep,
+                now=self._now,
+                progress=self._progress.api_progress,
             ),
             True,
         )
@@ -348,14 +395,16 @@ class GitHubSyncer:
     def _make_git(self) -> _GitStore:
         if self._git is not None:
             return self._git
-        destination = self.config.git_destination or git_store_path(self.config.destination)
         return GitObjectStore(
-            destination,
+            self._git_destination(),
             self.config.repository,
             self.config.git_url or default_git_url(self.config.repository),
             token=_token(self.config.token),
             sleep=self._sleep,
         )
+
+    def _git_destination(self) -> Path:
+        return self.config.git_destination or git_store_path(self.config.destination)
 
     async def _sync_cycle(
         self,
@@ -364,8 +413,10 @@ class GitHubSyncer:
         archive: ObservationArchive,
         cycle: SyncCycle,
     ) -> None:
+        self._progress.phase("discovering")
         cursor = await self._prepare_discovery(api, archive, cycle)
         while cursor is not None:
+            self._progress.phase("discovering", "catalog")
             observed_from = _utc(self._now())
             page = await api.get_page(cursor, accept=_CATALOG_ACCEPT)
             observed_until = _utc(self._now())
@@ -395,8 +446,10 @@ class GitHubSyncer:
                     items,
                     tasks,
                 )
+            self._progress.phase("fetching")
             await self._drain(api, git, archive, cycle.id)
             cursor = updated.discovery_cursor
+        self._progress.phase("fetching")
         await self._drain(api, git, archive, cycle.id)
 
     async def _prepare_discovery(
@@ -465,6 +518,7 @@ class GitHubSyncer:
                 tasks = await archive.take_tasks(cycle_id, self.config.concurrency)
             if not tasks:
                 return
+            self._progress.phase("fetching")
             pull_git = [task for task in tasks if task.kind == "pull-git"]
             commit_objects = [task for task in tasks if task.kind == "commit-object"]
             ordinary = [
@@ -523,6 +577,7 @@ class GitHubSyncer:
                 await self._finish_task(archive, task)
         if not pending:
             return []
+        self._progress.phase("syncing_git", f"pulls={len(pending)}")
         try:
             await self._prefetch_git(git, pending)
         except Exception as exc:
@@ -559,8 +614,13 @@ class GitHubSyncer:
             return []
         shas = [_required_sha(task.payload.get("sha"), task.task_key) for task in pending]
         try:
+            self._progress.phase("syncing_git", f"commits={len(shas)}")
             observed_from = _utc(self._now())
-            results = await git.retain_commits(shas)
+            results = await git.retain_commits(
+                shas,
+                heartbeat=self._progress.git_heartbeat,
+                retry=self._progress.git_retry,
+            )
             observed_until = _utc(self._now())
         except Exception as exc:
             for task in pending:
@@ -1760,8 +1820,12 @@ class GitHubSyncer:
         if existing is not None:
             await self._finish_task(archive, task)
             return
+        self._progress.phase("syncing_git", "upstream")
         observed_from = _utc(self._now())
-        refs = await git.sync_upstream()
+        refs = await git.sync_upstream(
+            heartbeat=self._progress.git_heartbeat,
+            retry=self._progress.git_retry,
+        )
         observed_until = _utc(self._now())
         await self._publish(
             archive,
@@ -1849,7 +1913,12 @@ class GitHubSyncer:
             for task in tasks
         }
         try:
-            await git.prefetch(pulls, retry_transient=len(tasks) == 1)
+            await git.prefetch(
+                pulls,
+                heartbeat=self._progress.git_heartbeat,
+                retry=self._progress.git_retry,
+                retry_transient=len(tasks) == 1,
+            )
         except TransientGitStoreError:
             if len(tasks) == 1:
                 raise
@@ -1870,7 +1939,12 @@ class GitHubSyncer:
         number = _task_number(task)
         pull = _object(task.payload.get("pull"), task.task_key)
         observed_from = _utc(self._now())
-        snapshot = await git.capture(number, pull)
+        snapshot = await git.capture(
+            number,
+            pull,
+            heartbeat=self._progress.git_heartbeat,
+            retry=self._progress.git_retry,
+        )
         observed_until = _utc(self._now())
         await self._publish(
             archive,

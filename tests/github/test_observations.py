@@ -327,3 +327,17 @@ async def test_importer_checkpoint_seed_is_idempotent_and_never_regresses(
         )
         cycle = await archive.start_cycle(_T0 + timedelta(hours=1))
         assert cycle.checkpoint_from == _T0
+
+
+@pytest.mark.asyncio
+async def test_archive_binds_one_explicit_git_object_store(tmp_path: Path) -> None:
+    database = tmp_path / "facts.sqlite3"
+    git_store = tmp_path / "objects.git"
+    async with ObservationArchive(database, _REPOSITORY, git_store):
+        pass
+
+    async with ObservationArchive(database, _REPOSITORY, git_store):
+        pass
+    with pytest.raises(ValueError, match="another Git object store"):
+        async with ObservationArchive(database, _REPOSITORY, tmp_path / "other.git"):
+            pass

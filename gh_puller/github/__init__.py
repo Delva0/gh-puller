@@ -1,61 +1,56 @@
-"""GitHub Issue/PR 原始事实的增量观测归档。
+"""增量观测并离线保存 GitHub Issue、PR 与关联 Git 对象。
 
-“拉取到目标时刻 T”表示在 T 到达后完成一次最终观测，不承诺 T 的历史快照，也不
-承诺发现 GitHub 未通过父对象或评论变化信号暴露的更新。调用时刻 C 在首次 await
-前确定，未指定 T 时令 T = C；实际完成时刻单独记录。
-每个 T 首次成功时原子发布一个 SQLite run，重试返回原 run；限流、网络错误和 HTTP
-5xx 在当前调用内等待恢复，取消或不可恢复错误留下可续跑的 pending run。可检测的不
-完整响应不推进水位。归档由 SQLite 语义事实库和同名 ``.git`` 对象库组成：前者
-无损保留 API 响应与直接观测到的 tombstone，后者同步上游 branches/tags 并固定
-PR 的原始 head、比较基点与可用 landing Git 对象。
-静默删除保留为最后一次观测状态。``iter_versions`` 可完全离线重建已观测历史，
-``iter_heads`` 可直接读取当前状态。
-
-拉取算法、恢复语义、公共 SQLite/Git 格式和可执行入口见
-``docs/github-puller.md``。
+每个语义完整的事实集合在真实读取窗口闭合后立即追加到 SQLite；同步 cycle 只负责
+发现游标、任务恢复和内部 checkpoint。历史读取按观测时刻选择事实，不存在仓库级
+target 快照或覆盖更新。静默删除及 GitHub 未暴露变更信号的旧子资源采用尽力而为
+语义；一旦 Issue/PR 被发现，全部已承诺集合都会重新观测。
 """
 
-from .client import GitHubAPI, GitHubAPIError
-from .git_store import GitStoreError, git_store_path
-from .progress import ConsoleProgress, ProgressObserver, PullProgress, RateQuota
-from .puller import (
-    GitHubPullConfig,
-    GitHubPuller,
-    IncompleteGitHubDataError,
-    PullResult,
-    incremental_pull,
+from .client import GitHubAPI
+from .errors import GitHubAPIError
+from .git_store import GitStoreError, TransientGitStoreError, git_store_path
+from .observations import (
+    Coverage,
+    FactObservation,
+    ObservationArchive,
+    Origin,
+    SyncCycle,
+    SyncTask,
+    iter_current_facts,
+    iter_facts_as_of,
+    iter_observations,
 )
-from .store import (
-    ArchivedFact,
-    ArchivedHead,
-    ArchivedRun,
-    ArchivedVersion,
-    iter_facts,
-    iter_heads,
-    iter_runs,
-    iter_versions,
+from .progress import ConsoleProgress, ProgressObserver, RateQuota, SyncProgress
+from .syncer import (
+    GitHubSyncConfig,
+    GitHubSyncer,
+    IncompleteGitHubDataError,
+    SyncResult,
+    sync,
 )
 
 __all__ = [
-    "ArchivedFact",
-    "ArchivedHead",
-    "ArchivedRun",
-    "ArchivedVersion",
     "ConsoleProgress",
+    "Coverage",
+    "FactObservation",
     "GitHubAPI",
     "GitHubAPIError",
-    "GitHubPullConfig",
-    "GitHubPuller",
+    "GitHubSyncConfig",
+    "GitHubSyncer",
     "GitStoreError",
     "IncompleteGitHubDataError",
+    "ObservationArchive",
+    "Origin",
     "ProgressObserver",
-    "PullProgress",
-    "PullResult",
     "RateQuota",
+    "SyncCycle",
+    "SyncProgress",
+    "SyncResult",
+    "SyncTask",
+    "TransientGitStoreError",
     "git_store_path",
-    "incremental_pull",
-    "iter_facts",
-    "iter_heads",
-    "iter_runs",
-    "iter_versions",
+    "iter_current_facts",
+    "iter_facts_as_of",
+    "iter_observations",
+    "sync",
 ]

@@ -38,7 +38,7 @@ def _policy_for(environment: dict[str, str], database: Path) -> Path:
 def _bind_archive(
     database: Path,
     repository: str = _REPOSITORY,
-    schema: str = "8",
+    schema: str = "10",
 ) -> None:
     with sqlite3.connect(database) as connection:
         connection.execute(
@@ -144,14 +144,10 @@ def test_daemon_script_renders_database_scoped_service_contract(tmp_path: Path) 
     assert "WantedBy=multi-user.target" in rendered
 
 
-@pytest.mark.parametrize("schema", ["8", "9"])
-def test_install_is_idempotent_and_uninstall_preserves_archive(
-    tmp_path: Path,
-    schema: str,
-) -> None:
+def test_install_is_idempotent_and_uninstall_preserves_archive(tmp_path: Path) -> None:
     environment, units, log = _environment(tmp_path)
     database = tmp_path / "widgets.sqlite3"
-    _bind_archive(database, schema=schema)
+    _bind_archive(database)
     original = database.read_bytes()
     unit_name = _unit_for(database)
     database_arguments = (str(database), os.path.relpath(database, _ROOT))
@@ -302,10 +298,14 @@ def test_archive_repository_binding_rejects_wrong_writer(tmp_path: Path) -> None
     assert not log.exists()
 
 
-def test_install_rejects_incompatible_archive_schema(tmp_path: Path) -> None:
+@pytest.mark.parametrize("schema", ["3", "8", "9"])
+def test_install_rejects_incompatible_archive_schema(
+    tmp_path: Path,
+    schema: str,
+) -> None:
     environment, units, log = _environment(tmp_path)
     database = tmp_path / "facts.sqlite3"
-    _bind_archive(database, schema="3")
+    _bind_archive(database, schema=schema)
 
     result = _run(
         "install",

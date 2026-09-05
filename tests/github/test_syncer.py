@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from datetime import timedelta
+import random
+import sqlite3
+from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any
 from urllib.parse import parse_qs, urlsplit
 
@@ -371,3 +373,150 @@ async def test_catalog_cursor_survives_failure_before_next_page(tmp_path: Path) 
     assert sum(call[1] == f"{_BASE}/issues/101/events" for call in api.calls) == 2
     async with ObservationArchive(database, "acme/widgets") as archive:
         assert await archive.discovery_checkpoint() == _T0
+
+
+@pytest.mark.asyncio
+async def test_random_churn_and_failures_converge_for_every_discovered_parent(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "facts.sqlite3"
+    api = FakeAPI()
+    git = FakeGitStore()
+    clock = Clock(_T0)
+    randomizer = random.Random(7)  # noqa: S311 - deterministic non-security simulation
+    active = set(range(1, 81))
+    deleted: set[int] = set()
+    next_number = 81
+    next_comment = 10_000
+    for number in sorted(active):
+        _add_random_parent(api, number, pull=number % 4 == 0)
+    syncer = _syncer(database, api, git, clock, concurrency=16)
+    await syncer.sync()
+
+    for _ in range(10):
+        previous_checkpoint = clock.current
+        clock.current += timedelta(hours=1)
+        added = set(range(next_number, next_number + 3))
+        next_number += 3
+        active.update(added)
+        for number in sorted(added):
+            _add_random_parent(api, number, pull=number % 4 == 0, at=clock.current)
+
+        touched = set(randomizer.sample(sorted(active), 5))
+        for number in touched:
+            summary = api.json[f"{_BASE}/issues/{number}"]
+            summary["body"] = f"root update at {clock.current.isoformat()}"
+            summary["updated_at"] = _iso(clock.current)
+
+        comment_parents = set(randomizer.sample(sorted(active), 6))
+        touched.update(comment_parents)
+        for number in comment_parents:
+            path = f"{_BASE}/issues/{number}/comments"
+            comments = api.pages.setdefault(path, [])
+            if comments and randomizer.random() < 0.4:
+                comments.pop(0)
+                api.json[f"{_BASE}/issues/{number}"]["updated_at"] = _iso(clock.current)
+            else:
+                comments.append(
+                    {
+                        "id": next_comment,
+                        "body": f"comment {next_comment}",
+                        "created_at": _iso(clock.current),
+                        "updated_at": _iso(clock.current),
+                        "reactions": {"total_count": 0},
+                    },
+                )
+                next_comment += 1
+            api.json[f"{_BASE}/issues/{number}"]["comments"] = len(comments)
+
+        pulls = [
+            number
+            for number in active
+            if "pull_request" in api.json[f"{_BASE}/issues/{number}"]
+        ]
+        review_parents = set(randomizer.sample(pulls, min(3, len(pulls))))
+        touched.update(review_parents)
+        for number in review_parents:
+            path = f"{_BASE}/pulls/{number}/comments"
+            comments = api.pages.setdefault(path, [])
+            comments.append(
+                {
+                    "id": next_comment,
+                    "body": f"review {next_comment}",
+                    "created_at": _iso(clock.current),
+                    "updated_at": _iso(clock.current),
+                    "commit_id": f"{number:040x}",
+                    "original_commit_id": f"{number:040x}",
+                    "reactions": {"total_count": 0},
+                },
+            )
+            next_comment += 1
+            api.json[f"{_BASE}/pulls/{number}"]["review_comments"] = len(comments)
+
+        removed = randomizer.choice(sorted(active - added - touched))
+        active.remove(removed)
+        deleted.add(removed)
+        api.catalog = [item for item in api.catalog if item["number"] != removed]
+        api.json.pop(f"{_BASE}/issues/{removed}")
+        api.json.pop(f"{_BASE}/pulls/{removed}", None)
+
+        failed = min(added)
+        api.fail_once.add(f"{_BASE}/issues/{failed}/events")
+        with pytest.raises(RuntimeError, match="injected failure"):
+            await syncer.sync()
+        async with ObservationArchive(database, "acme/widgets") as archive:
+            assert await archive.discovery_checkpoint() == previous_checkpoint
+        await syncer.sync()
+        async with ObservationArchive(database, "acme/widgets") as archive:
+            assert await archive.discovery_checkpoint() == clock.current
+
+        current = {
+            (fact.family, fact.subject_key): fact
+            async for fact in iter_current_facts(database)
+        }
+        for number in active:
+            issue = api.json[f"{_BASE}/issues/{number}"]
+            assert current[("issue", f"issue:{number}")].payload["value"] == issue
+            expected_comments = api.pages.get(f"{_BASE}/issues/{number}/comments", [])
+            actual_comments = current[
+                ("issue-comments", f"issue:{number}")
+            ].payload["value"]
+            assert len(actual_comments) == len(expected_comments)
+            assert all(
+                {key: actual[key] for key in expected} == expected
+                for actual, expected in zip(
+                    actual_comments,
+                    expected_comments,
+                    strict=True,
+                )
+            )
+        assert all(("issue", f"issue:{number}") in current for number in deleted)
+
+    with sqlite3.connect(database) as connection:
+        duplicate = connection.execute(
+            """
+            SELECT b.cycle_id, o.family, o.subject_key, COUNT(*)
+            FROM fact_observations AS o
+            JOIN fact_batches AS b ON b.id = o.batch_id
+            WHERE b.cycle_id IS NOT NULL
+            GROUP BY b.cycle_id, o.family, o.subject_key
+            HAVING COUNT(*) > 1
+            LIMIT 1
+            """,
+        ).fetchone()
+        assert duplicate is None
+        assert connection.execute(
+            "SELECT COUNT(*) FROM sync_cycles WHERE status != 'complete'",
+        ).fetchone()[0] == 0
+
+
+def _add_random_parent(
+    api: FakeAPI,
+    number: int,
+    *,
+    pull: bool,
+    at: datetime = _T0 - timedelta(days=1),
+) -> None:
+    api.add_issue(number, created_at=at, updated_at=at, pull=pull)
+    if pull:
+        api.json[f"{_BASE}/pulls/{number}"] = _pull_detail(number)

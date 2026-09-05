@@ -1,7 +1,7 @@
-"""将 systemd、journald 与 SQLite 发布进度投影为只读写者状态。
+"""将 systemd、journald 与 SQLite 状态投影为只读 writer 视图。
 
-本模块只观察由 daemon installer 管理的 unit，不访问 GitHub，也不把运维状态写回
-事实库。普通拉取进度来自 journald，补采进度从 SQLite 持久任务只读恢复。
+SQLite 提供可恢复的目录、任务和事实进度；journald 只补充当前阶段、配额、等待与
+错误。状态命令不访问 GitHub，也不修改归档。
 """
 
 from __future__ import annotations
@@ -14,92 +14,91 @@ import re
 import sqlite3
 import subprocess
 import sys
-import zlib
 from dataclasses import dataclass
 from datetime import UTC, datetime, tzinfo
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from .git_store import git_store_path
 from .progress import RateQuota
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
 _UNIT = re.compile(r"gh-puller-([0-9a-f]{12}|[0-9a-f]{64})\.service\Z")
-_PROGRESS_TYPE = "github_pull_progress"
+_PROGRESS_TYPE = "github_sync_progress"
 _JOURNAL_LINES = 512
 _WEEKDAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
-_OVERVIEW_WIDTHS = (12, 4, 17, 15, 7, 11, 7)
+_OVERVIEW_WIDTHS = (12, 4, 16, 14, 9, 11, 7)
 
 
 @dataclass(frozen=True, slots=True)
 class ManagedWriter:
-    unit: str  # Path-hash systemd unit name.
-    identity: str  # Full database-path digest.
-    repository: str  # Bound GitHub owner/repo.
-    database: Path  # Canonical SQLite destination.
-    git_store: Path  # Database-derived bare Git object store.
+    """Static identity read from one managed systemd unit."""
+
+    unit: str
+    identity: str
+    repository: str
+    database: Path
 
 
 @dataclass(frozen=True, slots=True)
 class ServiceState:
-    active: str  # systemd ActiveState.
-    sub: str  # systemd SubState.
-    pid: int  # Main process ID, or zero when absent.
-    restarts: int  # systemd restart counter.
+    """Relevant systemd process state."""
+
+    active: str
+    sub: str
+    pid: int
+    restarts: int
 
 
 @dataclass(frozen=True, slots=True)
 class ProgressState:
-    event_at: datetime | None  # Observation time of the journal event.
-    phase: str  # Puller phase name.
-    target_at: str | None  # Requested observation watermark T.
-    run_id: int | None  # Durable run identity, if allocated.
-    catalog_seen: int  # Unique root rows durably discovered in the active pass.
-    catalog_total: int | None  # Cold-start count estimate when available.
-    catalog_complete: bool  # Terminal catalog page is durable.
-    objects_completed: int  # Durable discovery tasks completed in the active pass.
-    objects_total: int | None  # Exact task count after catalog discovery closes.
-    bundles_completed: int  # Durable bundles completed for the current run plan.
-    issues_completed: int  # Issue bundles in bundles_completed.
-    pulls_completed: int  # Pull-request bundles in bundles_completed.
-    tombstones: int  # Durable directly observed absences.
-    latest_number: int | None  # Latest durably staged parent number.
-    latest_kind: str | None  # Kind of latest_number.
-    quotas: tuple[RateQuota, ...]  # Latest independent GitHub resource buckets.
-    wait_seconds: float | None  # Current target, retry, or rate-limit wait.
-    detail: str | None  # Machine-readable phase detail.
-    items: int | None = None  # Current or cold-start estimated Issue/PR head count.
+    """Latest disposable journal progress event."""
+
+    event_at: datetime | None
+    phase: str
+    cycle_id: int | None
+    checkpoint_from: datetime | None
+    requests: int
+    quotas: tuple[RateQuota, ...]
+    wait_seconds: float | None
+    detail: str | None
 
 
 @dataclass(frozen=True, slots=True)
-class FactJobState:
-    id: int  # Durable maintenance job identity.
-    kind: str  # backfill or refresh.
-    status: str  # pending or complete.
-    target_at: datetime  # Requested observation target.
-    resource_cutoff: int | None  # Frozen published resource-version boundary.
-    fact_cutoff: int | None  # Frozen preexisting supplemental-fact boundary.
-    fact_sets: tuple[tuple[str, int], ...]  # Requested family/schema contracts.
-    completed_tasks: int  # Tasks with a terminal primary result.
-    total_tasks: int  # Frozen missing-work population.
-    task_outcomes: tuple[tuple[str, int], ...]  # Primary result counts by status.
-    fact_outcomes: tuple[tuple[str, str, int], ...]  # Published facts by family/status.
-    next_task: tuple[str, str, int] | None  # Family, subject, and attempt count.
-    latest_fact: tuple[str, str, str] | None  # Family, subject, and latest status.
-    latest_success: tuple[str, str] | None  # Family and subject of latest successful fact.
-    updated_at: datetime  # Latest durable request or batch publication.
-    last_error: str | None  # Retryable error on the next pending task.
+class ArchiveState:
+    """Durable progress read from a version-ten observation archive."""
+
+    git_store: Path
+    checkpoint: datetime | None
+    cycle_id: int | None
+    cycle_status: str | None
+    cycle_started: datetime | None
+    cycle_completed: datetime | None
+    discovery_pages: int
+    discovered_items: int
+    discovery_complete: bool
+    tasks_completed: int
+    tasks_total: int
+    parents_completed: int
+    parents_total: int
+    observations: int
+    current_facts: int
+    requests: int
+    latest: tuple[str, str, datetime] | None
+    updated_at: datetime | None
+    last_error: str | None
 
 
 @dataclass(frozen=True, slots=True)
 class WriterStatus:
-    writer: ManagedWriter  # Static installer configuration.
-    service: ServiceState  # Current systemd process state.
-    progress: ProgressState | None  # Latest valid progress journal event.
-    maintenance: FactJobState | None = None  # Latest durable supplemental job.
-    archive_error: str | None = None  # Read-only supplemental-status failure.
+    """Combined read-only status of one managed writer."""
+
+    writer: ManagedWriter
+    service: ServiceState
+    progress: ProgressState | None
+    archive: ArchiveState | None
+    archive_error: str | None = None
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -119,7 +118,7 @@ def _managed_writers(
     writer_id: str | None = None,
 ) -> list[ManagedWriter]:
     selected = None if database is None else database.resolve()
-    writers: list[ManagedWriter] = []
+    writers = []
     for path in sorted(systemd_dir.glob("gh-puller-*.service")):
         match = _UNIT.fullmatch(path.name)
         if match is None:
@@ -138,20 +137,14 @@ def _managed_writers(
         ):
             continue
         writers.append(
-            ManagedWriter(
-                unit=path.name,
-                identity=identity,
-                repository=repository,
-                database=resolved,
-                git_store=git_store_path(resolved),
-            ),
+            ManagedWriter(path.name, identity, repository, resolved),
         )
     return writers
 
 
 def _unit_metadata(content: str) -> dict[str, str]:
     prefix = "# gh-puller-"
-    metadata: dict[str, str] = {}
+    metadata = {}
     for line in content.splitlines():
         if line.startswith(prefix) and "=" in line:
             key, value = line.removeprefix(prefix).split("=", 1)
@@ -166,12 +159,12 @@ def _collect(
 ) -> list[WriterStatus]:
     statuses = []
     for writer in writers:
-        maintenance, error = _fact_job_status(writer.database)
+        archive, error = _archive_state(writer.database)
         statuses.append(
             WriterStatus(
-                writer=writer,
-                service=_service_state(systemctl, writer.unit),
-                progress=_latest_progress(
+                writer,
+                _service_state(systemctl, writer.unit),
+                _latest_progress(
                     _output(
                         [
                             journalctl,
@@ -183,8 +176,8 @@ def _collect(
                         ],
                     ),
                 ),
-                maintenance=maintenance,
-                archive_error=error,
+                archive,
+                error,
             ),
         )
     return statuses
@@ -205,10 +198,10 @@ def _service_state(systemctl: str, unit: str) -> ServiceState:
     )
     values = dict(line.split("=", 1) for line in output.splitlines() if "=" in line)
     return ServiceState(
-        active=values.get("ActiveState", "unknown"),
-        sub=values.get("SubState", "unknown"),
-        pid=_int(values.get("MainPID")) or 0,
-        restarts=_int(values.get("NRestarts")) or 0,
+        values.get("ActiveState", "unknown"),
+        values.get("SubState", "unknown"),
+        _int(values.get("MainPID")) or 0,
+        _int(values.get("NRestarts")) or 0,
     )
 
 
@@ -234,183 +227,125 @@ def _latest_progress(output: str) -> ProgressState | None:
         return ProgressState(
             event_at=_time(payload.get("event_at")),
             phase=_text(payload.get("phase")) or "unknown",
-            target_at=_text(payload.get("target_at")),
-            run_id=_int(payload.get("run_id")),
-            catalog_seen=_int(payload.get("catalog_seen")) or 0,
-            catalog_total=_int(payload.get("catalog_total")),
-            catalog_complete=payload.get("catalog_complete") is True,
-            objects_completed=_int(payload.get("objects_completed")) or 0,
-            objects_total=_int(payload.get("objects_total")),
-            bundles_completed=_int(payload.get("bundles_completed")) or 0,
-            issues_completed=_int(payload.get("issues_completed")) or 0,
-            pulls_completed=_int(payload.get("pulls_completed")) or 0,
-            tombstones=_int(payload.get("tombstones")) or 0,
-            latest_number=_int(payload.get("latest_number")),
-            latest_kind=_text(payload.get("latest_kind")),
+            cycle_id=_int(payload.get("cycle_id")),
+            checkpoint_from=_time(payload.get("checkpoint_from")),
+            requests=_int(payload.get("requests")) or 0,
             quotas=_quotas(payload.get("quotas")),
             wait_seconds=_float(payload.get("wait_seconds")),
             detail=_text(payload.get("detail")),
-            items=_int(payload.get("items")),
         )
     return None
 
 
-def _fact_job_status(database: Path) -> tuple[FactJobState | None, str | None]:
-    if not database.is_file():
+def _archive_state(path: Path) -> tuple[ArchiveState | None, str | None]:
+    if not path.is_file():
         return None, None
     connection: sqlite3.Connection | None = None
     try:
-        connection = sqlite3.connect(f"{database.resolve().as_uri()}?mode=ro", uri=True)
+        connection = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
         connection.row_factory = sqlite3.Row
-        table = connection.execute(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'fact_jobs'",
-        ).fetchone()
-        if table is None:
-            return None, None
-        row = connection.execute(
+        metadata = dict(connection.execute("SELECT key, value FROM archive_meta"))
+        if metadata.get("schema_version") != "10":
+            raise ValueError(f"unsupported archive schema {metadata.get('schema_version')}")
+        git_store = metadata.get("git_store")
+        if not isinstance(git_store, str) or not git_store:
+            raise ValueError("archive has no Git object store binding")
+        cycle = connection.execute(
             """
-            SELECT j.*, p.codec, p.raw_size, p.payload
-            FROM fact_jobs AS j
-            JOIN payload_blobs AS p ON p.digest = j.scope_payload_digest
-            ORDER BY j.id DESC
+            SELECT * FROM sync_cycles
+            ORDER BY status = 'active' DESC, id DESC
             LIMIT 1
             """,
         ).fetchone()
-        if row is None:
-            return None, None
-        scope = _scope_payload(row)
-        task_outcomes = tuple(
-            (str(item["outcome"]), int(item["count"]))
-            for item in connection.execute(
-                """
-                SELECT coalesce(outcome, 'pending') AS outcome, count(*) AS count
-                FROM fact_tasks WHERE job_id = ?
-                GROUP BY coalesce(outcome, 'pending')
-                ORDER BY outcome
-                """,
-                (row["id"],),
-            )
-        )
-        fact_outcomes = tuple(
-            (str(item["fact_kind"]), str(item["status"]), int(item["count"]))
-            for item in connection.execute(
-                """
-                SELECT v.fact_kind, v.status, count(*) AS count
-                FROM fact_versions AS v
-                JOIN fact_batches AS b ON b.id = v.batch_id
-                WHERE b.job_id = ?
-                GROUP BY v.fact_kind, v.status
-                ORDER BY v.fact_kind, v.status
-                """,
-                (row["id"],),
-            )
-        )
-        pending = connection.execute(
-            """
-            SELECT fact_kind, subject_key, attempts, last_error
-            FROM fact_tasks
-            WHERE job_id = ? AND completed = 0
-            ORDER BY id
-            LIMIT 1
-            """,
-            (row["id"],),
-        ).fetchone()
+        cycle_id = None if cycle is None else int(cycle["id"])
+        tasks = _counts(connection, "sync_tasks", cycle_id)
+        parents = _counts(connection, "sync_tasks", cycle_id, "kind = 'parent'")
         latest = connection.execute(
             """
-            SELECT v.fact_kind, v.subject_key, v.status, b.published_at
-            FROM fact_versions AS v
-            JOIN fact_batches AS b ON b.id = v.batch_id
-            WHERE b.job_id = ?
-            ORDER BY v.id DESC
-            LIMIT 1
+            SELECT family, subject_key, observed_until
+            FROM fact_observations ORDER BY id DESC LIMIT 1
             """,
-            (row["id"],),
         ).fetchone()
-        success = connection.execute(
+        updated = connection.execute(
             """
-            SELECT v.fact_kind, v.subject_key
-            FROM fact_versions AS v
-            JOIN fact_batches AS b ON b.id = v.batch_id
-            WHERE b.job_id = ? AND v.status IN ('complete', 'null')
-            ORDER BY v.id DESC
-            LIMIT 1
-            """,
-            (row["id"],),
-        ).fetchone()
-        target_at = _required_time(row["target_at"], "fact job target")
-        updated = row["requested_at"] if latest is None else latest["published_at"]
-        updated_at = _required_time(updated, "fact job update")
-        fact_sets = scope.get("fact_sets")
-        versions = (
-            ()
-            if not isinstance(fact_sets, dict)
-            else tuple(
-                (str(kind), int(version))
-                for kind, version in sorted(fact_sets.items())
-                if isinstance(version, int) and not isinstance(version, bool)
+            SELECT MAX(value) FROM (
+                SELECT MAX(published_at) AS value FROM fact_batches
+                UNION ALL SELECT MAX(observed_until) FROM discovery_items
+                UNION ALL SELECT MAX(completed_at) FROM sync_tasks
+                UNION ALL SELECT MAX(completed_at) FROM sync_cycles
+                UNION ALL SELECT MAX(started_at) FROM sync_cycles
             )
+            """,
+        ).fetchone()
+        error = (
+            None
+            if cycle_id is None
+            else connection.execute(
+                """
+                SELECT last_error FROM sync_tasks
+                WHERE cycle_id = ? AND completed_at IS NULL AND last_error IS NOT NULL
+                ORDER BY id LIMIT 1
+                """,
+                (cycle_id,),
+            ).fetchone()
         )
         return (
-            FactJobState(
-                id=int(row["id"]),
-                kind=str(row["kind"]),
-                status=str(row["status"]),
-                target_at=target_at,
-                resource_cutoff=_int(scope.get("resource_version_cutoff")),
-                fact_cutoff=_int(scope.get("fact_version_cutoff")),
-                fact_sets=versions,
-                completed_tasks=int(row["completed_tasks"]),
-                total_tasks=int(row["total_tasks"]),
-                task_outcomes=task_outcomes,
-                fact_outcomes=fact_outcomes,
-                next_task=(
-                    None
-                    if pending is None
-                    else (
-                        str(pending["fact_kind"]),
-                        str(pending["subject_key"]),
-                        int(pending["attempts"]),
-                    )
-                ),
-                latest_fact=(
+            ArchiveState(
+                git_store=Path(git_store),
+                checkpoint=_time(metadata.get("discovery_checkpoint")),
+                cycle_id=cycle_id,
+                cycle_status=None if cycle is None else str(cycle["status"]),
+                cycle_started=None if cycle is None else _time(cycle["started_at"]),
+                cycle_completed=None if cycle is None else _time(cycle["completed_at"]),
+                discovery_pages=0 if cycle is None else int(cycle["discovery_pages"]),
+                discovered_items=0 if cycle is None else int(cycle["discovered_items"]),
+                discovery_complete=(False if cycle is None else bool(cycle["discovery_complete"])),
+                tasks_completed=tasks[0],
+                tasks_total=tasks[1],
+                parents_completed=parents[0],
+                parents_total=parents[1],
+                observations=int(connection.execute("SELECT COUNT(*) FROM fact_observations").fetchone()[0]),
+                current_facts=int(connection.execute("SELECT COUNT(*) FROM fact_heads").fetchone()[0]),
+                requests=0 if cycle is None else int(cycle["request_count"]),
+                latest=(
                     None
                     if latest is None
                     else (
-                        str(latest["fact_kind"]),
+                        str(latest["family"]),
                         str(latest["subject_key"]),
-                        str(latest["status"]),
+                        _required_time(latest["observed_until"], "latest observation"),
                     )
                 ),
-                latest_success=(None if success is None else (str(success["fact_kind"]), str(success["subject_key"]))),
-                updated_at=updated_at,
-                last_error=None if pending is None or pending["last_error"] is None else str(pending["last_error"]),
+                updated_at=None if updated is None else _time(updated[0]),
+                last_error=None if error is None else str(error["last_error"]),
             ),
             None,
         )
-    except (json.JSONDecodeError, OSError, sqlite3.Error, TypeError, ValueError, zlib.error) as exc:
+    except (OSError, sqlite3.Error, TypeError, ValueError) as exc:
         return None, f"{type(exc).__name__}: {exc}"
     finally:
         if connection is not None:
             connection.close()
 
 
-def _scope_payload(row: sqlite3.Row) -> dict[str, object]:
-    if row["codec"] != "zlib-json-v1":
-        raise ValueError(f"unsupported scope codec {row['codec']}")
-    raw = zlib.decompress(bytes(row["payload"]))
-    if len(raw) != int(row["raw_size"]):
-        raise ValueError("fact job scope has an invalid size")
-    value = json.loads(raw)
-    if not isinstance(value, dict):
-        raise TypeError("fact job scope is not an object")
-    return value
-
-
-def _required_time(value: object, context: str) -> datetime:
-    parsed = _time(value)
-    if parsed is None:
-        raise ValueError(f"{context} is invalid")
-    return parsed
+def _counts(
+    connection: sqlite3.Connection,
+    table: str,
+    cycle_id: int | None,
+    condition: str = "1",
+) -> tuple[int, int]:
+    if cycle_id is None:
+        return 0, 0
+    if table != "sync_tasks" or condition not in {"1", "kind = 'parent'"}:
+        raise ValueError("invalid internal count query")
+    row = connection.execute(
+        f"""
+        SELECT COUNT(completed_at), COUNT(*)
+        FROM sync_tasks WHERE cycle_id = ? AND {condition}
+        """,  # noqa: S608
+        (cycle_id,),
+    ).fetchone()
+    return int(row[0]), int(row[1])
 
 
 def _render_table(
@@ -427,9 +362,9 @@ def _render_table(
             _short_service(status.service),
             status.writer.repository,
             status.writer.database.name,
-            _short_phase(status.progress),
-            _short_objects(status.progress),
-            _age(status.progress.event_at, observed_at) if status.progress else "-",
+            _short_phase(status),
+            _short_parents(status.archive),
+            _age(_updated_at(status), observed_at),
         )
         for status in statuses
     ]
@@ -443,31 +378,36 @@ def _render_detail(
 ) -> str:
     observed_at = datetime.now(UTC) if now is None else now.astimezone(UTC)
     progress = status.progress
+    archive = status.archive
     rows = [
         ("WRITER", status.writer.identity[:12]),
         ("STATE", _service_detail(status.service)),
         ("REPOSITORY", status.writer.repository),
         ("DATABASE", str(status.writer.database)),
-        ("GIT STORE", str(status.writer.git_store)),
+        (
+            "GIT STORE",
+            str(Path(f"{status.writer.database}.git") if archive is None else archive.git_store),
+        ),
         ("PID", str(status.service.pid) if status.service.pid else "-"),
         ("RESTARTS", str(status.service.restarts)),
-        ("RUN", _show(progress.run_id if progress else None)),
-        ("TARGET T", _target(progress, zone)),
-        ("ITEMS", _items(progress)),
-        ("PHASE", progress.phase if progress else "-"),
-        ("CATALOG", _catalog(progress)),
-        ("OBJECTS", _objects(progress, 20)),
+        ("CYCLE", _cycle(archive, zone)),
+        ("CHECKPOINT", _local_optional(None if archive is None else archive.checkpoint, zone)),
+        ("PHASE", _phase(status)),
+        ("DISCOVERY", _discovery(archive)),
+        ("PARENTS", _parents(archive, 20)),
+        ("TASKS", _tasks(archive, 20)),
+        ("FACTS", _facts(archive)),
+        ("LATEST", _latest(archive, zone)),
         ("QUOTA", _quota(progress, zone)),
-        ("STAGED", _staged(progress)),
-        ("LATEST", _latest(progress)),
-        ("UPDATED", _updated(progress, observed_at, zone)),
+        ("UPDATED", _updated(status, observed_at, zone)),
     ]
-    if progress and progress.wait_seconds is not None:
+    if progress is not None and progress.wait_seconds is not None:
         rows.append(("WAIT", _wait(progress, observed_at)))
-    if progress and progress.detail:
-        rows.append(("DETAIL", progress.detail))
-    if status.maintenance is not None:
-        rows.extend(_maintenance_rows(status.maintenance, observed_at, zone))
+    detail = None if progress is None else progress.detail
+    if detail is None and archive is not None:
+        detail = archive.last_error
+    if detail is not None:
+        rows.append(("DETAIL", detail))
     if status.archive_error is not None:
         rows.append(("ARCHIVE", status.archive_error))
     width = max(len(key) for key, _ in rows)
@@ -479,58 +419,11 @@ def _render_detail(
     return "\n".join(lines)
 
 
-def _maintenance_rows(
-    job: FactJobState,
-    now: datetime,
-    zone: tzinfo | None,
-) -> list[tuple[str, str]]:
-    rows = [
-        ("FACT JOB", f"{job.kind}#{job.id} {job.status}"),
-        ("FACT TARGET", _local_time(job.target_at, zone)),
-        ("FACT SCOPE", _fact_scope(job)),
-        ("FACT TASKS", _meter("tasks", job.completed_tasks, job.total_tasks, 20)),
-        ("FACT RESULTS", _count_pairs(job.task_outcomes)),
-        ("FACT DATA", _fact_counts(job.fact_outcomes)),
-    ]
-    if job.next_task is not None:
-        kind, subject, attempts = job.next_task
-        rows.append(("FACT NEXT", f"{kind} {subject} attempt={attempts}"))
-    if job.latest_fact is not None:
-        kind, subject, outcome = job.latest_fact
-        rows.append(("FACT LATEST", f"{kind} {subject} {outcome}"))
-    if job.latest_success is not None:
-        rows.append(("FACT SUCCESS", " ".join(job.latest_success)))
-    rows.append(
-        (
-            "FACT UPDATED",
-            f"{_local_time(job.updated_at, zone)}; {_age(job.updated_at, now)} ago",
-        ),
-    )
-    if job.last_error is not None:
-        rows.append(("FACT ERROR", job.last_error))
-    return rows
-
-
-def _fact_scope(job: FactJobState) -> str:
-    cutoffs = []
-    if job.resource_cutoff is not None:
-        cutoffs.append(f"resources<={job.resource_cutoff:,}")
-    if job.fact_cutoff is not None:
-        cutoffs.append(f"facts<={job.fact_cutoff:,}")
-    versions = ", ".join(f"{kind}@{version}" for kind, version in job.fact_sets)
-    return "; ".join((*cutoffs, versions))
-
-
-def _count_pairs(items: tuple[tuple[str, int], ...]) -> str:
-    return "-" if not items else " ".join(f"{key}={value:,}" for key, value in items)
-
-
-def _fact_counts(items: tuple[tuple[str, str, int], ...]) -> str:
-    return "-" if not items else "\n".join(f"{kind} {status}={count:,}" for kind, status, count in items)
-
-
 def _overview_line(values: Sequence[str]) -> str:
-    cells = (f"{_fit(value, width):<{width}}" for value, width in zip(values, _OVERVIEW_WIDTHS, strict=True))
+    cells = (
+        f"{_fit(value, width):<{width}}"
+        for value, width in zip(values, _OVERVIEW_WIDTHS, strict=True)
+    )
     return " ".join(cells).rstrip()
 
 
@@ -542,36 +435,30 @@ def _fit(value: str, width: int) -> str:
 
 
 def _short_service(service: ServiceState) -> str:
-    labels = {
+    return {
         "active": "up",
         "activating": "boot",
         "deactivating": "stop",
         "failed": "fail",
         "inactive": "down",
         "unknown": "?",
-    }
-    return labels.get(service.active, service.active)
+    }.get(service.active, service.active)
 
 
-def _short_phase(progress: ProgressState | None) -> str:
-    if progress is None:
-        return "-"
-    labels = {
+def _short_phase(status: WriterStatus) -> str:
+    phase = _phase(status)
+    return {
+        "discovering": "discover",
         "rate_limit": "quota",
         "retry_wait": "retry",
-        "starting": "start",
         "syncing_git": "git",
-    }
-    if progress.phase.endswith(("_catalog", "_bundles")):
-        return "objects" if progress.catalog_complete else "catalog"
-    return labels.get(progress.phase, progress.phase)
+    }.get(phase, phase)
 
 
-def _short_objects(progress: ProgressState | None) -> str:
-    if progress is None:
+def _short_parents(archive: ArchiveState | None) -> str:
+    if archive is None:
         return "-"
-    total = "?" if progress.objects_total is None else _short_count(progress.objects_total)
-    return f"{_short_count(progress.objects_completed)}/{total}"
+    return f"{_short_count(archive.parents_completed)}/{_short_count(archive.parents_total)}"
 
 
 def _short_count(value: int) -> str:
@@ -582,48 +469,59 @@ def _short_count(value: int) -> str:
     return f"{scaled:.1f}{suffix}" if scaled < 99.95 else f"{scaled:.0f}{suffix}"
 
 
-def _service_label(service: ServiceState) -> str:
-    return service.sub if service.active == "active" else service.active
-
-
 def _service_detail(service: ServiceState) -> str:
-    return f"{_service_label(service)} (active={service.active}, sub={service.sub})"
+    label = service.sub if service.active == "active" else service.active
+    return f"{label} (active={service.active}, sub={service.sub})"
 
 
-def _items(progress: ProgressState | None) -> str:
-    if progress is None:
-        return "?"
-    items = progress.items if progress.items is not None else progress.catalog_total
-    return "?" if items is None else f"{items:,}"
+def _phase(status: WriterStatus) -> str:
+    if status.progress is not None:
+        return status.progress.phase
+    if status.archive is not None and status.archive.cycle_status == "active":
+        return "recoverable"
+    return "-"
 
 
-def _catalog(progress: ProgressState | None) -> str:
-    if progress is None:
+def _cycle(archive: ArchiveState | None, zone: tzinfo | None) -> str:
+    if archive is None or archive.cycle_id is None:
         return "-"
-    seen = f"{progress.catalog_seen:,}"
-    if progress.catalog_complete:
-        estimate = progress.catalog_total
-        if estimate is not None and estimate != progress.catalog_seen:
-            return f"complete {seen} (initial estimate {estimate:,})"
-        return f"complete {seen}"
-    estimate = "?" if progress.catalog_total is None else f"~{progress.catalog_total:,}"
-    return f"scanning {seen}/{estimate}"
+    started = _local_optional(archive.cycle_started, zone)
+    return f"{archive.cycle_id} {archive.cycle_status} since {started}"
 
 
-def _objects(progress: ProgressState | None, width: int) -> str:
-    if progress is None:
+def _discovery(archive: ArchiveState | None) -> str:
+    if archive is None:
         return "-"
-    return _meter("objects", progress.objects_completed, progress.objects_total, width)
+    state = "complete" if archive.discovery_complete else "scanning"
+    return f"{state} pages={archive.discovery_pages:,} items={archive.discovered_items:,}"
 
 
-def _target(progress: ProgressState | None, zone: tzinfo | None = None) -> str:
-    if progress is None or progress.target_at is None:
+def _parents(archive: ArchiveState | None, width: int) -> str:
+    if archive is None:
         return "-"
-    target = _time(progress.target_at)
-    return progress.target_at if target is None else _local_time(target, zone)
+    return _meter("parents", archive.parents_completed, archive.parents_total, width)
 
 
-def _quota(progress: ProgressState | None, zone: tzinfo | None = None) -> str:
+def _tasks(archive: ArchiveState | None, width: int) -> str:
+    if archive is None:
+        return "-"
+    return _meter("tasks", archive.tasks_completed, archive.tasks_total, width)
+
+
+def _facts(archive: ArchiveState | None) -> str:
+    if archive is None:
+        return "-"
+    return f"current={archive.current_facts:,} observations={archive.observations:,}"
+
+
+def _latest(archive: ArchiveState | None, zone: tzinfo | None) -> str:
+    if archive is None or archive.latest is None:
+        return "-"
+    family, subject, observed = archive.latest
+    return f"{family} {subject} at {_local_time(observed, zone)}"
+
+
+def _quota(progress: ProgressState | None, zone: tzinfo | None) -> str:
     if progress is None or not progress.quotas:
         return "-"
     width = max(len(quota.resource) for quota in progress.quotas)
@@ -633,62 +531,67 @@ def _quota(progress: ProgressState | None, zone: tzinfo | None = None) -> str:
 def _quota_item(quota: RateQuota, width: int, zone: tzinfo | None) -> str:
     remaining = "?" if quota.remaining is None else f"{quota.remaining:,}"
     limit = "?" if quota.limit is None else f"{quota.limit:,}"
-    reset_at = "?" if quota.reset_at is None else _local_time(quota.reset_at, zone)
-    return f"{quota.resource:<{width}}  {remaining}/{limit}  reset {reset_at}"
+    reset = "?" if quota.reset_at is None else _local_time(quota.reset_at, zone)
+    return f"{quota.resource:<{width}}  {remaining}/{limit}  reset {reset}"
 
 
-def _meter(label: str, completed: int, total: int | None, width: int) -> str:
-    if total is None:
-        return f"{label} {completed:,}/?"
+def _meter(label: str, completed: int, total: int, width: int) -> str:
     filled = width if total == 0 else min(width, int(width * completed / total))
     return f"{label} [{'#' * filled}{'-' * (width - filled)}] {completed:,}/{total:,}"
 
 
-def _staged(progress: ProgressState | None) -> str:
-    if progress is None:
-        return "-"
-    return f"issues={progress.issues_completed:,} pulls={progress.pulls_completed:,} tombstones={progress.tombstones:,}"
-
-
-def _latest(progress: ProgressState | None) -> str:
-    if progress is None or progress.latest_number is None:
-        return "-"
-    return f"{progress.latest_kind or 'item'}#{progress.latest_number}"
-
-
 def _updated(
-    progress: ProgressState | None,
+    status: WriterStatus,
     now: datetime,
-    zone: tzinfo | None = None,
+    zone: tzinfo | None,
 ) -> str:
-    if progress is None or progress.event_at is None:
+    value = _updated_at(status)
+    if value is None:
         return "-"
-    return f"{_local_time(progress.event_at, zone)}; {_age(progress.event_at, now)} ago"
+    return f"{_local_time(value, zone)}; {_age(value, now)} ago"
 
 
-def _local_time(value: datetime, zone: tzinfo | None = None) -> str:
-    local = value.astimezone(zone)
-    clock = local.strftime("%H:%M:%S")
-    if local.microsecond:
-        clock = f"{clock}.{local.microsecond:06d}"
-    name = local.tzname() or local.strftime("%z")
-    return f"{_WEEKDAYS[local.weekday()]} {local:%Y-%m-%d} {clock} {name}"
+def _updated_at(status: WriterStatus) -> datetime | None:
+    values = [
+        value
+        for value in (
+            None if status.progress is None else status.progress.event_at,
+            None if status.archive is None else status.archive.updated_at,
+        )
+        if value is not None
+    ]
+    return max(values, default=None)
 
 
-def _wait(progress: ProgressState | None, now: datetime) -> str:
-    if progress is None or progress.wait_seconds is None:
-        return "-"
-    elapsed = 0.0 if progress.event_at is None else max((now - progress.event_at).total_seconds(), 0.0)
-    return f"{_duration(max(progress.wait_seconds - elapsed, 0.0))} remaining"
+def _wait(progress: ProgressState, now: datetime) -> str:
+    elapsed = (
+        0.0
+        if progress.event_at is None
+        else max((now - progress.event_at).total_seconds(), 0.0)
+    )
+    return f"{_duration(max((progress.wait_seconds or 0.0) - elapsed, 0.0))} remaining"
 
 
 def _duration(seconds: float) -> str:
     rounded = int(seconds)
     if rounded < 60:
         return f"{rounded}s"
-    if rounded < 3600:
+    if rounded < 3_600:
         return f"{rounded // 60}m{rounded % 60:02d}s"
-    return f"{rounded // 3600}h{rounded % 3600 // 60:02d}m"
+    return f"{rounded // 3_600}h{rounded % 3_600 // 60:02d}m"
+
+
+def _local_optional(value: datetime | None, zone: tzinfo | None) -> str:
+    return "-" if value is None else _local_time(value, zone)
+
+
+def _local_time(value: datetime, zone: tzinfo | None) -> str:
+    local = value.astimezone(zone)
+    clock = local.strftime("%H:%M:%S")
+    if local.microsecond:
+        clock += f".{local.microsecond:06d}"
+    name = local.tzname() or local.strftime("%z")
+    return f"{_WEEKDAYS[local.weekday()]} {local:%Y-%m-%d} {clock} {name}"
 
 
 def _age(event_at: datetime | None, now: datetime) -> str:
@@ -697,15 +600,18 @@ def _age(event_at: datetime | None, now: datetime) -> str:
     seconds = max(int((now - event_at).total_seconds()), 0)
     if seconds < 60:
         return f"{seconds}s"
-    if seconds < 3600:
+    if seconds < 3_600:
         return f"{seconds // 60}m"
-    if seconds < 86400:
-        return f"{seconds // 3600}h"
-    return f"{seconds // 86400}d"
+    if seconds < 86_400:
+        return f"{seconds // 3_600}h"
+    return f"{seconds // 86_400}d"
 
 
-def _show(value: object | None) -> str:
-    return "-" if value is None else str(value)
+def _required_time(value: object, context: str) -> datetime:
+    parsed = _time(value)
+    if parsed is None:
+        raise ValueError(f"{context} is invalid")
+    return parsed
 
 
 def _text(value: object) -> str | None:
@@ -713,10 +619,8 @@ def _text(value: object) -> str | None:
 
 
 def _int(value: object) -> int | None:
-    return value if isinstance(value, int) and not isinstance(value, bool) else _integer_text(value)
-
-
-def _integer_text(value: object) -> int | None:
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
     try:
         return int(value) if isinstance(value, str) else None
     except ValueError:
@@ -744,32 +648,31 @@ def _time(value: object) -> datetime | None:
 def _quotas(value: object) -> tuple[RateQuota, ...]:
     if not isinstance(value, list):
         return ()
-    quotas = []
+    result = []
     for item in value:
         if not isinstance(item, dict):
             continue
         resource = _text(item.get("resource"))
-        if resource is None:
-            continue
-        quotas.append(
-            RateQuota(
-                resource=resource,
-                limit=_int(item.get("limit")),
-                remaining=_int(item.get("remaining")),
-                reset_at=_time(item.get("reset_at")),
-            ),
-        )
-    return tuple(quotas)
+        if resource is not None:
+            result.append(
+                RateQuota(
+                    resource,
+                    _int(item.get("limit")),
+                    _int(item.get("remaining")),
+                    _time(item.get("reset_at")),
+                ),
+            )
+    return tuple(result)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """呈现一个或全部受管数据库写者。
+    """Render one or every managed database writer.
 
     Args:
-        argv: 不含程序名的监控参数；None 使用当前进程参数。
+        argv: Monitor arguments without the program name.
 
     Returns:
-        成功为 0；指定数据库没有受管写者为 2。
+        Zero on success or two when an explicit selector has no writer.
     """
     args = _parser().parse_args(argv)
     database = None if args.database is None else args.database.resolve()

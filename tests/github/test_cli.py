@@ -1,310 +1,119 @@
-"""Verify GitHub CLI interval scheduling, recovery, output, and signal shutdown."""
+"""Test current sync commands and scheduler-only interval semantics."""
 
 from __future__ import annotations
 
-import argparse
-import asyncio
 import json
-import signal
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 import pytest
 
-from gh_puller.github import PullResult
 from gh_puller.github import __main__ as cli
-from gh_puller.github.store import SQLiteArchive, schedule_state
-from gh_puller.github.v9 import MigrationResult
+from gh_puller.github.syncer import SyncResult
 
 if TYPE_CHECKING:
     from pathlib import Path
 
-_T0 = datetime(2026, 9, 2, 12, tzinfo=UTC)
+_T0 = datetime(2026, 9, 5, 10, 7, tzinfo=UTC)
 
 
 @dataclass
-class StubPuller:
-    targets: list[datetime] = field(default_factory=list)
+class _Clock:
+    current: datetime
+    sleeps: list[float] = field(default_factory=list)
 
-    async def pull(self, target: datetime | None = None) -> PullResult:
-        assert target is not None
-        self.targets.append(target)
-        return PullResult(
-            target_at=target,
-            completed_at=target,
-            run_id=len(self.targets),
-            changed_items=0,
-            catalog_items=10,
-            requests=4,
+    def __call__(self) -> datetime:
+        return self.current
+
+    async def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.current += timedelta(seconds=seconds)
+
+
+class _Syncer:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def sync(self) -> SyncResult:
+        self.calls += 1
+        return SyncResult(
+            cycle_id=self.calls,
+            started_at=_T0,
+            completed_at=_T0,
+            checkpoint_from=None if self.calls == 1 else _T0,
+            discovered_items=3,
+            requests=5,
         )
 
 
-def _iso(value: datetime) -> str:
-    timespec = "microseconds" if value.microsecond else "seconds"
-    return value.astimezone(UTC).isoformat(timespec=timespec).replace("+00:00", "Z")
-
-
-async def _seed_run(
-    path: Path,
-    target: datetime,
-    *,
-    committed: bool,
-) -> None:
-    async with SQLiteArchive(path, "acme/widgets") as archive:
-        run = await archive.start_run(_iso(target), _iso(target))
-        if committed:
-            await archive.start_pass(run.id, "closing", _iso(target), "full")
-            await archive.prepare_pass(run.id, (), 0)
-            await archive.stage_catalog_page(run.id, (), None)
-            await archive.finish_pass(run.id, _iso(target))
-            await archive.finalize(run.id, _iso(target))
-
-
-def test_parser_builds_once_config_and_normalizes_target() -> None:
-    args = cli._parser().parse_args(
+def test_parser_exposes_only_current_runtime_and_explicit_import(tmp_path: Path) -> None:
+    once = cli._parser().parse_args(
+        ["once", "acme/widgets", str(tmp_path / "facts.sqlite3")],
+    )
+    migration = cli._parser().parse_args(
         [
-            "once",
+            "import-v9",
             "acme/widgets",
-            "/tmp/widgets",
-            "--target",
-            "2026-09-02T20:30:00+08:00",
-            "--concurrency",
-            "8",
-            "--git-url",
-            "https://git.example.test/acme/widgets.git",
-            "--no-progress",
+            str(tmp_path / "old.sqlite3"),
+            str(tmp_path / "new.sqlite3"),
         ],
     )
 
-    config = cli._config(args)
-    assert args.target == _T0 + timedelta(minutes=30)
-    assert config.repository == "acme/widgets"
-    assert config.concurrency == 8
-    assert config.git_url == "https://git.example.test/acme/widgets.git"
-    assert args.no_progress is True
-
-
-def test_parser_rejects_naive_target() -> None:
+    assert once.command == "once"
+    assert not hasattr(once, "target")
+    assert migration.command == "import-v9"
+    assert migration.source.name == "old.sqlite3"
     with pytest.raises(SystemExit):
-        cli._parser().parse_args(
-            ["once", "acme/widgets", "/tmp/widgets", "--target", "2026-09-02T12:00:00"],
-        )
-
-
-def test_parser_has_no_finite_retry_budget() -> None:
-    with pytest.raises(SystemExit):
-        cli._parser().parse_args(
-            ["once", "acme/widgets", "/tmp/widgets", "--transient-retries", "5"],
-        )
-
-
-def test_parser_accepts_configurable_schedule_interval() -> None:
-    args = cli._parser().parse_args(
-        ["schedule", "acme/widgets", "/tmp/widgets", "--interval", "90m"],
-    )
-
-    assert args.interval == timedelta(minutes=90)
-    assert cli._config(args).concurrency == 8
-
-
-def test_parser_accepts_an_archive_only_migration_command() -> None:
-    args = cli._parser().parse_args(["migrate", "/tmp/widgets.sqlite3"])
-
-    assert args.command == "migrate"
-    assert str(args.destination) == "/tmp/widgets.sqlite3"
-
-
-def test_parser_accepts_backfill_and_targeted_refresh() -> None:
-    backfill = cli._parser().parse_args(
-        ["backfill", "acme/widgets", "/tmp/widgets", "--fact", "reviews"],
-    )
-    refresh = cli._parser().parse_args(
-        [
-            "refresh",
-            "acme/widgets",
-            "/tmp/widgets",
-            "--pull",
-            "7",
-            "--issue",
-            "8",
-            "--commit",
-            "a" * 40,
-            "--fact",
-            "commits",
-            "--batch-size",
-            "4",
-            "--target",
-            "2026-09-02T20:00:00+08:00",
-        ],
-    )
-
-    assert backfill.fact_groups == ["reviews"]
-    assert refresh.pull == [7]
-    assert refresh.issue == [8]
-    assert refresh.commit == ["a" * 40]
-    assert refresh.fact_groups == ["commits"]
-    assert refresh.batch_size == 4
-    assert refresh.target == _T0
-
-
-@pytest.mark.parametrize("value", ["0s", "1.5h", "hour", "-1h"])
-def test_parser_rejects_invalid_schedule_interval(value: str) -> None:
-    with pytest.raises(SystemExit):
-        cli._parser().parse_args(
-            ["schedule", "acme/widgets", "/tmp/widgets", "--interval", value],
-        )
+        cli._parser().parse_args(["backfill"])
 
 
 @pytest.mark.asyncio
-async def test_schedule_starts_at_latest_due_boundary(tmp_path: Path) -> None:
-    puller = StubPuller()
-    emitted: list[PullResult] = []
+async def test_schedule_syncs_now_then_waits_for_utc_boundary() -> None:
+    clock = _Clock(_T0)
+    syncer = _Syncer()
+    emitted = []
 
     await cli._run_schedule(
-        puller,
-        tmp_path / "new-archive",
-        timedelta(minutes=30),
-        now=lambda: _T0 + timedelta(minutes=37),
+        syncer,
+        timedelta(hours=1),
+        now=clock,
+        sleep=clock.sleep,
         emit=emitted.append,
-        max_runs=4,
+        max_cycles=2,
     )
 
-    assert puller.targets == [_T0 + timedelta(minutes=30 * offset) for offset in range(1, 5)]
-    assert [result.target_at for result in emitted] == puller.targets
+    assert syncer.calls == 2
+    assert [result.cycle_id for result in emitted] == [1, 2]
+    assert clock.sleeps == [53 * 60]
+    assert clock.current == datetime(2026, 9, 5, 11, tzinfo=UTC)
 
 
-@pytest.mark.asyncio
-async def test_schedule_restart_uses_committed_then_retries_pending_run(tmp_path: Path) -> None:
-    archive = tmp_path / "archive"
-    await _seed_run(archive, _T0, committed=True)
-    pending = _T0 + timedelta(hours=1)
-    await _seed_run(archive, pending, committed=False)
-
-    puller = StubPuller()
-    await cli._run_schedule(
-        puller,
-        archive,
-        timedelta(hours=1),
-        now=lambda: _T0 + timedelta(hours=2),
-        emit=lambda _: None,
-        max_runs=2,
-    )
-    assert puller.targets == [pending, _T0 + timedelta(hours=2)]
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("30m", timedelta(minutes=30)),
+        ("1h", timedelta(hours=1)),
+        ("2d", timedelta(days=2)),
+    ],
+)
+def test_interval_parser(value: str, expected: timedelta) -> None:
+    assert cli._parse_interval(value) == expected
 
 
-@pytest.mark.asyncio
-async def test_schedule_coalesces_missed_targets_to_latest_boundary(tmp_path: Path) -> None:
-    archive = tmp_path / "archive"
-    await _seed_run(archive, _T0, committed=True)
+def test_result_json_describes_cycle_not_target(capsys: pytest.CaptureFixture[str]) -> None:
+    cli._emit(_SYNC_RESULT)
 
-    puller = StubPuller()
-    await cli._run_schedule(
-        puller,
-        archive,
-        timedelta(hours=1),
-        now=lambda: _T0 + timedelta(hours=3, minutes=37),
-        emit=lambda _: None,
-        max_runs=1,
-    )
-
-    assert puller.targets == [_T0 + timedelta(hours=3)]
-
-
-@pytest.mark.asyncio
-async def test_schedule_state_uses_greatest_target_not_latest_run_id(tmp_path: Path) -> None:
-    archive = tmp_path / "archive"
-    greatest = _T0 + timedelta(microseconds=900)
-    await _seed_run(archive, greatest, committed=True)
-    await _seed_run(archive, _T0 + timedelta(microseconds=100), committed=True)
-
-    state = await schedule_state(archive)
-
-    assert state.committed_target == _iso(greatest)
-
-
-def test_emit_writes_machine_readable_result(capsys: pytest.CaptureFixture[str]) -> None:
-    result = PullResult(
-        target_at=_T0,
-        completed_at=_T0 + timedelta(seconds=3),
-        run_id=42,
-        changed_items=2,
-        catalog_items=11,
-        requests=7,
-    )
-
-    cli._emit(result)
-
-    assert json.loads(capsys.readouterr().out) == {
-        "catalog_items": 11,
-        "changed_items": 2,
-        "completed_at": "2026-09-02T12:00:03Z",
-        "lag_seconds": 3.0,
-        "requests": 7,
-        "run_id": 42,
-        "target_at": "2026-09-02T12:00:00Z",
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == {
+        "checkpoint_from": None,
+        "completed_at": "2026-09-05T10:07:00Z",
+        "cycle_id": 1,
+        "discovered_items": 3,
+        "requests": 5,
+        "started_at": "2026-09-05T10:07:00Z",
     }
+    assert "target_at" not in payload
 
 
-def test_emit_writes_machine_readable_migration_result(
-    capsys: pytest.CaptureFixture[str],
-    tmp_path: Path,
-) -> None:
-    database = tmp_path / "archive.sqlite3"
-
-    cli._emit_migration(MigrationResult(database, "acme/widgets", True))
-
-    assert json.loads(capsys.readouterr().out) == {
-        "changed": True,
-        "database": str(database),
-        "repository": "acme/widgets",
-    }
-
-
-def test_schedule_process_lock_rejects_duplicate_scheduler(tmp_path: Path) -> None:
-    destination = tmp_path / "archive"
-
-    with (
-        cli._schedule_lock(destination),
-        pytest.raises(RuntimeError, match="already runs"),
-        cli._schedule_lock(destination),
-    ):
-        pytest.fail("duplicate scheduler acquired the lock")
-
-
-@pytest.mark.asyncio
-async def test_sigterm_cancels_active_command_and_returns_143(monkeypatch: pytest.MonkeyPatch) -> None:
-    started = asyncio.Event()
-    stopped = asyncio.Event()
-
-    async def dispatch(_: argparse.Namespace) -> None:
-        started.set()
-        try:
-            await asyncio.Event().wait()
-        finally:
-            stopped.set()
-
-    real_loop = asyncio.get_running_loop()
-
-    class LoopProxy:
-        def __init__(self) -> None:
-            self.handlers: dict[signal.Signals, tuple[Any, tuple[Any, ...]]] = {}
-            self.removed: list[signal.Signals] = []
-
-        def add_signal_handler(self, sig: signal.Signals, callback: Any, *args: Any) -> None:
-            self.handlers[sig] = (callback, args)
-
-        def remove_signal_handler(self, sig: signal.Signals) -> None:
-            self.removed.append(sig)
-
-    proxy = LoopProxy()
-    monkeypatch.setattr(cli, "_dispatch", dispatch)
-    monkeypatch.setattr(cli.asyncio, "get_running_loop", lambda: proxy)
-    task = real_loop.create_task(cli._run_with_signals(argparse.Namespace()))
-    await started.wait()
-    callback, args = proxy.handlers[signal.SIGTERM]
-    callback(*args)
-
-    assert await task == 143
-    assert stopped.is_set()
-    assert set(proxy.removed) == {signal.SIGINT, signal.SIGTERM}
+_SYNC_RESULT = SyncResult(1, _T0, _T0, None, 3, 5)

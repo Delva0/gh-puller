@@ -7,26 +7,11 @@ import re
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING, Any
+from typing import Any
 from urllib.parse import parse_qs, urlencode, urlsplit
 
-import aiosqlite
-
-from gh_puller.github import (
-    ArchivedHead,
-    ArchivedRun,
-    ArchivedVersion,
-    GitHubAPIError,
-    GitHubPullConfig,
-    GitHubPuller,
-    iter_heads,
-    iter_runs,
-    iter_versions,
-)
 from gh_puller.github.client import GitHubPage, GitHubResource
-
-if TYPE_CHECKING:
-    from pathlib import Path
+from gh_puller.github.errors import GitHubAPIError
 
 _BASE = "/repos/acme/widgets"
 _T0 = datetime(2026, 8, 1, 12, tzinfo=UTC)
@@ -85,7 +70,14 @@ class FakeAPI:
             raise RuntimeError(f"injected failure: {path}")
         if path.endswith("/requested_reviewers"):
             return deepcopy(self.json.get(path, {"users": [], "teams": []}))
-        value = deepcopy(self.json[path])
+        try:
+            value = deepcopy(self.json[path])
+        except KeyError as exc:
+            raise GitHubAPIError(
+                f"GitHub returned 404 for {path}",
+                status_code=404,
+                url=path,
+            ) from exc
         if re.fullmatch(rf"{re.escape(_BASE)}/pulls/\d+", path):
             value.setdefault("requested_reviewers", [])
             value.setdefault("requested_teams", [])
@@ -169,10 +161,14 @@ class FakeAPI:
     ) -> list[dict[str, Any]]:
         if path == f"{_BASE}/issues" and params and params.get("state") == "all":
             items = deepcopy(self.catalog)
-        elif path == f"{_BASE}/issues/comments" and not (params and params.get("since")):
-            items = self._repository_comments("issues", "issue_url")
-        elif path == f"{_BASE}/pulls/comments" and not (params and params.get("since")):
-            items = self._repository_comments("pulls", "pull_request_url")
+        elif path == f"{_BASE}/issues/comments":
+            items = deepcopy(
+                self.pages.get(path, self._repository_comments("issues", "issue_url")),
+            )
+        elif path == f"{_BASE}/pulls/comments":
+            items = deepcopy(
+                self.pages.get(path, self._repository_comments("pulls", "pull_request_url")),
+            )
         else:
             items = deepcopy(self.pages.get(path, []))
             issue_match = re.fullmatch(rf"{re.escape(_BASE)}/issues/\d+/comments", path)
@@ -794,111 +790,3 @@ def _graphql_reaction(number: int, content: str) -> dict[str, Any]:
             "isSiteAdmin": False,
         },
     }
-
-
-def _config(path: Path, **kwargs: Any) -> GitHubPullConfig:
-    return GitHubPullConfig(repository="acme/widgets", destination=path, **kwargs)
-
-
-def _puller(config: GitHubPullConfig, **kwargs: Any) -> GitHubPuller:
-    kwargs.setdefault("git", FakeGitStore())
-    return GitHubPuller(config, **kwargs)
-
-
-async def _versions(path: Path) -> list[ArchivedVersion]:
-    return [version async for version in iter_versions(path)]
-
-
-async def _runs(path: Path) -> list[ArchivedRun]:
-    return [run async for run in iter_runs(path)]
-
-
-async def _current(path: Path) -> dict[int, ArchivedHead]:
-    return {head.number: head async for head in iter_heads(path)}
-
-
-async def _rows(
-    path: Path,
-    sql: str,
-    parameters: tuple[Any, ...] = (),
-) -> list[dict[str, Any]]:
-    db = await aiosqlite.connect(path)
-    db.row_factory = aiosqlite.Row
-    try:
-        cursor = await db.execute(sql, parameters)
-        try:
-            return [dict(row) for row in await cursor.fetchall()]
-        finally:
-            await cursor.close()
-    finally:
-        await db.close()
-
-
-def _seed_churn_api(api: FakeAPI, size: int) -> None:
-    for number in range(1, size + 1):
-        pull = number % 3 == 0
-        api.add_issue(number, pull=pull)
-        if pull:
-            api.json[f"{_BASE}/pulls/{number}"] = {
-                "id": number * 10,
-                "changed_files": 0,
-                "commits": 0,
-                "review_comments": 0,
-            }
-        if number % 4:
-            continue
-        path = f"{_BASE}/issues/{number}"
-        comment = {
-            "id": 100_000 + number,
-            "body": "seed",
-            "created_at": _iso(_T0 - timedelta(hours=2)),
-            "updated_at": _iso(_T0 - timedelta(hours=2)),
-            "reactions": {"total_count": 0},
-        }
-        api.pages[f"{path}/comments"] = [comment]
-        api.json[path]["comments"] = 1
-
-
-def _apply_churn_epoch(
-    api: FakeAPI,
-    *,
-    deleted: set[int],
-    added: tuple[int, ...],
-    comment_operations: list[tuple[int, str, int]],
-    changed_at: datetime,
-) -> None:
-    api.catalog = [item for item in api.catalog if item["number"] not in deleted]
-    for number in added:
-        pull = number % 3 == 0
-        api.add_issue(number, created_at=changed_at, updated_at=changed_at, pull=pull)
-        if pull:
-            api.json[f"{_BASE}/pulls/{number}"] = {
-                "id": number * 10,
-                "changed_files": 0,
-                "commits": 0,
-                "review_comments": 0,
-            }
-
-    signals: list[dict[str, Any]] = []
-    for number, operation, comment_id in comment_operations:
-        path = f"{_BASE}/issues/{number}"
-        comments = api.pages.setdefault(f"{path}/comments", [])
-        if operation == "add":
-            comment = {
-                "id": comment_id,
-                "body": f"comment {comment_id}",
-                "created_at": _iso(changed_at),
-                "updated_at": _iso(changed_at),
-                "reactions": {"total_count": 0},
-            }
-            comments.append(comment)
-            signals.append(comment | {"issue_url": path})
-        else:
-            comments[:] = [comment for comment in comments if comment["id"] != comment_id]
-            summary = next(item for item in api.catalog if item["number"] == number)
-            summary["updated_at"] = _iso(changed_at)
-            api.json[path]["updated_at"] = _iso(changed_at)
-        if "pull_request" in api.json[path]:
-            api.closing[number] = [_closing_issue(comment_id)] if operation == "add" else []
-        api.json[path]["comments"] = len(comments)
-    api.pages[f"{_BASE}/issues/comments"] = signals

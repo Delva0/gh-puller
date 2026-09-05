@@ -1,8 +1,7 @@
-"""Extract explicit commit identities without guessing from free-form text.
+"""Extract explicit commit identities from fine-grained fact payloads.
 
-Bundle and review-thread schemas are traversed only at fields whose GitHub contract
-names a commit object. The returned JSON paths preserve every source relationship;
-Git availability and publication belong to git_store and store respectively.
+Only fields whose GitHub contract names a commit object are traversed. Returned JSON
+paths retain each source relationship; Git availability belongs to ``git_store``.
 """
 
 from __future__ import annotations
@@ -20,79 +19,6 @@ class CommitReference:
     field_path: str  # JSON Pointer-like path inside the source payload.
     source_kind: str  # Pull commit, review, review comment, or timeline event.
     source_id: str | int | None  # Stable GitHub source identity when present.
-
-
-@dataclass(frozen=True, slots=True)
-class CommitReferenceSource:
-    kind: str  # bundle or independently published supplemental fact family.
-    digest: str  # Content identity of the source payload.
-    resource_number: int | None  # Related Issue/PR number.
-    references: tuple[CommitReference, ...]  # Ordered structured fields in the source.
-
-
-def bundle_commit_references(bundle: dict[str, Any]) -> tuple[CommitReference, ...]:
-    """Extract all contract-defined commit fields from one historical bundle.
-
-    Args:
-        bundle: Decoded canonical Issue/PR bundle.
-
-    Returns:
-        Source-distinct references in their original collection order.
-
-    Raises:
-        ValueError: A non-null structured commit field is not an exact object ID.
-    """
-    result: list[CommitReference] = []
-    pull = bundle.get("pull_request")
-    if isinstance(pull, dict):
-        for index, item in enumerate(_objects(pull.get("commits"))):
-            _append(result, item.get("sha"), f"/pull_request/commits/{index}/sha", "pull_commit", item.get("sha"))
-        for index, review in enumerate(_objects(pull.get("reviews"))):
-            _append(
-                result,
-                review.get("commit_id"),
-                f"/pull_request/reviews/{index}/commit_id",
-                "review",
-                review.get("id"),
-            )
-        for index, comment in enumerate(_objects(pull.get("review_comments"))):
-            for field in ("commit_id", "original_commit_id"):
-                _append(
-                    result,
-                    comment.get(field),
-                    f"/pull_request/review_comments/{index}/{field}",
-                    "review_comment",
-                    comment.get("id"),
-                )
-    for collection in ("timeline", "events"):
-        for index, event in enumerate(_objects(bundle.get(collection))):
-            source_id = event.get("id", event.get("node_id"))
-            _append(
-                result,
-                event.get("commit_id"),
-                f"/{collection}/{index}/commit_id",
-                "timeline_event",
-                source_id,
-            )
-            if event.get("event") == "committed":
-                _append(
-                    result,
-                    event.get("sha"),
-                    f"/{collection}/{index}/sha",
-                    "timeline_event",
-                    source_id,
-                )
-            commit = event.get("commit")
-            if isinstance(commit, dict):
-                for field in ("sha", "oid"):
-                    _append(
-                        result,
-                        commit.get(field),
-                        f"/{collection}/{index}/commit/{field}",
-                        "timeline_event",
-                        source_id,
-                    )
-    return tuple(result)
 
 
 def review_thread_commit_references(
