@@ -25,6 +25,7 @@ FACT_SCHEMAS = {
     "pull-commits": 1,
     "pull-git": 1,
     "pull-requested-reviewers": 1,
+    "pull-review-comments": 1,
     "pull-review-comment-reactions": 1,
     "pull-review-threads": 1,
     "pull-reviews": 1,
@@ -67,6 +68,25 @@ CREATE TABLE sync_cycles (
 
 CREATE UNIQUE INDEX one_active_sync_cycle
 ON sync_cycles(status) WHERE status = 'active';
+
+CREATE TABLE discovery_items (
+    cycle_id INTEGER NOT NULL REFERENCES sync_cycles(id) ON DELETE CASCADE,
+    number INTEGER NOT NULL CHECK (number > 0),
+    kind TEXT NOT NULL CHECK (kind IN ('issue', 'pull')),
+    observed_from TEXT NOT NULL,
+    observed_until TEXT NOT NULL,
+    summary_digest TEXT NOT NULL REFERENCES payload_blobs(digest),
+    PRIMARY KEY(cycle_id, number),
+    CHECK (observed_from <= observed_until)
+) WITHOUT ROWID;
+
+CREATE TABLE discovery_signals (
+    cycle_id INTEGER NOT NULL REFERENCES sync_cycles(id) ON DELETE CASCADE,
+    number INTEGER NOT NULL CHECK (number > 0),
+    issue_comments INTEGER NOT NULL DEFAULT 0 CHECK (issue_comments IN (0, 1)),
+    pull_comments INTEGER NOT NULL DEFAULT 0 CHECK (pull_comments IN (0, 1)),
+    PRIMARY KEY(cycle_id, number)
+) WITHOUT ROWID;
 
 CREATE TABLE sync_tasks (
     id INTEGER PRIMARY KEY,

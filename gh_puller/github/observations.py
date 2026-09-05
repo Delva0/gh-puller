@@ -78,6 +78,29 @@ class TaskDraft:
 
 
 @dataclass(frozen=True, slots=True)
+class DiscoveryItemDraft:
+    """One raw Issue/PR summary observed in a repository catalog page."""
+
+    number: int
+    kind: str
+    observed_from: datetime
+    observed_until: datetime
+    summary: dict[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class DiscoveryItem:
+    """Durable transit evidence used to hydrate one selected Issue or PR."""
+
+    cycle_id: int
+    number: int
+    kind: str
+    observed_from: datetime
+    observed_until: datetime
+    summary: dict[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
 class SyncCycle:
     """Operational state for one resumable discovery-and-fetch cycle."""
 
@@ -224,6 +247,46 @@ class ObservationArchive:
         )
         return None if row is None else _cycle(row)
 
+    async def publication(
+        self,
+        publication_key: str,
+    ) -> tuple[FactObservation, ...] | None:
+        """Return an idempotent publication when it already exists.
+
+        Args:
+            publication_key: Stable source-operation identity.
+
+        Returns:
+            The original atomic batch, or None before publication.
+        """
+        row = await _fetchone(
+            self._connection,
+            "SELECT id FROM fact_batches WHERE publication_key = ?",
+            (publication_key,),
+        )
+        return None if row is None else await _batch_facts(self._connection, int(row["id"]))
+
+    async def current_fact(
+        self,
+        family: str,
+        subject_key: str,
+    ) -> FactObservation | None:
+        """Return one fact's latest observation by actual read time.
+
+        Args:
+            family: Versioned semantic fact family.
+            subject_key: Stable identity within that family.
+
+        Returns:
+            The current observation, or None when it has never been observed.
+        """
+        row = await _fetchone(
+            self._connection,
+            _CURRENT_FACT_QUERY,
+            (family, subject_key),
+        )
+        return None if row is None else _fact(row)
+
     async def discovery_checkpoint(self) -> datetime | None:
         """Return the last safely completed discovery boundary."""
         row = await _fetchone(
@@ -231,6 +294,100 @@ class ObservationArchive:
             "SELECT value FROM archive_meta WHERE key = 'discovery_checkpoint'",
         )
         return None if row is None else _time(str(row["value"]))
+
+    async def discovery_item(
+        self,
+        cycle_id: int,
+        number: int,
+    ) -> DiscoveryItem | None:
+        """Return the latest catalog summary seen for a cycle-local parent.
+
+        Args:
+            cycle_id: Cycle whose traversal produced the summary.
+            number: Repository-local Issue/PR number.
+
+        Returns:
+            Durable page evidence, or None for a comment-signal-only parent.
+        """
+        row = await _fetchone(
+            self._connection,
+            """
+            SELECT d.*, p.codec, p.raw_size, p.payload
+            FROM discovery_items AS d
+            JOIN payload_blobs AS p ON p.digest = d.summary_digest
+            WHERE d.cycle_id = ? AND d.number = ?
+            """,
+            (cycle_id, number),
+        )
+        return None if row is None else _discovery_item(row)
+
+    async def record_discovery_signals(
+        self,
+        cycle_id: int,
+        issue_comments: Collection[int],
+        pull_comments: Collection[int],
+    ) -> None:
+        """Persist repository comment feeds before catalog traversal starts.
+
+        Args:
+            cycle_id: Active cycle receiving the discovery evidence.
+            issue_comments: Parents selected by conversation-comment changes.
+            pull_comments: PRs selected by review-comment changes.
+        """
+        issue_numbers = set(issue_comments)
+        pull_numbers = set(pull_comments)
+        if any(number < 1 for number in issue_numbers | pull_numbers):
+            raise ValueError("discovery signal numbers must be positive")
+        db = self._connection
+        await db.execute("BEGIN IMMEDIATE")
+        try:
+            await _active_cycle_row(db, cycle_id)
+            await db.executemany(
+                """
+                INSERT INTO discovery_signals(
+                    cycle_id, number, issue_comments, pull_comments
+                ) VALUES (?, ?, ?, ?)
+                ON CONFLICT(cycle_id, number) DO UPDATE SET
+                    issue_comments = MAX(issue_comments, excluded.issue_comments),
+                    pull_comments = MAX(pull_comments, excluded.pull_comments)
+                """,
+                (
+                    (
+                        cycle_id,
+                        number,
+                        int(number in issue_numbers),
+                        int(number in pull_numbers),
+                    )
+                    for number in sorted(issue_numbers | pull_numbers)
+                ),
+            )
+            await db.commit()
+        except BaseException:
+            await db.rollback()
+            raise
+
+    async def discovery_signals(self, cycle_id: int, number: int) -> tuple[bool, bool]:
+        """Return durable conversation and review-comment selection signals.
+
+        Args:
+            cycle_id: Cycle whose repository feeds were read.
+            number: Repository-local Issue/PR number.
+
+        Returns:
+            ``(issue_comments, pull_comments)`` flags; absent evidence is false.
+        """
+        row = await _fetchone(
+            self._connection,
+            """
+            SELECT issue_comments, pull_comments
+            FROM discovery_signals
+            WHERE cycle_id = ? AND number = ?
+            """,
+            (cycle_id, number),
+        )
+        if row is None:
+            return False, False
+        return bool(row["issue_comments"]), bool(row["pull_comments"])
 
     async def begin_discovery(self, cycle_id: int, initial_cursor: str) -> str | None:
         """Persist the first discovery request or return the resume cursor.
@@ -275,7 +432,7 @@ class ObservationArchive:
         cycle_id: int,
         request_cursor: str,
         next_cursor: str | None,
-        item_count: int,
+        items: Collection[DiscoveryItemDraft],
         tasks: Collection[TaskDraft] = (),
     ) -> SyncCycle:
         """Atomically retain one consumed discovery page and its selected tasks.
@@ -284,7 +441,7 @@ class ObservationArchive:
             cycle_id: Active cycle receiving the page.
             request_cursor: Cursor used for this response; it must equal durable state.
             next_cursor: Cursor for the next page, or None for the terminal response.
-            item_count: Number of catalog entries accepted from this response.
+            items: Raw catalog entries accepted from this response.
             tasks: Idempotent work selected from the page.
 
         Returns:
@@ -294,8 +451,7 @@ class ObservationArchive:
             raise ValueError("request cursor cannot be empty")
         if next_cursor == "":
             raise ValueError("next cursor cannot be empty")
-        if item_count < 0:
-            raise ValueError("item_count cannot be negative")
+        page = tuple(_prepare_discovery_item(item) for item in items)
         prepared = tuple(_prepare_task(task) for task in tasks)
         db = self._connection
         await db.execute("BEGIN IMMEDIATE")
@@ -303,6 +459,30 @@ class ObservationArchive:
             row = await _active_cycle_row(db, cycle_id)
             if not bool(row["discovery_started"]) or row["discovery_cursor"] != request_cursor:
                 raise RuntimeError("discovery cursor does not match durable state")
+            for item, summary_digest, raw in page:
+                await _put_encoded_blob(db, summary_digest, raw)
+                await db.execute(
+                    """
+                    INSERT INTO discovery_items(
+                        cycle_id, number, kind, observed_from, observed_until,
+                        summary_digest
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(cycle_id, number) DO UPDATE SET
+                        kind = excluded.kind,
+                        observed_from = excluded.observed_from,
+                        observed_until = excluded.observed_until,
+                        summary_digest = excluded.summary_digest
+                    WHERE discovery_items.observed_until <= excluded.observed_until
+                    """,
+                    (
+                        cycle_id,
+                        item.number,
+                        item.kind,
+                        _iso(item.observed_from),
+                        _iso(item.observed_until),
+                        summary_digest,
+                    ),
+                )
             for task, input_digest, raw in prepared:
                 await _put_encoded_blob(db, input_digest, raw)
                 await _insert_task(db, cycle_id, task, input_digest)
@@ -315,7 +495,7 @@ class ObservationArchive:
                     discovered_items = discovered_items + ?
                 WHERE id = ?
                 """,
-                (next_cursor, int(next_cursor is None), item_count, cycle_id),
+                (next_cursor, int(next_cursor is None), len(page), cycle_id),
             )
             await db.commit()
         except BaseException:
@@ -806,6 +986,11 @@ WHERE (? IS NULL OR o.family = ?)
 ORDER BY o.family, o.subject_key
 """
 
+_CURRENT_FACT_QUERY = _FACT_SELECT + """
+JOIN fact_heads AS h ON h.observation_id = o.id
+WHERE o.family = ? AND o.subject_key = ?
+"""
+
 _AS_OF_QUERY = """
 SELECT * FROM (
     SELECT selected.*, ROW_NUMBER() OVER (
@@ -854,6 +1039,21 @@ def _prepare_task(task: TaskDraft) -> tuple[TaskDraft, str, bytes]:
         raise ValueError("resource number must be positive")
     raw = _json_bytes(task.payload)
     return task, _digest(raw), raw
+
+
+def _prepare_discovery_item(
+    item: DiscoveryItemDraft,
+) -> tuple[DiscoveryItemDraft, str, bytes]:
+    if item.number < 1 or item.kind not in {"issue", "pull"}:
+        raise ValueError("invalid discovery item identity")
+    observed_from = _iso(item.observed_from)
+    observed_until = _iso(item.observed_until)
+    if observed_from > observed_until:
+        raise ValueError("discovery observation window is reversed")
+    if item.summary.get("number") != item.number:
+        raise ValueError("discovery summary has another number")
+    raw = _json_bytes(item.summary)
+    return item, _digest(raw), raw
 
 
 async def _insert_task(
@@ -1044,6 +1244,17 @@ def _cycle(row: aiosqlite.Row) -> SyncCycle:
         discovery_pages=int(row["discovery_pages"]),
         discovered_items=int(row["discovered_items"]),
         request_count=int(row["request_count"]),
+    )
+
+
+def _discovery_item(row: aiosqlite.Row) -> DiscoveryItem:
+    return DiscoveryItem(
+        cycle_id=int(row["cycle_id"]),
+        number=int(row["number"]),
+        kind=str(row["kind"]),
+        observed_from=_time(str(row["observed_from"])),
+        observed_until=_time(str(row["observed_until"])),
+        summary=_decode_payload(row),
     )
 
 

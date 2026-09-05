@@ -11,6 +11,7 @@ import pytest
 
 from gh_puller.github.observations import (
     Coverage,
+    DiscoveryItemDraft,
     FactDraft,
     ObservationArchive,
     Origin,
@@ -79,6 +80,9 @@ async def test_fact_publication_is_atomic_idempotent_and_content_addressed(
             facts,
         )
         assert repeated == first
+        assert await archive.publication("import:7") == first
+        assert await archive.publication("missing") is None
+        assert await archive.current_fact("issue", "issue:7") == first[0]
 
         changed = _fact("issue", "issue:7", _T0, {"number": 7, "title": "other"})
         with pytest.raises(RuntimeError, match="different facts"):
@@ -192,10 +196,21 @@ async def test_cycle_resumes_pages_and_tasks_without_hiding_published_facts(
             cycle.id,
             "catalog?page=1",
             "catalog?page=2",
-            100,
+            tuple(
+                DiscoveryItemDraft(
+                    number,
+                    "issue",
+                    _T0,
+                    _T0 + timedelta(seconds=1),
+                    {"number": number, "title": "catalog"},
+                )
+                for number in range(1, 101)
+            ),
             (task_7,),
         )
         assert (cycle.discovery_pages, cycle.discovered_items) == (1, 100)
+        item = await archive.discovery_item(cycle.id, 7)
+        assert item is not None and item.summary["title"] == "catalog"
         claimed = await archive.take_tasks(cycle.id, 1)
         assert (claimed[0].task_key, claimed[0].attempts) == ("issue:7", 1)
         await archive.record_task_error(claimed[0].id, "GitHubAPIError: retry")
@@ -209,7 +224,16 @@ async def test_cycle_resumes_pages_and_tasks_without_hiding_published_facts(
             resumed.id,
             "catalog?page=2",
             None,
-            23,
+            tuple(
+                DiscoveryItemDraft(
+                    number,
+                    "issue",
+                    _T0,
+                    _T0 + timedelta(seconds=1),
+                    {"number": number},
+                )
+                for number in range(8, 31)
+            ),
             (task_8,),
         )
         assert resumed.discovery_complete
@@ -262,7 +286,7 @@ async def test_discovery_page_and_task_definition_are_transactional(tmp_path: Pa
                 cycle.id,
                 "page:1",
                 "page:2",
-                100,
+                (),
                 (conflicting,),
             )
         current = await archive.active_cycle()
