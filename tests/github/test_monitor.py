@@ -84,7 +84,7 @@ def _write_unit(
     return path
 
 
-def test_table_prioritizes_target_items_progress_and_database(tmp_path: Path) -> None:
+def test_table_is_a_compact_writer_overview(tmp_path: Path) -> None:
     progress = _progress(
         phase="rate_limit",
         wait_seconds=600.0,
@@ -94,34 +94,40 @@ def test_table_prioritizes_target_items_progress_and_database(tmp_path: Path) ->
     output = monitor._render_table(
         [_status(tmp_path / "facts.sqlite3", progress)],
         now=_EVENT_AT + timedelta(minutes=5),
-        zone=_LOCAL,
     )
 
-    assert "TARGET T" in output
-    assert "ITEMS" in output
-    assert "54,083" in output
-    assert "Wed 2026-09-02 13:37:49.940630 CST" in output
-    assert "objects [----------] 224/51,549" in output
-    assert "5m00s remaining" in output
-    assert str((tmp_path / "facts.sqlite3").resolve()) in output
-    assert str((tmp_path / "facts.sqlite3.git").resolve()) in output
-    assert "REQUEST" not in output
-    assert "QUOTA" in output
-    assert "core     4,498/5,000  reset Wed 2026-09-02 19:00:00 CST" in output
-    assert "graphql  4,997/5,000  reset Wed 2026-09-02 18:30:00 CST" in output
     lines = output.splitlines()
-    core_line = next(line for line in lines if "core" in line)
-    graphql_line = next(line for line in lines if "graphql" in line)
-    assert lines.index(graphql_line) == lines.index(core_line) + 1
-    assert core_line.index("core") == graphql_line.index("graphql")
-    assert " | " not in output
+    assert lines[0].split() == ["ID", "ST", "REPO", "DB", "PHASE", "DONE", "UPDATED"]
+    assert "up" in lines[1]
+    assert "acme/widgets" in lines[1]
+    assert "facts.sqlite3" in lines[1]
+    assert "quota" in lines[1]
+    assert "224/51.5k" in lines[1]
+    assert lines[1].endswith("5m")
+    assert max(map(len, lines)) <= 79
+    for omitted in ("GIT STORE", "RUN", "TARGET T", "ITEMS", "CATALOG", "QUOTA", "WAIT"):
+        assert omitted not in lines[0]
+
+
+def test_table_truncates_long_identifiers_to_79_columns(tmp_path: Path) -> None:
+    database = tmp_path / "a-very-long-github-archive-name.sqlite3"
+    status = _status(database)
+    status = replace(
+        status,
+        writer=_writer(database, "extraordinarily-long-owner/extraordinarily-long-repository"),
+    )
+
+    output = monitor._render_table([status], now=_EVENT_AT)
+
+    assert "…" in output
+    assert max(map(len, output.splitlines())) <= 79
 
 
 def test_table_output_is_stable_for_external_watch(tmp_path: Path) -> None:
     statuses = [_status(tmp_path / "facts.sqlite3")]
 
-    first = monitor._render_table(statuses, now=_EVENT_AT + timedelta(seconds=5), zone=_LOCAL)
-    second = monitor._render_table(statuses, now=_EVENT_AT + timedelta(seconds=5), zone=_LOCAL)
+    first = monitor._render_table(statuses, now=_EVENT_AT + timedelta(seconds=5))
+    second = monitor._render_table(statuses, now=_EVENT_AT + timedelta(seconds=5))
 
     assert first == second
     assert "\x1b" not in first
@@ -290,6 +296,10 @@ def test_managed_writers_require_matching_path_identity(tmp_path: Path) -> None:
 
     writers = monitor._managed_writers(units)
     selected = monitor._managed_writers(units, second)
+    selected_by_id = monitor._managed_writers(
+        units,
+        writer_id=_writer(second).identity[:12],
+    )
 
     assert {writer.database for writer in writers} == {
         first.resolve(),
@@ -297,6 +307,7 @@ def test_managed_writers_require_matching_path_identity(tmp_path: Path) -> None:
         third.resolve(),
     }
     assert [writer.database for writer in selected] == [second.resolve()]
+    assert [writer.database for writer in selected_by_id] == [second.resolve()]
 
 
 def test_collection_reads_systemd_and_latest_journal_event(

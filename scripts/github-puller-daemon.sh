@@ -17,7 +17,7 @@ Usage:
   github-puller-daemon.sh start DATABASE
   github-puller-daemon.sh stop DATABASE
   github-puller-daemon.sh restart DATABASE
-  github-puller-daemon.sh status [DATABASE]
+  github-puller-daemon.sh status [DATABASE|WRITER]
   github-puller-daemon.sh logs DATABASE
   github-puller-daemon.sh render OWNER/REPO DATABASE [PULLER_OPTIONS...]
 
@@ -319,9 +319,7 @@ monitor_status() {
         --systemctl "$SYSTEMCTL"
         --journalctl "$JOURNALCTL"
     )
-    if [[ $# -eq 1 ]]; then
-        arguments+=(--database "$1")
-    fi
+    arguments+=("$@")
     exec "$uv" --directory "$PROJECT_ROOT" run --frozen -m gh_puller.github.monitor "${arguments[@]}"
 }
 
@@ -437,13 +435,16 @@ case "$action" in
         fi
         ;;
     status)
-        [[ $# -le 2 ]] || fail "status accepts at most one DATABASE"
+        [[ $# -le 2 ]] || fail "status accepts at most one DATABASE or WRITER"
         if [[ $# -eq 1 ]]; then
             monitor_status
         fi
+        if [[ "$2" =~ ^[0-9a-f]{12}$ ]]; then
+            monitor_status --writer-id "$2"
+        fi
         destination="$(absolute_destination "$2")"
         resolve_managed_unit status "$2" "$destination" >/dev/null
-        monitor_status "$destination"
+        monitor_status --database "$destination"
         ;;
     logs)
         [[ $# -eq 2 ]] || fail "logs accepts only DATABASE"

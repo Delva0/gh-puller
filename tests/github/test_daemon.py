@@ -441,12 +441,39 @@ def test_status_without_database_lists_all_managed_writers(tmp_path: Path) -> No
 
     result = _run("status", environment=environment)
 
-    assert "WRITER" in result.stdout
-    assert "DATABASE" in result.stdout
-    assert str(first.resolve()) in result.stdout
-    assert str(second.resolve()) in result.stdout
+    assert result.stdout.splitlines()[0].split() == [
+        "ID",
+        "ST",
+        "REPO",
+        "DB",
+        "PHASE",
+        "DONE",
+        "UPDATED",
+    ]
+    assert first.name in result.stdout
+    assert second.name in result.stdout
     assert "acme/widgets" in result.stdout
     assert "acme/other" in result.stdout
+    assert "GIT STORE" not in result.stdout
+    assert "RUN" not in result.stdout
+    assert "QUOTA" not in result.stdout
+    assert max(map(len, result.stdout.splitlines())) <= 79
+
+
+def test_status_accepts_displayed_writer_id(tmp_path: Path) -> None:
+    environment, units, log = _environment(tmp_path)
+    database = tmp_path / "facts.sqlite3"
+    unit = _write_managed_unit(units, database)
+    identity = unit.stem.removeprefix("gh-puller-")
+
+    result = _run("status", identity, environment=environment)
+
+    assert f"WRITER      {identity}" in result.stdout
+    assert f"DATABASE    {database.resolve()}" in result.stdout
+    assert f"GIT STORE   {database.resolve()}.git" in result.stdout
+    calls = log.read_text().splitlines()
+    assert calls[0].startswith(f"show {unit.name} --property=ActiveState")
+    assert calls[1] == f"--unit {unit.name} --output=cat --lines=512 --no-pager"
 
 
 @pytest.mark.parametrize("action", ["status", "start", "stop", "restart", "logs"])

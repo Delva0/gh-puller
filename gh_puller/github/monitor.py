@@ -28,6 +28,7 @@ _UNIT = re.compile(r"gh-puller-([0-9a-f]{12}|[0-9a-f]{64})\.service\Z")
 _PROGRESS_TYPE = "github_pull_progress"
 _JOURNAL_LINES = 512
 _WEEKDAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+_OVERVIEW_WIDTHS = (12, 4, 17, 15, 7, 11, 7)
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,11 +83,17 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--systemd-dir", type=Path, required=True)
     parser.add_argument("--systemctl", required=True)
     parser.add_argument("--journalctl", required=True)
-    parser.add_argument("--database", type=Path)
+    selector = parser.add_mutually_exclusive_group()
+    selector.add_argument("--database", type=Path)
+    selector.add_argument("--writer-id")
     return parser
 
 
-def _managed_writers(systemd_dir: Path, database: Path | None = None) -> list[ManagedWriter]:
+def _managed_writers(
+    systemd_dir: Path,
+    database: Path | None = None,
+    writer_id: str | None = None,
+) -> list[ManagedWriter]:
     selected = None if database is None else database.resolve()
     writers: list[ManagedWriter] = []
     for path in sorted(systemd_dir.glob("gh-puller-*.service")):
@@ -100,7 +107,11 @@ def _managed_writers(systemd_dir: Path, database: Path | None = None) -> list[Ma
             continue
         resolved = Path(destination).resolve()
         identity = hashlib.sha256(os.fsencode(resolved)).hexdigest()
-        if not identity.startswith(match[1]) or (selected is not None and resolved != selected):
+        if (
+            not identity.startswith(match[1])
+            or (selected is not None and resolved != selected)
+            or (writer_id is not None and identity[:12] != writer_id)
+        ):
             continue
         writers.append(
             ManagedWriter(
@@ -218,54 +229,24 @@ def _latest_progress(output: str) -> ProgressState | None:
 def _render_table(
     statuses: Sequence[WriterStatus],
     now: datetime | None = None,
-    zone: tzinfo | None = None,
 ) -> str:
     if not statuses:
         return "No managed GitHub writers."
     observed_at = datetime.now(UTC) if now is None else now.astimezone(UTC)
-    headers = (
-        "WRITER",
-        "STATE",
-        "REPOSITORY",
-        "DATABASE",
-        "GIT STORE",
-        "RUN",
-        "TARGET T",
-        "ITEMS",
-        "PHASE",
-        "CATALOG",
-        "OBJECTS",
-        "QUOTA",
-        "WAIT",
-        "UPDATED",
-    )
+    headers = ("ID", "ST", "REPO", "DB", "PHASE", "DONE", "UPDATED")
     rows = [
         (
             status.writer.identity[:12],
-            _service_label(status.service),
+            _short_service(status.service),
             status.writer.repository,
-            str(status.writer.database),
-            str(status.writer.git_store),
-            _show(status.progress.run_id if status.progress else None),
-            _target(status.progress, zone),
-            _items(status.progress),
-            status.progress.phase if status.progress else "-",
-            _catalog(status.progress),
-            _objects(status.progress, 10),
-            _quota(status.progress, zone),
-            _wait(status.progress, observed_at),
+            status.writer.database.name,
+            _short_phase(status.progress),
+            _short_objects(status.progress),
             _age(status.progress.event_at, observed_at) if status.progress else "-",
         )
         for status in statuses
     ]
-    widths = [
-        max(_cell_width(headers[index]), *(_cell_width(row[index]) for row in rows))
-        for index in range(len(headers) - 1)
-    ]
-    lines = _table_lines(headers, widths)
-    for row in rows:
-        lines.extend(_table_lines(row, widths))
-    return "\n".join(lines)
+    return "\n".join(_overview_line(row) for row in (headers, *rows))
 
 
 def _render_detail(
@@ -307,24 +288,60 @@ def _render_detail(
     return "\n".join(lines)
 
 
-def _cell_width(value: str) -> int:
-    return max(map(len, value.splitlines()), default=0)
+def _overview_line(values: Sequence[str]) -> str:
+    cells = (
+        f"{_fit(value, width):<{width}}"
+        for value, width in zip(values, _OVERVIEW_WIDTHS, strict=True)
+    )
+    return " ".join(cells).rstrip()
 
 
-def _table_lines(values: Sequence[str], widths: Sequence[int]) -> list[str]:
-    cells = [value.splitlines() or [""] for value in values]
-    return [
-        _table_line(
-            tuple(cell[index] if index < len(cell) else "" for cell in cells),
-            widths,
-        )
-        for index in range(max(map(len, cells)))
-    ]
+def _fit(value: str, width: int) -> str:
+    if len(value) <= width:
+        return value
+    left = (width - 1) // 2
+    return f"{value[:left]}…{value[-(width - left - 1):]}"
 
 
-def _table_line(values: Sequence[str], widths: Sequence[int]) -> str:
-    leading = (f"{value:<{widths[index]}}" for index, value in enumerate(values[:-1]))
-    return "  ".join((*leading, values[-1])).rstrip()
+def _short_service(service: ServiceState) -> str:
+    labels = {
+        "active": "up",
+        "activating": "boot",
+        "deactivating": "stop",
+        "failed": "fail",
+        "inactive": "down",
+        "unknown": "?",
+    }
+    return labels.get(service.active, service.active)
+
+
+def _short_phase(progress: ProgressState | None) -> str:
+    if progress is None:
+        return "-"
+    labels = {
+        "rate_limit": "quota",
+        "retry_wait": "retry",
+        "starting": "start",
+        "syncing_git": "git",
+    }
+    if progress.phase.endswith(("_catalog", "_bundles")):
+        return "objects" if progress.catalog_complete else "catalog"
+    return labels.get(progress.phase, progress.phase)
+
+
+def _short_objects(progress: ProgressState | None) -> str:
+    if progress is None:
+        return "-"
+    total = "?" if progress.objects_total is None else _short_count(progress.objects_total)
+    return f"{_short_count(progress.objects_completed)}/{total}"
+
+
+def _short_count(value: int) -> str:
+    if value < 1_000:
+        return str(value)
+    scale, suffix = (1_000_000, "m") if value >= 1_000_000 else (1_000, "k")
+    scaled = value / scale
+    return f"{scaled:.1f}{suffix}" if scaled < 99.95 else f"{scaled:.0f}{suffix}"
 
 
 def _service_label(service: ServiceState) -> str:
@@ -518,12 +535,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     """
     args = _parser().parse_args(argv)
     database = None if args.database is None else args.database.resolve()
-    writers = _managed_writers(args.systemd_dir, database)
-    if database is not None and not writers:
-        print(f"No managed writer for database: {database}", file=sys.stderr)
+    writers = _managed_writers(args.systemd_dir, database, args.writer_id)
+    selected = database is not None or args.writer_id is not None
+    if selected and not writers:
+        selector = f"ID: {args.writer_id}" if args.writer_id else f"database: {database}"
+        print(f"No managed writer for {selector}", file=sys.stderr)
         return 2
     statuses = _collect(writers, args.systemctl, args.journalctl)
-    print(_render_detail(statuses[0]) if database is not None else _render_table(statuses))
+    print(_render_detail(statuses[0]) if selected else _render_table(statuses))
     return 0
 
 
