@@ -12,7 +12,11 @@ from typing import TYPE_CHECKING, Any
 import pytest
 
 from gh_puller.github.client import GitHubResource
-from gh_puller.github.observations import iter_current_facts, iter_observations
+from gh_puller.github.observations import (
+    ObservationArchive,
+    iter_current_facts,
+    iter_observations,
+)
 from gh_puller.github.v10.import_v9 import V9ImportConfig, V9Importer
 
 if TYPE_CHECKING:
@@ -143,6 +147,33 @@ async def test_imports_current_pending_resources_and_resumes_without_work(
         for fact in imported
         if fact.family != "pull-review-threads"
     )
+    with sqlite3.connect(destination) as connection:
+        connection.row_factory = sqlite3.Row
+        cycle = connection.execute("SELECT * FROM sync_cycles").fetchone()
+        assert cycle is not None
+        assert datetime.fromisoformat(cycle["started_at"]) == datetime.fromisoformat(
+            _LEGACY_TIME,
+        )
+        assert cycle["status"] == "active"
+        assert cycle["discovery_complete"] == 1
+        assert cycle["discovery_pages"] == 2
+        assert cycle["discovered_items"] == 101
+        assert connection.execute(
+            "SELECT key FROM archive_meta WHERE key = 'discovery_checkpoint'",
+        ).fetchone() is None
+        task_counts = connection.execute(
+            "SELECT kind, COUNT(*) FROM sync_tasks GROUP BY kind ORDER BY kind",
+        ).fetchall()
+        assert [tuple(row) for row in task_counts] == [
+            ("closing-issues", 2),
+            ("git-refs", 1),
+            ("parent", 101),
+        ]
+        window = connection.execute(
+            "SELECT MIN(observed_from), MAX(observed_until) FROM discovery_items",
+        ).fetchone()
+        assert datetime.fromisoformat(window[0]) == datetime.fromisoformat(_LEGACY_TIME)
+        assert datetime.fromisoformat(window[1]) == _MIGRATION_TIME
 
     counts = len(observations), len(api.calls), len(git.retentions), git.syncs
     repeated = await importer.migrate()
@@ -153,6 +184,50 @@ async def test_imports_current_pending_resources_and_resumes_without_work(
         len(git.retentions),
         git.syncs,
     ) == counts
+
+
+@pytest.mark.asyncio
+async def test_pending_catalog_resumes_after_a_durable_page(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "v9.sqlite3"
+    destination = tmp_path / "facts.sqlite3"
+    _source_archive(source)
+    importer = V9Importer(
+        V9ImportConfig(source, destination, _REPOSITORY, concurrency=2),
+        api=_API(),
+        git=_Git(),
+        now=lambda: _MIGRATION_TIME,
+    )
+    original = ObservationArchive.save_discovery_page
+    calls = 0
+
+    async def fail_second_page(*args: Any, **kwargs: Any) -> Any:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("injected catalog import failure")
+        return await original(*args, **kwargs)
+
+    monkeypatch.setattr(ObservationArchive, "save_discovery_page", fail_second_page)
+    with pytest.raises(RuntimeError, match="injected catalog import failure"):
+        await importer.migrate()
+
+    with sqlite3.connect(destination) as connection:
+        assert connection.execute(
+            "SELECT discovery_pages, discovered_items FROM sync_cycles",
+        ).fetchone() == (1, 100)
+        assert connection.execute("SELECT COUNT(*) FROM sync_tasks").fetchone()[0] == 102
+
+    monkeypatch.setattr(ObservationArchive, "save_discovery_page", original)
+    await importer.migrate()
+
+    with sqlite3.connect(destination) as connection:
+        assert connection.execute(
+            "SELECT discovery_pages, discovered_items FROM sync_cycles",
+        ).fetchone() == (2, 101)
+        assert connection.execute("SELECT COUNT(*) FROM sync_tasks").fetchone()[0] == 104
 
 
 def _source_archive(path: Path) -> None:
@@ -168,7 +243,19 @@ def _source_archive(path: Path) -> None:
                 bundle_digest TEXT PRIMARY KEY, cache_digest TEXT NOT NULL,
                 codec TEXT NOT NULL, raw_size INTEGER NOT NULL, payload BLOB NOT NULL
             );
-            CREATE TABLE pull_runs (id INTEGER PRIMARY KEY, target_at TEXT NOT NULL);
+            CREATE TABLE pull_runs (
+                id INTEGER PRIMARY KEY, target_at TEXT NOT NULL,
+                started_at TEXT NOT NULL, status TEXT NOT NULL
+            );
+            CREATE TABLE pull_passes (
+                run_id INTEGER PRIMARY KEY, name TEXT NOT NULL,
+                cutoff_at TEXT NOT NULL, catalog_complete INTEGER NOT NULL
+            );
+            CREATE TABLE pull_tasks (
+                id INTEGER PRIMARY KEY, run_id INTEGER NOT NULL,
+                number INTEGER NOT NULL, kind TEXT NOT NULL,
+                summary_digest TEXT NOT NULL, completed INTEGER NOT NULL
+            );
             CREATE TABLE resource_versions (
                 id INTEGER PRIMARY KEY, run_id INTEGER NOT NULL, observed_at TEXT NOT NULL,
                 number INTEGER NOT NULL, github_id INTEGER NOT NULL, kind TEXT NOT NULL,
@@ -196,7 +283,14 @@ def _source_archive(path: Path) -> None:
             "INSERT INTO archive_meta(key, value) VALUES (?, ?)",
             (("schema_version", "9"), ("repository", _REPOSITORY)),
         )
-        db.execute("INSERT INTO pull_runs VALUES (1, ?)", (_LEGACY_TIME,))
+        db.execute(
+            "INSERT INTO pull_runs VALUES (1, ?, ?, 'pending')",
+            (_LEGACY_TIME, _LEGACY_TIME),
+        )
+        db.execute(
+            "INSERT INTO pull_passes VALUES (1, 'closing', ?, 1)",
+            (_LEGACY_TIME,),
+        )
         for number, kind, bundle in (
             (1, "issue", _issue_bundle()),
             (2, "pull", _pull_bundle()),
@@ -232,6 +326,28 @@ def _source_archive(path: Path) -> None:
                     summary_digest,
                     bundle_digest,
                 ),
+            )
+            db.execute(
+                "INSERT INTO pull_tasks VALUES (?, 1, ?, ?, ?, 1)",
+                (number, number, kind, summary_digest),
+            )
+        for number in range(3, 104):
+            kind = "pull" if number % 2 else "issue"
+            summary = {
+                "id": number * 10,
+                "number": number,
+                "title": f"pending {number}",
+                "created_at": _LEGACY_TIME,
+                "updated_at": _LEGACY_TIME,
+            }
+            if kind == "pull":
+                summary["pull_request"] = {
+                    "url": f"/repos/acme/widgets/pulls/{number}",
+                }
+            summary_digest = _payload(db, summary)
+            db.execute(
+                "INSERT INTO pull_tasks VALUES (?, 1, ?, ?, ?, 0)",
+                (number, number, kind, summary_digest),
             )
         old_threads = _payload(
             db,

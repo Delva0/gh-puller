@@ -3,8 +3,8 @@
 The importer is an explicit one-time bridge, not a runtime compatibility path. It
 projects every stored collection from each selected legacy resource, observes
 missing review threads and Issue relations at real current times, verifies
-structured commit objects in the managed Git store, and seeds a conservative
-discovery checkpoint only after all stages finish.
+structured commit objects in the managed Git store, then restores unfinished
+catalog work or seeds a conservative discovery checkpoint.
 
 Legacy bundle projections use the migration execution time and ``origin=import``.
 This deliberately records the operator-approved assumed-unchanged migration policy;
@@ -31,10 +31,12 @@ from ..git_store import GitObjectStore, default_git_url, git_store_path
 from ..locking import archive_lock
 from ..observations import (
     Coverage,
+    DiscoveryItemDraft,
     FactDraft,
     FactObservation,
     ObservationArchive,
     Origin,
+    TaskDraft,
     iter_observations,
 )
 
@@ -44,6 +46,8 @@ if TYPE_CHECKING:
 _CORE_BATCH_SIZE = 25
 _REFERENCE_BATCH_SIZE = 100
 _GIT_BATCH_SIZE = 32
+_PENDING_PAGE_SIZE = 100
+_PENDING_CURSOR_PREFIX = "import-v9:pending:"
 _FACT_FAMILIES = {
     "commit-object": "commit-object",
     "commit-references": "commit-references",
@@ -116,6 +120,20 @@ class _LegacyResource:
     target_at: str
 
 
+@dataclass(frozen=True, slots=True)
+class _LegacyPending:
+    number: int
+    kind: str
+    summary_digest: str
+
+
+@dataclass(frozen=True, slots=True)
+class _LegacyPendingCatalog:
+    checkpoint: datetime
+    observed_from: datetime
+    items: tuple[_LegacyPending, ...]
+
+
 class V9Importer:
     """Execute the resumable migration while both archive writers are locked.
 
@@ -142,7 +160,7 @@ class V9Importer:
         self._store_lock = asyncio.Lock()
 
     async def migrate(self) -> V9ImportResult:
-        """Run all migration stages and seed discovery after complete coverage.
+        """Run every import stage before restoring the discovery position.
 
         Returns:
             Counts for the selected current resources and completed observation work.
@@ -155,6 +173,7 @@ class V9Importer:
             try:
                 resources = _current_resources(source)
                 checkpoint = _source_checkpoint(source)
+                pending = _pending_catalog(source, checkpoint)
                 async with ObservationArchive(
                     self.config.destination,
                     self.config.repository,
@@ -165,10 +184,89 @@ class V9Importer:
                     live = await self.backfill_live(archive, resources)
                     references = await self.retain_references(archive)
                     await self.observe_refs(archive)
-                    await archive.seed_discovery_checkpoint(checkpoint)
+                    await self._restore_pending(archive, source, pending)
             finally:
                 source.close()
         return V9ImportResult(core, supplemental, live, references, checkpoint)
+
+    async def _restore_pending(
+        self,
+        archive: ObservationArchive,
+        source: sqlite3.Connection,
+        pending: _LegacyPendingCatalog | None,
+    ) -> None:
+        """Restore a stopped cold catalog as one current recoverable cycle.
+
+        Args:
+            archive: Open v10 destination after all imported facts are durable.
+            source: Validated read-only v9 connection supplying catalog summaries.
+            pending: Validated unfinished catalog, or None when discovery had no work.
+        """
+        if pending is None:
+            await archive.seed_discovery_checkpoint(_source_checkpoint(source))
+            return
+        committed = await archive.discovery_checkpoint()
+        if committed is not None:
+            if committed < pending.checkpoint:
+                raise RuntimeError("destination checkpoint precedes imported discovery")
+            return
+        cycle = await archive.start_cycle(pending.checkpoint)
+        if cycle.started_at != pending.checkpoint or cycle.checkpoint_from is not None:
+            raise RuntimeError("destination has another active sync cycle")
+        await archive.enqueue_tasks(
+            cycle.id,
+            (TaskDraft("git-refs", "git-refs", "repository", {}),),
+        )
+        cursor = await archive.begin_discovery(cycle.id, _pending_cursor(0))
+        if cursor is None:
+            return
+        page_index = _pending_page(cursor)
+        if page_index != cycle.discovery_pages:
+            raise RuntimeError("imported discovery cursor conflicts with durable pages")
+        pages = tuple(_chunks(pending.items, _PENDING_PAGE_SIZE))
+        for index in range(page_index, len(pages)):
+            chunk = pages[index]
+            observed_until = _utc(self._now())
+            items = tuple(
+                DiscoveryItemDraft(
+                    number=item.number,
+                    kind=item.kind,
+                    observed_from=pending.observed_from,
+                    observed_until=observed_until,
+                    summary=_blob(source, item.summary_digest),
+                )
+                for item in chunk
+            )
+            tasks = tuple(
+                TaskDraft(
+                    task_key=f"parent:{item.number}",
+                    kind="parent",
+                    subject_key=f"issue:{item.number}",
+                    resource_number=item.number,
+                    payload={"number": item.number},
+                )
+                for item in chunk
+            )
+            pulls = [item.number for item in chunk if item.kind == "pull"]
+            if pulls:
+                tasks += (
+                    TaskDraft(
+                        task_key=f"closing:import-v9:{index}",
+                        kind="closing-issues",
+                        subject_key=f"import-v9-page:{index}",
+                        payload={"numbers": pulls},
+                    ),
+                )
+            next_cursor = (
+                None if index + 1 == len(pages) else _pending_cursor(index + 1)
+            )
+            cycle = await archive.save_discovery_page(
+                cycle.id,
+                _pending_cursor(index),
+                next_cursor,
+                items,
+                tasks,
+            )
 
     async def import_core(
         self,
@@ -548,6 +646,76 @@ def _source_checkpoint(source: sqlite3.Connection) -> datetime:
     if row is None or row[0] is None:
         raise ValueError("source archive has no observed resources")
     return _time(str(row[0]))
+
+
+def _pending_catalog(
+    source: sqlite3.Connection,
+    checkpoint: datetime,
+) -> _LegacyPendingCatalog | None:
+    rows = source.execute(
+        """
+        SELECT run_id, number, kind, summary_digest
+        FROM pull_tasks
+        WHERE completed = 0
+        ORDER BY id
+        """,
+    ).fetchall()
+    if not rows:
+        return None
+    run_ids = {int(row["run_id"]) for row in rows}
+    if len(run_ids) != 1:
+        raise ValueError("v9 archive has pending tasks from multiple runs")
+    run_id = run_ids.pop()
+    pass_row = source.execute(
+        """
+        SELECT r.started_at, p.cutoff_at, p.catalog_complete
+        FROM pull_runs AS r
+        JOIN pull_passes AS p ON p.run_id = r.id
+        WHERE r.id = ? AND p.name = 'closing'
+        """,
+        (run_id,),
+    ).fetchone()
+    if pass_row is None or not bool(pass_row["catalog_complete"]):
+        raise ValueError("v9 pending run has no complete closing catalog")
+    cutoff = _time(str(pass_row["cutoff_at"]))
+    if cutoff != checkpoint:
+        raise ValueError("v9 pending catalog has another discovery boundary")
+    items = tuple(
+        _LegacyPending(
+            number=int(row["number"]),
+            kind=str(row["kind"]),
+            summary_digest=str(row["summary_digest"]),
+        )
+        for row in rows
+    )
+    if (
+        any(item.kind not in {"issue", "pull"} for item in items)
+        or any(not item.summary_digest for item in items)
+        or len({item.number for item in items}) != len(items)
+    ):
+        raise ValueError("v9 pending catalog has invalid task identities")
+    return _LegacyPendingCatalog(
+        checkpoint=cutoff,
+        observed_from=_time(str(pass_row["started_at"])),
+        items=items,
+    )
+
+
+def _pending_cursor(page: int) -> str:
+    return f"{_PENDING_CURSOR_PREFIX}{page}"
+
+
+def _pending_page(cursor: str) -> int:
+    if not cursor.startswith(_PENDING_CURSOR_PREFIX):
+        raise RuntimeError("destination has another discovery cursor")
+    value = cursor.removeprefix(_PENDING_CURSOR_PREFIX)
+    try:
+        page = int(value)
+    except ValueError as exc:
+        raise RuntimeError("imported discovery cursor is invalid") from exc
+    if page < 0:
+        raise RuntimeError("imported discovery cursor is invalid")
+    return page
 
 
 def _resource_facts(
