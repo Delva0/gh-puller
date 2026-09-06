@@ -187,8 +187,9 @@ Let `W` be the last completed cycle's discovery checkpoint. A new cycle combines
 
 GitHub's [repository-Issue endpoint](https://docs.github.com/en/rest/issues/issues#list-repository-issues)
 applies the `since` filter to last-update time independently of its `sort` parameter.
-The writer therefore uses `since` to select the changed set while traversing that set
-by immutable creation time. Updating an existing result cannot move it across page
+Cold start omits `since`; warm synchronization sets `since=W-overlap`, which selects
+roots by `updated_at`. Both use `sort=created&direction=asc`, so `created_at` controls
+only their stable page order. Updating an existing result cannot move it across page
 offsets; candidates entering after cycle start may be observed immediately or in the
 next cycle. Comment feeds follow the same stable creation order.
 
