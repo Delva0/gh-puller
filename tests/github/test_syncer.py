@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import random
 import sqlite3
 from datetime import datetime, timedelta
@@ -13,7 +14,9 @@ import pytest
 from gh_puller.github.errors import GitHubAPIError
 from gh_puller.github.observations import (
     Coverage,
+    DiscoveryItemDraft,
     ObservationArchive,
+    TaskDraft,
     iter_current_facts,
     iter_observations,
 )
@@ -300,6 +303,108 @@ async def test_pull_git_and_closing_relations_keep_batched_throughput(tmp_path: 
     assert all(
         fact.coverage is Coverage.COMPLETE for fact in current if fact.family in {"pull-git", "pull-closing-issues"}
     )
+
+
+@pytest.mark.asyncio
+async def test_git_lane_consumes_pr_children_while_a_later_parent_waits(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "facts.sqlite3"
+    sha = "c" * 40
+
+    class BlockingAPI(FakeAPI):
+        def __init__(self) -> None:
+            super().__init__()
+            self.blocked = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def paginate_cached(
+            self,
+            path: str,
+            *,
+            previous: list[dict[str, Any]] | None,
+            cache: dict[str, Any] | None,
+            params: dict[str, Any] | None = None,
+            page_observer: Any = None,
+        ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+            if path == f"{_BASE}/issues/2/timeline":
+                self.blocked.set()
+                await self.release.wait()
+            return await super().paginate_cached(
+                path,
+                previous=previous,
+                cache=cache,
+                params=params,
+                page_observer=page_observer,
+            )
+
+    class TrackingGit(FakeGitStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.pull_captured = asyncio.Event()
+            self.commit_retained = asyncio.Event()
+
+        async def capture(self, number: int, pull: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
+            result = await super().capture(number, pull, **kwargs)
+            self.pull_captured.set()
+            return result
+
+        async def retain_commits(
+            self,
+            shas: list[str],
+            **kwargs: Any,
+        ) -> dict[str, dict[str, Any]]:
+            result = await super().retain_commits(shas, **kwargs)
+            self.commit_retained.set()
+            return result
+
+    api = BlockingAPI()
+    pull = api.add_issue(1, pull=True)
+    issue = api.add_issue(2)
+    api.json[f"{_BASE}/pulls/1"] = _pull_detail(1, commits=1)
+    api.pages[f"{_BASE}/pulls/1/commits"] = [
+        {"sha": sha, "commit": {"message": "retained while API waits"}},
+    ]
+    clock = Clock(_T0)
+    git = TrackingGit()
+    async with ObservationArchive(database, "acme/widgets") as archive:
+        cycle = await archive.start_cycle(clock.current)
+        cursor = await archive.begin_discovery(cycle.id, "catalog")
+        assert cursor == "catalog"
+        await archive.save_discovery_page(
+            cycle.id,
+            cursor,
+            None,
+            (
+                DiscoveryItemDraft(1, "pull", _T0, _T0, pull),
+                DiscoveryItemDraft(2, "issue", _T0, _T0, issue),
+            ),
+            (
+                TaskDraft("parent:1", "parent", "issue:1", {"number": 1}, 1),
+                TaskDraft("parent:2", "parent", "issue:2", {"number": 2}, 2),
+            ),
+        )
+
+    running = asyncio.create_task(
+        _syncer(
+            database,
+            api,
+            git,
+            clock,
+            concurrency=1,
+            git_batch_size=8,
+        ).sync(),
+    )
+    try:
+        await asyncio.wait_for(api.blocked.wait(), 1)
+        await asyncio.wait_for(git.pull_captured.wait(), 1)
+        await asyncio.wait_for(git.commit_retained.wait(), 1)
+    finally:
+        api.release.set()
+        await running
+
+    assert git.captures == [1]
+    assert {value for batch in git.retentions for value in batch} == {sha}
 
 
 @pytest.mark.asyncio

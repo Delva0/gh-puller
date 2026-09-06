@@ -2,8 +2,9 @@
 
 同步入口在调用前冻结 cycle 起点 S。冷启动遍历全部 Issue/PR；后续从已提交
 checkpoint 的重叠边界筛选父对象和评论变更信号。两者均按不可变的创建时间升序
-遍历。每个目录页及其任务先落 SQLite，再并发消费。一个事实集合完成后立即追加
-观测；cycle 仅在目录闭合且所有任务完成后把内部 discovery checkpoint 推进到 S。
+遍历。每个目录页及其任务先落 SQLite，再由 API 与 Git 两个独立有界通道消费。
+一个事实集合完成后立即追加观测；cycle 仅在目录闭合且所有任务完成后把内部
+discovery checkpoint 推进到 S。
 
 发现信号并不覆盖 GitHub 的全部可变子资源。拉取器不主动寻找静默删除或无信号的
 旧对象变化，但一旦父对象被选择，就重新观测其全部已承诺事实集合。
@@ -26,6 +27,7 @@ from .observations import (
     DiscoveryItemDraft,
     ObservationArchive,
     SyncCycle,
+    SyncTask,
     TaskDraft,
 )
 from .progress import ProgressObserver, _SyncProgressTracker
@@ -36,6 +38,8 @@ if TYPE_CHECKING:
 
 _NUMBER_AT_END = re.compile(r"/(\d+)$")
 _CATALOG_ACCEPT = "application/vnd.github.raw+json"
+_API_TASK_KINDS = frozenset({"closing-issues", "parent"})
+_GIT_TASK_KINDS = frozenset({"commit-object", "git-refs", "pull-git"})
 IncompleteGitHubDataError = _IncompleteGitHubDataError
 
 
@@ -306,29 +310,147 @@ class GitHubSyncer:
         archive: ObservationArchive,
         cycle_id: int,
     ) -> None:
-        while True:
-            async with self._store_lock:
-                tasks = await archive.take_tasks(cycle_id, self.config.concurrency)
-            if not tasks:
-                return
-            self._progress.phase("fetching")
-            pull_git = [task for task in tasks if task.kind == "pull-git"]
-            commit_objects = [task for task in tasks if task.kind == "commit-object"]
-            ordinary = [task for task in tasks if task.kind not in {"pull-git", "commit-object"}]
-            errors = await asyncio.gather(
-                *(self._collector.run_sync_task(api, git, archive, task) for task in ordinary),
+        stop = asyncio.Event()
+        api_done = asyncio.Event()
+        git_ready = asyncio.Event()
+        git_ready.set()
+        api_errors, git_errors = await asyncio.gather(
+            self._drain_api(
+                api,
+                git,
+                archive,
+                cycle_id,
+                stop,
+                api_done,
+                git_ready,
+            ),
+            self._drain_git(
+                api,
+                git,
+                archive,
+                cycle_id,
+                stop,
+                api_done,
+                git_ready,
+            ),
+        )
+        failures = [*api_errors, *git_errors]
+        if failures:
+            raise failures[0]
+
+    async def _drain_api(
+        self,
+        api: GitHubAPIReader,
+        git: GitObjectWriter,
+        archive: ObservationArchive,
+        cycle_id: int,
+        stop: asyncio.Event,
+        api_done: asyncio.Event,
+        git_ready: asyncio.Event,
+    ) -> list[Exception]:
+        failures: list[Exception] = []
+        try:
+            while not stop.is_set():
+                async with self._store_lock:
+                    tasks = await archive.take_tasks(
+                        cycle_id,
+                        self.config.concurrency,
+                        kinds=_API_TASK_KINDS,
+                    )
+                if not tasks:
+                    break
+                self._progress.phase("fetching")
+                errors = await asyncio.gather(
+                    *(
+                        self._run_api_task(api, git, archive, task, git_ready)
+                        for task in tasks
+                    ),
+                )
+                failures.extend(error for error in errors if error is not None)
+                if failures:
+                    stop.set()
+        except BaseException:
+            stop.set()
+            raise
+        finally:
+            api_done.set()
+            git_ready.set()
+        return failures
+
+    async def _run_api_task(
+        self,
+        api: GitHubAPIReader,
+        git: GitObjectWriter,
+        archive: ObservationArchive,
+        task: SyncTask,
+        git_ready: asyncio.Event,
+    ) -> Exception | None:
+        try:
+            return await self._collector.run_sync_task(api, git, archive, task)
+        finally:
+            git_ready.set()
+
+    async def _drain_git(
+        self,
+        api: GitHubAPIReader,
+        git: GitObjectWriter,
+        archive: ObservationArchive,
+        cycle_id: int,
+        stop: asyncio.Event,
+        api_done: asyncio.Event,
+        git_ready: asyncio.Event,
+    ) -> list[Exception]:
+        failures: list[Exception] = []
+        try:
+            while not stop.is_set():
+                git_ready.clear()
+                async with self._store_lock:
+                    tasks = await archive.take_tasks(
+                        cycle_id,
+                        self.config.git_batch_size,
+                        kinds=_GIT_TASK_KINDS,
+                    )
+                if not tasks:
+                    if api_done.is_set():
+                        break
+                    await git_ready.wait()
+                    continue
+                errors = await self._run_git_tasks(api, git, archive, tasks)
+                failures.extend(error for error in errors if error is not None)
+                if failures:
+                    stop.set()
+        except BaseException:
+            stop.set()
+            raise
+        return failures
+
+    async def _run_git_tasks(
+        self,
+        api: GitHubAPIReader,
+        git: GitObjectWriter,
+        archive: ObservationArchive,
+        tasks: tuple[SyncTask, ...],
+    ) -> list[Exception | None]:
+        git_refs = [task for task in tasks if task.kind == "git-refs"]
+        pull_git = [task for task in tasks if task.kind == "pull-git"]
+        commit_objects = [task for task in tasks if task.kind == "commit-object"]
+        errors = list(
+            await asyncio.gather(
+                *(
+                    self._collector.run_sync_task(api, git, archive, task)
+                    for task in git_refs
+                ),
+            ),
+        )
+        if pull_git:
+            errors.extend(
+                await self._collector.run_pull_git_batch(git, archive, pull_git),
             )
-            if pull_git:
-                errors.extend(
-                    await self._collector.run_pull_git_batch(git, archive, pull_git),
-                )
-            if commit_objects:
-                errors.extend(
-                    await self._collector.run_commit_batch(git, archive, commit_objects),
-                )
-            failures = [error for error in errors if error is not None]
-            if failures:
-                raise failures[0]
+        if commit_objects:
+            errors.extend(
+                await self._collector.run_commit_batch(git, archive, commit_objects),
+            )
+        return errors
 
     def _make_collector(self) -> GitHubFactCollector:
         return GitHubFactCollector(

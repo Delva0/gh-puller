@@ -1089,32 +1089,59 @@ class ObservationArchive:
             raise
         return tuple([await _task_from_row(db, row) for row in rows])
 
-    async def take_tasks(self, cycle_id: int, limit: int) -> tuple[SyncTask, ...]:
+    async def take_tasks(
+        self,
+        cycle_id: int,
+        limit: int,
+        *,
+        kinds: Collection[str] | None = None,
+    ) -> tuple[SyncTask, ...]:
         """Claim pending tasks for the archive's single writer.
 
         Args:
             cycle_id: Active cycle whose tasks are requested.
             limit: Maximum number returned; each returned task increments attempts.
+            kinds: Optional task kinds forming one independent execution lane.
 
         Returns:
             Pending tasks ordered by durable identity.
         """
         if limit < 1:
             raise ValueError("task limit must be positive")
+        selected = None if kinds is None else tuple(sorted(set(kinds)))
+        if selected is not None and (
+            not selected
+            or any(not isinstance(kind, str) or not kind for kind in selected)
+        ):
+            raise ValueError("task kinds must be non-empty strings")
         db = self._connection
         await db.execute("BEGIN IMMEDIATE")
         try:
             await _active_cycle_row(db, cycle_id)
-            rows = await _fetchall(
-                db,
-                """
-                SELECT * FROM sync_tasks
-                WHERE cycle_id = ? AND completed_at IS NULL
-                ORDER BY id
-                LIMIT ?
-                """,
-                (cycle_id, limit),
-            )
+            if selected is None:
+                rows = await _fetchall(
+                    db,
+                    """
+                    SELECT * FROM sync_tasks
+                    WHERE cycle_id = ? AND completed_at IS NULL
+                    ORDER BY id
+                    LIMIT ?
+                    """,
+                    (cycle_id, limit),
+                )
+            else:
+                placeholders = ",".join("?" for _ in selected)
+                rows = await _fetchall(
+                    db,
+                    f"""
+                    SELECT * FROM sync_tasks
+                    WHERE cycle_id = ? AND completed_at IS NULL
+                          AND kind IN ({placeholders})
+                    ORDER BY id
+                    LIMIT ?
+                    """,  # noqa: S608 - values use bound parameters.
+                    (cycle_id, *selected, limit),
+                )
             if rows:
                 await db.executemany(
                     "UPDATE sync_tasks SET attempts = attempts + 1 WHERE id = ?",
