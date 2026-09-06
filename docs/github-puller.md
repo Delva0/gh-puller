@@ -47,7 +47,7 @@ retain fields absent from their query. `payload["cache"]`, when present, pairs H
 validators with the value that they validate; a valid `304` reuses those bytes while
 creating a new, honestly timed observation.
 
-Sources: [gh_puller/github/observations.py](../gh_puller/github/observations.py); [gh_puller/github/syncer.py](../gh_puller/github/syncer.py)
+Sources: [gh_puller/github/observations.py](../gh_puller/github/observations.py); [gh_puller/github/collector.py](../gh_puller/github/collector.py)
 
 ### Families and API requests
 
@@ -70,7 +70,7 @@ and GraphQL, preserves one honest completeness result across pagination, and mak
 publication and retry granular without presenting an entire Issue/PR as one atomic
 snapshot.
 
-Sources: [gh_puller/github/client.py](../gh_puller/github/client.py); [gh_puller/github/syncer.py](../gh_puller/github/syncer.py)
+Sources: [gh_puller/github/client.py](../gh_puller/github/client.py); [gh_puller/github/collector.py](../gh_puller/github/collector.py)
 
 ### Time and offline queries
 
@@ -413,11 +413,12 @@ DATABASE       SQLite facts, observation history, and recovery state
 DATABASE.git   Repository-bound bare Git object store by default
 ```
 
-`archive_meta` binds schema version 11, repository identity, Git layout 0, and the
-absolute Git-store path. Opening an existing database with another Git-store path is
-rejected. Back up both members and restore them to their original paths. For an
-archive created with a non-default Git store, every writer must pass that exact
-already-bound path with `--git-destination`; the CLI has no rebind operation.
+`archive_meta` binds the current archive-format identifier, repository identity, Git
+layout, and the absolute Git-store path. Opening a database with another format,
+repository, layout, or Git-store path is rejected. Back up both members and restore
+them to their original paths. For an archive created with a non-default Git store,
+every writer must pass that exact already-bound path with `--git-destination`; the CLI
+has no migration or rebind operation.
 
 The durable SQLite relations are grouped by responsibility:
 
@@ -429,6 +430,8 @@ The durable SQLite relations are grouped by responsibility:
 | `maintenance_jobs`, `maintenance_tasks` | Frozen refresh/backfill scopes, attempts, progress, outcomes, and errors. |
 | `commit_reference_index` | Rebuildable acceleration index over immutable structured-reference facts. |
 | `fact_schemas`, `archive_meta` | Format registry and archive binding. |
+
+Sources: [gh_puller/github/schema.py](../gh_puller/github/schema.py); [gh_puller/github/observations.py](../gh_puller/github/observations.py)
 
 ### Git evidence
 
@@ -569,26 +572,6 @@ uv run -m gh_puller.github schedule \
 The interval is a positive integer followed by `s`, `m`, `h`, or `d`. Other relevant
 controls are `--concurrency`, `--git-batch-size`, `--overlap-seconds`,
 `--request-timeout`, `--git-url`, `--git-destination`, and `--no-progress`.
-
-### Format migration
-
-Version 11 is an explicit in-place migration from a stopped version-10 archive. It
-adds maintenance state, the reference index, and support for schema-two commit
-reconstruction facts without changing existing payload bytes, digests, observations,
-discovery cursors, or pending sync tasks. Migration itself creates no schema-two
-observation; `backfill` or later sync work publishes that evidence. The paired Git
-layout remains version 0.
-
-```bash
-scripts/github-puller-daemon.sh stop archives/vllm.sqlite3
-uv run -m gh_puller.github migrate archives/vllm.sqlite3
-```
-
-The command is idempotent once the archive is version 11. The filename does not encode
-the schema version and need not change. Start the existing managed writer after the
-migration or run an explicit maintenance operation while it remains stopped.
-
-Sources: [gh_puller/github/v11/](../gh_puller/github/v11/)
 
 ### Managed Linux service
 

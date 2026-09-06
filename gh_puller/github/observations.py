@@ -28,7 +28,7 @@ from .commit_references import (
     commit_reference_index_rows,
     commit_reference_provenance,
 )
-from .v11 import FACT_SCHEMAS, GIT_LAYOUT_VERSION, SCHEMA, VERSION
+from .schema import ARCHIVE_SCHEMA_VERSION, FACT_SCHEMAS, GIT_LAYOUT_VERSION, SCHEMA
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Collection, Iterable
@@ -1518,7 +1518,7 @@ class ObservationArchive:
             await db.executemany(
                 "INSERT INTO archive_meta(key, value) VALUES (?, ?)",
                 (
-                    ("schema_version", VERSION),
+                    ("schema_version", ARCHIVE_SCHEMA_VERSION),
                     ("git_layout_version", GIT_LAYOUT_VERSION),
                     ("git_store", str(self.git_store)),
                     ("repository", self.repository),
@@ -1534,7 +1534,7 @@ class ObservationArchive:
             str(row["key"]): str(row["value"])
             for row in await _fetchall(db, "SELECT key, value FROM archive_meta")
         }
-        if metadata.get("schema_version") != VERSION:
+        if metadata.get("schema_version") != ARCHIVE_SCHEMA_VERSION:
             raise ValueError("unsupported GitHub observation archive schema")
         if metadata.get("repository") != self.repository:
             raise ValueError("archive belongs to another GitHub repository")
@@ -1566,7 +1566,7 @@ async def iter_observations(
     """Replay immutable observations in publication order.
 
     Args:
-        path: Version-eleven SQLite archive.
+        path: SQLite observation archive.
         after: Exclusive global observation cursor.
         family: Optional exact fact-family filter.
         subject_key: Optional exact subject filter.
@@ -1591,7 +1591,7 @@ async def iter_current_facts(
     """Read the latest actual observation for each selected semantic fact.
 
     Args:
-        path: Version-eleven SQLite archive.
+        path: SQLite observation archive.
         family: Optional exact fact-family filter.
         subject_key: Optional exact subject filter.
 
@@ -1614,7 +1614,7 @@ async def iter_facts_as_of(
     """Read each fact's latest observation closed no later than a timestamp.
 
     Args:
-        path: Version-eleven SQLite archive.
+        path: SQLite observation archive.
         at: Inclusive UTC-normalized observation boundary.
         family: Optional exact fact-family filter.
         subject_key: Optional exact subject filter.
@@ -1640,7 +1640,7 @@ class _Reader:
             str(row["key"]): str(row["value"])
             for row in await _fetchall(self.db, "SELECT key, value FROM archive_meta")
         }
-        if metadata.get("schema_version") != VERSION:
+        if metadata.get("schema_version") != ARCHIVE_SCHEMA_VERSION:
             await self.db.close()
             self.db = None
             raise ValueError("unsupported GitHub observation archive schema")

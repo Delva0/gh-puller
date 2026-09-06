@@ -65,9 +65,6 @@ def test_parser_exposes_only_current_runtime_commands(tmp_path: Path) -> None:
             "pull-review-threads",
         ],
     )
-    migrate = cli._parser().parse_args(
-        ["migrate", str(tmp_path / "facts.sqlite3")],
-    )
     backfill = cli._parser().parse_args(
         ["backfill", "acme/widgets", str(tmp_path / "facts.sqlite3")],
     )
@@ -80,9 +77,8 @@ def test_parser_exposes_only_current_runtime_commands(tmp_path: Path) -> None:
         [7],
         ["pull-review-threads"],
     )
-    assert migrate.command == "migrate"
     assert backfill.command == "backfill"
-    for removed in ("import-v9",):
+    for removed in ("import-v9", "migrate"):
         with pytest.raises(SystemExit):
             cli._parser().parse_args([removed])
 

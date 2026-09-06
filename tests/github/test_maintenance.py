@@ -21,8 +21,8 @@ from gh_puller.github.observations import (
     Origin,
     iter_observations,
 )
+from gh_puller.github.schema import FACT_SCHEMAS
 from gh_puller.github.syncer import GitHubSyncConfig
-from gh_puller.github.v11 import FACT_SCHEMAS
 from tests.github._puller_support import _BASE, _T0, Clock, FakeAPI, FakeGitStore
 
 if TYPE_CHECKING:

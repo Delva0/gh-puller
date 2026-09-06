@@ -38,7 +38,6 @@ from .syncer import (
     SyncResult,
     sync,
 )
-from .v11.migrate import MigrationResult, migrate_archive
 
 __all__ = [
     "REFRESH_FAMILIES",
@@ -55,7 +54,6 @@ __all__ = [
     "MaintenanceJob",
     "MaintenanceResult",
     "MaintenanceTask",
-    "MigrationResult",
     "ObservationArchive",
     "Origin",
     "ProgressObserver",
@@ -70,7 +68,6 @@ __all__ = [
     "iter_current_facts",
     "iter_facts_as_of",
     "iter_observations",
-    "migrate_archive",
     "refresh",
     "sync",
 ]

@@ -24,7 +24,7 @@ from .archive_format import (
     source_staging_ref,
     upstream_ref,
 )
-from .v11 import GIT_LAYOUT_VERSION
+from .schema import GIT_LAYOUT_VERSION
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Mapping, Sequence

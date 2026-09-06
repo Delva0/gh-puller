@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from .progress import RateQuota
+from .schema import ARCHIVE_SCHEMA_VERSION
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -68,7 +69,7 @@ class ProgressState:
 
 @dataclass(frozen=True, slots=True)
 class ArchiveState:
-    """Durable progress read from a version-eleven observation archive."""
+    """Durable progress read from the current observation archive."""
 
     git_store: Path
     checkpoint: datetime | None
@@ -264,7 +265,7 @@ def _archive_state(path: Path) -> tuple[ArchiveState | None, str | None]:
         connection = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
         connection.row_factory = sqlite3.Row
         metadata = dict(connection.execute("SELECT key, value FROM archive_meta"))
-        if metadata.get("schema_version") != "11":
+        if metadata.get("schema_version") != ARCHIVE_SCHEMA_VERSION:
             raise ValueError(f"unsupported archive schema {metadata.get('schema_version')}")
         git_store = metadata.get("git_store")
         if not isinstance(git_store, str) or not git_store:
