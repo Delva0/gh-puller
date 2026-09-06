@@ -304,11 +304,43 @@ uv run -m gh_puller.github refresh \
 
 ### Structured-commit baseline
 
-`backfill` freezes the current maximum observation ID, enumerates every structured
-commit reference at or below that cutoff, and records a deterministic task
-population. Facts published after the cutoff belong to later normal sync or a later
-baseline. Job completion means every frozen target received an outcome; it does not
-mean every commit was obtainable.
+`backfill` freezes the current maximum observation ID as a **source cutoff** `N`.
+Its baseline consists of every complete raw observation at `id <= N` from PR
+commits, reviews, review comments, review threads, and Issue/PR timeline and event
+families. It extracts commit fields from those raw payloads directly; the derived
+reference index is never used to decide which source observations or commit IDs
+exist.
+
+```mermaid
+flowchart TD
+    Freeze["Freeze raw source cutoff N"] --> Enumerate["Enumerate complete contract sources with id <= N"]
+    Enumerate --> Derive["Rebuild missing commit-reference scans"]
+    Derive --> Barrier["All frozen sources scanned, including empty results"]
+    Barrier --> Verify["Verify unique commit IDs without schema-two outcomes"]
+    Verify --> Complete["Close the frozen baseline"]
+```
+
+Existing exact `commit-references` facts are reused. A missing scan becomes a
+recoverable first-stage task even when the raw payload contains no commit ID; its
+published empty result proves that the source was inspected. Git verification starts
+only after every such task completes. The second stage deduplicates commit IDs while
+retaining every distinct source edge in the resulting provenance.
+
+The boundary applies to the raw source, not to publication time of its derivative.
+A source observation with `id <= N` remains in the baseline when its
+`commit-references` fact is published at an ID greater than `N`. A raw source first
+published after `N` belongs to the next baseline. The frozen job records a digest and
+counts for its source population, reference edges, empty observations, reused scans,
+and task population, so a zero-target completion is distinguishable from an
+unexamined index.
+
+Source enumeration and reference rebuilding read SQLite only and consume no GitHub
+API requests. Git-object tasks may still fetch known Git remotes when the managed
+store lacks an object. Both stages are durable: interruption resumes the same source
+cutoff, reuses already published scans or object results, and never advances normal
+discovery checkpoint `W`. Job completion means every unique commit in the frozen
+raw-source population has a schema-two outcome; it does not mean every commit was
+obtainable.
 
 ```bash
 uv run -m gh_puller.github backfill \
@@ -316,11 +348,12 @@ uv run -m gh_puller.github backfill \
   --idempotency-key structured-commits-2026-09
 ```
 
-`commit_reference_index` is a rebuildable SHA-to-observation index used to enumerate
-the baseline without copying provenance into task definitions. The immutable
-`commit-references` payload remains the authoritative source for parent, source fact,
-field path, and source-object identity. Each `commit-object` result links back to the
-supporting reference observation IDs and records the number of source edges checked.
+`commit_reference_index` is a rebuildable acceleration index used after the frozen
+source population is closed. The immutable raw observation defines baseline
+membership; the corresponding `commit-references` payload preserves parent, source
+fact, field path, and source-object identity. Each `commit-object` result links back
+to the supporting reference observation IDs and records the number of source edges
+checked.
 
 ## SQLite and Git archive pair
 

@@ -8,10 +8,15 @@ from typing import TYPE_CHECKING, Any
 
 import pytest
 
+from gh_puller.github.commit_references import (
+    commit_reference_payload,
+    observation_commit_references,
+)
 from gh_puller.github.maintenance import GitHubMaintainer
 from gh_puller.github.observations import (
     Coverage,
     FactDraft,
+    FactObservation,
     ObservationArchive,
     Origin,
     iter_observations,
@@ -43,6 +48,66 @@ async def _roots(database: Path, api: FakeAPI) -> None:
                 for item in api.catalog
             ),
         )
+
+
+async def _source(
+    archive: ObservationArchive,
+    key: str,
+    family: str,
+    payload: dict[str, Any],
+    *,
+    resource_number: int = 7,
+) -> FactObservation:
+    return (
+        await archive.publish(
+            f"seed:source:{key}",
+            "import",
+            _T0,
+            (
+                FactDraft(
+                    family,
+                    f"{family}:{key}",
+                    _T0,
+                    _T0,
+                    Coverage.COMPLETE,
+                    Origin.IMPORT,
+                    payload,
+                    resource_number=resource_number,
+                ),
+            ),
+        )
+    )[0]
+
+
+async def _scan(archive: ObservationArchive, key: str, source: FactObservation) -> None:
+    references = observation_commit_references(source.family, source.payload)
+    await archive.publish(
+        f"seed:scan:{key}",
+        "import",
+        _T0,
+        (
+            FactDraft(
+                "commit-references",
+                f"payload:{source.payload_digest}",
+                source.observed_from,
+                source.observed_until,
+                Coverage.COMPLETE,
+                Origin.DERIVED,
+                {
+                    "operation": "StructuredCommitReferenceScan",
+                    "repository": "acme/widgets",
+                    "source_family": source.family,
+                    "source_observation_id": source.id,
+                    "source_payload_digest": source.payload_digest,
+                    "references": [
+                        commit_reference_payload(reference) for reference in references
+                    ],
+                },
+                resource_number=source.resource_number,
+                source_digest=source.payload_digest,
+            ),
+        ),
+    )
 
 
 def _maintainer(
@@ -229,41 +294,21 @@ async def test_backfill_freezes_all_reference_sources_and_replays_by_cursor(tmp_
     first_sha = "a" * 40
     second_sha = "b" * 40
     async with ObservationArchive(database, "acme/widgets") as archive:
-        await archive.publish(
-            "seed:references:1",
-            "import",
-            _T0,
-            (
-                FactDraft(
-                    "commit-references",
-                    "payload:first",
-                    _T0,
-                    _T0,
-                    Coverage.COMPLETE,
-                    Origin.IMPORT,
+        source = await _source(
+            archive,
+            "first",
+            "pull-review-comments",
+            {
+                "value": [
                     {
-                        "source_observation_id": 10,
-                        "source_payload_digest": "1" * 64,
-                        "source_family": "pull-review-comments",
-                        "references": [
-                            {
-                                "sha": first_sha,
-                                "field_path": "/value/0/commit_id",
-                                "source_kind": "review_comment",
-                                "source_id": 101,
-                            },
-                            {
-                                "sha": second_sha,
-                                "field_path": "/value/0/original_commit_id",
-                                "source_kind": "review_comment",
-                                "source_id": 101,
-                            },
-                        ],
+                        "id": 101,
+                        "commit_id": first_sha,
+                        "original_commit_id": second_sha,
                     },
-                    resource_number=7,
-                ),
-            ),
+                ],
+            },
         )
+        cutoff = source.id
     clock = Clock(_T0 + timedelta(hours=1))
     git = FakeGitStore()
     maintainer = _maintainer(database, FakeAPI(), git, clock)
@@ -278,7 +323,10 @@ async def test_backfill_freezes_all_reference_sources_and_replays_by_cursor(tmp_
     assert repeated == result
     assert resumed == prefix
     assert git.retentions == [(first_sha, second_sha)]
+    assert result.requests == 0
     objects = [fact for fact in prefix if fact.family == "commit-object"]
+    scans = [fact for fact in prefix if fact.family == "commit-references"]
+    assert len(scans) == 1 and scans[0].id > cutoff
     assert {fact.subject_key for fact in objects} == {
         f"commit:{first_sha}",
         f"commit:{second_sha}",
@@ -287,6 +335,185 @@ async def test_backfill_freezes_all_reference_sources_and_replays_by_cursor(tmp_
     assert all(fact.maintenance_job_id == result.job_id for fact in objects)
     assert all(fact.payload["reference_scope"]["reference_count"] == 1 for fact in objects)
     assert all(fact.payload["reference_scope"]["observation_ids"] for fact in objects)
+
+
+@pytest.mark.asyncio
+async def test_backfill_closes_every_raw_source_family_without_api_calls(tmp_path: Path) -> None:
+    database = tmp_path / "facts.sqlite3"
+    sha = "c" * 40
+    payloads = {
+        "pull-commits": {"value": [{"sha": sha}]},
+        "pull-reviews": {"value": [{"id": 1, "commit_id": sha}]},
+        "pull-review-comments": {"value": [{"id": 2, "commit_id": sha}]},
+        "pull-review-threads": {"raw": {"nodes": [_thread("scan", sha, resolved=False)]}},
+        "issue-timeline": {"value": [{"id": 3, "commit_id": sha}]},
+        "issue-events": {"value": [{"id": 4, "commit_id": sha}]},
+    }
+    source_ids = []
+    async with ObservationArchive(database, "acme/widgets") as archive:
+        await archive.start_cycle(_T0)
+        for index, (family, payload) in enumerate(payloads.items()):
+            source = await _source(archive, str(index), family, payload)
+            source_ids.append(source.id)
+        duplicate = await _source(
+            archive,
+            "duplicate",
+            "pull-reviews",
+            payloads["pull-reviews"],
+            resource_number=8,
+        )
+        source_ids.append(duplicate.id)
+        empty = await _source(
+            archive,
+            "empty",
+            "issue-events",
+            {"value": []},
+            resource_number=9,
+        )
+        source_ids.append(empty.id)
+    api = FakeAPI()
+    git = FakeGitStore()
+    maintainer = _maintainer(database, api, git, Clock(_T0 + timedelta(hours=1)))
+
+    result = await maintainer.backfill()
+
+    assert result.requests == 0
+    assert api.request_count == 0
+    assert git.retentions == [(sha,)]
+    facts = [fact async for fact in iter_observations(database)]
+    scans = [fact for fact in facts if fact.family == "commit-references"]
+    assert {fact.payload["source_observation_id"] for fact in scans} == set(source_ids)
+    assert sum(not fact.payload["references"] for fact in scans) == 1
+    commit = next(fact for fact in facts if fact.family == "commit-object")
+    assert commit.payload["reference_scope"]["reference_count"] == len(payloads) + 1
+    assert len(commit.payload["reference_scope"]["observation_ids"]) == len(payloads) + 1
+    async with ObservationArchive(database, "acme/widgets") as archive:
+        job = await archive.maintenance_job(result.job_id)
+        assert job.scope["source_population"] == {
+            "digest": job.scope["source_population"]["digest"],
+            "digest_algorithm": "sha256-json-lines-v1",
+            "empty_observations": 1,
+            "observations": len(source_ids),
+            "pending_scans": len(source_ids),
+            "preexisting_scans": 0,
+            "reference_edges": len(payloads) + 1,
+        }
+        assert await archive.discovery_checkpoint() is None
+        assert (await archive.active_cycle()) is not None
+
+
+@pytest.mark.asyncio
+async def test_empty_source_is_scanned_but_empty_archive_has_no_work(tmp_path: Path) -> None:
+    empty_database = tmp_path / "empty.sqlite3"
+    empty_result = await _maintainer(
+        empty_database,
+        FakeAPI(),
+        FakeGitStore(),
+        Clock(_T0),
+    ).backfill()
+    assert empty_result.total_tasks == 0
+    async with ObservationArchive(empty_database, "acme/widgets") as archive:
+        empty_job = await archive.maintenance_job(empty_result.job_id)
+        assert empty_job.scope["source_population"]["observations"] == 0
+
+    source_database = tmp_path / "source.sqlite3"
+    async with ObservationArchive(source_database, "acme/widgets") as archive:
+        source = await _source(archive, "empty", "issue-timeline", {"value": []})
+    source_result = await _maintainer(
+        source_database,
+        FakeAPI(),
+        FakeGitStore(),
+        Clock(_T0),
+    ).backfill()
+
+    assert source_result.total_tasks == 1
+    scans = [
+        fact
+        async for fact in iter_observations(source_database, family="commit-references")
+    ]
+    assert len(scans) == 1
+    assert scans[0].payload["source_observation_id"] == source.id
+    assert scans[0].payload["references"] == []
+
+
+@pytest.mark.asyncio
+async def test_interrupted_reference_rebuild_resumes_before_git(tmp_path: Path) -> None:
+    database = tmp_path / "facts.sqlite3"
+    shas = ("d" * 40, "e" * 40)
+    async with ObservationArchive(database, "acme/widgets") as archive:
+        for index, sha in enumerate(shas):
+            await _source(
+                archive,
+                str(index),
+                "pull-reviews",
+                {"value": [{"id": index, "commit_id": sha}]},
+            )
+        cutoff = await archive.observation_cutoff()
+    api = FakeAPI()
+    git = FakeGitStore()
+    maintainer = _maintainer(database, api, git, Clock(_T0 + timedelta(hours=1)))
+    original = maintainer._syncer._structured_commits
+    interrupted = False
+
+    async def interrupt_after_first_source(archive, task, sources):
+        nonlocal interrupted
+        if task.kind == "commit-reference-scan-batch" and not interrupted:
+            interrupted = True
+            await original(archive, task, sources[:1])
+            raise RuntimeError("injected reference rebuild failure")
+        return await original(archive, task, sources)
+
+    maintainer._syncer._structured_commits = interrupt_after_first_source
+    with pytest.raises(RuntimeError, match="injected reference rebuild failure"):
+        await maintainer.backfill()
+    assert git.retentions == []
+    maintainer._syncer._structured_commits = original
+
+    result = await maintainer.backfill()
+
+    assert api.request_count == 0
+    assert git.retentions == [shas]
+    scans = [fact async for fact in iter_observations(database, family="commit-references")]
+    assert len(scans) == len(shas)
+    assert all(fact.id > cutoff for fact in scans)
+    with sqlite3.connect(database) as connection:
+        attempts = connection.execute(
+            "SELECT attempts FROM maintenance_tasks "
+            "WHERE job_id = ? AND kind = 'commit-reference-scan-batch'",
+            (result.job_id,),
+        ).fetchone()
+    assert attempts == (2,)
+
+
+@pytest.mark.asyncio
+async def test_later_raw_source_belongs_to_the_next_backfill(tmp_path: Path) -> None:
+    database = tmp_path / "facts.sqlite3"
+    first_sha = "f" * 40
+    second_sha = "1" * 40
+    async with ObservationArchive(database, "acme/widgets") as archive:
+        await _source(
+            archive,
+            "first",
+            "issue-events",
+            {"value": [{"id": 1, "commit_id": first_sha}]},
+        )
+    git = FakeGitStore()
+    maintainer = _maintainer(database, FakeAPI(), git, Clock(_T0 + timedelta(hours=1)))
+
+    first = await maintainer.backfill()
+    async with ObservationArchive(database, "acme/widgets") as archive:
+        later = await _source(
+            archive,
+            "second",
+            "issue-events",
+            {"value": [{"id": 2, "commit_id": second_sha}]},
+        )
+        first_job = await archive.maintenance_job(first.job_id)
+        assert later.id > first_job.scope["source_observation_cutoff"]
+    second = await maintainer.backfill()
+
+    assert second.job_id != first.job_id
+    assert git.retentions == [(first_sha,), (second_sha,)]
 
 
 @pytest.mark.asyncio
@@ -340,32 +567,11 @@ async def test_interrupted_commit_backfill_reuses_its_frozen_job(tmp_path: Path)
     database = tmp_path / "facts.sqlite3"
     sha = "d" * 40
     async with ObservationArchive(database, "acme/widgets") as archive:
-        await archive.publish(
-            "seed:references",
-            "import",
-            _T0,
-            (
-                FactDraft(
-                    "commit-references",
-                    "payload:commit",
-                    _T0,
-                    _T0,
-                    Coverage.COMPLETE,
-                    Origin.IMPORT,
-                    {
-                        "source_family": "pull-review-comments",
-                        "references": [
-                            {
-                                "sha": sha,
-                                "field_path": "/value/0/commit_id",
-                                "source_kind": "review_comment",
-                                "source_id": 101,
-                            },
-                        ],
-                    },
-                    resource_number=7,
-                ),
-            ),
+        await _source(
+            archive,
+            "commit",
+            "pull-review-comments",
+            {"value": [{"id": 101, "commit_id": sha}]},
         )
 
     class InterruptedGit(FakeGitStore):
@@ -397,7 +603,8 @@ async def test_interrupted_commit_backfill_reuses_its_frozen_job(tmp_path: Path)
     assert len(objects) == 1
     with sqlite3.connect(database) as connection:
         attempt = connection.execute(
-            "SELECT attempts, completed_at, last_error FROM maintenance_tasks WHERE job_id = ?",
+            "SELECT attempts, completed_at, last_error FROM maintenance_tasks "
+            "WHERE job_id = ? AND kind = 'commit-object-batch'",
             (result.job_id,),
         ).fetchone()
     assert attempt is not None
@@ -407,38 +614,58 @@ async def test_interrupted_commit_backfill_reuses_its_frozen_job(tmp_path: Path)
 
 
 @pytest.mark.asyncio
+async def test_backfill_retries_publication_after_git_check(tmp_path: Path) -> None:
+    database = tmp_path / "facts.sqlite3"
+    sha = "2" * 40
+    async with ObservationArchive(database, "acme/widgets") as archive:
+        await _source(
+            archive,
+            "publish",
+            "pull-commits",
+            {"value": [{"sha": sha}]},
+        )
+    git = FakeGitStore()
+    maintainer = _maintainer(
+        database,
+        FakeAPI(),
+        git,
+        Clock(_T0 + timedelta(hours=1)),
+    )
+    original = maintainer._syncer._publish
+    failed = False
+
+    async def fail_first_commit_publication(archive, task, operation, facts, **kwargs):
+        nonlocal failed
+        if operation == "commit-objects" and not failed:
+            failed = True
+            raise RuntimeError("injected commit publication failure")
+        return await original(archive, task, operation, facts, **kwargs)
+
+    maintainer._syncer._publish = fail_first_commit_publication
+    with pytest.raises(RuntimeError, match="injected commit publication failure"):
+        await maintainer.backfill()
+    maintainer._syncer._publish = original
+
+    result = await maintainer.backfill()
+
+    assert result.completed_tasks == result.total_tasks
+    assert git.retentions == [(sha,), (sha,)]
+    objects = [fact async for fact in iter_observations(database, family="commit-object")]
+    assert len(objects) == 1
+
+
+@pytest.mark.asyncio
 async def test_backfill_batches_commit_verification_and_publication(tmp_path: Path) -> None:
     database = tmp_path / "facts.sqlite3"
     shas = [f"{number:040x}" for number in range(1, 258)]
     async with ObservationArchive(database, "acme/widgets") as archive:
-        await archive.publish(
-            "seed:many-references",
-            "import",
-            _T0,
-            (
-                FactDraft(
-                    "commit-references",
-                    "payload:many",
-                    _T0,
-                    _T0,
-                    Coverage.COMPLETE,
-                    Origin.IMPORT,
-                    {
-                        "source_family": "pull-commits",
-                        "references": [
-                            {
-                                "sha": sha,
-                                "field_path": f"/value/{index}/sha",
-                                "source_kind": "pull_commit",
-                                "source_id": sha,
-                            }
-                            for index, sha in enumerate(shas)
-                        ],
-                    },
-                    resource_number=7,
-                ),
-            ),
+        source = await _source(
+            archive,
+            "many",
+            "pull-commits",
+            {"value": [{"sha": sha} for sha in shas]},
         )
+        await _scan(archive, "many", source)
     git = FakeGitStore()
 
     result = await _maintainer(
@@ -450,9 +677,15 @@ async def test_backfill_batches_commit_verification_and_publication(tmp_path: Pa
 
     assert result.total_tasks == 2
     assert list(map(len, git.retentions)) == [256, 1]
+    scans = [fact async for fact in iter_observations(database, family="commit-references")]
+    assert len(scans) == 1
     objects = [fact async for fact in iter_observations(database, family="commit-object")]
     assert len(objects) == len(shas)
     assert len({fact.batch_id for fact in objects}) == 2
+    async with ObservationArchive(database, "acme/widgets") as archive:
+        job = await archive.maintenance_job(result.job_id)
+        assert job.scope["source_population"]["preexisting_scans"] == 1
+        assert job.scope["source_population"]["pending_scans"] == 0
 
 
 def _thread(identity: str, sha: str, *, resolved: bool) -> dict[str, Any]:

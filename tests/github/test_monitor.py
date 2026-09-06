@@ -240,7 +240,7 @@ async def test_detail_recovers_active_maintenance_progress_from_sqlite(tmp_path:
                     "batch:1",
                     "commit-object-batch",
                     "commits:x",
-                    {"observation_cutoff": 0, "shas": ["a" * 40]},
+                    {"source_observation_cutoff": 0, "shas": ["a" * 40]},
                 ),
             ),
         )

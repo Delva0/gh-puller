@@ -1,8 +1,10 @@
 """Run recoverable targeted observations without advancing discovery state.
 
 Maintenance jobs share the normal syncer's source operations and immutable fact
-stream. Their request scope and tasks are durable, while retryable transport errors
-remain task-attempt state rather than false source observations.
+stream. A structured-commit baseline freezes raw source observations, closes missing
+derived scans, then verifies their unique Git objects. Request scope and tasks are
+durable, while retryable transport errors remain task-attempt state rather than false
+source observations.
 """
 
 from __future__ import annotations
@@ -15,7 +17,12 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
-from .commit_references import commit_reference_scope
+from .commit_references import (
+    COMMIT_REFERENCE_SOURCE_FAMILIES,
+    commit_reference_payload,
+    commit_reference_scope,
+    observation_commit_references,
+)
 from .git_store import GitStoreError
 from .locking import archive_lock
 from .observations import (
@@ -47,6 +54,7 @@ REFRESH_FAMILIES = (
     "pull-review-threads",
 )
 _COMMIT_TASK_SIZE = 256
+_REFERENCE_SCAN_TASK_SIZE = 256
 
 
 @dataclass(frozen=True, slots=True)
@@ -185,7 +193,7 @@ class GitHubMaintainer:
         *,
         idempotency_key: str | None = None,
     ) -> MaintenanceResult:
-        """Verify every structured commit in a frozen published fact range.
+        """Verify commits extracted from every raw fact in a frozen source range.
 
         Args:
             idempotency_key: Optional caller identity. Reuse returns or resumes the
@@ -230,23 +238,86 @@ class GitHubMaintainer:
                             raise ValueError("idempotency key belongs to another backfill request")
                         return _result(existing)
                 cutoff = await archive.observation_cutoff()
-                ordered_references = await archive.referenced_commits(cutoff)
+                scans = await archive.commit_reference_scans(cutoff)
+                source_population = hashlib.sha256()
+                source_count = 0
+                edge_count = 0
+                empty_sources = 0
+                missing_scans = []
+                reference_order: dict[str, tuple[int, int, str]] = {}
+                async for source in archive.iter_structured_commit_sources(cutoff):
+                    source_count += 1
+                    source_population.update(
+                        json.dumps(
+                            [source.id, source.family, source.payload_digest],
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        ).encode(),
+                    )
+                    source_population.update(b"\n")
+                    selected = observation_commit_references(
+                        source.family,
+                        source.payload,
+                    )
+                    edge_count += len(selected)
+                    if not selected:
+                        empty_sources += 1
+                    signature = (
+                        source.id,
+                        source.family,
+                        source.payload_digest,
+                        _json_digest(
+                            [commit_reference_payload(reference) for reference in selected],
+                        ),
+                    )
+                    if signature not in scans:
+                        missing_scans.append(source.id)
+                    resource = (
+                        source.resource_number
+                        if source.resource_number is not None
+                        else 2**63 - 1
+                    )
+                    for reference in selected:
+                        order = (resource, source.id, reference.sha)
+                        previous = reference_order.get(reference.sha)
+                        if previous is None or order < previous:
+                            reference_order[reference.sha] = order
+                ordered_references = tuple(
+                    sorted(reference_order, key=reference_order.__getitem__),
+                )
                 referenced = set(ordered_references)
                 covered = await archive.checked_commits(cutoff)
                 pending = tuple(sha for sha in ordered_references if sha not in covered)
-                tasks = _commit_tasks(pending, cutoff)
+                reference_tasks = _reference_scan_tasks(missing_scans, cutoff)
+                commit_tasks = _commit_tasks(pending, cutoff)
+                tasks = (*reference_tasks, *commit_tasks)
                 scope = {
                     "operation": "StructuredCommitBackfill",
                     "repository": self.config.repository,
                     "request": request,
-                    "observation_cutoff": cutoff,
-                    "source_schema": {"commit-references": 1},
+                    "source_observation_cutoff": cutoff,
+                    "source_schema": dict.fromkeys(
+                        sorted(COMMIT_REFERENCE_SOURCE_FAMILIES),
+                        1,
+                    ),
+                    "derived_schema": {"commit-references": 1},
                     "output_schema": {"commit-object": 2},
                     "referenced_commits": len(referenced),
                     "preexisting_results": len(referenced & covered),
+                    "source_population": {
+                        "digest": source_population.hexdigest(),
+                        "digest_algorithm": "sha256-json-lines-v1",
+                        "observations": source_count,
+                        "reference_edges": edge_count,
+                        "empty_observations": empty_sources,
+                        "preexisting_scans": source_count - len(missing_scans),
+                        "pending_scans": len(missing_scans),
+                    },
                     "population": {
                         "digest": _task_digest(tasks),
                         "subjects": len(pending),
+                        "reference_scan_tasks": len(reference_tasks),
+                        "commit_object_tasks": len(commit_tasks),
                         "total": len(tasks),
                     },
                 }
@@ -312,11 +383,16 @@ class GitHubMaintainer:
     async def _reference_index(
         self,
         archive: ObservationArchive,
-        cutoff: int,
+        source_cutoff: int,
         selected_shas: set[str] | None = None,
     ) -> dict[str, tuple[dict[str, Any], ...]]:
         references: dict[str, list[dict[str, Any]]] = {}
-        async for item in archive.iter_commit_references(cutoff, selected_shas):
+        if selected_shas is None:
+            raise ValueError("source-bounded references require exact commit targets")
+        async for item in archive.iter_commit_references_by_source(
+            source_cutoff,
+            selected_shas,
+        ):
             sha = _sha(item.get("sha"))
             references.setdefault(sha, []).append(item)
         return {
@@ -342,11 +418,20 @@ class GitHubMaintainer:
         try:
             while job.status == "active":
                 started_at = _utc(self._now())
-                tasks = await archive.take_maintenance_tasks(
-                    job.id,
-                    self.config.concurrency,
-                    started_at,
-                )
+                tasks = ()
+                if job.kind == "backfill":
+                    tasks = await archive.take_maintenance_tasks(
+                        job.id,
+                        self.config.concurrency,
+                        started_at,
+                        kind="commit-reference-scan-batch",
+                    )
+                if not tasks:
+                    tasks = await archive.take_maintenance_tasks(
+                        job.id,
+                        self.config.concurrency,
+                        started_at,
+                    )
                 if not tasks:
                     raise RuntimeError(f"maintenance job {job.id} has no pending task")
                 progress.phase(
@@ -417,6 +502,19 @@ class GitHubMaintainer:
             return (await self._syncer._issue_relations(api, archive, task)).coverage
         if task.kind == "git-refs":
             await self._syncer._git_refs(git, archive, task)
+            return Coverage.COMPLETE
+        if task.kind == "commit-reference-scan-batch":
+            cutoff, source_ids = _reference_scan_task_scope(task)
+            sources = [
+                source
+                async for source in archive.iter_structured_commit_sources(
+                    cutoff,
+                    source_ids,
+                )
+            ]
+            if tuple(source.id for source in sources) != source_ids:
+                raise RuntimeError(f"maintenance task {task.task_key} lost a source fact")
+            await self._syncer._structured_commits(archive, task, sources)
             return Coverage.COMPLETE
         if task.kind == "commit-object-batch":
             cutoff, shas = _commit_task_scope(task)
@@ -620,17 +718,17 @@ def _caller_key(kind: str, value: str) -> str:
 
 def _commit_tasks(
     shas: Sequence[str],
-    cutoff: int,
+    source_cutoff: int,
 ) -> tuple[TaskDraft, ...]:
-    if cutoff < 0:
-        raise ValueError("observation cutoff cannot be negative")
+    if source_cutoff < 0:
+        raise ValueError("source observation cutoff cannot be negative")
     ordered = tuple(_sha(sha) for sha in shas)
     if len(ordered) != len(set(ordered)):
         raise ValueError("commit task population must be unique")
     tasks = []
     for offset in range(0, len(ordered), _COMMIT_TASK_SIZE):
         payload = {
-            "observation_cutoff": cutoff,
+            "source_observation_cutoff": source_cutoff,
             "shas": list(ordered[offset : offset + _COMMIT_TASK_SIZE]),
         }
         digest = _json_digest(payload)
@@ -645,10 +743,66 @@ def _commit_tasks(
     return tuple(tasks)
 
 
+def _reference_scan_tasks(
+    observation_ids: Sequence[int],
+    source_cutoff: int,
+) -> tuple[TaskDraft, ...]:
+    if source_cutoff < 0:
+        raise ValueError("source observation cutoff cannot be negative")
+    ordered = tuple(observation_ids)
+    if (
+        any(type(observation_id) is not int or observation_id < 1 for observation_id in ordered)
+        or len(ordered) != len(set(ordered))
+        or tuple(sorted(ordered)) != ordered
+    ):
+        raise ValueError("reference scan population must be ordered unique observations")
+    tasks = []
+    for offset in range(0, len(ordered), _REFERENCE_SCAN_TASK_SIZE):
+        payload = {
+            "source_observation_cutoff": source_cutoff,
+            "source_observation_ids": list(
+                ordered[offset : offset + _REFERENCE_SCAN_TASK_SIZE],
+            ),
+        }
+        digest = _json_digest(payload)
+        tasks.append(
+            TaskDraft(
+                f"commit-reference-scan-batch:{offset // _REFERENCE_SCAN_TASK_SIZE:08d}:{digest}",
+                "commit-reference-scan-batch",
+                f"sources:{digest}",
+                payload,
+            ),
+        )
+    return tuple(tasks)
+
+
+def _reference_scan_task_scope(
+    task: MaintenanceTask,
+) -> tuple[int, tuple[int, ...]]:
+    cutoff = task.payload.get("source_observation_cutoff")
+    values = task.payload.get("source_observation_ids")
+    if type(cutoff) is not int or cutoff < 0 or not isinstance(values, list):
+        raise TypeError(f"maintenance task {task.task_key} has invalid source scope")
+    observation_ids = tuple(values)
+    if (
+        not observation_ids
+        or any(
+            type(observation_id) is not int
+            or observation_id < 1
+            or observation_id > cutoff
+            for observation_id in observation_ids
+        )
+        or len(observation_ids) != len(set(observation_ids))
+        or tuple(sorted(observation_ids)) != observation_ids
+    ):
+        raise ValueError(f"maintenance task {task.task_key} has invalid source population")
+    return cutoff, observation_ids
+
+
 def _commit_task_scope(
     task: MaintenanceTask,
 ) -> tuple[int, tuple[str, ...]]:
-    cutoff = task.payload.get("observation_cutoff")
+    cutoff = task.payload.get("source_observation_cutoff")
     values = task.payload.get("shas")
     if type(cutoff) is not int or cutoff < 0 or not isinstance(values, list):
         raise TypeError(f"maintenance task {task.task_key} has invalid commit scope")

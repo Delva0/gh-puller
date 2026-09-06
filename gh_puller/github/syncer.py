@@ -23,6 +23,7 @@ from urllib.parse import urlencode
 from .client import GitHubAPI, GitHubPage, GitHubResource
 from .commit_references import (
     CommitReference,
+    commit_reference_payload,
     commit_reference_scope,
     observation_commit_references,
 )
@@ -2072,17 +2073,17 @@ class GitHubSyncer:
         task: SyncTask | MaintenanceTask,
         sources: list[FactObservation],
     ) -> dict[str, tuple[dict[str, Any], ...]]:
-        references: dict[str, list[CommitReference]] = {}
-        source_by_digest = {}
-        reference_by_digest = {}
+        references: dict[int, list[CommitReference]] = {}
+        source_by_id = {}
+        reference_by_id = {}
         for source in sources:
             if source.coverage is not Coverage.COMPLETE:
                 continue
             selected = list(
                 observation_commit_references(source.family, source.payload),
             )
-            references[source.payload_digest] = selected
-            source_by_digest[source.payload_digest] = source
+            references[source.id] = selected
+            source_by_id[source.id] = source
             operation = f"commit-references:{source.id}"
             publication = await self._publication(archive, task, operation)
             if publication is None:
@@ -2106,19 +2107,22 @@ class GitHubSyncer:
                                 "source_family": source.family,
                                 "source_observation_id": source.id,
                                 "source_payload_digest": source.payload_digest,
-                                "references": [_reference_payload(reference) for reference in selected],
+                                "references": [
+                                    commit_reference_payload(reference)
+                                    for reference in selected
+                                ],
                             },
                         ),
                     ),
                 )
-            reference_by_digest[source.payload_digest] = _single(
+            reference_by_id[source.id] = _single(
                 publication,
                 "commit-references",
             )
         by_sha: dict[str, list[dict[str, Any]]] = {}
-        for digest, selected in references.items():
-            source = source_by_digest[digest]
-            reference_fact = reference_by_digest[digest]
+        for source_id, selected in references.items():
+            source = source_by_id[source_id]
+            reference_fact = reference_by_id[source_id]
             for reference in selected:
                 by_sha.setdefault(reference.sha, []).append(
                     {
@@ -2127,7 +2131,7 @@ class GitHubSyncer:
                         "source_payload_digest": source.payload_digest,
                         "source_family": source.family,
                         "resource_number": source.resource_number,
-                        **_reference_payload(reference),
+                        **commit_reference_payload(reference),
                     },
                 )
         frozen = {sha: tuple(items) for sha, items in sorted(by_sha.items())}
@@ -2357,15 +2361,6 @@ def _repository_git_url(repository: dict[str, Any], full_name: str) -> str:
     if isinstance(html_url, str) and html_url.startswith(("http://", "https://")):
         return f"{html_url.rstrip('/')}.git"
     return default_git_url(full_name)
-
-
-def _reference_payload(reference: CommitReference) -> dict[str, Any]:
-    return {
-        "sha": reference.sha,
-        "field_path": reference.field_path,
-        "source_kind": reference.source_kind,
-        "source_id": reference.source_id,
-    }
 
 
 def _error_text(error: Exception) -> str:

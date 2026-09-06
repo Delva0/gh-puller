@@ -15,6 +15,17 @@ if TYPE_CHECKING:
 
 _SHA = re.compile(r"[0-9a-f]{40,64}\Z")
 
+COMMIT_REFERENCE_SOURCE_FAMILIES = frozenset(
+    {
+        "issue-events",
+        "issue-timeline",
+        "pull-commits",
+        "pull-review-comments",
+        "pull-review-threads",
+        "pull-reviews",
+    },
+)
+
 
 @dataclass(frozen=True, slots=True)
 class CommitReference:
@@ -103,6 +114,20 @@ def observation_commit_references(
     elif family in {"issue-timeline", "issue-events"}:
         _append_event_references(result, family, _objects(value))
     return tuple(result)
+
+
+def commit_reference_payload(reference: CommitReference) -> dict[str, Any]:
+    """Encode one extracted reference in its derived-fact representation.
+
+    Args:
+        reference: Exact structured source edge.
+    """
+    return {
+        "sha": reference.sha,
+        "field_path": reference.field_path,
+        "source_kind": reference.source_kind,
+        "source_id": reference.source_id,
+    }
 
 
 def commit_reference_index_rows(

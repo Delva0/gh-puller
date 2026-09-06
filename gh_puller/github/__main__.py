@@ -73,7 +73,7 @@ def _parser() -> argparse.ArgumentParser:
 
     backfill = commands.add_parser(
         "backfill",
-        help="verify structured commits over a frozen published range",
+        help="verify structured commits over a frozen raw-source range",
     )
     _add_sync_arguments(backfill)
     backfill.add_argument("--idempotency-key")

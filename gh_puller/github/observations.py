@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, Any, Self
 import aiosqlite
 
 from .commit_references import (
+    COMMIT_REFERENCE_SOURCE_FAMILIES,
     commit_reference_index_rows,
     commit_reference_provenance,
 )
@@ -447,6 +448,8 @@ class ObservationArchive:
         job_id: int,
         limit: int,
         started_at: datetime,
+        *,
+        kind: str | None = None,
     ) -> tuple[MaintenanceTask, ...]:
         """Claim a durable batch from an active maintenance job.
 
@@ -454,6 +457,7 @@ class ObservationArchive:
             job_id: Active job owning the work.
             limit: Maximum tasks returned.
             started_at: Actual start of this execution attempt.
+            kind: Optional task kind used to enforce a maintenance stage barrier.
 
         Returns:
             Pending tasks in durable order with incremented attempt counts.
@@ -470,10 +474,11 @@ class ObservationArchive:
                 """
                 SELECT * FROM maintenance_tasks
                 WHERE job_id = ? AND completed_at IS NULL
+                      AND (? IS NULL OR kind = ?)
                 ORDER BY id
                 LIMIT ?
                 """,
-                (job_id, limit),
+                (job_id, kind, kind, limit),
             )
             if rows:
                 await db.executemany(
@@ -578,6 +583,162 @@ class ObservationArchive:
         )
         return 0 if row is None else int(row["cutoff"])
 
+    async def iter_structured_commit_sources(
+        self,
+        cutoff: int,
+        observation_ids: Collection[int] | None = None,
+    ) -> AsyncIterator[FactObservation]:
+        """Read complete raw facts covered by structured commit extraction.
+
+        Args:
+            cutoff: Inclusive source-observation identity frozen by the caller.
+            observation_ids: Optional exact subset within the frozen range.
+
+        Yields:
+            Contract-covered source facts ordered by observation identity.
+        """
+        if cutoff < 0:
+            raise ValueError("source observation cutoff cannot be negative")
+        selected = None if observation_ids is None else tuple(sorted(set(observation_ids)))
+        if selected is not None and any(
+            type(observation_id) is not int
+            or observation_id < 1
+            or observation_id > cutoff
+            for observation_id in selected
+        ):
+            raise ValueError("source observations must belong to the frozen range")
+        if selected == ():
+            return
+        families = tuple(sorted(COMMIT_REFERENCE_SOURCE_FAMILIES))
+        family_placeholders = ",".join("?" for _ in families)
+        if selected is None:
+            query = f"""
+                {_FACT_SELECT}
+                WHERE o.id <= ? AND o.coverage = 'complete'
+                      AND o.family IN ({family_placeholders})
+                ORDER BY o.id
+            """
+            async with self._connection.execute(query, (cutoff, *families)) as cursor:
+                async for row in cursor:
+                    yield _fact(row)
+            return
+        rows: dict[int, aiosqlite.Row] = {}
+        for offset in range(0, len(selected), 500):
+            chunk = selected[offset : offset + 500]
+            id_placeholders = ",".join("?" for _ in chunk)
+            query = f"""
+                {_FACT_SELECT}
+                WHERE o.id <= ? AND o.coverage = 'complete'
+                      AND o.family IN ({family_placeholders})
+                      AND o.id IN ({id_placeholders})
+            """
+            for row in await _fetchall(
+                self._connection,
+                query,
+                (cutoff, *families, *chunk),
+            ):
+                rows[int(row["id"])] = row
+        for _, row in sorted(rows.items()):
+            yield _fact(row)
+
+    async def commit_reference_scans(
+        self,
+        source_cutoff: int,
+    ) -> set[tuple[int, str, str, str]]:
+        """Return valid derived scans attached to a frozen raw-source range.
+
+        Args:
+            source_cutoff: Inclusive source-observation identity. A derived fact may
+                have been published later than this boundary.
+
+        Returns:
+            Source identity, family, payload digest, and reference-list digest for
+            every valid scan, including scans whose reference list is empty.
+        """
+        if source_cutoff < 0:
+            raise ValueError("source observation cutoff cannot be negative")
+        scans = set()
+        query = f"""
+            {_FACT_SELECT}
+            WHERE o.family = 'commit-references' AND o.coverage = 'complete'
+            ORDER BY o.id
+        """
+        async with self._connection.execute(query) as cursor:
+            async for row in cursor:
+                signature = _commit_reference_scan_signature(_fact(row))
+                if signature is not None and signature[0] <= source_cutoff:
+                    scans.add(signature)
+        return scans
+
+    async def iter_commit_references_by_source(
+        self,
+        source_cutoff: int,
+        shas: Collection[str],
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Read references selected by their raw source boundary.
+
+        Args:
+            source_cutoff: Inclusive raw source-observation identity.
+            shas: Exact commit targets required by one verification task.
+
+        Yields:
+            Source-distinct provenance from the latest valid scan per raw fact.
+        """
+        if source_cutoff < 0:
+            raise ValueError("source observation cutoff cannot be negative")
+        selected = tuple(sorted(set(shas)))
+        if not selected:
+            return
+        rows: dict[int, aiosqlite.Row] = {}
+        for offset in range(0, len(selected), 500):
+            chunk = selected[offset : offset + 500]
+            placeholders = ",".join("?" for _ in chunk)
+            candidates = await _fetchall(
+                self._connection,
+                f"""
+                SELECT o.id AS observation_id, o.resource_number, o.source_digest,
+                       p.codec, p.raw_size, p.payload
+                FROM (
+                    SELECT DISTINCT observation_id
+                    FROM commit_reference_index
+                    WHERE sha IN ({placeholders})
+                ) AS selected
+                JOIN fact_observations AS o ON o.id = selected.observation_id
+                JOIN payload_blobs AS p ON p.digest = o.payload_digest
+                WHERE o.family = 'commit-references' AND o.coverage = 'complete'
+                """,  # noqa: S608 - placeholders are generated from exact SHA values.
+                chunk,
+            )
+            rows.update((int(row["observation_id"]), row) for row in candidates)
+        chosen: dict[tuple[int, str, str], tuple[dict[str, Any], ...]] = {}
+        selected_set = set(selected)
+        for observation_id, row in sorted(rows.items(), reverse=True):
+            payload = _decode_payload(row)
+            identity = _commit_reference_source_payload_identity(
+                payload,
+                _optional_text(row["source_digest"]),
+            )
+            if identity is None or identity[0] > source_cutoff or identity in chosen:
+                continue
+            try:
+                references = commit_reference_provenance(
+                    observation_id,
+                    (
+                        None
+                        if row["resource_number"] is None
+                        else int(row["resource_number"])
+                    ),
+                    payload,
+                )
+            except ValueError:
+                continue
+            chosen[identity] = tuple(
+                reference for reference in references if reference["sha"] in selected_set
+            )
+        for _, references in sorted(chosen.items()):
+            for reference in references:
+                yield reference
+
     async def iter_commit_references(
         self,
         cutoff: int,
@@ -638,28 +799,6 @@ class ObservationArchive:
         for _, row in sorted(rows.items()):
             for value in _indexed_references(row, selected_set):
                 yield value
-
-    async def referenced_commits(self, cutoff: int) -> tuple[str, ...]:
-        """Return structured commit targets in source-locality order.
-
-        Args:
-            cutoff: Inclusive global observation identity.
-        """
-        if cutoff < 0:
-            raise ValueError("observation cutoff cannot be negative")
-        rows = await _fetchall(
-            self._connection,
-            """
-            SELECT i.sha, MIN(COALESCE(o.resource_number, 9223372036854775807)) AS resource
-            FROM commit_reference_index AS i
-            JOIN fact_observations AS o ON o.id = i.observation_id
-            WHERE i.observation_id <= ?
-            GROUP BY i.sha
-            ORDER BY resource, i.sha
-            """,
-            (cutoff,),
-        )
-        return tuple(str(row["sha"]) for row in rows)
 
     async def checked_commits(self, cutoff: int) -> set[str]:
         """Return targets with a version-two reconstruction outcome.
@@ -2031,6 +2170,48 @@ def _fact_schema_rows() -> list[tuple[str, int]]:
     )
 
 
+def _commit_reference_scan_signature(
+    fact: FactObservation,
+) -> tuple[int, str, str, str] | None:
+    identity = _commit_reference_source_identity(fact)
+    if identity is None:
+        return None
+    try:
+        commit_reference_provenance(
+            fact.id,
+            fact.resource_number,
+            fact.payload,
+        )
+    except ValueError:
+        return None
+    return (*identity, _value_digest(fact.payload.get("references")))
+
+
+def _commit_reference_source_identity(
+    fact: FactObservation,
+) -> tuple[int, str, str] | None:
+    return _commit_reference_source_payload_identity(fact.payload, fact.source_digest)
+
+
+def _commit_reference_source_payload_identity(
+    payload: dict[str, Any],
+    source_digest: str | None,
+) -> tuple[int, str, str] | None:
+    observation_id = payload.get("source_observation_id")
+    family = payload.get("source_family")
+    payload_digest = payload.get("source_payload_digest")
+    if (
+        type(observation_id) is not int
+        or observation_id < 1
+        or family not in COMMIT_REFERENCE_SOURCE_FAMILIES
+        or not isinstance(payload_digest, str)
+        or not _is_digest(payload_digest)
+        or source_digest != payload_digest
+    ):
+        return None
+    return observation_id, str(family), payload_digest
+
+
 def _indexed_references(
     row: aiosqlite.Row,
     selected: Collection[str] | None,
@@ -2054,6 +2235,17 @@ def _json_bytes(value: dict[str, Any]) -> bytes:
         separators=(",", ":"),
         sort_keys=True,
     ).encode()
+
+
+def _value_digest(value: object) -> str:
+    raw = json.dumps(
+        value,
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+    return _digest(raw)
 
 
 def _digest(raw: bytes) -> str:
