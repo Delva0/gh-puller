@@ -1,0 +1,84 @@
+import json
+
+import pytest
+
+from gh_puller.codebase.archive import Archive, ArchiveError, ArchiveWriter, RadixTree, graph_digest
+from gh_puller.codebase.cbm_build import (
+    BuildError,
+    _validate_resume_binary,
+    _validate_resume_force_full,
+    prepare_output_dir,
+)
+from gh_puller.codebase.cbm_transport import index_execution_from_envelope
+from gh_puller.codebase.store import GraphRows
+
+
+def make_build(directory):
+    directory.mkdir()
+    writer = ArchiveWriter(directory / "archive.kga")
+    root = RadixTree(writer, "nodes").build(GraphRows({"a": {"v": 1}}, {}).nodes.items())
+    writer.commit(
+        {
+            "sha": "c1",
+            "parents": [],
+            "node_root": root.to_json(),
+            "edge_root": None,
+            "nodes": 1,
+            "edges": 0,
+            "graph_digest": graph_digest(root, None),
+        },
+    )
+    writer.finalize()
+    (directory / "summary.json").write_text(json.dumps({"archive_format_version": 5}))
+
+
+def test_out_dir_copies_native_archive_without_linking(tmp_path):
+    source, destination = tmp_path / "source", tmp_path / "destination"
+    make_build(source)
+    assert prepare_output_dir(source, destination) == destination
+    assert (source / "archive.kga").stat().st_ino != (destination / "archive.kga").stat().st_ino
+    assert len(Archive(destination / "archive.kga")) == 1
+
+
+def test_out_dir_rejects_unsupported_archive_bytes(tmp_path):
+    source, destination = tmp_path / "source", tmp_path / "destination"
+    source.mkdir()
+    (source / "archive.kga").write_bytes(b"not-an-archive")
+    with pytest.raises((BuildError, ArchiveError, OSError)):
+        prepare_output_dir(source, destination)
+
+
+def test_index_execution_parses_cli_text_envelope():
+    execution = {"route": "closure_repair", "changed_files": 1, "elapsed_ms": 1729}
+    envelope = {"content": [{"type": "text", "text": json.dumps({"index_execution": execution})}]}
+    assert index_execution_from_envelope(envelope) == execution
+
+
+def test_index_execution_returns_none_when_old_cbm_does_not_report_it():
+    assert index_execution_from_envelope({"content": [{"type": "text", "text": "{}"}]}) is None
+
+
+def test_resume_force_full_is_explicit_and_backward_compatible():
+    _validate_resume_force_full(None, True)
+    _validate_resume_force_full({"sha": "legacy"}, False)
+    _validate_resume_force_full(
+        {"sha": "current", "cbm_force_full": True},
+        True,
+    )
+
+    with pytest.raises(BuildError, match="does not match"):
+        _validate_resume_force_full({"sha": "legacy"}, True)
+    with pytest.raises(BuildError, match="does not match"):
+        _validate_resume_force_full({"sha": "invalid", "cbm_force_full": "yes"}, True)
+
+
+def test_resume_pins_cbm_digest_unless_upgrade_is_explicit():
+    _validate_resume_binary(None, "new", False)
+    _validate_resume_binary({"cbm_binary_sha256": "same"}, "same", False)
+    _validate_resume_binary({"sha": "legacy"}, "new", True)
+    _validate_resume_binary({"cbm_binary_sha256": "old"}, "new", True)
+
+    with pytest.raises(BuildError, match="predates"):
+        _validate_resume_binary({"sha": "legacy"}, "new", False)
+    with pytest.raises(BuildError, match="differs"):
+        _validate_resume_binary({"cbm_binary_sha256": "old"}, "new", False)
