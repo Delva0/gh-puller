@@ -30,12 +30,6 @@ _TRANSIENT_FETCH_STATUS = re.compile(
     re.IGNORECASE,
 )
 _MISSING_PULL_REF = re.compile(r"couldn't find remote ref refs/pull/(\d+)/head", re.IGNORECASE)
-_UNAVAILABLE_COMMIT_MARKERS = (
-    "not our ref",
-    "server does not allow request for unadvertised object",
-    "couldn't find remote ref",
-    "remote ref does not exist",
-)
 _TRANSIENT_FETCH_MARKERS = (
     "connection closed",
     "connection reset",
@@ -121,7 +115,11 @@ class GitObjectStore:
         heartbeat: Callable[[], None] | None = None,
         retry: Callable[[float], None] | None = None,
     ) -> dict[str, dict[str, Any]]:
-        """Pin complete Git objects named by structured API fields.
+        """Pin complete managed-store objects named by structured API fields.
+
+        Upstream and PR ref acquisition populate the store. An arbitrary structured SHA
+        is evidence, not a remote ref, so this operation verifies it locally and reports
+        absence without guessing a fetch source.
 
         Args:
             shas: Distinct commit object IDs to verify and retain.
@@ -143,63 +141,27 @@ class GitObjectStore:
             await self._prepare()
             await self._sync_upstream(heartbeat=heartbeat, retry=retry)
             missing = await self._missing_commits(selected)
-            fetched: set[str] = set()
-            unavailable: dict[str, str] = {}
-            for sha in selected:
-                if sha not in missing:
-                    continue
-                staging_ref = _commit_staging_ref(sha)
-                try:
-                    await self._git(
-                        "fetch",
-                        "--quiet",
-                        "--no-tags",
-                        "--no-write-fetch-head",
-                        "origin",
-                        f"+{sha}:{staging_ref}",
-                        heartbeat=heartbeat,
-                        retry=retry,
-                    )
-                except GitStoreError as exc:
-                    if not _is_unavailable_commit_failure(exc):
-                        raise
-                    unavailable[sha] = str(exc)
-                else:
-                    if sha in await self._missing_commits((sha,)):
-                        unavailable[sha] = "fetch completed without the requested commit"
-                    else:
-                        fetched.add(sha)
-            available = [sha for sha in selected if sha not in unavailable]
-            for sha in available:
-                if sha in await self._missing_commits((sha,)):
-                    unavailable[sha] = "commit is absent from the full Git object store"
-                    continue
-                tree = await self._git("cat-file", "-t", f"{sha}^{{tree}}", ok=(0, 1, 128))
-                if tree.strip() != "tree":
-                    unavailable[sha] = "commit tree is unavailable"
-            available = [sha for sha in selected if sha not in unavailable]
+            available = [sha for sha in selected if sha not in missing]
             if available:
                 await self._git(
                     "update-ref",
                     "--stdin",
                     input_text="".join(f"update {commit_ref(sha)} {sha}\n" for sha in available),
                 )
-            for sha in selected:
-                await self._delete_ref(_commit_staging_ref(sha))
             return {
                 sha: (
                     {
                         "sha": sha,
                         "status": "available",
                         "ref": commit_ref(sha),
-                        "obtained": "fetched" if sha in fetched else "existing",
+                        "obtained": "existing",
                         "verification": "commit-and-root-tree",
                     }
-                    if sha not in unavailable
+                    if sha not in missing
                     else {
                         "sha": sha,
                         "status": "unavailable",
-                        "reason": unavailable[sha],
+                        "reason": "commit or root tree is absent from the managed Git store",
                     }
                 )
                 for sha in selected
@@ -436,12 +398,24 @@ class GitObjectStore:
         return result
 
     async def _missing_commits(self, shas: Sequence[str]) -> set[str]:
-        missing = set()
-        for sha in shas:
-            kind = await self._git("cat-file", "-t", f"{sha}^{{commit}}", ok=(0, 1, 128))
-            if kind.strip() != "commit":
-                missing.add(sha)
-        return missing
+        if not shas:
+            return set()
+        output = await self._git(
+            "cat-file",
+            "--batch-check=%(objectname) %(objecttype)",
+            input_text="".join(
+                f"{sha}^{{commit}}\n{sha}^{{tree}}\n" for sha in shas
+            ),
+        )
+        lines = output.splitlines()
+        if len(lines) != 2 * len(shas):
+            raise GitStoreError("Git returned an incomplete commit verification batch")
+        return {
+            sha
+            for index, sha in enumerate(shas)
+            if not lines[2 * index].endswith(" commit")
+            or not lines[2 * index + 1].endswith(" tree")
+        }
 
     async def _available_commit(self, sha: str | None) -> str | None:
         if sha is None:
@@ -720,15 +694,6 @@ def _is_transient_fetch_failure(error: GitStoreError) -> bool:
 
 def _missing_pull_numbers(error: GitStoreError) -> set[int]:
     return {int(number) for number in _MISSING_PULL_REF.findall(str(error))}
-
-
-def _is_unavailable_commit_failure(error: GitStoreError) -> bool:
-    detail = str(error).casefold()
-    return any(marker in detail for marker in _UNAVAILABLE_COMMIT_MARKERS)
-
-
-def _commit_staging_ref(sha: str) -> str:
-    return f"refs/github-archive/staging/commits/{sha}"
 
 
 def _remove_temporary_packs(path: Path) -> None:

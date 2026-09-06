@@ -325,21 +325,41 @@ async def test_upstream_sync_publishes_native_refs_and_pins_removed_tips(tmp_pat
 
 
 @pytest.mark.asyncio
-async def test_structured_commit_retention_pins_fetchable_objects_and_reports_missing(
+async def test_structured_commit_retention_pins_acquired_objects_and_reports_missing(
+    monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     source = tmp_path / "source"
     base, head = _source_repository(source, 1)
     path = git_store_path(tmp_path / "facts.sqlite3")
+    real_command = git_store_module._command
+    commands: list[Sequence[str]] = []
+
+    async def record(command: Sequence[str], **kwargs: Any) -> str:
+        commands.append(command)
+        return await real_command(command, **kwargs)
+
+    monkeypatch.setattr(git_store_module, "_command", record)
     store = GitObjectStore(path, "acme/widgets", str(source))
+    await store.prefetch({7: {"head": {"sha": head}}})
+    commands.clear()
 
     retained = await store.retain_commits((base, head, "f" * 40))
 
     assert retained[base]["status"] == "available"
     assert retained[base]["obtained"] == "existing"
     assert retained[head]["status"] == "available"
-    assert retained[head]["obtained"] == "fetched"
+    assert retained[head]["obtained"] == "existing"
     assert retained["f" * 40]["status"] == "unavailable"
+    checks = [
+        command
+        for command in commands
+        if "cat-file" in command
+        and any(argument.startswith("--batch-check=") for argument in command)
+    ]
+    assert len(checks) == 1
+    assert not any("f" * 40 in argument for command in commands for argument in command)
+    _stored_git(path, "update-ref", "-d", "refs/github-archive/staging/pulls/7/head")
     _git(source, "update-ref", "-d", "refs/pull/7/head")
     for ref in ("refs/heads/main", "refs/tags/v1"):
         _stored_git(path, "update-ref", "-d", ref)
