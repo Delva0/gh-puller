@@ -12,15 +12,14 @@ checkpoint 的重叠边界筛选父对象和评论变更信号。两者均按不
 from __future__ import annotations
 
 import asyncio
-import os
 import re
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlencode
 
-from .client import GitHubAPI, GitHubPage, GitHubResource
+from .client import GitHubResource
 from .commit_references import (
     CommitReference,
     commit_reference_payload,
@@ -30,11 +29,9 @@ from .commit_references import (
 from .errors import GitHubAPIError
 from .git_store import (
     CommitFetchSource,
-    GitObjectStore,
     GitStoreError,
     TransientGitStoreError,
     default_git_url,
-    git_store_path,
 )
 from .locking import archive_lock
 from .observations import (
@@ -51,9 +48,10 @@ from .observations import (
     TaskDraft,
 )
 from .progress import ProgressObserver, _SyncProgressTracker
+from .runtime import GitHubAPIReader, GitHubRuntime, GitObjectWriter
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable, Mapping, Sequence
+    from collections.abc import Awaitable, Callable, Sequence
 
 _NUMBER_AT_END = re.compile(r"/(\d+)$")
 _CATALOG_ACCEPT = "application/vnd.github.raw+json"
@@ -62,167 +60,6 @@ _SHA = re.compile(r"[0-9a-f]{40,64}\Z")
 
 class IncompleteGitHubDataError(RuntimeError):
     """A source response cannot prove the promised collection is complete."""
-
-
-class _API(Protocol):
-    request_count: int
-
-    async def close(self) -> None: ...
-
-    async def get_json_cached(
-        self,
-        path: str,
-        *,
-        previous: Any | None,
-        cache: dict[str, Any] | None,
-        params: dict[str, Any] | None = None,
-        accept: str | None = None,
-    ) -> tuple[Any, dict[str, Any] | None]: ...
-
-    async def get_page(
-        self,
-        path: str,
-        *,
-        params: dict[str, Any] | None = None,
-        accept: str | None = None,
-    ) -> GitHubPage: ...
-
-    async def paginate(
-        self,
-        path: str,
-        *,
-        params: dict[str, Any] | None = None,
-        page_observer: Callable[[int], None] | None = None,
-    ) -> list[dict[str, Any]]: ...
-
-    async def paginate_cached(
-        self,
-        path: str,
-        *,
-        previous: list[dict[str, Any]] | None,
-        cache: dict[str, Any] | None,
-        params: dict[str, Any] | None = None,
-        page_observer: Callable[[int], None] | None = None,
-    ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]: ...
-
-    async def issue_comments(
-        self,
-        owner: str,
-        repo: str,
-        number: int,
-        *,
-        previous: list[dict[str, Any]] | None,
-        cache: dict[str, Any] | None,
-    ) -> GitHubResource: ...
-
-    async def reactions(
-        self,
-        path: str,
-        node_id: str | None,
-        *,
-        previous: list[dict[str, Any]] | None,
-        cache: dict[str, Any] | None,
-    ) -> GitHubResource: ...
-
-    async def issue_relations(
-        self,
-        owner: str,
-        repo: str,
-        number: int,
-    ) -> GitHubResource: ...
-
-    async def pull_request(
-        self,
-        owner: str,
-        repo: str,
-        number: int,
-        *,
-        previous: dict[str, Any] | None,
-        cache: dict[str, Any] | None,
-    ) -> GitHubResource: ...
-
-    async def pull_reviews(
-        self,
-        owner: str,
-        repo: str,
-        number: int,
-        *,
-        previous: list[dict[str, Any]] | None,
-        cache: dict[str, Any] | None,
-    ) -> GitHubResource: ...
-
-    async def pull_review_threads(
-        self,
-        owner: str,
-        repo: str,
-        number: int,
-    ) -> GitHubResource: ...
-
-    async def pull_review_comments(
-        self,
-        owner: str,
-        repo: str,
-        number: int,
-        *,
-        previous: list[dict[str, Any]] | None,
-        cache: dict[str, Any] | None,
-    ) -> GitHubResource: ...
-
-    async def pull_commits(
-        self,
-        owner: str,
-        repo: str,
-        number: int,
-        *,
-        expected: int,
-        base: str,
-        head: str,
-        previous: list[dict[str, Any]] | None,
-        cache: dict[str, Any] | None,
-    ) -> GitHubResource: ...
-
-    async def closing_issue_references(
-        self,
-        owner: str,
-        repo: str,
-        numbers: list[int],
-    ) -> dict[int, list[dict[str, Any]]]: ...
-
-
-class _GitStore(Protocol):
-    async def sync_upstream(
-        self,
-        *,
-        heartbeat: Callable[[], None] | None = None,
-        retry: Callable[[float], None] | None = None,
-    ) -> dict[str, Any]: ...
-
-    async def prefetch(
-        self,
-        pulls: Mapping[int, dict[str, Any]],
-        *,
-        heartbeat: Callable[[], None] | None = None,
-        retry: Callable[[float], None] | None = None,
-        retry_transient: bool = True,
-    ) -> None: ...
-
-    async def capture(
-        self,
-        number: int,
-        pull: dict[str, Any],
-        *,
-        heartbeat: Callable[[], None] | None = None,
-        retry: Callable[[float], None] | None = None,
-    ) -> dict[str, Any]: ...
-
-    async def retain_commits(
-        self,
-        shas: Sequence[str],
-        *,
-        sources: Mapping[str, Sequence[CommitFetchSource]] | None = None,
-        heartbeat: Callable[[], None] | None = None,
-        retry: Callable[[float], None] | None = None,
-    ) -> dict[str, dict[str, Any]]: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -297,28 +134,34 @@ class GitHubSyncer:
         now: 记录实际读取窗口和 cycle 边界的时区时钟。
         sleep: Git 网络重试使用的异步等待函数。
         observer: 不参与事实发布的同步进度接收器。
+        runtime: 与维护流程共享的依赖装配；通常由同步器自行构造。
     """
 
     def __init__(
         self,
         config: GitHubSyncConfig,
         *,
-        api: _API | None = None,
-        git: _GitStore | None = None,
+        api: GitHubAPIReader | None = None,
+        git: GitObjectWriter | None = None,
         now: Callable[[], datetime] = lambda: datetime.now(UTC),
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         observer: ProgressObserver | None = None,
+        runtime: GitHubRuntime | None = None,
     ) -> None:
         self.config = config
-        self._api = api
-        self._git = git
         self._now = now
-        self._sleep = sleep
         self._observer = observer
         self._progress = _SyncProgressTracker(observer, now)
+        self._runtime = runtime or GitHubRuntime(
+            config,
+            api=api,
+            git=git,
+            now=now,
+            sleep=sleep,
+        )
         self._owner, self._repo = config.repository.split("/", 1)
         self._base = f"/repos/{self._owner}/{self._repo}"
-        self._store_lock = asyncio.Lock()
+        self._store_lock = self._runtime.store_lock
 
     async def sync(self) -> SyncResult:
         """Resume or execute one complete discovery-and-observation cycle.
@@ -341,12 +184,12 @@ class GitHubSyncer:
                 ObservationArchive(
                     self.config.destination,
                     self.config.repository,
-                    self._git_destination(),
+                    self._runtime.git_destination,
                 ) as archive,
             ):
                 cycle = await archive.start_cycle(invoked_at)
-                api, owned = self._make_api()
-                git = self._make_git()
+                api, owned = self._runtime.make_api(self._progress.api_progress)
+                git = self._runtime.make_git()
                 request_start = api.request_count
                 self._progress.bind_cycle(
                     cycle.id,
@@ -383,42 +226,10 @@ class GitHubSyncer:
             self._progress.error(exc)
             raise
 
-    def _make_api(self) -> tuple[_API, bool]:
-        if self._api is not None:
-            return self._api, False
-        return (
-            GitHubAPI(
-                token=_token(self.config.token),
-                base_url=self.config.api_url,
-                graphql_url=self.config.graphql_url,
-                api_version=self.config.api_version,
-                timeout=self.config.request_timeout,
-                sleep=self._sleep,
-                now=self._now,
-                progress=self._progress.api_progress,
-            ),
-            True,
-        )
-
-    def _make_git(self) -> _GitStore:
-        if self._git is not None:
-            return self._git
-        return GitObjectStore(
-            self._git_destination(),
-            self.config.repository,
-            self.config.git_url or default_git_url(self.config.repository),
-            token=_token(self.config.token),
-            sleep=self._sleep,
-            now=self._now,
-        )
-
-    def _git_destination(self) -> Path:
-        return self.config.git_destination or git_store_path(self.config.destination)
-
     async def _sync_cycle(
         self,
-        api: _API,
-        git: _GitStore,
+        api: GitHubAPIReader,
+        git: GitObjectWriter,
         archive: ObservationArchive,
         cycle: SyncCycle,
     ) -> None:
@@ -460,7 +271,7 @@ class GitHubSyncer:
 
     async def _prepare_discovery(
         self,
-        api: _API,
+        api: GitHubAPIReader,
         archive: ObservationArchive,
         cycle: SyncCycle,
     ) -> str | None:
@@ -492,7 +303,7 @@ class GitHubSyncer:
 
     async def _comment_signals(
         self,
-        api: _API,
+        api: GitHubAPIReader,
         checkpoint: datetime,
     ) -> tuple[set[int], set[int]]:
         since = _iso_seconds(checkpoint - timedelta(seconds=self.config.overlap_seconds))
@@ -511,8 +322,8 @@ class GitHubSyncer:
 
     async def _drain(
         self,
-        api: _API,
-        git: _GitStore,
+        api: GitHubAPIReader,
+        git: GitObjectWriter,
         archive: ObservationArchive,
         cycle_id: int,
     ) -> None:
@@ -542,8 +353,8 @@ class GitHubSyncer:
 
     async def _guard_task(
         self,
-        api: _API,
-        git: _GitStore,
+        api: GitHubAPIReader,
+        git: GitObjectWriter,
         archive: ObservationArchive,
         task: SyncTask,
     ) -> Exception | None:
@@ -564,7 +375,7 @@ class GitHubSyncer:
 
     async def _guard_pull_git_batch(
         self,
-        git: _GitStore,
+        git: GitObjectWriter,
         archive: ObservationArchive,
         tasks: list[SyncTask],
     ) -> list[Exception | None]:
@@ -598,7 +409,7 @@ class GitHubSyncer:
 
     async def _guard_commit_batch(
         self,
-        git: _GitStore,
+        git: GitObjectWriter,
         archive: ObservationArchive,
         tasks: list[SyncTask],
     ) -> list[Exception | None]:
@@ -747,7 +558,7 @@ class GitHubSyncer:
 
     async def _hydrate_parent(
         self,
-        api: _API,
+        api: GitHubAPIReader,
         archive: ObservationArchive,
         task: SyncTask,
     ) -> None:
@@ -808,7 +619,7 @@ class GitHubSyncer:
 
     async def _issue_fact(
         self,
-        api: _API,
+        api: GitHubAPIReader,
         archive: ObservationArchive,
         task: SyncTask | MaintenanceTask,
         item: DiscoveryItem | None,
@@ -907,7 +718,7 @@ class GitHubSyncer:
 
     async def _issue_timeline(
         self,
-        api: _API,
+        api: GitHubAPIReader,
         archive: ObservationArchive,
         task: SyncTask | MaintenanceTask,
     ) -> FactObservation:
@@ -931,7 +742,7 @@ class GitHubSyncer:
 
     async def _issue_events(
         self,
-        api: _API,
+        api: GitHubAPIReader,
         archive: ObservationArchive,
         task: SyncTask | MaintenanceTask,
     ) -> FactObservation:
@@ -955,7 +766,7 @@ class GitHubSyncer:
 
     async def _issue_comments(
         self,
-        api: _API,
+        api: GitHubAPIReader,
         archive: ObservationArchive,
         task: SyncTask | MaintenanceTask,
         issue_fact: FactObservation,
@@ -995,7 +806,7 @@ class GitHubSyncer:
 
     async def _issue_reactions(
         self,
-        api: _API,
+        api: GitHubAPIReader,
         archive: ObservationArchive,
         task: SyncTask | MaintenanceTask,
         issue_fact: FactObservation,
@@ -1032,7 +843,7 @@ class GitHubSyncer:
 
     async def _comment_reactions(
         self,
-        api: _API,
+        api: GitHubAPIReader,
         archive: ObservationArchive,
         task: SyncTask | MaintenanceTask,
         comments_fact: FactObservation,
@@ -1085,7 +896,7 @@ class GitHubSyncer:
 
     async def _pull_facts(
         self,
-        api: _API,
+        api: GitHubAPIReader,
         archive: ObservationArchive,
         task: SyncTask,
         *,
@@ -1125,7 +936,7 @@ class GitHubSyncer:
 
     async def _pull_detail(
         self,
-        api: _API,
+        api: GitHubAPIReader,
         archive: ObservationArchive,
         task: SyncTask | MaintenanceTask,
     ) -> FactObservation:
@@ -1149,7 +960,7 @@ class GitHubSyncer:
 
     async def _pull_reviews(
         self,
-        api: _API,
+        api: GitHubAPIReader,
         archive: ObservationArchive,
         task: SyncTask | MaintenanceTask,
     ) -> FactObservation:
@@ -1173,7 +984,7 @@ class GitHubSyncer:
 
     async def _review_threads(
         self,
-        api: _API,
+        api: GitHubAPIReader,
         archive: ObservationArchive,
         task: SyncTask | MaintenanceTask,
     ) -> FactObservation:
@@ -1237,7 +1048,7 @@ class GitHubSyncer:
 
     async def _review_comments(
         self,
-        api: _API,
+        api: GitHubAPIReader,
         archive: ObservationArchive,
         task: SyncTask | MaintenanceTask,
         detail: FactObservation,
@@ -1292,7 +1103,7 @@ class GitHubSyncer:
 
     async def _pull_commits(
         self,
-        api: _API,
+        api: GitHubAPIReader,
         archive: ObservationArchive,
         task: SyncTask | MaintenanceTask,
         detail: FactObservation,
@@ -1337,7 +1148,7 @@ class GitHubSyncer:
 
     async def _requested_reviewers(
         self,
-        api: _API,
+        api: GitHubAPIReader,
         archive: ObservationArchive,
         task: SyncTask | MaintenanceTask,
         detail: FactObservation,
@@ -1376,7 +1187,7 @@ class GitHubSyncer:
 
     async def _issue_relations(
         self,
-        api: _API,
+        api: GitHubAPIReader,
         archive: ObservationArchive,
         task: SyncTask | MaintenanceTask,
     ) -> FactObservation:
@@ -1671,7 +1482,7 @@ class GitHubSyncer:
 
     async def _closing_issues(
         self,
-        api: _API,
+        api: GitHubAPIReader,
         archive: ObservationArchive,
         task: SyncTask | MaintenanceTask,
         numbers: Sequence[int] | None = None,
@@ -1763,7 +1574,7 @@ class GitHubSyncer:
 
     async def _git_refs(
         self,
-        git: _GitStore,
+        git: GitObjectWriter,
         archive: ObservationArchive,
         task: SyncTask | MaintenanceTask,
     ) -> FactObservation:
@@ -1849,7 +1660,7 @@ class GitHubSyncer:
 
     async def _prefetch_git(
         self,
-        git: _GitStore,
+        git: GitObjectWriter,
         tasks: list[SyncTask],
     ) -> None:
         for offset in range(0, len(tasks), self.config.git_batch_size):
@@ -1860,7 +1671,7 @@ class GitHubSyncer:
 
     async def _prefetch_git_group(
         self,
-        git: _GitStore,
+        git: GitObjectWriter,
         tasks: list[SyncTask],
     ) -> None:
         pulls = {_task_number(task): _object(task.payload.get("pull"), task.task_key) for task in tasks}
@@ -1880,7 +1691,7 @@ class GitHubSyncer:
 
     async def _pull_git(
         self,
-        git: _GitStore,
+        git: GitObjectWriter,
         archive: ObservationArchive,
         task: SyncTask | MaintenanceTask,
         pull: dict[str, Any] | None = None,
@@ -2089,7 +1900,7 @@ class GitHubSyncer:
 
 
 async def _paginate_resource(
-    api: _API,
+    api: GitHubAPIReader,
     path: str,
     previous: list[dict[str, Any]] | None,
     cache: dict[str, Any] | None,
@@ -2103,7 +1914,7 @@ async def _paginate_resource(
 
 
 async def _object_resource(
-    api: _API,
+    api: GitHubAPIReader,
     path: str,
     previous: dict[str, Any] | None,
     cache: dict[str, Any] | None,
@@ -2344,8 +2155,3 @@ def _stored_time(value: str) -> datetime:
 
 def _iso_seconds(value: datetime) -> str:
     return _utc(value).isoformat(timespec="seconds").replace("+00:00", "Z")
-
-
-def _token(configured: str | None) -> str | None:
-    value = configured if configured is not None else os.getenv("GH_TOKEN") or os.getenv("GITHUB_TOKEN")
-    return value or None

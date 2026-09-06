@@ -45,6 +45,7 @@ from .observations import (
     TaskDraft,
 )
 from .progress import _SyncProgressTracker
+from .runtime import GitHubRuntime
 from .syncer import (
     GitHubSyncConfig,
     GitHubSyncer,
@@ -99,12 +100,18 @@ class GitHubMaintainer:
     ) -> None:
         self.config = config
         self._now = now
-        self._syncer = GitHubSyncer(
+        self._runtime = GitHubRuntime(
             config,
             api=api,
             git=git,
             now=now,
+            sleep=asyncio.sleep,
+        )
+        self._syncer = GitHubSyncer(
+            config,
+            now=now,
             observer=observer,
+            runtime=self._runtime,
         )
         self._observer = observer
 
@@ -145,7 +152,7 @@ class GitHubMaintainer:
             ObservationArchive(
                 self.config.destination,
                 self.config.repository,
-                self._syncer._git_destination(),
+                self._runtime.git_destination,
             ) as archive,
         ):
             active = await archive.active_maintenance_job()
@@ -229,7 +236,7 @@ class GitHubMaintainer:
             ObservationArchive(
                 self.config.destination,
                 self.config.repository,
-                self._syncer._git_destination(),
+                self._runtime.git_destination,
             ) as archive,
         ):
             active = await archive.active_maintenance_job()
@@ -636,8 +643,8 @@ class GitHubMaintainer:
         progress = _SyncProgressTracker(self._observer, self._now)
         self._syncer._progress = progress
         progress.start()
-        api, owned = self._syncer._make_api()
-        git = self._syncer._make_git()
+        api, owned = self._runtime.make_api(progress.api_progress)
+        git = self._runtime.make_git()
         request_start = api.request_count
         accounted_at = request_start
         progress.bind_maintenance(job.id, job.request_count, request_start)
