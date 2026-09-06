@@ -10,6 +10,7 @@ import pytest
 
 import gh_puller.github.git_store as git_store_module
 from gh_puller.github.git_store import (
+    CommitFetchSource,
     GitObjectStore,
     GitStoreError,
     TransientGitStoreError,
@@ -77,6 +78,29 @@ def _stored_git(path: Path, *arguments: str) -> str:
 
 def _is_fetch(command: Sequence[str]) -> bool:
     return len(command) > 3 and command[1] == "--git-dir" and command[3] == "fetch"
+
+
+def _remove_loose_object(path: Path, oid: str) -> None:
+    object_path = path / "objects" / oid[:2] / oid[2:]
+    assert object_path.is_file()
+    object_path.unlink()
+
+
+def test_git_token_is_scoped_to_the_managed_origin(tmp_path: Path) -> None:
+    remote = "https://github.example/acme/widgets.git"
+    token = f"{tmp_path.name}-token"
+    store = GitObjectStore(
+        tmp_path / "facts.sqlite3.git",
+        "acme/widgets",
+        remote,
+        token=token,
+    )
+
+    environment = store._environment()
+
+    assert environment["GIT_CONFIG_KEY_1"] == f"http.{remote}.extraHeader"
+    assert environment["GIT_CONFIG_VALUE_1"].startswith("Authorization: Basic ")
+    assert token not in environment["GIT_CONFIG_VALUE_1"]
 
 
 @pytest.mark.asyncio
@@ -354,10 +378,9 @@ async def test_structured_commit_retention_pins_acquired_objects_and_reports_mis
     checks = [
         command
         for command in commands
-        if "cat-file" in command
-        and any(argument.startswith("--batch-check=") for argument in command)
+        if "cat-file" in command and any(argument.startswith("--batch-check=") for argument in command)
     ]
-    assert len(checks) == 1
+    assert len(checks) == 3
     assert not any("f" * 40 in argument for command in commands for argument in command)
     _stored_git(path, "update-ref", "-d", "refs/github-archive/staging/pulls/7/head")
     _git(source, "update-ref", "-d", "refs/pull/7/head")
@@ -368,6 +391,201 @@ async def test_structured_commit_retention_pins_acquired_objects_and_reports_mis
 
     assert _stored_git(path, "cat-file", "-t", retained[head]["ref"]) == "commit"
     assert _stored_git(path, "show", f"{retained[head]['ref']}:changes/0000.txt") == "0"
+    assert _stored_git(path, "rev-list", retained[head]["ref"]).splitlines() == [
+        head,
+        base,
+    ]
+    assert _stored_git(path, "diff", "--name-only", base, retained[head]["ref"]) == ("changes/0000.txt")
+    assert retained[head]["verification"]["snapshot"]["status"] == "complete"
+    assert retained[head]["verification"]["history"]["status"] == "complete"
+
+
+@pytest.mark.asyncio
+async def test_structured_commit_is_fetched_from_its_known_pull_ref(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    _, head = _source_repository(source, 1)
+    path = git_store_path(tmp_path / "facts.sqlite3")
+    real_command = git_store_module._command
+    commands: list[Sequence[str]] = []
+
+    async def record(command: Sequence[str], **kwargs: Any) -> str:
+        commands.append(command)
+        return await real_command(command, **kwargs)
+
+    monkeypatch.setattr(git_store_module, "_command", record)
+    store = GitObjectStore(path, "acme/widgets", str(source))
+    source_ref = CommitFetchSource(
+        "pull-ref",
+        str(source),
+        "refs/pull/7/head",
+        "acme/widgets",
+        7,
+    )
+
+    retained = await store.retain_commits((head,), sources={head: (source_ref,)})
+
+    assert retained[head]["status"] == "available"
+    assert retained[head]["obtained"] == "pull-ref"
+    assert retained[head]["attempts"][-1]["ref"] == "refs/pull/7/head"
+    assert retained[head]["attempts"][-1]["outcome"] == "available"
+    assert not any("+refs/heads/*:refs/heads/*" in command for command in commands)
+
+
+@pytest.mark.asyncio
+async def test_unavailable_known_pull_ref_can_be_retried_after_it_appears(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    _, head = _source_repository(source, 1)
+    _git(source, "update-ref", "-d", "refs/pull/7/head")
+    path = git_store_path(tmp_path / "facts.sqlite3")
+    store = GitObjectStore(path, "acme/widgets", str(source))
+    source_ref = CommitFetchSource(
+        "pull-ref",
+        str(source),
+        "refs/pull/7/head",
+        "acme/widgets",
+        7,
+    )
+
+    missing = await store.retain_commits((head,), sources={head: (source_ref,)})
+    _git(source, "update-ref", "refs/pull/7/head", head)
+    retained = await store.retain_commits((head,), sources={head: (source_ref,)})
+
+    assert missing[head]["status"] == "unavailable"
+    assert missing[head]["attempts"][-1]["outcome"] == "unavailable"
+    pull_attempt = next(attempt for attempt in missing[head]["attempts"] if attempt["kind"] == "pull-ref")
+    assert "couldn't find remote ref" in pull_attempt["error"]
+    assert retained[head]["status"] == "available"
+
+
+@pytest.mark.asyncio
+async def test_known_source_authentication_failure_remains_retryable(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    _, head = _source_repository(source, 1)
+    path = git_store_path(tmp_path / "facts.sqlite3")
+    source_ref = CommitFetchSource(
+        "pull-ref",
+        str(source),
+        "refs/pull/7/head",
+        "acme/widgets",
+        7,
+    )
+    real_command = git_store_module._command
+
+    async def rejected(command: Sequence[str], **kwargs: Any) -> str:
+        if _is_fetch(command) and any("refs/pull/7/head" in value for value in command):
+            raise GitStoreError("git fetch failed: fatal: Authentication failed")
+        return await real_command(command, **kwargs)
+
+    monkeypatch.setattr(git_store_module, "_command", rejected)
+    store = GitObjectStore(path, "acme/widgets", str(source))
+
+    with pytest.raises(GitStoreError, match="Authentication failed") as caught:
+        await store.retain_commits((head,), sources={head: (source_ref,)})
+    assert "pull-ref acme/widgets refs/pull/7/head" in str(caught.value)
+
+
+@pytest.mark.asyncio
+async def test_verification_distinguishes_snapshot_from_missing_parent_history(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    base, head = _source_repository(source, 1)
+    path = git_store_path(tmp_path / "facts.sqlite3")
+    store = GitObjectStore(path, "acme/widgets", str(source))
+    await store.prefetch({7: {"head": {"sha": head}}})
+    _remove_loose_object(path, base)
+
+    async def unchanged(**_: Any) -> None:
+        return None
+
+    monkeypatch.setattr(store, "_sync_upstream", unchanged)
+
+    retained = await store.retain_commits((head,))
+
+    assert retained[head]["status"] == "partial"
+    assert retained[head]["verification"]["endpoint"]["status"] == "complete"
+    assert retained[head]["verification"]["snapshot"]["status"] == "complete"
+    assert retained[head]["verification"]["history"]["status"] == "partial"
+
+
+@pytest.mark.asyncio
+async def test_incomplete_closure_tries_a_known_source(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    base, head = _source_repository(source, 1)
+    path = git_store_path(tmp_path / "facts.sqlite3")
+    store = GitObjectStore(path, "acme/widgets", str(source))
+    await store.prefetch({7: {"head": {"sha": head}}})
+    _remove_loose_object(path, base)
+    pull_source = CommitFetchSource(
+        "pull-ref",
+        str(source),
+        "refs/pull/7/head",
+        "acme/widgets",
+        7,
+    )
+
+    retained = await store.retain_commits(
+        (head,),
+        sources={head: (pull_source,)},
+    )
+
+    assert [attempt["kind"] for attempt in retained[head]["attempts"]] == [
+        "managed-store",
+        "pull-ref",
+    ]
+    assert retained[head]["attempts"][0]["outcome"] == "partial"
+    assert retained[head]["attempts"][1]["outcome"] == "available"
+    assert retained[head]["status"] == "available"
+
+
+@pytest.mark.asyncio
+async def test_verification_rejects_a_snapshot_with_a_missing_blob(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    _, head = _source_repository(source, 1)
+    blob = _git(source, "rev-parse", f"{head}:changes/0000.txt")
+    path = git_store_path(tmp_path / "facts.sqlite3")
+    store = GitObjectStore(path, "acme/widgets", str(source))
+    await store.prefetch({7: {"head": {"sha": head}}})
+    _remove_loose_object(path, blob)
+
+    retained = await store.retain_commits((head,))
+
+    assert retained[head]["status"] == "partial"
+    assert retained[head]["verification"]["snapshot"]["status"] == "partial"
+    assert retained[head]["verification"]["history"]["status"] == "partial"
+
+
+@pytest.mark.asyncio
+async def test_verification_does_not_publish_operational_git_failures(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    _, head = _source_repository(source, 1)
+    store = GitObjectStore(
+        git_store_path(tmp_path / "facts.sqlite3"),
+        "acme/widgets",
+        str(source),
+    )
+    await store.prefetch({7: {"head": {"sha": head}}})
+    real_command = git_store_module._command
+
+    async def denied(command: Sequence[str], **kwargs: Any) -> str:
+        if len(command) > 3 and command[3] == "rev-list":
+            raise GitStoreError("git rev-list failed: Permission denied")
+        return await real_command(command, **kwargs)
+
+    monkeypatch.setattr(git_store_module, "_command", denied)
+
+    with pytest.raises(GitStoreError, match="Permission denied"):
+        await store.retain_commits((head,))
 
 
 @pytest.mark.asyncio
@@ -441,10 +659,7 @@ async def test_same_commit_can_belong_to_multiple_pull_requests(tmp_path: Path) 
     _git(source, "update-ref", "refs/pull/8/head", head)
     path = git_store_path(tmp_path / "facts.sqlite3")
     store = GitObjectStore(path, "acme/widgets", str(source))
-    pulls = {
-        number: {"base": {"sha": base}, "head": {"sha": head}, "merged": False}
-        for number in (7, 8)
-    }
+    pulls = {number: {"base": {"sha": base}, "head": {"sha": head}, "merged": False} for number in (7, 8)}
 
     await store.prefetch(pulls)
     snapshots = {number: await store.capture(number, pull) for number, pull in pulls.items()}
@@ -518,8 +733,7 @@ async def test_git_fetch_retries_transient_transport_failures(
             if attempts <= 7:
                 failed_pack.write_bytes(b"incomplete")
                 raise GitStoreError(
-                    "git fetch failed: gnutls_handshake() failed: "
-                    "Error decoding the received TLS packet.",
+                    "git fetch failed: gnutls_handshake() failed: Error decoding the received TLS packet.",
                 )
         return await real_command(command, **kwargs)
 

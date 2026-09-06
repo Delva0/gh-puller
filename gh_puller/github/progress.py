@@ -1,7 +1,7 @@
-"""提供不参与事实发布的 GitHub 同步进度事件与控制台呈现。
+"""提供不参与事实发布的 GitHub 操作进度事件与控制台呈现。
 
 进度是可丢弃的带外信号；SQLite 中的 cycle、任务和观测才是恢复依据。API 客户端
-在响应、重试和限流等待时更新配额，syncer 负责阶段与 Git 心跳。
+在响应、重试和限流等待时更新配额，执行器负责阶段与 Git 心跳。
 """
 
 from __future__ import annotations
@@ -42,6 +42,7 @@ class SyncProgress:
     event_at: datetime
     phase: str
     cycle_id: int | None = None
+    maintenance_job_id: int | None = None
     checkpoint_from: datetime | None = None
     requests: int = 0
     quotas: tuple[RateQuota, ...] = ()
@@ -69,7 +70,7 @@ class _SyncProgressTracker:
     def start(self) -> None:
         self._emit()
 
-    def bind(
+    def bind_cycle(
         self,
         cycle_id: int,
         checkpoint_from: datetime | None,
@@ -80,7 +81,23 @@ class _SyncProgressTracker:
         self._api_start = api_start
         self._emit(
             cycle_id=cycle_id,
+            maintenance_job_id=None,
             checkpoint_from=checkpoint_from,
+            requests=carried_requests,
+        )
+
+    def bind_maintenance(
+        self,
+        job_id: int,
+        carried_requests: int,
+        api_start: int,
+    ) -> None:
+        self._carried_requests = carried_requests
+        self._api_start = api_start
+        self._emit(
+            cycle_id=None,
+            maintenance_job_id=job_id,
+            checkpoint_from=None,
             requests=carried_requests,
         )
 
@@ -203,10 +220,12 @@ def _tty_line(progress: SyncProgress) -> str:
     )
     wait = "" if progress.wait_seconds is None else f" wait={progress.wait_seconds:.1f}s"
     detail = "" if progress.detail is None else f" {progress.detail}"
-    return (
-        f"{progress.phase} cycle={_count(progress.cycle_id)} "
-        f"requests={progress.requests:,} quota={quota or '?'}{wait}{detail}"
+    operation = (
+        f"job={progress.maintenance_job_id}"
+        if progress.maintenance_job_id is not None
+        else f"cycle={_count(progress.cycle_id)}"
     )
+    return f"{progress.phase} {operation} requests={progress.requests:,} quota={quota or '?'}{wait}{detail}"
 
 
 def _json_event(progress: SyncProgress) -> dict[str, Any]:

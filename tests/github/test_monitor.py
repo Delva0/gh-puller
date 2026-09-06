@@ -41,6 +41,7 @@ def _progress(**changes: object) -> monitor.ProgressState:
         "event_at": _EVENT_AT,
         "phase": "fetching",
         "cycle_id": 3,
+        "maintenance_job_id": None,
         "checkpoint_from": _EVENT_AT - timedelta(hours=1),
         "requests": 41,
         "quotas": (
@@ -75,6 +76,7 @@ def _archive(database: Path) -> monitor.ArchiveState:
         latest=("issue-comments", "issue:42", _EVENT_AT),
         updated_at=_EVENT_AT,
         last_error=None,
+        maintenance=None,
     )
 
 
@@ -222,6 +224,52 @@ async def test_archive_progress_is_recovered_without_journal(tmp_path: Path) -> 
     assert (state.observations, state.current_facts) == (1, 1)
     assert state.last_error == "GitHubAPIError: transient"
     assert state.latest is not None and state.latest[:2] == ("issue", "issue:1")
+
+
+@pytest.mark.asyncio
+async def test_detail_recovers_active_maintenance_progress_from_sqlite(tmp_path: Path) -> None:
+    database = tmp_path / "facts.sqlite3"
+    async with ObservationArchive(database, "acme/widgets") as archive:
+        job = await archive.start_maintenance_job(
+            "backfill:test",
+            "backfill",
+            _EVENT_AT,
+            {"operation": "test"},
+            (
+                TaskDraft(
+                    "batch:1",
+                    "commit-object-batch",
+                    "commits:x",
+                    {"observation_cutoff": 0, "shas": ["a" * 40]},
+                ),
+            ),
+        )
+        (task,) = await archive.take_maintenance_tasks(job.id, 1, _EVENT_AT)
+        await archive.record_maintenance_task_error(
+            task.id,
+            _EVENT_AT + timedelta(seconds=2),
+            "GitStoreError: disconnected",
+        )
+
+    archive, error = monitor._archive_state(database)
+    assert error is None
+    assert archive is not None and archive.maintenance is not None
+    assert archive.maintenance.kind == "backfill"
+    assert archive.maintenance.last_error == "GitStoreError: disconnected"
+    status = monitor.WriterStatus(
+        _writer(database),
+        monitor.ServiceState("inactive", "dead", 0, 0),
+        None,
+        archive,
+    )
+
+    output = monitor._render_detail(status, now=_EVENT_AT + timedelta(seconds=3), zone=_LOCAL)
+
+    assert "MAINT       1 backfill active" in output
+    assert "M TASKS     tasks [--------------------] 0/1" in output
+    assert "M OUTCOMES  pending" in output
+    assert "PHASE       backfill" in output
+    assert "DETAIL      GitStoreError: disconnected" in output
 
 
 def test_managed_writers_accept_database_or_short_identity(tmp_path: Path) -> None:

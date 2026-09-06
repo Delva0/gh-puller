@@ -272,6 +272,108 @@ async def test_cycle_resumes_pages_and_tasks_without_hiding_published_facts(
 
 
 @pytest.mark.asyncio
+async def test_maintenance_job_resumes_errors_and_publishes_without_advancing_discovery(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "facts.sqlite3"
+    tasks = (
+        TaskDraft("1:threads:7", "pull-review-threads", "pull:7", {"number": 7}, 7),
+        TaskDraft("2:relations:8", "issue-relations", "issue:8", {"number": 8}, 8),
+    )
+    scope = {"families": ["pull-review-threads", "issue-relations"], "targets": [7, 8]}
+
+    async with ObservationArchive(database, _REPOSITORY) as archive:
+        cycle = await archive.start_cycle(_T0)
+        job = await archive.start_maintenance_job(
+            "refresh:first",
+            "refresh",
+            _T0 + timedelta(minutes=1),
+            scope,
+            tasks,
+        )
+        claimed = await archive.take_maintenance_tasks(
+            job.id,
+            1,
+            _T0 + timedelta(minutes=2),
+        )
+        await archive.record_maintenance_task_error(
+            claimed[0].id,
+            _T0 + timedelta(minutes=3),
+            "RuntimeError: disconnected",
+        )
+
+    async with ObservationArchive(database, _REPOSITORY) as archive:
+        resumed = await archive.active_maintenance_job()
+        assert resumed is not None and resumed.id == job.id
+        claimed = await archive.take_maintenance_tasks(
+            resumed.id,
+            2,
+            _T0 + timedelta(minutes=4),
+        )
+        assert [(task.task_key, task.attempts) for task in claimed] == [
+            ("1:threads:7", 2),
+            ("2:relations:8", 1),
+        ]
+        first = await archive.publish(
+            "maintenance:1:threads:7",
+            "refresh",
+            _T0 + timedelta(minutes=5),
+            (
+                _fact(
+                    "pull-review-threads",
+                    "pull:7",
+                    _T0 + timedelta(minutes=5),
+                    {"threads": []},
+                ),
+            ),
+            maintenance_task_id=claimed[0].id,
+        )
+        assert first[0].maintenance_job_id == resumed.id
+        assert first[0].maintenance_task_id == claimed[0].id
+        await archive.complete_maintenance_task(
+            claimed[0].id,
+            _T0 + timedelta(minutes=5),
+            Coverage.COMPLETE,
+        )
+        assert await archive.discovery_checkpoint() is None
+        await archive.publish(
+            "maintenance:1:relations:8",
+            "refresh",
+            _T0 + timedelta(minutes=6),
+            (
+                _fact(
+                    "issue-relations",
+                    "issue:8",
+                    _T0 + timedelta(minutes=6),
+                    {"members": []},
+                    resource_number=8,
+                ),
+            ),
+            maintenance_task_id=claimed[1].id,
+        )
+        await archive.complete_maintenance_task(
+            claimed[1].id,
+            _T0 + timedelta(minutes=6),
+            Coverage.COMPLETE,
+        )
+        completed = await archive.maintenance_job(resumed.id)
+        assert (completed.status, completed.completed_tasks, completed.total_tasks) == (
+            "complete",
+            2,
+            2,
+        )
+        assert await archive.active_cycle() == cycle
+        next_job = await archive.start_maintenance_job(
+            "refresh:second",
+            "refresh",
+            _T0 + timedelta(minutes=7),
+            scope,
+            tasks,
+        )
+        assert next_job.id != completed.id
+
+
+@pytest.mark.asyncio
 async def test_discovery_page_and_task_definition_are_transactional(tmp_path: Path) -> None:
     database = tmp_path / "facts.sqlite3"
     first = TaskDraft("issue:7", "issue", "issue:7", {"number": 7}, 7)

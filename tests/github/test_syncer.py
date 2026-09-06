@@ -87,20 +87,12 @@ async def test_cold_sync_publishes_independent_lossless_issue_facts(tmp_path: Pa
     assert result.cycle_id == 1
     assert result.started_at == result.completed_at == _T0
     assert result.discovered_items == 1
-    catalog = next(
-        call
-        for call in api.calls
-        if call[0] == "page" and call[1] == f"{_BASE}/issues"
-    )
+    catalog = next(call for call in api.calls if call[0] == "page" and call[1] == f"{_BASE}/issues")
     assert catalog[2] is not None
     assert catalog[2]["sort"] == "created"
     assert catalog[2]["direction"] == "asc"
     assert "since" not in catalog[2]
-    current = {
-        fact.family: fact
-        async for fact in iter_current_facts(database)
-        if fact.resource_number == 7
-    }
+    current = {fact.family: fact async for fact in iter_current_facts(database) if fact.resource_number == 7}
     assert {
         "issue",
         "issue-comments",
@@ -200,11 +192,7 @@ async def test_warm_sync_combines_root_and_comment_signals_without_full_scan(
     result = await syncer.sync()
 
     assert result.checkpoint_from == _T0
-    catalog = next(
-        call
-        for call in api.calls
-        if call[0] == "page" and call[1] == f"{_BASE}/issues"
-    )
+    catalog = next(call for call in api.calls if call[0] == "page" and call[1] == f"{_BASE}/issues")
     assert catalog[2] is not None
     assert catalog[2]["sort"] == "created"
     assert catalog[2]["direction"] == "asc"
@@ -260,10 +248,7 @@ async def test_created_order_keeps_warm_candidates_stable_across_pages(
     api.on_request = move_first_item_after_page_one
     await _syncer(database, api, git, clock).sync()
 
-    current = {
-        fact.resource_number: fact
-        async for fact in iter_current_facts(database, family="issue")
-    }
+    current = {fact.resource_number: fact async for fact in iter_current_facts(database, family="issue")}
     assert set(current) == set(range(2, 103))
     assert current[2].payload["value"]["updated_at"] == _iso(changed_at)
 
@@ -313,9 +298,7 @@ async def test_pull_git_and_closing_relations_keep_batched_throughput(tmp_path: 
     assert sum(fact.family == "pull-git" for fact in current) == 9
     assert sum(fact.family == "pull-closing-issues" for fact in current) == 9
     assert all(
-        fact.coverage is Coverage.COMPLETE
-        for fact in current
-        if fact.family in {"pull-git", "pull-closing-issues"}
+        fact.coverage is Coverage.COMPLETE for fact in current if fact.family in {"pull-git", "pull-closing-issues"}
     )
 
 
@@ -326,6 +309,14 @@ async def test_structured_commit_sources_are_retained_and_traceable(tmp_path: Pa
     git = FakeGitStore()
     api.add_issue(2, pull=True)
     api.json[f"{_BASE}/pulls/2"] = _pull_detail(2, commits=1) | {
+        "head": {
+            "sha": f"{2:040x}",
+            "ref": "feature",
+            "repo": {
+                "full_name": "alice/widgets",
+                "html_url": "https://github.example/alice/widgets",
+            },
+        },
         "review_comments": 1,
     }
     api.pages[f"{_BASE}/pulls/2/commits"] = [
@@ -366,20 +357,54 @@ async def test_structured_commit_sources_are_retained_and_traceable(tmp_path: Pa
 
     retained = {sha for batch in git.retentions for sha in batch}
     assert retained == {"1" * 40, "c" * 40, "d" * 40, "e" * 40, "f" * 40}
-    references = [
-        fact
-        async for fact in iter_current_facts(database, family="commit-references")
-    ]
-    assert {
-        reference["sha"]
-        for fact in references
-        for reference in fact.payload["references"]
-    } == retained
+    references = [fact async for fact in iter_current_facts(database, family="commit-references")]
+    assert {reference["sha"] for fact in references for reference in fact.payload["references"]} == retained
     objects = [fact async for fact in iter_current_facts(database, family="commit-object")]
-    assert {fact.subject_key for fact in objects} == {
-        f"commit:{sha}" for sha in retained
-    }
+    assert {fact.subject_key for fact in objects} == {f"commit:{sha}" for sha in retained}
     assert all(fact.coverage is Coverage.COMPLETE for fact in objects)
+    reference_ids = {fact.id for fact in references}
+    assert all(set(fact.payload["reference_scope"]["observation_ids"]) <= reference_ids for fact in objects)
+    sources = {source for batch in git.retention_sources for selected in batch.values() for source in selected}
+    assert {(source.kind, source.remote_ref) for source in sources} == {
+        ("pull-ref", "refs/pull/2/head"),
+        ("repository-ref", "refs/heads/feature"),
+    }
+
+
+@pytest.mark.asyncio
+async def test_shared_commit_sources_from_multiple_parents_do_not_conflict(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "facts.sqlite3"
+    api = FakeAPI()
+    git = FakeGitStore()
+    sha = "c" * 40
+    for number in (2, 3):
+        api.add_issue(number, pull=True)
+        api.json[f"{_BASE}/pulls/{number}"] = _pull_detail(number, commits=1)
+        api.pages[f"{_BASE}/pulls/{number}/commits"] = [
+            {"sha": sha, "commit": {"message": "shared"}},
+        ]
+
+    await _syncer(
+        database,
+        api,
+        git,
+        Clock(_T0),
+        concurrency=16,
+    ).sync()
+
+    assert {value for batch in git.retentions for value in batch} == {sha}
+    references = [
+        fact async for fact in iter_observations(database, family="commit-references") if fact.payload["references"]
+    ]
+    objects = [fact async for fact in iter_observations(database, family="commit-object")]
+    assert {fact.resource_number for fact in references} == {2, 3}
+    assert len(objects) == 2
+    assert all(
+        set(fact.payload["reference_scope"]["observation_ids"]) == {reference.id for reference in references}
+        for fact in objects
+    )
 
 
 @pytest.mark.asyncio
@@ -428,11 +453,7 @@ async def test_catalog_cursor_survives_failure_before_next_page(tmp_path: Path) 
 
     await syncer.sync()
 
-    catalog_calls = [
-        call
-        for call in api.calls
-        if call[0] == "page" and call[1] == f"{_BASE}/issues"
-    ]
+    catalog_calls = [call for call in api.calls if call[0] == "page" and call[1] == f"{_BASE}/issues"]
     assert len(catalog_calls) == 2
     assert sum(call[1] == f"{_BASE}/issues/1/timeline" for call in api.calls) == 1
     assert sum(call[1] == f"{_BASE}/issues/1/events" for call in api.calls) == 2
@@ -494,11 +515,7 @@ async def test_random_churn_and_failures_converge_for_every_discovered_parent(
                 next_comment += 1
             api.json[f"{_BASE}/issues/{number}"]["comments"] = len(comments)
 
-        pulls = [
-            number
-            for number in active
-            if "pull_request" in api.json[f"{_BASE}/issues/{number}"]
-        ]
+        pulls = [number for number in active if "pull_request" in api.json[f"{_BASE}/issues/{number}"]]
         review_parents = set(randomizer.sample(pulls, min(3, len(pulls))))
         touched.update(review_parents)
         for number in review_parents:
@@ -535,17 +552,12 @@ async def test_random_churn_and_failures_converge_for_every_discovered_parent(
         async with ObservationArchive(database, "acme/widgets") as archive:
             assert await archive.discovery_checkpoint() == clock.current
 
-        current = {
-            (fact.family, fact.subject_key): fact
-            async for fact in iter_current_facts(database)
-        }
+        current = {(fact.family, fact.subject_key): fact async for fact in iter_current_facts(database)}
         for number in active:
             issue = api.json[f"{_BASE}/issues/{number}"]
             assert current[("issue", f"issue:{number}")].payload["value"] == issue
             expected_comments = api.pages.get(f"{_BASE}/issues/{number}/comments", [])
-            actual_comments = current[
-                ("issue-comments", f"issue:{number}")
-            ].payload["value"]
+            actual_comments = current[("issue-comments", f"issue:{number}")].payload["value"]
             assert len(actual_comments) == len(expected_comments)
             assert all(
                 {key: actual[key] for key in expected} == expected
@@ -570,9 +582,12 @@ async def test_random_churn_and_failures_converge_for_every_discovered_parent(
             """,
         ).fetchone()
         assert duplicate is None
-        assert connection.execute(
-            "SELECT COUNT(*) FROM sync_cycles WHERE status != 'complete'",
-        ).fetchone()[0] == 0
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM sync_cycles WHERE status != 'complete'",
+            ).fetchone()[0]
+            == 0
+        )
 
 
 def _add_random_parent(

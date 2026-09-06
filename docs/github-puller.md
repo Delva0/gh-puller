@@ -104,8 +104,8 @@ complete data must filter `coverage` explicitly.
 
 ## Archived facts
 
-When an Issue or PR is selected, the writer observes every applicable supported
-family rather than only the signal that selected it:
+When normal discovery selects an Issue or PR, the writer observes every applicable
+supported family rather than only the signal that selected it:
 
 | Families | Archived evidence |
 | --- | --- |
@@ -118,7 +118,7 @@ family rather than only the signal that selected it:
 | `pull-review-comment-reactions`, `pull-requested-reviewers` | Review-comment reactions and requested users/teams. |
 | `pull-commits`, `pull-closing-issues` | Ordered PR commits and Issues that GitHub says the PR closes. |
 | `pull-git` | Retained base/head/comparison/landing Git evidence for one PR observation. |
-| `commit-references`, `commit-object` | Exact structured commit-field paths and verified Git-object availability. |
+| `commit-references`, `commit-object` | Exact structured commit-field paths, acquisition attempts, retention refs, and layered Git reconstruction checks. |
 | `git-refs` | Native branch/tag map, default branch, and symbolic `HEAD`. |
 
 `catalog-item` may occur in explicitly imported archives to preserve a source catalog
@@ -240,6 +240,88 @@ operation has equivalent REST and GraphQL implementations, the client chooses us
 their latest known relative capacity and tries the other transport when appropriate.
 Transport-specific operations remain on their required quota.
 
+## Explicit refresh and backfill
+
+Maintenance jobs read declared sources without changing discovery checkpoint `W`.
+They are useful when a research sample must be current despite having no discovery
+signal, or when a finite published history needs a new verification baseline.
+
+```mermaid
+flowchart TD
+    Request["Declare targets and fact families"] --> Scope["Persist immutable job scope and tasks"]
+    Scope --> Work["Claim pending tasks"]
+    Work --> Read["Read API or verify Git"]
+    Read --> Publish["Atomically append closed facts"]
+    Publish --> Done{"All tasks have outcomes?"}
+    Done -- "no" --> Work
+    Done -- "yes" --> Close["Close job; leave W unchanged"]
+    Read -- "retryable failure" --> Error["Persist attempt and error"]
+    Error --> Work
+```
+
+Only one maintenance job is active per archive. Its scope, task population, attempts,
+errors, outcomes, and request count are durable. A process restart resumes pending
+tasks. A fact published before interruption is recognized by its publication key and
+is not reread; a retryable failure publishes no substitute fact and therefore cannot
+overwrite the last successful observation.
+
+An optional caller idempotency key names one exact request. Reusing it resumes or
+returns that job. Without a key, a matching interrupted job resumes, while every call
+after completion creates a fresh observation. Maintenance facts use the same global
+observation IDs and `iter_observations(after=N)` stream as sync facts. Their
+`maintenance_job_id` and `maintenance_task_id` identify the owning work.
+
+Sources: [gh_puller/github/maintenance.py](../gh_puller/github/maintenance.py); [gh_puller/github/observations.py](../gh_puller/github/observations.py)
+
+### Targeted refresh
+
+The supported target-to-family mapping is:
+
+| Target | Default family | Additional effect |
+| --- | --- | --- |
+| Archived PR number | `pull-review-threads` | Extracts structured commits from the new thread observation and verifies them. |
+| Archived Issue number | `issue-relations` | Rereads the complete parent/sub-Issue and blocking relation operation. |
+| Commit ID | `commit-object` | Repeats known-source acquisition and reconstruction checks. |
+| Repository | `git-refs` when selected explicitly | Fetches and records a new native branch/tag map. |
+
+PR and Issue roots must already exist as complete archive facts. Repeat `--pull`,
+`--issue`, or `--commit` to select several targets. `--family` narrows the request and
+must have a compatible target; `git-refs` needs no numbered target.
+
+```bash
+uv run -m gh_puller.github refresh \
+  vllm-project/vllm archives/vllm.sqlite3 \
+  --pull 24324 --issue 4395
+
+uv run -m gh_puller.github refresh \
+  vllm-project/vllm archives/vllm.sqlite3 \
+  --commit COMMIT_SHA --idempotency-key research-sample-1
+
+uv run -m gh_puller.github refresh \
+  vllm-project/vllm archives/vllm.sqlite3 \
+  --family git-refs
+```
+
+### Structured-commit baseline
+
+`backfill` freezes the current maximum observation ID, enumerates every structured
+commit reference at or below that cutoff, and records a deterministic task
+population. Facts published after the cutoff belong to later normal sync or a later
+baseline. Job completion means every frozen target received an outcome; it does not
+mean every commit was obtainable.
+
+```bash
+uv run -m gh_puller.github backfill \
+  vllm-project/vllm archives/vllm.sqlite3 \
+  --idempotency-key structured-commits-2026-09
+```
+
+`commit_reference_index` is a rebuildable SHA-to-observation index used to enumerate
+the baseline without copying provenance into task definitions. The immutable
+`commit-references` payload remains the authoritative source for parent, source fact,
+field path, and source-object identity. Each `commit-object` result links back to the
+supporting reference observation IDs and records the number of source edges checked.
+
 ## SQLite and Git archive pair
 
 For a destination named `DATABASE`, the archive boundary is:
@@ -249,7 +331,7 @@ DATABASE       SQLite facts, observation history, and recovery state
 DATABASE.git   Repository-bound bare Git object store by default
 ```
 
-`archive_meta` binds schema version 10, repository identity, Git layout 0, and the
+`archive_meta` binds schema version 11, repository identity, Git layout 0, and the
 absolute Git-store path. Moving only one member breaks that binding. Back up or move
 the pair together, or pass the bound path explicitly with `--git-destination`.
 
@@ -260,6 +342,8 @@ The durable SQLite relations are grouped by responsibility:
 | `fact_observations`, `fact_batches`, `payload_blobs` | Immutable facts, atomic publication order, and compressed canonical JSON. |
 | `fact_heads`, `current_facts`, `fact_records` | Latest-by-observation-time identities and joined encoded payload records. |
 | `sync_cycles`, `discovery_items`, `discovery_signals`, `sync_tasks` | Recoverable writer state; not GitHub facts. |
+| `maintenance_jobs`, `maintenance_tasks` | Frozen refresh/backfill scopes, attempts, progress, outcomes, and errors. |
+| `commit_reference_index` | Rebuildable acceleration index over immutable structured-reference facts. |
 | `fact_schemas`, `archive_meta` | Format registry and archive binding. |
 
 ### Git evidence
@@ -302,6 +386,31 @@ The store is ordinary bare Git and uses Git's content-addressed object namespace
 Different PRs that name the same commit share the same object while SQLite preserves
 their separate relationships.
 
+Structured commit retention checks sources in a bounded order: the managed object
+store, provenance-backed PR or fork branch refs, then the managed upstream branches
+and tags. It does not guess unrelated repositories. Each attempted source records
+its repository, ref, real time window, outcome, and error when the ref is conclusively
+absent. Authentication and transport failures leave the task retryable instead of
+being published as object unavailability.
+
+A schema-two `commit-object` fact separates four claims:
+
+| Check | Meaning |
+| --- | --- |
+| `endpoint` | The named object is a commit with a readable root tree. |
+| `snapshot` | Every tree and blob reachable from that root tree is locally readable. |
+| `history` | The commit, all reachable parents, and their tree/blob closure are locally readable. |
+| `retention` | An immutable `refs/github-archive/commits/<sha>` ref pins the object graph against GC. |
+
+The checks use native Git object traversal. Fact coverage is `complete` only when the
+reachable history closure is complete, `partial` when the endpoint is available but
+the promised closure is not, and `unavailable` when the checked known sources do not
+provide the endpoint. Git LFS payloads and submodule repositories are external to
+that object closure and remain outside this guarantee. Schema-one historical
+`commit-object` facts use the older endpoint/root-tree check; their `complete` value
+does not imply a complete history closure. Backfill emits schema-two evidence rather
+than reinterpreting them.
+
 Sources: [gh_puller/github/git_store.py](../gh_puller/github/git_store.py); [gh_puller/github/archive_format.py](../gh_puller/github/archive_format.py)
 
 ### Direct offline use
@@ -331,8 +440,8 @@ should mutate the canonical pair.
 ## Running the writer
 
 The CLI loads `.env`, prefers `GH_TOKEN` over `GITHUB_TOKEN`, writes progress to
-stderr, and emits completed-cycle JSON to stdout. Use an authenticated token for a
-production archive:
+stderr, and emits completed operation JSON to stdout. Use an authenticated token for
+a production archive:
 
 ```dotenv
 GH_TOKEN=github_pat_your_token
@@ -377,6 +486,24 @@ The interval is a positive integer followed by `s`, `m`, `h`, or `d`. Other rele
 controls are `--concurrency`, `--git-batch-size`, `--overlap-seconds`,
 `--request-timeout`, `--git-url`, `--git-destination`, and `--no-progress`.
 
+### Format migration
+
+Version 11 is an explicit in-place migration from a stopped version-10 archive. It
+adds maintenance state, the reference index, and schema-two commit reconstruction
+facts without changing existing payload bytes, digests, observations, discovery
+cursors, or pending sync tasks. The paired Git layout remains version 0.
+
+```bash
+scripts/github-puller-daemon.sh stop archives/vllm.sqlite3
+uv run -m gh_puller.github migrate archives/vllm.sqlite3
+```
+
+The command is idempotent once the archive is version 11. The filename does not encode
+the schema version and need not change. Start the existing managed writer after the
+migration or run an explicit maintenance operation while it remains stopped.
+
+Sources: [gh_puller/github/v11/](../gh_puller/github/v11/)
+
 ### Managed Linux service
 
 The systemd helper binds one service to the canonical database path. Its 12-character
@@ -414,8 +541,8 @@ scripts/github-puller-daemon.sh logs archives/vllm.sqlite3
 
 The detail view combines systemd and journald with read-only SQLite state. Its quota
 values are the latest response headers already observed by the writer; status makes
-no GitHub request. Durable discovery, parent, task, fact, checkpoint, and last-error
-state remains visible even when no process is running.
+no GitHub request. Durable discovery, maintenance, task, fact, checkpoint, and
+last-error state remains visible even when no process is running.
 
 `uninstall` removes only the unit and control policy. SQLite, Git objects, `.env`, the
 environment, and source tree remain:

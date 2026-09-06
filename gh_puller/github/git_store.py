@@ -12,11 +12,19 @@ import base64
 import logging
 import os
 import re
+from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from .archive_format import commit_ref, pull_ref, pull_staging_ref, upstream_ref
-from .v10 import GIT_LAYOUT_VERSION
+from .archive_format import (
+    commit_ref,
+    pull_ref,
+    pull_staging_ref,
+    source_staging_ref,
+    upstream_ref,
+)
+from .v11 import GIT_LAYOUT_VERSION
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Mapping, Sequence
@@ -30,6 +38,7 @@ _TRANSIENT_FETCH_STATUS = re.compile(
     re.IGNORECASE,
 )
 _MISSING_PULL_REF = re.compile(r"couldn't find remote ref refs/pull/(\d+)/head", re.IGNORECASE)
+_MISSING_REMOTE_REF = re.compile(r"couldn't find remote ref (\S+)", re.IGNORECASE)
 _TRANSIENT_FETCH_MARKERS = (
     "connection closed",
     "connection reset",
@@ -50,6 +59,15 @@ _TRANSIENT_FETCH_MARKERS = (
     "tls connection was non-properly terminated",
     "unexpected disconnect",
 )
+_INCOMPLETE_CLOSURE_MARKERS = (
+    "bad object",
+    "bad tree object",
+    "could not read",
+    "failed to traverse",
+    "missing blob object",
+    "missing tree object",
+    "unable to read tree",
+)
 _LOG = logging.getLogger(__name__)
 
 
@@ -61,6 +79,35 @@ class TransientGitStoreError(GitStoreError):
     """单次 Git fetch 因可重试的传输错误失败。"""
 
 
+@dataclass(frozen=True, slots=True)
+class CommitFetchSource:
+    """One provenance-backed remote ref that may reach a structured commit.
+
+    Args:
+        kind: ``pull-ref`` or ``repository-ref`` acquisition route.
+        remote_url: Credential-free Git transport URL used for this attempt.
+        remote_ref: Exact advertised ref to fetch.
+        repository: Human-readable owner/repo source identity.
+        resource_number: Related PR number when this is a pull ref.
+    """
+
+    kind: str
+    remote_url: str
+    remote_ref: str
+    repository: str
+    resource_number: int | None = None
+
+    def __post_init__(self) -> None:
+        if (
+            self.kind not in {"pull-ref", "repository-ref"}
+            or not self.remote_url
+            or not self.remote_ref.startswith("refs/")
+            or not self.repository
+            or (self.resource_number is not None and self.resource_number < 1)
+        ):
+            raise ValueError("invalid commit fetch source")
+
+
 class GitObjectStore:
     """管理一个仓库专属的 bare Git 对象库。
 
@@ -70,6 +117,7 @@ class GitObjectStore:
         remote_url: Git fetch 使用的远端地址。
         token: HTTPS 远端的 GitHub token；不会写入 Git 配置。
         sleep: 瞬时 Git 传输错误的可取消退避等待器。
+        now: 记录逐来源获取尝试窗口的时区时钟。
     """
 
     def __init__(
@@ -80,12 +128,14 @@ class GitObjectStore:
         *,
         token: str | None = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        now: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
         self.path = Path(path)
         self.repository = repository
         self.remote_url = remote_url
         self._token = token
         self._sleep = sleep
+        self._now = now
         self._lock = asyncio.Lock()
         self._ready = False
         self._upstream_synced = False
@@ -112,22 +162,22 @@ class GitObjectStore:
         self,
         shas: Sequence[str],
         *,
+        sources: Mapping[str, Sequence[CommitFetchSource]] | None = None,
         heartbeat: Callable[[], None] | None = None,
         retry: Callable[[float], None] | None = None,
     ) -> dict[str, dict[str, Any]]:
-        """Pin complete managed-store objects named by structured API fields.
-
-        Upstream and PR ref acquisition populate the store. An arbitrary structured SHA
-        is evidence, not a remote ref, so this operation verifies it locally and reports
-        absence without guessing a fetch source.
+        """Acquire, verify, and pin commits named by structured API fields.
 
         Args:
             shas: Distinct commit object IDs to verify and retain.
+            sources: Provenance-backed refs to try for each SHA before a broad
+                upstream refresh. Unknown remotes are never guessed.
             heartbeat: Git network operation progress observer.
             retry: Transient Git transport retry observer.
 
         Returns:
-            Per-SHA availability, immutable ref, acquisition path, and failure evidence.
+            Per-SHA acquisition attempts, immutable ref, and endpoint/snapshot/history
+            verification. ``available`` means the full reachable Git closure passed.
 
         Raises:
             GitStoreError: Input is invalid or Git fails without proving unavailability.
@@ -137,32 +187,117 @@ class GitObjectStore:
             raise ValueError("shas must contain unique Git object IDs")
         if not selected:
             return {}
+        supplied = {} if sources is None else sources
+        if set(supplied) - set(selected):
+            raise ValueError("commit sources contain an unrequested SHA")
+        routes = {sha: tuple(dict.fromkeys(supplied.get(sha, ()))) for sha in selected}
         async with self._lock:
             await self._prepare()
-            await self._sync_upstream(heartbeat=heartbeat, retry=retry)
-            missing = await self._missing_commits(selected)
-            available = [sha for sha in selected if sha not in missing]
-            if available:
+            attempts: dict[str, list[dict[str, Any]]] = {sha: [] for sha in selected}
+            obtained = dict.fromkeys(selected, "existing")
+            observed_from = self._time()
+            verification = await self._reconstruction(selected, heartbeat)
+            observed_until = self._time()
+            for sha in selected:
+                attempts[sha].append(
+                    _attempt(
+                        "managed-store",
+                        self.repository,
+                        None,
+                        observed_from,
+                        observed_until,
+                        _reconstruction_outcome(verification.get(sha)),
+                        _verification_error(verification.get(sha)),
+                    ),
+                )
+            pending = {sha for sha in selected if _reconstruction_outcome(verification.get(sha)) != "available"}
+            staging = set()
+            for source, targets in _source_groups(routes, pending):
+                active = tuple(sha for sha in targets if sha in pending)
+                if not active:
+                    continue
+                observed_from = self._time()
+                ref = source_staging_ref(_source_identity(source))
+                staging.add(ref)
+                error = await self._fetch_source(
+                    source,
+                    ref,
+                    refetch=any(verification.get(sha) is not None for sha in active),
+                    heartbeat=heartbeat,
+                    retry=retry,
+                )
+                checked = await self._reconstruction(active, heartbeat)
+                observed_until = self._time()
+                for sha in active:
+                    state = checked.get(sha)
+                    outcome = _reconstruction_outcome(state)
+                    attempts[sha].append(
+                        _attempt(
+                            source.kind,
+                            source.repository,
+                            source.remote_ref,
+                            observed_from,
+                            observed_until,
+                            outcome,
+                            error or _verification_error(state),
+                            source.resource_number,
+                        ),
+                    )
+                    if state is not None:
+                        obtained[sha] = source.kind
+                        verification[sha] = state
+                    if outcome == "available":
+                        pending.remove(sha)
+            before_upstream = set(pending)
+            if before_upstream:
+                observed_from = self._time()
+                refetch = any(verification.get(sha) is not None for sha in before_upstream)
+                if not self._upstream_synced or refetch:
+                    await self._sync_upstream(
+                        heartbeat=heartbeat,
+                        retry=retry,
+                        force=refetch,
+                        refetch=refetch,
+                    )
+                checked = await self._reconstruction(
+                    tuple(before_upstream),
+                    heartbeat,
+                )
+                observed_until = self._time()
+                for sha in before_upstream:
+                    state = checked.get(sha)
+                    outcome = _reconstruction_outcome(state)
+                    attempts[sha].append(
+                        _attempt(
+                            "upstream-refs",
+                            self.repository,
+                            "refs/heads/* + refs/tags/*",
+                            observed_from,
+                            observed_until,
+                            outcome,
+                            _verification_error(state),
+                        ),
+                    )
+                    if state is not None:
+                        obtained[sha] = "upstream-refs"
+                        verification[sha] = state
+                    if outcome == "available":
+                        pending.remove(sha)
+            pinnable = tuple(sha for sha in selected if verification.get(sha) is not None)
+            if pinnable:
                 await self._git(
                     "update-ref",
                     "--stdin",
-                    input_text="".join(f"update {commit_ref(sha)} {sha}\n" for sha in available),
+                    input_text="".join(f"update {commit_ref(sha)} {sha}\n" for sha in pinnable),
                 )
+            for ref in staging:
+                await self._delete_ref(ref)
             return {
-                sha: (
-                    {
-                        "sha": sha,
-                        "status": "available",
-                        "ref": commit_ref(sha),
-                        "obtained": "existing",
-                        "verification": "commit-and-root-tree",
-                    }
-                    if sha not in missing
-                    else {
-                        "sha": sha,
-                        "status": "unavailable",
-                        "reason": "commit or root tree is absent from the managed Git store",
-                    }
+                sha: _retention_result(
+                    sha,
+                    attempts[sha],
+                    obtained[sha],
+                    verification.get(sha),
                 )
                 for sha in selected
             }
@@ -403,9 +538,7 @@ class GitObjectStore:
         output = await self._git(
             "cat-file",
             "--batch-check=%(objectname) %(objecttype)",
-            input_text="".join(
-                f"{sha}^{{commit}}\n{sha}^{{tree}}\n" for sha in shas
-            ),
+            input_text="".join(f"{sha}^{{commit}}\n{sha}^{{tree}}\n" for sha in shas),
         )
         lines = output.splitlines()
         if len(lines) != 2 * len(shas):
@@ -413,9 +546,132 @@ class GitObjectStore:
         return {
             sha
             for index, sha in enumerate(shas)
-            if not lines[2 * index].endswith(" commit")
-            or not lines[2 * index + 1].endswith(" tree")
+            if not lines[2 * index].endswith(" commit") or not lines[2 * index + 1].endswith(" tree")
         }
+
+    async def _fetch_source(
+        self,
+        source: CommitFetchSource,
+        staging_ref: str,
+        *,
+        refetch: bool,
+        heartbeat: Callable[[], None] | None,
+        retry: Callable[[float], None] | None,
+    ) -> str | None:
+        await self._delete_ref(staging_ref)
+        remote = "origin" if source.remote_url == self.remote_url else source.remote_url
+        try:
+            await self._git(
+                "fetch",
+                "--quiet",
+                "--no-tags",
+                "--no-write-fetch-head",
+                *(("--refetch",) if refetch else ()),
+                remote,
+                f"+{source.remote_ref}:{staging_ref}",
+                heartbeat=heartbeat,
+                retry=retry,
+            )
+        except GitStoreError as exc:
+            if not _is_known_source_absence(exc):
+                raise GitStoreError(
+                    f"{source.kind} {source.repository} {source.remote_ref} failed: {exc}",
+                ) from exc
+            return str(exc)
+        return None
+
+    async def _verify_commits(
+        self,
+        shas: Sequence[str],
+        *,
+        heartbeat: Callable[[], None] | None = None,
+    ) -> dict[str, dict[str, Any]]:
+        if not shas:
+            return {}
+        trees = await self._commit_trees(shas)
+        history_failures = await self._closure_failures(
+            tuple((sha, sha) for sha in shas),
+            heartbeat,
+        )
+        snapshot_targets = tuple((sha, trees[sha]) for sha in shas if sha in history_failures)
+        snapshot_failures = await self._closure_failures(snapshot_targets, heartbeat)
+        return {
+            sha: {
+                "method": "git-rev-list-objects-missing-error-v1",
+                "endpoint": {"status": "complete"},
+                "snapshot": _verification_level(snapshot_failures.get(sha)),
+                "history": _verification_level(history_failures.get(sha)),
+                "retention": {
+                    "status": "complete",
+                    "ref": commit_ref(sha),
+                },
+            }
+            for sha in shas
+        }
+
+    async def _reconstruction(
+        self,
+        shas: Sequence[str],
+        heartbeat: Callable[[], None] | None,
+    ) -> dict[str, dict[str, Any]]:
+        missing = await self._missing_commits(shas)
+        available = tuple(sha for sha in shas if sha not in missing)
+        return await self._verify_commits(available, heartbeat=heartbeat)
+
+    async def _commit_trees(self, shas: Sequence[str]) -> dict[str, str]:
+        output = await self._git(
+            "cat-file",
+            "--batch-check=%(objectname) %(objecttype)",
+            input_text="".join(f"{sha}^{{tree}}\n" for sha in shas),
+        )
+        lines = output.splitlines()
+        if len(lines) != len(shas):
+            raise GitStoreError("Git returned an incomplete root-tree batch")
+        result = {}
+        for sha, line in zip(shas, lines, strict=True):
+            fields = line.split()
+            if len(fields) != 2 or fields[1] != "tree" or _SHA.fullmatch(fields[0]) is None:
+                raise GitStoreError(f"commit {sha} has no readable root tree")
+            result[sha] = fields[0]
+        return result
+
+    async def _closure_failures(
+        self,
+        targets: Sequence[tuple[str, str]],
+        heartbeat: Callable[[], None] | None,
+    ) -> dict[str, str]:
+        failures: dict[str, str] = {}
+
+        async def verify(selected: Sequence[tuple[str, str]]) -> None:
+            if not selected:
+                return
+            try:
+                await self._git(
+                    "rev-list",
+                    "--objects",
+                    "--missing=error",
+                    "--quiet",
+                    *(root for _, root in selected),
+                    heartbeat=heartbeat,
+                )
+            except GitStoreError as exc:
+                if not _is_incomplete_closure(exc):
+                    raise
+                if len(selected) == 1:
+                    failures[selected[0][0]] = str(exc)
+                    return
+                middle = len(selected) // 2
+                await verify(selected[:middle])
+                await verify(selected[middle:])
+
+        await verify(targets)
+        return failures
+
+    def _time(self) -> str:
+        value = self._now()
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("Git observation clock must include a timezone")
+        return value.astimezone(UTC).isoformat(timespec="microseconds").replace("+00:00", "Z")
 
     async def _available_commit(self, sha: str | None) -> str | None:
         if sha is None:
@@ -469,6 +725,7 @@ class GitObjectStore:
         heartbeat: Callable[[], None] | None,
         retry: Callable[[float], None] | None,
         force: bool = False,
+        refetch: bool = False,
     ) -> None:
         if self._upstream_synced and not force:
             return
@@ -480,6 +737,7 @@ class GitObjectStore:
             "--prune",
             "--prune-tags",
             "--no-write-fetch-head",
+            *(("--refetch",) if refetch else ()),
             "origin",
             "+refs/heads/*:refs/heads/*",
             "+refs/tags/*:refs/tags/*",
@@ -505,9 +763,7 @@ class GitObjectStore:
             if len(fields) not in {2, 3}:
                 raise GitStoreError("Git returned an invalid native ref record")
             ref, oid, *peeled = fields
-            if _SHA.fullmatch(oid) is None or (
-                peeled and _SHA.fullmatch(peeled[0]) is None
-            ):
+            if _SHA.fullmatch(oid) is None or (peeled and _SHA.fullmatch(peeled[0]) is None):
                 raise GitStoreError(f"upstream ref has invalid object ID: {ref}")
             item = {"name": ref, "oid": oid}
             if ref.startswith("refs/tags/"):
@@ -606,6 +862,8 @@ class GitObjectStore:
         if not remote.strip():
             await self._git("remote", "add", "origin", self.remote_url)
         await self._git("config", "gc.auto", "0")
+        if sum(1 for _ in (self.path / "objects" / "pack").glob("*.idx")) > 1:
+            await self._git("multi-pack-index", "write")
         self._ready = True
 
     async def _git(
@@ -655,7 +913,7 @@ class GitObjectStore:
             credential = base64.b64encode(f"x-access-token:{self._token}".encode()).decode()
             environment |= {
                 "GIT_CONFIG_COUNT": "2",
-                "GIT_CONFIG_KEY_1": "http.extraHeader",
+                "GIT_CONFIG_KEY_1": f"http.{self.remote_url}.extraHeader",
                 "GIT_CONFIG_VALUE_1": f"Authorization: Basic {credential}",
             }
         return environment
@@ -685,11 +943,135 @@ def default_git_url(repository: str) -> str:
     return f"https://github.com/{repository}.git"
 
 
+def _source_groups(
+    routes: Mapping[str, Sequence[CommitFetchSource]],
+    missing: set[str],
+) -> list[tuple[CommitFetchSource, tuple[str, ...]]]:
+    grouped: dict[CommitFetchSource, set[str]] = {}
+    for sha in missing:
+        for source in routes[sha]:
+            grouped.setdefault(source, set()).add(sha)
+    priority = {"pull-ref": 0, "repository-ref": 1}
+    return [
+        (source, tuple(sorted(grouped[source])))
+        for source in sorted(
+            grouped,
+            key=lambda item: (
+                priority[item.kind],
+                item.repository,
+                item.remote_ref,
+                item.resource_number or 0,
+            ),
+        )
+    ]
+
+
+def _source_identity(source: CommitFetchSource) -> str:
+    return "\0".join(
+        (
+            source.kind,
+            source.repository,
+            source.remote_ref,
+            str(source.resource_number or 0),
+        ),
+    )
+
+
+def _attempt(
+    kind: str,
+    repository: str,
+    ref: str | None,
+    observed_from: str,
+    observed_until: str,
+    outcome: str,
+    error: str | None = None,
+    resource_number: int | None = None,
+) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "kind": kind,
+        "repository": repository,
+        "ref": ref,
+        "observed_from": observed_from,
+        "observed_until": observed_until,
+        "outcome": outcome,
+    }
+    if resource_number is not None:
+        result["resource_number"] = resource_number
+    if error is not None:
+        result["error"] = error
+    return result
+
+
+def _verification_level(error: str | None) -> dict[str, str]:
+    return {"status": "complete"} if error is None else {"status": "partial", "reason": error}
+
+
+def _reconstruction_outcome(verification: dict[str, Any] | None) -> str:
+    if verification is None:
+        return "unavailable"
+    history = verification.get("history")
+    return "available" if isinstance(history, dict) and history.get("status") == "complete" else "partial"
+
+
+def _verification_error(verification: dict[str, Any] | None) -> str | None:
+    if verification is None:
+        return None
+    for key in ("history", "snapshot"):
+        value = verification.get(key)
+        if isinstance(value, dict) and isinstance(value.get("reason"), str):
+            return value["reason"]
+    return None
+
+
+def _retention_result(
+    sha: str,
+    attempts: list[dict[str, Any]],
+    obtained: str,
+    verification: dict[str, Any] | None,
+) -> dict[str, Any]:
+    if verification is None:
+        return {
+            "sha": sha,
+            "status": "unavailable",
+            "attempts": attempts,
+            "reason": "known Git sources did not provide the commit and root tree",
+            "verification": {
+                "method": "git-rev-list-objects-missing-error-v1",
+                "endpoint": {"status": "unavailable"},
+                "snapshot": {"status": "not-checked"},
+                "history": {"status": "not-checked"},
+                "retention": {"status": "not-pinned"},
+            },
+        }
+    history = verification.get("history")
+    complete = isinstance(history, dict) and history.get("status") == "complete"
+    result = {
+        "sha": sha,
+        "status": "available" if complete else "partial",
+        "attempts": attempts,
+        "obtained": obtained,
+        "ref": commit_ref(sha),
+        "verification": verification,
+    }
+    if not complete:
+        result["reason"] = "reachable Git object closure failed verification"
+    return result
+
+
 def _is_transient_fetch_failure(error: GitStoreError) -> bool:
     detail = str(error).casefold()
     return any(marker in detail for marker in _TRANSIENT_FETCH_MARKERS) or bool(
         _TRANSIENT_FETCH_STATUS.search(detail),
     )
+
+
+def _is_known_source_absence(error: GitStoreError) -> bool:
+    return _MISSING_REMOTE_REF.search(str(error)) is not None
+
+
+def _is_incomplete_closure(error: GitStoreError) -> bool:
+    detail = str(error).casefold()
+    return any(marker in detail for marker in _INCOMPLETE_CLOSURE_MARKERS)
 
 
 def _missing_pull_numbers(error: GitStoreError) -> set[int]:

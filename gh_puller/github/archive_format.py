@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
 
 _SHA = re.compile(r"[0-9a-f]{40,64}\Z")
@@ -55,3 +56,15 @@ def commit_ref(sha: str) -> str:
     if _SHA.fullmatch(sha) is None:
         raise ValueError("invalid commit evidence ref")
     return f"{_PREFIX}/commits/{sha}"
+
+
+def source_staging_ref(source: str) -> str:
+    """Return a bounded mutable ref for one known acquisition source.
+
+    Args:
+        source: Stable non-secret source identity such as repository and remote ref.
+    """
+    if not source:
+        raise ValueError("source identity cannot be empty")
+    digest = hashlib.sha256(source.encode()).hexdigest()[:24]
+    return f"{_PREFIX}/staging/sources/{digest}"

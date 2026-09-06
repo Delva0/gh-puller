@@ -54,11 +54,35 @@ def test_parser_exposes_only_current_runtime_commands(tmp_path: Path) -> None:
     schedule = cli._parser().parse_args(
         ["schedule", "acme/widgets", str(tmp_path / "facts.sqlite3")],
     )
+    refresh = cli._parser().parse_args(
+        [
+            "refresh",
+            "acme/widgets",
+            str(tmp_path / "facts.sqlite3"),
+            "--pull",
+            "7",
+            "--family",
+            "pull-review-threads",
+        ],
+    )
+    migrate = cli._parser().parse_args(
+        ["migrate", str(tmp_path / "facts.sqlite3")],
+    )
+    backfill = cli._parser().parse_args(
+        ["backfill", "acme/widgets", str(tmp_path / "facts.sqlite3")],
+    )
 
     assert once.command == "once"
     assert not hasattr(once, "target")
     assert schedule.command == "schedule"
-    for removed in ("import-v9", "backfill"):
+    assert (refresh.command, refresh.pull, refresh.families) == (
+        "refresh",
+        [7],
+        ["pull-review-threads"],
+    )
+    assert migrate.command == "migrate"
+    assert backfill.command == "backfill"
+    for removed in ("import-v9",):
         with pytest.raises(SystemExit):
             cli._parser().parse_args([removed])
 

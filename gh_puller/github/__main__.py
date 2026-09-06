@@ -1,6 +1,7 @@
-"""提供 GitHub 观测归档的一次同步与周期调度命令。
+"""提供 GitHub 观测归档的同步、调度、维护与格式迁移命令。
 
-调度只决定何时调用同步器；事实时间始终来自实际 source read，不会被调度边界改写。
+调度只决定何时调用同步器；维护任务不推进发现水位；格式迁移不联网。事实时间始终
+来自实际 source read，不会被调度边界或维护请求时间改写。
 """
 
 from __future__ import annotations
@@ -18,8 +19,10 @@ from typing import TYPE_CHECKING, Any
 
 from dotenv import load_dotenv
 
+from .maintenance import REFRESH_FAMILIES, GitHubMaintainer, MaintenanceResult
 from .progress import ConsoleProgress
 from .syncer import GitHubSyncConfig, GitHubSyncer, SyncResult
+from .v11.migrate import MigrationResult, migrate_archive
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Iterator, Sequence
@@ -51,6 +54,32 @@ def _parser() -> argparse.ArgumentParser:
         metavar="DURATION",
         help="UTC-aligned cadence such as 30m, 1h, or 1d (default: 1h)",
     )
+
+    refresh = commands.add_parser(
+        "refresh",
+        help="actively observe selected Issues, PRs, commits, or Git refs",
+    )
+    _add_sync_arguments(refresh)
+    refresh.add_argument("--pull", type=_positive_int, action="append", default=[])
+    refresh.add_argument("--issue", type=_positive_int, action="append", default=[])
+    refresh.add_argument("--commit", action="append", default=[])
+    refresh.add_argument(
+        "--family",
+        dest="families",
+        choices=REFRESH_FAMILIES,
+        action="append",
+    )
+    refresh.add_argument("--idempotency-key")
+
+    backfill = commands.add_parser(
+        "backfill",
+        help="verify structured commits over a frozen published range",
+    )
+    _add_sync_arguments(backfill)
+    backfill.add_argument("--idempotency-key")
+
+    migrate = commands.add_parser("migrate", help="migrate a stopped v10 archive to v11")
+    migrate.add_argument("destination", type=Path, help="SQLite observation archive")
 
     return parser
 
@@ -111,7 +140,25 @@ def _config(args: argparse.Namespace) -> GitHubSyncConfig:
 
 
 async def _dispatch(args: argparse.Namespace) -> None:
+    if args.command == "migrate":
+        _emit_migration(await migrate_archive(args.destination))
+        return
     observer = None if args.no_progress else ConsoleProgress()
+    if args.command in {"backfill", "refresh"}:
+        maintainer = GitHubMaintainer(_config(args), observer=observer)
+        result = (
+            await maintainer.backfill(idempotency_key=args.idempotency_key)
+            if args.command == "backfill"
+            else await maintainer.refresh(
+                pulls=args.pull,
+                issues=args.issue,
+                commits=args.commit,
+                families=args.families,
+                idempotency_key=args.idempotency_key,
+            )
+        )
+        _emit_maintenance(result)
+        return
     syncer = GitHubSyncer(_config(args), observer=observer)
     if args.command == "once":
         _emit(await syncer.sync())
@@ -189,6 +236,42 @@ def _emit(result: SyncResult) -> None:
         "started_at": _time(result.started_at),
     }
     print(json.dumps(payload, ensure_ascii=False, sort_keys=True), flush=True)
+
+
+def _emit_migration(result: MigrationResult) -> None:
+    print(
+        json.dumps(
+            {
+                "changed": result.changed,
+                "destination": str(result.path),
+                "previous_version": result.previous_version,
+                "schema_version": result.version,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        ),
+        flush=True,
+    )
+
+
+def _emit_maintenance(result: MaintenanceResult) -> None:
+    print(
+        json.dumps(
+            {
+                "completed_at": _time(result.completed_at),
+                "completed_tasks": result.completed_tasks,
+                "job_id": result.job_id,
+                "job_key": result.job_key,
+                "kind": result.kind,
+                "requested_at": _time(result.requested_at),
+                "requests": result.requests,
+                "total_tasks": result.total_tasks,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        ),
+        flush=True,
+    )
 
 
 def _optional_time(value: datetime | None) -> str | None:

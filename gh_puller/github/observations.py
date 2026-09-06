@@ -5,8 +5,8 @@
 只追加，不覆盖历史。当前状态按读取窗口结束时刻选择，写入较晚的旧观测不会倒退
 事实头。
 
-同步 cycle 只承载发现游标、任务恢复和内部 checkpoint。事实一经闭合便独立发布，
-无需等待 cycle 完成；checkpoint 仅在发现遍历和全部任务完成后推进。请求失败属于任务
+同步 cycle 只承载发现游标、任务恢复和内部 checkpoint；maintenance job 独立承载
+定向刷新与补采。事实一经闭合便独立发布，无需等待所属操作完成。请求失败属于任务
 执行状态，不进入事实观测流。
 """
 
@@ -23,7 +23,11 @@ from typing import TYPE_CHECKING, Any, Self
 
 import aiosqlite
 
-from .v10 import FACT_SCHEMAS, GIT_LAYOUT_VERSION, SCHEMA, VERSION
+from .commit_references import (
+    commit_reference_index_rows,
+    commit_reference_provenance,
+)
+from .v11 import FACT_SCHEMAS, GIT_LAYOUT_VERSION, SCHEMA, VERSION
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Collection, Iterable
@@ -68,7 +72,7 @@ class FactDraft:
 
 @dataclass(frozen=True, slots=True)
 class TaskDraft:
-    """A durable unit whose successful execution publishes at most one fact batch."""
+    """A durable unit whose successful execution publishes closed fact batches."""
 
     task_key: str
     kind: str
@@ -134,6 +138,42 @@ class SyncTask:
 
 
 @dataclass(frozen=True, slots=True)
+class MaintenanceJob:
+    """One recoverable refresh or backfill scope independent of discovery."""
+
+    id: int
+    job_key: str
+    kind: str
+    requested_at: datetime
+    completed_at: datetime | None
+    status: str
+    scope_digest: str
+    scope: dict[str, Any]
+    total_tasks: int
+    completed_tasks: int
+    request_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class MaintenanceTask:
+    """One durable source operation within a maintenance job."""
+
+    id: int
+    job_id: int
+    task_key: str
+    kind: str
+    subject_key: str
+    resource_number: int | None
+    payload: dict[str, Any]
+    completed_at: datetime | None
+    outcome: Coverage | None
+    attempts: int
+    last_attempt_from: datetime | None
+    last_attempt_until: datetime | None
+    last_error: str | None
+
+
+@dataclass(frozen=True, slots=True)
 class FactObservation:
     """One immutable fact observation in the global replay stream."""
 
@@ -143,6 +183,8 @@ class FactObservation:
     batch_kind: str
     cycle_id: int | None
     task_id: int | None
+    maintenance_job_id: int | None
+    maintenance_task_id: int | None
     published_at: datetime
     ordinal: int
     family: str
@@ -256,6 +298,238 @@ class ObservationArchive:
         )
         return None if row is None else _cycle(row)
 
+    async def start_maintenance_job(
+        self,
+        job_key: str,
+        kind: str,
+        requested_at: datetime,
+        scope: dict[str, Any],
+        tasks: Collection[TaskDraft],
+    ) -> MaintenanceJob:
+        """Create or resume an immutable refresh or backfill scope.
+
+        Args:
+            job_key: Stable identity for retrying this exact invocation.
+            kind: ``refresh`` or ``backfill``.
+            requested_at: Actual first invocation time.
+            scope: Frozen target set and field-family contract.
+            tasks: Complete deterministic work population.
+
+        Returns:
+            The existing identical job or the newly persisted job.
+
+        Raises:
+            RuntimeError: Another maintenance job remains active.
+            ValueError: The key or task definitions conflict with durable state.
+        """
+        if not job_key or kind not in {"backfill", "refresh"}:
+            raise ValueError("invalid maintenance job identity")
+        requested = _iso(requested_at)
+        scope_raw = _json_bytes(scope)
+        scope_digest = _digest(scope_raw)
+        prepared = tuple(sorted((_prepare_task(task) for task in tasks), key=lambda item: item[0].task_key))
+        keys = [item[0].task_key for item in prepared]
+        if len(keys) != len(set(keys)):
+            raise ValueError("maintenance task keys must be unique")
+        db = self._connection
+        await db.execute("BEGIN IMMEDIATE")
+        try:
+            existing = await _fetchone(
+                db,
+                "SELECT * FROM maintenance_jobs WHERE job_key = ?",
+                (job_key,),
+            )
+            if existing is not None:
+                await _verify_maintenance_job(
+                    db,
+                    existing,
+                    kind,
+                    requested,
+                    scope_digest,
+                    prepared,
+                )
+                await db.commit()
+                return await _maintenance_job_from_row(db, existing)
+            active = await _fetchone(
+                db,
+                "SELECT id FROM maintenance_jobs WHERE status = 'active'",
+            )
+            if active is not None:
+                raise RuntimeError(f"maintenance job {active['id']} must finish first")
+            await _put_encoded_blob(db, scope_digest, scope_raw)
+            status = "complete" if not prepared else "active"
+            cursor = await db.execute(
+                """
+                INSERT INTO maintenance_jobs(
+                    job_key, kind, requested_at, completed_at, status, scope_digest,
+                    total_tasks, completed_tasks
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 0)
+                """,
+                (
+                    job_key,
+                    kind,
+                    requested,
+                    requested if not prepared else None,
+                    status,
+                    scope_digest,
+                    len(prepared),
+                ),
+            )
+            job_id = int(cursor.lastrowid)
+            for task, input_digest, raw in prepared:
+                await _put_encoded_blob(db, input_digest, raw)
+                await db.execute(
+                    """
+                    INSERT INTO maintenance_tasks(
+                        job_id, task_key, kind, subject_key, resource_number,
+                        input_digest
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        job_id,
+                        task.task_key,
+                        task.kind,
+                        task.subject_key,
+                        task.resource_number,
+                        input_digest,
+                    ),
+                )
+            await db.commit()
+        except BaseException:
+            await db.rollback()
+            raise
+        row = await _fetchone(db, "SELECT * FROM maintenance_jobs WHERE id = ?", (job_id,))
+        if row is None:
+            raise RuntimeError("maintenance job disappeared")
+        return await _maintenance_job_from_row(db, row)
+
+    async def active_maintenance_job(self) -> MaintenanceJob | None:
+        """Return the sole resumable maintenance job, if one exists."""
+        row = await _fetchone(
+            self._connection,
+            "SELECT * FROM maintenance_jobs WHERE status = 'active'",
+        )
+        return None if row is None else await _maintenance_job_from_row(self._connection, row)
+
+    async def maintenance_job(self, job_id: int) -> MaintenanceJob:
+        """Return one maintenance job by durable identity.
+
+        Args:
+            job_id: Refresh or backfill job identity.
+
+        Raises:
+            KeyError: The job does not exist.
+        """
+        row = await _fetchone(
+            self._connection,
+            "SELECT * FROM maintenance_jobs WHERE id = ?",
+            (job_id,),
+        )
+        if row is None:
+            raise KeyError(job_id)
+        return await _maintenance_job_from_row(self._connection, row)
+
+    async def maintenance_job_by_key(self, job_key: str) -> MaintenanceJob | None:
+        """Return one maintenance job by idempotency key.
+
+        Args:
+            job_key: Stable invocation identity.
+        """
+        row = await _fetchone(
+            self._connection,
+            "SELECT * FROM maintenance_jobs WHERE job_key = ?",
+            (job_key,),
+        )
+        return None if row is None else await _maintenance_job_from_row(self._connection, row)
+
+    async def take_maintenance_tasks(
+        self,
+        job_id: int,
+        limit: int,
+        started_at: datetime,
+    ) -> tuple[MaintenanceTask, ...]:
+        """Claim a durable batch from an active maintenance job.
+
+        Args:
+            job_id: Active job owning the work.
+            limit: Maximum tasks returned.
+            started_at: Actual start of this execution attempt.
+
+        Returns:
+            Pending tasks in durable order with incremented attempt counts.
+        """
+        if limit < 1:
+            raise ValueError("task limit must be positive")
+        started = _iso(started_at)
+        db = self._connection
+        await db.execute("BEGIN IMMEDIATE")
+        try:
+            await _active_maintenance_job_row(db, job_id)
+            rows = await _fetchall(
+                db,
+                """
+                SELECT * FROM maintenance_tasks
+                WHERE job_id = ? AND completed_at IS NULL
+                ORDER BY id
+                LIMIT ?
+                """,
+                (job_id, limit),
+            )
+            if rows:
+                await db.executemany(
+                    """
+                    UPDATE maintenance_tasks
+                    SET attempts = attempts + 1, last_attempt_from = ?,
+                        last_attempt_until = NULL, last_error = NULL
+                    WHERE id = ?
+                    """,
+                    ((started, int(row["id"])) for row in rows),
+                )
+                rows = [
+                    await _required_row(
+                        db,
+                        "SELECT * FROM maintenance_tasks WHERE id = ?",
+                        (int(row["id"]),),
+                        "maintenance task disappeared",
+                    )
+                    for row in rows
+                ]
+            await db.commit()
+        except BaseException:
+            await db.rollback()
+            raise
+        return tuple([await _maintenance_task_from_row(db, row) for row in rows])
+
+    async def record_maintenance_task_error(
+        self,
+        task_id: int,
+        observed_until: datetime,
+        error: str,
+    ) -> None:
+        """Persist one retryable failed attempt without publishing a fact.
+
+        Args:
+            task_id: Pending maintenance task.
+            observed_until: Actual end of the failed attempt.
+            error: Concise exception type and message.
+        """
+        if not error:
+            raise ValueError("task error cannot be empty")
+        ended = _iso(observed_until)
+        cursor = await self._connection.execute(
+            """
+            UPDATE maintenance_tasks
+            SET last_attempt_until = ?, last_error = ?
+            WHERE id = ? AND completed_at IS NULL
+                AND last_attempt_from IS NOT NULL AND last_attempt_from <= ?
+            """,
+            (ended, error, task_id, ended),
+        )
+        if cursor.rowcount != 1:
+            await self._connection.rollback()
+            raise RuntimeError("maintenance task is not pending")
+        await self._connection.commit()
+
     async def publication(
         self,
         publication_key: str,
@@ -295,6 +569,116 @@ class ObservationArchive:
             (family, subject_key),
         )
         return None if row is None else _fact(row)
+
+    async def observation_cutoff(self) -> int:
+        """Return the greatest globally replayable observation identity."""
+        row = await _fetchone(
+            self._connection,
+            "SELECT COALESCE(MAX(id), 0) AS cutoff FROM fact_observations",
+        )
+        return 0 if row is None else int(row["cutoff"])
+
+    async def iter_commit_references(
+        self,
+        cutoff: int,
+        shas: Collection[str] | None = None,
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Read indexed structured references within a stable replay cutoff.
+
+        Args:
+            cutoff: Inclusive global observation identity.
+            shas: Optional exact commit targets; None reads the complete range.
+
+        Yields:
+            Source-distinct provenance records in source observation order.
+        """
+        if cutoff < 0:
+            raise ValueError("observation cutoff cannot be negative")
+        selected = None if shas is None else tuple(sorted(set(shas)))
+        if selected == ():
+            return
+        selected_set = None if selected is None else set(selected)
+        if selected is None or len(selected) > 5_000:
+            async with self._connection.execute(
+                """
+                SELECT o.id AS observation_id, o.resource_number,
+                       p.codec, p.raw_size, p.payload
+                FROM fact_observations AS o
+                JOIN payload_blobs AS p ON p.digest = o.payload_digest
+                WHERE o.family = 'commit-references' AND o.coverage = 'complete'
+                      AND o.id <= ?
+                ORDER BY o.id
+                """,
+                (cutoff,),
+            ) as cursor:
+                async for row in cursor:
+                    for value in _indexed_references(row, selected_set):
+                        yield value
+            return
+        rows: dict[int, aiosqlite.Row] = {}
+        for offset in range(0, len(selected), 500):
+            chunk = selected[offset : offset + 500]
+            placeholders = ",".join("?" for _ in chunk)
+            candidates = await _fetchall(
+                self._connection,
+                f"""
+                SELECT o.id AS observation_id, o.resource_number,
+                       p.codec, p.raw_size, p.payload
+                FROM (
+                    SELECT DISTINCT observation_id
+                    FROM commit_reference_index
+                    WHERE observation_id <= ? AND sha IN ({placeholders})
+                ) AS selected
+                JOIN fact_observations AS o ON o.id = selected.observation_id
+                JOIN payload_blobs AS p ON p.digest = o.payload_digest
+                """,  # noqa: S608
+                (cutoff, *chunk),
+            )
+            rows.update((int(row["observation_id"]), row) for row in candidates)
+        for _, row in sorted(rows.items()):
+            for value in _indexed_references(row, selected_set):
+                yield value
+
+    async def referenced_commits(self, cutoff: int) -> tuple[str, ...]:
+        """Return structured commit targets in source-locality order.
+
+        Args:
+            cutoff: Inclusive global observation identity.
+        """
+        if cutoff < 0:
+            raise ValueError("observation cutoff cannot be negative")
+        rows = await _fetchall(
+            self._connection,
+            """
+            SELECT i.sha, MIN(COALESCE(o.resource_number, 9223372036854775807)) AS resource
+            FROM commit_reference_index AS i
+            JOIN fact_observations AS o ON o.id = i.observation_id
+            WHERE i.observation_id <= ?
+            GROUP BY i.sha
+            ORDER BY resource, i.sha
+            """,
+            (cutoff,),
+        )
+        return tuple(str(row["sha"]) for row in rows)
+
+    async def checked_commits(self, cutoff: int) -> set[str]:
+        """Return targets with a version-two reconstruction outcome.
+
+        Args:
+            cutoff: Inclusive global observation identity.
+        """
+        if cutoff < 0:
+            raise ValueError("observation cutoff cannot be negative")
+        rows = await _fetchall(
+            self._connection,
+            """
+            SELECT DISTINCT subject_key
+            FROM fact_observations
+            WHERE family = 'commit-object' AND schema_version = 2 AND id <= ?
+            """,
+            (cutoff,),
+        )
+        return {str(row["subject_key"]).removeprefix("commit:") for row in rows}
 
     async def discovery_checkpoint(self) -> datetime | None:
         """Return the last safely completed discovery boundary."""
@@ -645,16 +1029,18 @@ class ObservationArchive:
         *,
         cycle_id: int | None = None,
         task_id: int | None = None,
+        maintenance_task_id: int | None = None,
     ) -> tuple[FactObservation, ...]:
         """Atomically append one or more closed observations.
 
         Args:
             publication_key: Stable idempotency key for this source operation.
-            kind: ``sync``, ``import``, or explicit ``refresh`` publication.
+            kind: ``sync``, ``import``, or maintenance ``refresh`` publication.
             published_at: Actual durable publication time.
             facts: Distinct family/subject observations forming one atomic result.
             cycle_id: Owning active cycle for normal sync work.
             task_id: Optional pending task completed in the same transaction.
+            maintenance_task_id: Optional maintenance task owning this publication.
 
         Returns:
             Immutable replay rows. Repeating the same publication returns the originals.
@@ -669,6 +1055,12 @@ class ObservationArchive:
             raise ValueError("invalid publication kind")
         if task_id is not None and cycle_id is None:
             raise ValueError("task publication requires its cycle")
+        if task_id is not None and maintenance_task_id is not None:
+            raise ValueError("publication cannot complete two task types")
+        if maintenance_task_id is not None and cycle_id is not None:
+            raise ValueError("maintenance publication cannot belong to a sync cycle")
+        if maintenance_task_id is not None and kind != "refresh":
+            raise ValueError("maintenance task requires a maintenance publication")
         published = _iso(published_at)
         prepared = tuple(_prepare_fact(fact) for fact in facts)
         if not prepared:
@@ -688,7 +1080,15 @@ class ObservationArchive:
                 (publication_key,),
             )
             if existing is not None:
-                await _verify_existing_batch(db, existing, kind, cycle_id, task_id, prepared)
+                await _verify_existing_batch(
+                    db,
+                    existing,
+                    kind,
+                    cycle_id,
+                    task_id,
+                    maintenance_task_id,
+                    prepared,
+                )
                 await db.commit()
                 return await _batch_facts(db, int(existing["id"]))
             if cycle_id is not None:
@@ -701,6 +1101,24 @@ class ObservationArchive:
                     or task["completed_at"] is not None
                 ):
                     raise RuntimeError("fact publication requires its pending task")
+            maintenance_task = None
+            if maintenance_task_id is not None:
+                maintenance_task = await _fetchone(
+                    db,
+                    """
+                    SELECT t.*, j.kind AS job_kind, j.status AS job_status
+                    FROM maintenance_tasks AS t
+                    JOIN maintenance_jobs AS j ON j.id = t.job_id
+                    WHERE t.id = ?
+                    """,
+                    (maintenance_task_id,),
+                )
+                if (
+                    maintenance_task is None
+                    or maintenance_task["completed_at"] is not None
+                    or maintenance_task["job_status"] != "active"
+                ):
+                    raise RuntimeError("fact publication requires its pending maintenance task")
             for _, payload_digest, _, raw in prepared:
                 await _put_encoded_blob(db, payload_digest, raw)
             for fact, _, _, _ in prepared:
@@ -709,10 +1127,19 @@ class ObservationArchive:
             cursor = await db.execute(
                 """
                 INSERT INTO fact_batches(
-                    publication_key, kind, cycle_id, task_id, published_at, fact_count
-                ) VALUES (?, ?, ?, ?, ?, ?)
+                    publication_key, kind, cycle_id, task_id, maintenance_task_id,
+                    published_at, fact_count
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
-                (publication_key, kind, cycle_id, task_id, published, len(prepared)),
+                (
+                    publication_key,
+                    kind,
+                    cycle_id,
+                    task_id,
+                    maintenance_task_id,
+                    published,
+                    len(prepared),
+                ),
             )
             batch_id = int(cursor.lastrowid)
             for ordinal, (fact, payload_digest, _, _) in enumerate(prepared):
@@ -739,7 +1166,21 @@ class ObservationArchive:
                         payload_digest,
                     ),
                 )
-                await _advance_head(db, int(cursor.lastrowid), fact.family, fact.subject_key)
+                observation_id = int(cursor.lastrowid)
+                if fact.family == "commit-references" and fact.coverage is Coverage.COMPLETE:
+                    await db.executemany(
+                        """
+                        INSERT INTO commit_reference_index(
+                            observation_id, ordinal, sha
+                        ) VALUES (?, ?, ?)
+                        """,
+                        commit_reference_index_rows(
+                            observation_id,
+                            fact.resource_number,
+                            fact.payload,
+                        ),
+                    )
+                await _advance_head(db, observation_id, fact.family, fact.subject_key)
             if task_id is not None:
                 await db.execute(
                     "UPDATE sync_tasks SET completed_at = ?, last_error = NULL WHERE id = ?",
@@ -750,6 +1191,81 @@ class ObservationArchive:
             await db.rollback()
             raise
         return await _batch_facts(db, batch_id)
+
+    async def complete_maintenance_task(
+        self,
+        task_id: int,
+        completed_at: datetime,
+        outcome: Coverage,
+    ) -> MaintenanceTask:
+        """Complete a maintenance workflow after all its facts are durable.
+
+        Args:
+            task_id: Pending maintenance task.
+            completed_at: Actual workflow completion time.
+            outcome: Aggregate source coverage for this declared task.
+
+        Returns:
+            The completed task; repeating the call is idempotent.
+        """
+        if not isinstance(outcome, Coverage):
+            raise TypeError("invalid maintenance task outcome")
+        completed = _iso(completed_at)
+        db = self._connection
+        await db.execute("BEGIN IMMEDIATE")
+        try:
+            row = await _fetchone(db, "SELECT * FROM maintenance_tasks WHERE id = ?", (task_id,))
+            if row is None:
+                raise RuntimeError("unknown maintenance task")
+            if row["completed_at"] is None:
+                await _active_maintenance_job_row(db, int(row["job_id"]))
+                started = row["last_attempt_from"]
+                if started is None or str(started) > completed:
+                    raise RuntimeError("maintenance task has no active attempt")
+                await db.execute(
+                    """
+                    UPDATE maintenance_tasks
+                    SET completed_at = ?, outcome = ?, last_attempt_until = ?,
+                        last_error = NULL
+                    WHERE id = ?
+                    """,
+                    (completed, outcome.value, completed, task_id),
+                )
+                await _advance_maintenance_job(db, int(row["job_id"]), completed)
+            elif row["outcome"] != outcome.value:
+                raise RuntimeError("maintenance task already has another outcome")
+            await db.commit()
+        except BaseException:
+            await db.rollback()
+            raise
+        current = await _required_row(
+            db,
+            "SELECT * FROM maintenance_tasks WHERE id = ?",
+            (task_id,),
+            "maintenance task disappeared",
+        )
+        return await _maintenance_task_from_row(db, current)
+
+    async def add_maintenance_requests(self, job_id: int, count: int) -> None:
+        """Add attempted HTTP operations to an active maintenance job.
+
+        Args:
+            job_id: Active refresh or backfill job.
+            count: Non-negative number of newly attempted operations.
+        """
+        if count < 0:
+            raise ValueError("request count cannot be negative")
+        cursor = await self._connection.execute(
+            """
+            UPDATE maintenance_jobs
+            SET request_count = request_count + ?
+            WHERE id = ?
+            """,
+            (count, job_id),
+        )
+        if cursor.rowcount != 1:
+            raise RuntimeError("request accounting requires a maintenance job")
+        await self._connection.commit()
 
     async def add_requests(self, cycle_id: int, count: int) -> None:
         """Add attempted HTTP operations to an active cycle.
@@ -849,7 +1365,7 @@ class ObservationArchive:
             )
             await db.executemany(
                 "INSERT INTO fact_schemas(family, version) VALUES (?, ?)",
-                sorted(FACT_SCHEMAS.items()),
+                _fact_schema_rows(),
             )
             await db.commit()
             return
@@ -866,10 +1382,10 @@ class ObservationArchive:
         if metadata.get("git_store") != str(self.git_store):
             raise ValueError("archive belongs to another Git object store")
         schemas = {
-            str(row["family"]): int(row["version"])
+            (str(row["family"]), int(row["version"]))
             for row in await _fetchall(db, "SELECT family, version FROM fact_schemas")
         }
-        if schemas != FACT_SCHEMAS:
+        if schemas != set(_fact_schema_rows()):
             raise ValueError("archive fact schema registry is inconsistent")
 
     @property
@@ -889,7 +1405,7 @@ async def iter_observations(
     """Replay immutable observations in publication order.
 
     Args:
-        path: Version-ten SQLite archive.
+        path: Version-eleven SQLite archive.
         after: Exclusive global observation cursor.
         family: Optional exact fact-family filter.
         subject_key: Optional exact subject filter.
@@ -914,7 +1430,7 @@ async def iter_current_facts(
     """Read the latest actual observation for each selected semantic fact.
 
     Args:
-        path: Version-ten SQLite archive.
+        path: Version-eleven SQLite archive.
         family: Optional exact fact-family filter.
         subject_key: Optional exact subject filter.
 
@@ -937,7 +1453,7 @@ async def iter_facts_as_of(
     """Read each fact's latest observation closed no later than a timestamp.
 
     Args:
-        path: Version-ten SQLite archive.
+        path: Version-eleven SQLite archive.
         at: Inclusive UTC-normalized observation boundary.
         family: Optional exact fact-family filter.
         subject_key: Optional exact subject filter.
@@ -1025,8 +1541,8 @@ ORDER BY family, subject_key
 
 
 def _prepare_fact(fact: FactDraft) -> tuple[FactDraft, str, str, bytes]:
-    version = FACT_SCHEMAS.get(fact.family)
-    if version is None or fact.schema_version != version:
+    versions = FACT_SCHEMAS.get(fact.family)
+    if versions is None or fact.schema_version not in versions:
         raise ValueError(f"unsupported fact schema: {fact.family}@{fact.schema_version}")
     if not fact.subject_key:
         raise ValueError("fact subject cannot be empty")
@@ -1110,15 +1626,21 @@ async def _verify_existing_batch(
     kind: str,
     cycle_id: int | None,
     task_id: int | None,
+    maintenance_task_id: int | None,
     facts: tuple[tuple[FactDraft, str, str, bytes], ...],
 ) -> None:
     identity = (
         str(batch["kind"]),
         None if batch["cycle_id"] is None else int(batch["cycle_id"]),
         None if batch["task_id"] is None else int(batch["task_id"]),
+        (
+            None
+            if batch["maintenance_task_id"] is None
+            else int(batch["maintenance_task_id"])
+        ),
         int(batch["fact_count"]),
     )
-    if identity != (kind, cycle_id, task_id, len(facts)):
+    if identity != (kind, cycle_id, task_id, maintenance_task_id, len(facts)):
         raise RuntimeError("publication key belongs to another operation")
     rows = await _fetchall(
         db,
@@ -1197,6 +1719,39 @@ async def _advance_head(
     )
 
 
+async def _advance_maintenance_job(
+    db: aiosqlite.Connection,
+    job_id: int,
+    completed_at: str,
+) -> None:
+    progress = await _fetchone(
+        db,
+        """
+        SELECT COUNT(*) AS total,
+               COUNT(CASE WHEN completed_at IS NOT NULL THEN 1 END) AS completed
+        FROM maintenance_tasks WHERE job_id = ?
+        """,
+        (job_id,),
+    )
+    if progress is None:
+        raise RuntimeError("maintenance job progress disappeared")
+    total = int(progress["total"])
+    completed = int(progress["completed"])
+    await db.execute(
+        """
+        UPDATE maintenance_jobs
+        SET completed_tasks = ?, status = ?, completed_at = ?
+        WHERE id = ? AND status = 'active'
+        """,
+        (
+            completed,
+            "complete" if completed == total else "active",
+            completed_at if completed == total else None,
+            job_id,
+        ),
+    )
+
+
 def _observation_order(row: aiosqlite.Row) -> tuple[str, str, int]:
     return str(row["observed_until"]), str(row["observed_from"]), int(row["id"])
 
@@ -1235,6 +1790,72 @@ async def _task_from_row(db: aiosqlite.Connection, row: aiosqlite.Row) -> SyncTa
             None if row["completed_at"] is None else _time(str(row["completed_at"]))
         ),
         attempts=int(row["attempts"]),
+        last_error=_optional_text(row["last_error"]),
+    )
+
+
+async def _maintenance_job_from_row(
+    db: aiosqlite.Connection,
+    row: aiosqlite.Row,
+) -> MaintenanceJob:
+    payload_row = await _required_row(
+        db,
+        "SELECT codec, raw_size, payload FROM payload_blobs WHERE digest = ?",
+        (str(row["scope_digest"]),),
+        "maintenance scope is missing",
+    )
+    return MaintenanceJob(
+        id=int(row["id"]),
+        job_key=str(row["job_key"]),
+        kind=str(row["kind"]),
+        requested_at=_time(str(row["requested_at"])),
+        completed_at=(
+            None if row["completed_at"] is None else _time(str(row["completed_at"]))
+        ),
+        status=str(row["status"]),
+        scope_digest=str(row["scope_digest"]),
+        scope=_decode_payload(payload_row),
+        total_tasks=int(row["total_tasks"]),
+        completed_tasks=int(row["completed_tasks"]),
+        request_count=int(row["request_count"]),
+    )
+
+
+async def _maintenance_task_from_row(
+    db: aiosqlite.Connection,
+    row: aiosqlite.Row,
+) -> MaintenanceTask:
+    payload_row = await _required_row(
+        db,
+        "SELECT codec, raw_size, payload FROM payload_blobs WHERE digest = ?",
+        (str(row["input_digest"]),),
+        "maintenance task input is missing",
+    )
+    return MaintenanceTask(
+        id=int(row["id"]),
+        job_id=int(row["job_id"]),
+        task_key=str(row["task_key"]),
+        kind=str(row["kind"]),
+        subject_key=str(row["subject_key"]),
+        resource_number=(
+            None if row["resource_number"] is None else int(row["resource_number"])
+        ),
+        payload=_decode_payload(payload_row),
+        completed_at=(
+            None if row["completed_at"] is None else _time(str(row["completed_at"]))
+        ),
+        outcome=(None if row["outcome"] is None else Coverage(str(row["outcome"]))),
+        attempts=int(row["attempts"]),
+        last_attempt_from=(
+            None
+            if row["last_attempt_from"] is None
+            else _time(str(row["last_attempt_from"]))
+        ),
+        last_attempt_until=(
+            None
+            if row["last_attempt_until"] is None
+            else _time(str(row["last_attempt_until"]))
+        ),
         last_error=_optional_text(row["last_error"]),
     )
 
@@ -1278,6 +1899,16 @@ def _fact(row: aiosqlite.Row) -> FactObservation:
         batch_kind=str(row["batch_kind"]),
         cycle_id=None if row["cycle_id"] is None else int(row["cycle_id"]),
         task_id=None if row["task_id"] is None else int(row["task_id"]),
+        maintenance_job_id=(
+            None
+            if row["maintenance_job_id"] is None
+            else int(row["maintenance_job_id"])
+        ),
+        maintenance_task_id=(
+            None
+            if row["maintenance_task_id"] is None
+            else int(row["maintenance_task_id"])
+        ),
         published_at=_time(str(row["published_at"])),
         ordinal=int(row["ordinal"]),
         family=str(row["family"]),
@@ -1337,6 +1968,84 @@ async def _active_cycle_row(db: aiosqlite.Connection, cycle_id: int) -> aiosqlit
     return row
 
 
+async def _active_maintenance_job_row(
+    db: aiosqlite.Connection,
+    job_id: int,
+) -> aiosqlite.Row:
+    row = await _fetchone(db, "SELECT * FROM maintenance_jobs WHERE id = ?", (job_id,))
+    if row is None or row["status"] != "active":
+        raise RuntimeError("operation requires an active maintenance job")
+    return row
+
+
+async def _verify_maintenance_job(
+    db: aiosqlite.Connection,
+    job: aiosqlite.Row,
+    kind: str,
+    requested_at: str,
+    scope_digest: str,
+    tasks: tuple[tuple[TaskDraft, str, bytes], ...],
+) -> None:
+    identity = (
+        str(job["kind"]),
+        str(job["requested_at"]),
+        str(job["scope_digest"]),
+        int(job["total_tasks"]),
+    )
+    if identity != (kind, requested_at, scope_digest, len(tasks)):
+        raise ValueError("maintenance job key has another definition")
+    rows = await _fetchall(
+        db,
+        "SELECT * FROM maintenance_tasks WHERE job_id = ? ORDER BY task_key",
+        (int(job["id"]),),
+    )
+    stored = tuple(
+        (
+            str(row["task_key"]),
+            str(row["kind"]),
+            str(row["subject_key"]),
+            None if row["resource_number"] is None else int(row["resource_number"]),
+            str(row["input_digest"]),
+        )
+        for row in rows
+    )
+    supplied = tuple(
+        (
+            task.task_key,
+            task.kind,
+            task.subject_key,
+            task.resource_number,
+            input_digest,
+        )
+        for task, input_digest, _ in tasks
+    )
+    if stored != supplied:
+        raise ValueError("maintenance job key has other tasks")
+
+
+def _fact_schema_rows() -> list[tuple[str, int]]:
+    return sorted(
+        (family, version)
+        for family, versions in FACT_SCHEMAS.items()
+        for version in versions
+    )
+
+
+def _indexed_references(
+    row: aiosqlite.Row,
+    selected: Collection[str] | None,
+) -> tuple[dict[str, Any], ...]:
+    observation_id = int(row["observation_id"])
+    values = commit_reference_provenance(
+        observation_id,
+        None if row["resource_number"] is None else int(row["resource_number"]),
+        _decode_payload(row),
+    )
+    if selected is None:
+        return values
+    return tuple(value for value in values if value["sha"] in selected)
+
+
 def _json_bytes(value: dict[str, Any]) -> bytes:
     return json.dumps(
         value,
@@ -1388,3 +2097,15 @@ async def _fetchall(
 ) -> list[aiosqlite.Row]:
     async with db.execute(query, tuple(parameters)) as cursor:
         return await cursor.fetchall()
+
+
+async def _required_row(
+    db: aiosqlite.Connection,
+    query: str,
+    parameters: Iterable[object],
+    error: str,
+) -> aiosqlite.Row:
+    row = await _fetchone(db, query, parameters)
+    if row is None:
+        raise RuntimeError(error)
+    return row

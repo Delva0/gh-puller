@@ -469,6 +469,7 @@ class FakeGitStore:
         self.prefetches: list[list[int]] = []
         self.captures: list[int] = []
         self.retentions: list[list[str]] = []
+        self.retention_sources: list[Any] = []
         self.syncs = 0
         self.ref_observation: dict[str, Any] = {
             "repository": "acme/widgets",
@@ -493,11 +494,13 @@ class FakeGitStore:
         self,
         shas: list[str],
         *,
+        sources: Any = None,
         heartbeat: Any = None,
         retry: Any = None,
     ) -> dict[str, dict[str, Any]]:
         del retry
         self.retentions.append(shas)
+        self.retention_sources.append(sources)
         if heartbeat is not None:
             heartbeat()
         return {
@@ -506,7 +509,17 @@ class FakeGitStore:
                 "status": "available",
                 "ref": f"refs/github-archive/commits/{sha}",
                 "obtained": "existing",
-                "verification": "commit-and-root-tree",
+                "attempts": [],
+                "verification": {
+                    "method": "git-rev-list-objects-missing-error-v1",
+                    "endpoint": {"status": "complete"},
+                    "snapshot": {"status": "complete"},
+                    "history": {"status": "complete"},
+                    "retention": {
+                        "status": "complete",
+                        "ref": f"refs/github-archive/commits/{sha}",
+                    },
+                },
             }
             for sha in shas
         }

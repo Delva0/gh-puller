@@ -38,7 +38,7 @@ def _policy_for(environment: dict[str, str], database: Path) -> Path:
 def _bind_archive(
     database: Path,
     repository: str = _REPOSITORY,
-    schema: str = "10",
+    schema: str = "11",
 ) -> None:
     with sqlite3.connect(database) as connection:
         connection.execute(

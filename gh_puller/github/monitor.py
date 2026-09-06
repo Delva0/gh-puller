@@ -58,6 +58,7 @@ class ProgressState:
     event_at: datetime | None
     phase: str
     cycle_id: int | None
+    maintenance_job_id: int | None
     checkpoint_from: datetime | None
     requests: int
     quotas: tuple[RateQuota, ...]
@@ -67,7 +68,7 @@ class ProgressState:
 
 @dataclass(frozen=True, slots=True)
 class ArchiveState:
-    """Durable progress read from a version-ten observation archive."""
+    """Durable progress read from a version-eleven observation archive."""
 
     git_store: Path
     checkpoint: datetime | None
@@ -87,6 +88,23 @@ class ArchiveState:
     requests: int
     latest: tuple[str, str, datetime] | None
     updated_at: datetime | None
+    last_error: str | None
+    maintenance: MaintenanceState | None
+
+
+@dataclass(frozen=True, slots=True)
+class MaintenanceState:
+    """Durable progress for the latest refresh or backfill job."""
+
+    job_id: int
+    kind: str
+    status: str
+    requested_at: datetime
+    completed_at: datetime | None
+    tasks_completed: int
+    tasks_total: int
+    outcomes: tuple[tuple[str, int], ...]
+    latest: tuple[str, str, datetime] | None
     last_error: str | None
 
 
@@ -228,6 +246,7 @@ def _latest_progress(output: str) -> ProgressState | None:
             event_at=_time(payload.get("event_at")),
             phase=_text(payload.get("phase")) or "unknown",
             cycle_id=_int(payload.get("cycle_id")),
+            maintenance_job_id=_int(payload.get("maintenance_job_id")),
             checkpoint_from=_time(payload.get("checkpoint_from")),
             requests=_int(payload.get("requests")) or 0,
             quotas=_quotas(payload.get("quotas")),
@@ -245,7 +264,7 @@ def _archive_state(path: Path) -> tuple[ArchiveState | None, str | None]:
         connection = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
         connection.row_factory = sqlite3.Row
         metadata = dict(connection.execute("SELECT key, value FROM archive_meta"))
-        if metadata.get("schema_version") != "10":
+        if metadata.get("schema_version") != "11":
             raise ValueError(f"unsupported archive schema {metadata.get('schema_version')}")
         git_store = metadata.get("git_store")
         if not isinstance(git_store, str) or not git_store:
@@ -260,6 +279,7 @@ def _archive_state(path: Path) -> tuple[ArchiveState | None, str | None]:
         cycle_id = None if cycle is None else int(cycle["id"])
         tasks = _counts(connection, "sync_tasks", cycle_id)
         parents = _counts(connection, "sync_tasks", cycle_id, "kind = 'parent'")
+        maintenance = _maintenance_state(connection)
         latest = connection.execute(
             """
             SELECT family, subject_key, observed_until
@@ -274,6 +294,10 @@ def _archive_state(path: Path) -> tuple[ArchiveState | None, str | None]:
                 UNION ALL SELECT MAX(completed_at) FROM sync_tasks
                 UNION ALL SELECT MAX(completed_at) FROM sync_cycles
                 UNION ALL SELECT MAX(started_at) FROM sync_cycles
+                UNION ALL SELECT MAX(requested_at) FROM maintenance_jobs
+                UNION ALL SELECT MAX(completed_at) FROM maintenance_jobs
+                UNION ALL SELECT MAX(last_attempt_from) FROM maintenance_tasks
+                UNION ALL SELECT MAX(last_attempt_until) FROM maintenance_tasks
             )
             """,
         ).fetchone()
@@ -317,7 +341,12 @@ def _archive_state(path: Path) -> tuple[ArchiveState | None, str | None]:
                     )
                 ),
                 updated_at=None if updated is None else _time(updated[0]),
-                last_error=None if error is None else str(error["last_error"]),
+                last_error=(
+                    maintenance.last_error
+                    if maintenance is not None and maintenance.last_error is not None
+                    else None if error is None else str(error["last_error"])
+                ),
+                maintenance=maintenance,
             ),
             None,
         )
@@ -346,6 +375,71 @@ def _counts(
         (cycle_id,),
     ).fetchone()
     return int(row[0]), int(row[1])
+
+
+def _maintenance_state(connection: sqlite3.Connection) -> MaintenanceState | None:
+    job = connection.execute(
+        """
+        SELECT * FROM maintenance_jobs
+        ORDER BY status = 'active' DESC, id DESC
+        LIMIT 1
+        """,
+    ).fetchone()
+    if job is None:
+        return None
+    job_id = int(job["id"])
+    outcomes = tuple(
+        (str(row["outcome"]), int(row["count"]))
+        for row in connection.execute(
+            """
+            SELECT outcome, COUNT(*) AS count
+            FROM maintenance_tasks
+            WHERE job_id = ? AND outcome IS NOT NULL
+            GROUP BY outcome ORDER BY outcome
+            """,
+            (job_id,),
+        )
+    )
+    latest = connection.execute(
+        """
+        SELECT kind, subject_key,
+               COALESCE(last_attempt_until, last_attempt_from, completed_at) AS observed_at
+        FROM maintenance_tasks
+        WHERE job_id = ? AND COALESCE(last_attempt_until, last_attempt_from, completed_at) IS NOT NULL
+        ORDER BY observed_at DESC, id DESC
+        LIMIT 1
+        """,
+        (job_id,),
+    ).fetchone()
+    error = connection.execute(
+        """
+        SELECT last_error FROM maintenance_tasks
+        WHERE job_id = ? AND completed_at IS NULL AND last_error IS NOT NULL
+        ORDER BY COALESCE(last_attempt_until, last_attempt_from) DESC, id DESC
+        LIMIT 1
+        """,
+        (job_id,),
+    ).fetchone()
+    return MaintenanceState(
+        job_id=job_id,
+        kind=str(job["kind"]),
+        status=str(job["status"]),
+        requested_at=_required_time(job["requested_at"], "maintenance request"),
+        completed_at=_time(job["completed_at"]),
+        tasks_completed=int(job["completed_tasks"]),
+        tasks_total=int(job["total_tasks"]),
+        outcomes=outcomes,
+        latest=(
+            None
+            if latest is None
+            else (
+                str(latest["kind"]),
+                str(latest["subject_key"]),
+                _required_time(latest["observed_at"], "maintenance task"),
+            )
+        ),
+        last_error=None if error is None else str(error["last_error"]),
+    )
 
 
 def _render_table(
@@ -392,6 +486,10 @@ def _render_detail(
         ("RESTARTS", str(status.service.restarts)),
         ("CYCLE", _cycle(archive, zone)),
         ("CHECKPOINT", _local_optional(None if archive is None else archive.checkpoint, zone)),
+        ("MAINT", _maintenance(archive, zone)),
+        ("M TASKS", _maintenance_tasks(archive, 20)),
+        ("M OUTCOMES", _maintenance_outcomes(archive)),
+        ("M LATEST", _maintenance_latest(archive, zone)),
         ("PHASE", _phase(status)),
         ("DISCOVERY", _discovery(archive)),
         ("PARENTS", _parents(archive, 20)),
@@ -458,6 +556,11 @@ def _short_phase(status: WriterStatus) -> str:
 def _short_parents(archive: ArchiveState | None) -> str:
     if archive is None:
         return "-"
+    if archive.maintenance is not None and archive.maintenance.status == "active":
+        return (
+            f"{_short_count(archive.maintenance.tasks_completed)}/"
+            f"{_short_count(archive.maintenance.tasks_total)}"
+        )
     return f"{_short_count(archive.parents_completed)}/{_short_count(archive.parents_total)}"
 
 
@@ -475,6 +578,16 @@ def _service_detail(service: ServiceState) -> str:
 
 
 def _phase(status: WriterStatus) -> str:
+    maintenance = None if status.archive is None else status.archive.maintenance
+    if (
+        maintenance is not None
+        and maintenance.status == "active"
+        and (
+            status.progress is None
+            or status.progress.maintenance_job_id != maintenance.job_id
+        )
+    ):
+        return maintenance.kind
     if status.progress is not None:
         return status.progress.phase
     if status.archive is not None and status.archive.cycle_status == "active":
@@ -487,6 +600,35 @@ def _cycle(archive: ArchiveState | None, zone: tzinfo | None) -> str:
         return "-"
     started = _local_optional(archive.cycle_started, zone)
     return f"{archive.cycle_id} {archive.cycle_status} since {started}"
+
+
+def _maintenance(archive: ArchiveState | None, zone: tzinfo | None) -> str:
+    if archive is None or archive.maintenance is None:
+        return "-"
+    job = archive.maintenance
+    requested = _local_time(job.requested_at, zone)
+    return f"{job.job_id} {job.kind} {job.status} since {requested}"
+
+
+def _maintenance_tasks(archive: ArchiveState | None, width: int) -> str:
+    if archive is None or archive.maintenance is None:
+        return "-"
+    job = archive.maintenance
+    return _meter("tasks", job.tasks_completed, job.tasks_total, width)
+
+
+def _maintenance_outcomes(archive: ArchiveState | None) -> str:
+    if archive is None or archive.maintenance is None:
+        return "-"
+    outcomes = archive.maintenance.outcomes
+    return "pending" if not outcomes else " ".join(f"{key}={value:,}" for key, value in outcomes)
+
+
+def _maintenance_latest(archive: ArchiveState | None, zone: tzinfo | None) -> str:
+    if archive is None or archive.maintenance is None or archive.maintenance.latest is None:
+        return "-"
+    kind, subject, observed = archive.maintenance.latest
+    return f"{kind} {subject} at {_local_time(observed, zone)}"
 
 
 def _discovery(archive: ArchiveState | None) -> str:

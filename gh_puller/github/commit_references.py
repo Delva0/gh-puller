@@ -8,7 +8,10 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
 
 _SHA = re.compile(r"[0-9a-f]{40,64}\Z")
 
@@ -100,6 +103,89 @@ def observation_commit_references(
     elif family in {"issue-timeline", "issue-events"}:
         _append_event_references(result, family, _objects(value))
     return tuple(result)
+
+
+def commit_reference_index_rows(
+    observation_id: int,
+    resource_number: int | None,
+    payload: dict[str, Any],
+) -> tuple[tuple[int, int, str], ...]:
+    """Normalize one published reference fact into a rebuildable SHA index.
+
+    Args:
+        observation_id: Global identity of the ``commit-references`` fact.
+        resource_number: Related Issue or PR number, when present.
+        payload: Complete schema-one ``commit-references`` payload.
+
+    Returns:
+        Rows containing fact identity, source order, and SHA.
+    """
+    provenance = commit_reference_provenance(observation_id, resource_number, payload)
+    return tuple(
+        (observation_id, ordinal, str(value["sha"]))
+        for ordinal, value in enumerate(provenance)
+    )
+
+
+def commit_reference_provenance(
+    observation_id: int,
+    resource_number: int | None,
+    payload: dict[str, Any],
+) -> tuple[dict[str, Any], ...]:
+    """Recover complete source records from one reference fact.
+
+    Args:
+        observation_id: Global identity of the ``commit-references`` fact.
+        resource_number: Related Issue or PR number, when present.
+        payload: Complete schema-one ``commit-references`` payload.
+
+    Returns:
+        Source-distinct provenance records in source order.
+    """
+    values = payload.get("references")
+    if not isinstance(values, list) or any(not isinstance(value, dict) for value in values):
+        raise ValueError(f"commit reference observation {observation_id} is malformed")
+    result = []
+    for value in values:
+        sha = value.get("sha")
+        if not isinstance(sha, str) or _SHA.fullmatch(sha) is None:
+            raise ValueError(f"commit reference observation {observation_id} has an invalid SHA")
+        provenance = value | {
+            "reference_observation_id": observation_id,
+            "resource_number": resource_number,
+            "source_family": payload.get("source_family"),
+            "source_observation_id": payload.get("source_observation_id"),
+            "source_payload_digest": payload.get("source_payload_digest"),
+        }
+        result.append(provenance)
+    return tuple(result)
+
+
+def commit_reference_scope(
+    references: Sequence[dict[str, Any]],
+) -> dict[str, Any]:
+    """Identify the immutable reference facts supporting one Git check.
+
+    Args:
+        references: Provenance records recovered from published reference facts.
+
+    Returns:
+        Reference observation identities and source-edge count.
+    """
+    observation_ids = sorted(
+        {
+            value
+            for reference in references
+            if type(value := reference.get("reference_observation_id")) is int
+            and value > 0
+        },
+    )
+    if references and not observation_ids:
+        raise ValueError("structured commit sources lack reference observations")
+    return {
+        "observation_ids": observation_ids,
+        "reference_count": len(references),
+    }
 
 
 def _append_event_references(

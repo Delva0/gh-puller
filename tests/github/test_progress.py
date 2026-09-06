@@ -45,7 +45,7 @@ def test_tracker_combines_resumed_and_current_process_requests() -> None:
     events = []
     tracker = _SyncProgressTracker(events.append, lambda: _T0)
     tracker.start()
-    tracker.bind(4, _T0 - timedelta(hours=1), 70, 10)
+    tracker.bind_cycle(4, _T0 - timedelta(hours=1), 70, 10)
 
     tracker.api_progress(
         APIProgress(
@@ -58,6 +58,17 @@ def test_tracker_combines_resumed_and_current_process_requests() -> None:
     assert events[-2].requests == 73
     assert events[-1].phase == "idle"
     assert events[-1].requests == 73
+
+
+def test_tracker_distinguishes_maintenance_from_sync_cycles() -> None:
+    events = []
+    tracker = _SyncProgressTracker(events.append, lambda: _T0)
+
+    tracker.bind_maintenance(9, 4, 0)
+
+    assert events[-1].maintenance_job_id == 9
+    assert events[-1].cycle_id is None
+    assert events[-1].checkpoint_from is None
 
 
 def test_tty_progress_finishes_idle_and_error_lines() -> None:

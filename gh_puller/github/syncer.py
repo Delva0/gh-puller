@@ -14,16 +14,21 @@ from __future__ import annotations
 import asyncio
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 from urllib.parse import urlencode
 
 from .client import GitHubAPI, GitHubPage, GitHubResource
-from .commit_references import CommitReference, observation_commit_references
+from .commit_references import (
+    CommitReference,
+    commit_reference_scope,
+    observation_commit_references,
+)
 from .errors import GitHubAPIError
 from .git_store import (
+    CommitFetchSource,
     GitObjectStore,
     GitStoreError,
     TransientGitStoreError,
@@ -37,6 +42,7 @@ from .observations import (
     DiscoveryItemDraft,
     FactDraft,
     FactObservation,
+    MaintenanceTask,
     ObservationArchive,
     Origin,
     SyncCycle,
@@ -212,6 +218,7 @@ class _GitStore(Protocol):
         self,
         shas: Sequence[str],
         *,
+        sources: Mapping[str, Sequence[CommitFetchSource]] | None = None,
         heartbeat: Callable[[], None] | None = None,
         retry: Callable[[float], None] | None = None,
     ) -> dict[str, dict[str, Any]]: ...
@@ -340,7 +347,7 @@ class GitHubSyncer:
                 api, owned = self._make_api()
                 git = self._make_git()
                 request_start = api.request_count
-                self._progress.bind(
+                self._progress.bind_cycle(
                     cycle.id,
                     cycle.checkpoint_from,
                     cycle.request_count,
@@ -401,6 +408,7 @@ class GitHubSyncer:
             self.config.git_url or default_git_url(self.config.repository),
             token=_token(self.config.token),
             sleep=self._sleep,
+            now=self._now,
         )
 
     def _git_destination(self) -> Path:
@@ -423,10 +431,7 @@ class GitHubSyncer:
             current = await archive.active_cycle()
             if current is None or current.id != cycle.id:
                 raise RuntimeError("active sync cycle disappeared")
-            items = tuple(
-                _discovery_item(item, observed_from, observed_until)
-                for item in page.items
-            )
+            items = tuple(_discovery_item(item, observed_from, observed_until) for item in page.items)
             tasks = tuple(_parent_task(item.number) for item in items)
             pull_numbers = [item.number for item in items if item.kind == "pull"]
             if pull_numbers:
@@ -473,10 +478,7 @@ class GitHubSyncer:
                         issue_numbers,
                         pull_numbers,
                     )
-                tasks.extend(
-                    _parent_task(number)
-                    for number in sorted(issue_numbers | pull_numbers)
-                )
+                tasks.extend(_parent_task(number) for number in sorted(issue_numbers | pull_numbers))
             async with self._store_lock:
                 await archive.enqueue_tasks(cycle.id, tuple(tasks))
         initial = _catalog_url(
@@ -521,11 +523,7 @@ class GitHubSyncer:
             self._progress.phase("fetching")
             pull_git = [task for task in tasks if task.kind == "pull-git"]
             commit_objects = [task for task in tasks if task.kind == "commit-object"]
-            ordinary = [
-                task
-                for task in tasks
-                if task.kind not in {"pull-git", "commit-object"}
-            ]
+            ordinary = [task for task in tasks if task.kind not in {"pull-git", "commit-object"}]
             errors = await asyncio.gather(
                 *(self._guard_task(api, git, archive, task) for task in ordinary),
             )
@@ -612,12 +610,26 @@ class GitHubSyncer:
                     await archive.complete_task(task.id, _utc(self._now()))
         if not pending:
             return []
-        shas = [_required_sha(task.payload.get("sha"), task.task_key) for task in pending]
+        task_shas = [_required_sha(task.payload.get("sha"), task.task_key) for task in pending]
+        shas = tuple(dict.fromkeys(task_shas))
         try:
             self._progress.phase("syncing_git", f"commits={len(shas)}")
             observed_from = _utc(self._now())
+            references = await self._commit_reference_index(archive, set(shas))
+            source_tasks = [
+                replace(
+                    task,
+                    payload={
+                        "sha": sha,
+                        "references": list(references.get(sha, ())),
+                    },
+                )
+                for task, sha in zip(pending, task_shas, strict=True)
+            ]
+            fetch_sources = await self._commit_fetch_sources(archive, source_tasks)
             results = await git.retain_commits(
                 shas,
+                sources=fetch_sources,
                 heartbeat=self._progress.git_heartbeat,
                 retry=self._progress.git_retry,
             )
@@ -628,7 +640,7 @@ class GitHubSyncer:
                     await archive.record_task_error(task.id, _error_text(exc))
             return [exc]
         failures: list[Exception | None] = []
-        for task, sha in zip(pending, shas, strict=True):
+        for task, sha in zip(pending, task_shas, strict=True):
             try:
                 result = results.get(sha)
                 if not isinstance(result, dict):
@@ -638,6 +650,8 @@ class GitHubSyncer:
                 status = result.get("status")
                 if status == "available":
                     coverage = Coverage.COMPLETE
+                elif status == "partial":
+                    coverage = Coverage.PARTIAL
                 elif status == "unavailable":
                     coverage = Coverage.UNAVAILABLE
                 else:
@@ -649,14 +663,18 @@ class GitHubSyncer:
                     (
                         FactDraft(
                             family="commit-object",
+                            schema_version=2,
                             subject_key=f"commit:{sha}",
                             observed_from=observed_from,
                             observed_until=observed_until,
                             coverage=coverage,
                             origin=Origin.GIT,
                             payload={
-                                "operation": "GitCommitRetention",
+                                "operation": "GitCommitReconstruction",
                                 "repository": self.config.repository,
+                                "reference_scope": commit_reference_scope(
+                                    references.get(sha, ()),
+                                ),
                                 "sha": sha,
                                 "value": result,
                             },
@@ -675,7 +693,7 @@ class GitHubSyncer:
     async def _publication(
         self,
         archive: ObservationArchive,
-        task: SyncTask,
+        task: SyncTask | MaintenanceTask,
         operation: str,
     ) -> tuple[FactObservation, ...] | None:
         async with self._store_lock:
@@ -693,29 +711,38 @@ class GitHubSyncer:
     async def _publish(
         self,
         archive: ObservationArchive,
-        task: SyncTask,
+        task: SyncTask | MaintenanceTask,
         operation: str,
         facts: tuple[FactDraft, ...],
         *,
         complete_task: bool = False,
     ) -> tuple[FactObservation, ...]:
         async with self._store_lock:
+            maintenance = isinstance(task, MaintenanceTask)
             return await archive.publish(
                 _publication_key(task, operation),
-                "sync",
+                "refresh" if maintenance else "sync",
                 _utc(self._now()),
                 facts,
-                cycle_id=task.cycle_id,
-                task_id=task.id if complete_task else None,
+                cycle_id=None if maintenance else task.cycle_id,
+                task_id=(task.id if complete_task and not maintenance else None),
+                maintenance_task_id=task.id if maintenance else None,
             )
 
     async def _finish_task(
         self,
         archive: ObservationArchive,
-        task: SyncTask,
+        task: SyncTask | MaintenanceTask,
     ) -> None:
         async with self._store_lock:
-            await archive.complete_task(task.id, _utc(self._now()))
+            if isinstance(task, MaintenanceTask):
+                await archive.complete_maintenance_task(
+                    task.id,
+                    _utc(self._now()),
+                    Coverage.COMPLETE,
+                )
+            else:
+                await archive.complete_task(task.id, _utc(self._now()))
 
     async def _hydrate_parent(
         self,
@@ -1094,7 +1121,7 @@ class GitHubSyncer:
         self,
         api: _API,
         archive: ObservationArchive,
-        task: SyncTask,
+        task: SyncTask | MaintenanceTask,
     ) -> FactObservation:
         existing = await self._publication(archive, task, "pull-review-threads")
         if existing is not None:
@@ -1292,7 +1319,7 @@ class GitHubSyncer:
         self,
         api: _API,
         archive: ObservationArchive,
-        task: SyncTask,
+        task: SyncTask | MaintenanceTask,
     ) -> FactObservation:
         existing = await self._publication(archive, task, "issue-relations")
         if existing is not None:
@@ -1667,7 +1694,7 @@ class GitHubSyncer:
     async def _coverage_fact(
         self,
         archive: ObservationArchive,
-        task: SyncTask,
+        task: SyncTask | MaintenanceTask,
         operation_key: str,
         family: str,
         subject_key: str,
@@ -1814,7 +1841,7 @@ class GitHubSyncer:
         self,
         git: _GitStore,
         archive: ObservationArchive,
-        task: SyncTask,
+        task: SyncTask | MaintenanceTask,
     ) -> None:
         existing = await self._publication(archive, task, "git-refs")
         if existing is not None:
@@ -1908,10 +1935,7 @@ class GitHubSyncer:
         git: _GitStore,
         tasks: list[SyncTask],
     ) -> None:
-        pulls = {
-            _task_number(task): _object(task.payload.get("pull"), task.task_key)
-            for task in tasks
-        }
+        pulls = {_task_number(task): _object(task.payload.get("pull"), task.task_key) for task in tasks}
         try:
             await git.prefetch(
                 pulls,
@@ -1958,9 +1982,7 @@ class GitHubSyncer:
                     observed_from=observed_from,
                     observed_until=observed_until,
                     coverage=(
-                        Coverage.PARTIAL
-                        if snapshot.get("comparison_kind") == "unavailable"
-                        else Coverage.COMPLETE
+                        Coverage.PARTIAL if snapshot.get("comparison_kind") == "unavailable" else Coverage.COMPLETE
                     ),
                     origin=Origin.GIT,
                     payload={
@@ -1974,13 +1996,85 @@ class GitHubSyncer:
             complete_task=True,
         )
 
+    async def _commit_fetch_sources(
+        self,
+        archive: ObservationArchive,
+        tasks: Sequence[SyncTask | MaintenanceTask],
+    ) -> dict[str, tuple[CommitFetchSource, ...]]:
+        references = [(task, _task_references(task)) for task in tasks]
+        numbers = sorted(
+            {
+                number
+                for _, selected in references
+                for item in selected
+                if type(number := item.get("resource_number")) is int and number > 0
+            },
+        )
+        pulls = {}
+        for number in numbers:
+            current = await self._current(archive, "pull", f"pull:{number}")
+            if current is not None and current.coverage is Coverage.COMPLETE:
+                pulls[number] = _fact_object(current, f"pull #{number}")
+        result: dict[str, list[CommitFetchSource]] = {}
+        for task, selected in references:
+            sha = _required_sha(task.payload.get("sha"), task.task_key)
+            sources = result.setdefault(sha, [])
+            for number in sorted(
+                {value for item in selected if type(value := item.get("resource_number")) is int and value in pulls},
+            ):
+                sources.append(
+                    CommitFetchSource(
+                        "pull-ref",
+                        self.config.git_url or default_git_url(self.config.repository),
+                        f"refs/pull/{number}/head",
+                        self.config.repository,
+                        number,
+                    ),
+                )
+                pull = pulls[number]
+                head = pull.get("head")
+                repository = head.get("repo") if isinstance(head, dict) else None
+                full_name = repository.get("full_name") if isinstance(repository, dict) else None
+                ref = head.get("ref") if isinstance(head, dict) else None
+                if (
+                    isinstance(full_name, str)
+                    and "/" in full_name
+                    and full_name != self.config.repository
+                    and isinstance(ref, str)
+                    and ref
+                ):
+                    sources.append(
+                        CommitFetchSource(
+                            "repository-ref",
+                            _repository_git_url(repository, full_name),
+                            f"refs/heads/{ref}",
+                            full_name,
+                            number,
+                        ),
+                    )
+        return {sha: tuple(dict.fromkeys(sources)) for sha, sources in result.items()}
+
+    async def _commit_reference_index(
+        self,
+        archive: ObservationArchive,
+        shas: set[str],
+    ) -> dict[str, tuple[dict[str, Any], ...]]:
+        cutoff = await archive.observation_cutoff()
+        references: dict[str, list[dict[str, Any]]] = {}
+        async for item in archive.iter_commit_references(cutoff, shas):
+            sha = _required_sha(item.get("sha"), "commit reference")
+            references.setdefault(sha, []).append(item)
+        return {sha: tuple(items) for sha, items in references.items()}
+
     async def _structured_commits(
         self,
         archive: ObservationArchive,
-        task: SyncTask,
+        task: SyncTask | MaintenanceTask,
         sources: list[FactObservation],
-    ) -> None:
+    ) -> dict[str, tuple[dict[str, Any], ...]]:
         references: dict[str, list[CommitReference]] = {}
+        source_by_digest = {}
+        reference_by_digest = {}
         for source in sources:
             if source.coverage is not Coverage.COMPLETE:
                 continue
@@ -1988,9 +2082,11 @@ class GitHubSyncer:
                 observation_commit_references(source.family, source.payload),
             )
             references[source.payload_digest] = selected
+            source_by_digest[source.payload_digest] = source
             operation = f"commit-references:{source.id}"
-            if await self._publication(archive, task, operation) is None:
-                await self._publish(
+            publication = await self._publication(archive, task, operation)
+            if publication is None:
+                publication = await self._publish(
                     archive,
                     task,
                     operation,
@@ -2010,37 +2106,48 @@ class GitHubSyncer:
                                 "source_family": source.family,
                                 "source_observation_id": source.id,
                                 "source_payload_digest": source.payload_digest,
-                                "references": [
-                                    _reference_payload(reference)
-                                    for reference in selected
-                                ],
+                                "references": [_reference_payload(reference) for reference in selected],
                             },
                         ),
                     ),
                 )
-        shas = sorted(
-            {
-                reference.sha
-                for selected in references.values()
-                for reference in selected
-            },
-        )
-        if not shas:
-            return
+            reference_by_digest[source.payload_digest] = _single(
+                publication,
+                "commit-references",
+            )
+        by_sha: dict[str, list[dict[str, Any]]] = {}
+        for digest, selected in references.items():
+            source = source_by_digest[digest]
+            reference_fact = reference_by_digest[digest]
+            for reference in selected:
+                by_sha.setdefault(reference.sha, []).append(
+                    {
+                        "reference_observation_id": reference_fact.id,
+                        "source_observation_id": source.id,
+                        "source_payload_digest": source.payload_digest,
+                        "source_family": source.family,
+                        "resource_number": source.resource_number,
+                        **_reference_payload(reference),
+                    },
+                )
+        frozen = {sha: tuple(items) for sha, items in sorted(by_sha.items())}
+        if not frozen or isinstance(task, MaintenanceTask):
+            return frozen
         async with self._store_lock:
             await archive.enqueue_tasks(
                 task.cycle_id,
                 tuple(
                     TaskDraft(
-                        task_key=f"commit-object:{sha}",
+                        task_key=f"commit-object:{sha}:parent-task:{task.id}",
                         kind="commit-object",
                         subject_key=f"commit:{sha}",
                         resource_number=None,
                         payload={"sha": sha},
                     )
-                    for sha in shas
+                    for sha in frozen
                 ),
             )
+        return frozen
 
 
 def _discovery_item(
@@ -2099,11 +2206,12 @@ def _signal_numbers(items: list[dict[str, Any]], field: str) -> set[int]:
     return numbers
 
 
-def _publication_key(task: SyncTask, operation: str) -> str:
-    return f"sync:{task.cycle_id}:task:{task.id}:{operation}"
+def _publication_key(task: SyncTask | MaintenanceTask, operation: str) -> str:
+    owner = f"maintenance:{task.job_id}" if isinstance(task, MaintenanceTask) else f"sync:{task.cycle_id}"
+    return f"{owner}:task:{task.id}:{operation}"
 
 
-def _task_number(task: SyncTask) -> int:
+def _task_number(task: SyncTask | MaintenanceTask) -> int:
     value = task.payload.get("number", task.resource_number)
     if type(value) is not int or value < 1:
         raise RuntimeError(f"{task.task_key} has no valid resource number")
@@ -2235,6 +2343,20 @@ def _required_sha(value: Any, context: str) -> str:
     if not isinstance(value, str) or _SHA.fullmatch(value) is None:
         raise IncompleteGitHubDataError(f"{context} has no valid commit ID")
     return value
+
+
+def _task_references(task: SyncTask | MaintenanceTask) -> list[dict[str, Any]]:
+    value = task.payload.get("references", [])
+    if not isinstance(value, list) or any(not isinstance(item, dict) for item in value):
+        raise RuntimeError(f"{task.task_key} has invalid commit references")
+    return [dict(item) for item in value]
+
+
+def _repository_git_url(repository: dict[str, Any], full_name: str) -> str:
+    html_url = repository.get("html_url")
+    if isinstance(html_url, str) and html_url.startswith(("http://", "https://")):
+        return f"{html_url.rstrip('/')}.git"
+    return default_git_url(full_name)
 
 
 def _reference_payload(reference: CommitReference) -> dict[str, Any]:
