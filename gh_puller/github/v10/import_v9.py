@@ -433,13 +433,19 @@ class V9Importer:
                 await archive.publish(key, "import", _utc(self._now()), tuple(facts))
         git = self._make_git()
         selected = sorted(shas)
+        pending = []
         for chunk in _chunks(selected, _GIT_BATCH_SIZE):
             key = _batch_key("v9-objects", ((sha,) for sha in chunk))
             if await archive.publication(key) is not None:
                 continue
+            pending.append((key, chunk))
+        if pending:
             observed_from = _utc(self._now())
-            results = await git.retain_commits(list(chunk))
+            results = await git.retain_commits(
+                [sha for _, chunk in pending for sha in chunk],
+            )
             observed_until = _utc(self._now())
+        for key, chunk in pending:
             facts = tuple(
                 _commit_object_fact(
                     self.config.repository,
