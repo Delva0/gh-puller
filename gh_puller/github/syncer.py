@@ -172,7 +172,9 @@ class GitHubSyncer:
             ):
                 cycle = await archive.start_cycle(invoked_at)
                 api, owned = self._runtime.make_api(self._progress.api_progress)
-                git = self._runtime.make_git()
+                git = self._runtime.make_git(
+                    upstream_synced=await archive.task_completed(cycle.id, "git-refs"),
+                )
                 request_start = api.request_count
                 self._progress.bind_cycle(
                     cycle.id,

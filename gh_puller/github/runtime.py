@@ -257,14 +257,20 @@ class GitHubRuntime:
             True,
         )
 
-    def make_git(self) -> GitObjectWriter:
-        """Return the injected or configured repository Git writer."""
+    def make_git(self, *, upstream_synced: bool = False) -> GitObjectWriter:
+        """Return the injected or configured repository Git writer.
+
+        Args:
+            upstream_synced: Whether the active cycle already completed its durable
+                upstream refs task.
+        """
         if self._git is not None:
             return self._git
         return GitObjectStore(
             self.git_destination,
             self.config.repository,
             self.config.git_url or default_git_url(self.config.repository),
+            upstream_synced=upstream_synced,
             token=_token(self.config.token),
             sleep=self._sleep,
             now=self._now,

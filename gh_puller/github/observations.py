@@ -1089,6 +1089,27 @@ class ObservationArchive:
             raise
         return tuple([await _task_from_row(db, row) for row in rows])
 
+    async def task_completed(self, cycle_id: int, task_key: str) -> bool:
+        """Report whether one durable cycle task has completed.
+
+        Args:
+            cycle_id: Cycle that owns the task.
+            task_key: Stable task identity within the cycle.
+
+        Returns:
+            True only when the task exists and has a completion timestamp.
+        """
+        row = await _fetchone(
+            self._connection,
+            """
+            SELECT completed_at
+            FROM sync_tasks
+            WHERE cycle_id = ? AND task_key = ?
+            """,
+            (cycle_id, task_key),
+        )
+        return row is not None and row["completed_at"] is not None
+
     async def take_tasks(
         self,
         cycle_id: int,

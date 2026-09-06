@@ -213,6 +213,7 @@ async def test_cycle_resumes_pages_and_tasks_without_hiding_published_facts(
         assert item is not None and item.summary["title"] == "catalog"
         claimed = await archive.take_tasks(cycle.id, 1)
         assert (claimed[0].task_key, claimed[0].attempts) == ("issue:7", 1)
+        assert not await archive.task_completed(cycle.id, "issue:7")
         await archive.record_task_error(claimed[0].id, "GitHubAPIError: retry")
 
     async with ObservationArchive(database, _REPOSITORY) as archive:
@@ -253,6 +254,8 @@ async def test_cycle_resumes_pages_and_tasks_without_hiding_published_facts(
             task_id=claimed[0].id,
         )
         assert published[0].task_id == claimed[0].id
+        assert await archive.task_completed(resumed.id, "issue:7")
+        assert not await archive.task_completed(resumed.id, "missing")
         assert await archive.discovery_checkpoint() is None
         assert [fact.payload async for fact in iter_current_facts(database)] == [{"number": 7}]
 

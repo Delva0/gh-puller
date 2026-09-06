@@ -115,6 +115,7 @@ class GitObjectStore:
         path: 与 SQLite 事实库配套的 bare Git 目录。
         repository: 固定绑定的 GitHub ``owner/repo``。
         remote_url: Git fetch 使用的远端地址。
+        upstream_synced: 配套事实库是否已证明当前 cycle 完成上游 refs 同步。
         token: HTTPS 远端的 GitHub token；不会写入 Git 配置。
         sleep: 瞬时 Git 传输错误的可取消退避等待器。
         now: 记录逐来源获取尝试窗口的时区时钟。
@@ -126,6 +127,7 @@ class GitObjectStore:
         repository: str,
         remote_url: str,
         *,
+        upstream_synced: bool = False,
         token: str | None = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         now: Callable[[], datetime] = lambda: datetime.now(UTC),
@@ -138,7 +140,7 @@ class GitObjectStore:
         self._now = now
         self._lock = asyncio.Lock()
         self._ready = False
-        self._upstream_synced = False
+        self._upstream_synced = upstream_synced
         self._symbolic_head: str | None = None
 
     async def sync_upstream(

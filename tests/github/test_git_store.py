@@ -716,6 +716,37 @@ async def test_git_store_removes_an_interrupted_fetch_pack_on_open(tmp_path: Pat
 
 
 @pytest.mark.asyncio
+async def test_resumed_cycle_skips_only_the_implicit_upstream_fetch(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    _, head = _source_repository(source, 1)
+    path = tmp_path / "facts.sqlite3.git"
+    await GitObjectStore(path, "acme/widgets", str(source)).sync_upstream()
+    real_command = git_store_module._command
+    commands: list[Sequence[str]] = []
+
+    async def record(command: Sequence[str], **kwargs: Any) -> str:
+        commands.append(command)
+        return await real_command(command, **kwargs)
+
+    monkeypatch.setattr(git_store_module, "_command", record)
+    resumed = GitObjectStore(
+        path,
+        "acme/widgets",
+        str(source),
+        upstream_synced=True,
+    )
+
+    await resumed.prefetch({7: {"head": {"sha": head}}})
+
+    assert not any("+refs/heads/*:refs/heads/*" in command for command in commands)
+    await resumed.sync_upstream()
+    assert any("+refs/heads/*:refs/heads/*" in command for command in commands)
+
+
+@pytest.mark.asyncio
 async def test_git_fetch_retries_transient_transport_failures(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
