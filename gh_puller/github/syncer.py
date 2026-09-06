@@ -912,15 +912,21 @@ class GitHubSyncer:
         task: SyncTask | MaintenanceTask,
     ) -> FactObservation:
         number = _task_number(task)
-        return await self._rest_collection(
-            api,
+        path = f"{self._base}/issues/{number}/timeline"
+        return await self._resource_collection(
             archive,
             task,
             "issue-timeline",
+            "issue-timeline",
             f"issue:{number}",
             "IssueTimeline",
-            f"{self._base}/issues/{number}/timeline",
             number,
+            lambda previous, cache: _paginate_resource(
+                api,
+                path,
+                previous,
+                cache,
+            ),
         )
 
     async def _issue_events(
@@ -930,15 +936,21 @@ class GitHubSyncer:
         task: SyncTask | MaintenanceTask,
     ) -> FactObservation:
         number = _task_number(task)
-        return await self._rest_collection(
-            api,
+        path = f"{self._base}/issues/{number}/events"
+        return await self._resource_collection(
             archive,
             task,
             "issue-events",
+            "issue-events",
             f"issue:{number}",
             "IssueEvents",
-            f"{self._base}/issues/{number}/events",
             number,
+            lambda previous, cache: _paginate_resource(
+                api,
+                path,
+                previous,
+                cache,
+            ),
         )
 
     async def _issue_comments(
@@ -1345,16 +1357,21 @@ class GitHubSyncer:
                 detail,
                 "PullRequestDetail",
             )
-        return await self._rest_object(
-            api,
+        path = f"{self._base}/pulls/{number}/requested_reviewers"
+        return await self._resource_object(
             archive,
             task,
             "pull-requested-reviewers",
             "pull-requested-reviewers",
             f"pull:{number}",
             "PullRequestedReviewers",
-            f"{self._base}/pulls/{number}/requested_reviewers",
             number,
+            lambda previous, cache: _object_resource(
+                api,
+                path,
+                previous,
+                cache,
+            ),
         )
 
     async def _issue_relations(
@@ -1545,143 +1562,6 @@ class GitHubSyncer:
                             resource.source,
                             resource.raw,
                             resource.cache,
-                        ),
-                    ),
-                ),
-            ),
-            operation_key,
-        )
-
-    async def _rest_collection(
-        self,
-        api: _API,
-        archive: ObservationArchive,
-        task: SyncTask | MaintenanceTask,
-        operation_key: str,
-        subject_key: str,
-        operation: str,
-        path: str,
-        resource_number: int,
-    ) -> FactObservation:
-        existing = await self._publication(archive, task, operation_key)
-        if existing is not None:
-            return _single(existing, operation_key)
-        previous, cache = await self._previous(archive, operation_key, subject_key)
-        observed_from = _utc(self._now())
-        try:
-            value, updated = await api.paginate_cached(
-                path,
-                previous=_optional_objects(previous),
-                cache=cache,
-            )
-        except GitHubAPIError as exc:
-            coverage = _coverage_error(exc, unauthenticated=False)
-            if coverage is None:
-                raise
-            return await self._coverage_fact(
-                archive,
-                task,
-                operation_key,
-                operation_key,
-                subject_key,
-                resource_number,
-                observed_from,
-                coverage,
-                exc,
-            )
-        observed_until = _utc(self._now())
-        items = _objects(value, operation)
-        return _single(
-            await self._publish(
-                archive,
-                task,
-                operation_key,
-                (
-                    FactDraft(
-                        family=operation_key,
-                        subject_key=subject_key,
-                        resource_number=resource_number,
-                        observed_from=observed_from,
-                        observed_until=observed_until,
-                        coverage=Coverage.COMPLETE,
-                        origin=Origin.API,
-                        payload=_source_payload(
-                            operation,
-                            self.config.repository,
-                            resource_number,
-                            items,
-                            "rest",
-                            items,
-                            updated,
-                        ),
-                    ),
-                ),
-            ),
-            operation_key,
-        )
-
-    async def _rest_object(
-        self,
-        api: _API,
-        archive: ObservationArchive,
-        task: SyncTask | MaintenanceTask,
-        operation_key: str,
-        family: str,
-        subject_key: str,
-        operation: str,
-        path: str,
-        resource_number: int,
-    ) -> FactObservation:
-        existing = await self._publication(archive, task, operation_key)
-        if existing is not None:
-            return _single(existing, operation_key)
-        previous, cache = await self._previous(archive, family, subject_key)
-        observed_from = _utc(self._now())
-        try:
-            value, updated = await api.get_json_cached(
-                path,
-                previous=previous if isinstance(previous, dict) else None,
-                cache=cache,
-            )
-        except GitHubAPIError as exc:
-            coverage = _coverage_error(exc, unauthenticated=False)
-            if coverage is None:
-                raise
-            return await self._coverage_fact(
-                archive,
-                task,
-                operation_key,
-                family,
-                subject_key,
-                resource_number,
-                observed_from,
-                coverage,
-                exc,
-            )
-        observed_until = _utc(self._now())
-        item = _object(value, operation)
-        return _single(
-            await self._publish(
-                archive,
-                task,
-                operation_key,
-                (
-                    FactDraft(
-                        family=family,
-                        subject_key=subject_key,
-                        resource_number=resource_number,
-                        observed_from=observed_from,
-                        observed_until=observed_until,
-                        coverage=Coverage.COMPLETE,
-                        origin=Origin.API,
-                        payload=_source_payload(
-                            operation,
-                            self.config.repository,
-                            resource_number,
-                            item,
-                            "rest",
-                            item,
-                            updated,
                         ),
                     ),
                 ),
@@ -2206,6 +2086,34 @@ class GitHubSyncer:
                 ),
             )
         return frozen
+
+
+async def _paginate_resource(
+    api: _API,
+    path: str,
+    previous: list[dict[str, Any]] | None,
+    cache: dict[str, Any] | None,
+) -> GitHubResource:
+    value, updated = await api.paginate_cached(
+        path,
+        previous=previous,
+        cache=cache,
+    )
+    return GitHubResource(value, "rest", value, updated)
+
+
+async def _object_resource(
+    api: _API,
+    path: str,
+    previous: dict[str, Any] | None,
+    cache: dict[str, Any] | None,
+) -> GitHubResource:
+    value, updated = await api.get_json_cached(
+        path,
+        previous=previous,
+        cache=cache,
+    )
+    return GitHubResource(value, "rest", value, updated)
 
 
 def _discovery_item(
