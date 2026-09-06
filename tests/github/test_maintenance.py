@@ -725,7 +725,7 @@ async def test_interrupted_reference_rebuild_resumes_before_git(tmp_path: Path) 
     api = FakeAPI()
     git = FakeGitStore()
     maintainer = _maintainer(database, api, git, Clock(_T0 + timedelta(hours=1)))
-    original = maintainer._syncer._structured_commits
+    original = maintainer._collector.structured_commits
     interrupted = False
 
     async def interrupt_after_first_source(archive, task, sources):
@@ -736,11 +736,11 @@ async def test_interrupted_reference_rebuild_resumes_before_git(tmp_path: Path) 
             raise RuntimeError("injected reference rebuild failure")
         return await original(archive, task, sources)
 
-    maintainer._syncer._structured_commits = interrupt_after_first_source
+    maintainer._collector.structured_commits = interrupt_after_first_source
     with pytest.raises(RuntimeError, match="injected reference rebuild failure"):
         await maintainer.backfill()
     assert git.retentions == []
-    maintainer._syncer._structured_commits = original
+    maintainer._collector.structured_commits = original
 
     result = await maintainer.backfill()
 
@@ -904,7 +904,7 @@ async def test_backfill_retries_publication_after_git_check(tmp_path: Path) -> N
         git,
         Clock(_T0 + timedelta(hours=1)),
     )
-    original = maintainer._syncer._publish
+    original = maintainer._collector.publish
     failed = False
 
     async def fail_first_commit_publication(archive, task, operation, facts, **kwargs):
@@ -914,10 +914,10 @@ async def test_backfill_retries_publication_after_git_check(tmp_path: Path) -> N
             raise RuntimeError("injected commit publication failure")
         return await original(archive, task, operation, facts, **kwargs)
 
-    maintainer._syncer._publish = fail_first_commit_publication
+    maintainer._collector.publish = fail_first_commit_publication
     with pytest.raises(RuntimeError, match="injected commit publication failure"):
         await maintainer.backfill()
-    maintainer._syncer._publish = original
+    maintainer._collector.publish = original
 
     result = await maintainer.backfill()
 

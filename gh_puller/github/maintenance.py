@@ -18,6 +18,12 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
+from .collector import (
+    GitHubFactCollector,
+    IncompleteGitHubDataError,
+    _error_text,
+    _utc,
+)
 from .commit_references import (
     COMMIT_REFERENCE_SOURCE_FAMILIES,
     commit_reference_payload,
@@ -46,18 +52,12 @@ from .observations import (
 )
 from .progress import _SyncProgressTracker
 from .runtime import GitHubRuntime
-from .syncer import (
-    GitHubSyncConfig,
-    GitHubSyncer,
-    IncompleteGitHubDataError,
-    _error_text,
-    _utc,
-)
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Sequence
 
     from .progress import ProgressObserver
+    from .syncer import GitHubSyncConfig
 
 _COMMIT_TASK_SIZE = 256
 _REFERENCE_SCAN_TASK_SIZE = 256
@@ -107,13 +107,13 @@ class GitHubMaintainer:
             now=now,
             sleep=asyncio.sleep,
         )
-        self._syncer = GitHubSyncer(
+        self._observer = observer
+        self._collector = GitHubFactCollector(
             config,
             now=now,
-            observer=observer,
-            runtime=self._runtime,
+            progress=_SyncProgressTracker(observer, now),
+            store_lock=self._runtime.store_lock,
         )
-        self._observer = observer
 
     async def refresh(
         self,
@@ -434,7 +434,7 @@ class GitHubMaintainer:
             facts[family] = fact
             outcomes[family] = fact.coverage
 
-        root = await self._syncer._issue_fact(api, archive, task, None)
+        root = await self._collector.issue(api, archive, task, None)
         record("issue", root)
         if root.coverage is not Coverage.COMPLETE:
             return root.coverage
@@ -448,7 +448,7 @@ class GitHubMaintainer:
         if "issue-comments" in effective:
             record(
                 "issue-comments",
-                await self._syncer._issue_comments(
+                await self._collector.issue_comments(
                     api,
                     archive,
                     task,
@@ -459,22 +459,22 @@ class GitHubMaintainer:
         if "issue-timeline" in effective:
             record(
                 "issue-timeline",
-                await self._syncer._issue_timeline(api, archive, task),
+                await self._collector.issue_timeline(api, archive, task),
             )
         if "issue-events" in effective:
             record(
                 "issue-events",
-                await self._syncer._issue_events(api, archive, task),
+                await self._collector.issue_events(api, archive, task),
             )
         if "issue-reactions" in effective:
             record(
                 "issue-reactions",
-                await self._syncer._issue_reactions(api, archive, task, root),
+                await self._collector.issue_reactions(api, archive, task, root),
             )
         if "issue-comment-reactions" in effective:
             comments = facts["issue-comments"]
             if comments.coverage is Coverage.COMPLETE:
-                reactions = await self._syncer._comment_reactions(
+                reactions = await self._collector.comment_reactions(
                     api,
                     archive,
                     task,
@@ -491,7 +491,7 @@ class GitHubMaintainer:
         if "issue-relations" in effective:
             record(
                 "issue-relations",
-                await self._syncer._issue_relations(api, archive, task),
+                await self._collector.issue_relations(api, archive, task),
             )
 
         if kind == "pull":
@@ -508,7 +508,7 @@ class GitHubMaintainer:
         references: dict[str, tuple[dict[str, Any], ...]] = {}
         if reference_sources:
             selected = [facts[family] for family in reference_sources if family in facts]
-            references = await self._syncer._structured_commits(archive, task, selected)
+            references = await self._collector.structured_commits(archive, task, selected)
             source_coverage = _aggregate_coverage(
                 [outcomes[family] for family in reference_sources],
             )
@@ -541,16 +541,16 @@ class GitHubMaintainer:
             outcomes[family] = fact.coverage
 
         if "pull" in effective:
-            record("pull", await self._syncer._pull_detail(api, archive, task))
+            record("pull", await self._collector.pull(api, archive, task))
         if "pull-reviews" in effective:
             record(
                 "pull-reviews",
-                await self._syncer._pull_reviews(api, archive, task),
+                await self._collector.pull_reviews(api, archive, task),
             )
         if "pull-review-threads" in effective:
             record(
                 "pull-review-threads",
-                await self._syncer._review_threads(api, archive, task),
+                await self._collector.pull_review_threads(api, archive, task),
             )
         if "pull-review-comments" in effective:
             detail = facts["pull"]
@@ -558,7 +558,7 @@ class GitHubMaintainer:
             if Coverage.COMPLETE in {detail.coverage, threads.coverage}:
                 record(
                     "pull-review-comments",
-                    await self._syncer._review_comments(
+                    await self._collector.pull_review_comments(
                         api,
                         archive,
                         task,
@@ -576,7 +576,7 @@ class GitHubMaintainer:
             if detail.coverage is Coverage.COMPLETE:
                 record(
                     "pull-commits",
-                    await self._syncer._pull_commits(api, archive, task, detail),
+                    await self._collector.pull_commits(api, archive, task, detail),
                 )
             else:
                 outcomes["pull-commits"] = detail.coverage
@@ -585,14 +585,14 @@ class GitHubMaintainer:
             if detail.coverage is Coverage.COMPLETE:
                 record(
                     "pull-requested-reviewers",
-                    await self._syncer._requested_reviewers(api, archive, task, detail),
+                    await self._collector.pull_requested_reviewers(api, archive, task, detail),
                 )
             else:
                 outcomes["pull-requested-reviewers"] = detail.coverage
         if "pull-review-comment-reactions" in effective:
             comments = facts.get("pull-review-comments")
             if comments is not None and comments.coverage is Coverage.COMPLETE:
-                reactions = await self._syncer._comment_reactions(
+                reactions = await self._collector.comment_reactions(
                     api,
                     archive,
                     task,
@@ -609,7 +609,7 @@ class GitHubMaintainer:
                     "pull-review-comments"
                 ]
         if "pull-closing-issues" in effective:
-            closing = await self._syncer._closing_issues(
+            closing = await self._collector.pull_closing_issues(
                 api,
                 archive,
                 task,
@@ -628,7 +628,7 @@ class GitHubMaintainer:
                     )
                 record(
                     "pull-git",
-                    await self._syncer._pull_git(git, archive, task, value),
+                    await self._collector.pull_git(git, archive, task, value),
                 )
             else:
                 outcomes["pull-git"] = detail.coverage
@@ -641,7 +641,7 @@ class GitHubMaintainer:
         if job.status == "complete":
             return _result(job)
         progress = _SyncProgressTracker(self._observer, self._now)
-        self._syncer._progress = progress
+        self._collector.bind_progress(progress)
         progress.start()
         api, owned = self._runtime.make_api(progress.api_progress)
         git = self._runtime.make_git()
@@ -706,10 +706,10 @@ class GitHubMaintainer:
     ) -> Exception | None:
         try:
             outcome = await self._execute_task(api, git, archive, task)
-            async with self._syncer._store_lock:
+            async with self._runtime.store_lock:
                 await archive.complete_maintenance_task(task.id, _utc(self._now()), outcome)
         except Exception as exc:
-            async with self._syncer._store_lock:
+            async with self._runtime.store_lock:
                 await archive.record_maintenance_task_error(
                     task.id,
                     _utc(self._now()),
@@ -728,7 +728,7 @@ class GitHubMaintainer:
         if task.kind == "parent-refresh":
             return await self._refresh_parent(api, git, archive, task)
         if task.kind == "git-refs":
-            return (await self._syncer._git_refs(git, archive, task)).coverage
+            return (await self._collector.git_refs(git, archive, task)).coverage
         if task.kind == "commit-reference-scan-batch":
             cutoff, source_ids = _reference_scan_task_scope(task)
             sources = [
@@ -740,7 +740,7 @@ class GitHubMaintainer:
             ]
             if tuple(source.id for source in sources) != source_ids:
                 raise RuntimeError(f"maintenance task {task.task_key} lost a source fact")
-            await self._syncer._structured_commits(archive, task, sources)
+            await self._collector.structured_commits(archive, task, sources)
             return Coverage.COMPLETE
         if task.kind == "commit-object-batch":
             cutoff, shas = _commit_task_scope(task)
@@ -761,12 +761,12 @@ class GitHubMaintainer:
         references: dict[str, tuple[dict[str, Any], ...]],
     ) -> Coverage:
         shas = tuple(references)
-        publication = await self._syncer._publication(archive, task, "commit-objects")
+        publication = await self._collector.publication(archive, task, "commit-objects")
         if publication is not None:
             return _aggregate_coverage([fact.coverage for fact in publication])
         if not shas:
             return Coverage.COMPLETE
-        self._syncer._progress.phase("syncing_git", f"commits={len(shas)}")
+        self._collector._progress.phase("syncing_git", f"commits={len(shas)}")
         observed_from = _utc(self._now())
         source_tasks = [
             replace(
@@ -778,9 +778,9 @@ class GitHubMaintainer:
         ]
         results = await git.retain_commits(
             shas,
-            sources=await self._syncer._commit_fetch_sources(archive, source_tasks),
-            heartbeat=self._syncer._progress.git_heartbeat,
-            retry=self._syncer._progress.git_retry,
+            sources=await self._collector.commit_fetch_sources(archive, source_tasks),
+            heartbeat=self._collector._progress.git_heartbeat,
+            retry=self._collector._progress.git_retry,
         )
         observed_until = _utc(self._now())
         facts = []
@@ -816,7 +816,7 @@ class GitHubMaintainer:
                     },
                 ),
             )
-        publication = await self._syncer._publish(
+        publication = await self._collector.publish(
             archive,
             task,
             "commit-objects",
