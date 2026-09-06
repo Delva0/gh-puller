@@ -47,25 +47,20 @@ class _Syncer:
         )
 
 
-def test_parser_exposes_only_current_runtime_and_explicit_import(tmp_path: Path) -> None:
+def test_parser_exposes_only_current_runtime_commands(tmp_path: Path) -> None:
     once = cli._parser().parse_args(
         ["once", "acme/widgets", str(tmp_path / "facts.sqlite3")],
     )
-    migration = cli._parser().parse_args(
-        [
-            "import-v9",
-            "acme/widgets",
-            str(tmp_path / "old.sqlite3"),
-            str(tmp_path / "new.sqlite3"),
-        ],
+    schedule = cli._parser().parse_args(
+        ["schedule", "acme/widgets", str(tmp_path / "facts.sqlite3")],
     )
 
     assert once.command == "once"
     assert not hasattr(once, "target")
-    assert migration.command == "import-v9"
-    assert migration.source.name == "old.sqlite3"
-    with pytest.raises(SystemExit):
-        cli._parser().parse_args(["backfill"])
+    assert schedule.command == "schedule"
+    for removed in ("import-v9", "backfill"):
+        with pytest.raises(SystemExit):
+            cli._parser().parse_args([removed])
 
 
 @pytest.mark.asyncio

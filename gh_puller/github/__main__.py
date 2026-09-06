@@ -1,4 +1,4 @@
-"""提供 GitHub 观测归档的一次同步、周期调度与显式旧库导入命令。
+"""提供 GitHub 观测归档的一次同步与周期调度命令。
 
 调度只决定何时调用同步器；事实时间始终来自实际 source read，不会被调度边界改写。
 """
@@ -52,14 +52,6 @@ def _parser() -> argparse.ArgumentParser:
         help="UTC-aligned cadence such as 30m, 1h, or 1d (default: 1h)",
     )
 
-    migration = commands.add_parser(
-        "import-v9",
-        help="import one stopped v9 archive into a separate current archive",
-    )
-    migration.add_argument("repository", help="GitHub owner/repo")
-    migration.add_argument("source", type=Path, help="stopped v9 SQLite archive")
-    migration.add_argument("destination", type=Path, help="new SQLite archive")
-    _add_source_arguments(migration)
     return parser
 
 
@@ -119,25 +111,6 @@ def _config(args: argparse.Namespace) -> GitHubSyncConfig:
 
 
 async def _dispatch(args: argparse.Namespace) -> None:
-    if args.command == "import-v9":
-        from .v10.import_v9 import V9ImportConfig, V9Importer
-
-        result = await V9Importer(
-            V9ImportConfig(
-                source=args.source,
-                destination=args.destination,
-                repository=args.repository,
-                api_url=args.api_url,
-                graphql_url=args.graphql_url,
-                api_version=args.api_version,
-                git_url=args.git_url,
-                git_destination=args.git_destination,
-                concurrency=args.concurrency,
-                request_timeout=args.request_timeout,
-            ),
-        ).migrate()
-        _emit_import(result)
-        return
     observer = None if args.no_progress else ConsoleProgress()
     syncer = GitHubSyncer(_config(args), observer=observer)
     if args.command == "once":
@@ -214,17 +187,6 @@ def _emit(result: SyncResult) -> None:
         "discovered_items": result.discovered_items,
         "requests": result.requests,
         "started_at": _time(result.started_at),
-    }
-    print(json.dumps(payload, ensure_ascii=False, sort_keys=True), flush=True)
-
-
-def _emit_import(result: Any) -> None:
-    payload = {
-        "checkpoint": _time(result.checkpoint),
-        "live_facts": result.live_facts,
-        "referenced_commits": result.referenced_commits,
-        "resources": result.resources,
-        "supplemental_facts": result.supplemental_facts,
     }
     print(json.dumps(payload, ensure_ascii=False, sort_keys=True), flush=True)
 

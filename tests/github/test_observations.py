@@ -315,21 +315,6 @@ async def test_old_schema_and_naive_times_are_rejected(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_importer_checkpoint_seed_is_idempotent_and_never_regresses(
-    tmp_path: Path,
-) -> None:
-    database = tmp_path / "facts.sqlite3"
-    async with ObservationArchive(database, _REPOSITORY) as archive:
-        assert await archive.seed_discovery_checkpoint(_T0) == _T0
-        assert (
-            await archive.seed_discovery_checkpoint(_T0 - timedelta(days=1))
-            == _T0
-        )
-        cycle = await archive.start_cycle(_T0 + timedelta(hours=1))
-        assert cycle.checkpoint_from == _T0
-
-
-@pytest.mark.asyncio
 async def test_archive_binds_one_explicit_git_object_store(tmp_path: Path) -> None:
     database = tmp_path / "facts.sqlite3"
     git_store = tmp_path / "objects.git"
