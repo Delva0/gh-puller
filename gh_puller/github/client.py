@@ -58,6 +58,7 @@ _DEFAULT_ACCEPT = "application/vnd.github.full+json"
 _GRAPHQL_PAGE_SIZE = 100
 _QUOTA_RESET_JITTER_SECONDS = 5
 _TRANSIENT_DELAYS = (1, 2, 4, 8, 16, 30)
+_TRANSIENT_HTTP_STATUSES = {499}
 _TRANSPORT_RESET_ATTEMPTS = len(_TRANSIENT_DELAYS)
 _LIMIT_RECHECK_SECONDS = 30
 _CORE_AUX_RESOURCE = "core_aux"
@@ -1574,7 +1575,7 @@ class GitHubAPI:
                 continue
             if response.status_code != 304:
                 self._remember_primary_limit(response, resource)
-            if response.status_code >= 500:
+            if response.status_code in _TRANSIENT_HTTP_STATUSES or response.status_code >= 500:
                 transient_attempt += 1
                 await self._wait_transient(
                     transient_attempt,

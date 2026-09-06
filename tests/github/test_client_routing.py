@@ -169,6 +169,26 @@ async def test_transient_failures_retry_in_place_until_the_page_succeeds() -> No
 
 
 @pytest.mark.asyncio
+async def test_proxy_499_retries_in_place() -> None:
+    clock = Clock(_T0)
+    responses = [499, 200]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        status = responses.pop(0)
+        return httpx.Response(status, json={"ok": True}, request=request)
+
+    client = httpx.AsyncClient(base_url="https://api.github.test", transport=httpx.MockTransport(handler))
+    api = GitHubAPI(client=client, sleep=clock.sleep, now=clock)
+    try:
+        assert await api.get_json("/resource") == {"ok": True}
+    finally:
+        await client.aclose()
+
+    assert clock.sleeps == [1]
+    assert api.request_count == 2
+
+
+@pytest.mark.asyncio
 async def test_concurrent_requests_share_recovery_from_a_poisoned_transport(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
