@@ -87,6 +87,15 @@ async def test_cold_sync_publishes_independent_lossless_issue_facts(tmp_path: Pa
     assert result.cycle_id == 1
     assert result.started_at == result.completed_at == _T0
     assert result.discovered_items == 1
+    catalog = next(
+        call
+        for call in api.calls
+        if call[0] == "page" and call[1] == f"{_BASE}/issues"
+    )
+    assert catalog[2] is not None
+    assert catalog[2]["sort"] == "created"
+    assert catalog[2]["direction"] == "asc"
+    assert "since" not in catalog[2]
     current = {
         fact.family: fact
         async for fact in iter_current_facts(database)
@@ -197,7 +206,7 @@ async def test_warm_sync_combines_root_and_comment_signals_without_full_scan(
         if call[0] == "page" and call[1] == f"{_BASE}/issues"
     )
     assert catalog[2] is not None
-    assert catalog[2]["sort"] == "updated"
+    assert catalog[2]["sort"] == "created"
     assert catalog[2]["direction"] == "asc"
     assert "since" in catalog[2]
     assert sum(call[1] == f"{_BASE}/issues/2" for call in api.calls) == 1
@@ -214,6 +223,62 @@ async def test_warm_sync_combines_root_and_comment_signals_without_full_scan(
     assert len([fact async for fact in iter_observations(database)]) > initial_count
     async with ObservationArchive(database, "acme/widgets") as archive:
         assert await archive.discovery_checkpoint() == clock.current
+
+
+@pytest.mark.asyncio
+async def test_created_order_keeps_warm_candidates_stable_across_pages(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "facts.sqlite3"
+    api = FakeAPI()
+    git = FakeGitStore()
+    clock = Clock(_T0)
+    async with ObservationArchive(database, "acme/widgets") as archive:
+        cycle = await archive.start_cycle(clock.current)
+        cursor = await archive.begin_discovery(cycle.id, "empty")
+        assert cursor is not None
+        await archive.save_discovery_page(cycle.id, cursor, None, ())
+        await archive.complete_cycle(cycle.id, clock.current)
+
+    changed_at = _T0 + timedelta(minutes=10)
+    for number in range(2, 103):
+        api.add_issue(
+            number,
+            created_at=_T0 - timedelta(days=2) + timedelta(seconds=number),
+            updated_at=changed_at,
+        )
+    moved = api.json[f"{_BASE}/issues/2"]
+    clock.current += timedelta(hours=1)
+
+    def move_first_item_after_page_one() -> None:
+        kind, path, _ = api.calls[-1]
+        if kind != "page" or path != f"{_BASE}/issues":
+            return
+        moved["updated_at"] = _iso(clock.current + timedelta(seconds=1))
+        api.on_request = None
+
+    api.on_request = move_first_item_after_page_one
+    await _syncer(database, api, git, clock).sync()
+
+    current = {
+        fact.resource_number: fact
+        async for fact in iter_current_facts(database, family="issue")
+    }
+    assert set(current) == set(range(2, 103))
+    assert current[2].payload["value"]["updated_at"] == _iso(changed_at)
+
+    clock.current += timedelta(hours=1)
+    await _syncer(database, api, git, clock).sync()
+
+    refreshed = [
+        fact
+        async for fact in iter_current_facts(
+            database,
+            family="issue",
+            subject_key="issue:2",
+        )
+    ]
+    assert refreshed[0].payload["value"]["updated_at"] == moved["updated_at"]
 
 
 @pytest.mark.asyncio
@@ -346,7 +411,7 @@ async def test_catalog_cursor_survives_failure_before_next_page(tmp_path: Path) 
     git = FakeGitStore()
     for number in range(1, 102):
         api.add_issue(number)
-    api.fail_once.add(f"{_BASE}/issues/101/events")
+    api.fail_once.add(f"{_BASE}/issues/1/events")
     clock = Clock(_T0)
     syncer = _syncer(database, api, git, clock, concurrency=1)
 
@@ -369,8 +434,8 @@ async def test_catalog_cursor_survives_failure_before_next_page(tmp_path: Path) 
         if call[0] == "page" and call[1] == f"{_BASE}/issues"
     ]
     assert len(catalog_calls) == 2
-    assert sum(call[1] == f"{_BASE}/issues/101/timeline" for call in api.calls) == 1
-    assert sum(call[1] == f"{_BASE}/issues/101/events" for call in api.calls) == 2
+    assert sum(call[1] == f"{_BASE}/issues/1/timeline" for call in api.calls) == 1
+    assert sum(call[1] == f"{_BASE}/issues/1/events" for call in api.calls) == 2
     async with ObservationArchive(database, "acme/widgets") as archive:
         assert await archive.discovery_checkpoint() == _T0
 

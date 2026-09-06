@@ -1,9 +1,9 @@
 """编排立即发布、可断点恢复的 GitHub Issue/PR 增量观测。
 
-同步入口在调用前冻结 cycle 起点 S。冷启动按创建时间从新到旧遍历 Issue/PR
-目录；后续从已提交 checkpoint 的重叠边界读取父对象和评论变更信号。每个目录页
-及其任务先落 SQLite，再并发消费。一个事实集合完成后立即追加观测；cycle 仅在目录
-闭合且所有任务完成后把内部 discovery checkpoint 推进到 S。
+同步入口在调用前冻结 cycle 起点 S。冷启动遍历全部 Issue/PR；后续从已提交
+checkpoint 的重叠边界筛选父对象和评论变更信号。两者均按不可变的创建时间升序
+遍历。每个目录页及其任务先落 SQLite，再并发消费。一个事实集合完成后立即追加
+观测；cycle 仅在目录闭合且所有任务完成后把内部 discovery checkpoint 推进到 S。
 
 发现信号并不覆盖 GitHub 的全部可变子资源。拉取器不主动寻找静默删除或无信号的
 旧对象变化，但一旦父对象被选择，就重新观测其全部已承诺事实集合。
@@ -2076,21 +2076,16 @@ def _catalog_url(
     checkpoint: datetime | None,
     overlap_seconds: int,
 ) -> str:
-    if checkpoint is None:
-        parameters = {
-            "state": "all",
-            "sort": "created",
-            "direction": "desc",
-            "per_page": 100,
-        }
-    else:
-        parameters = {
-            "state": "all",
-            "sort": "updated",
-            "direction": "asc",
-            "since": _iso_seconds(checkpoint - timedelta(seconds=overlap_seconds)),
-            "per_page": 100,
-        }
+    parameters = {
+        "state": "all",
+        "sort": "created",
+        "direction": "asc",
+        "per_page": 100,
+    }
+    if checkpoint is not None:
+        parameters["since"] = _iso_seconds(
+            checkpoint - timedelta(seconds=overlap_seconds),
+        )
     return f"{base}/issues?{urlencode(parameters)}"
 
 

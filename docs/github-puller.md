@@ -151,10 +151,11 @@ flowchart TD
     Call["sync() freezes cycle start S"] --> Resume{"Active cycle?"}
     Resume -- "yes" --> Durable["Resume cursor and pending tasks"]
     Resume -- "no" --> Previous{"Checkpoint W exists?"}
-    Previous -- "no: cold start" --> Cold["Issue/PR catalog: newest to oldest"]
-    Previous -- "yes: warm sync" --> Signals["Root and comment signals since W - overlap"]
-    Cold --> Page["Persist one catalog page and its tasks"]
-    Signals --> Page
+    Previous -- "no: cold start" --> Cold["All Issue/PR roots"]
+    Previous -- "yes: warm sync" --> Signals["Changed roots and comments since W - overlap"]
+    Cold --> Order["Traverse by immutable creation time"]
+    Signals --> Order
+    Order --> Page["Persist one catalog page and its tasks"]
     Page --> Consume["Observe selected parents concurrently"]
     Consume --> Publish["Publish each closed fact immediately"]
     Publish --> More{"More pages or tasks?"}
@@ -166,7 +167,7 @@ flowchart TD
 ### Cold start
 
 With no committed discovery checkpoint, the writer traverses GitHub's combined
-Issue/PR catalog in descending creation order. Each page and its parent tasks are
+Issue/PR catalog in ascending creation order. Each page and its parent tasks are
 committed before consumption. The current producer/consumer unit is one page: up to
 100 catalog entries become durable, their parent operations run with bounded
 concurrency, and then discovery proceeds to the next page.
@@ -180,12 +181,19 @@ incomplete.
 
 Let `W` be the last completed cycle's discovery checkpoint. A new cycle combines:
 
-- Issue/PR roots returned by the repository catalog since `W - overlap`;
+- Issue/PR roots last updated since `W - overlap`;
 - Issue conversation comments returned since the same boundary;
 - PR review comments returned since the same boundary.
 
-Comment feeds are discovery signals: the writer then reobserves the complete
-supported parent, not just the returned comment. Timestamp overlap makes equal and
+GitHub's [repository-Issue endpoint](https://docs.github.com/en/rest/issues/issues#list-repository-issues)
+applies the `since` filter to last-update time independently of its `sort` parameter.
+The writer therefore uses `since` to select the changed set while traversing that set
+by immutable creation time. Updating an existing result cannot move it across page
+offsets; candidates entering after cycle start may be observed immediately or in the
+next cycle. Comment feeds follow the same stable creation order.
+
+Comment feeds are discovery signals: the writer reobserves the complete supported
+parent, not just the returned comment. Timestamp overlap makes equal and
 second-resolution boundary values harmless; task and publication identities remove
 duplicates within the cycle.
 
@@ -208,8 +216,8 @@ The writer therefore uses a deliberate best-effort boundary:
   selects their parent;
 - states that appear and disappear between source reads were never observed;
 - permission-hidden or API-unsupported fields cannot be reconstructed;
-- GitHub pagination can prove a read internally consistent, but cannot turn these
-  missing discovery signals into a complete historical clone.
+- a durable page cursor records completed work but does not turn GitHub's live listing
+  into a repository snapshot.
 
 The writer does not fall back to an expensive full repository scan when counts look
 suspicious. Once a parent is selected by a supported signal, however, every promised
