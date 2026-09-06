@@ -157,7 +157,7 @@ class MaintenanceJob:
 
 @dataclass(frozen=True, slots=True)
 class MaintenanceTask:
-    """One durable source operation within a maintenance job."""
+    """One durable work unit containing idempotently published source operations."""
 
     id: int
     job_id: int
@@ -571,6 +571,28 @@ class ObservationArchive:
         row = await _fetchone(
             self._connection,
             _CURRENT_FACT_QUERY,
+            (family, subject_key),
+        )
+        return None if row is None else _fact(row)
+
+    async def latest_complete_fact(
+        self,
+        family: str,
+        subject_key: str,
+    ) -> FactObservation | None:
+        """Return the newest complete observation for one fact identity.
+
+        Args:
+            family: Versioned semantic fact family.
+            subject_key: Stable identity within that family.
+
+        Returns:
+            The latest complete observation, even when a newer non-complete
+            conclusion is current, or None when completeness was never observed.
+        """
+        row = await _fetchone(
+            self._connection,
+            _LATEST_COMPLETE_FACT_QUERY,
             (family, subject_key),
         )
         return None if row is None else _fact(row)
@@ -1656,6 +1678,12 @@ ORDER BY o.family, o.subject_key
 _CURRENT_FACT_QUERY = _FACT_SELECT + """
 JOIN fact_heads AS h ON h.observation_id = o.id
 WHERE o.family = ? AND o.subject_key = ?
+"""
+
+_LATEST_COMPLETE_FACT_QUERY = _FACT_SELECT + """
+WHERE o.family = ? AND o.subject_key = ? AND o.coverage = 'complete'
+ORDER BY o.observed_until DESC, o.observed_from DESC, o.id DESC
+LIMIT 1
 """
 
 _AS_OF_QUERY = """

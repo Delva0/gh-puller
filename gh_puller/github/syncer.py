@@ -776,26 +776,8 @@ class GitHubSyncer:
             issue_fact,
             force=issue_signal,
         )
-        timeline = await self._rest_collection(
-            api,
-            archive,
-            task,
-            "issue-timeline",
-            f"issue:{number}",
-            "IssueTimeline",
-            f"{self._base}/issues/{number}/timeline",
-            number,
-        )
-        events = await self._rest_collection(
-            api,
-            archive,
-            task,
-            "issue-events",
-            f"issue:{number}",
-            "IssueEvents",
-            f"{self._base}/issues/{number}/events",
-            number,
-        )
+        timeline = await self._issue_timeline(api, archive, task)
+        events = await self._issue_events(api, archive, task)
         await self._issue_reactions(api, archive, task, issue_fact)
         if comments.coverage is Coverage.COMPLETE:
             await self._comment_reactions(
@@ -828,7 +810,7 @@ class GitHubSyncer:
         self,
         api: _API,
         archive: ObservationArchive,
-        task: SyncTask,
+        task: SyncTask | MaintenanceTask,
         item: DiscoveryItem | None,
     ) -> FactObservation:
         existing = await self._publication(archive, task, "issue")
@@ -923,11 +905,47 @@ class GitHubSyncer:
             "issue",
         )
 
+    async def _issue_timeline(
+        self,
+        api: _API,
+        archive: ObservationArchive,
+        task: SyncTask | MaintenanceTask,
+    ) -> FactObservation:
+        number = _task_number(task)
+        return await self._rest_collection(
+            api,
+            archive,
+            task,
+            "issue-timeline",
+            f"issue:{number}",
+            "IssueTimeline",
+            f"{self._base}/issues/{number}/timeline",
+            number,
+        )
+
+    async def _issue_events(
+        self,
+        api: _API,
+        archive: ObservationArchive,
+        task: SyncTask | MaintenanceTask,
+    ) -> FactObservation:
+        number = _task_number(task)
+        return await self._rest_collection(
+            api,
+            archive,
+            task,
+            "issue-events",
+            f"issue:{number}",
+            "IssueEvents",
+            f"{self._base}/issues/{number}/events",
+            number,
+        )
+
     async def _issue_comments(
         self,
         api: _API,
         archive: ObservationArchive,
-        task: SyncTask,
+        task: SyncTask | MaintenanceTask,
         issue_fact: FactObservation,
         *,
         force: bool,
@@ -967,7 +985,7 @@ class GitHubSyncer:
         self,
         api: _API,
         archive: ObservationArchive,
-        task: SyncTask,
+        task: SyncTask | MaintenanceTask,
         issue_fact: FactObservation,
     ) -> FactObservation:
         number = _task_number(task)
@@ -1004,14 +1022,15 @@ class GitHubSyncer:
         self,
         api: _API,
         archive: ObservationArchive,
-        task: SyncTask,
+        task: SyncTask | MaintenanceTask,
         comments_fact: FactObservation,
         *,
         endpoint: str,
         family: str,
         subject_prefix: str,
-    ) -> None:
+    ) -> tuple[FactObservation, ...]:
         comments = _fact_list(comments_fact, family)
+        facts = []
         for comment in comments:
             comment_id = comment.get("id")
             if type(comment_id) is not int or comment_id < 1:
@@ -1019,33 +1038,38 @@ class GitHubSyncer:
             operation = f"{family}:{comment_id}"
             subject = f"{subject_prefix}:{comment_id}"
             if _zero_count(comment.get("reactions")):
-                await self._derived(
+                facts.append(
+                    await self._derived(
+                        archive,
+                        task,
+                        operation,
+                        family,
+                        subject,
+                        _task_number(task),
+                        [],
+                        comments_fact,
+                        "CommentReactionCount",
+                    ),
+                )
+                continue
+            facts.append(
+                await self._resource_collection(
                     archive,
                     task,
                     operation,
                     family,
                     subject,
+                    "CommentReactions",
                     _task_number(task),
-                    [],
-                    comments_fact,
-                    "CommentReactionCount",
-                )
-                continue
-            await self._resource_collection(
-                archive,
-                task,
-                operation,
-                family,
-                subject,
-                "CommentReactions",
-                _task_number(task),
-                lambda previous, cache, comment_id=comment_id, comment=comment: api.reactions(
-                    f"{self._base}/{endpoint}/{comment_id}/reactions",
-                    _optional_string(comment.get("node_id")),
-                    previous=previous,
-                    cache=cache,
+                    lambda previous, cache, comment_id=comment_id, comment=comment: api.reactions(
+                        f"{self._base}/{endpoint}/{comment_id}/reactions",
+                        _optional_string(comment.get("node_id")),
+                        previous=previous,
+                        cache=cache,
+                    ),
                 ),
             )
+        return tuple(facts)
 
     async def _pull_facts(
         self,
@@ -1057,41 +1081,10 @@ class GitHubSyncer:
         cataloged: bool,
     ) -> list[FactObservation]:
         number = _task_number(task)
-        subject = f"pull:{number}"
-        detail = await self._resource_object(
-            archive,
-            task,
-            "pull",
-            "pull",
-            subject,
-            "PullRequest",
-            number,
-            lambda previous, cache: api.pull_request(
-                self._owner,
-                self._repo,
-                number,
-                previous=previous,
-                cache=cache,
-            ),
-        )
+        detail = await self._pull_detail(api, archive, task)
         if detail.coverage is not Coverage.COMPLETE:
             return [detail]
-        reviews = await self._resource_collection(
-            archive,
-            task,
-            "pull-reviews",
-            "pull-reviews",
-            subject,
-            "PullReviews",
-            number,
-            lambda previous, cache: api.pull_reviews(
-                self._owner,
-                self._repo,
-                number,
-                previous=previous,
-                cache=cache,
-            ),
-        )
+        reviews = await self._pull_reviews(api, archive, task)
         threads = await self._review_threads(api, archive, task)
         review_comments = await self._review_comments(
             api,
@@ -1117,6 +1110,54 @@ class GitHubSyncer:
         if not cataloged:
             await self._enqueue_closing_issues(archive, task, number)
         return [reviews, threads, review_comments, commits]
+
+    async def _pull_detail(
+        self,
+        api: _API,
+        archive: ObservationArchive,
+        task: SyncTask | MaintenanceTask,
+    ) -> FactObservation:
+        number = _task_number(task)
+        return await self._resource_object(
+            archive,
+            task,
+            "pull",
+            "pull",
+            f"pull:{number}",
+            "PullRequest",
+            number,
+            lambda previous, cache: api.pull_request(
+                self._owner,
+                self._repo,
+                number,
+                previous=previous,
+                cache=cache,
+            ),
+        )
+
+    async def _pull_reviews(
+        self,
+        api: _API,
+        archive: ObservationArchive,
+        task: SyncTask | MaintenanceTask,
+    ) -> FactObservation:
+        number = _task_number(task)
+        return await self._resource_collection(
+            archive,
+            task,
+            "pull-reviews",
+            "pull-reviews",
+            f"pull:{number}",
+            "PullReviews",
+            number,
+            lambda previous, cache: api.pull_reviews(
+                self._owner,
+                self._repo,
+                number,
+                previous=previous,
+                cache=cache,
+            ),
+        )
 
     async def _review_threads(
         self,
@@ -1186,14 +1227,13 @@ class GitHubSyncer:
         self,
         api: _API,
         archive: ObservationArchive,
-        task: SyncTask,
+        task: SyncTask | MaintenanceTask,
         detail: FactObservation,
         threads: FactObservation,
         *,
         force: bool,
     ) -> FactObservation:
         number = _task_number(task)
-        pull = _fact_object(detail, f"pull #{number}")
         if threads.coverage is Coverage.COMPLETE:
             value = _fact_object(threads, "review threads").get("review_comments")
             comments = _objects(value, "review thread comments")
@@ -1208,6 +1248,7 @@ class GitHubSyncer:
                 threads,
                 "PullReviewThreads",
             )
+        pull = _fact_object(detail, f"pull #{number}")
         if not force and _zero(pull.get("review_comments")):
             return await self._derived(
                 archive,
@@ -1241,7 +1282,7 @@ class GitHubSyncer:
         self,
         api: _API,
         archive: ObservationArchive,
-        task: SyncTask,
+        task: SyncTask | MaintenanceTask,
         detail: FactObservation,
     ) -> FactObservation:
         number = _task_number(task)
@@ -1286,7 +1327,7 @@ class GitHubSyncer:
         self,
         api: _API,
         archive: ObservationArchive,
-        task: SyncTask,
+        task: SyncTask | MaintenanceTask,
         detail: FactObservation,
     ) -> FactObservation:
         number = _task_number(task)
@@ -1378,7 +1419,7 @@ class GitHubSyncer:
     async def _resource_collection(
         self,
         archive: ObservationArchive,
-        task: SyncTask,
+        task: SyncTask | MaintenanceTask,
         operation_key: str,
         family: str,
         subject_key: str,
@@ -1446,7 +1487,7 @@ class GitHubSyncer:
     async def _resource_object(
         self,
         archive: ObservationArchive,
-        task: SyncTask,
+        task: SyncTask | MaintenanceTask,
         operation_key: str,
         family: str,
         subject_key: str,
@@ -1515,7 +1556,7 @@ class GitHubSyncer:
         self,
         api: _API,
         archive: ObservationArchive,
-        task: SyncTask,
+        task: SyncTask | MaintenanceTask,
         operation_key: str,
         subject_key: str,
         operation: str,
@@ -1583,7 +1624,7 @@ class GitHubSyncer:
         self,
         api: _API,
         archive: ObservationArchive,
-        task: SyncTask,
+        task: SyncTask | MaintenanceTask,
         operation_key: str,
         family: str,
         subject_key: str,
@@ -1651,7 +1692,7 @@ class GitHubSyncer:
     async def _derived(
         self,
         archive: ObservationArchive,
-        task: SyncTask,
+        task: SyncTask | MaintenanceTask,
         operation_key: str,
         family: str,
         subject_key: str,
@@ -1752,13 +1793,15 @@ class GitHubSyncer:
         self,
         api: _API,
         archive: ObservationArchive,
-        task: SyncTask,
-    ) -> None:
+        task: SyncTask | MaintenanceTask,
+        numbers: Sequence[int] | None = None,
+    ) -> tuple[FactObservation, ...]:
         existing = await self._publication(archive, task, "closing-issues")
         if existing is not None:
-            await self._finish_task(archive, task)
-            return
-        value = task.payload.get("numbers")
+            if isinstance(task, SyncTask):
+                await self._finish_task(archive, task)
+            return existing
+        value = task.payload.get("numbers") if numbers is None else list(numbers)
         if (
             not isinstance(value, list)
             or not value
@@ -1830,7 +1873,7 @@ class GitHubSyncer:
                 )
                 for number in numbers
             )
-        await self._publish(
+        return await self._publish(
             archive,
             task,
             "closing-issues",
@@ -1843,11 +1886,12 @@ class GitHubSyncer:
         git: _GitStore,
         archive: ObservationArchive,
         task: SyncTask | MaintenanceTask,
-    ) -> None:
+    ) -> FactObservation:
         existing = await self._publication(archive, task, "git-refs")
         if existing is not None:
-            await self._finish_task(archive, task)
-            return
+            if isinstance(task, SyncTask):
+                await self._finish_task(archive, task)
+            return _single(existing, "git-refs")
         self._progress.phase("syncing_git", "upstream")
         observed_from = _utc(self._now())
         refs = await git.sync_upstream(
@@ -1855,27 +1899,30 @@ class GitHubSyncer:
             retry=self._progress.git_retry,
         )
         observed_until = _utc(self._now())
-        await self._publish(
-            archive,
-            task,
-            "git-refs",
-            (
-                FactDraft(
-                    family="git-refs",
-                    subject_key="repository",
-                    resource_number=None,
-                    observed_from=observed_from,
-                    observed_until=observed_until,
-                    coverage=Coverage.COMPLETE,
-                    origin=Origin.GIT,
-                    payload={
-                        "operation": "GitRefObservation",
-                        "repository": self.config.repository,
-                        "value": _object(refs, "Git ref observation"),
-                    },
+        return _single(
+            await self._publish(
+                archive,
+                task,
+                "git-refs",
+                (
+                    FactDraft(
+                        family="git-refs",
+                        subject_key="repository",
+                        resource_number=None,
+                        observed_from=observed_from,
+                        observed_until=observed_until,
+                        coverage=Coverage.COMPLETE,
+                        origin=Origin.GIT,
+                        payload={
+                            "operation": "GitRefObservation",
+                            "repository": self.config.repository,
+                            "value": _object(refs, "Git ref observation"),
+                        },
+                    ),
                 ),
+                complete_task=True,
             ),
-            complete_task=True,
+            "git-refs",
         )
 
     async def _enqueue_pull_git(
@@ -1955,14 +2002,16 @@ class GitHubSyncer:
         self,
         git: _GitStore,
         archive: ObservationArchive,
-        task: SyncTask,
-    ) -> None:
+        task: SyncTask | MaintenanceTask,
+        pull: dict[str, Any] | None = None,
+    ) -> FactObservation:
         existing = await self._publication(archive, task, "pull-git")
         if existing is not None:
-            await self._finish_task(archive, task)
-            return
+            if isinstance(task, SyncTask):
+                await self._finish_task(archive, task)
+            return _single(existing, "pull-git")
         number = _task_number(task)
-        pull = _object(task.payload.get("pull"), task.task_key)
+        pull = _object(task.payload.get("pull"), task.task_key) if pull is None else pull
         observed_from = _utc(self._now())
         snapshot = await git.capture(
             number,
@@ -1971,30 +2020,35 @@ class GitHubSyncer:
             retry=self._progress.git_retry,
         )
         observed_until = _utc(self._now())
-        await self._publish(
-            archive,
-            task,
-            "pull-git",
-            (
-                FactDraft(
-                    family="pull-git",
-                    subject_key=f"pull:{number}",
-                    resource_number=number,
-                    observed_from=observed_from,
-                    observed_until=observed_until,
-                    coverage=(
-                        Coverage.PARTIAL if snapshot.get("comparison_kind") == "unavailable" else Coverage.COMPLETE
+        return _single(
+            await self._publish(
+                archive,
+                task,
+                "pull-git",
+                (
+                    FactDraft(
+                        family="pull-git",
+                        subject_key=f"pull:{number}",
+                        resource_number=number,
+                        observed_from=observed_from,
+                        observed_until=observed_until,
+                        coverage=(
+                            Coverage.PARTIAL
+                            if snapshot.get("comparison_kind") == "unavailable"
+                            else Coverage.COMPLETE
+                        ),
+                        origin=Origin.GIT,
+                        payload={
+                            "operation": "PullGitSnapshot",
+                            "repository": self.config.repository,
+                            "resource_number": number,
+                            "value": _object(snapshot, f"pull #{number} Git snapshot"),
+                        },
                     ),
-                    origin=Origin.GIT,
-                    payload={
-                        "operation": "PullGitSnapshot",
-                        "repository": self.config.repository,
-                        "resource_number": number,
-                        "value": _object(snapshot, f"pull #{number} Git snapshot"),
-                    },
                 ),
+                complete_task=True,
             ),
-            complete_task=True,
+            "pull-git",
         )
 
     async def _commit_fetch_sources(

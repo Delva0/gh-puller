@@ -68,6 +68,7 @@ def _parser() -> argparse.ArgumentParser:
         dest="families",
         choices=REFRESH_FAMILIES,
         action="append",
+        help="refresh this family; repeat to narrow the goal (dependencies are automatic)",
     )
     refresh.add_argument("--idempotency-key")
 

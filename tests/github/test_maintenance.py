@@ -12,7 +12,7 @@ from gh_puller.github.commit_references import (
     commit_reference_payload,
     observation_commit_references,
 )
-from gh_puller.github.maintenance import GitHubMaintainer
+from gh_puller.github.maintenance import REFRESH_FAMILIES, GitHubMaintainer
 from gh_puller.github.observations import (
     Coverage,
     FactDraft,
@@ -22,7 +22,8 @@ from gh_puller.github.observations import (
     iter_observations,
 )
 from gh_puller.github.syncer import GitHubSyncConfig
-from tests.github._puller_support import _T0, Clock, FakeAPI, FakeGitStore
+from gh_puller.github.v11 import FACT_SCHEMAS
+from tests.github._puller_support import _BASE, _T0, Clock, FakeAPI, FakeGitStore
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -124,6 +125,268 @@ def _maintainer(
     )
 
 
+def _pull_detail(
+    number: int,
+    *,
+    commits: int = 0,
+    review_comments: int = 0,
+) -> dict[str, Any]:
+    return {
+        "id": number * 10,
+        "number": number,
+        "base": {"sha": "a" * 40},
+        "head": {"sha": f"{number:040x}"},
+        "commits": commits,
+        "review_comments": review_comments,
+        "requested_reviewers": [],
+        "requested_teams": [],
+    }
+
+
+def test_every_live_fact_family_is_refreshable() -> None:
+    assert set(REFRESH_FAMILIES) == set(FACT_SCHEMAS) - {"catalog-item"}
+
+
+@pytest.mark.asyncio
+async def test_root_and_repository_refreshes_keep_their_scope_minimal(tmp_path: Path) -> None:
+    database = tmp_path / "facts.sqlite3"
+    api = FakeAPI()
+    api.add_issue(8)
+    await _roots(database, api)
+    git = FakeGitStore()
+    maintainer = _maintainer(
+        database,
+        api,
+        git,
+        Clock(_T0 + timedelta(hours=1)),
+    )
+
+    root = await maintainer.refresh(issues=[8], families=["issue"])
+    refs = await maintainer.refresh(families=["git-refs"])
+
+    assert root.requests == 1
+    assert refs.requests == 0
+    assert git.syncs == 1
+    async with ObservationArchive(database, "acme/widgets") as archive:
+        root_job = await archive.maintenance_job(root.job_id)
+        refs_job = await archive.maintenance_job(refs.job_id)
+    assert root_job.scope["plan"]["issues"]["effective_families"] == ["issue"]
+    assert refs_job.scope["plan"]["repository"]["effective_families"] == ["git-refs"]
+
+
+@pytest.mark.asyncio
+async def test_parent_refresh_can_retry_after_a_noncomplete_root(tmp_path: Path) -> None:
+    database = tmp_path / "facts.sqlite3"
+    api = FakeAPI()
+    issue = api.add_issue(8)
+    await _roots(database, api)
+    del api.json[f"{_BASE}/issues/8"]
+    maintainer = _maintainer(
+        database,
+        api,
+        FakeGitStore(),
+        Clock(_T0 + timedelta(hours=1)),
+    )
+
+    await maintainer.refresh(issues=[8], families=["issue"])
+    api.json[f"{_BASE}/issues/8"] = issue
+    await maintainer.refresh(issues=[8], families=["issue"])
+
+    roots = [fact async for fact in iter_observations(database, family="issue")]
+    assert [fact.coverage for fact in roots] == [
+        Coverage.COMPLETE,
+        Coverage.UNAVAILABLE,
+        Coverage.COMPLETE,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_refresh_expands_leaf_dependencies_and_records_the_plan(tmp_path: Path) -> None:
+    database = tmp_path / "facts.sqlite3"
+    api = FakeAPI()
+    api.add_issue(7, pull=True)
+    api.json[f"{_BASE}/pulls/7"] = _pull_detail(7, review_comments=1)
+    sha = "b" * 40
+    api.pages[f"{_BASE}/pulls/7/comments"] = [
+        {
+            "id": 701,
+            "node_id": "comment-701",
+            "commit_id": sha,
+            "original_commit_id": None,
+            "reactions": {"total_count": 1},
+        },
+    ]
+    api.pages[f"{_BASE}/pulls/comments/701/reactions"] = [
+        {"id": 702, "content": "heart"},
+    ]
+    await _roots(database, api)
+    git = FakeGitStore()
+
+    result = await _maintainer(
+        database,
+        api,
+        git,
+        Clock(_T0 + timedelta(hours=1)),
+    ).refresh(
+        pulls=[7],
+        families=["pull-review-comment-reactions"],
+    )
+
+    expected = {
+        "commit-object",
+        "commit-references",
+        "issue",
+        "pull",
+        "pull-review-comment-reactions",
+        "pull-review-comments",
+        "pull-review-threads",
+    }
+    async with ObservationArchive(database, "acme/widgets") as archive:
+        job = await archive.maintenance_job(result.job_id)
+    assert job.scope["plan"]["pulls"] == {
+        "requested_families": ["pull-review-comment-reactions"],
+        "effective_families": sorted(expected),
+        "reference_source_families": [
+            "pull-review-comments",
+            "pull-review-threads",
+        ],
+    }
+    facts = [fact async for fact in iter_observations(database)]
+    assert expected - {"issue"} <= {fact.family for fact in facts}
+    assert git.retentions == [(sha,)]
+    assert api.request_count == 4
+
+
+@pytest.mark.asyncio
+async def test_default_parent_refresh_observes_every_applicable_family(tmp_path: Path) -> None:
+    database = tmp_path / "facts.sqlite3"
+    api = FakeAPI()
+    api.add_issue(7, pull=True)
+    api.add_issue(8)
+    api.json[f"{_BASE}/pulls/7"] = _pull_detail(7)
+    await _roots(database, api)
+    git = FakeGitStore()
+
+    result = await _maintainer(
+        database,
+        api,
+        git,
+        Clock(_T0 + timedelta(hours=1)),
+    ).refresh(pulls=[7], issues=[8])
+
+    async with ObservationArchive(database, "acme/widgets") as archive:
+        job = await archive.maintenance_job(result.job_id)
+    assert set(job.scope["plan"]["pulls"]["requested_families"]) == _PULL_EXPECTED
+    assert set(job.scope["plan"]["issues"]["requested_families"]) == _ISSUE_EXPECTED
+    facts = [fact async for fact in iter_observations(database)]
+    issue_families = {fact.family for fact in facts if fact.resource_number == 8}
+    pull_families = {fact.family for fact in facts if fact.resource_number == 7}
+    assert _ISSUE_EXPECTED - {"issue-comment-reactions", "commit-object"} <= issue_families
+    assert _PULL_EXPECTED - {
+        "commit-object",
+        "issue-comment-reactions",
+        "pull-review-comment-reactions",
+    } <= pull_families
+    assert git.captures == [7]
+    assert git.syncs == 0
+
+
+@pytest.mark.asyncio
+async def test_parent_commit_refresh_reobserves_every_structured_source(tmp_path: Path) -> None:
+    database = tmp_path / "facts.sqlite3"
+    api = FakeAPI()
+    api.add_issue(7, pull=True)
+    api.json[f"{_BASE}/pulls/7"] = _pull_detail(7, commits=1)
+    sha = "c" * 40
+    api.pages[f"{_BASE}/pulls/7/commits"] = [{"sha": sha}]
+    await _roots(database, api)
+    git = FakeGitStore()
+
+    result = await _maintainer(
+        database,
+        api,
+        git,
+        Clock(_T0 + timedelta(hours=1)),
+    ).refresh(pulls=[7], families=["commit-object"])
+
+    source_families = {
+        "issue-events",
+        "issue-timeline",
+        "pull-commits",
+        "pull-review-comments",
+        "pull-review-threads",
+        "pull-reviews",
+    }
+    facts = [fact async for fact in iter_observations(database)]
+    assert source_families <= {fact.family for fact in facts}
+    scans = [fact for fact in facts if fact.family == "commit-references"]
+    assert {fact.payload["source_family"] for fact in scans} == source_families
+    assert git.retentions == [(sha,)]
+    assert git.captures == []
+    async with ObservationArchive(database, "acme/widgets") as archive:
+        job = await archive.maintenance_job(result.job_id)
+    assert set(job.scope["plan"]["pulls"]["reference_source_families"]) == source_families
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("targets", "families", "message"),
+    [
+        ({"pulls": [7]}, ["issue-relations"], "do not apply to pull"),
+        ({"issues": [8]}, ["pull"], "do not apply to issue"),
+        ({"commits": ["a" * 40]}, ["git-refs"], "commit targets require"),
+        ({"issues": [8]}, ["catalog-item"], "unknown refresh families"),
+    ],
+)
+async def test_refresh_rejects_families_without_compatible_targets(
+    tmp_path: Path,
+    targets: dict[str, list[Any]],
+    families: list[str],
+    message: str,
+) -> None:
+    maintainer = _maintainer(
+        tmp_path / "facts.sqlite3",
+        FakeAPI(),
+        FakeGitStore(),
+        Clock(_T0),
+    )
+
+    with pytest.raises(ValueError, match=message):
+        await maintainer.refresh(**targets, families=families)
+
+
+_ISSUE_EXPECTED = {
+    "commit-object",
+    "commit-references",
+    "issue",
+    "issue-comment-reactions",
+    "issue-comments",
+    "issue-events",
+    "issue-reactions",
+    "issue-relations",
+    "issue-timeline",
+}
+_PULL_EXPECTED = {
+    "commit-object",
+    "commit-references",
+    "issue",
+    "issue-comment-reactions",
+    "issue-comments",
+    "issue-events",
+    "issue-reactions",
+    "issue-timeline",
+    "pull",
+    "pull-closing-issues",
+    "pull-commits",
+    "pull-git",
+    "pull-requested-reviewers",
+    "pull-review-comment-reactions",
+    "pull-review-comments",
+    "pull-review-threads",
+    "pull-reviews",
+}
+
+
 @pytest.mark.asyncio
 async def test_refresh_observes_silent_thread_and_relation_replacements(tmp_path: Path) -> None:
     database = tmp_path / "facts.sqlite3"
@@ -138,20 +401,23 @@ async def test_refresh_observes_silent_thread_and_relation_replacements(tmp_path
     clock = Clock(_T0 + timedelta(hours=1))
     maintainer = _maintainer(database, api, git, clock)
 
-    first = await maintainer.refresh(pulls=[7], issues=[8])
+    families = ["pull-review-threads", "issue-relations"]
+    first = await maintainer.refresh(pulls=[7], issues=[8], families=families)
     first_calls = len(api.calls)
     repeated = await maintainer.refresh(
         pulls=[7],
         issues=[8],
+        families=families,
         idempotency_key="research-sample-1",
     )
     repeated_calls = len(api.calls)
     assert repeated.job_id != first.job_id
-    assert repeated_calls == first_calls + 2
+    assert repeated_calls == first_calls + 4
     assert (
         await maintainer.refresh(
             pulls=[7],
             issues=[8],
+            families=families,
             idempotency_key="research-sample-1",
         )
         == repeated
@@ -161,7 +427,11 @@ async def test_refresh_observes_silent_thread_and_relation_replacements(tmp_path
     api.review_threads[7] = [_thread("new", sha, resolved=True)]
     api.issue_relation_sets[8] = _relations(8, 10)
     clock.current += timedelta(hours=1)
-    second = await maintainer.refresh(pulls=[7], issues=[8])
+    second = await maintainer.refresh(
+        pulls=[7],
+        issues=[8],
+        families=families,
+    )
 
     assert second.job_id != repeated.job_id
     observations = [fact async for fact in iter_observations(database)]
@@ -204,20 +474,23 @@ async def test_interrupted_refresh_resumes_only_unpublished_work(tmp_path: Path)
     maintainer = _maintainer(database, api, FakeGitStore(), clock)
 
     with pytest.raises(RuntimeError, match="injected disconnect"):
-        await maintainer.refresh(pulls=[7])
+        await maintainer.refresh(pulls=[7], families=["pull-review-threads"])
     async with ObservationArchive(database, "acme/widgets") as archive:
         active = await archive.active_maintenance_job()
         assert active is not None
         job_id = active.id
 
-    result = await maintainer.refresh(pulls=[7])
+    result = await maintainer.refresh(
+        pulls=[7],
+        families=["pull-review-threads"],
+    )
 
     assert result.job_id == job_id
     async with ObservationArchive(database, "acme/widgets") as archive:
         assert await archive.active_maintenance_job() is None
     threads = [fact async for fact in iter_observations(database, family="pull-review-threads")]
     assert len(threads) == 1
-    assert api.request_count == 2
+    assert api.request_count == 3
 
 
 @pytest.mark.asyncio
@@ -241,12 +514,12 @@ async def test_failed_refresh_preserves_the_last_successful_observation(
     await _roots(database, api)
     clock = Clock(_T0 + timedelta(hours=1))
     maintainer = _maintainer(database, api, FakeGitStore(), clock)
-    await maintainer.refresh(issues=[8])
+    await maintainer.refresh(issues=[8], families=["issue-relations"])
     api.fail = True
     clock.current += timedelta(hours=1)
 
     with pytest.raises(RuntimeError, match="injected relation failure"):
-        await maintainer.refresh(issues=[8])
+        await maintainer.refresh(issues=[8], families=["issue-relations"])
 
     relations = [fact async for fact in iter_observations(database, family="issue-relations")]
     assert len(relations) == 1
@@ -280,8 +553,8 @@ async def test_two_unkeyed_refresh_invocations_at_same_time_are_distinct(tmp_pat
         Clock(_T0 + timedelta(hours=1)),
     )
 
-    first = await maintainer.refresh(issues=[8])
-    second = await maintainer.refresh(issues=[8])
+    first = await maintainer.refresh(issues=[8], families=["issue-relations"])
+    second = await maintainer.refresh(issues=[8], families=["issue-relations"])
 
     assert first.job_id != second.job_id
     observations = [fact async for fact in iter_observations(database, family="issue-relations")]

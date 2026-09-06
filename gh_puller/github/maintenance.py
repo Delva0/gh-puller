@@ -1,10 +1,11 @@
 """Run recoverable targeted observations without advancing discovery state.
 
-Maintenance jobs share the normal syncer's source operations and immutable fact
-stream. A structured-commit baseline freezes raw source observations, closes missing
-derived scans, then verifies their unique Git objects. Request scope and tasks are
-durable, while retryable transport errors remain task-attempt state rather than false
-source observations.
+Refresh callers select semantic fact families while the durable plan owns source
+dependencies and structured-commit consequences. Jobs share the normal syncer's
+source operations and immutable fact stream. A structured-commit baseline freezes
+raw source observations, closes missing derived scans, then verifies their unique Git
+objects. Retryable transport errors remain task-attempt state rather than false source
+observations.
 """
 
 from __future__ import annotations
@@ -28,6 +29,7 @@ from .locking import archive_lock
 from .observations import (
     Coverage,
     FactDraft,
+    FactObservation,
     MaintenanceJob,
     MaintenanceTask,
     ObservationArchive,
@@ -38,6 +40,7 @@ from .progress import _SyncProgressTracker
 from .syncer import (
     GitHubSyncConfig,
     GitHubSyncer,
+    IncompleteGitHubDataError,
     _error_text,
     _utc,
 )
@@ -47,12 +50,40 @@ if TYPE_CHECKING:
 
     from .progress import ProgressObserver
 
-REFRESH_FAMILIES = (
-    "commit-object",
-    "git-refs",
-    "issue-relations",
-    "pull-review-threads",
+_COMMON_PARENT_FAMILIES = frozenset(
+    {
+        "commit-object",
+        "commit-references",
+        "issue",
+        "issue-comment-reactions",
+        "issue-comments",
+        "issue-events",
+        "issue-reactions",
+        "issue-timeline",
+    },
 )
+_ISSUE_FAMILIES = _COMMON_PARENT_FAMILIES | {"issue-relations"}
+_PULL_FAMILIES = _COMMON_PARENT_FAMILIES | {
+    "pull",
+    "pull-closing-issues",
+    "pull-commits",
+    "pull-git",
+    "pull-requested-reviewers",
+    "pull-review-comment-reactions",
+    "pull-review-comments",
+    "pull-review-threads",
+    "pull-reviews",
+}
+REFRESH_FAMILIES = tuple(sorted(_ISSUE_FAMILIES | _PULL_FAMILIES | {"git-refs"}))
+_FAMILY_DEPENDENCIES = {
+    "commit-object": frozenset({"commit-references"}),
+    "issue-comment-reactions": frozenset({"issue-comments"}),
+    "pull-commits": frozenset({"pull"}),
+    "pull-git": frozenset({"pull"}),
+    "pull-requested-reviewers": frozenset({"pull"}),
+    "pull-review-comment-reactions": frozenset({"pull-review-comments"}),
+    "pull-review-comments": frozenset({"pull", "pull-review-threads"}),
+}
 _COMMIT_TASK_SIZE = 256
 _REFERENCE_SCAN_TASK_SIZE = 256
 
@@ -117,8 +148,8 @@ class GitHubMaintainer:
             pulls: Archived PR numbers whose selected facts are reread.
             issues: Archived Issue numbers whose selected facts are reread.
             commits: Exact commit IDs to reacquire and verify.
-            families: Selected R1-R4 fact families; None selects every applicable
-                family for the supplied targets.
+            families: Selected fact families. None selects every applicable family
+                for each supplied target. Required source families are inferred.
             idempotency_key: Optional caller identity. Reuse returns or resumes the
                 same job; omission resumes a matching active job but creates a fresh
                 observation after prior completion.
@@ -132,6 +163,7 @@ class GitHubMaintainer:
             ValueError: Targets and selected families are inconsistent.
         """
         request = _refresh_request(pulls, issues, commits, families)
+        plan = _refresh_plan(request)
         requested_at = _utc(self._now())
         async with (
             archive_lock(self.config.destination),
@@ -162,17 +194,21 @@ class GitHubMaintainer:
                     if existing.kind != "refresh" or existing.scope.get("request") != request:
                         raise ValueError("idempotency key belongs to another refresh request")
                     return _result(existing)
-                tasks = await self._refresh_tasks(archive, request)
+                tasks = await self._refresh_tasks(archive, request, plan)
+                planned_families = {
+                    family
+                    for target in plan.values()
+                    for family in target["effective_families"]
+                }
                 fact_schemas = {
                     family: 2 if family == "commit-object" else 1
-                    for family in request["families"]
+                    for family in planned_families
                 }
-                if "pull-review-threads" in request["families"]:
-                    fact_schemas |= {"commit-references": 1, "commit-object": 2}
                 scope = {
                     "operation": "TargetedFactRefresh",
                     "repository": self.config.repository,
                     "request": request,
+                    "plan": plan,
                     "fact_schemas": fact_schemas,
                     "population": {
                         "digest": _task_digest(tasks),
@@ -342,42 +378,40 @@ class GitHubMaintainer:
         self,
         archive: ObservationArchive,
         request: dict[str, Any],
+        plan: dict[str, Any],
     ) -> tuple[TaskDraft, ...]:
-        families = set(request["families"])
         tasks = []
         for number in request["pulls"]:
             await _require_parent(archive, number, "pull")
-            if "pull-review-threads" in families:
-                tasks.append(
-                    TaskDraft(
-                        f"pull-review-threads:{number}",
-                        "pull-review-threads",
-                        f"pull:{number}",
-                        {"number": number},
-                        number,
-                    ),
-                )
+            payload = {"kind": "pull", "number": number} | plan["pulls"]
+            tasks.append(
+                TaskDraft(
+                    f"parent-refresh:pull:{number}",
+                    "parent-refresh",
+                    f"pull:{number}",
+                    payload,
+                    number,
+                ),
+            )
         for number in request["issues"]:
             await _require_parent(archive, number, "issue")
-            if "issue-relations" in families:
-                tasks.append(
-                    TaskDraft(
-                        f"issue-relations:{number}",
-                        "issue-relations",
-                        f"issue:{number}",
-                        {"number": number},
-                        number,
-                    ),
-                )
-        if "commit-object" in families:
+            payload = {"kind": "issue", "number": number} | plan["issues"]
+            tasks.append(
+                TaskDraft(
+                    f"parent-refresh:issue:{number}",
+                    "parent-refresh",
+                    f"issue:{number}",
+                    payload,
+                    number,
+                ),
+            )
+        if request["commits"]:
             cutoff = await archive.observation_cutoff()
             tasks.extend(
                 _commit_tasks(request["commits"], cutoff),
             )
-        if "git-refs" in families:
+        if "repository" in plan:
             tasks.append(TaskDraft("git-refs", "git-refs", "repository", {}))
-        if not tasks:
-            raise ValueError("selected fact families do not apply to any target")
         return tuple(tasks)
 
     async def _reference_index(
@@ -399,6 +433,220 @@ class GitHubMaintainer:
             sha: tuple(_distinct_objects(items))
             for sha, items in sorted(references.items())
         }
+
+    async def _refresh_parent(
+        self,
+        api: Any,
+        git: Any,
+        archive: ObservationArchive,
+        task: MaintenanceTask,
+    ) -> Coverage:
+        kind, effective, reference_sources = _parent_refresh_task_scope(task)
+        facts: dict[str, FactObservation] = {}
+        outcomes: dict[str, Coverage] = {}
+
+        def record(family: str, fact: FactObservation) -> None:
+            facts[family] = fact
+            outcomes[family] = fact.coverage
+
+        root = await self._syncer._issue_fact(api, archive, task, None)
+        record("issue", root)
+        if root.coverage is not Coverage.COMPLETE:
+            return root.coverage
+        value = root.payload.get("value")
+        actual = "pull" if isinstance(value, dict) and "pull_request" in value else "issue"
+        if actual != kind:
+            raise IncompleteGitHubDataError(
+                f"archived {kind} #{task.resource_number} is now reported as {actual}",
+            )
+
+        if "issue-comments" in effective:
+            record(
+                "issue-comments",
+                await self._syncer._issue_comments(
+                    api,
+                    archive,
+                    task,
+                    root,
+                    force=False,
+                ),
+            )
+        if "issue-timeline" in effective:
+            record(
+                "issue-timeline",
+                await self._syncer._issue_timeline(api, archive, task),
+            )
+        if "issue-events" in effective:
+            record(
+                "issue-events",
+                await self._syncer._issue_events(api, archive, task),
+            )
+        if "issue-reactions" in effective:
+            record(
+                "issue-reactions",
+                await self._syncer._issue_reactions(api, archive, task, root),
+            )
+        if "issue-comment-reactions" in effective:
+            comments = facts["issue-comments"]
+            if comments.coverage is Coverage.COMPLETE:
+                reactions = await self._syncer._comment_reactions(
+                    api,
+                    archive,
+                    task,
+                    comments,
+                    endpoint="issues/comments",
+                    family="issue-comment-reactions",
+                    subject_prefix="issue-comment",
+                )
+                outcomes["issue-comment-reactions"] = _aggregate_coverage(
+                    [fact.coverage for fact in reactions],
+                )
+            else:
+                outcomes["issue-comment-reactions"] = comments.coverage
+        if "issue-relations" in effective:
+            record(
+                "issue-relations",
+                await self._syncer._issue_relations(api, archive, task),
+            )
+
+        if kind == "pull":
+            await self._refresh_pull_families(
+                api,
+                git,
+                archive,
+                task,
+                effective,
+                facts,
+                outcomes,
+            )
+
+        references: dict[str, tuple[dict[str, Any], ...]] = {}
+        if reference_sources:
+            selected = [facts[family] for family in reference_sources if family in facts]
+            references = await self._syncer._structured_commits(archive, task, selected)
+            source_coverage = _aggregate_coverage(
+                [outcomes[family] for family in reference_sources],
+            )
+            outcomes["commit-references"] = source_coverage
+            retention = await self._retain_commits(git, archive, task, references)
+            outcomes["commit-object"] = _aggregate_coverage(
+                [source_coverage, retention],
+            )
+
+        missing = effective - outcomes.keys()
+        if missing:
+            raise RuntimeError(
+                f"maintenance task {task.task_key} left families unobserved: "
+                f"{', '.join(sorted(missing))}",
+            )
+        return _aggregate_coverage([outcomes[family] for family in effective])
+
+    async def _refresh_pull_families(
+        self,
+        api: Any,
+        git: Any,
+        archive: ObservationArchive,
+        task: MaintenanceTask,
+        effective: set[str],
+        facts: dict[str, FactObservation],
+        outcomes: dict[str, Coverage],
+    ) -> None:
+        def record(family: str, fact: FactObservation) -> None:
+            facts[family] = fact
+            outcomes[family] = fact.coverage
+
+        if "pull" in effective:
+            record("pull", await self._syncer._pull_detail(api, archive, task))
+        if "pull-reviews" in effective:
+            record(
+                "pull-reviews",
+                await self._syncer._pull_reviews(api, archive, task),
+            )
+        if "pull-review-threads" in effective:
+            record(
+                "pull-review-threads",
+                await self._syncer._review_threads(api, archive, task),
+            )
+        if "pull-review-comments" in effective:
+            detail = facts["pull"]
+            threads = facts["pull-review-threads"]
+            if Coverage.COMPLETE in {detail.coverage, threads.coverage}:
+                record(
+                    "pull-review-comments",
+                    await self._syncer._review_comments(
+                        api,
+                        archive,
+                        task,
+                        detail,
+                        threads,
+                        force=False,
+                    ),
+                )
+            else:
+                outcomes["pull-review-comments"] = _aggregate_coverage(
+                    [detail.coverage, threads.coverage],
+                )
+        if "pull-commits" in effective:
+            detail = facts["pull"]
+            if detail.coverage is Coverage.COMPLETE:
+                record(
+                    "pull-commits",
+                    await self._syncer._pull_commits(api, archive, task, detail),
+                )
+            else:
+                outcomes["pull-commits"] = detail.coverage
+        if "pull-requested-reviewers" in effective:
+            detail = facts["pull"]
+            if detail.coverage is Coverage.COMPLETE:
+                record(
+                    "pull-requested-reviewers",
+                    await self._syncer._requested_reviewers(api, archive, task, detail),
+                )
+            else:
+                outcomes["pull-requested-reviewers"] = detail.coverage
+        if "pull-review-comment-reactions" in effective:
+            comments = facts.get("pull-review-comments")
+            if comments is not None and comments.coverage is Coverage.COMPLETE:
+                reactions = await self._syncer._comment_reactions(
+                    api,
+                    archive,
+                    task,
+                    comments,
+                    endpoint="pulls/comments",
+                    family="pull-review-comment-reactions",
+                    subject_prefix="pull-review-comment",
+                )
+                outcomes["pull-review-comment-reactions"] = _aggregate_coverage(
+                    [fact.coverage for fact in reactions],
+                )
+            else:
+                outcomes["pull-review-comment-reactions"] = outcomes[
+                    "pull-review-comments"
+                ]
+        if "pull-closing-issues" in effective:
+            closing = await self._syncer._closing_issues(
+                api,
+                archive,
+                task,
+                [task.payload["number"]],
+            )
+            outcomes["pull-closing-issues"] = _aggregate_coverage(
+                [fact.coverage for fact in closing],
+            )
+        if "pull-git" in effective:
+            detail = facts["pull"]
+            if detail.coverage is Coverage.COMPLETE:
+                value = detail.payload.get("value")
+                if not isinstance(value, dict):
+                    raise IncompleteGitHubDataError(
+                        f"pull #{task.resource_number} detail is not an object",
+                    )
+                record(
+                    "pull-git",
+                    await self._syncer._pull_git(git, archive, task, value),
+                )
+            else:
+                outcomes["pull-git"] = detail.coverage
 
     async def _run(
         self,
@@ -492,17 +740,10 @@ class GitHubMaintainer:
         archive: ObservationArchive,
         task: MaintenanceTask,
     ) -> Coverage:
-        if task.kind == "pull-review-threads":
-            fact = await self._syncer._review_threads(api, archive, task)
-            if fact.coverage is not Coverage.COMPLETE:
-                return fact.coverage
-            references = await self._syncer._structured_commits(archive, task, [fact])
-            return await self._retain_commits(git, archive, task, references)
-        if task.kind == "issue-relations":
-            return (await self._syncer._issue_relations(api, archive, task)).coverage
+        if task.kind == "parent-refresh":
+            return await self._refresh_parent(api, git, archive, task)
         if task.kind == "git-refs":
-            await self._syncer._git_refs(git, archive, task)
-            return Coverage.COMPLETE
+            return (await self._syncer._git_refs(git, archive, task)).coverage
         if task.kind == "commit-reference-scan-batch":
             cutoff, source_ids = _reference_scan_task_scope(task)
             sources = [
@@ -616,7 +857,8 @@ async def refresh(
         pulls: Archived PR numbers to refresh.
         issues: Archived Issue numbers to refresh.
         commits: Commit IDs to retry.
-        families: Selected fact families; None selects applicable defaults.
+        families: Selected fact families. None selects every applicable family for
+            each target; source dependencies are automatic.
         idempotency_key: Optional stable caller identity.
         observer: Disposable out-of-band progress receiver.
     """
@@ -652,8 +894,8 @@ async def _require_parent(
     number: int,
     expected: str,
 ) -> None:
-    fact = await archive.current_fact("issue", f"issue:{number}")
-    if fact is None or fact.coverage is not Coverage.COMPLETE:
+    fact = await archive.latest_complete_fact("issue", f"issue:{number}")
+    if fact is None:
         raise KeyError(f"#{number} has no complete archived root")
     value = fact.payload.get("value")
     actual = "pull" if isinstance(value, dict) and "pull_request" in value else "issue"
@@ -675,9 +917,9 @@ def _refresh_request(
     if families is None:
         selected = set()
         if pull_numbers:
-            selected.add("pull-review-threads")
+            selected.update(_PULL_FAMILIES)
         if issue_numbers:
-            selected.add("issue-relations")
+            selected.update(_ISSUE_FAMILIES)
         if shas:
             selected.add("commit-object")
     else:
@@ -686,13 +928,110 @@ def _refresh_request(
         if unknown:
             raise ValueError(f"unknown refresh families: {', '.join(sorted(unknown))}")
     if not pull_numbers and not issue_numbers and not shas and "git-refs" not in selected:
-        raise ValueError("refresh requires an Issue, PR, commit, or git-refs")
+        raise ValueError("refresh requires an Issue, PR, commit, or git-refs target")
     return {
         "commits": list(shas),
         "families": sorted(selected),
         "issues": list(issue_numbers),
         "pulls": list(pull_numbers),
     }
+
+
+def _refresh_plan(request: dict[str, Any]) -> dict[str, Any]:
+    selected = set(request["families"])
+    matched = set()
+    plan = {}
+    for group, kind, applicable in (
+        ("issues", "issue", _ISSUE_FAMILIES),
+        ("pulls", "pull", _PULL_FAMILIES),
+    ):
+        if not request[group]:
+            continue
+        requested = selected & applicable
+        if not requested:
+            raise ValueError(f"selected families do not apply to {kind} targets")
+        plan[group] = _parent_family_plan(kind, requested)
+        matched.update(requested)
+    if request["commits"]:
+        if "commit-object" not in selected:
+            raise ValueError("commit targets require the commit-object family")
+        plan["commits"] = {
+            "requested_families": ["commit-object"],
+            "effective_families": ["commit-object"],
+            "reference_source_families": [],
+        }
+        matched.add("commit-object")
+    if "git-refs" in selected:
+        plan["repository"] = {
+            "requested_families": ["git-refs"],
+            "effective_families": ["git-refs"],
+            "reference_source_families": [],
+        }
+        matched.add("git-refs")
+    unmatched = selected - matched
+    if unmatched:
+        raise ValueError(
+            f"selected families have no compatible target: {', '.join(sorted(unmatched))}",
+        )
+    if not plan:
+        raise ValueError("refresh has no applicable target")
+    return plan
+
+
+def _parent_family_plan(kind: str, requested: set[str]) -> dict[str, list[str]]:
+    source_families = COMMIT_REFERENCE_SOURCE_FAMILIES & (
+        _ISSUE_FAMILIES if kind == "issue" else _PULL_FAMILIES
+    )
+    effective = set(requested) | {"issue"}
+    while True:
+        dependencies = {
+            dependency
+            for family in effective
+            for dependency in (
+                source_families
+                if family == "commit-references"
+                else _FAMILY_DEPENDENCIES.get(family, ())
+            )
+        }
+        expanded = effective | dependencies
+        if expanded == effective:
+            break
+        effective = expanded
+    reference_sources = effective & source_families
+    if reference_sources:
+        effective.update({"commit-object", "commit-references"})
+    return {
+        "requested_families": sorted(requested),
+        "effective_families": sorted(effective),
+        "reference_source_families": sorted(reference_sources),
+    }
+
+
+def _parent_refresh_task_scope(
+    task: MaintenanceTask,
+) -> tuple[str, set[str], tuple[str, ...]]:
+    kind = task.payload.get("kind")
+    number = task.payload.get("number")
+    requested = task.payload.get("requested_families")
+    if (
+        kind not in {"issue", "pull"}
+        or type(number) is not int
+        or number < 1
+        or number != task.resource_number
+        or not isinstance(requested, list)
+        or not requested
+        or any(not isinstance(family, str) for family in requested)
+    ):
+        raise RuntimeError(f"maintenance task {task.task_key} has invalid parent scope")
+    expected = _parent_family_plan(kind, set(requested))
+    for field in ("requested_families", "effective_families", "reference_source_families"):
+        if task.payload.get(field) != expected[field]:
+            raise RuntimeError(f"maintenance task {task.task_key} has invalid family plan")
+    return (
+        kind,
+        set(expected["effective_families"]),
+        tuple(expected["reference_source_families"]),
+    )
 
 
 def _numbers(values: Iterable[int]) -> tuple[int, ...]:

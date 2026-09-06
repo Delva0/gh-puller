@@ -272,7 +272,8 @@ signal, or when a finite published history needs a new verification baseline.
 
 ```mermaid
 flowchart TD
-    Request["Declare targets and fact families"] --> Scope["Persist immutable job scope and tasks"]
+    Request["Declare targets and desired families"] --> Plan["Expand source dependencies"]
+    Plan --> Scope["Persist requested and effective scope"]
     Scope --> Work["Claim pending tasks"]
     Work --> Read["Read API or verify Git"]
     Read --> Publish["Atomically append closed facts"]
@@ -299,20 +300,44 @@ Sources: [gh_puller/github/maintenance.py](../gh_puller/github/maintenance.py); 
 
 ### Targeted refresh
 
-The supported target-to-family mapping is:
+With no `--family`, each numbered target refreshes every applicable live family. An
+explicit `--family` narrows the desired result; the caller selects semantics, while
+the maintainer expands and executes the dependencies needed to support them.
 
-| Target | Default family | Additional effect |
-| --- | --- | --- |
-| Archived PR number | `pull-review-threads` | Extracts structured commits from the new thread observation and verifies them. |
-| Archived Issue number | `issue-relations` | Rereads the complete parent/sub-Issue and blocking relation operation. |
-| Commit ID | `commit-object` | Repeats known-source acquisition and reconstruction checks. |
-| Repository | `git-refs` when selected explicitly | Fetches and records a new native branch/tag map. |
+| Target | Applicable families |
+| --- | --- |
+| Archived Issue number | `issue`, `issue-comments`, `issue-events`, `issue-timeline`, `issue-reactions`, `issue-comment-reactions`, `issue-relations`, `commit-references`, and `commit-object`. |
+| Archived PR number | The Issue families except `issue-relations`, plus `pull`, `pull-reviews`, `pull-review-threads`, `pull-review-comments`, `pull-review-comment-reactions`, `pull-commits`, `pull-requested-reviewers`, `pull-closing-issues`, and `pull-git`. |
+| Commit ID | `commit-object`; repeats provenance-backed acquisition and reconstruction checks for that exact ID. |
+| Repository | `git-refs`, selected explicitly without a numbered target. |
 
-PR and Issue roots must already exist as complete archive facts. Repeat `--pull`,
-`--issue`, or `--commit` to select several targets. `--family` narrows the request and
-must have a compatible target; `git-refs` needs no numbered target.
+PR and Issue roots must have at least one complete archived observation. A newer
+`forbidden` or `unavailable` root does not disable an explicit retry. Repeat
+`--pull`, `--issue`, or `--commit` to select several targets. Repeated `--family`
+values form one desired family set: every supplied target kind must match at least
+one value, and every value must match a supplied target.
+
+Every numbered refresh first rereads its `issue` root to confirm current existence
+and Issue/PR kind. Other dependency examples are comments before per-comment
+reactions, PR detail and review threads before review-comment fallback, and all
+applicable structured sources—two for an Issue and six for a PR—before a requested
+`commit-references` or parent-scoped `commit-object` result. A newly observed complete
+structured source is always scanned for its contract-defined commit fields and those
+commits are checked in the Git store. Thus a narrow source refresh does not leave its
+derived reference evidence pending.
+
+The durable job scope records `requested_families`, `effective_families`, and the raw
+families used for structured-reference scans. An interrupted retry reuses each
+already published source operation within that plan. `catalog-item` remains an
+import-only family and cannot be actively refreshed. A numbered refresh does not
+implicitly refresh repository Git refs.
 
 ```bash
+uv run -m gh_puller.github refresh \
+  vllm-project/vllm archives/vllm.sqlite3 \
+  --pull 24324 \
+  --family pull-review-threads
+
 uv run -m gh_puller.github refresh \
   vllm-project/vllm archives/vllm.sqlite3 \
   --pull 24324 --issue 4395
