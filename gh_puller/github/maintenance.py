@@ -14,7 +14,7 @@ import asyncio
 import hashlib
 import json
 import uuid
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
@@ -27,7 +27,6 @@ from .collector import (
 from .commit_references import (
     COMMIT_REFERENCE_SOURCE_FAMILIES,
     commit_reference_payload,
-    commit_reference_scope,
     observation_commit_references,
 )
 from .family_plan import REFRESH_FAMILIES as _REFRESH_FAMILIES
@@ -38,16 +37,13 @@ from .family_plan import (
     refresh_request,
     validate_commit_sha,
 )
-from .git_store import GitStoreError
 from .locking import archive_lock
 from .observations import (
     Coverage,
-    FactDraft,
     FactObservation,
     MaintenanceJob,
     MaintenanceTask,
     ObservationArchive,
-    Origin,
     TaskDraft,
 )
 from .progress import _SyncProgressTracker
@@ -766,61 +762,17 @@ class GitHubMaintainer:
             return _aggregate_coverage([fact.coverage for fact in publication])
         if not shas:
             return Coverage.COMPLETE
-        self._collector._progress.phase("syncing_git", f"commits={len(shas)}")
-        observed_from = _utc(self._now())
-        source_tasks = [
-            replace(
-                task,
-                task_key=f"{task.task_key}:{sha}",
-                payload={"sha": sha, "references": list(references[sha])},
-            )
-            for sha in shas
-        ]
-        results = await git.retain_commits(
-            shas,
-            sources=await self._collector.commit_fetch_sources(archive, source_tasks),
-            heartbeat=self._collector._progress.git_heartbeat,
-            retry=self._collector._progress.git_retry,
+        facts = await self._collector.commit_objects(
+            git,
+            archive,
+            references,
+            resource_number=task.resource_number,
         )
-        observed_until = _utc(self._now())
-        facts = []
-        for sha in shas:
-            result = results.get(sha)
-            if not isinstance(result, dict):
-                raise GitStoreError(f"Git retention returned no result for {sha}")
-            status = result.get("status")
-            if status == "available":
-                coverage = Coverage.COMPLETE
-            elif status == "partial":
-                coverage = Coverage.PARTIAL
-            elif status == "unavailable":
-                coverage = Coverage.UNAVAILABLE
-            else:
-                raise GitStoreError(f"Git retention returned invalid status for {sha}")
-            facts.append(
-                FactDraft(
-                    family="commit-object",
-                    schema_version=2,
-                    subject_key=f"commit:{sha}",
-                    resource_number=task.resource_number,
-                    observed_from=observed_from,
-                    observed_until=observed_until,
-                    coverage=coverage,
-                    origin=Origin.GIT,
-                    payload={
-                        "operation": "GitCommitReconstruction",
-                        "repository": self.config.repository,
-                        "reference_scope": commit_reference_scope(references[sha]),
-                        "sha": sha,
-                        "value": result,
-                    },
-                ),
-            )
         publication = await self._collector.publish(
             archive,
             task,
             "commit-objects",
-            tuple(facts),
+            facts,
         )
         return _aggregate_coverage([fact.coverage for fact in publication])
 

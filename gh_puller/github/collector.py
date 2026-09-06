@@ -8,7 +8,6 @@ durable job scheduling, and lifecycle of the injected API, Git, and archive obje
 from __future__ import annotations
 
 import re
-from dataclasses import replace
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Protocol
 
@@ -40,7 +39,7 @@ from .observations import (
 
 if TYPE_CHECKING:
     import asyncio
-    from collections.abc import Awaitable, Callable, Sequence
+    from collections.abc import Awaitable, Callable, Mapping, Sequence
 
     from .progress import _SyncProgressTracker
     from .runtime import GitHubAPIReader, GitObjectWriter
@@ -162,73 +161,30 @@ class GitHubFactCollector:
         task_shas = [_required_sha(task.payload.get("sha"), task.task_key) for task in pending]
         shas = tuple(dict.fromkeys(task_shas))
         try:
-            self._progress.phase("syncing_git", f"commits={len(shas)}")
-            observed_from = _utc(self._now())
             references = await self.commit_reference_index(archive, set(shas))
-            source_tasks = [
-                replace(
-                    task,
-                    payload={
-                        "sha": sha,
-                        "references": list(references.get(sha, ())),
-                    },
-                )
-                for task, sha in zip(pending, task_shas, strict=True)
-            ]
-            fetch_sources = await self.commit_fetch_sources(archive, source_tasks)
-            results = await git.retain_commits(
-                shas,
-                sources=fetch_sources,
-                heartbeat=self._progress.git_heartbeat,
-                retry=self._progress.git_retry,
+            facts = await self.commit_objects(
+                git,
+                archive,
+                {sha: references.get(sha, ()) for sha in shas},
+                resource_number=None,
             )
-            observed_until = _utc(self._now())
         except Exception as exc:
             for task in pending:
                 async with self._store_lock:
                     await archive.record_task_error(task.id, _error_text(exc))
             return [exc]
         failures: list[Exception | None] = []
+        facts_by_sha = {
+            _required_sha(fact.payload.get("sha"), fact.subject_key): fact
+            for fact in facts
+        }
         for task, sha in zip(pending, task_shas, strict=True):
             try:
-                result = results.get(sha)
-                if not isinstance(result, dict):
-                    raise IncompleteGitHubDataError(
-                        f"Git retention returned no result for {sha}",
-                    )
-                status = result.get("status")
-                if status == "available":
-                    coverage = Coverage.COMPLETE
-                elif status == "partial":
-                    coverage = Coverage.PARTIAL
-                elif status == "unavailable":
-                    coverage = Coverage.UNAVAILABLE
-                else:
-                    raise GitStoreError(f"Git retention returned invalid status for {sha}")
                 await self.publish(
                     archive,
                     task,
                     "commit-object",
-                    (
-                        FactDraft(
-                            family="commit-object",
-                            schema_version=2,
-                            subject_key=f"commit:{sha}",
-                            observed_from=observed_from,
-                            observed_until=observed_until,
-                            coverage=coverage,
-                            origin=Origin.GIT,
-                            payload={
-                                "operation": "GitCommitReconstruction",
-                                "repository": self.config.repository,
-                                "reference_scope": commit_reference_scope(
-                                    references.get(sha, ()),
-                                ),
-                                "sha": sha,
-                                "value": result,
-                            },
-                        ),
-                    ),
+                    (facts_by_sha[sha],),
                     complete_task=True,
                 )
             except Exception as exc:
@@ -1482,13 +1438,12 @@ class GitHubFactCollector:
     async def commit_fetch_sources(
         self,
         archive: ObservationArchive,
-        tasks: Sequence[SyncTask | MaintenanceTask],
+        references: Mapping[str, Sequence[dict[str, Any]]],
     ) -> dict[str, tuple[CommitFetchSource, ...]]:
-        references = [(task, _task_references(task)) for task in tasks]
         numbers = sorted(
             {
                 number
-                for _, selected in references
+                for selected in references.values()
                 for item in selected
                 if type(number := item.get("resource_number")) is int and number > 0
             },
@@ -1499,8 +1454,8 @@ class GitHubFactCollector:
             if current is not None and current.coverage is Coverage.COMPLETE:
                 pulls[number] = _fact_object(current, f"pull #{number}")
         result: dict[str, list[CommitFetchSource]] = {}
-        for task, selected in references:
-            sha = _required_sha(task.payload.get("sha"), task.task_key)
+        for value, selected in references.items():
+            sha = _required_sha(value, "commit source")
             sources = result.setdefault(sha, [])
             for number in sorted(
                 {value for item in selected if type(value := item.get("resource_number")) is int and value in pulls},
@@ -1536,6 +1491,40 @@ class GitHubFactCollector:
                         ),
                     )
         return {sha: tuple(dict.fromkeys(sources)) for sha, sources in result.items()}
+
+    async def commit_objects(
+        self,
+        git: GitObjectWriter,
+        archive: ObservationArchive,
+        references: Mapping[str, Sequence[dict[str, Any]]],
+        *,
+        resource_number: int | None,
+    ) -> tuple[FactDraft, ...]:
+        """Acquire commit objects and construct one observation draft per SHA."""
+        shas = tuple(_required_sha(sha, "commit target") for sha in references)
+        if not shas:
+            return ()
+        self._progress.phase("syncing_git", f"commits={len(shas)}")
+        observed_from = _utc(self._now())
+        results = await git.retain_commits(
+            shas,
+            sources=await self.commit_fetch_sources(archive, references),
+            heartbeat=self._progress.git_heartbeat,
+            retry=self._progress.git_retry,
+        )
+        observed_until = _utc(self._now())
+        return tuple(
+            _commit_object_fact(
+                self.config.repository,
+                sha,
+                references[sha],
+                results.get(sha),
+                resource_number,
+                observed_from,
+                observed_until,
+            )
+            for sha in shas
+        )
 
     async def commit_reference_index(
         self,
@@ -1748,6 +1737,43 @@ def _source_payload(
     return payload
 
 
+def _commit_object_fact(
+    repository: str,
+    sha: str,
+    references: Sequence[dict[str, Any]],
+    result: Any,
+    resource_number: int | None,
+    observed_from: datetime,
+    observed_until: datetime,
+) -> FactDraft:
+    if not isinstance(result, dict):
+        raise GitStoreError(f"Git retention returned no result for {sha}")
+    coverage = {
+        "available": Coverage.COMPLETE,
+        "partial": Coverage.PARTIAL,
+        "unavailable": Coverage.UNAVAILABLE,
+    }.get(result.get("status"))
+    if coverage is None:
+        raise GitStoreError(f"Git retention returned invalid status for {sha}")
+    return FactDraft(
+        family="commit-object",
+        schema_version=2,
+        subject_key=f"commit:{sha}",
+        resource_number=resource_number,
+        observed_from=observed_from,
+        observed_until=observed_until,
+        coverage=coverage,
+        origin=Origin.GIT,
+        payload={
+            "operation": "GitCommitReconstruction",
+            "repository": repository,
+            "reference_scope": commit_reference_scope(references),
+            "sha": sha,
+            "value": result,
+        },
+    )
+
+
 def _coverage_error(
     error: GitHubAPIError,
     *,
@@ -1801,13 +1827,6 @@ def _required_sha(value: Any, context: str) -> str:
     if not isinstance(value, str) or _SHA.fullmatch(value) is None:
         raise IncompleteGitHubDataError(f"{context} has no valid commit ID")
     return value
-
-
-def _task_references(task: SyncTask | MaintenanceTask) -> list[dict[str, Any]]:
-    value = task.payload.get("references", [])
-    if not isinstance(value, list) or any(not isinstance(item, dict) for item in value):
-        raise RuntimeError(f"{task.task_key} has invalid commit references")
-    return [dict(item) for item in value]
 
 
 def _repository_git_url(repository: dict[str, Any], full_name: str) -> str:
