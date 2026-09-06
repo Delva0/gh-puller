@@ -24,6 +24,14 @@ from .commit_references import (
     commit_reference_scope,
     observation_commit_references,
 )
+from .family_plan import REFRESH_FAMILIES as _REFRESH_FAMILIES
+from .family_plan import (
+    FamilyPlan,
+    parent_refresh_scope,
+    refresh_plan,
+    refresh_request,
+    validate_commit_sha,
+)
 from .git_store import GitStoreError
 from .locking import archive_lock
 from .observations import (
@@ -50,42 +58,9 @@ if TYPE_CHECKING:
 
     from .progress import ProgressObserver
 
-_COMMON_PARENT_FAMILIES = frozenset(
-    {
-        "commit-object",
-        "commit-references",
-        "issue",
-        "issue-comment-reactions",
-        "issue-comments",
-        "issue-events",
-        "issue-reactions",
-        "issue-timeline",
-    },
-)
-_ISSUE_FAMILIES = _COMMON_PARENT_FAMILIES | {"issue-relations"}
-_PULL_FAMILIES = _COMMON_PARENT_FAMILIES | {
-    "pull",
-    "pull-closing-issues",
-    "pull-commits",
-    "pull-git",
-    "pull-requested-reviewers",
-    "pull-review-comment-reactions",
-    "pull-review-comments",
-    "pull-review-threads",
-    "pull-reviews",
-}
-REFRESH_FAMILIES = tuple(sorted(_ISSUE_FAMILIES | _PULL_FAMILIES | {"git-refs"}))
-_FAMILY_DEPENDENCIES = {
-    "commit-object": frozenset({"commit-references"}),
-    "issue-comment-reactions": frozenset({"issue-comments"}),
-    "pull-commits": frozenset({"pull"}),
-    "pull-git": frozenset({"pull"}),
-    "pull-requested-reviewers": frozenset({"pull"}),
-    "pull-review-comment-reactions": frozenset({"pull-review-comments"}),
-    "pull-review-comments": frozenset({"pull", "pull-review-threads"}),
-}
 _COMMIT_TASK_SIZE = 256
 _REFERENCE_SCAN_TASK_SIZE = 256
+REFRESH_FAMILIES = _REFRESH_FAMILIES
 
 
 @dataclass(frozen=True, slots=True)
@@ -162,8 +137,8 @@ class GitHubMaintainer:
             RuntimeError: Another maintenance request remains active.
             ValueError: Targets and selected families are inconsistent.
         """
-        request = _refresh_request(pulls, issues, commits, families)
-        plan = _refresh_plan(request)
+        request = refresh_request(pulls, issues, commits, families)
+        plan = refresh_plan(request)
         requested_at = _utc(self._now())
         async with (
             archive_lock(self.config.destination),
@@ -198,7 +173,7 @@ class GitHubMaintainer:
                 planned_families = {
                     family
                     for target in plan.values()
-                    for family in target["effective_families"]
+                    for family in target.effective
                 }
                 fact_schemas = {
                     family: 2 if family == "commit-object" else 1
@@ -208,7 +183,10 @@ class GitHubMaintainer:
                     "operation": "TargetedFactRefresh",
                     "repository": self.config.repository,
                     "request": request,
-                    "plan": plan,
+                    "plan": {
+                        target: family_plan.payload()
+                        for target, family_plan in plan.items()
+                    },
                     "fact_schemas": fact_schemas,
                     "population": {
                         "digest": _task_digest(tasks),
@@ -378,12 +356,12 @@ class GitHubMaintainer:
         self,
         archive: ObservationArchive,
         request: dict[str, Any],
-        plan: dict[str, Any],
+        plan: dict[str, FamilyPlan],
     ) -> tuple[TaskDraft, ...]:
         tasks = []
         for number in request["pulls"]:
             await _require_parent(archive, number, "pull")
-            payload = {"kind": "pull", "number": number} | plan["pulls"]
+            payload = {"kind": "pull", "number": number} | plan["pulls"].payload()
             tasks.append(
                 TaskDraft(
                     f"parent-refresh:pull:{number}",
@@ -395,7 +373,7 @@ class GitHubMaintainer:
             )
         for number in request["issues"]:
             await _require_parent(archive, number, "issue")
-            payload = {"kind": "issue", "number": number} | plan["issues"]
+            payload = {"kind": "issue", "number": number} | plan["issues"].payload()
             tasks.append(
                 TaskDraft(
                     f"parent-refresh:issue:{number}",
@@ -427,7 +405,7 @@ class GitHubMaintainer:
             source_cutoff,
             selected_shas,
         ):
-            sha = _sha(item.get("sha"))
+            sha = validate_commit_sha(item.get("sha"))
             references.setdefault(sha, []).append(item)
         return {
             sha: tuple(_distinct_objects(items))
@@ -441,7 +419,7 @@ class GitHubMaintainer:
         archive: ObservationArchive,
         task: MaintenanceTask,
     ) -> Coverage:
-        kind, effective, reference_sources = _parent_refresh_task_scope(task)
+        kind, effective, reference_sources = parent_refresh_scope(task)
         facts: dict[str, FactObservation] = {}
         outcomes: dict[str, Coverage] = {}
 
@@ -903,152 +881,6 @@ async def _require_parent(
         raise ValueError(f"#{number} is an {actual}, not a {expected}")
 
 
-def _refresh_request(
-    pulls: Iterable[int],
-    issues: Iterable[int],
-    commits: Iterable[str],
-    families: Iterable[str] | None,
-) -> dict[str, Any]:
-    pull_numbers = _numbers(pulls)
-    issue_numbers = _numbers(issues)
-    shas = tuple(sorted({_sha(value) for value in commits}))
-    if set(pull_numbers) & set(issue_numbers):
-        raise ValueError("one parent cannot be selected as both Issue and PR")
-    if families is None:
-        selected = set()
-        if pull_numbers:
-            selected.update(_PULL_FAMILIES)
-        if issue_numbers:
-            selected.update(_ISSUE_FAMILIES)
-        if shas:
-            selected.add("commit-object")
-    else:
-        selected = set(families)
-        unknown = selected - set(REFRESH_FAMILIES)
-        if unknown:
-            raise ValueError(f"unknown refresh families: {', '.join(sorted(unknown))}")
-    if not pull_numbers and not issue_numbers and not shas and "git-refs" not in selected:
-        raise ValueError("refresh requires an Issue, PR, commit, or git-refs target")
-    return {
-        "commits": list(shas),
-        "families": sorted(selected),
-        "issues": list(issue_numbers),
-        "pulls": list(pull_numbers),
-    }
-
-
-def _refresh_plan(request: dict[str, Any]) -> dict[str, Any]:
-    selected = set(request["families"])
-    matched = set()
-    plan = {}
-    for group, kind, applicable in (
-        ("issues", "issue", _ISSUE_FAMILIES),
-        ("pulls", "pull", _PULL_FAMILIES),
-    ):
-        if not request[group]:
-            continue
-        requested = selected & applicable
-        if not requested:
-            raise ValueError(f"selected families do not apply to {kind} targets")
-        plan[group] = _parent_family_plan(kind, requested)
-        matched.update(requested)
-    if request["commits"]:
-        if "commit-object" not in selected:
-            raise ValueError("commit targets require the commit-object family")
-        plan["commits"] = {
-            "requested_families": ["commit-object"],
-            "effective_families": ["commit-object"],
-            "reference_source_families": [],
-        }
-        matched.add("commit-object")
-    if "git-refs" in selected:
-        plan["repository"] = {
-            "requested_families": ["git-refs"],
-            "effective_families": ["git-refs"],
-            "reference_source_families": [],
-        }
-        matched.add("git-refs")
-    unmatched = selected - matched
-    if unmatched:
-        raise ValueError(
-            f"selected families have no compatible target: {', '.join(sorted(unmatched))}",
-        )
-    if not plan:
-        raise ValueError("refresh has no applicable target")
-    return plan
-
-
-def _parent_family_plan(kind: str, requested: set[str]) -> dict[str, list[str]]:
-    source_families = COMMIT_REFERENCE_SOURCE_FAMILIES & (
-        _ISSUE_FAMILIES if kind == "issue" else _PULL_FAMILIES
-    )
-    effective = set(requested) | {"issue"}
-    while True:
-        dependencies = {
-            dependency
-            for family in effective
-            for dependency in (
-                source_families
-                if family == "commit-references"
-                else _FAMILY_DEPENDENCIES.get(family, ())
-            )
-        }
-        expanded = effective | dependencies
-        if expanded == effective:
-            break
-        effective = expanded
-    reference_sources = effective & source_families
-    if reference_sources:
-        effective.update({"commit-object", "commit-references"})
-    return {
-        "requested_families": sorted(requested),
-        "effective_families": sorted(effective),
-        "reference_source_families": sorted(reference_sources),
-    }
-
-
-def _parent_refresh_task_scope(
-    task: MaintenanceTask,
-) -> tuple[str, set[str], tuple[str, ...]]:
-    kind = task.payload.get("kind")
-    number = task.payload.get("number")
-    requested = task.payload.get("requested_families")
-    if (
-        kind not in {"issue", "pull"}
-        or type(number) is not int
-        or number < 1
-        or number != task.resource_number
-        or not isinstance(requested, list)
-        or not requested
-        or any(not isinstance(family, str) for family in requested)
-    ):
-        raise RuntimeError(f"maintenance task {task.task_key} has invalid parent scope")
-    expected = _parent_family_plan(kind, set(requested))
-    for field in ("requested_families", "effective_families", "reference_source_families"):
-        if task.payload.get(field) != expected[field]:
-            raise RuntimeError(f"maintenance task {task.task_key} has invalid family plan")
-    return (
-        kind,
-        set(expected["effective_families"]),
-        tuple(expected["reference_source_families"]),
-    )
-
-
-def _numbers(values: Iterable[int]) -> tuple[int, ...]:
-    selected = tuple(sorted(set(values)))
-    if any(type(number) is not int or number < 1 for number in selected):
-        raise ValueError("Issue and PR numbers must be positive integers")
-    return selected
-
-
-def _sha(value: object) -> str:
-    if not isinstance(value, str) or len(value) not in {40, 64}:
-        raise ValueError("commit IDs must contain 40 or 64 lowercase hexadecimal digits")
-    if any(character not in "0123456789abcdef" for character in value):
-        raise ValueError("commit IDs must contain 40 or 64 lowercase hexadecimal digits")
-    return value
-
-
 def _caller_key(kind: str, value: str) -> str:
     if not value or len(value) > 200:
         raise ValueError("idempotency key must contain 1 to 200 characters")
@@ -1061,7 +893,7 @@ def _commit_tasks(
 ) -> tuple[TaskDraft, ...]:
     if source_cutoff < 0:
         raise ValueError("source observation cutoff cannot be negative")
-    ordered = tuple(_sha(sha) for sha in shas)
+    ordered = tuple(validate_commit_sha(sha) for sha in shas)
     if len(ordered) != len(set(ordered)):
         raise ValueError("commit task population must be unique")
     tasks = []
@@ -1145,7 +977,7 @@ def _commit_task_scope(
     values = task.payload.get("shas")
     if type(cutoff) is not int or cutoff < 0 or not isinstance(values, list):
         raise TypeError(f"maintenance task {task.task_key} has invalid commit scope")
-    shas = tuple(_sha(value) for value in values)
+    shas = tuple(validate_commit_sha(value) for value in values)
     if not shas or len(shas) != len(set(shas)):
         raise ValueError(f"maintenance task {task.task_key} has invalid commit population")
     return cutoff, shas
