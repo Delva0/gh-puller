@@ -150,8 +150,9 @@ publication barrier.
 flowchart TD
     Call["sync() freezes cycle start S"] --> Resume{"Active cycle?"}
     Resume -- "yes" --> Durable["Resume cursor and pending tasks"]
-    Resume -- "no, cold" --> Cold["Issue/PR catalog: newest to oldest"]
-    Resume -- "no, warm" --> Signals["Root and comment signals since W - overlap"]
+    Resume -- "no" --> Previous{"Checkpoint W exists?"}
+    Previous -- "no: cold start" --> Cold["Issue/PR catalog: newest to oldest"]
+    Previous -- "yes: warm sync" --> Signals["Root and comment signals since W - overlap"]
     Cold --> Page["Persist one catalog page and its tasks"]
     Signals --> Page
     Page --> Consume["Observe selected parents concurrently"]
