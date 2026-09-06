@@ -26,13 +26,14 @@ A fact contains:
 
 | Field | Meaning |
 | --- | --- |
-| `family`, `schema_version`, `subject_key` | Versioned semantic identity. |
+| `family`, `subject_key` | Stable semantic identity and current-fact key. |
+| `schema_version` | Payload contract used by this observation. |
 | `resource_number` | Related repository Issue/PR number, when applicable. |
 | `observed_from`, `observed_until` | Real clock interval enclosing the complete source operation. |
 | `coverage` | What conclusion that operation supports. |
 | `origin` | `api`, `git`, `derived`, or `import`. |
 | `payload_digest`, `payload` | Content-addressed JSON evidence and its decoded value. |
-| `source_digest` | Source payload for a derived fact, when applicable. |
+| `source_digest` | Digest of the source payload for a derived fact, when applicable. |
 | `published_at` | Time the closed observation became durable in SQLite. |
 
 One multi-page collection has one observation window; fields inside the same source
@@ -47,6 +48,29 @@ validators with the value that they validate; a valid `304` reuses those bytes w
 creating a new, honestly timed observation.
 
 Sources: [gh_puller/github/observations.py](../gh_puller/github/observations.py); [gh_puller/github/syncer.py](../gh_puller/github/syncer.py)
+
+### Families and API requests
+
+A family is a semantic completeness boundary for readers, not an HTTP endpoint,
+page, or request. One parent task can publish many independently timed families, and
+one family closes only after its transport work reaches a conclusive coverage result.
+Already published sibling families remain readable if later work for the same
+parent fails.
+
+| Operation shape | Transport work | Published facts |
+| --- | --- | --- |
+| Issue/PR catalog page | One REST request shared by up to 100 parents | One `issue` observation per selected parent; PR detail remains a separate `pull` family. |
+| Complete collection such as comments or reviews | One or more REST or GraphQL pages | One observation for the whole family, never one per page. |
+| Batched closing-Issue lookup | A GraphQL request can serve several PRs; nested pagination may add requests | One `pull-closing-issues` observation per PR. |
+| Count-proven empty collection or structured derivation | No additional API request | A complete derived observation with the source's time window. |
+| Git refs, PR snapshots, or commit reconstruction | Local Git commands and, when needed, Git remote fetches | `git-refs`, `pull-git`, or `commit-object`; no REST/GraphQL request accounting. |
+
+This separation keeps downstream identities stable when routing changes between REST
+and GraphQL, preserves one honest completeness result across pagination, and makes
+publication and retry granular without presenting an entire Issue/PR as one atomic
+snapshot.
+
+Sources: [gh_puller/github/client.py](../gh_puller/github/client.py); [gh_puller/github/syncer.py](../gh_puller/github/syncer.py)
 
 ### Time and offline queries
 
@@ -185,7 +209,7 @@ Let `W` be the last completed cycle's discovery checkpoint. A new cycle combines
 - Issue conversation comments returned since the same boundary;
 - PR review comments returned since the same boundary.
 
-GitHub's [repository-Issue endpoint](https://docs.github.com/en/rest/issues/issues#list-repository-issues)
+GitHub's [repository-Issue endpoint](https://docs.github.com/en/rest/issues/issues?apiVersion=2022-11-28#list-repository-issues)
 applies the `since` filter to last-update time independently of its `sort` parameter.
 Cold start omits `since`; warm synchronization sets `since=W-overlap`, which selects
 roots by `updated_at`. Both use `sort=created&direction=asc`, so `created_at` controls
@@ -365,8 +389,10 @@ DATABASE.git   Repository-bound bare Git object store by default
 ```
 
 `archive_meta` binds schema version 11, repository identity, Git layout 0, and the
-absolute Git-store path. Moving only one member breaks that binding. Back up or move
-the pair together, or pass the bound path explicitly with `--git-destination`.
+absolute Git-store path. Opening an existing database with another Git-store path is
+rejected. Back up both members and restore them to their original paths. For an
+archive created with a non-default Git store, every writer must pass that exact
+already-bound path with `--git-destination`; the CLI has no rebind operation.
 
 The durable SQLite relations are grouped by responsibility:
 
@@ -522,9 +548,11 @@ controls are `--concurrency`, `--git-batch-size`, `--overlap-seconds`,
 ### Format migration
 
 Version 11 is an explicit in-place migration from a stopped version-10 archive. It
-adds maintenance state, the reference index, and schema-two commit reconstruction
-facts without changing existing payload bytes, digests, observations, discovery
-cursors, or pending sync tasks. The paired Git layout remains version 0.
+adds maintenance state, the reference index, and support for schema-two commit
+reconstruction facts without changing existing payload bytes, digests, observations,
+discovery cursors, or pending sync tasks. Migration itself creates no schema-two
+observation; `backfill` or later sync work publishes that evidence. The paired Git
+layout remains version 0.
 
 ```bash
 scripts/github-puller-daemon.sh stop archives/vllm.sqlite3
@@ -574,8 +602,10 @@ scripts/github-puller-daemon.sh logs archives/vllm.sqlite3
 
 The detail view combines systemd and journald with read-only SQLite state. Its quota
 values are the latest response headers already observed by the writer; status makes
-no GitHub request. Durable discovery, maintenance, task, fact, checkpoint, and
-last-error state remains visible even when no process is running.
+no GitHub request. `core_aux` is local bookkeeping for reaction and requested-reviewer
+REST routes whose observed headers use a different effective window; it is not a
+promised extra GitHub quota pool. Durable discovery, maintenance, task, fact,
+checkpoint, and last-error state remains visible even when no process is running.
 
 `uninstall` removes only the unit and control policy. SQLite, Git objects, `.env`, the
 environment, and source tree remain:
