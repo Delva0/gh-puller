@@ -1,4 +1,4 @@
-"""Resolve adapter process settings from environment variables."""
+"""Resolve adapter settings from environment and account-local defaults."""
 
 from __future__ import annotations
 
@@ -22,6 +22,7 @@ class Settings:
     @classmethod
     def from_env(cls) -> Settings:
         """Build settings from the ``VLLM_KB_ADAPTER_*`` environment contract."""
+        snapshot_home = Path.home()
         return cls(
             upstream_url=os.environ.get(
                 "VLLM_KB_ADAPTER_UPSTREAM_URL",
@@ -30,13 +31,13 @@ class Settings:
             vllm_root=Path(
                 os.environ.get(
                     "VLLM_KB_ADAPTER_VLLM_ROOT",
-                    "/home/w30071576/snapshots-vllm",
+                    str(snapshot_home / "snapshots-vllm"),
                 ),
             ),
             vllm_ascend_root=Path(
                 os.environ.get(
                     "VLLM_KB_ADAPTER_VLLM_ASCEND_ROOT",
-                    "/home/w30071576/snapshots-vllm-ascend",
+                    str(snapshot_home / "snapshots-vllm-ascend"),
                 ),
             ),
             host=os.environ.get("VLLM_KB_ADAPTER_HOST", "127.0.0.1"),
