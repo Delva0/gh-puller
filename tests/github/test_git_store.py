@@ -491,7 +491,12 @@ async def test_batched_source_fetch_matches_serial_source_attribution(
     _git(source, "update-ref", "refs/pull/8/head", second_head)
     first_source = _pull_source(source, 7)
     second_source = _pull_source(source, 8)
-    routes = {middle: (first_source,), second_head: (second_source,)}
+    missing = "f" * 40
+    routes = {
+        middle: (first_source,),
+        second_head: (second_source,),
+        missing: (first_source, second_source),
+    }
     real_command = git_store_module._command
     commands: list[Sequence[str]] = []
 
@@ -511,18 +516,19 @@ async def test_batched_source_fetch_matches_serial_source_attribution(
         str(source),
         ref_batch_size=1,
         now=fixed_now,
-    ).retain_commits((middle, second_head), sources=routes)
+    ).retain_commits((middle, second_head, missing), sources=routes)
     batched = await GitObjectStore(
         batched_path,
         "acme/widgets",
         str(source),
         ref_batch_size=8,
         now=fixed_now,
-    ).retain_commits((middle, second_head), sources=routes)
+    ).retain_commits((middle, second_head, missing), sources=routes)
 
     assert batched == serial
     assert _pull_fetch_sizes(commands, serial_path) == [1, 1]
     assert _pull_fetch_sizes(commands, batched_path) == [2]
+    assert batched[missing]["status"] == "unavailable"
     assert {middle, second_head} <= set(
         _stored_git(batched_path, "rev-list", "--all").splitlines(),
     )

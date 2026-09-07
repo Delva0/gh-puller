@@ -1180,7 +1180,7 @@ def _source_batches(
     pending: set[str],
     limit: int,
 ) -> tuple[_SourceBatch, ...]:
-    """Group transport-compatible refs without mixing one target's sources."""
+    """Group transport-compatible refs within the configured transfer bound."""
     batches: list[_SourceBatch] = []
     current: list[_SourceGroup] = []
     targets: set[str] = set()
@@ -1193,7 +1193,6 @@ def _source_batches(
             len(current) >= limit
             or source.remote_url != remote_url
             or source.kind != current[0][0].kind
-            or not targets.isdisjoint(active)
         ):
             batches.append(tuple(current))
             current = []
