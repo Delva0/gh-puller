@@ -39,7 +39,7 @@ if TYPE_CHECKING:
 _NUMBER_AT_END = re.compile(r"/(\d+)$")
 _CATALOG_ACCEPT = "application/vnd.github.raw+json"
 _API_TASK_KINDS = frozenset({"closing-issues", "parent"})
-_COMMIT_BATCH_SIZE = 256
+_COMMIT_BATCH_SIZE = 512
 IncompleteGitHubDataError = _IncompleteGitHubDataError
 
 

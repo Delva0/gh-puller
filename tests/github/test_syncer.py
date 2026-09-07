@@ -330,7 +330,7 @@ async def test_commit_checks_are_batched_independently_from_pull_fetches(
     ).sync()
 
     assert [len(batch) for batch in git.prefetches] == [1]
-    assert [len(batch) for batch in git.retentions] == [256, 1]
+    assert [len(batch) for batch in git.retentions] == [257]
     assert len({sha for batch in git.retentions for sha in batch}) == 257
 
 
