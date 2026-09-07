@@ -1,31 +1,64 @@
-## Agent 行为规则
+## Agent behavior
 
-- **语音输入容错**：用户通过语音转文本输入。结合整体意图和上下文，忽略拼写错误、同音词和填充词。
-- **编写前讨论**：收到任务后，先简述需求理解和计划。仅在关键选择、范围不明或不可逆操作前等待确认；用户明确要求直接执行时继续。
-- **通过 UV 执行 Python 代码**：Python 工具统一通过 `uv`。
-- **代码风格与一致性**：采用简洁、零冗余的研究型或竞赛型风格，尽可能减少防御性编程。注释一律使用英文，并严格遵循现有核心代码的风格。
-- **验证**：选择合适的工具验证改动。
+- **Tolerate speech-to-text errors**: The user dictates through speech recognition. Infer
+  meaning from the overall intent and context, ignoring spelling mistakes, homophones, and
+  filler words.
+- **Discuss before writing**: After receiving a task, briefly state your understanding and
+  plan. Wait for confirmation only when a key decision is required, the scope is ambiguous,
+  or an operation is irreversible. Continue immediately when the user explicitly requests
+  execution.
+- **Run Python through UV**: Use `uv` for every Python command.
+- **Preserve code style and consistency**: Follow the concise, zero-redundancy style of
+  research or competitive-programming code, minimizing defensive programming where
+  practical. Write all comments in English and follow the style of the existing core code
+  exactly.
+- **Verify changes**: Select appropriate tools and checks for every change.
 
-## Python 注释规范
+## Python documentation and comment rules
 
-机械项由 `ruff` 强制（`uvx ruff check` 必须全绿；`select=ALL` 配合定向 `ignore`）。以下规范约束 lint 无法判断的内容。
+Mechanical requirements are enforced by `ruff` (`uvx ruff check` must pass, using
+`select=ALL` with targeted `ignore` entries). The following rules cover qualities that
+linting cannot determine.
 
-- **模块 docstring 必写**（lint 强制）：
-  - **内容**：首行用一句话说明职责；按需补充架构层的边界、依赖契约（依赖谁、被谁依赖）、内部组织（模块/文件角色分工）和对外暴露。
-  - **范围**：不列函数/类地图、符号级细节或「几路」「几生成器」式计数；符号细节归其自身 docstring。
-  - **文件边界**：每个文件只描述自身。新文件必须自带模块 docstring；不为说明新文件而改写旧文件。
-- **类/函数 docstring 按信息量，不按可见性**：
-  - **一般规则**：只写签名无法表达的信息，包括非显然参数语义、失败/降级语义、时序/并发不变量和跨文件契约。返回语义非显然时写 `Returns`；仅在调用方需要捕获失败时写 `Raises`。
-  - **协议核心 API 例外**：模块/包对外契约面的函数与公共方法必须逐参写 `Args`，覆盖散装参数位、dict/config 构造、缺省和契约约束。只写语义，不写类型；签名已有缺省值时，只补充其契约含义。
-  - **纯转发 override**：不另写 docstring，契约与 `Args` 均沿用基类。
-- **共享契约与核心概念唯一真实源**：定义锚定在概念归属的包/模块 docstring，而非逐个消费点；他处只使用概念名或「见 X」引用，不引行号。新增或调整概念说明时只改锚点文件。
-- **行内注释只写 why**：适用于陷阱、不变量、设计取舍和扩展点，禁止讲解 Python 语法或简单 API。有意为之的反常写法（宽捕获、lazy import、lint 豁免）须就地说明理由。`TODO` 带动作说明；大文件用 `# --- 分节 ---` 横幅，标题须与内容一致。
-- **只写现状，不写变更史**：README 和 docstring 只说明当前设计与用法；变更历史归 commit message 与 changelog。
-- **复杂逻辑用图表解释**：关系或流程用图表比线性文字更清楚时，使用图表。
+- **Module docstrings are required** (enforced by lint):
+  - **Content**: Begin with one sentence that states the module's responsibility. Add
+    architecture-level boundaries, dependency contracts (what it depends on and what
+    depends on it), internal organization (the roles of modules or files), and public
+    exports only when needed.
+  - **Scope**: Do not list functions or classes, symbol-level details, or implementation
+    counts such as the number of routes or generators. Put symbol details in the symbol's
+    own docstring.
+  - **File boundary**: Each file documents only itself. Every new file must provide its own
+    module docstring; do not rewrite an existing file merely to explain a new file.
+- **Class and function docstrings depend on information content, not visibility**:
+  - **General rule**: Document only information the signature cannot express, including
+    non-obvious parameter semantics, failure or fallback behavior, timing or concurrency
+    invariants, and cross-file contracts. Add `Returns` when return semantics are
+    non-obvious. Add `Raises` only when callers need to catch the failure.
+  - **Core protocol API exception**: Functions and public methods on a module or package
+    contract surface must provide `Args` entries for every parameter, including independent
+    parameters, dict or config construction, defaults, and contract constraints. Describe
+    semantics, not types. When the signature already shows a default value, document only
+    its contractual meaning.
+  - **Pure forwarding overrides**: Do not add a separate docstring. Inherit the contract
+    and `Args` documentation from the base class.
+- **Keep one source of truth for shared contracts and core concepts**: Anchor each
+  definition in the docstring of the package or module that owns the concept. Consumers
+  should use the concept's name or refer to that source without citing line numbers. When
+  adding or revising a concept description, edit only its anchor.
+- **Inline comments explain only why**: Use them for traps, invariants, design tradeoffs,
+  and extension points, never to explain Python syntax or straightforward APIs. Explain
+  intentional anomalies such as broad exception handling, lazy imports, and lint
+  suppressions in place. Every `TODO` must name an action. In large files, use
+  `# --- Section ---` banners whose titles match their contents.
+- **Describe the current state, not change history**: README files and docstrings explain
+  only the current design and usage. Put change history in commit messages and changelogs.
+- **Use diagrams for complex logic**: When a diagram communicates a relationship or flow
+  more clearly than linear prose, use one.
 
-## 本代码仓地图
+## Repository map
 
-- **不允许查看范围**：archive/
-- **Python 主包**: gh-puller/
-- **实验场所**: playground/
-- **共享 UI 包**：ui/
+- **Do not inspect**: `archive/`
+- **Main Python package**: `gh_puller/`
+- **Experimental workspace**: `playground/`
+- **Shared UI packages**: `ui/`
