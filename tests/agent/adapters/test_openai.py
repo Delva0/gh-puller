@@ -103,7 +103,7 @@ async def test_openai_is_multi_turn(monkeypatch, tmp_path) -> None:
             "system_prompt": "system", "tools": tools, "parameters": {"temperature": 0},
         }
     assert [
-        {key: value for key, value in event["data"].items() if key != "requestId"}
+        {key: value for key, value in event["data"].items() if key not in {"requestId", "requestSha256"}}
         for event in events if event["type"] == "model/request"
     ] == [
         {"model": "m", "parameters": {"temperature": 0}, "provider": "p"},
@@ -125,6 +125,9 @@ async def test_openai_is_multi_turn(monkeypatch, tmp_path) -> None:
     ]
     assert [event["data"]["requestId"] for event in events
             if event["type"] == "model/request"] == ["r1", "r2"]
+    request_hashes = [event["data"]["requestSha256"] for event in events
+                      if event["type"] == "model/request"]
+    assert len(set(request_hashes)) == 2 and all(len(value) == 64 for value in request_hashes)
     assert _context_at_requests(events) == [
         ["system", "user"],
         ["system", "user", "reasoning", "assistant", "user"],
@@ -195,3 +198,22 @@ async def test_openai_normalizes_one_complete_inference(monkeypatch, tmp_path) -
     config = next(event for event in events if event["type"] == "agent/set")["data"]["config"]
     assert config["api_key"] == "<redacted>"
     _assert_inferences(events)
+
+
+@pytest.mark.asyncio
+async def test_openai_correlates_a_failed_stream(monkeypatch, tmp_path) -> None:
+    from gh_puller.agent.adapters import openai
+
+    _HttpClient.scripts = [[{"choices": [{"delta": {"content": "partial"}}]}]]
+    monkeypatch.setattr(openai.httpx, "AsyncClient", _HttpClient)
+    events = await _capture(tmp_path)
+    subject = agent.OpenAI({"model": "m", "base_url": "http://fake"})
+    with pytest.raises(agent.RequestFailedError, match="finish normally"):
+        async with subject.session(session="openai/failure"):
+            await subject.result("question")
+    await _settle()
+    request = next(event for event in events if event["type"] == "model/request")
+    failure = next(event for event in events if event["type"] == "model/error")
+    assert failure["data"]["requestId"] == request["data"]["requestId"]
+    assert failure["data"]["error"]["type"] == "RequestFailedError"
+    assert not any(event["type"] == "model/response" for event in events)

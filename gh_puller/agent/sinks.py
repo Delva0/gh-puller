@@ -17,6 +17,16 @@ def _file_stem(session: str) -> str:
     return session.rsplit("/", 1)[-1]
 
 
+def session_path(session: str, *, directory: str | Path | None = None) -> Path:
+    """Locate one canonical JSONL log without creating it.
+
+    Args:
+        session: Observation identity; its final slash-separated component names the file.
+        directory: Explicit sink root, or the currently configured root when omitted.
+    """
+    return Path(_cfg["file_dir"] if directory is None else directory) / f"{_file_stem(session)}.jsonl"
+
+
 def _log(msg: str) -> None:
     _utils_log(msg, prefix="agent-monitor")
 
@@ -50,7 +60,7 @@ class FileSink:
 
     def _open(self, session: str) -> None:
         """Register the session file (created on session/start)."""
-        self._files[session] = self.root / f"{_file_stem(session)}.jsonl"
+        self._files[session] = session_path(session, directory=self.root)
 
     async def touch(self, session: str) -> None:
         """Keep-warm primitive: refresh file mtime only (no writes); silent no-op on failure."""
@@ -177,6 +187,8 @@ class OtelSink:
                 self._on_model_delta(state, evt)
             elif t == "model/response":
                 self._on_model_response(state, evt)
+            elif t == "model/error":
+                self._on_model_error(state, evt)
             elif t == "tool/start":
                 self._on_tool_start(state, evt)
             elif t == "tool/end":
@@ -278,6 +290,17 @@ class OtelSink:
             "gh_puller.reasoning_chars": len(reasoning),
             "gh_puller.reasoning_preview": truncate(reasoning, 300)[1],
         })
+        span.end(end_time=_ns(evt.get("ts")))
+
+    def _on_model_error(self, state: dict, evt: dict) -> None:
+        d = evt["data"]
+        request = state["requests"].pop(d["requestId"], None)
+        span = request["span"] if request else self._child(
+            state, f"model:{d['requestId']}", evt.get("ts"))
+        error = d.get("error") or {}
+        detail = f"{error.get('type', '')}: {error.get('message', '')}".strip(": ")
+        _attrs(span, {"gh_puller.error": detail})
+        span.set_status(self._trace.Status(self._trace.StatusCode.ERROR, detail[:300]))
         span.end(end_time=_ns(evt.get("ts")))
 
     def _on_tool_start(self, state: dict, evt: dict) -> None:
@@ -440,11 +463,16 @@ def configure(*, file_dir=None, ws_urls=None, otel_urls=None, raw=None) -> None:
         raw: True writes model deltas; None re-reads AGENT_MONITOR_FILE_RAW;
             False writes the compact replay-equivalent stream.
     """
-    global _bus, _file_sinks
+    shutdown()
     _cfg["file_dir"] = envs.AGENT_MONITOR_DIR if file_dir is None else file_dir
     _cfg["raw"] = envs.AGENT_MONITOR_FILE_RAW if raw is None else bool(raw)
     _cfg["ws_urls"] = _split_urls(envs.AGENT_MONITOR_WEBUI_URL if ws_urls is None else ws_urls)
     _cfg["otel_urls"] = _default_otel_urls() if otel_urls is None else _split_urls(otel_urls)
+
+
+def shutdown() -> None:
+    """Stop the process-wide observation bus after all Agent sessions have ended."""
+    global _bus, _file_sinks
     if _bus is not None:
         _bus.shutdown()
         _bus = None
@@ -456,6 +484,12 @@ async def touch(session: str) -> None:
     """Keep-warm fan-out: forward to every registered FileSink.touch; no sink → no-op."""
     for fs in _file_sinks:
         await fs.touch(session)
+
+
+async def flush() -> None:
+    """Drain configured sink consumers after producers have stopped publishing."""
+    if _bus is not None:
+        await _bus.flush()
 
 
 def ensure_bus() -> EventBus:
@@ -470,7 +504,7 @@ def ensure_bus() -> EventBus:
         b = EventBus()
         fs = FileSink(_cfg["file_dir"], raw=_cfg["raw"])
         _file_sinks.append(fs)
-        b.add(fs.consume)
+        b.add(fs.consume, lossless=_cfg["raw"])
         for url in _cfg["ws_urls"]:
             if not _url_reachable(url):
                 _log(f"ws sink 未启用: 端口不可达 {url}")

@@ -153,4 +153,18 @@ describe('RunFold', () => {
       .toEqual([['left', 'L'], ['right', 'R']])
     expect(fold.activeModels().map(request => request.requestId)).toEqual(['right'])
   })
+
+  it('treats model errors as terminal request activity', () => {
+    const fold = new RunFold()
+    fold.applyBatch([
+      evt('model/request', 0, { requestId: 'failed' }),
+      evt('model/error', 1, {
+        requestId: 'failed', error: { type: 'ReadTimeout', message: 'late' },
+      }),
+    ])
+    expect(fold.activeModels()).toEqual([])
+    expect(fold.modelActivity()[0]).toMatchObject({
+      requestId: 'failed', responseSeq: 1, error: { type: 'ReadTimeout' },
+    })
+  })
 })

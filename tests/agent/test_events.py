@@ -44,6 +44,18 @@ async def test_event_bus_preserves_order_for_every_sink() -> None:
 
 
 @pytest.mark.asyncio
+async def test_event_bus_can_flush_a_lossless_raw_sink() -> None:
+    received: list[dict] = []
+    bus = EventBus()
+    bus.add(_receiver(received), lossless=True)
+    for index in range(5100):
+        bus.publish({"type": "model/delta/text", "index": index})
+    await bus.flush()
+    assert received == [{"type": "model/delta/text", "index": index} for index in range(5100)]
+    bus.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_event_bus_backlog_never_drops_compact_events() -> None:
     received: list[dict] = []
     bus = EventBus()
@@ -81,6 +93,8 @@ async def test_recorder_supports_multiple_loose_turns_and_replay() -> None:
         recorder.end_turn()
     recorder.finish(True)
     await _settle()
+    elapsed = [event["elapsedMs"] for event in events]
+    assert elapsed == sorted(elapsed) and elapsed[0] >= 0
     state = fold_state(events)
     assert state["agent"] == {"agent": "custom", "config": {"mode": "default"}}
     assert _context_labels(state["context"]) == [
@@ -206,6 +220,24 @@ async def test_otel_uses_request_and_call_correlations() -> None:
     assert "gh_puller.cache_write_tokens" not in spans["model:r1"].attributes
     assert spans["tool:read"].status.status_code is StatusCode.ERROR
     assert spans["run"].status.status_code is StatusCode.ERROR
+
+
+@pytest.mark.asyncio
+async def test_otel_closes_a_failed_model_request() -> None:
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    sink = OtelSink("", tracer=provider.get_tracer("test"))
+    for event in [
+        _event("session/start", 0, label="run"),
+        _event("model/request", 1, requestId="r1"),
+        _event("model/error", 2, requestId="r1", error={"type": "ReadTimeout", "message": "late"}),
+        _event("session/end", 3, outcome="failed", durationMs=2),
+    ]:
+        await sink.consume(event)
+    spans = {span.name: span for span in exporter.get_finished_spans()}
+    assert spans["model:r1"].status.status_code is StatusCode.ERROR
+    assert spans["model:r1"].attributes["gh_puller.error"] == "ReadTimeout: late"
 
 
 @pytest.mark.asyncio

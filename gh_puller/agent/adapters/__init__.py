@@ -9,12 +9,13 @@ from ..base import BaseAgent, RequestFailedError
 from .cc import ClaudeCode, ClaudeConfig
 from .codex import Codex, CodexConfig
 from .dsh import Dsh, DshConfig
-from .openai import OpenAI, OpenAIConfig
+from .openai import ChatCompletion, OpenAI, OpenAIConfig
 from .opencode import OpenCode, OpenCodeConfig
 
 __all__ = [
     "AGENTS",
     "BaseAgent",
+    "ChatCompletion",
     "ClaudeCode",
     "ClaudeConfig",
     "Codex",

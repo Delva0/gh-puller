@@ -87,6 +87,11 @@ export class RunFold {
         request.output = evt.data.output as Item[]
         request.usage = evt.data.usage as ModelActivity['usage']
         if (typeof evt.data.stopReason === 'string') request.stopReason = evt.data.stopReason
+      } else if (evt.type === 'model/error' && requestId !== null) {
+        const request = requests.get(requestId)
+        if (request === undefined) continue
+        request.responseSeq = evt.seq
+        request.error = evt.data.error
       }
     }
     return [...requests.values()].sort((a, b) => a.requestSeq - b.requestSeq)

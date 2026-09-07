@@ -21,6 +21,10 @@ error, cancelled, timeout and adapter-reported budget_exhausted; ``phase`` locat
 failure at initialize, run or cleanup. The first failure determines the footer;
 later cleanup failures remain separate session/error events. ``stopReason`` is the
 backend's model stop reason, independent of session termination.
+
+Recorder envelopes include ``elapsedMs``, sampled from a session-local monotonic
+clock at publication. ``ts`` remains wall time for external correlation. Neither
+clock describes server-side token generation; deltas mark adapter receipt.
 """
 
 import asyncio
@@ -47,7 +51,7 @@ EVENT_TYPES = frozenset({
     "session/start", "session/end", "session/error",
     "turn/start", "turn/end", "step/start", "step/end",
     "agent/set", "context/set",
-    "model/request", "model/response", "tool/start", "tool/end",
+    "model/request", "model/response", "model/error", "tool/start", "tool/end",
 }) | CONTEXT_APPEND_TYPES | DELTA_TYPES
 FailureReason = Literal["error", "cancelled", "timeout", "budget_exhausted"]
 FailurePhase = Literal["initialize", "run", "cleanup"]
@@ -164,6 +168,8 @@ def new_event(event_type: str, **data) -> dict:
         raise TypeError("session/end requires outcome")
     if event_type == "model/response":
         _validate_model_output(data.get("output"), event_type)
+    elif event_type == "model/error" and not isinstance(data.get("error"), dict):
+        raise TypeError("model/error requires error")
     elif event_type in {"model/delta/text", "model/delta/reasoning"}:
         if not isinstance(data.get("index"), int) or not isinstance(data.get("text"), str):
             raise TypeError(f"{event_type} requires integer index and string text")
@@ -447,6 +453,7 @@ class EventRecorder:
         event = new_event(event_type, **_jsonable(data))
         event["session"] = self.session
         event["seq"] = self.seq
+        event["elapsedMs"] = (time.monotonic() - self.started_at) * 1000
         self.seq += 1
         bus.publish(event)
         return event
@@ -642,6 +649,16 @@ class EventRecorder:
             self.result_stop_reason = stop_reason
         self.event("model/response", **data)
 
+    def model_error(self, exc: BaseException, *, request_id: str) -> None:
+        """Record one failed inference boundary without turning it into Context.
+
+        Args:
+            exc: Failure propagated by the inference adapter.
+            request_id: Owning model request.
+        """
+        self.event("model/error", requestId=request_id,
+                   error={"type": type(exc).__name__, "message": str(exc)})
+
     def tool_start(self, call_id: str, name: str, arguments) -> None:
         """Record the start of a local tool invocation.
 
@@ -797,21 +814,23 @@ class EventBus:
     """Loop-affine, non-blocking fan-out that never drops compact events."""
 
     def __init__(self):
-        self._sinks: list[asyncio.Queue[dict]] = []
+        self._sinks: list[tuple[asyncio.Queue[dict], bool]] = []
         self._tasks: list[asyncio.Task] = []
 
     @property
     def enabled(self) -> bool:
         return bool(self._sinks)
 
-    def add(self, consume) -> None:
+    def add(self, consume, *, lossless: bool = False) -> None:
         """Register one asynchronous event consumer.
 
         Args:
             consume: Coroutine function accepting one event envelope.
+            lossless: Retain model deltas even when this consumer falls behind.
+                Intended for explicitly requested raw recording.
         """
         queue: asyncio.Queue[dict] = asyncio.Queue()
-        self._sinks.append(queue)
+        self._sinks.append((queue, lossless))
         self._tasks.append(asyncio.create_task(self._drain(consume, queue)))
 
     async def _drain(self, consume, queue) -> None:
@@ -821,6 +840,8 @@ class EventBus:
                 await consume(event)
             except Exception as exc:
                 _log(f"sink consume failed: {type(exc).__name__}: {exc}")
+            finally:
+                queue.task_done()
 
     def publish(self, event: dict) -> None:
         """Enqueue one event for every sink without blocking the producer.
@@ -828,8 +849,20 @@ class EventBus:
         Args:
             event: Canonical event envelope.
         """
-        for queue in self._sinks:
-            _put_event(queue, event)
+        for queue, lossless in self._sinks:
+            if lossless:
+                queue.put_nowait(event)
+            else:
+                _put_event(queue, event)
+
+    async def flush(self) -> None:
+        """Wait for queued consumer attempts before reading logs or shutting down.
+
+        Producers must stop publishing for a finite drain. Sink errors retain their
+        normal isolation; completion does not acknowledge remote WS/OTel delivery.
+        Call before ``shutdown``, while every registered consumer is still running.
+        """
+        await asyncio.gather(*(queue.join() for queue, _ in self._sinks))
 
     def shutdown(self) -> None:
         """Cancel every sink worker."""

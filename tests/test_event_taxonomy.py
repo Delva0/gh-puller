@@ -18,13 +18,13 @@ from gh_puller.agent.events import (
     EVENT_TYPES,
     EventBus,
     EventRecorder,
-    _normalize_usage,
     fold_state,
     function_call_item,
     function_output_item,
     is_compact_event,
     is_event_type,
     new_event,
+    normalize_usage,
     reasoning_item,
     set_active_bus,
     text_message,
@@ -44,6 +44,7 @@ def test_event_families_keep_state_and_activity_independent() -> None:
         "context/append/user",
         "context/append/assistant",
         "context/append/tool",
+        "model/error",
     } <= EVENT_TYPES
     assert is_event_type("agent/set/mode")
     assert is_event_type("agent/set/model")
@@ -130,9 +131,9 @@ def test_model_response_enforces_one_inference_order() -> None:
         )
 
 
-def test_usage_normalization_omits_empty_reports_and_maps_codex_fields() -> None:
-    assert _normalize_usage({"input_tokens": 0, "output_tokens": 0}) is None
-    assert _normalize_usage({
+def test_usage_normalization_preserves_zero_and_maps_codex_fields() -> None:
+    assert normalize_usage({"input_tokens": 0, "output_tokens": 0}) == {"input": 0, "output": 0}
+    assert normalize_usage({
         "input_tokens": 20,
         "output_tokens": 5,
         "cached_input_tokens": 12,
@@ -221,6 +222,8 @@ def test_payload_and_correlation_validation() -> None:
         new_event("context/append/user", items="text")
     with pytest.raises(ValueError, match="requestId"):
         new_event("model/request")
+    with pytest.raises(TypeError, match="model/error requires error"):
+        new_event("model/error", requestId="r1")
     with pytest.raises(ValueError, match="callId"):
         new_event("tool/start", name="x", arguments={})
     with pytest.raises(TypeError, match="message requires role"):

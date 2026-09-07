@@ -61,6 +61,10 @@ function eventSummary(event: EventEnvelope, request?: ModelActivity): string {
   if (event.type === 'model/response') {
     return [data.stopReason, itemsPreview(data)].filter(Boolean).map(String).join(' · ');
   }
+  if (event.type === 'model/error') {
+    const error = data.error as { message?: unknown } | undefined;
+    return String(error?.message ?? data.requestId ?? '');
+  }
   if (event.type === 'tool/start') return `${String(data.name ?? '')} · ${String(data.callId ?? '')}`;
   if (event.type === 'tool/end') {
     return `${String(data.callId ?? '')} · ${data.error === undefined ? 'completed' : 'error'}`;
@@ -69,11 +73,11 @@ function eventSummary(event: EventEnvelope, request?: ModelActivity): string {
 }
 
 function tone(type: string): string {
+  if (type.endsWith('/error') || type === 'session/error') return 'border-l-red-400';
   if (type.startsWith('agent/')) return 'border-l-violet-400';
   if (type.startsWith('context/')) return 'border-l-emerald-400';
   if (type.startsWith('model/')) return 'border-l-blue-400';
   if (type.startsWith('tool/')) return 'border-l-amber-400';
-  if (type.endsWith('/error') || type === 'session/error') return 'border-l-red-400';
   return 'border-l-[var(--border-color)]';
 }
 

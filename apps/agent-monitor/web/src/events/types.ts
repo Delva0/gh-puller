@@ -39,6 +39,7 @@ export interface Usage {
 export interface EventEnvelope {
   seq: number
   ts: number
+  elapsedMs?: number
   session: string
   type: string
   data: Record<string, unknown>
@@ -50,6 +51,7 @@ export interface ModelActivity {
   request: Record<string, unknown>
   stateAtRequest: CanonicalState
   responseSeq?: number
+  error?: unknown
   text: string
   reasoning: string
   deltaCount: number
