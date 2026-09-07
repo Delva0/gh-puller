@@ -91,6 +91,20 @@ def _pull_source(repository: Path, number: int) -> CommitFetchSource:
     )
 
 
+def _repository_source(
+    repository: Path,
+    number: int,
+    branch: str,
+) -> CommitFetchSource:
+    return CommitFetchSource(
+        "repository-ref",
+        str(repository),
+        f"refs/heads/{branch}",
+        "contributor/widgets",
+        number,
+    )
+
+
 def _pull_fetch_sizes(
     commands: Sequence[Sequence[str]],
     repository: Path | None = None,
@@ -512,6 +526,213 @@ async def test_batched_source_fetch_matches_serial_source_attribution(
     assert {middle, second_head} <= set(
         _stored_git(batched_path, "rev-list", "--all").splitlines(),
     )
+
+
+@pytest.mark.asyncio
+async def test_equal_repository_tip_reuses_pull_ref_without_fetching_pack(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    _, head = _source_repository(source, 1)
+    _git(source, "branch", "feature", head)
+    missing = "f" * 40
+    routes = {
+        missing: (
+            _pull_source(source, 7),
+            _repository_source(source, 7, "feature"),
+        ),
+    }
+    real_command = git_store_module._command
+    commands: list[Sequence[str]] = []
+
+    async def record(command: Sequence[str], **kwargs: Any) -> str:
+        commands.append(command)
+        return await real_command(command, **kwargs)
+
+    monkeypatch.setattr(git_store_module, "_command", record)
+    retained = await GitObjectStore(
+        tmp_path / "facts.sqlite3.git",
+        "acme/widgets",
+        str(source),
+    ).retain_commits((missing,), sources=routes)
+
+    attempt = next(
+        item
+        for item in retained[missing]["attempts"]
+        if item["kind"] == "repository-ref"
+    )
+    assert retained[missing]["status"] == "unavailable"
+    assert attempt["outcome"] == "unavailable"
+    assert attempt["preflight"]["advertised_sha"] == head
+    assert attempt["preflight"]["equivalent_source"] == {
+        "kind": "pull-ref",
+        "ref": "refs/pull/7/head",
+        "resource_number": 7,
+    }
+    assert any(len(command) > 3 and command[3] == "ls-remote" for command in commands)
+    assert not any(
+        _is_fetch(command)
+        and any("+refs/heads/feature:" in argument for argument in command)
+        for command in commands
+    )
+
+    baseline_commands: list[Sequence[str]] = []
+
+    async def force_full_fetch(command: Sequence[str], **kwargs: Any) -> str:
+        baseline_commands.append(command)
+        if (
+            len(command) > 3
+            and command[3] == "ls-remote"
+            and "refs/heads/feature" in command
+        ):
+            raise GitStoreError("git ls-remote failed: forced inconclusive preflight")
+        return await real_command(command, **kwargs)
+
+    monkeypatch.setattr(git_store_module, "_command", force_full_fetch)
+    baseline = await GitObjectStore(
+        tmp_path / "baseline.git",
+        "acme/widgets",
+        str(source),
+    ).retain_commits((missing,), sources=routes)
+
+    for key in ("sha", "status", "reason", "verification"):
+        assert retained[missing][key] == baseline[missing][key]
+    assert any(
+        _is_fetch(command)
+        and any("+refs/heads/feature:" in argument for argument in command)
+        for command in baseline_commands
+    )
+
+
+@pytest.mark.asyncio
+async def test_changed_repository_tip_is_fetched_and_can_supply_commit(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    _, head = _source_repository(source, 1)
+    _git(source, "checkout", "--quiet", "--detach", head)
+    (source / "later.txt").write_text("later\n")
+    _git(source, "add", "later.txt")
+    _git(source, "commit", "--quiet", "-m", "later fork commit")
+    later = _git(source, "rev-parse", "HEAD")
+    _git(source, "branch", "feature", later)
+    routes = {
+        later: (
+            _pull_source(source, 7),
+            _repository_source(source, 7, "feature"),
+        ),
+    }
+    real_command = git_store_module._command
+    commands: list[Sequence[str]] = []
+
+    async def record(command: Sequence[str], **kwargs: Any) -> str:
+        commands.append(command)
+        return await real_command(command, **kwargs)
+
+    monkeypatch.setattr(git_store_module, "_command", record)
+    retained = await GitObjectStore(
+        tmp_path / "facts.sqlite3.git",
+        "acme/widgets",
+        str(source),
+    ).retain_commits((later,), sources=routes)
+
+    attempt = retained[later]["attempts"][-1]
+    assert retained[later]["status"] == "available"
+    assert retained[later]["obtained"] == "repository-ref"
+    assert attempt["kind"] == "repository-ref"
+    assert attempt["preflight"]["advertised_sha"] == later
+    assert "equivalent_source" not in attempt["preflight"]
+    assert any(
+        _is_fetch(command)
+        and any("+refs/heads/feature:" in argument for argument in command)
+        for command in commands
+    )
+
+
+@pytest.mark.asyncio
+async def test_missing_repository_ref_is_recorded_without_fetching_pack(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    _source_repository(source, 1)
+    missing = "f" * 40
+    repository_source = _repository_source(source, 7, "deleted")
+    real_command = git_store_module._command
+    commands: list[Sequence[str]] = []
+
+    async def record(command: Sequence[str], **kwargs: Any) -> str:
+        commands.append(command)
+        return await real_command(command, **kwargs)
+
+    monkeypatch.setattr(git_store_module, "_command", record)
+    retained = await GitObjectStore(
+        tmp_path / "facts.sqlite3.git",
+        "acme/widgets",
+        str(source),
+    ).retain_commits((missing,), sources={missing: (repository_source,)})
+
+    attempt = next(
+        item
+        for item in retained[missing]["attempts"]
+        if item["kind"] == "repository-ref"
+    )
+    assert retained[missing]["status"] == "unavailable"
+    assert attempt["preflight"]["outcome"] == "absent"
+    assert "found no advertised ref" in attempt["error"]
+    assert not any(
+        _is_fetch(command)
+        and any("+refs/heads/deleted:" in argument for argument in command)
+        for command in commands
+    )
+
+
+@pytest.mark.asyncio
+async def test_repository_ref_preflight_is_bounded_and_parallel(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    _, head = _source_repository(source, 1)
+    for branch in ("one", "two", "three"):
+        _git(source, "branch", branch, head)
+    store = GitObjectStore(
+        tmp_path / "facts.sqlite3.git",
+        "acme/widgets",
+        str(source),
+        ref_batch_size=2,
+    )
+    await store._prepare()
+    sources = tuple(
+        _repository_source(source, number, branch)
+        for number, branch in enumerate(("one", "two", "three"), start=1)
+    )
+    real_command = git_store_module._command
+    gate = asyncio.Event()
+    active = 0
+    peak = 0
+
+    async def measure(command: Sequence[str], **kwargs: Any) -> str:
+        nonlocal active, peak
+        if len(command) <= 3 or command[3] != "ls-remote":
+            return await real_command(command, **kwargs)
+        active += 1
+        peak = max(peak, active)
+        if active == 2:
+            gate.set()
+        await asyncio.wait_for(gate.wait(), timeout=1)
+        try:
+            return await real_command(command, **kwargs)
+        finally:
+            active -= 1
+
+    monkeypatch.setattr(git_store_module, "_command", measure)
+    observed = await store._observe_remote_refs(sources, heartbeat=None)
+
+    assert peak == 2
+    assert {item.sha for item in observed.values()} == {head}
 
 
 @pytest.mark.asyncio

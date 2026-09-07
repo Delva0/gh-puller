@@ -476,10 +476,13 @@ their separate relationships.
 
 Structured commit retention checks sources in a bounded order: the managed object
 store, provenance-backed PR or fork branch refs, then the managed upstream branches
-and tags. It does not guess unrelated repositories. Each attempted source records
-its repository, ref, real time window, outcome, and error when the ref is conclusively
-absent. Authentication and transport failures leave the task retryable instead of
-being published as object unavailability.
+and tags. Before transferring a fork branch, the writer observes its advertised tip
+with bounded parallelism. A missing branch needs no pack transfer; a tip identical to
+the already fetched PR ref reuses that content-addressed history; a different tip is
+fetched normally. It does not guess unrelated repositories. Each attempted source
+records its repository, ref, real time window, outcome, and error when the ref is
+conclusively absent. Authentication and transport failures fall back to the exact ref
+fetch and leave the task retryable instead of being published as object unavailability.
 
 A schema-two `commit-object` fact separates four claims:
 

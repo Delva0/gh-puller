@@ -112,6 +112,14 @@ type _SourceGroup = tuple[CommitFetchSource, tuple[str, ...]]
 type _SourceBatch = tuple[_SourceGroup, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class _RemoteRefObservation:
+    observed_from: str
+    observed_until: str
+    sha: str | None
+    error: str | None = None
+
+
 class GitObjectStore:
     """管理一个仓库专属的 bare Git 对象库。
 
@@ -227,11 +235,15 @@ class GitObjectStore:
                 source_staging_ref(_source_identity(source))
                 for source, _ in source_groups
             }
-            for planned in _source_batches(
+            batches = _source_batches(
                 source_groups,
                 pending,
                 self._ref_batch_size,
-            ):
+            )
+            repository_observations: dict[CommitFetchSource, _RemoteRefObservation] = {}
+            pull_tips: dict[int, tuple[str, str]] = {}
+            repository_observed = False
+            for planned in batches:
                 batch = tuple(
                     (source, targets)
                     for source, targets in planned
@@ -239,27 +251,57 @@ class GitObjectStore:
                 )
                 if not batch:
                     continue
+                if batch[0][0].kind == "repository-ref" and not repository_observed:
+                    repository_sources = tuple(
+                        source
+                        for source, targets in source_groups
+                        if source.kind == "repository-ref"
+                        and any(sha in pending for sha in targets)
+                    )
+                    repository_observations = await self._observe_remote_refs(
+                        repository_sources,
+                        heartbeat=heartbeat,
+                    )
+                    pull_tips = await self._pull_source_tips(source_groups)
+                    repository_observed = True
                 observed_from = self._time()
-                errors = await self._fetch_sources(
-                    tuple(source for source, _ in batch),
-                    refetch=any(
-                        verification.get(sha) is not None
-                        for _, targets in batch
-                        for sha in targets
-                        if sha in pending
-                    ),
-                    heartbeat=heartbeat,
-                    retry=retry,
-                )
+                errors: dict[CommitFetchSource, str | None] = {}
+                evidence_refs: dict[CommitFetchSource, str] = {}
+                fetch_sources: list[CommitFetchSource] = []
+                for source, _ in batch:
+                    observation = repository_observations.get(source)
+                    equivalent = _equivalent_pull_ref(source, observation, pull_tips)
+                    if observation is not None and observation.error is None and observation.sha is None:
+                        errors[source] = f"git ls-remote found no advertised ref {source.remote_ref}"
+                    elif equivalent is not None:
+                        errors[source] = None
+                        evidence_refs[source] = equivalent
+                    else:
+                        fetch_sources.append(source)
+                if fetch_sources:
+                    errors |= await self._fetch_sources(
+                        tuple(fetch_sources),
+                        refetch=any(
+                            verification.get(sha) is not None
+                            for _, targets in batch
+                            for sha in targets
+                            if sha in pending
+                        ),
+                        heartbeat=heartbeat,
+                        retry=retry,
+                    )
                 for source, targets in batch:
                     active = tuple(sha for sha in targets if sha in pending)
                     if not active:
                         continue
                     error = errors[source]
                     candidates = active
-                    if error is None and len(batch) > 1:
+                    if error is None and (len(fetch_sources) > 1 or source in evidence_refs):
                         candidates = await self._reachable_commits(
-                            source_staging_ref(_source_identity(source)),
+                            evidence_refs.get(
+                                source,
+                                source_staging_ref(_source_identity(source)),
+                            ),
                             active,
                         )
                     checked = (
@@ -268,6 +310,7 @@ class GitObjectStore:
                         else await self._reconstruction(candidates, heartbeat)
                     )
                     observed_until = self._time()
+                    observation = repository_observations.get(source)
                     for sha in active:
                         state = checked.get(sha)
                         outcome = _reconstruction_outcome(state)
@@ -281,6 +324,10 @@ class GitObjectStore:
                                 outcome,
                                 error or _verification_error(state),
                                 source.resource_number,
+                                _preflight_record(
+                                    observation,
+                                    source.resource_number if source in evidence_refs else None,
+                                ),
                             ),
                         )
                         if state is not None:
@@ -607,6 +654,68 @@ class GitObjectStore:
             heartbeat=heartbeat,
             retry=retry,
         )
+
+    async def _observe_remote_refs(
+        self,
+        sources: tuple[CommitFetchSource, ...],
+        *,
+        heartbeat: Callable[[], None] | None,
+    ) -> dict[CommitFetchSource, _RemoteRefObservation]:
+        semaphore = asyncio.Semaphore(self._ref_batch_size)
+
+        async def observe(source: CommitFetchSource) -> tuple[CommitFetchSource, _RemoteRefObservation]:
+            async with semaphore:
+                observed_from = self._time()
+                try:
+                    output = await self._git(
+                        "ls-remote",
+                        source.remote_url,
+                        source.remote_ref,
+                        heartbeat=heartbeat,
+                        retry_transient=False,
+                    )
+                    sha = _remote_ref_sha(output, source.remote_ref)
+                except GitStoreError as exc:
+                    return source, _RemoteRefObservation(
+                        observed_from,
+                        self._time(),
+                        None,
+                        str(exc),
+                    )
+                return source, _RemoteRefObservation(
+                    observed_from,
+                    self._time(),
+                    sha,
+                )
+
+        return dict(await asyncio.gather(*(observe(source) for source in sources)))
+
+    async def _pull_source_tips(
+        self,
+        groups: Sequence[_SourceGroup],
+    ) -> dict[int, tuple[str, str]]:
+        sources = {
+            source_staging_ref(_source_identity(source)): source
+            for source, _ in groups
+            if source.kind == "pull-ref" and source.resource_number is not None
+        }
+        if not sources:
+            return {}
+        output = await self._git(
+            "for-each-ref",
+            "--format=%(refname)%09%(objectname)",
+            "refs/github-archive/staging/sources",
+        )
+        result: dict[int, tuple[str, str]] = {}
+        for line in output.splitlines():
+            ref, separator, sha = line.partition("\t")
+            source = sources.get(ref)
+            if not separator or source is None or _SHA.fullmatch(sha) is None:
+                continue
+            number = source.resource_number
+            if number is not None:
+                result[number] = (sha, ref)
+        return result
 
     async def _fetch_source_batch(
         self,
@@ -1083,6 +1192,7 @@ def _source_batches(
         if current and (
             len(current) >= limit
             or source.remote_url != remote_url
+            or source.kind != current[0][0].kind
             or not targets.isdisjoint(active)
         ):
             batches.append(tuple(current))
@@ -1107,6 +1217,57 @@ def _source_identity(source: CommitFetchSource) -> str:
     )
 
 
+def _remote_ref_sha(output: str, expected_ref: str) -> str | None:
+    if not output:
+        return None
+    matches = []
+    for line in output.splitlines():
+        sha, separator, ref = line.partition("\t")
+        if not separator or ref != expected_ref or _SHA.fullmatch(sha) is None:
+            raise GitStoreError(f"git ls-remote returned an invalid ref for {expected_ref}")
+        matches.append(sha)
+    if len(matches) != 1:
+        raise GitStoreError(f"git ls-remote returned ambiguous refs for {expected_ref}")
+    return matches[0]
+
+
+def _equivalent_pull_ref(
+    source: CommitFetchSource,
+    observation: _RemoteRefObservation | None,
+    pull_tips: Mapping[int, tuple[str, str]],
+) -> str | None:
+    if observation is None or observation.error is not None or observation.sha is None:
+        return None
+    tip = pull_tips.get(source.resource_number or 0)
+    return tip[1] if tip is not None and tip[0] == observation.sha else None
+
+
+def _preflight_record(
+    observation: _RemoteRefObservation | None,
+    equivalent_pull: int | None,
+) -> dict[str, Any] | None:
+    if observation is None:
+        return None
+    outcome = "inconclusive" if observation.error is not None else "absent"
+    result: dict[str, Any] = {
+        "method": "git-ls-remote-tip-v1",
+        "observed_from": observation.observed_from,
+        "observed_until": observation.observed_until,
+        "outcome": "advertised" if observation.sha is not None else outcome,
+    }
+    if observation.sha is not None:
+        result["advertised_sha"] = observation.sha
+    if observation.error is not None:
+        result["error"] = observation.error
+    if equivalent_pull is not None:
+        result["equivalent_source"] = {
+            "kind": "pull-ref",
+            "ref": f"refs/pull/{equivalent_pull}/head",
+            "resource_number": equivalent_pull,
+        }
+    return result
+
+
 def _attempt(
     kind: str,
     repository: str,
@@ -1116,6 +1277,7 @@ def _attempt(
     outcome: str,
     error: str | None = None,
     resource_number: int | None = None,
+    preflight: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     result: dict[str, Any] = {
         "kind": kind,
@@ -1129,6 +1291,8 @@ def _attempt(
         result["resource_number"] = resource_number
     if error is not None:
         result["error"] = error
+    if preflight is not None:
+        result["preflight"] = preflight
     return result
 
 
