@@ -298,3 +298,65 @@ def test_managed_writers_accept_database_or_short_identity(tmp_path: Path) -> No
 
     assert monitor._managed_writers(units, database)[0].database == database.resolve()
     assert monitor._managed_writers(units, writer_id=writer.identity[:12])[0] == writer
+
+
+def test_watch_cache_invalidates_with_database_or_wal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = tmp_path / "facts.sqlite3"
+    database.write_bytes(b"database")
+    calls = 0
+
+    def archive_state(path: Path) -> tuple[monitor.ArchiveState | None, str | None]:
+        nonlocal calls
+        assert path == database
+        calls += 1
+        return None, None
+
+    monkeypatch.setattr(monitor, "_archive_state", archive_state)
+    cache: dict[Path, monitor._ArchiveCacheEntry] = {}
+
+    monitor._cached_archive_state(database, cache)
+    monitor._cached_archive_state(database, cache)
+    database.write_bytes(b"changed database")
+    monitor._cached_archive_state(database, cache)
+    Path(f"{database}-wal").write_bytes(b"wal")
+    monitor._cached_archive_state(database, cache)
+
+    assert calls == 3
+
+
+def test_watch_renders_once_and_stops_cleanly(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    status = _status(tmp_path / "facts.sqlite3")
+    caches: list[dict[Path, monitor._ArchiveCacheEntry] | None] = []
+
+    def collect(
+        writers: object,
+        systemctl: str,
+        journalctl: str,
+        cache: dict[Path, monitor._ArchiveCacheEntry] | None = None,
+    ) -> list[monitor.WriterStatus]:
+        assert writers == [status.writer]
+        assert (systemctl, journalctl) == ("systemctl", "journalctl")
+        caches.append(cache)
+        return [status]
+
+    def interrupt(_: float) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(monitor, "_collect", collect)
+    monkeypatch.setattr(monitor.time, "sleep", interrupt)
+
+    result = monitor._watch([status.writer], "systemctl", "journalctl", 2.0, True)
+
+    output = capsys.readouterr().out
+    assert result == 0
+    assert "Every 2.0s: gh-puller status " in output
+    assert status.writer.identity[:12] in output
+    assert f"DATABASE    {status.writer.database}" in output
+    assert len(caches) == 1 and caches[0] == {}

@@ -18,6 +18,7 @@ Usage:
   github-puller-daemon.sh stop DATABASE
   github-puller-daemon.sh restart DATABASE
   github-puller-daemon.sh status [DATABASE|WRITER]
+  github-puller-daemon.sh watch [-n SECONDS] [DATABASE|WRITER]
   github-puller-daemon.sh logs DATABASE
   github-puller-daemon.sh render OWNER/REPO DATABASE [PULLER_OPTIONS...]
 
@@ -323,6 +324,22 @@ monitor_status() {
     exec "$uv" --directory "$PROJECT_ROOT" run --frozen -m gh_puller.github.monitor "${arguments[@]}"
 }
 
+monitor_selection() {
+    local action="$1"
+    local selector="$2"
+    shift 2
+    if [[ -z "$selector" ]]; then
+        monitor_status "$@"
+    fi
+    if [[ "$selector" =~ ^[0-9a-f]{12}$ ]]; then
+        monitor_status "$@" --writer-id "$selector"
+    fi
+    local destination
+    destination="$(absolute_destination "$selector")"
+    resolve_managed_unit "$action" "$selector" "$destination" >/dev/null
+    monitor_status "$@" --database "$destination"
+}
+
 action="${1:-}"
 if [[ -z "$action" || "$action" == "-h" || "$action" == "--help" ]]; then
     usage
@@ -436,15 +453,34 @@ case "$action" in
         ;;
     status)
         [[ $# -le 2 ]] || fail "status accepts at most one DATABASE or WRITER"
-        if [[ $# -eq 1 ]]; then
-            monitor_status
-        fi
-        if [[ "$2" =~ ^[0-9a-f]{12}$ ]]; then
-            monitor_status --writer-id "$2"
-        fi
-        destination="$(absolute_destination "$2")"
-        resolve_managed_unit status "$2" "$destination" >/dev/null
-        monitor_status --database "$destination"
+        monitor_selection status "${2:-}"
+        ;;
+    watch)
+        shift
+        interval=2
+        selector=""
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                -n|--interval)
+                    [[ $# -ge 2 ]] || fail "$1 requires SECONDS"
+                    interval="$2"
+                    shift 2
+                    ;;
+                --interval=*)
+                    interval="${1#*=}"
+                    shift
+                    ;;
+                -*)
+                    fail "unknown watch option: $1"
+                    ;;
+                *)
+                    [[ -z "$selector" ]] || fail "watch accepts at most one DATABASE or WRITER"
+                    selector="$1"
+                    shift
+                    ;;
+            esac
+        done
+        monitor_selection watch "$selector" --watch --interval "$interval"
         ;;
     logs)
         [[ $# -eq 2 ]] || fail "logs accepts only DATABASE"

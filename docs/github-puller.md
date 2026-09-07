@@ -614,12 +614,15 @@ List writers in a narrow table, then inspect one database or writer ID in detail
 scripts/github-puller-daemon.sh status
 scripts/github-puller-daemon.sh status archives/vllm.sqlite3
 scripts/github-puller-daemon.sh status 0123456789ab
+scripts/github-puller-daemon.sh watch archives/vllm.sqlite3
+scripts/github-puller-daemon.sh watch -n 5 0123456789ab
 scripts/github-puller-daemon.sh logs archives/vllm.sqlite3
 ```
 
 The detail view combines systemd and journald with read-only SQLite state. Its quota
 values are the latest response headers already observed by the writer; status makes
-no GitHub request. `core_aux` is local bookkeeping for reaction and requested-reviewer
+no GitHub request. `watch` keeps one monitor process alive and reuses archive statistics
+until the database or its WAL changes. `core_aux` is local bookkeeping for reaction and requested-reviewer
 REST routes whose observed headers use a different effective window; it is not a
 promised extra GitHub quota pool. Durable discovery, maintenance, task, fact,
 checkpoint, and last-error state remains visible even when no process is running.

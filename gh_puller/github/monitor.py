@@ -14,6 +14,7 @@ import re
 import sqlite3
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime, tzinfo
 from pathlib import Path
@@ -31,6 +32,9 @@ _JOURNAL_LINES = 512
 _RECENT_TASK_SAMPLE = 2_048
 _WEEKDAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 _OVERVIEW_WIDTHS = (12, 4, 16, 14, 9, 11, 7)
+
+type _FileVersion = tuple[int, int, int, int] | None
+type _ArchiveVersion = tuple[_FileVersion, _FileVersion]
 
 
 @dataclass(frozen=True, slots=True)
@@ -132,11 +136,38 @@ class WriterStatus:
     archive_error: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class _ArchiveCacheEntry:
+    """Archive state associated with an unchanged database and WAL."""
+
+    version: _ArchiveVersion
+    state: ArchiveState | None
+    error: str | None
+
+
+def _watch_interval(value: str) -> float:
+    try:
+        interval = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a number") from exc
+    if interval < 0.1:
+        raise argparse.ArgumentTypeError("must be at least 0.1 seconds")
+    return interval
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="uv run -m gh_puller.github.monitor")
     parser.add_argument("--systemd-dir", type=Path, required=True)
     parser.add_argument("--systemctl", required=True)
     parser.add_argument("--journalctl", required=True)
+    parser.add_argument("--watch", action="store_true")
+    parser.add_argument(
+        "-n",
+        "--interval",
+        type=_watch_interval,
+        default=2.0,
+        metavar="SECONDS",
+    )
     selector = parser.add_mutually_exclusive_group()
     selector.add_argument("--database", type=Path)
     selector.add_argument("--writer-id")
@@ -187,10 +218,11 @@ def _collect(
     writers: Sequence[ManagedWriter],
     systemctl: str,
     journalctl: str,
+    archive_cache: dict[Path, _ArchiveCacheEntry] | None = None,
 ) -> list[WriterStatus]:
     statuses = []
     for writer in writers:
-        archive, error = _archive_state(writer.database)
+        archive, error = _cached_archive_state(writer.database, archive_cache)
         statuses.append(
             WriterStatus(
                 writer,
@@ -212,6 +244,36 @@ def _collect(
             ),
         )
     return statuses
+
+
+def _cached_archive_state(
+    path: Path,
+    cache: dict[Path, _ArchiveCacheEntry] | None,
+) -> tuple[ArchiveState | None, str | None]:
+    if cache is None:
+        return _archive_state(path)
+    version = _archive_version(path)
+    cached = cache.get(path)
+    if cached is not None and cached.version == version:
+        return cached.state, cached.error
+    state, error = _archive_state(path)
+    if error is None and version == _archive_version(path):
+        cache[path] = _ArchiveCacheEntry(version, state, error)
+    else:
+        cache.pop(path, None)
+    return state, error
+
+
+def _archive_version(path: Path) -> _ArchiveVersion:
+    return _file_version(path), _file_version(Path(f"{path}-wal"))
+
+
+def _file_version(path: Path) -> _FileVersion:
+    try:
+        value = path.stat()
+    except FileNotFoundError:
+        return None
+    return value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns
 
 
 def _service_state(systemctl: str, unit: str) -> ServiceState:
@@ -871,6 +933,37 @@ def _quotas(value: object) -> tuple[RateQuota, ...]:
     return tuple(result)
 
 
+def _watch(
+    writers: Sequence[ManagedWriter],
+    systemctl: str,
+    journalctl: str,
+    interval: float,
+    selected: bool,
+) -> int:
+    cache: dict[Path, _ArchiveCacheEntry] = {}
+    deadline = time.monotonic()
+    label = f" {writers[0].identity[:12]}" if selected else ""
+    try:
+        while True:
+            statuses = _collect(writers, systemctl, journalctl, cache)
+            content = _render_detail(statuses[0]) if selected else _render_table(statuses)
+            observed_at = datetime.now().astimezone()
+            header = (
+                f"Every {interval:.1f}s: gh-puller status{label}  "
+                f"{os.uname().nodename}: {observed_at:%a %Y-%m-%d %H:%M:%S %Z}"
+            )
+            prefix = "\x1b[H\x1b[2J" if sys.stdout.isatty() else ""
+            print(f"{prefix}{header}\n\n{content}", flush=True)
+            deadline += interval
+            delay = deadline - time.monotonic()
+            if delay <= 0:
+                deadline = time.monotonic()
+                continue
+            time.sleep(delay)
+    except KeyboardInterrupt:
+        return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Render one or every managed database writer.
 
@@ -888,6 +981,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         selector = f"ID: {args.writer_id}" if args.writer_id else f"database: {database}"
         print(f"No managed writer for {selector}", file=sys.stderr)
         return 2
+    if args.watch:
+        return _watch(writers, args.systemctl, args.journalctl, args.interval, selected)
     statuses = _collect(writers, args.systemctl, args.journalctl)
     print(_render_detail(statuses[0]) if selected else _render_table(statuses))
     return 0

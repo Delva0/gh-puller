@@ -480,7 +480,39 @@ def test_status_accepts_displayed_writer_id(tmp_path: Path) -> None:
     assert calls[1] == f"--unit {unit.name} --output=cat --lines=512 --no-pager"
 
 
-@pytest.mark.parametrize("action", ["status", "start", "stop", "restart", "logs"])
+def test_watch_executes_one_persistent_monitor(tmp_path: Path) -> None:
+    environment, units, _ = _environment(tmp_path)
+    database = tmp_path / "facts.sqlite3"
+    _write_managed_unit(units, database)
+    uv_log = tmp_path / "uv.log"
+    uv = tmp_path / "uv"
+    uv.write_text(
+        "#!/usr/bin/env bash\n"
+        "printf '%s\\n' \"$*\" >\"$GH_PULLER_TEST_UV_LOG\"\n",
+    )
+    uv.chmod(0o755)
+    environment |= {
+        "GH_PULLER_TEST_UV_LOG": str(uv_log),
+        "GH_PULLER_UV_BIN": str(uv),
+    }
+
+    _run("watch", str(database), "-n", "3", environment=environment)
+
+    arguments = uv_log.read_text().split()
+    assert arguments[:6] == [
+        "--directory",
+        str(_ROOT),
+        "run",
+        "--frozen",
+        "-m",
+        "gh_puller.github.monitor",
+    ]
+    assert "--watch" in arguments
+    assert arguments[arguments.index("--interval") + 1] == "3"
+    assert arguments[arguments.index("--database") + 1] == str(database.resolve())
+
+
+@pytest.mark.parametrize("action", ["status", "watch", "start", "stop", "restart", "logs"])
 def test_control_action_rejects_repository_in_database_position(
     tmp_path: Path,
     action: str,
