@@ -257,6 +257,7 @@ class PersistentMCPTransport:
         self._messages: queue.Queue[object] = queue.Queue()
         self._pending: dict[int, dict] = {}
         self._stderr_tail: deque[str] = deque(maxlen=256)
+        self._request_lock = threading.RLock()
         self._closed = False
         self.process = subprocess.Popen(
             [str(binary)],
@@ -346,6 +347,10 @@ class PersistentMCPTransport:
         self._send({"jsonrpc": "2.0", "method": method, "params": params})
 
     def _request(self, method: str, params: dict, timeout: float | None = None) -> dict:
+        with self._request_lock:
+            return self._request_locked(method, params, timeout)
+
+    def _request_locked(self, method: str, params: dict, timeout: float | None = None) -> dict:
         self._next_id += 1
         request_id = self._next_id
         self._send(
@@ -441,41 +446,43 @@ class PersistentMCPTransport:
                 reader.join(timeout=2)
 
     def _terminate(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        if self.process.stdin is not None:
-            with suppress(OSError):
-                self.process.stdin.close()
-        if self.process.poll() is None:
-            self.process.terminate()
-            try:
-                self.process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                self.process.kill()
-                self.process.wait()
-        self._join_readers()
-        self.monitor.child_pid = None
+        with self._request_lock:
+            if self._closed:
+                return
+            self._closed = True
+            if self.process.stdin is not None:
+                with suppress(OSError):
+                    self.process.stdin.close()
+            if self.process.poll() is None:
+                self.process.terminate()
+                try:
+                    self.process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    self.process.kill()
+                    self.process.wait()
+            self._join_readers()
+            self.monitor.child_pid = None
 
     def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        if self.process.stdin is not None:
-            with suppress(OSError):
-                self.process.stdin.close()
-        try:
-            self.process.wait(timeout=30)
-        except subprocess.TimeoutExpired:
-            self.process.terminate()
+        with self._request_lock:
+            if self._closed:
+                return
+            self._closed = True
+            if self.process.stdin is not None:
+                with suppress(OSError):
+                    self.process.stdin.close()
             try:
-                self.process.wait(timeout=10)
+                self.process.wait(timeout=30)
             except subprocess.TimeoutExpired:
-                self.process.kill()
-                self.process.wait()
-        self._join_readers()
-        self.monitor.child_pid = None
-        self.monitor.sample()
+                self.process.terminate()
+                try:
+                    self.process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    self.process.kill()
+                    self.process.wait()
+            self._join_readers()
+            self.monitor.child_pid = None
+            self.monitor.sample()
 
 
 def make_transport(
