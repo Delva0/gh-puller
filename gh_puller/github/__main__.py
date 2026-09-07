@@ -86,7 +86,6 @@ def _add_sync_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("destination", type=Path, help="SQLite observation archive")
     _add_source_arguments(parser)
     parser.add_argument("--git-batch-size", type=_positive_int, default=8)
-    parser.add_argument("--git-ref-batch-size", type=_positive_int, default=16)
     parser.add_argument("--overlap-seconds", type=_positive_int, default=2)
     parser.add_argument("--no-progress", action="store_true", help="disable progress on stderr")
 
@@ -132,7 +131,6 @@ def _config(args: argparse.Namespace) -> GitHubSyncConfig:
         git_destination=args.git_destination,
         concurrency=args.concurrency,
         git_batch_size=args.git_batch_size,
-        git_ref_batch_size=args.git_ref_batch_size,
         request_timeout=args.request_timeout,
         overlap_seconds=args.overlap_seconds,
     )
