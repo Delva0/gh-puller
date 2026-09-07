@@ -1,5 +1,15 @@
+import math
+
+import pytest
+
 import gh_puller.codebase.archive as archive_module
-from gh_puller.codebase.archive import Archive, ArchiveWriter, RadixTree, TreeRef, graph_digest
+from gh_puller.codebase.archive import (
+    Archive,
+    ArchiveWriter,
+    RadixTree,
+    TreeRef,
+    graph_digest,
+)
 from gh_puller.codebase.store import GraphRows
 
 
@@ -162,7 +172,7 @@ def test_complete_archive_open_uses_footer_without_scanning(tmp_path, monkeypatc
     writer = ArchiveWriter(path)
     commit_rows(writer, "c1", [], GraphRows({"a": {"v": 1}}, {}))
     writer.finalize()
-    monkeypatch.setattr(archive_module, "_scan", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError))
+    monkeypatch.setattr(archive_module, "_scan_reader", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError))
     assert len(Archive(path)) == 1
 
 
@@ -172,7 +182,7 @@ def test_complete_archive_extension_uses_footer_and_verifies_only_append(tmp_pat
     old_root, _, _ = commit_rows(writer, "c1", [], GraphRows({"a": {"v": 1}}, {}))
     writer.finalize()
 
-    monkeypatch.setattr(archive_module, "_scan", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError))
+    monkeypatch.setattr(archive_module, "_scan_reader", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError))
     writer = ArchiveWriter(path, extend_complete=True)
     root = RadixTree(writer, "nodes").apply(old_root, {"a": {"v": 2}})
     writer.commit(
@@ -205,7 +215,7 @@ def test_incomplete_checkpoint_discards_partial_tail_without_scanning(tmp_path, 
     with path.open("ab") as file:
         file.write(b"partial next frame")
 
-    monkeypatch.setattr(archive_module, "_scan", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError))
+    monkeypatch.setattr(archive_module, "_scan_reader", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError))
     assert len(Archive(path, allow_incomplete=True)) == 1
     writer = ArchiveWriter(path)
     assert path.stat().st_size == durable_size
@@ -239,7 +249,7 @@ def test_interrupted_first_extension_recovers_embedded_footer_without_scanning(t
     with path.open("ab") as file:
         file.write(b"partial first extension page")
 
-    monkeypatch.setattr(archive_module, "_scan", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError))
+    monkeypatch.setattr(archive_module, "_scan_reader", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError))
     assert len(Archive(path, allow_incomplete=True)) == 1
     writer = ArchiveWriter(path)
     assert path.stat().st_size == durable_size
@@ -267,3 +277,114 @@ def test_full_verify_accepts_embedded_checkpoints_and_prior_footer(tmp_path):
     )
     writer.finalize()
     Archive(path).verify()
+
+
+def test_live_readers_capture_independent_durable_snapshots(tmp_path):
+    path = tmp_path / "archive.kga"
+    writer = ArchiveWriter(path)
+    root, _, _ = commit_rows(writer, "c1", [], GraphRows({"a": {"v": 1}}, {}))
+    first = Archive(path, allow_incomplete=True)
+
+    root = RadixTree(writer, "nodes").apply(root, {"b": {"v": 2}})
+    writer.commit(
+        {
+            "sha": "c2",
+            "parents": ["c1"],
+            "node_root": root.to_json(),
+            "edge_root": None,
+            "nodes": 2,
+            "edges": 0,
+            "graph_digest": graph_digest(root, None),
+        },
+    )
+    later = [Archive(path, allow_incomplete=True) for _ in range(4)]
+
+    assert first.commit_ids() == ("c1",)
+    assert first.load_rows().nodes == {"a": {"v": 1}}
+    assert all(reader.commit_ids() == ("c1", "c2") for reader in later)
+    assert all(reader.load_rows().nodes == {"a": {"v": 1}, "b": {"v": 2}} for reader in later)
+
+    first.close()
+    for reader in later:
+        reader.close()
+    writer.close_incomplete()
+
+
+def test_reader_uses_footer_offset_captured_before_extension_append(tmp_path, monkeypatch):
+    path = tmp_path / "archive.kga"
+    writer = ArchiveWriter(path)
+    commit_rows(writer, "c1", [], GraphRows({"a": {"v": 1}}, {}))
+    writer.finalize()
+    extension = ArchiveWriter(path, extend_complete=True)
+    original = archive_module._footer_offset
+    appended = False
+
+    def append_after_capture(reader):
+        nonlocal appended
+        offset = original(reader)
+        if offset is not None and not appended:
+            appended = True
+            extension.append(archive_module.PAGE, b'{"kind":"leaf"}')
+            extension._file.flush()
+        return offset
+
+    monkeypatch.setattr(archive_module, "_footer_offset", append_after_capture)
+    try:
+        with Archive(path, allow_incomplete=True) as archive:
+            assert archive.commit_ids() == ("c1",)
+    finally:
+        extension.close_incomplete()
+
+
+def test_archive_writer_is_exclusive(tmp_path):
+    path = tmp_path / "archive.kga"
+    writer = ArchiveWriter(path)
+    with pytest.raises(archive_module.ArchiveError, match="already has a writer"):
+        ArchiveWriter(path)
+    writer.close_incomplete()
+
+    resumed = ArchiveWriter(path)
+    resumed.close_incomplete()
+
+
+def test_reader_cache_budget_and_context_manager(tmp_path):
+    path = tmp_path / "archive.kga"
+    writer = ArchiveWriter(path)
+    commit_rows(writer, "c1", [], GraphRows({"a": {"v": 1}}, {}))
+    writer.finalize()
+
+    with Archive(path, cache_bytes=0) as archive:
+        assert archive.load_rows().nodes == {"a": {"v": 1}}
+        assert not archive._cache
+        reader = archive._reader
+    assert reader.fd == -1
+
+
+def test_native_page_decoder_preserves_rows_without_standard_json(tmp_path, monkeypatch):
+    path = tmp_path / "archive.kga"
+    writer = ArchiveWriter(path)
+    rows = GraphRows(
+        {"source": {"label": "Function", "properties": {"nested": [1, {"ok": True}]}}},
+        {("source", "target", None, None): {"properties": {"line": 3}}},
+    )
+    commit_rows(writer, "c1", [], rows)
+    writer.finalize()
+    archive = Archive(path)
+
+    monkeypatch.setattr(
+        archive_module.json,
+        "loads",
+        lambda _raw: (_ for _ in ()).throw(AssertionError("standard json decoder used")),
+    )
+    assert archive.load_rows() == rows
+    archive.close()
+
+
+def test_native_page_decoder_falls_back_for_nonfinite_json(tmp_path):
+    path = tmp_path / "archive.kga"
+    writer = ArchiveWriter(path)
+    commit_rows(writer, "c1", [], GraphRows({"a": {"value": math.nan}}, {}))
+    writer.finalize()
+
+    with Archive(path) as archive:
+        assert math.isnan(archive.load_rows().nodes["a"]["value"])

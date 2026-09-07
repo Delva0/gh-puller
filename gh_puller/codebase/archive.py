@@ -1,7 +1,13 @@
-"""Append-only archive with incrementally updated Merkle radix trees."""
+"""Store durable graph snapshots in append-only Merkle radix trees.
+
+One writer holds an advisory lock while independent readers capture immutable file
+prefixes. Commit checkpoints publish roots only after their referenced frames exist;
+readers therefore ignore an incomplete append tail without blocking the writer.
+"""
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import struct
@@ -11,13 +17,15 @@ from copy import deepcopy
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Self
+
+import msgspec
 
 from .graph import SnapshotGraph, snapshot_to_networkx
 from .store import GraphRows, rows_to_snapshot
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Iterator
+    from collections.abc import Iterable
 
     import networkx as nx
 
@@ -47,6 +55,13 @@ class ArchiveError(Exception):
 
 def _json_bytes(value) -> bytes:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+
+
+def _json_value(raw: bytes):
+    try:
+        return msgspec.json.decode(raw)
+    except msgspec.DecodeError:
+        return json.loads(raw)
 
 
 def _key_json(key):
@@ -91,25 +106,84 @@ class TreeRef:
         return None if value is None else cls(value["offset"], value["logical_hash"], value["count"])
 
 
-def _has_footer(path: Path) -> bool:
-    if not path.exists() or path.stat().st_size < len(MAGIC) + FOOTER.size:
-        return False
-    with path.open("rb") as file:
-        file.seek(-FOOTER.size, os.SEEK_END)
-        _, magic = FOOTER.unpack(file.read(FOOTER.size))
-    return magic == FOOTER_MAGIC
+class _PageRef(msgspec.Struct, frozen=True):
+    offset: int
+    logical_hash: str
+    count: int
 
 
-def _read_frame_at(path: Path, offset: int, expected_kind: int | None = None) -> tuple[FrameInfo, bytes]:
-    with path.open("rb") as file:
-        file.seek(offset)
-        header = file.read(FRAME.size)
-        if len(header) != FRAME.size:
-            raise ArchiveError(f"truncated frame header at {offset}")
-        kind, raw_len, compressed_len, crc, digest = FRAME.unpack(header)
-        if expected_kind is not None and kind != expected_kind:
-            raise ArchiveError(f"frame at {offset} has kind {kind}, expected {expected_kind}")
-        compressed = file.read(compressed_len)
+class _BranchPage(msgspec.Struct, tag="branch", tag_field="kind"):
+    tree: str
+    depth: int
+    children: list[tuple[str, _PageRef]]
+    logical_hash: str
+    count: int
+
+
+class _NodeLeafPage(msgspec.Struct, tag="leaf", tag_field="kind"):
+    tree: str
+    depth: int
+    entries: list[tuple[str, dict[str, Any]]]
+    logical_hash: str
+    count: int
+
+
+class _EdgeLeafPage(msgspec.Struct, tag="leaf", tag_field="kind"):
+    tree: str
+    depth: int
+    entries: list[tuple[tuple[str, str, str | None, str | None], dict[str, Any]]]
+    logical_hash: str
+    count: int
+
+
+_NODE_PAGE_DECODER = msgspec.json.Decoder(_BranchPage | _NodeLeafPage)
+_EDGE_PAGE_DECODER = msgspec.json.Decoder(_BranchPage | _EdgeLeafPage)
+
+
+class _ReadFile:
+    def __init__(self, path: Path):
+        self.path = path
+        self.fd = -1
+        self.fd = os.open(path, os.O_RDONLY)
+        self.size = os.fstat(self.fd).st_size
+
+    def read(self, offset: int, size: int) -> bytes:
+        return os.pread(self.fd, size, offset)
+
+    def close(self) -> None:
+        if self.fd >= 0:
+            os.close(self.fd)
+            self.fd = -1
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *_args) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        self.close()
+
+
+def _footer_offset(reader: _ReadFile) -> int | None:
+    if reader.size < len(MAGIC) + FOOTER.size:
+        return None
+    offset = reader.size - FOOTER.size
+    payload = reader.read(offset, FOOTER.size)
+    if len(payload) != FOOTER.size:
+        return None
+    _, magic = FOOTER.unpack(payload)
+    return offset if magic == FOOTER_MAGIC else None
+
+
+def _read_frame(reader: _ReadFile, offset: int, expected_kind: int | None = None) -> tuple[FrameInfo, bytes]:
+    header = reader.read(offset, FRAME.size)
+    if len(header) != FRAME.size:
+        raise ArchiveError(f"truncated frame header at {offset}")
+    kind, raw_len, compressed_len, crc, digest = FRAME.unpack(header)
+    if expected_kind is not None and kind != expected_kind:
+        raise ArchiveError(f"frame at {offset} has kind {kind}, expected {expected_kind}")
+    compressed = reader.read(offset + FRAME.size, compressed_len)
     if len(compressed) != compressed_len or zlib.crc32(compressed) != crc:
         raise ArchiveError(f"frame at {offset} is truncated or corrupt")
     try:
@@ -122,17 +196,22 @@ def _read_frame_at(path: Path, offset: int, expected_kind: int | None = None) ->
     return info, raw
 
 
-def _scan_frames(path: Path, start: int, limit: int, *, verify: bool) -> tuple[list[FrameInfo], int]:
+def _read_frame_at(path: Path, offset: int, expected_kind: int | None = None) -> tuple[FrameInfo, bytes]:
+    with _ReadFile(path) as reader:
+        return _read_frame(reader, offset, expected_kind)
+
+
+def _scan_frames_reader(reader: _ReadFile, start: int, limit: int, *, verify: bool) -> tuple[list[FrameInfo], int]:
     frames = []
-    with path.open("rb") as file:
+    with reader.path.open("rb") as file:
         offset = start
         while offset < limit:
             file.seek(offset)
             prefix = file.read(min(FRAME.size, limit - offset))
-            # Checkpoint trailers are deliberately retained between frames.  A
+            # Checkpoint trailers are deliberately retained between frames. A
             # checkpoint is tiny, belongs to the final archive, and lets an
             # interrupted writer recover from the tail instead of rescanning
-            # every historical page.  A footer can likewise be embedded when a
+            # every historical page. A footer can likewise be embedded when a
             # previously complete archive is extended.
             if len(prefix) >= CHECKPOINT.size and prefix[16:24] == CHECKPOINT_MAGIC:
                 offset += CHECKPOINT.size
@@ -142,8 +221,7 @@ def _scan_frames(path: Path, start: int, limit: int, *, verify: bool) -> tuple[l
                 continue
             if len(prefix) < FRAME.size:
                 break
-            header = prefix
-            kind, raw_len, compressed_len, crc, digest = FRAME.unpack(header)
+            kind, raw_len, compressed_len, crc, digest = FRAME.unpack(prefix)
             end = offset + FRAME.size + compressed_len
             if compressed_len <= 0 or end > limit:
                 break
@@ -161,120 +239,119 @@ def _scan_frames(path: Path, start: int, limit: int, *, verify: bool) -> tuple[l
     return frames, offset
 
 
-def _scan(path: Path, *, verify: bool) -> tuple[list[FrameInfo], int]:
-    size = path.stat().st_size
-    limit = size - FOOTER.size if _has_footer(path) else size
-    with path.open("rb") as file:
-        if file.read(len(MAGIC)) != MAGIC:
-            raise ArchiveError(f"{path} is not a supported archive")
-    return _scan_frames(path, len(MAGIC), limit, verify=verify)
+def _scan_frames(path: Path, start: int, limit: int, *, verify: bool) -> tuple[list[FrameInfo], int]:
+    with _ReadFile(path) as reader:
+        return _scan_frames_reader(reader, start, limit, verify=verify)
 
 
-def _read_final_index(path: Path, footer_offset: int | None = None) -> tuple[FrameInfo, dict]:
+def _scan_reader(reader: _ReadFile, *, verify: bool) -> tuple[list[FrameInfo], int]:
+    footer_offset = _footer_offset(reader)
+    limit = footer_offset if footer_offset is not None else reader.size
+    if reader.read(0, len(MAGIC)) != MAGIC:
+        raise ArchiveError(f"{reader.path} is not a supported archive")
+    return _scan_frames_reader(reader, len(MAGIC), limit, verify=verify)
+
+
+def _read_final_index_reader(reader: _ReadFile, footer_offset: int | None = None) -> tuple[FrameInfo, dict]:
     if footer_offset is None:
-        footer_offset = path.stat().st_size - FOOTER.size
-    with path.open("rb") as file:
-        file.seek(footer_offset)
-        payload = file.read(FOOTER.size)
+        footer_offset = reader.size - FOOTER.size
+    payload = reader.read(footer_offset, FOOTER.size)
     if len(payload) != FOOTER.size:
         raise ArchiveError(f"truncated footer at {footer_offset}")
     index_offset, magic = FOOTER.unpack(payload)
     if magic != FOOTER_MAGIC:
         raise ArchiveError(f"invalid footer at {footer_offset}")
-    frame, raw = _read_frame_at(path, index_offset, FINAL_INDEX)
-    index = json.loads(raw)
+    frame, raw = _read_frame(reader, index_offset, FINAL_INDEX)
+    index = _json_value(raw)
     if index.get("version") != FORMAT_VERSION or not isinstance(index.get("commits"), list):
         raise ArchiveError("invalid archive index")
     return frame, index
 
 
-def _read_checkpoint(path: Path, offset: int) -> tuple[int, int, dict]:
-    with path.open("rb") as file:
-        file.seek(offset)
-        payload = file.read(CHECKPOINT.size)
+def _read_final_index(path: Path, footer_offset: int | None = None) -> tuple[FrameInfo, dict]:
+    with _ReadFile(path) as reader:
+        return _read_final_index_reader(reader, footer_offset)
+
+
+def _read_checkpoint_reader(reader: _ReadFile, offset: int) -> tuple[int, int, dict]:
+    payload = reader.read(offset, CHECKPOINT.size)
     if len(payload) != CHECKPOINT.size:
         raise ArchiveError(f"truncated checkpoint at {offset}")
     commit_offset, previous_offset, magic = CHECKPOINT.unpack(payload)
     if magic != CHECKPOINT_MAGIC:
         raise ArchiveError(f"invalid checkpoint at {offset}")
-    frame, raw = _read_frame_at(path, commit_offset, COMMIT)
+    frame, raw = _read_frame(reader, commit_offset, COMMIT)
     if frame.end != offset:
         raise ArchiveError(f"checkpoint at {offset} is not adjacent to its commit")
-    manifest = json.loads(raw)
+    manifest = _json_value(raw)
     if not isinstance(manifest, dict) or not isinstance(manifest.get("sha"), str):
         raise ArchiveError(f"invalid commit manifest at {commit_offset}")
     return previous_offset, offset + CHECKPOINT.size, manifest
 
 
-def _find_last_checkpoint(path: Path, *, chunk_size: int = 1 << 20) -> int | None:
+def _find_last_checkpoint_reader(reader: _ReadFile, *, chunk_size: int = 1 << 20) -> int | None:
     """Find the newest valid checkpoint, normally by reading only the tail.
 
     A crash may leave partial page frames after the last committed checkpoint,
     so the trailer is not required to be exactly at EOF.  False magic matches
     inside compressed payloads are rejected by checking the referenced commit.
     """
-    size = path.stat().st_size
     overlap = len(CHECKPOINT_MAGIC) - 1
-    end = size
-    with path.open("rb") as file:
-        while end > len(MAGIC):
-            start = max(len(MAGIC), end - chunk_size)
-            file.seek(start)
-            block = file.read(end - start)
-            position = len(block)
-            while True:
-                found = block.rfind(CHECKPOINT_MAGIC, 0, position)
-                if found < 0:
-                    break
-                checkpoint_offset = start + found - (CHECKPOINT.size - len(CHECKPOINT_MAGIC))
-                if checkpoint_offset >= len(MAGIC):
-                    try:
-                        _read_checkpoint(path, checkpoint_offset)
-                    except (ArchiveError, json.JSONDecodeError, OSError):
-                        pass
-                    else:
-                        return checkpoint_offset
-                position = found
-            if start == len(MAGIC):
+    end = reader.size
+    while end > len(MAGIC):
+        start = max(len(MAGIC), end - chunk_size)
+        block = reader.read(start, end - start)
+        position = len(block)
+        while True:
+            found = block.rfind(CHECKPOINT_MAGIC, 0, position)
+            if found < 0:
                 break
-            end = start + overlap
+            checkpoint_offset = start + found - (CHECKPOINT.size - len(CHECKPOINT_MAGIC))
+            if checkpoint_offset >= len(MAGIC):
+                try:
+                    _read_checkpoint_reader(reader, checkpoint_offset)
+                except (ArchiveError, json.JSONDecodeError, OSError):
+                    pass
+                else:
+                    return checkpoint_offset
+            position = found
+        if start == len(MAGIC):
+            break
+        end = start + overlap
     return None
 
 
-def _find_last_footer(path: Path, *, chunk_size: int = 1 << 20) -> int | None:
+def _find_last_footer_reader(reader: _ReadFile, *, chunk_size: int = 1 << 20) -> int | None:
     """Find a valid embedded final-index footer before an interrupted tail."""
-    size = path.stat().st_size
     overlap = len(FOOTER_MAGIC) - 1
-    end = size
-    with path.open("rb") as file:
-        while end > len(MAGIC):
-            start = max(len(MAGIC), end - chunk_size)
-            file.seek(start)
-            block = file.read(end - start)
-            position = len(block)
-            while True:
-                found = block.rfind(FOOTER_MAGIC, 0, position)
-                if found < 0:
-                    break
-                footer_offset = start + found - (FOOTER.size - len(FOOTER_MAGIC))
-                if footer_offset >= len(MAGIC):
-                    try:
-                        frame, _ = _read_final_index(path, footer_offset)
-                    except (ArchiveError, json.JSONDecodeError, OSError):
-                        pass
-                    else:
-                        if frame.end == footer_offset:
-                            return footer_offset
-                position = found
-            if start == len(MAGIC):
+    end = reader.size
+    while end > len(MAGIC):
+        start = max(len(MAGIC), end - chunk_size)
+        block = reader.read(start, end - start)
+        position = len(block)
+        while True:
+            found = block.rfind(FOOTER_MAGIC, 0, position)
+            if found < 0:
                 break
-            end = start + overlap
+            footer_offset = start + found - (FOOTER.size - len(FOOTER_MAGIC))
+            if footer_offset >= len(MAGIC):
+                try:
+                    frame, _ = _read_final_index_reader(reader, footer_offset)
+                except (ArchiveError, json.JSONDecodeError, OSError):
+                    pass
+                else:
+                    if frame.end == footer_offset:
+                        return footer_offset
+            position = found
+        if start == len(MAGIC):
+            break
+        end = start + overlap
     return None
 
 
-def _load_checkpoint_chain(path: Path) -> tuple[list[dict], int, int] | None:
+def _load_checkpoint_chain_reader(reader: _ReadFile) -> tuple[list[dict], int, int] | None:
     """Return manifests, durable end, and latest checkpoint trailer offset."""
-    latest = _find_last_checkpoint(path)
+    latest = _find_last_checkpoint_reader(reader)
     if latest is None:
         return None
     manifests = []
@@ -285,14 +362,12 @@ def _load_checkpoint_chain(path: Path) -> tuple[list[dict], int, int] | None:
         if offset in seen:
             raise ArchiveError("checkpoint cycle detected")
         seen.add(offset)
-        with path.open("rb") as file:
-            file.seek(offset + 8)
-            marker = file.read(8)
+        marker = reader.read(offset + 8, 8)
         if marker == FOOTER_MAGIC:
-            _, index = _read_final_index(path, offset)
+            _, index = _read_final_index_reader(reader, offset)
             manifests = list(index["commits"]) + list(reversed(manifests))
             break
-        previous, checkpoint_end, manifest = _read_checkpoint(path, offset)
+        previous, checkpoint_end, manifest = _read_checkpoint_reader(reader, offset)
         if not durable:
             durable = checkpoint_end
         manifests.append(manifest)
@@ -303,37 +378,52 @@ def _load_checkpoint_chain(path: Path) -> tuple[list[dict], int, int] | None:
 
 
 class PageStore:
-    def __init__(self, path: Path, *, cache_bytes: int = 64 << 20):
+    def __init__(self, path: Path, *, cache_bytes: int = 64 << 20, reader: _ReadFile | None = None):
         self.path = path
         self.cache_bytes = cache_bytes
-        self._cache: OrderedDict[int, tuple[dict, int]] = OrderedDict()
+        self._reader = reader
+        self._cache: OrderedDict[tuple[int, str], tuple[Any, int]] = OrderedDict()
         self._cache_size = 0
 
-    def _remember(self, offset: int, page: dict, raw_size: int) -> None:
+    def _remember(self, key: tuple[int, str], page: Any, raw_size: int) -> None:
         if raw_size > self.cache_bytes:
             return
         while self._cache and self._cache_size + raw_size > self.cache_bytes:
             _, (_, evicted_size) = self._cache.popitem(last=False)
             self._cache_size -= evicted_size
-        self._cache[offset] = (page, raw_size)
+        self._cache[key] = (page, raw_size)
         self._cache_size += raw_size
 
+    def _read_page_frame(self, ref: TreeRef | _PageRef) -> tuple[FrameInfo, bytes]:
+        if self._reader is None:
+            return _read_frame_at(self.path, ref.offset, PAGE)
+        return _read_frame(self._reader, ref.offset, PAGE)
+
     def read_page(self, ref: TreeRef) -> dict:
-        cached = self._cache.get(ref.offset)
+        key = (ref.offset, "json")
+        cached = self._cache.get(key)
         if cached is None:
-            _, raw = _read_frame_at(self.path, ref.offset, PAGE)
-            page = json.loads(raw)
+            _, raw = self._read_page_frame(ref)
+            page = _json_value(raw)
             if page.get("logical_hash") != ref.logical_hash or page.get("count") != ref.count:
                 raise ArchiveError(f"page reference mismatch at {ref.offset}")
-            self._remember(ref.offset, page, len(raw))
+            self._remember(key, page, len(raw))
         else:
             page, _ = cached
-            self._cache.move_to_end(ref.offset)
+            self._cache.move_to_end(key)
         return page
 
 
 class ArchiveWriter(PageStore):
-    """Transactional writer with constant-time complete-archive resume."""
+    """Transactional single writer with constant-time complete-archive resume.
+
+    Args:
+        path: Archive file to create, resume, or extend.
+        compression_level: Zlib level for newly appended frames.
+        resume: Reuse the final durable transaction in an existing file.
+        extend_complete: Permit appending to a file with a final index.
+        cache_bytes: Raw JSON byte budget for parsed writer pages.
+    """
 
     def __init__(
         self,
@@ -346,73 +436,95 @@ class ArchiveWriter(PageStore):
     ):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        existed = self.path.exists()
+        self._lock_file = self.path.open("a+b")
+        try:
+            fcntl.flock(self._lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            self._lock_file.close()
+            raise ArchiveError(f"archive already has a writer: {self.path}") from exc
         self.compression_level = compression_level
         self.frames: list[FrameInfo] = []
         self.commits: list[dict] = []
         self._previous_checkpoint_offset = 0
-        needs_anchor = False
-        complete = _has_footer(self.path)
-        if self.path.exists() and resume:
-            if complete and not extend_complete:
-                raise ArchiveError(f"archive is already complete: {self.path}")
-            if complete:
-                # Keep the prior final index and footer as a durable anchor.
-                # New checkpoints link back to it, so even a crash during the
-                # first extension commit never turns a fast-resumable archive
-                # into one that needs a 15 GB historical scan.
-                _, index = _read_final_index(self.path)
-                self.commits = list(index["commits"])
-                durable = self.path.stat().st_size
-                self._previous_checkpoint_offset = durable - FOOTER.size
-            elif checkpoint := _load_checkpoint_chain(self.path):
-                self.commits, durable, self._previous_checkpoint_offset = checkpoint
+        self._final_size: int | None = None
+        try:
+            needs_anchor = False
+            if existed and resume:
+                with _ReadFile(self.path) as reader:
+                    footer_offset = _footer_offset(reader)
+                    if footer_offset is not None and not extend_complete:
+                        raise ArchiveError(f"archive is already complete: {self.path}")
+                    if footer_offset is not None:
+                        # Keep the prior final index and footer as a durable anchor.
+                        # New checkpoints link back to it, so even a crash during the
+                        # first extension commit never turns a fast-resumable archive
+                        # into one that needs a historical scan.
+                        _, index = _read_final_index_reader(reader, footer_offset)
+                        self.commits = list(index["commits"])
+                        durable = reader.size
+                        self._previous_checkpoint_offset = footer_offset
+                    elif checkpoint := _load_checkpoint_chain_reader(reader):
+                        self.commits, durable, self._previous_checkpoint_offset = checkpoint
+                    elif embedded_footer := _find_last_footer_reader(reader):
+                        _, index = _read_final_index_reader(reader, embedded_footer)
+                        self.commits = list(index["commits"])
+                        durable = embedded_footer + FOOTER.size
+                        self._previous_checkpoint_offset = embedded_footer
+                    else:
+                        # Compatibility path for archives created before checkpoint
+                        # trailers existed. It is paid once because the next commit
+                        # establishes a fast-resume chain.
+                        self.frames, _ = _scan_reader(reader, verify=True)
+                        self._load_commits(reader)
+                        durable = self.commits[-1]["_frame_end"] if self.commits else len(MAGIC)
+                        self.frames = [frame for frame in self.frames if frame.end <= durable]
+                        needs_anchor = bool(self.commits)
                 with self.path.open("r+b") as file:
                     file.truncate(durable)
-            elif footer_offset := _find_last_footer(self.path):
-                _, index = _read_final_index(self.path, footer_offset)
-                self.commits = list(index["commits"])
-                durable = footer_offset + FOOTER.size
-                self._previous_checkpoint_offset = footer_offset
-                with self.path.open("r+b") as file:
-                    file.truncate(durable)
+                self._append_start = durable
+                self._file = self.path.open("ab")
+                if needs_anchor:
+                    index = {
+                        "version": FORMAT_VERSION,
+                        "commits": [
+                            {key: value for key, value in item.items() if not key.startswith("_")}
+                            for item in self.commits
+                        ],
+                        "metadata": {"checkpoint_anchor": True},
+                    }
+                    frame = self.append(FINAL_INDEX, _json_bytes(index))
+                    self._previous_checkpoint_offset = self._file.tell()
+                    self._file.write(FOOTER.pack(frame.offset, FOOTER_MAGIC))
+                    self._file.flush()
+                    os.fsync(self._file.fileno())
             else:
-                # Compatibility path for archives created before checkpoint
-                # trailers existed.  It is paid at most once: the next commit
-                # written by this version establishes a fast-resume chain.
-                self.frames, _ = _scan(self.path, verify=True)
-                self._load_commits()
-                durable = self.commits[-1]["_frame_end"] if self.commits else len(MAGIC)
-                with self.path.open("r+b") as file:
-                    file.truncate(durable)
-                self.frames = [frame for frame in self.frames if frame.end <= durable]
-                needs_anchor = bool(self.commits)
-            self._append_start = durable
-            self._file = self.path.open("ab")
-            if needs_anchor:
-                index = {
-                    "version": FORMAT_VERSION,
-                    "commits": [{k: v for k, v in item.items() if not k.startswith("_")} for item in self.commits],
-                    "metadata": {"checkpoint_anchor": True},
-                }
-                frame = self.append(FINAL_INDEX, _json_bytes(index))
-                self._previous_checkpoint_offset = self._file.tell()
-                self._file.write(FOOTER.pack(frame.offset, FOOTER_MAGIC))
+                self._file = self.path.open("wb")
+                self._file.write(MAGIC)
                 self._file.flush()
                 os.fsync(self._file.fileno())
-        else:
-            self._file = self.path.open("wb")
-            self._file.write(MAGIC)
-            self._file.flush()
-            os.fsync(self._file.fileno())
-            self._append_start = len(MAGIC)
-        self._closed = False
-        super().__init__(self.path, cache_bytes=cache_bytes)
+                self._append_start = len(MAGIC)
+            self._closed = False
+            super().__init__(self.path, cache_bytes=cache_bytes)
+        except BaseException:
+            # Constructor failures must release both the partial writer and its
+            # advisory lock, including cancellation and process-exit exceptions.
+            if file := getattr(self, "_file", None):
+                file.close()
+            self._release_lock()
+            raise
 
-    def _load_commits(self) -> None:
+    def _release_lock(self) -> None:
+        lock_file = self._lock_file
+        if not lock_file.closed:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            lock_file.close()
+
+    def _load_commits(self, reader: _ReadFile) -> None:
         for frame in self.frames:
             if frame.kind == COMMIT:
-                _, raw = _read_frame_at(self.path, frame.offset, COMMIT)
-                item = json.loads(raw)
+                _, raw = _read_frame(reader, frame.offset, COMMIT)
+                item = _json_value(raw)
                 item["_frame_end"] = frame.end
                 self.commits.append(item)
 
@@ -433,7 +545,7 @@ class ArchiveWriter(PageStore):
         raw = _json_bytes({**payload, "logical_hash": logical_hash, "count": count})
         frame = self.append(PAGE, raw)
         ref = TreeRef(frame.offset, logical_hash, count)
-        self._remember(ref.offset, {**payload, "logical_hash": logical_hash, "count": count}, len(raw))
+        self._remember((ref.offset, "json"), {**payload, "logical_hash": logical_hash, "count": count}, len(raw))
         return ref
 
     def commit(self, manifest: dict) -> None:
@@ -456,24 +568,29 @@ class ArchiveWriter(PageStore):
         self._file.write(FOOTER.pack(frame.offset, FOOTER_MAGIC))
         self._file.flush()
         os.fsync(self._file.fileno())
+        self._final_size = self._file.tell()
         self._file.close()
         self._closed = True
+        self._release_lock()
 
     def verify_appended(self) -> None:
         """Verify every byte appended by this writer, trusting its durable prefix."""
-        if not self._closed or not _has_footer(self.path):
+        if not self._closed or self._final_size is None:
             raise ArchiveError("archive must be finalized before appended-byte verification")
-        limit = self.path.stat().st_size - FOOTER.size
+        limit = self._final_size - FOOTER.size
         frames, end = _scan_frames(self.path, self._append_start, limit, verify=True)
         if not frames or frames[-1].kind != FINAL_INDEX or end != limit:
             raise ArchiveError("appended archive frame verification failed")
-        _read_final_index(self.path)
+        _read_final_index(self.path, limit)
 
     def close_incomplete(self) -> None:
-        if not self._closed:
-            self._file.flush()
-            self._file.close()
-            self._closed = True
+        try:
+            if not self._closed:
+                self._file.flush()
+                self._file.close()
+                self._closed = True
+        finally:
+            self._release_lock()
 
 
 class RadixTree:
@@ -562,32 +679,62 @@ def graph_digest(node_root: TreeRef | None, edge_root: TreeRef | None) -> str:
 
 
 class Archive(PageStore):
-    def __init__(self, path: str | Path, *, allow_incomplete: bool = False):
-        self.path = Path(path)
-        self.complete = _has_footer(self.path)
-        if not self.complete and not allow_incomplete:
-            raise ArchiveError("archive is incomplete")
-        self._commits = self._load_index() if self.complete else self._load_incomplete()
-        self._entries = {item["sha"]: item for item in self._commits}
-        self.latest_commit = self._commits[-1]["sha"] if self._commits else None
-        super().__init__(self.path)
+    """Stable commit view backed by one positional-read file descriptor.
 
-    def _load_index(self) -> list[dict]:
-        _, index = _read_final_index(self.path)
+    Args:
+        path: Archive file to open.
+        allow_incomplete: Read the final durable checkpoint when no final footer
+            exists. The captured view does not observe later commits.
+        cache_bytes: Raw JSON byte budget for parsed pages. Parsed Python objects
+            can occupy more memory than this accounting value.
+    """
+
+    def __init__(self, path: str | Path, *, allow_incomplete: bool = False, cache_bytes: int = 64 << 20):
+        self.path = Path(path)
+        reader = _ReadFile(self.path)
+        try:
+            super().__init__(self.path, cache_bytes=cache_bytes, reader=reader)
+            self._footer_offset = _footer_offset(reader)
+            self.complete = self._footer_offset is not None
+            if not self.complete and not allow_incomplete:
+                raise ArchiveError("archive is incomplete")
+            self._commits = (
+                self._load_index(self._footer_offset) if self._footer_offset is not None else self._load_incomplete()
+            )
+            self._entries = {item["sha"]: item for item in self._commits}
+            self.latest_commit = self._commits[-1]["sha"] if self._commits else None
+        except BaseException:
+            # Initialization owns the descriptor even when archive validation or
+            # cancellation aborts before the instance reaches its public surface.
+            reader.close()
+            raise
+
+    def _load_index(self, footer_offset: int) -> list[dict]:
+        _, index = _read_final_index_reader(self._reader, footer_offset)
         return index["commits"]
 
     def _load_incomplete(self) -> list[dict]:
-        if checkpoint := _load_checkpoint_chain(self.path):
+        if checkpoint := _load_checkpoint_chain_reader(self._reader):
             return checkpoint[0]
-        if footer_offset := _find_last_footer(self.path):
-            return _read_final_index(self.path, footer_offset)[1]["commits"]
-        frames, _ = _scan(self.path, verify=False)
+        if footer_offset := _find_last_footer_reader(self._reader):
+            return _read_final_index_reader(self._reader, footer_offset)[1]["commits"]
+        frames, _ = _scan_reader(self._reader, verify=False)
         result = []
         for frame in frames:
             if frame.kind == COMMIT:
-                _, raw = _read_frame_at(self.path, frame.offset, COMMIT)
-                result.append(json.loads(raw))
+                _, raw = _read_frame(self._reader, frame.offset, COMMIT)
+                result.append(_json_value(raw))
         return result
+
+    def close(self) -> None:
+        """Release the reader's persistent file descriptor."""
+        self._reader.close()
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *_args) -> None:
+        self.close()
 
     def __len__(self) -> int:
         return len(self._commits)
@@ -608,24 +755,60 @@ class Archive(PageStore):
         """
         return deepcopy(self._entries[self.latest_commit if commit is None else commit])
 
-    def _records(self, ref: TreeRef | None) -> Iterator[tuple]:
-        if ref is None:
-            return
-        page = self.read_page(ref)
-        if page["kind"] == "leaf":
-            for key, value in page["entries"]:
-                yield _key_value(key), value
-            return
-        for _, child in page["children"]:
-            yield from self._records(TreeRef.from_json(child))
+    def _typed_page(self, ref: TreeRef | _PageRef, tree: str):
+        key = (ref.offset, tree)
+        cached = self._cache.get(key)
+        if cached is not None:
+            page, _ = cached
+            self._cache.move_to_end(key)
+            return page
+        _, raw = self._read_page_frame(ref)
+        decoder = _NODE_PAGE_DECODER if tree == "nodes" else _EDGE_PAGE_DECODER
+        try:
+            page = decoder.decode(raw)
+        except msgspec.DecodeError:
+            # Standard json accepts non-finite floats written by historical KGA5
+            # archives, while strict native decoders correctly reject them.
+            page = _json_value(raw)
+        logical_hash = page.get("logical_hash") if isinstance(page, dict) else page.logical_hash
+        count = page.get("count") if isinstance(page, dict) else page.count
+        page_tree = page.get("tree") if isinstance(page, dict) else page.tree
+        if logical_hash != ref.logical_hash or count != ref.count or page_tree != tree:
+            raise ArchiveError(f"page reference mismatch at {ref.offset}")
+        self._remember(key, page, len(raw))
+        return page
+
+    def _records(self, ref: TreeRef | None, tree: str) -> dict:
+        records = {}
+        stack: list[TreeRef | _PageRef] = [] if ref is None else [ref]
+        while stack:
+            page = self._typed_page(stack.pop(), tree)
+            if isinstance(page, _BranchPage):
+                stack.extend(child for _, child in reversed(page.children))
+            elif isinstance(page, dict) and page["kind"] != "leaf":
+                stack.extend(TreeRef.from_json(child) for _, child in reversed(page["children"]))
+            elif isinstance(page, dict) and tree == "edges":
+                records.update((tuple(key), value) for key, value in page["entries"])
+            else:
+                records.update(page["entries"] if isinstance(page, dict) else page.entries)
+        return records
 
     def load_rows(self, commit: str | None = None) -> GraphRows:
+        """Materialize the exact node and parallel-edge rows for one commit.
+
+        Args:
+            commit: Exact archived commit ID. Omission selects the latest commit
+                captured when this reader opened.
+
+        Raises:
+            KeyError: The requested commit is absent from this reader's view.
+        """
         sha = self.latest_commit if commit is None else commit
         if sha not in self._entries:
             raise KeyError(sha)
         item = self._entries[sha]
-        nodes = dict(self._records(TreeRef.from_json(item.get("node_root"))))
-        edges = dict(self._records(TreeRef.from_json(item.get("edge_root"))))
+        nodes = self._records(TreeRef.from_json(item.get("node_root")), "nodes")
+        edges = self._records(TreeRef.from_json(item.get("edge_root")), "edges")
         return GraphRows(nodes, edges)
 
     def load_raw(self, commit: str | None = None) -> SnapshotGraph:
@@ -638,8 +821,8 @@ class Archive(PageStore):
         return tuple(self._entries[commit]["parents"])
 
     def verify(self) -> None:
-        frames, end = _scan(self.path, verify=True)
-        expected = self.path.stat().st_size - (FOOTER.size if self.complete else 0)
+        frames, end = _scan_reader(self._reader, verify=True)
+        expected = self._footer_offset if self._footer_offset is not None else self._reader.size
         if not frames or end != expected:
             raise ArchiveError("archive frame verification failed")
         for item in self._commits:
@@ -652,7 +835,7 @@ class Archive(PageStore):
         """Verify the final index frame and every manifest's logical roots."""
         if not self.complete:
             raise ArchiveError("archive is incomplete")
-        _read_final_index(self.path)
+        _read_final_index_reader(self._reader, self._footer_offset)
         for item in self._commits:
             node_root = TreeRef.from_json(item.get("node_root"))
             edge_root = TreeRef.from_json(item.get("edge_root"))

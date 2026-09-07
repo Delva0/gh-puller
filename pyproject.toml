@@ -27,6 +27,7 @@ benchmark = [
     "uvicorn[standard]>=0.51.0",
 ]
 codebase = [
+    "msgspec>=0.19",
     "networkx>=3.4",
 ]
 
