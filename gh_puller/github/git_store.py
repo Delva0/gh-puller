@@ -32,6 +32,8 @@ if TYPE_CHECKING:
 _SHA = re.compile(r"[0-9a-f]{40,64}\Z")
 _HEARTBEAT_SECONDS = 2.0
 _FETCH_RETRY_CEILING = 30.0
+# Ref-tip probes carry no pack data, so their concurrency is independent of fetch size.
+_REMOTE_REF_CONCURRENCY = 16
 _LOOSE_REF_MAINTENANCE_THRESHOLD = 256
 _PACK_MAINTENANCE_THRESHOLD = 64
 _TRANSIENT_FETCH_STATUS = re.compile(
@@ -665,7 +667,7 @@ class GitObjectStore:
         *,
         heartbeat: Callable[[], None] | None,
     ) -> dict[CommitFetchSource, _RemoteRefObservation]:
-        semaphore = asyncio.Semaphore(self._ref_batch_size)
+        semaphore = asyncio.Semaphore(_REMOTE_REF_CONCURRENCY)
 
         async def observe(source: CommitFetchSource) -> tuple[CommitFetchSource, _RemoteRefObservation]:
             async with semaphore:

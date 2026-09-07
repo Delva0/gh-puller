@@ -767,6 +767,7 @@ async def test_repository_ref_preflight_is_bounded_and_parallel(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
+    monkeypatch.setattr(git_store_module, "_REMOTE_REF_CONCURRENCY", 2)
     source = tmp_path / "source"
     _, head = _source_repository(source, 1)
     for branch in ("one", "two", "three"):
