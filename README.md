@@ -57,7 +57,7 @@ uv run -m gh_puller.github once OWNER/REPO archives/repository.sqlite3
 
 观测时间、完整性边界、存储格式、定时调度、systemd 服务与 PR diff 见 [GitHub 归档设计与运维文档][github-archive]。
 
-## 归档代码图历史
+## 代码仓库图化
 
 `gh_puller.codebase` 把 Git 的 root-first topo commit 序列构建成一个可恢复、可随机读取的
 Merkle 代码图归档。运行时解析一次经过实验门禁晋升的 CBM 二进制，并把其 SHA-256 固定在
@@ -71,8 +71,8 @@ uv run -m gh_puller.codebase build \
 ```
 
 最终交付物是 `archive.kga` 和 `summary.json`。同一命令提高 `--max-commits` 即可续跑；
-`--out-dir` 可复制已有归档后从副本继续。二进制安装、解析顺序、增量精度开关、升级门禁和
-读取 API 见[代码图归档文档][codebase-archive]。
+`--out-dir` 可复制已有归档后从副本继续。CBM 构建与查询边界、Merkle 历史压缩、二进制
+解析、增量配置和读取 API 见[代码图文档][codebase-graph]。
 
 ## 选择入口
 
@@ -81,7 +81,7 @@ uv run -m gh_puller.codebase build \
 | 想完成的任务 | 从这里开始 |
 | --- | --- |
 | 持续归档 GitHub Issue、PR 与代码对象 | [`gh_puller.github`][github-package]：根 CLI 与离线读取 API；详见[归档文档][github-archive] |
-| 构建可恢复、可随机读取的逐 commit 代码图 | [`gh_puller.codebase`][codebase-package]：Merkle 归档构建与读取；详见[代码图归档文档][codebase-archive] |
+| 构建可恢复、可随机读取的逐 commit 代码图 | [`gh_puller.codebase`][codebase-package]：CBM 图化与 Merkle 历史压缩；详见[代码图文档][codebase-graph] |
 | 生成代码 Wiki、Code Map 并进行问答 | [DeepWiki WebUI]：FastAPI + Next.js 的 DeepWiki 兼容应用 |
 | 记录并查看 Agent Context、模型与工具活动 | [Agent monitor]：JSONL / WebSocket 查看器；语义契约见[事件模型][agent-events] |
 | 通过 MCP 暴露代码图谱工具 | [gh-puller MCP]：对 `codebase-memory-mcp` CLI 的 MCP 服务封装 |
@@ -111,7 +111,7 @@ uvx ruff check
 [github-package]: gh_puller/github/
 [github-archive]: docs/github-puller.md
 [codebase-package]: gh_puller/codebase/
-[codebase-archive]: docs/codebase-archive.md
+[codebase-graph]: docs/codebase-graph.md
 [github-cli-test]: tests/github/test_cli.py
 [deepwiki webui]: apps/deepwiki-webui/README.md
 [agent monitor]: apps/agent-monitor/README.md
