@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from contextlib import closing
 from typing import TYPE_CHECKING
 
 from .generation_diff import ChangeSet, PinnedGeneration
@@ -28,7 +29,7 @@ class JournalUnavailableError(Exception):
 def available(db_path: str | Path, project: str) -> bool:
     """Return whether the published generation has a complete supported journal."""
     try:
-        with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=60) as connection:
+        with closing(sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=60)) as connection, connection:
             row = connection.execute(
                 "SELECT format_version,node_count,edge_count FROM cbm_delta_change_journal WHERE project=?",
                 (project,),
@@ -52,7 +53,7 @@ def candidate_counts(db_path: str | Path, project: str) -> dict[str, int]:
     """Read the native journal candidate counts after validating its metadata."""
     if not available(db_path, project):
         raise JournalUnavailableError("published generation has no complete native journal")
-    with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=60) as connection:
+    with closing(sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=60)) as connection, connection:
         node_count, edge_count = connection.execute(
             "SELECT node_count,edge_count FROM cbm_delta_change_journal WHERE project=?",
             (project,),

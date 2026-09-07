@@ -307,21 +307,23 @@ class PersistentMCPTransport:
         if stream is None:
             self._messages.put(_STREAM_CLOSED)
             return
-        for line in stream:
-            try:
-                message = json.loads(line)
-            except json.JSONDecodeError:
-                self._stderr_tail.append(f"invalid MCP stdout: {line[-500:]}")
-                continue
-            self._messages.put(message)
+        with stream:
+            for line in stream:
+                try:
+                    message = json.loads(line)
+                except json.JSONDecodeError:
+                    self._stderr_tail.append(f"invalid MCP stdout: {line[-500:]}")
+                    continue
+                self._messages.put(message)
         self._messages.put(_STREAM_CLOSED)
 
     def _read_stderr(self) -> None:
         stream = self.process.stderr
         if stream is None:
             return
-        for line in stream:
-            self._stderr_tail.append(line)
+        with stream:
+            for line in stream:
+                self._stderr_tail.append(line)
 
     def _send(self, payload: dict) -> None:
         if self._closed or self.process.poll() is not None or self.process.stdin is None:
@@ -424,6 +426,12 @@ class PersistentMCPTransport:
                 return definitions
             arguments = {"cursor": result["nextCursor"]}
 
+    def _join_readers(self) -> None:
+        # Pipe creation can fail before constructor-owned readers exist.
+        for name in ("_stdout_thread", "_stderr_thread"):
+            if reader := getattr(self, name, None):
+                reader.join(timeout=2)
+
     def _terminate(self) -> None:
         if self._closed:
             return
@@ -438,6 +446,7 @@ class PersistentMCPTransport:
             except subprocess.TimeoutExpired:
                 self.process.kill()
                 self.process.wait()
+        self._join_readers()
         self.monitor.child_pid = None
 
     def close(self) -> None:
@@ -456,8 +465,7 @@ class PersistentMCPTransport:
             except subprocess.TimeoutExpired:
                 self.process.kill()
                 self.process.wait()
-        self._stdout_thread.join(timeout=2)
-        self._stderr_thread.join(timeout=2)
+        self._join_readers()
         self.monitor.child_pid = None
         self.monitor.sample()
 

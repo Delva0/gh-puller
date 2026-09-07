@@ -110,6 +110,11 @@ def test_persistent_mcp_reuses_one_process(tmp_path):
 
     assert monitor.child_pid is None
     assert transport.process.returncode == 0
+    assert all(
+        stream.closed for stream in (transport.process.stdin, transport.process.stdout, transport.process.stderr)
+    )
+    assert not transport._stdout_thread.is_alive() and not transport._stderr_thread.is_alive()
+    transport.close()
 
 
 def test_cli_transport_remains_available_as_control(tmp_path):
@@ -139,6 +144,10 @@ def test_persistent_mcp_timeout_terminates_process(tmp_path):
 
     assert transport.process.poll() is not None
     assert monitor.child_pid is None
+    assert all(
+        stream.closed for stream in (transport.process.stdin, transport.process.stdout, transport.process.stderr)
+    )
+    assert not transport._stdout_thread.is_alive() and not transport._stderr_thread.is_alive()
     transport.close()
 
 

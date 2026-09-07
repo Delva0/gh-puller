@@ -3,9 +3,11 @@
 import os
 import shutil
 import sqlite3
+from contextlib import ExitStack, closing
 
 import pytest
 
+from gh_puller.codebase import journal
 from gh_puller.codebase.generation_diff import PinnedGeneration
 from gh_puller.codebase.journal import JournalUnavailableError, available, candidate_counts, changes_after_publish
 
@@ -70,7 +72,7 @@ def test_native_journal_matches_full_generation_diff(tmp_path):
     journal_old = PinnedGeneration(path, "p")
     full_old = PinnedGeneration(path, "p")
     shutil.copy2(path, replacement)
-    with sqlite3.connect(replacement) as connection:
+    with closing(sqlite3.connect(replacement)) as connection, connection:
         connection.execute("UPDATE nodes SET label='Class' WHERE id=1")
         connection.execute("UPDATE nodes SET qualified_name='p.c' WHERE id=2")
         connection.execute("INSERT INTO nodes VALUES (3,'p','File','d','p.d','d.py',1,2,'{}')")
@@ -103,7 +105,7 @@ def test_journal_exact_filter_removes_noop_candidates_and_captures_deletes(tmp_p
     write_generation(path)
     old = PinnedGeneration(path, "p")
     shutil.copy2(path, replacement)
-    with sqlite3.connect(replacement) as connection:
+    with closing(sqlite3.connect(replacement)) as connection, connection:
         connection.execute("PRAGMA foreign_keys=ON")
         connection.execute("UPDATE nodes SET label=label WHERE id=2")
         connection.execute("DELETE FROM nodes WHERE id=1")
@@ -126,7 +128,7 @@ def test_journal_preserves_non_utf8_property_bytes(tmp_path):
     shutil.copy2(path, replacement)
     bad_node = b'{"node":"\xff"}'
     bad_edge = b'{"edge":"\xfe"}'
-    with sqlite3.connect(replacement) as connection:
+    with closing(sqlite3.connect(replacement)) as connection, connection:
         connection.execute("UPDATE nodes SET properties=CAST(? AS TEXT) WHERE id=1", (bad_node,))
         connection.execute("UPDATE edges SET properties=CAST(? AS TEXT) WHERE id=1", (bad_edge,))
         write_journal(connection, node_ids=(1,), edge_ids=(1,))
@@ -159,7 +161,38 @@ def test_incomplete_journal_is_unavailable(tmp_path):
     """Reject a partially persisted candidate set instead of missing changes."""
     path = tmp_path / "graph.db"
     write_generation(path)
-    with sqlite3.connect(path) as connection:
+    with closing(sqlite3.connect(path)) as connection, connection:
         write_journal(connection, node_ids=(1,), edge_ids=())
         connection.execute("UPDATE cbm_delta_change_journal SET node_count=2")
     assert not available(path, "p")
+
+
+@pytest.mark.parametrize("state", ["missing", "partial", "complete"])
+def test_journal_metadata_queries_close_owned_connections(tmp_path, monkeypatch, state):
+    path = tmp_path / "graph.db"
+    write_generation(path)
+    if state != "missing":
+        with closing(sqlite3.connect(path)) as connection, connection:
+            write_journal(connection, node_ids=(1,), edge_ids=())
+            if state == "partial":
+                connection.execute("UPDATE cbm_delta_change_journal SET node_count=2")
+    connect = sqlite3.connect
+    connections = []
+    with ExitStack() as resources:
+
+        def open_connection(*args, **kwargs):
+            connection = resources.enter_context(closing(connect(*args, **kwargs)))
+            connections.append(connection)
+            return connection
+
+        monkeypatch.setattr(journal.sqlite3, "connect", open_connection)
+        assert available(path, "p") == (state == "complete")
+        if state == "complete":
+            assert candidate_counts(path, "p") == {"nodes": 1, "edges": 0}
+        else:
+            with pytest.raises(JournalUnavailableError):
+                candidate_counts(path, "p")
+        assert len(connections) == (3 if state == "complete" else 2)
+        for connection in connections:
+            with pytest.raises(sqlite3.ProgrammingError, match="closed database"):
+                connection.execute("SELECT 1")

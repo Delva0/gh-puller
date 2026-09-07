@@ -1,5 +1,6 @@
 import os
 import sqlite3
+from contextlib import closing
 
 from gh_puller.codebase.generation_diff import PinnedGeneration
 
@@ -54,7 +55,7 @@ def test_diff_preserves_non_utf8_property_bytes(tmp_path):
     write_generation(replacement, "{}", include_edge=True, id_offset=100)
     bad_node = b'{"node":"\xff"}'
     bad_edge = b'{"edge":"\xfe"}'
-    with sqlite3.connect(replacement) as connection:
+    with closing(sqlite3.connect(replacement)) as connection, connection:
         connection.execute(
             "UPDATE nodes SET properties=CAST(? AS TEXT) WHERE qualified_name='p.a'",
             (bad_node,),
