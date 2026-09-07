@@ -4,7 +4,9 @@ import pytest
 
 from gh_puller.codebase.archive import Archive, ArchiveError, ArchiveWriter, RadixTree, graph_digest
 from gh_puller.codebase.cbm_build import (
+    GRAPH_FIDELITY_VERSION,
     BuildError,
+    _requires_full_snapshot_anchor,
     _validate_resume_binary,
     _validate_resume_force_full,
     prepare_output_dir,
@@ -82,3 +84,16 @@ def test_resume_pins_cbm_digest_unless_upgrade_is_explicit():
         _validate_resume_binary({"sha": "legacy"}, "new", False)
     with pytest.raises(BuildError, match="differs"):
         _validate_resume_binary({"cbm_binary_sha256": "old"}, "new", False)
+
+
+def test_resume_reanchors_untrusted_or_semantically_changed_graphs():
+    assert _requires_full_snapshot_anchor(None, "binary", "p")
+    assert _requires_full_snapshot_anchor({"sha": "legacy"}, "binary", "p")
+    trusted = {
+        "graph_fidelity_version": GRAPH_FIDELITY_VERSION,
+        "cbm_binary_sha256": "same",
+        "cbm_project": "p",
+    }
+    assert _requires_full_snapshot_anchor({**trusted, "cbm_binary_sha256": "old"}, "new", "p")
+    assert _requires_full_snapshot_anchor(trusted, "same", "renamed")
+    assert not _requires_full_snapshot_anchor(trusted, "same", "p")

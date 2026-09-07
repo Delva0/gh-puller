@@ -8,13 +8,12 @@ by the full generation diff.
 
 from __future__ import annotations
 
-import json
 import sqlite3
 from contextlib import closing
 from typing import TYPE_CHECKING
 
 from .generation_diff import ChangeSet, PinnedGeneration
-from .store import _normalize, _parse_properties
+from .store import ExtractionError, _edge_attributes, _node_attributes
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -61,27 +60,17 @@ def candidate_counts(db_path: str | Path, project: str) -> dict[str, int]:
     return {"nodes": node_count, "edges": edge_count}
 
 
-def _node_value(row: tuple, project: str) -> dict | None:
+def _node_value(row: tuple) -> dict | None:
     node_id, label, name, file_path, start_line, end_line, properties = row
     if node_id is None:
         return None
-    return _normalize(
-        {
-            "label": label,
-            "name": name,
-            "file_path": file_path or "",
-            "start_line": start_line or 0,
-            "end_line": end_line or 0,
-            "properties": _parse_properties(properties),
-        },
-        project,
-    )
+    return _node_attributes(label, name, file_path, start_line, end_line, properties)
 
 
-def _edge_value(edge_id, properties, project: str) -> dict | None:
+def _edge_value(edge_id, properties) -> dict | None:
     if edge_id is None:
         return None
-    return _normalize({"properties": _parse_properties(properties)}, project)
+    return _edge_attributes(properties)
 
 
 def _prepare_candidates(connection: sqlite3.Connection, project: str) -> None:
@@ -210,9 +199,9 @@ def changes_after_publish(previous: PinnedGeneration) -> ChangeSet:
             (previous.project, previous.project),
         )
         for row in rows:
-            key = _normalize(row[0], previous.project)
-            old_value = _node_value(row[1:8], previous.project)
-            new_value = _node_value(row[8:15], previous.project)
+            key = row[0]
+            old_value = _node_value(row[1:8])
+            new_value = _node_value(row[8:15])
             if old_value != new_value:
                 nodes[key] = new_value
 
@@ -242,15 +231,15 @@ def changes_after_publish(previous: PinnedGeneration) -> ChangeSet:
         )
         for source, target, edge_type, local, old_id, old_props, new_id, new_props in rows:
             key = (
-                _normalize(source, previous.project),
-                _normalize(target, previous.project),
+                source,
+                target,
                 edge_type,
                 local,
             )
-            old_value = _edge_value(old_id, old_props, previous.project)
-            new_value = _edge_value(new_id, new_props, previous.project)
+            old_value = _edge_value(old_id, old_props)
+            new_value = _edge_value(new_id, new_props)
             if old_value != new_value:
                 edges[key] = new_value
         return ChangeSet(nodes, edges)
-    except (sqlite3.Error, json.JSONDecodeError) as exc:
+    except (sqlite3.Error, ExtractionError) as exc:
         raise JournalUnavailableError(str(exc)) from exc

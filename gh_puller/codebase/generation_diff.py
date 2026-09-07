@@ -13,7 +13,7 @@ import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 
-from .store import _normalize, _parse_properties
+from .store import _edge_attributes, _node_attributes
 
 
 @dataclass(frozen=True)
@@ -78,20 +78,17 @@ class PinnedGeneration:
             """,
             (self.project,),
         ):
-            key = _normalize(old_key, self.project)
+            key = old_key
             nodes[key] = (
                 None
                 if node_id is None
-                else _normalize(
-                    {
-                        "label": label,
-                        "name": name,
-                        "file_path": file_path or "",
-                        "start_line": start_line or 0,
-                        "end_line": end_line or 0,
-                        "properties": _parse_properties(properties),
-                    },
-                    self.project,
+                else _node_attributes(
+                    label,
+                    name,
+                    file_path,
+                    start_line,
+                    end_line,
+                    properties,
                 )
             )
 
@@ -155,8 +152,6 @@ class PinnedGeneration:
             """,
             (self.project, self.project, self.project),
         ):
-            key = (_normalize(source, self.project), _normalize(target, self.project), edge_type, local)
-            edges[key] = (
-                None if edge_id is None else _normalize({"properties": _parse_properties(properties)}, self.project)
-            )
+            key = (source, target, edge_type, local)
+            edges[key] = None if edge_id is None else _edge_attributes(properties)
         return ChangeSet(nodes, edges)

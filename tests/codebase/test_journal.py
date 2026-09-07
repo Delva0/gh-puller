@@ -88,11 +88,11 @@ def test_native_journal_matches_full_generation_diff(tmp_path):
         journal_old.close()
         full_old.close()
     assert journal == full
-    assert set(journal.nodes) == {"a", "b", "c", "d"}
+    assert set(journal.nodes) == {"p.a", "p.b", "p.c", "p.d"}
     assert set(journal.edges) == {
-        ("a", "b", "CALLS", ""),
-        ("a", "c", "CALLS", ""),
-        ("d", "a", "CALLS", ""),
+        ("p.a", "p.b", "CALLS", ""),
+        ("p.a", "p.c", "CALLS", ""),
+        ("p.d", "p.a", "CALLS", ""),
     }
     assert available(path, "p")
     assert candidate_counts(path, "p") == {"nodes": 3, "edges": 1}
@@ -115,12 +115,12 @@ def test_journal_exact_filter_removes_noop_candidates_and_captures_deletes(tmp_p
         changes = changes_after_publish(old)
     finally:
         old.close()
-    assert set(changes.nodes) == {"a"}
-    assert changes.nodes["a"] is None
-    assert changes.edges == {("a", "b", "CALLS", ""): None}
+    assert set(changes.nodes) == {"p.a"}
+    assert changes.nodes["p.a"] is None
+    assert changes.edges == {("p.a", "p.b", "CALLS", ""): None}
 
 
-def test_journal_preserves_non_utf8_property_bytes(tmp_path):
+def test_journal_rejects_non_utf8_property_bytes(tmp_path):
     path = tmp_path / "graph.db"
     replacement = tmp_path / "replacement.db"
     write_generation(path)
@@ -134,11 +134,10 @@ def test_journal_preserves_non_utf8_property_bytes(tmp_path):
         write_journal(connection, node_ids=(1,), edge_ids=(1,))
     os.replace(replacement, path)
     try:
-        changes = changes_after_publish(old)
+        with pytest.raises(JournalUnavailableError, match="not UTF-8"):
+            changes_after_publish(old)
     finally:
         old.close()
-    assert changes.nodes["a"]["properties"] == {"_raw_bytes": bad_node.hex()}
-    assert changes.edges[("a", "b", "CALLS", "")]["properties"] == {"_raw_bytes": bad_edge.hex()}
 
 
 def test_fresh_full_generation_reports_journal_unavailable(tmp_path):

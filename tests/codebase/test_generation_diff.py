@@ -2,7 +2,10 @@ import os
 import sqlite3
 from contextlib import closing
 
+import pytest
+
 from gh_puller.codebase.generation_diff import PinnedGeneration
+from gh_puller.codebase.store import ExtractionError
 
 SCHEMA = """
 CREATE TABLE projects(name TEXT PRIMARY KEY);
@@ -42,12 +45,12 @@ def test_diff_keeps_old_inode_across_atomic_publish(tmp_path):
         changes = old.changes_after_publish()
     finally:
         old.close()
-    assert changes.nodes["a"]["properties"] == {"v": 2}
-    assert changes.edges[("a", "b", "CALLS", "")] is None
-    assert "b" not in changes.nodes
+    assert changes.nodes["p.a"]["properties"] == {"v": 2}
+    assert changes.edges[("p.a", "p.b", "CALLS", "")] is None
+    assert "p.b" not in changes.nodes
 
 
-def test_diff_preserves_non_utf8_property_bytes(tmp_path):
+def test_diff_rejects_non_utf8_property_bytes(tmp_path):
     path = tmp_path / "graph.db"
     replacement = tmp_path / "replacement.db"
     write_generation(path, "{}", include_edge=True)
@@ -63,8 +66,27 @@ def test_diff_preserves_non_utf8_property_bytes(tmp_path):
         connection.execute("UPDATE edges SET properties=CAST(? AS TEXT) WHERE id=1", (bad_edge,))
     os.replace(replacement, path)
     try:
+        with pytest.raises(ExtractionError, match="not UTF-8"):
+            old.changes_after_publish()
+    finally:
+        old.close()
+
+
+def test_diff_preserves_project_like_property_strings(tmp_path):
+    path = tmp_path / "graph.db"
+    replacement = tmp_path / "replacement.db"
+    write_generation(path, "{}", include_edge=False)
+    old = PinnedGeneration(path, "p")
+    properties = '{"plain":"a","prefixed":"p.a","project":"p","sentinel":"__project__"}'
+    write_generation(replacement, properties, include_edge=False, id_offset=100)
+    os.replace(replacement, path)
+    try:
         changes = old.changes_after_publish()
     finally:
         old.close()
-    assert changes.nodes["a"]["properties"] == {"_raw_bytes": bad_node.hex()}
-    assert changes.edges[("a", "b", "CALLS", "")]["properties"] == {"_raw_bytes": bad_edge.hex()}
+    assert changes.nodes["p.a"]["properties"] == {
+        "plain": "a",
+        "prefixed": "p.a",
+        "project": "p",
+        "sentinel": "__project__",
+    }

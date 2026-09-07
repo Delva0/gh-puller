@@ -20,6 +20,7 @@ from pathlib import Path
 
 from .archive import (
     FORMAT_VERSION,
+    GRAPH_FIDELITY_VERSION,
     Archive,
     ArchiveError,
     ArchiveWriter,
@@ -36,9 +37,7 @@ from .incremental_config import (
     IncrementalConfigError,
     add_incremental_arguments,
 )
-from .journal import available as journal_available
-from .journal import changes_after_publish as journal_changes_after_publish
-from .store import iter_edges, iter_nodes
+from .store import ExtractionError, GraphRows, iter_edges, iter_nodes, validate_rows
 
 SHA_RE = re.compile(r"^[0-9a-f]{40,64}$")
 
@@ -373,6 +372,16 @@ def _validate_resume_binary(last_item: dict | None, digest: str, allow_upgrade: 
     )
 
 
+def _requires_full_snapshot_anchor(last_item: dict | None, binary_digest: str, project: str) -> bool:
+    if last_item is None:
+        return True
+    return (
+        last_item.get("graph_fidelity_version") != GRAPH_FIDELITY_VERSION
+        or last_item.get("cbm_binary_sha256") != binary_digest
+        or last_item.get("cbm_project") != project
+    )
+
+
 def build(args) -> int:
     try:
         incremental_config = IncrementalConfig.from_namespace(args)
@@ -416,6 +425,7 @@ def build(args) -> int:
     _validate_resume_force_full(last_existing_item, force_full)
     if existing and existing.complete and existing_count == len(commits):
         existing.verify()
+        existing.verify_snapshot()
         print(json.dumps({"archive": str(archive_path), "commits": existing_count, "verified": True}))
         return 0
     _validate_resume_binary(
@@ -468,6 +478,7 @@ def build(args) -> int:
         )
         last_item = writer.commits[-1] if writer.commits else None
         node_root, edge_root = _root(last_item, "node_root"), _root(last_item, "edge_root")
+        full_snapshot_anchor = _requires_full_snapshot_anchor(last_item, cbm_binary.sha256, project)
 
         if last_item:
             last_sha = last_item["sha"]
@@ -513,12 +524,12 @@ def build(args) -> int:
                 )
                 stage_times["cbm_seconds"] = time.monotonic() - started
                 started = time.monotonic()
-                if previous_generation and index_execution["route"] == "noop":
+                if full_snapshot_anchor:
+                    changes = None
+                    generation_diff_source = "full_snapshot_anchor"
+                elif previous_generation and index_execution["route"] == "noop":
                     changes = ChangeSet({}, {})
                     generation_diff_source = "noop"
-                elif previous_generation and journal_available(db_path, project):
-                    changes = journal_changes_after_publish(previous_generation)
-                    generation_diff_source = "native_journal"
                 elif previous_generation:
                     changes = previous_generation.changes_after_publish()
                     generation_diff_source = "full_generation"
@@ -535,8 +546,13 @@ def build(args) -> int:
             if changes is not None:
                 node_changes, edge_changes = changes.nodes, changes.edges
             else:
+                node_root, edge_root = None, None
                 node_changes = dict(iter_nodes(db_path, project))
                 edge_changes = dict(iter_edges(db_path, project))
+                try:
+                    validate_rows(GraphRows(node_changes, edge_changes), project)
+                except ExtractionError as exc:
+                    raise BuildError(f"CBM produced an unrestorable graph: {exc}") from exc
             node_tree, edge_tree = RadixTree(writer, "nodes"), RadixTree(writer, "edges")
             node_root = node_tree.apply(node_root, node_changes)
             edge_root = edge_tree.apply(edge_root, edge_changes)
@@ -554,12 +570,15 @@ def build(args) -> int:
                 "pages_read": node_tree.pages_read + edge_tree.pages_read,
                 "pages_written": node_tree.pages_written + edge_tree.pages_written,
                 "generation_diff_source": generation_diff_source,
+                "graph_fidelity_version": GRAPH_FIDELITY_VERSION,
                 "cbm_index_execution": index_execution,
                 "cbm_incremental": incremental_metadata,
                 "cbm_force_full": force_full,
                 "cbm_binary_sha256": cbm_binary.sha256,
+                "cbm_project": project,
             }
             writer.commit(manifest)
+            full_snapshot_anchor = False
             _write_state(state_path, sha)
             stage_times["merkle_seconds"] = time.monotonic() - started
             stage_times = {key: round(value, 3) for key, value in stage_times.items()}
@@ -588,6 +607,7 @@ def build(args) -> int:
         writer.verify_appended()
         archive = Archive(archive_path)
         archive.verify_index()
+        archive.verify_snapshot()
         progress.render("cleanup")
         cleanup_ok, cleanup_detail = transport.delete_project(project)
         transport.close()

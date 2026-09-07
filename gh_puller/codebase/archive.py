@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING, Any, Self
 import msgspec
 
 from .graph import SnapshotGraph, snapshot_to_networkx
-from .store import GraphRows, rows_to_snapshot
+from .store import ExtractionError, GraphRows, rows_to_snapshot, validate_rows
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -33,6 +33,7 @@ if TYPE_CHECKING:
 # contract. They remain unchanged so existing large archives resume in place;
 # they are not the Python package or product version.
 FORMAT_VERSION = 5
+GRAPH_FIDELITY_VERSION = 2
 MAGIC = b"KGA5\r\n\x1a\n"
 FOOTER_MAGIC = b"KGA5IDX!"
 CHECKPOINT_MAGIC = b"KGA5CP!!"
@@ -810,6 +811,35 @@ class Archive(PageStore):
         nodes = self._records(TreeRef.from_json(item.get("node_root")), "nodes")
         edges = self._records(TreeRef.from_json(item.get("edge_root")), "edges")
         return GraphRows(nodes, edges)
+
+    def verify_snapshot(self, commit: str | None = None) -> None:
+        """Verify that one snapshot can be restored exactly into CBM.
+
+        Args:
+            commit: Exact archived commit ID. Omission selects the latest commit
+                captured when this reader opened.
+
+        Raises:
+            ArchiveError: The snapshot predates the fidelity protocol or violates
+                its row counts, project identity, JSON, or graph-closure contract.
+            KeyError: The requested commit is absent from this reader's view.
+        """
+        sha = self.latest_commit if commit is None else commit
+        if sha not in self._entries:
+            raise KeyError(sha)
+        item = self._entries[sha]
+        if item.get("graph_fidelity_version") != GRAPH_FIDELITY_VERSION:
+            raise ArchiveError(f"snapshot {sha} has no verified CBM fidelity boundary")
+        project = item.get("cbm_project")
+        if not isinstance(project, str) or not project:
+            raise ArchiveError(f"snapshot {sha} has no CBM project identity")
+        rows = self.load_rows(sha)
+        if item.get("nodes") != len(rows.nodes) or item.get("edges") != len(rows.edges):
+            raise ArchiveError(f"snapshot {sha} row counts do not match its manifest")
+        try:
+            validate_rows(rows, project)
+        except ExtractionError as exc:
+            raise ArchiveError(f"snapshot {sha} is not restorable: {exc}") from exc
 
     def load_raw(self, commit: str | None = None) -> SnapshotGraph:
         return rows_to_snapshot(self.load_rows(commit))

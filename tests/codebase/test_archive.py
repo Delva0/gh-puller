@@ -4,7 +4,9 @@ import pytest
 
 import gh_puller.codebase.archive as archive_module
 from gh_puller.codebase.archive import (
+    GRAPH_FIDELITY_VERSION,
     Archive,
+    ArchiveError,
     ArchiveWriter,
     RadixTree,
     TreeRef,
@@ -388,3 +390,60 @@ def test_native_page_decoder_falls_back_for_nonfinite_json(tmp_path):
 
     with Archive(path) as archive:
         assert math.isnan(archive.load_rows().nodes["a"]["value"])
+
+
+def test_snapshot_fidelity_rejects_legacy_and_dangling_graphs(tmp_path):
+    path = tmp_path / "archive.kga"
+    writer = ArchiveWriter(path)
+    node = {
+        "label": "Project",
+        "name": "p",
+        "file_path": "",
+        "start_line": 0,
+        "end_line": 0,
+        "properties": {},
+    }
+    nodes = RadixTree(writer, "nodes").build({"p": node}.items())
+    edges = RadixTree(writer, "edges").build(
+        {("p", "p.missing", "CONTAINS", ""): {"properties": {}}}.items(),
+    )
+    common = {
+        "node_root": nodes.to_json(),
+        "edge_root": edges.to_json(),
+        "nodes": 1,
+        "edges": 1,
+        "graph_digest": graph_digest(nodes, edges),
+        "cbm_project": "p",
+    }
+    writer.commit({"sha": "legacy", "parents": [], **common})
+    writer.commit(
+        {
+            "sha": "current",
+            "parents": ["legacy"],
+            "graph_fidelity_version": GRAPH_FIDELITY_VERSION,
+            **common,
+        },
+    )
+    missing = {**node, "label": "Function", "name": "missing"}
+    nodes = RadixTree(writer, "nodes").apply(nodes, {"p.missing": missing})
+    writer.commit(
+        {
+            "sha": "closed",
+            "parents": ["current"],
+            "node_root": nodes.to_json(),
+            "edge_root": edges.to_json(),
+            "nodes": 2,
+            "edges": 1,
+            "graph_digest": graph_digest(nodes, edges),
+            "graph_fidelity_version": GRAPH_FIDELITY_VERSION,
+            "cbm_project": "p",
+        },
+    )
+    writer.finalize()
+
+    with Archive(path) as archive:
+        with pytest.raises(ArchiveError, match="no verified CBM fidelity"):
+            archive.verify_snapshot("legacy")
+        with pytest.raises(ArchiveError, match="1 missing edge endpoints"):
+            archive.verify_snapshot("current")
+        archive.verify_snapshot("closed")
