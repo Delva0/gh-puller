@@ -69,6 +69,7 @@ async def test_each_group_keeps_the_common_tools_prompt_and_model_contract(monke
 
     async def enter(subject):
         if isinstance(subject, pilot.Workspace):
+            assert subject.cwd == "/work/repo"
             mounts.append(dict(subject.mounts))
         return subject
 
@@ -78,7 +79,7 @@ async def test_each_group_keeps_the_common_tools_prompt_and_model_contract(monke
     async def process(*args):
         return {"exit_code": 0, "stdout": {"text": "fixture-image"}}
 
-    async def checked(workspace, command):
+    async def checked(workspace, command, **kwargs):
         return case["commit"] if command.endswith("rev-parse HEAD") else ""
 
     for cls in (pilot.Workspace, pilot.Web):

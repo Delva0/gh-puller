@@ -57,8 +57,8 @@ def verified_case(path, number, github):
             "source_cutoff": probe["scope"]["cutoff"], "role": "previously-seen-development-pilot"}
 
 
-async def checked(workspace, command):
-    result = json.loads(await workspace.execute(["bash", "-c", command], seconds=180))
+async def checked(workspace, command, *, cwd=None):
+    result = json.loads(await workspace.execute(["bash", "-c", command], seconds=180, cwd=cwd))
     if result["exit_code"]:
         raise RuntimeError(result["stderr"]["text"])
     return result["stdout"]["text"]
@@ -99,6 +99,7 @@ async def run(args):
                 "provider_host": urlsplit(config["base_url"]).hostname, "image": image_id,
                 "limits": asdict(limits), "parameters": config.get("parameters", {}),
                 "max_tokens_field": args.max_tokens_field,
+                "working_directory": "/work/repo",
                 "code_sha256": {path.name: sha256(path.read_bytes()).hexdigest()
                                 for path in Path(__file__).parent.glob("*.py") if not path.name.startswith("test_")},
                 "support_sha256": {str(path): sha256(path.read_bytes()).hexdigest() for path in [
@@ -110,7 +111,7 @@ async def run(args):
     (args.out / "input.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n")
     environment = {"GH_TOKEN": os.environ["GH_TOKEN"]} if os.environ.get("GH_TOKEN") else {}
     workspace = Workspace(args.out / "work", image=image_id, mounts={"/inputs/repository.git": args.git},
-                          environment=environment)
+                          environment=environment, cwd="/work/repo")
     subject = None
     result = {"outcome": "failed"}
     try:
@@ -133,11 +134,11 @@ async def run(args):
             await resources.enter_async_context(workspace)
             sha = shlex.quote(case["commit"])
             await checked(workspace, "git -c safe.directory=/inputs/repository.git clone --shared --no-checkout "
-                          "/inputs/repository.git /work/repo")
+                          "/inputs/repository.git /work/repo", cwd="/work")
             await checked(workspace, f"git -C /work/repo checkout --detach {sha}")
             await checked(workspace, "git -C /work/repo remote set-url origin "
                           + shlex.quote(f"https://github.com/{case['repository']}.git"))
-            actual = await checked(workspace, "git -C /work/repo rev-parse HEAD")
+            actual = await checked(workspace, "git rev-parse HEAD")
             if actual.strip() != case["commit"]:
                 raise ValueError("Workspace checkout does not match the case")
             result["program_versions"] = await checked(

@@ -55,7 +55,7 @@ async def process(arguments, *, data=b"", environment=None, capture_bytes=2 << 2
 
 class Workspace:
     def __init__(self, directory: Path, *, image: str, mounts: dict[str, Path] | None = None,
-                 environment: dict[str, str] | None = None):
+                 environment: dict[str, str] | None = None, cwd: str = "/work"):
         """Own one networked shell environment for an experimental agent session.
 
         Args:
@@ -64,11 +64,13 @@ class Workspace:
             mounts: Container absolute paths mapped to read-only fact directories.
             environment: Explicit container environment, independent of host defaults.
                 Credential values are removed from returned command output.
+            cwd: Default in-container working directory for commands and all relative file paths.
         """
         self.directory = directory.resolve()
         self.image = image
         self.mounts = mounts or {}
         self.environment = dict(environment or {})
+        self.cwd = cwd
         self.script = Path(__file__).resolve()
         self.uv = Path(shutil.which("uv")).resolve()
         self.name = "graphub-v1-" + uuid4().hex
@@ -103,19 +105,19 @@ class Workspace:
             await process(["docker", "rm", "--force", self.name])
             self.opened = False
 
-    async def execute(self, arguments: list[str], *, data: str = "", cwd: str = "/work", seconds: int = 120) -> str:
+    async def execute(self, arguments: list[str], *, data: str = "", cwd: str | None = None, seconds: int = 120) -> str:
         """Execute a command without a program whitelist and return bounded output.
 
         Args:
             arguments: Exact executable and argv inside the container.
             data: UTF-8 stdin, separate from command arguments.
-            cwd: Container working directory; no host path resolution is performed.
+            cwd: Container working directory override; omission uses the configured workspace default.
             seconds: Command deadline. Background descendants remain owned by the
                 container and are removed at session close or cancellation.
         """
         try:
             result = await process([
-                "docker", "exec", "--interactive", "--workdir", cwd, self.name,
+                "docker", "exec", "--interactive", "--workdir", cwd or self.cwd, self.name,
                 "timeout", "--kill-after=2", str(seconds), *arguments,
             ], data=data.encode())
         except asyncio.CancelledError:
@@ -133,7 +135,7 @@ class Workspace:
         from .agent import Tool
 
         async def bash(args):
-            return await self.execute(["bash", "-c", args["command"]], cwd=args.get("cwd", "/work"),
+            return await self.execute(["bash", "-c", args["command"]], cwd=args.get("cwd", self.cwd),
                                       seconds=args.get("timeout_seconds", 120))
 
         async def grep(args):
@@ -142,12 +144,12 @@ class Workspace:
                 argv.append("--ignore-case")
             if args.get("glob"):
                 argv.extend(["--glob", args["glob"]])
-            argv.extend(["--", args["pattern"], args.get("path", "/work")])
+            argv.extend(["--", args["pattern"], args.get("path", self.cwd)])
             return await self.execute(argv)
 
         async def glob(args):
             return await self.execute(["rg", "--files", "--hidden", "--no-ignore", "--glob", args["pattern"],
-                                       "--", args.get("path", "/work")])
+                                       "--", args.get("path", self.cwd)])
 
         def file_handler(operation):
             async def invoke(args):
