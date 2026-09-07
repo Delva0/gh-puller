@@ -39,7 +39,7 @@ if TYPE_CHECKING:
 _NUMBER_AT_END = re.compile(r"/(\d+)$")
 _CATALOG_ACCEPT = "application/vnd.github.raw+json"
 _API_TASK_KINDS = frozenset({"closing-issues", "parent"})
-_GIT_TASK_KINDS = frozenset({"commit-object", "git-refs", "pull-git"})
+_COMMIT_BATCH_SIZE = 256
 IncompleteGitHubDataError = _IncompleteGitHubDataError
 
 
@@ -406,12 +406,7 @@ class GitHubSyncer:
         try:
             while not stop.is_set():
                 git_ready.clear()
-                async with self._store_lock:
-                    tasks = await archive.take_tasks(
-                        cycle_id,
-                        self.config.git_batch_size,
-                        kinds=_GIT_TASK_KINDS,
-                    )
+                tasks = await self._take_git_tasks(archive, cycle_id)
                 if not tasks:
                     if api_done.is_set():
                         break
@@ -425,6 +420,27 @@ class GitHubSyncer:
             stop.set()
             raise
         return failures
+
+    async def _take_git_tasks(
+        self,
+        archive: ObservationArchive,
+        cycle_id: int,
+    ) -> tuple[SyncTask, ...]:
+        async with self._store_lock:
+            refs = await archive.take_tasks(cycle_id, 1, kinds=("git-refs",))
+            if refs:
+                return refs
+            pulls = await archive.take_tasks(
+                cycle_id,
+                self.config.git_batch_size,
+                kinds=("pull-git",),
+            )
+            commits = await archive.take_tasks(
+                cycle_id,
+                _COMMIT_BATCH_SIZE,
+                kinds=("commit-object",),
+            )
+        return (*pulls, *commits)
 
     async def _run_git_tasks(
         self,

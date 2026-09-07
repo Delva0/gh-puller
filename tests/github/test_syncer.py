@@ -306,6 +306,35 @@ async def test_pull_git_and_closing_relations_keep_batched_throughput(tmp_path: 
 
 
 @pytest.mark.asyncio
+async def test_commit_checks_are_batched_independently_from_pull_fetches(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "facts.sqlite3"
+    api = FakeAPI()
+    git = FakeGitStore()
+    api.add_issue(1, pull=True)
+    api.json[f"{_BASE}/pulls/1"] = _pull_detail(1, commits=257)
+    commits = [
+        {"sha": f"{index:040x}", "commit": {"message": f"commit {index}"}}
+        for index in range(1, 258)
+    ]
+    api.comparisons["a" * 40, f"{1:040x}"] = commits
+
+    await _syncer(
+        database,
+        api,
+        git,
+        Clock(_T0),
+        concurrency=1,
+        git_batch_size=8,
+    ).sync()
+
+    assert [len(batch) for batch in git.prefetches] == [1]
+    assert [len(batch) for batch in git.retentions] == [256, 1]
+    assert len({sha for batch in git.retentions for sha in batch}) == 257
+
+
+@pytest.mark.asyncio
 async def test_git_lane_consumes_pr_children_while_a_later_parent_waits(
     tmp_path: Path,
 ) -> None:
