@@ -51,46 +51,32 @@ Sources: [gh_puller/github/observations.py](../gh_puller/github/observations.py)
 
 ### Tasks, parents, and facts
 
-A task is a durable instruction for the writer; a fact observation is archived data.
-`parent` is one task kind, named for the Issue or PR whose comments, events, reviews,
-and other child resources it gathers. It is not a fact hierarchy or a promise that
-every related family is ready.
+A task is durable writer work; a fact observation is archived data. `parent` is the
+task kind that gathers one Issue or PR and its child resources, not a fact hierarchy
+or an all-family readiness marker. Each source operation becomes an atomic,
+idempotent publication; one task may make several, and later tasks may append new
+observations for the same identity.
 
 ```text
 task -> one or more idempotent publications -> fact observations
                                                (family, subject_key)
 ```
 
-One task may publish several fact identities, and later cycles may publish new
-observations for the same identity. Each publication is atomic, but a parent publishes
-its families as their source operations close rather than holding them for one
-Issue/PR-wide transaction.
+| Synchronization task | Scope and durable result |
+| --- | --- |
+| `parent` | Publishes one Issue/PR's applicable [archived facts](#archived-facts), except the deferred families below. A complete `pull` detail enqueues `pull-git`; structured commit IDs enqueue `commit-object`. |
+| `closing-issues` | Publishes `(pull-closing-issues, pull:N)` for each PR in a catalog-page batch. A PR parent without a persisted catalog item enqueues a single-PR equivalent. |
+| `git-refs` | Once per cycle, publishes `(git-refs, repository)`. |
+| `pull-git` | Publishes `(pull-git, pull:N)` for one PR. |
+| `commit-object` | Publishes `(commit-object, commit:SHA)` for one commit; execution may batch tasks. |
 
-| Task kind | Work scope | Direct fact output | Follow-up work |
-| --- | --- | --- | --- |
-| `parent` | One selected Issue or PR | The API and derived families described below | A PR with complete `pull` detail enqueues `pull-git`; structured commit IDs enqueue `commit-object`; a PR without a persisted catalog item also enqueues `closing-issues`. |
-| `closing-issues` | PRs grouped from one catalog page, or one PR without a persisted catalog item | One `(pull-closing-issues, pull:N)` observation per PR | None. |
-| `git-refs` | The repository once per cycle | One `(git-refs, repository)` observation | None. |
-| `pull-git` | One PR | One `(pull-git, pull:N)` observation | None. |
-| `commit-object` | One commit ID; execution may batch many tasks | One `(commit-object, commit:SHA)` observation | None. |
-
-With a readable `issue` root, both Issue and PR parents directly observe `issue`,
-`issue-comments`, `issue-events`, `issue-timeline`, `issue-reactions`, per-comment
-`issue-comment-reactions`, and `commit-references` derived from complete timeline and
-event sources. An Issue parent additionally observes `issue-relations`. A PR parent
-instead adds `pull`, `pull-reviews`, `pull-review-threads`, `pull-review-comments`,
-per-comment `pull-review-comment-reactions`, `pull-commits`, and
-`pull-requested-reviewers`; its complete reviews, review threads, review comments,
-and pull commits also produce `commit-references`.
-
-The catalog page creates one `closing-issues` task for all PR numbers on that page so
-one GraphQL operation can serve several PRs. If a comment signal causes a PR parent
-to run before this cycle has persisted a catalog item for that PR, the parent
-enqueues a single-PR equivalent. Both paths publish the same fact identity.
-
-If the root or a dependency has non-complete coverage, the parent records the
-conclusion it can support and may omit dependent families. Consequently, status
-counts have deliberately operational meanings:
+Both parent kinds defer `commit-object`. A PR parent also defers
+`pull-closing-issues` and `pull-git`. Direct families publish as their operations
+close rather than waiting for an Issue/PR-wide transaction. Per-comment reactions
+require a complete comment family; a non-complete root or dependency records the
+supported conclusion and may omit its dependants. Parent completion therefore means
+the inline workflow reached a terminal state, not that every related fact is ready.
+Status counts therefore have deliberately operational meanings:
 
 | Status field | Meaning |
 | --- | --- |
@@ -104,11 +90,9 @@ Sources: [gh_puller/github/collector.py](../gh_puller/github/collector.py); [gh_
 
 ### Families and API requests
 
-A family is a semantic completeness boundary for readers, not an HTTP endpoint,
-page, or request. One parent task can publish many independently timed families, and
-one family closes only after its transport work reaches a conclusive coverage result.
-Already published sibling families remain readable if later work for the same
-parent fails.
+A family is a semantic completeness boundary, independent of HTTP routing. It closes
+only after its source operation reaches a conclusive coverage result; already
+published sibling families survive a later failure for the same parent.
 
 | Operation shape | Transport work | Published facts |
 | --- | --- | --- |
@@ -118,10 +102,9 @@ parent fails.
 | Count-proven empty collection or structured derivation | No additional API request | A complete derived observation with the source's time window. |
 | Git refs, PR snapshots, or commit reconstruction | Local Git commands and, when needed, Git remote fetches | `git-refs`, `pull-git`, or `commit-object`; no REST/GraphQL request accounting. |
 
-This separation keeps downstream identities stable when routing changes between REST
-and GraphQL, preserves one honest completeness result across pagination, and makes
-publication and retry granular without presenting an entire Issue/PR as one atomic
-snapshot.
+Thus REST/GraphQL routing can change without changing downstream identities, and a
+paginated collection retains one honest completeness result without pretending the
+whole Issue/PR is an atomic snapshot.
 
 Sources: [gh_puller/github/client.py](../gh_puller/github/client.py); [gh_puller/github/collector.py](../gh_puller/github/collector.py)
 
@@ -319,43 +302,31 @@ Transport-specific operations remain on their required quota.
 
 ## Explicit refresh and backfill
 
-Maintenance jobs read declared sources without changing discovery checkpoint `W`.
-They are useful when a research sample must be current despite having no discovery
-signal, or when a finite published history needs a new verification baseline.
+Maintenance jobs reread declared sources without advancing discovery checkpoint `W`.
+They make an unsignalled research sample current or verify a finite published
+history. Their facts use the same IDs and `iter_observations(after=N)` stream as sync
+facts; `maintenance_job_id` and `maintenance_task_id` identify the owning work.
 
-```mermaid
-flowchart TD
-    Request["Declare targets and desired families"] --> Plan["Expand source dependencies"]
-    Plan --> Scope["Persist requested and effective scope"]
-    Scope --> Work["Claim pending tasks"]
-    Work --> Read["Read API or verify Git"]
-    Read --> Publish["Atomically append closed facts"]
-    Publish --> Done{"All tasks have outcomes?"}
-    Done -- "no" --> Work
-    Done -- "yes" --> Close["Close job; leave W unchanged"]
-    Read -- "retryable failure" --> Error["Persist attempt and error"]
-    Error --> Work
+```text
+request -> expand dependencies -> persist plan and tasks -> read/verify -> publish -> close
 ```
 
-Only one maintenance job is active per archive. Its scope, task population, attempts,
-errors, outcomes, and request count are durable. A process restart resumes pending
-tasks. A fact published before interruption is recognized by its publication key and
-is not reread; a retryable failure publishes no substitute fact and therefore cannot
-overwrite the last successful observation.
+One job may be active per archive. Its scope, tasks, attempts, errors, outcomes, and
+request count are durable. Restart resumes pending tasks and reuses facts already
+committed under the job's publication keys. A retryable failure publishes no
+substitute fact, so it cannot replace the last successful observation.
 
-An optional caller idempotency key names one exact request. Reusing it resumes or
-returns that job. Without a key, a matching interrupted job resumes, while every call
-after completion creates a fresh observation. Maintenance facts use the same global
-observation IDs and `iter_observations(after=N)` stream as sync facts. Their
-`maintenance_job_id` and `maintenance_task_id` identify the owning work.
+An optional idempotency key names one exact request: reuse resumes or returns that
+job. Without a key, a matching interrupted job resumes, while a call after completion
+creates fresh observations.
 
 Sources: [gh_puller/github/maintenance.py](../gh_puller/github/maintenance.py); [gh_puller/github/observations.py](../gh_puller/github/observations.py)
 
 ### Targeted refresh
 
-With no `--family`, each numbered target refreshes every applicable live family. An
-explicit `--family` narrows the desired result; the caller selects semantics, while
-the maintainer expands and executes the dependencies needed to support them.
+Without `--family`, each numbered target refreshes every applicable live family.
+Supplying it narrows the desired result; maintenance expands the required source
+dependencies.
 
 | Target | Applicable families |
 | --- | --- |
@@ -364,26 +335,21 @@ the maintainer expands and executes the dependencies needed to support them.
 | Commit ID | `commit-object`; repeats provenance-backed acquisition and reconstruction checks for that exact ID. |
 | Repository | `git-refs`, selected explicitly without a numbered target. |
 
-PR and Issue roots must have at least one complete archived observation. A newer
-`forbidden` or `unavailable` root does not disable an explicit retry. Repeat
-`--pull`, `--issue`, or `--commit` to select several targets. Repeated `--family`
-values form one desired family set: every supplied target kind must match at least
-one value, and every value must match a supplied target.
+PR and Issue roots need at least one complete archived observation; a newer
+`forbidden` or `unavailable` root still permits explicit retry. Repeat `--pull`,
+`--issue`, or `--commit` to select several subjects. Repeated `--family` values form
+one set in which every target kind and every family must have a match.
 
-Every numbered refresh first rereads its `issue` root to confirm current existence
-and Issue/PR kind. Other dependency examples are comments before per-comment
-reactions, PR detail and review threads before review-comment fallback, and all
-applicable structured sources—two for an Issue and six for a PR—before a requested
-`commit-references` or parent-scoped `commit-object` result. A newly observed complete
-structured source is always scanned for its contract-defined commit fields and those
-commits are checked in the Git store. Thus a narrow source refresh does not leave its
-derived reference evidence pending.
+Every numbered refresh rereads its `issue` root to confirm existence and kind.
+Dependencies include comments before their reactions, and PR detail and threads
+before review-comment fallback. A requested `commit-references` or parent-scoped
+`commit-object` result reads all applicable structured sources, scans every newly
+complete source, and checks the resulting commits in Git, closing its derived
+reference evidence in the same plan.
 
-The durable job scope records `requested_families`, `effective_families`, and the raw
-families used for structured-reference scans. An interrupted retry reuses each
-already published source operation within that plan. `catalog-item` remains an
-import-only family and cannot be actively refreshed. A numbered refresh does not
-implicitly refresh repository Git refs.
+The durable scope records `requested_families`, `effective_families`, and raw
+structured sources. Retry reuses published operations in that plan. `catalog-item`
+is import only, and numbered refresh does not implicitly refresh repository Git refs.
 
 ```bash
 uv run -m gh_puller.github refresh \
@@ -509,38 +475,33 @@ refs/github-archive/pulls/<n>/landings/<sha>
 refs/github-archive/commits/<sha>
 ```
 
-The upstream repository is synchronized once per cycle. If a PR head is already in
-that graph, no separate PR fetch is needed. Otherwise the writer fetches the original
-PR head, which preserves open and closed-unmerged histories as well as pre-squash or
-pre-rebase commits when GitHub still exposes them. Batched PR fetches start at
-`--git-batch-size`; structured-commit sources sharing one remote use the same bound.
-Both recursively split on transient transfer failure.
+One `git-refs` task synchronizes upstream per cycle. A PR head already reachable from
+that graph needs no separate fetch; otherwise the writer fetches its original ref,
+preserving unmerged and pre-squash/rebase history while GitHub exposes it. PR fetches,
+and structured-commit sources sharing a remote, start at `--git-batch-size` and
+recursively split on transient transfer failure.
 
-The writer keeps Git lookup cost bounded as evidence accumulates. It packs loose
-refs after 256 additions, runs Git's incremental multi-pack maintenance at 64 pack
-files, and refreshes the commit graph with either operation. These are derived-index
-and physical-layout changes: ref names, object IDs, and SQLite facts do not change.
+After 256 loose refs the writer packs refs; at 64 pack files it runs incremental
+multi-pack maintenance. Both refresh the commit graph and change only Git's derived
+indexes and physical layout, not ref names, object IDs, or SQLite facts.
 
-`comparison_kind=merge_base` names the unique merge base for an offline PR diff.
-`empty_tree` represents unrelated histories. `unavailable` records which required
-objects could not be obtained without claiming a complete diff. A landing ref is
-recorded when GitHub identifies a merged result and that object is available;
-`history_preserved` says whether the original head is its ancestor, not which merge
-button was used.
+`comparison_kind=merge_base` names the unique merge base for an offline PR diff;
+`empty_tree` represents unrelated histories. `unavailable` identifies missing
+required objects without claiming a complete diff. When GitHub identifies an
+available merged result, a landing ref pins it; `history_preserved` says whether the
+original head is its ancestor, not which merge button was used.
 
 The store is ordinary bare Git and uses Git's content-addressed object namespace.
 Different PRs that name the same commit share the same object while SQLite preserves
 their separate relationships.
 
-Structured commit retention checks sources in a bounded order: the managed object
-store, provenance-backed PR or fork branch refs, then the managed upstream branches
-and tags. Before transferring a fork branch, the writer observes its advertised tip
-with bounded parallelism. A missing branch needs no pack transfer; a tip identical to
-the already fetched PR ref reuses that content-addressed history; a different tip is
-fetched normally. It does not guess unrelated repositories. Each attempted source
-records its repository, ref, real time window, outcome, and error when the ref is
-conclusively absent. Authentication and transport failures fall back to the exact ref
-fetch and leave the task retryable instead of being published as object unavailability.
+Structured commit retention checks the managed store, provenance-backed PR or fork
+refs, then upstream branches and tags; it never guesses unrelated repositories. Fork
+tips are preflighted with bounded concurrency: an absent ref avoids a pack transfer,
+an already fetched tip reuses its history, and a different tip is fetched. Every
+attempt records repository, ref, real time window, outcome, and any conclusive error.
+Missing repositories or refs can yield unavailable evidence; authentication and
+transport failures fall back to exact-ref fetch and leave the task retryable.
 
 A schema-two `commit-object` fact separates four claims:
 
@@ -551,14 +512,12 @@ A schema-two `commit-object` fact separates four claims:
 | `history` | The commit, all reachable parents, and their tree/blob closure are locally readable. |
 | `retention` | An immutable `refs/github-archive/commits/<sha>` ref pins the object graph against GC. |
 
-The checks use native Git object traversal. Fact coverage is `complete` only when the
-reachable history closure is complete, `partial` when the endpoint is available but
-the promised closure is not, and `unavailable` when the checked known sources do not
-provide the endpoint. Git LFS payloads and submodule repositories are external to
-that object closure and remain outside this guarantee. Schema-one historical
-`commit-object` facts use the older endpoint/root-tree check; their `complete` value
-does not imply a complete history closure. Backfill emits schema-two evidence rather
-than reinterpreting them.
+Native Git traversal yields `complete` only for a complete reachable-history closure,
+`partial` when the endpoint exists without that closure, and `unavailable` when known
+sources lack the endpoint. Git LFS bytes and submodule repositories remain outside
+the closure. Schema-one `commit-object` facts only checked the endpoint and root tree,
+so their `complete` value does not imply full history; backfill emits schema-two
+evidence instead of reinterpreting them.
 
 Sources: [gh_puller/github/git_store.py](../gh_puller/github/git_store.py); [gh_puller/github/archive_format.py](../gh_puller/github/archive_format.py)
 
@@ -637,15 +596,13 @@ controls are `--concurrency`, `--git-batch-size`, `--overlap-seconds`,
 
 ### Managed Linux service
 
-The systemd helper binds one service to the canonical database path. Its 12-character
-writer ID is the prefix of the SHA-256 digest of that path; the repository is service
-configuration, not part of writer identity. Different databases may have independent
-writers, including writers for the same repository. The archive lock prevents two
-entry points from writing one database.
+The systemd helper binds one service to a canonical database path. Its 12-character
+writer ID is that path's SHA-256 prefix; repository configuration does not affect
+identity. Different databases may have independent writers, even for the same
+repository, while the archive lock keeps each database single-writer.
 
-`install` is privileged because it creates a system unit and a narrowly scoped polkit
-rule. It registers the service disabled and inactive. The bound non-root service user
-can then start, stop, or restart it without `sudo`:
+`install` uses privilege to create a disabled, inactive system unit and narrow polkit
+rule. The bound non-root user can then control it without `sudo`:
 
 ```bash
 sudo scripts/github-puller-daemon.sh install \
@@ -657,9 +614,9 @@ scripts/github-puller-daemon.sh stop archives/vllm.sqlite3
 scripts/github-puller-daemon.sh restart archives/vllm.sqlite3
 ```
 
-`GH_PULLER_SERVICE_USER` selects the owner; under ordinary `sudo`, `SUDO_USER` is the
-default. Reinstalling updates the unit but leaves it stopped. It rejects repository,
-database, or owner rebinding.
+`GH_PULLER_SERVICE_USER` selects the owner and otherwise defaults to `SUDO_USER`.
+Reinstall updates it and leaves it stopped; repository, database, and owner rebinding
+are rejected.
 
 List writers in a narrow table, then inspect one database or writer ID in detail:
 
@@ -672,15 +629,13 @@ scripts/github-puller-daemon.sh watch -n 5 0123456789ab
 scripts/github-puller-daemon.sh logs archives/vllm.sqlite3
 ```
 
-The detail view combines systemd and journald with read-only SQLite state. Its quota
-values are the latest response headers already observed by the writer; status makes
-no GitHub request. `watch` keeps one monitor process alive and reuses archive
-statistics until the database or its WAL changes. `core_aux` is local bookkeeping
-for reaction and requested-reviewer REST routes whose observed headers use a
-different effective window; it is not a promised extra GitHub quota pool. Durable
-discovery, maintenance, task, fact, checkpoint, and last-error state remains visible
-even when no process is running. The operational counters use the definitions in
-[Tasks, parents, and facts](#tasks-parents-and-facts).
+Detail status joins systemd and journald to read-only SQLite state without GitHub
+requests. Quotas are the writer's latest response headers; `core_aux` tracks reaction
+and requested-reviewer REST routes observed with a different effective window, not an
+extra promised pool. `watch` keeps one monitor alive and reuses archive statistics
+until the database or WAL changes. Durable discovery/checkpoint, maintenance,
+task/fact, and last-error state remains visible without a process; counter meanings
+are in [Tasks, parents, and facts](#tasks-parents-and-facts).
 
 `uninstall` removes only the unit and control policy. SQLite, Git objects, `.env`, the
 environment, and source tree remain:
