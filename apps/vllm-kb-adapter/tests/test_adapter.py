@@ -119,6 +119,8 @@ async def test_tools_list_exposes_only_checklist_contract(registry: SnapshotRegi
     assert response["id"] == 7
     assert [tool["name"] for tool in tools] == list(CHECKLIST_TOOLS)
     assert all("version" in tool["inputSchema"]["properties"] for tool in tools)
+    trace = next(tool for tool in tools if tool["name"] == "trace_path")
+    assert "repeat the same call" in trace["description"]
     detect = next(tool for tool in tools if tool["name"] == "detect_changes")
     assert detect["inputSchema"]["required"] == ["project", "diff"]
     assert set(detect["inputSchema"]["properties"]) == {

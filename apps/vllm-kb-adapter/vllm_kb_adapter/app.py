@@ -12,6 +12,7 @@ from vllm_kb_adapter.adapter import Adapter
 from vllm_kb_adapter.upstream import MCPUpstream, UpstreamError
 
 if TYPE_CHECKING:
+    from vllm_kb_adapter.indexing import IndexCoordinator
     from vllm_kb_adapter.snapshots import SnapshotRegistry
 
 
@@ -19,20 +20,24 @@ def create_app(
     registry: SnapshotRegistry,
     upstream: MCPUpstream,
     *,
+    indexes: IndexCoordinator | None = None,
     path: str = "/gh-puller/graph",
 ) -> FastAPI:
     """Assemble the scoped HTTP adapter.
 
     Args:
-        registry: Prebuilt snapshot lookup used for every tool call.
-        upstream: Client for the unchanged gh-puller-mcp service.
+        registry: Immutable snapshot lookup used for every tool call.
+        upstream: Bounded client for ordinary gh-puller-mcp queries.
+        indexes: Optional coordinator for asynchronous missing-index builds.
         path: Public stateless MCP endpoint configured in vllm-kb.
     """
-    adapter = Adapter(registry, upstream)
+    adapter = Adapter(registry, upstream, indexes)
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
         yield
+        if indexes is not None:
+            await indexes.aclose()
         await upstream.aclose()
 
     app = FastAPI(

@@ -1,7 +1,8 @@
 """Implement the scoped vllm-kb MCP contract over versioned graph indexes.
 
-Only tools/list and the six checklist tools are public. Index mutation stays
-in the offline prebuild workflow; online calls resolve an already-built graph.
+Only tools/list and the six checklist tools are public. Offline prebuild is the
+primary indexing path; graph-backed calls queue missing indexes through the
+online coordinator and expose its state in the ordinary tool result.
 """
 
 from __future__ import annotations
@@ -9,7 +10,7 @@ from __future__ import annotations
 import json
 from collections import Counter
 from pathlib import PurePosixPath
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from vllm_kb_adapter.diffs import (
     ChangedFile,
@@ -20,6 +21,9 @@ from vllm_kb_adapter.diffs import (
 from vllm_kb_adapter.normalize import normalize_result
 from vllm_kb_adapter.snapshots import RegistryError, Snapshot, SnapshotRegistry
 from vllm_kb_adapter.upstream import MCPUpstream, structured_content, tool_error_text
+
+if TYPE_CHECKING:
+    from vllm_kb_adapter.indexing import IndexCoordinator, IndexNotice
 
 CHECKLIST_TOOLS = (
     "search_graph",
@@ -36,17 +40,24 @@ _MAX_DEPTH = 10
 
 
 class Adapter:
-    """Route public MCP calls to the matching prebuilt project version."""
+    """Route public MCP calls to the matching project version and index state."""
 
-    def __init__(self, registry: SnapshotRegistry, upstream: MCPUpstream) -> None:
+    def __init__(
+        self,
+        registry: SnapshotRegistry,
+        upstream: MCPUpstream,
+        indexes: IndexCoordinator | None = None,
+    ) -> None:
         """Bind snapshot resolution to an upstream MCP client.
 
         Args:
             registry: Complete immutable production snapshot registry.
-            upstream: Client for the unchanged gh-puller-mcp service.
+            upstream: Bounded client for ordinary gh-puller-mcp queries.
+            indexes: Optional asynchronous coordinator for missing indexes.
         """
         self.registry = registry
         self.upstream = upstream
+        self.indexes = indexes
 
     async def handle(self, request: Any) -> dict[str, Any]:
         """Handle one stateless JSON-RPC request.
@@ -98,6 +109,9 @@ class Adapter:
             return _tool_error(str(exc))
         if name == "detect_changes":
             return await self._detect_changes(snapshot, arguments)
+        notice = await self._prepare_index(snapshot)
+        if notice is not None:
+            return _index_result(notice)
         forwarded = dict(arguments)
         forwarded.pop("version", None)
         forwarded["project"] = snapshot.index_name
@@ -143,6 +157,10 @@ class Adapter:
         }
         if scope == "files" or not changes:
             return _tool_result(base)
+
+        notice = await self._prepare_index(snapshot)
+        if notice is not None:
+            return _index_result(notice)
 
         selected = changes[:_MAX_CHANGED_FILES]
         seed_rows = await self._seed_rows(snapshot, selected)
@@ -222,6 +240,11 @@ class Adapter:
         )
         return _query_rows(result)
 
+    async def _prepare_index(self, snapshot: Snapshot) -> IndexNotice | None:
+        if self.indexes is None:
+            return None
+        return await self.indexes.prepare(snapshot)
+
 
 def _public_tool(tool: dict[str, Any]) -> dict[str, Any]:
     public = dict(tool)
@@ -255,6 +278,12 @@ def _public_tool(tool: dict[str, Any]) -> dict[str, Any]:
         }
         schema["properties"] = properties
         schema["required"] = ["project", "diff"]
+    description = public.get("description")
+    if isinstance(description, str):
+        description += (
+            " A missing selected index returns its asynchronous index_repository state; repeat the same call."
+        )
+        public["description"] = description
     public["inputSchema"] = schema
     return public
 
@@ -321,6 +350,13 @@ def _tool_result(data: dict[str, Any]) -> dict[str, Any]:
         "structuredContent": data,
         "isError": False,
     }
+
+
+def _index_result(notice: IndexNotice) -> dict[str, Any]:
+    data = notice.payload()
+    result = _tool_result(data)
+    result["isError"] = notice.state == "failed"
+    return result
 
 
 def _tool_error(message: str) -> dict[str, Any]:

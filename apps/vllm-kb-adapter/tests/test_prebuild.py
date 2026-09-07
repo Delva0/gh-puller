@@ -5,7 +5,12 @@ from typing import Any
 
 import pytest
 
-from vllm_kb_adapter.prebuild import PrebuildError, audit_indexes, prebuild_all
+from vllm_kb_adapter.prebuild import (
+    PrebuildError,
+    audit_indexes,
+    ensure_bindings,
+    prebuild_all,
+)
 from vllm_kb_adapter.snapshots import SnapshotRegistry
 
 
@@ -83,3 +88,20 @@ async def test_audit_reports_missing_and_mismatched_indexes(
     assert audit.ok is False
     assert audit.mismatched == (mismatched,)
     assert audit.missing == registry.snapshots[2:]
+
+
+@pytest.mark.asyncio
+async def test_online_binding_audit_allows_missing_but_rejects_mismatches(
+    registry: SnapshotRegistry,
+    tmp_path: Path,
+) -> None:
+    missing = await audit_indexes(registry, FakeUpstream({}))
+    ensure_bindings(missing)
+
+    snapshot = registry.snapshots[0]
+    mismatched = await audit_indexes(
+        registry,
+        FakeUpstream({snapshot.index_name: tmp_path / "wrong"}),
+    )
+    with pytest.raises(PrebuildError, match="mismatched"):
+        ensure_bindings(mismatched)

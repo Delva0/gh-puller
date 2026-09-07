@@ -1,4 +1,4 @@
-"""Build and audit every versioned snapshot index before serving traffic."""
+"""Build versioned snapshot indexes and audit their published bindings."""
 
 from __future__ import annotations
 
@@ -48,6 +48,21 @@ def ensure_indexes(audit: IndexAudit) -> None:
     raise PrebuildError(
         f"prebuilt index audit failed; missing=[{missing}] mismatched=[{mismatched}]",
     )
+
+
+def ensure_bindings(audit: IndexAudit) -> None:
+    """Reject index names bound to a source other than their registered snapshot.
+
+    Args:
+        audit: Complete snapshot-to-index comparison.
+
+    Raises:
+        PrebuildError: One or more published indexes point at the wrong source.
+    """
+    if not audit.mismatched:
+        return
+    mismatched = ", ".join(snapshot.index_name for snapshot in audit.mismatched)
+    raise PrebuildError(f"index binding audit failed; mismatched=[{mismatched}]")
 
 
 async def indexed_projects(upstream: MCPUpstream) -> dict[str, Path]:

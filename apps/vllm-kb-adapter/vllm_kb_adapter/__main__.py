@@ -12,10 +12,12 @@ import uvicorn
 from vllm_kb_adapter.adapter import CHECKLIST_TOOLS
 from vllm_kb_adapter.app import create_app
 from vllm_kb_adapter.config import Settings
+from vllm_kb_adapter.indexing import IndexCoordinator
 from vllm_kb_adapter.prebuild import (
+    IndexAudit,
     PrebuildError,
     audit_indexes,
-    ensure_indexes,
+    ensure_bindings,
     prebuild_all,
 )
 from vllm_kb_adapter.snapshots import RegistryError, Snapshot, SnapshotRegistry
@@ -33,7 +35,7 @@ def _parser(settings: Settings) -> argparse.ArgumentParser:
     prebuild.add_argument("--mode", choices=("full", "moderate", "fast"), default="full")
     prebuild.add_argument("--refresh", action="store_true")
 
-    serve = commands.add_parser("serve", help="audit all indexes, then serve the adapter")
+    serve = commands.add_parser("serve", help="audit index bindings, then serve the adapter")
     serve.add_argument("--host", default=settings.host)
     serve.add_argument("--port", type=int, default=settings.port)
     serve.add_argument("--path", default=settings.path)
@@ -56,21 +58,23 @@ async def _prebuild(args, registry: SnapshotRegistry) -> None:
     print(f"prebuild complete: built={len(report.built)} skipped={len(report.skipped)}")
 
 
-async def _audit(args, registry: SnapshotRegistry) -> None:
+async def _audit(args, registry: SnapshotRegistry) -> IndexAudit:
     upstream = MCPUpstream(args.upstream_url, timeout=args.upstream_timeout)
     try:
         audit = await audit_indexes(registry, upstream)
         tools_result = await upstream.request("tools/list", {})
     finally:
         await upstream.aclose()
-    ensure_indexes(audit)
+    ensure_bindings(audit)
     tools = tools_result.get("tools")
     if not isinstance(tools, list):
         raise PrebuildError("upstream tools/list returned no tool list")
     names = {tool["name"] for tool in tools if isinstance(tool, dict) and isinstance(tool.get("name"), str)}
-    missing_tools = [name for name in CHECKLIST_TOOLS if name not in names]
+    required_tools = (*CHECKLIST_TOOLS, "list_projects", "index_repository")
+    missing_tools = [name for name in required_tools if name not in names]
     if missing_tools:
-        raise PrebuildError(f"upstream is missing checklist tools: {', '.join(missing_tools)}")
+        raise PrebuildError(f"upstream is missing required tools: {', '.join(missing_tools)}")
+    return audit
 
 
 def _progress(action: str, snapshot: Snapshot) -> None:
@@ -86,14 +90,17 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "prebuild":
             asyncio.run(_prebuild(args, registry))
             return 0
-        asyncio.run(_audit(args, registry))
+        audit = asyncio.run(_audit(args, registry))
     except (PrebuildError, RegistryError, UpstreamError) as exc:
         print(f"vllm-kb-adapter: {exc}", file=sys.stderr)
         return 1
 
     upstream = MCPUpstream(args.upstream_url, timeout=args.upstream_timeout)
+    index_upstream = MCPUpstream(args.upstream_url, timeout=None)
+    ready = tuple(snapshot for snapshot in registry.snapshots if snapshot not in audit.missing)
+    indexes = IndexCoordinator(index_upstream, ready)
     uvicorn.run(
-        create_app(registry, upstream, path=args.path),
+        create_app(registry, upstream, indexes=indexes, path=args.path),
         host=args.host,
         port=args.port,
     )
