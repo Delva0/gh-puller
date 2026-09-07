@@ -47,6 +47,13 @@ def test_incremental_radix_archive_loads_every_commit(tmp_path):
     archive.verify()
     assert archive.load_rows("c1") == first
     assert archive.load_rows("c2") == changes
+    assert archive.commit_ids() == ("c1", "c2")
+    assert archive.manifest()["sha"] == "c2"
+    manifest = archive.manifest("c2")
+    manifest["parents"].clear()
+    manifest["node_root"]["count"] = 0
+    assert archive.manifest("c2")["parents"] == ["c1"]
+    assert archive.manifest("c2")["node_root"]["count"] == 2
 
 
 def test_networkx_view_preserves_parallel_edge_rows(tmp_path):

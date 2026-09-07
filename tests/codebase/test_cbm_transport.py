@@ -175,6 +175,22 @@ def test_capability_probe_requires_every_delta_control():
     assert "granular-delta-controls" not in capabilities_from_tools_list(result)
 
 
+def test_tool_discovery_follows_every_native_cursor(monkeypatch):
+    transport = object.__new__(PersistentMCPTransport)
+    calls = []
+
+    def request(method, arguments):
+        calls.append((method, arguments))
+        if arguments:
+            return {"tools": [{"name": "index_repository", "inputSchema": {"properties": {"force_full": {}}}}]}
+        return {"tools": [{"name": "search_graph"}], "nextCursor": "next-page"}
+
+    monkeypatch.setattr(transport, "_request", request)
+    assert [tool["name"] for tool in transport.list_tools()] == ["search_graph", "index_repository"]
+    assert calls == [("tools/list", {}), ("tools/list", {"cursor": "next-page"})]
+    assert "force-full-route" in transport.capabilities()
+
+
 @pytest.mark.parametrize("transport_name", ["cli", "persistent-mcp"])
 def test_transport_passes_environment_overrides(tmp_path, transport_name):
     binary = tmp_path / "fake-cbm"

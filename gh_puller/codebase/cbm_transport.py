@@ -411,7 +411,18 @@ class PersistentMCPTransport:
 
     def capabilities(self) -> frozenset[str]:
         """Return capabilities advertised by the live server's index schema."""
-        return capabilities_from_tools_list(self._request("tools/list", {}))
+        return capabilities_from_tools_list({"tools": self.list_tools()})
+
+    def list_tools(self) -> list[dict]:
+        """Return native tool definitions across all advertised MCP cursor pages."""
+        definitions = []
+        arguments = {}
+        while True:
+            result = self._request("tools/list", arguments)
+            definitions.extend(result["tools"])
+            if not result.get("nextCursor"):
+                return definitions
+            arguments = {"cursor": result["nextCursor"]}
 
     def _terminate(self) -> None:
         if self._closed:

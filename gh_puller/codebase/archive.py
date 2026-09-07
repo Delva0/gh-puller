@@ -7,6 +7,7 @@ import os
 import struct
 import zlib
 from collections import OrderedDict
+from copy import deepcopy
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
@@ -590,6 +591,22 @@ class Archive(PageStore):
 
     def __len__(self) -> int:
         return len(self._commits)
+
+    def commit_ids(self) -> tuple[str, ...]:
+        """Return published commit IDs in this reader's captured archive order."""
+        return tuple(item["sha"] for item in self._commits)
+
+    def manifest(self, commit: str | None = None) -> dict:
+        """Return an independent copy of one snapshot's stored provenance and roots.
+
+        Args:
+            commit: Exact archived commit ID. Omission selects the latest commit
+                captured when this reader opened, not a later append by a writer.
+
+        Raises:
+            KeyError: The requested commit is absent from this reader's view.
+        """
+        return deepcopy(self._entries[self.latest_commit if commit is None else commit])
 
     def _records(self, ref: TreeRef | None) -> Iterator[tuple]:
         if ref is None:
