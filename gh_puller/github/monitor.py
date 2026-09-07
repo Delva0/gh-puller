@@ -82,6 +82,7 @@ class ArchiveState:
     discovery_complete: bool
     tasks_completed: int
     tasks_total: int
+    task_counts: tuple[tuple[str, int, int], ...]
     parents_completed: int
     parents_total: int
     observations: int
@@ -278,8 +279,13 @@ def _archive_state(path: Path) -> tuple[ArchiveState | None, str | None]:
             """,
         ).fetchone()
         cycle_id = None if cycle is None else int(cycle["id"])
-        tasks = _counts(connection, "sync_tasks", cycle_id)
-        parents = _counts(connection, "sync_tasks", cycle_id, "kind = 'parent'")
+        task_counts = _task_counts(connection, cycle_id)
+        task_index = {kind: (completed, total) for kind, completed, total in task_counts}
+        tasks = (
+            sum(completed for _, completed, _ in task_counts),
+            sum(total for _, _, total in task_counts),
+        )
+        parents = task_index.get("parent", (0, 0))
         maintenance = _maintenance_state(connection)
         latest = connection.execute(
             """
@@ -327,6 +333,7 @@ def _archive_state(path: Path) -> tuple[ArchiveState | None, str | None]:
                 discovery_complete=(False if cycle is None else bool(cycle["discovery_complete"])),
                 tasks_completed=tasks[0],
                 tasks_total=tasks[1],
+                task_counts=task_counts,
                 parents_completed=parents[0],
                 parents_total=parents[1],
                 observations=int(connection.execute("SELECT COUNT(*) FROM fact_observations").fetchone()[0]),
@@ -358,24 +365,21 @@ def _archive_state(path: Path) -> tuple[ArchiveState | None, str | None]:
             connection.close()
 
 
-def _counts(
+def _task_counts(
     connection: sqlite3.Connection,
-    table: str,
     cycle_id: int | None,
-    condition: str = "1",
-) -> tuple[int, int]:
+) -> tuple[tuple[str, int, int], ...]:
     if cycle_id is None:
-        return 0, 0
-    if table != "sync_tasks" or condition not in {"1", "kind = 'parent'"}:
-        raise ValueError("invalid internal count query")
-    row = connection.execute(
-        f"""
-        SELECT COUNT(completed_at), COUNT(*)
-        FROM sync_tasks WHERE cycle_id = ? AND {condition}
-        """,  # noqa: S608
+        return ()
+    rows = connection.execute(
+        """
+        SELECT kind, COUNT(completed_at), COUNT(*)
+        FROM sync_tasks WHERE cycle_id = ?
+        GROUP BY kind ORDER BY kind
+        """,
         (cycle_id,),
-    ).fetchone()
-    return int(row[0]), int(row[1])
+    )
+    return tuple((str(row[0]), int(row[1]), int(row[2])) for row in rows)
 
 
 def _maintenance_state(connection: sqlite3.Connection) -> MaintenanceState | None:
@@ -495,6 +499,7 @@ def _render_detail(
         ("DISCOVERY", _discovery(archive)),
         ("PARENTS", _parents(archive, 20)),
         ("TASKS", _tasks(archive, 20)),
+        ("GIT TASKS", _git_tasks(archive)),
         ("FACTS", _facts(archive)),
         ("LATEST", _latest(archive, zone)),
         ("QUOTA", _quota(progress, zone)),
@@ -649,6 +654,18 @@ def _tasks(archive: ArchiveState | None, width: int) -> str:
     if archive is None:
         return "-"
     return _meter("tasks", archive.tasks_completed, archive.tasks_total, width)
+
+
+def _git_tasks(archive: ArchiveState | None) -> str:
+    if archive is None:
+        return "-"
+    counts = {kind: (completed, total) for kind, completed, total in archive.task_counts}
+    commits = counts.get("commit-object", (0, 0))
+    pulls = counts.get("pull-git", (0, 0))
+    return (
+        f"commits={commits[0]:,}/{commits[1]:,} "
+        f"pulls={pulls[0]:,}/{pulls[1]:,}"
+    )
 
 
 def _facts(archive: ArchiveState | None) -> str:
