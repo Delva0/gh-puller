@@ -35,5 +35,5 @@ TOOL = ToolDef(
 
 @register
 def list_projects(arguments: dict, config: ServerConfig) -> types.CallToolResult:
-    """List projects：默认透传 CBM 后端；具体定制在此扩展。"""
+    """Pass project listing through to the CBM backend."""
     return passthrough(TOOL, arguments, config)

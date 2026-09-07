@@ -1,11 +1,7 @@
-"""codemap 主线:两阶段 codemap 生成(骨架 → 指南/图),NDJSON 事件流;阶段失败
+"""Generate grounded codemaps as a two-phase NDJSON event stream.
 
-语义与原相同(骨架失败 error 事件;指南/图失败退化为骨架)。
-
-入口 generate_codemap 恒走单一生成器管道(_codemap);本主线专用
-helper:骨架/富化提示词、codemap 引用接地(snippet 权威见 _locate_snippet)。
-跨功能通用 helper 在 utils,经本模块属性调用(utils.xxx 调用时取 ——
-monkeypatch 活性)。
+Skeleton failures emit an error event; enrichment failures retain the usable skeleton.
+Source snippets, rather than model-provided line numbers, anchor citations.
 """
 
 from __future__ import annotations
@@ -17,14 +13,11 @@ from dataclasses import dataclass, field
 
 from ..utils import Repo, _event, _extract_json, _phase
 from . import (
-    utils,  # 模块对象绑定:跨功能 helper 属性调用(monkeypatch 位点活性)
+    utils,  # Keep helper patches visible at call time.
 )
 from .utils import log
 
-# ---------------------------------------------------------------------------
-# 引擎契约 dataclass 族(codemap 主线;零 pydantic,字段名即序化键):
-# wire/落盘 camelCase;wire 契约(出网校验)在 apps/deepwiki-webui/server/schemas.py。
-# ---------------------------------------------------------------------------
+# --- Wire models ---
 
 
 @dataclass
@@ -60,10 +53,16 @@ class CodeMap:
 
 
 def codemap_of(d: dict) -> CodeMap:
-    """dict → CodeMap(递归构造;缺失字段按缺省兜底);坏结构 → ValueError(调用方按失败处理)。
+    """Build a codemap recursively while applying wire-format defaults.
 
-    兜底默认值与旧 pydantic 契约逐字相同(summary/guide/diagram/code = "",steps = [],
-    citation = None),保证 codemap 退化路径与 NDJSON 事件形态不漂移。
+    Args:
+        d: Decoded codemap object with required title, section, and step fields.
+
+    Returns:
+        A codemap whose optional prose, code, and citation fields have stable defaults.
+
+    Raises:
+        ValueError: The decoded object does not satisfy the codemap structure.
     """
     try:
         return CodeMap(
@@ -91,7 +90,7 @@ def codemap_of(d: dict) -> CodeMap:
     except (KeyError, TypeError, AttributeError) as e:
         raise ValueError(f"无效 codemap 数据: {e}") from e
 
-# codemap 生成 - 阶段 1:分析代码并产出 codemap 骨架(带 JSON 输出格式与引用接地规则)
+# Phase one produces a grounded codemap skeleton.
 _CODEMAP_SKELETON_PROMPT = """<role>
 You are an expert code analyst building a "codemap" for the {repo_type} repository: {repo_url} ({repo_name}).
 A codemap is a structured, step-by-step guide that answers a usage/how-to question, where every
@@ -143,7 +142,7 @@ Output ONLY a single JSON object, no markdown fences, no commentary before or af
 Leave every "guide" and "diagram" field as an empty string "" in this phase.
 </output_format>"""
 
-# codemap 生成 - 阶段 2:填充散文指南与 mermaid 图
+# Phase two adds prose guides and Mermaid diagrams.
 _CODEMAP_ENRICH_PROMPT = """<role>
 You are enriching an existing codemap skeleton for the {repo_type} repository: {repo_url} ({repo_name}).
 IMPORTANT: All prose MUST be written in {language_name} language.
@@ -164,13 +163,11 @@ Output ONLY the complete updated JSON object with the same shape as the skeleton
 </output_format>"""
 
 
-# ---------------------------------------------------------------------------
-# codemap 引用接地:模型产出的 snippet 在真实源码里重新定位行号(权威覆盖)
-# ---------------------------------------------------------------------------
+# --- Citation grounding ---
 
 
 def _locate_snippet(text: str, snippet: str) -> tuple[int, int] | None:
-    """在文本中定位 snippet 的 1-based 行号范围(模型给的行号不可靠,snippet 为权威)。"""
+    """Locate a source snippet and return its one-based line range."""
     snippet = snippet.strip("\n")
     if not snippet:
         return None
@@ -188,7 +185,7 @@ def _locate_snippet(text: str, snippet: str) -> tuple[int, int] | None:
 
 
 def _ground_citations(codemap: CodeMap, repo_dir: str) -> None:
-    """用真实源码里的 snippet 位置覆盖每条引用的行号范围(codemap 接地)。"""
+    """Replace model-provided ranges with locations of real source snippets."""
     file_cache: dict[str, str | None] = {}
     for section in codemap.sections:
         for step in section.steps:
@@ -210,23 +207,21 @@ def _ground_citations(codemap: CodeMap, repo_dir: str) -> None:
                 cit.start_line, cit.end_line = loc
 
 
-# ---------------------------------------------------------------------------
-# 实现(单一生成器管道:两阶段整收)
-# ---------------------------------------------------------------------------
+# --- Generation ---
 
 
 async def _codemap(
     *, generator: str | None = None, generator_config: dict | None = None, repo: Repo,
     question: str, language: str = "en",
 ):
-    """两阶段 codemap 生成(骨架 → 指南/图),NDJSON 事件流;阶段失败语义与原相同。"""
+    """Generate a skeleton, enrich it, and yield NDJSON events."""
     yield _phase("analyzing", "start")
     yield _phase("analyzing", "done", chunk_count=0)
 
     fmt = utils.prompt_fmt(repo, language=language)
 
     async def _run_json(prompt: str, attempts: int = 3) -> dict:
-        """整收 + 解析 JSON,失败重试(每轮新生成器);system 恒用骨架提示词。"""
+        """Collect and parse JSON, retrying each attempt in a fresh Agent session."""
         last_error: Exception | None = None
         for attempt in range(1, attempts + 1):
             try:
@@ -243,7 +238,7 @@ async def _codemap(
                 log(f"codemap JSON 解析尝试 {attempt}/{attempts} 失败: {last_error}")
         raise ValueError(f"Model did not return valid JSON after {attempts} attempts: {last_error}")
 
-    # 阶段 1:骨架
+    # Phase one is required for a usable codemap.
     yield _phase("initial_codemap", "start")
     skeleton_prompt = f"{question}"
     try:
@@ -254,7 +249,7 @@ async def _codemap(
         return
     yield _phase("initial_codemap", "done", section_count=len(skeleton.sections))
 
-    # 阶段 2:指南/图;i/骨架失败不致命 — 退化为骨架
+    # Phase two is optional; enrichment failure degrades to the skeleton.
     yield _phase("diagrams", "start")
     enrich_query = (
         f"{question}\n\n<SKELETON>\n{json.dumps(dataclasses.asdict(skeleton))}\n</SKELETON>"
@@ -270,7 +265,7 @@ async def _codemap(
         final = codemap_of(_extract_json(raw))
         yield _phase("diagrams", "done")
     except Exception as e:
-        err = utils.failure(e)  # RequestFailedError 先转「generator 执行失败」再降级(同原包装时序)
+        err = utils.failure(e)
         log(f"codemap 指南/图失败,使用骨架: {err}")
         yield _phase("diagrams", "done", degraded=True)
 
@@ -279,16 +274,22 @@ async def _codemap(
     yield _event(type="done")
 
 
-# ---------------------------------------------------------------------------
-# 服务入口(端点层从 app.py 直呼)
-# ---------------------------------------------------------------------------
-
-
 async def generate_codemap(
     *, generator: str | None = None, generator_config: dict | None = None, repo: Repo,
     question: str, language: str = "en",
 ):
-    """两阶段 codemap 生成(骨架 → 指南/图),NDJSON 事件流;阶段失败语义与原相同;单一生成器管道。"""
+    """Stream a two-phase codemap generation.
+
+    Args:
+        generator: Registered Agent adapter name, or the default when omitted.
+        generator_config: Adapter-specific construction options.
+        repo: Repository to analyze and use for citation grounding.
+        question: Usage question that the codemap should answer.
+        language: Language code for human-readable output.
+
+    Yields:
+        NDJSON phase, codemap, error, and completion events.
+    """
     async for ev in _codemap(
         generator=generator, generator_config=generator_config,
         repo=repo, question=question, language=language,

@@ -1,7 +1,7 @@
-"""提供 GitHub 观测归档的同步、调度与维护命令。
+"""Provide synchronization, scheduling, and maintenance commands for GitHub archives.
 
-调度只决定何时调用同步器；维护任务不推进发现水位。事实时间始终来自实际
-source read，不会被调度边界或维护请求时间改写。
+Scheduling controls only when synchronization runs, and maintenance never advances the
+discovery watermark. Fact timestamps always come from actual source reads.
 """
 
 from __future__ import annotations

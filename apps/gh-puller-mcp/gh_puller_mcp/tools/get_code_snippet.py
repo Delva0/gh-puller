@@ -39,5 +39,5 @@ TOOL = ToolDef(
 
 @register
 def get_code_snippet(arguments: dict, config: ServerConfig) -> types.CallToolResult:
-    """Get code snippet：默认透传 CBM 后端；具体定制在此扩展。"""
+    """Pass code-snippet reads through to the CBM backend."""
     return passthrough(TOOL, arguments, config)

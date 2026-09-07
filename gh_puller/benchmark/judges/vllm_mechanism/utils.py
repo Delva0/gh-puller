@@ -1,27 +1,23 @@
-"""vllm_mechanism 题库的自动评测配置:评分维度、提示词组装、判定解析、Claude 工具授权。
+"""Configure scoring dimensions, prompts, and verdict parsing for this bank."""
 
-LLM/Claude 评测器为半抽象基础设施,evaluate 机制由基类提供,评测内容
-(本文件)由题库提供并挂接为子类扩展点;扩展点即本题库的专属评判规则。
-"""
-
-# 自动评测共用的评分维度(每维 0-10)
+# Shared 0-10 scoring dimensions for automated evaluators.
 DIMENSIONS = {
-    "code_essence": "接近代码细节与本质",  # 是否触及核心机制/代码级细节
+    "code_essence": "接近代码细节与本质",
     "detail": "内容详细度",
-    "file_links": "文件链接数量",  # 具体文件/文档链接(如 vllm/vllm/attention/...)
+    "file_links": "文件链接数量",
     "time_precision": "时间精确到 commit/版本",
     "accuracy": "最终答案准确",
     "logic_depth": "补充问题背后的逻辑",
     "latent_need": "解决提问者潜在需求",
 }
 
-# Claude 评测器工具授权配置:本题库纯评分,不授任何工具;需要时在此扩展
+# This bank grants its Claude evaluator no tools.
 MCP_SERVERS: dict = {}
 SKILLS: list = []
 
 
 def auto_system_prompt() -> str:
-    """自动评测器的评分规则,随 DIMENSIONS 变动。"""
+    """Build scoring instructions from ``DIMENSIONS``."""
     dims = "\n".join(f"- {k}: {v}" for k, v in DIMENSIONS.items())
     return (
         "你是 vLLM 技术知识评测的评分员,负责评判参赛方对给定题目的回答。\n"
@@ -34,7 +30,7 @@ def auto_system_prompt() -> str:
 
 
 def auto_user_prompt(question: str, ref: str, answer: str) -> str:
-    """自动评测的单题请求(题目 + 参考答案要点 + 参赛方回答 + JSON 输出规格)。"""
+    """Build one evaluation request with its required JSON output shape."""
     keys = ", ".join(DIMENSIONS)
     return (
         f"题目:\n{question}\n\n参考答案要点:\n{ref}\n\n参赛方回答:\n{answer}\n\n"
@@ -46,7 +42,7 @@ def auto_user_prompt(question: str, ref: str, answer: str) -> str:
 
 
 def coerce_verdict(data) -> dict:
-    """自动评测输出规范化:维度补齐/限幅 0-10、overall 限幅、reason 兜底;结构不合法时抛异常由调用方降级。"""
+    """Validate a verdict, fill dimensions, and clamp numeric scores to 0-10."""
     if not isinstance(data, dict):
         raise TypeError("评测输出不是 JSON 对象")
     dims = data.get("dimensions")

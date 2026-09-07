@@ -106,7 +106,7 @@ export const closeWebSocket = (ws: WebSocket | null): void => {
 
 /* ------------------------------------------------------------------ *
  *  Codemap: source-grounded step-by-step guide generation             *
- *  (领域类型上收 @gh-puller/ui 的 types/codemap,此处再导出,既有消费零改动) *
+ *  Domain types are re-exported from @gh-puller/ui for compatibility. *
  * ------------------------------------------------------------------ */
 
 import type {

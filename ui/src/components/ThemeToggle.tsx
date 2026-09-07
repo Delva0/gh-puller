@@ -13,10 +13,9 @@ export default function ThemeToggle() {
       aria-label="Toggle theme"
       onClick={() => setTheme(resolvedTheme === 'dark' ? 'light' : 'dark')}
     >
-      {/* 日/月图标可见性由 theme.css 的 [data-theme] 规则控制,类名必须保持静态(theme-agnostic):
-          SSR 时 theme 为 undefined、客户端首渲染却是 localStorage 解析值,把 theme 写进 className 必然水合不一致。
-          Dark Reader 等扩展会在水合前给初始渲染的 svg 注入 --darkreader-inline-stroke 等属性,
-          所有新加入初始 SSR 树的 svg 元素(根与每个带 stroke 的子元素)都必须带 suppressHydrationWarning */}
+      {/* CSS controls icon visibility so class names remain stable across SSR and hydration.
+          Browser extensions may inject SVG attributes before hydration, so every SVG element
+          in the initial tree that carries a stroke must suppress hydration warnings. */}
       <div className="relative w-5 h-5">
         {/* Sun icon (light mode) */}
         <div className="theme-toggle-sun absolute inset-0 transition-opacity duration-300">

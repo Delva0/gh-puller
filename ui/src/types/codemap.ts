@@ -1,4 +1,4 @@
-// codemap 领域类型(CodeMap/CodeViewer 组件契约;ws/HTTP 传输层复用)
+// Domain types shared by CodeMap, CodeViewer, and WebSocket/HTTP transports.
 export interface CodemapCitation {
   file_path: string;
   start_line: number | null;

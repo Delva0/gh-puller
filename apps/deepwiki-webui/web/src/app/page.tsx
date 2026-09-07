@@ -63,7 +63,7 @@ export default function Home() {
         if (config) {
           setSelectedLanguage(config.selectedLanguage || lang);
           setIsComprehensiveView(config.isComprehensiveView === undefined ? true : config.isComprehensiveView);
-          // 公开 target 仅存 generator/provider/model;凭证从当前标签页 sessionStorage 合并
+          // Persist the public target only; merge credentials from this tab.
           const creds = loadCreds(repoUrl);
           setTarget({
             generator: config.generator || '',
@@ -101,7 +101,7 @@ export default function Home() {
     }
   }, []);
 
-  // Target(generator/provider/model)选择状态;配置模态里编辑,凭证仅存会话
+  // Generation target configured by the modal; credentials remain in this session.
   const [target, setTarget] = useState<TargetConfig>({ generator: '', provider: '', model: '' });
 
   // Wiki type state - default to comprehensive view
@@ -127,7 +127,7 @@ export default function Home() {
     setLang(selectedLanguage as Lang);
   }, [selectedLanguage, setLang]);
 
-  // 语言检测在水合后异步生效,lang 会从初始 en 切换为检测值;此时同步 selectedLanguage(用户未手动改配置时)
+  // Language detection updates after hydration; keep the selection in sync.
   useEffect(() => {
     setSelectedLanguage(lang);
   }, [lang]);
@@ -292,7 +292,7 @@ export default function Home() {
       const currentRepoUrl = repositoryInput.trim();
       if (currentRepoUrl) {
         const existingConfigs = JSON.parse(localStorage.getItem(REPO_CONFIG_CACHE_KEY) || '{}');
-        // localStorage 只持久化公开三元组;凭证单独存当前标签页 sessionStorage
+        // Persist only the public target; keep credentials in this tab.
         const configToSave = {
           selectedLanguage,
           isComprehensiveView,
@@ -337,8 +337,9 @@ export default function Home() {
     } else {
       params.append('repo_url', encodeURIComponent(repositoryInput));
     }
-    // Add public target params(凭证不进 URL,经 sessionStorage 由会话内页面读取;
-    // file 类 = config_path;object 类 = provider/model —— 空参由服务端 env 缺省解析)
+    // Keep credentials out of the URL; the repository page reads them from
+    // session storage. File-backed targets use config_path, while object-backed
+    // targets use provider/model; empty values defer to server defaults.
     params.append('generator', target.generator);
     params.append('config_path', target.config_path || '');
     params.append('provider', target.provider || '');

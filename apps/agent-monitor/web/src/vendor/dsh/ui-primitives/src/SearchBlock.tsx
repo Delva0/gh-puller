@@ -41,9 +41,8 @@ export interface SearchFileGroup {
 interface SearchBlockCommon {
   /**
    * Whether the tool capped the inline result: the shape carries only the
-   * retained results, not every result the search found. The banner summary
-   * folds the pre-cap `total` in (`显示 X / 共 N …`) so the card never presents a
-   * capped result as complete.
+   * retained results, not every result the search found. The banner includes
+   * the pre-cap `total` so it never presents a capped result as complete.
    */
   truncated: boolean
   /** Total results the search found before capping (equals the retained count when not `truncated`). */
@@ -111,11 +110,8 @@ function shownCount(props: SearchBlockProps): number {
 }
 
 /**
- * The banner summary. When the search was capped it reads `显示 X / 共 N …` so
- * the retained count and the pre-cap total sit in one clause (mirroring the read
- * card's `显示 X / Y 行`); when it was not capped it is a plain count of what the
- * card holds. The unit — `处匹配 · K 个文件` for grep, `个路径` for glob — trails
- * the count either way.
+ * Build the localized banner summary. Capped results show the retained and
+ * pre-cap counts together; complete results show only the retained count.
  * @param props - the card's props.
  * @param shown - the retained result count from {@link shownCount}.
  * @param truncated - whether the search was capped.

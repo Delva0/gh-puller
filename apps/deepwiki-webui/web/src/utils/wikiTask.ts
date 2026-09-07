@@ -23,7 +23,7 @@ export interface WikiTaskSubmitRequest {
   repo: string;
   comprehensive?: boolean;
   token?: string;
-  /** 统一 target(generator/provider/model + 请求态凭证);嵌套下发,不再用扁平 provider/model */
+  /** Unified generation target, including request-scoped credentials. */
   target?: import('@gh-puller/ui').TargetConfig;
   language?: string;
   excluded_dirs?: string;
@@ -38,7 +38,8 @@ export interface WikiTaskSubmitResult {
   created: boolean;
   joined: boolean;
   from_cache: boolean;
-  resumed?: boolean; // 从落盘生成状态续跑(更新后与进程重启后再次提交)
+  /** Whether generation resumed from persisted state. */
+  resumed?: boolean;
 }
 
 export interface WikiTaskPageDto {

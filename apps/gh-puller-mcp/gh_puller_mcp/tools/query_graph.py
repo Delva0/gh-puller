@@ -55,5 +55,5 @@ TOOL = ToolDef(
 
 @register
 def query_graph(arguments: dict, config: ServerConfig) -> types.CallToolResult:
-    """Query graph：默认透传 CBM 后端；具体定制在此扩展。"""
+    """Pass graph queries through to the CBM backend."""
     return passthrough(TOOL, arguments, config)

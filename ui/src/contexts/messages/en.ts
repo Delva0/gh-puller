@@ -1,5 +1,4 @@
-// 共享包英文文案(扁平键):监控面板 + 共享组件(配置表单/wiki 型选择等);
-// zh 缺键回退 en,再由键名兜底
+// Flat English catalog for the monitor and shared controls; zh falls back to en, then the key.
 export default {
   'app.title': 'Agent Monitor',
   'sidebar.search': 'Search sessions…',
@@ -52,7 +51,7 @@ export default {
   'meta.steps': 'steps',
   'meta.chars': 'chars',
   'meta.usage': 'tokens',
-  // 共享组件(配置表单/wiki 型选择等)文案:从 deepwiki-webui extraMessages 上收
+  // Shared control messages for configuration and wiki selectors.
   'common.cancel': 'Cancel',
   'common.generateWiki': 'Generate Wiki',
   'common.processing': 'Processing...',

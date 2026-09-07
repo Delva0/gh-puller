@@ -1,9 +1,4 @@
-"""评测管线（单点评测）：导入题库模块 → 资格检查 → 注入 ask → 收集 judgment → 单文件存档。
-
-一次运行 = 一个题库文件（--bank）+ 一个参赛方 endpoint（--url）。
-框架只认识三样东西：ask 接口签名、题库导出的 JUDGE、judge 返回的 judgment（原样存档）。
-题目形态、参考答案、评判逻辑、输出结构——全部由题库（出题人）自拟，框架零认知。
-"""
+"""Run one question bank against one endpoint and persist its opaque verdict."""
 
 import argparse
 import asyncio
@@ -21,17 +16,17 @@ from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_ex
 
 from gh_puller.benchmark.protocol import ASK_PATH, OPENAPI_PATH, RESPONSE_SCHEMA
 from gh_puller.benchmark.types import Answer
-from gh_puller.envs import TIMEOUT  # 单题超时（秒，1 小时），全局统一入口
+from gh_puller.envs import TIMEOUT
 
-RETRY_ATTEMPTS = 3  # 连接类错误的重试次数（调用方行为，非协议）
+RETRY_ATTEMPTS = 3
 
-# ---------- 数据模型 ----------
+# --- Results ---
 
 
 @dataclass
 class EligibilityResult:
-    valid: bool  # 端口是否合法（通过资格检查）
-    detail: str  # 探测诊断信息（终端展示用）
+    valid: bool
+    detail: str
 
 
 @dataclass
@@ -39,16 +34,16 @@ class BenchResult:
     name: str
     url: str
     valid: bool
-    invalid_reason: str = ""  # 非法原因（出局理由）；合法时为空
-    judgment: Any = None  # judge 原样输出；裁判异常时为空
+    invalid_reason: str = ""
+    judgment: Any = None
     judge_error: str = ""
 
 
-# ---------- 题库模块导入（插件式） ----------
+# --- Question-bank loading ---
 
 
 def load_bank(path: str | Path) -> ModuleType:
-    """导入用户题库文件（任意路径），仅取 JUDGE，不碰任何题目数据。"""
+    """Load a question-bank module from any path and validate its ``JUDGE`` export."""
     path = Path(path).resolve()
     if not path.is_file():
         raise SystemExit(f"题库文件不存在：{path}")
@@ -56,26 +51,26 @@ def load_bank(path: str | Path) -> ModuleType:
     module = importlib.util.module_from_spec(spec)
     try:
         spec.loader.exec_module(module)
-    except Exception as e:  # 出题人代码出错，给出清晰报错
+    except Exception as e:  # Preserve the bank failure as a concise CLI error.
         raise SystemExit(f"题库模块执行出错：{type(e).__name__}: {e}") from e
     if not callable(getattr(module, "JUDGE", None)):
         raise SystemExit(f"题库文件必须导出 JUDGE（async 可调用对象）：{path}")
     return module
 
 
-# ---------- 路由探测与资格检查 ----------
+# --- Endpoint qualification ---
 
 
 async def _discover_route(client: httpx.AsyncClient, base_url: str) -> tuple[str, str]:
-    """探测 /ask 是否存在，返回 (status, detail)，status ∈ ok | no_route | unreachable。"""
-    # 优先读 openapi.json 声明
+    """Return route status as ``ok``, ``no_route``, or ``unreachable``."""
+    # Prefer an explicit OpenAPI route declaration.
     try:
         r = await client.get(f"{base_url}{OPENAPI_PATH}")
         if r.status_code == 200 and r.json().get("paths", {}).get(ASK_PATH, {}).get("post"):
             return "ok", f"openapi.json 声明了 {ASK_PATH}"
     except (httpx.HTTPError, ValueError):
         pass
-    # fallback：向 /ask 发探测请求；404 视为路由缺失，其余 4xx 视为路由存在（拒收探测请求）
+    # A non-404 response proves the fallback probe reached an ``/ask`` handler.
     try:
         r = await client.post(f"{base_url}{ASK_PATH}", json={"question": "ping"})
     except httpx.HTTPError:
@@ -86,7 +81,7 @@ async def _discover_route(client: httpx.AsyncClient, base_url: str) -> tuple[str
 
 
 async def check_eligibility(client: httpx.AsyncClient, base_url: str) -> EligibilityResult:
-    """两步资格检查：路由探测 + 冒烟测试。任一失败即取消参赛资格。"""
+    """Qualify an endpoint through route discovery and a schema-checked smoke test."""
     status, detail = await _discover_route(client, base_url)
     if status != "ok":
         return EligibilityResult(False, detail)
@@ -104,7 +99,7 @@ async def check_eligibility(client: httpx.AsyncClient, base_url: str) -> Eligibi
     return EligibilityResult(True, detail)
 
 
-# ---------- ask 封装（参赛方接口注入） ----------
+# --- Participant endpoint ---
 
 
 @retry(
@@ -114,7 +109,7 @@ async def check_eligibility(client: httpx.AsyncClient, base_url: str) -> Eligibi
     reraise=True,
 )
 async def _post_ask(client: httpx.AsyncClient, base_url: str, question: str) -> dict:
-    """发单题请求；仅连接类错误（含超时）重试，HTTP 错误不重试。"""
+    """Post one question, retrying transport failures but not HTTP errors."""
     r = await client.post(f"{base_url}{ASK_PATH}", json={"question": question}, timeout=TIMEOUT)
     if r.status_code != 200:
         raise httpx.HTTPStatusError(str(r.status_code), request=r.request, response=r)
@@ -122,7 +117,7 @@ async def _post_ask(client: httpx.AsyncClient, base_url: str, question: str) -> 
 
 
 def make_ask_fn(client: httpx.AsyncClient, base_url: str):
-    """参赛方接口封装：async ask(question) -> Answer；异常向上抛，由 judge 自行处理。"""
+    """Bind a participant endpoint to the ``async ask(question)`` bank contract."""
 
     async def ask(question: str) -> Answer:
         body = await _post_ask(client, base_url, question)
@@ -132,7 +127,7 @@ def make_ask_fn(client: httpx.AsyncClient, base_url: str):
     return ask
 
 
-# ---------- 评测 ----------
+# --- Evaluation ---
 
 
 async def run_benchmark(module: ModuleType, url: str, name: str) -> BenchResult:
@@ -148,23 +143,23 @@ async def run_benchmark(module: ModuleType, url: str, name: str) -> BenchResult:
         try:
             judgment = await judge(make_ask_fn(client, url))
             return BenchResult(name, url, True, judgment=judgment)
-        except Exception as e:  # 裁判异常：评测仍完成并出存档
+        except Exception as e:  # Preserve judge failures in the result archive.
             print(f"  → 裁判异常：{type(e).__name__}: {e}", flush=True)
             return BenchResult(name, url, True, judge_error=f"{type(e).__name__}: {e}")
 
 
-# ---------- 单文件存档 ----------
+# --- Persistence ---
 
 
 def write_result(result: BenchResult, out_dir: Path) -> Path:
-    """judge 完成后单对象序列化存档；judgment 不可序列化时兜底转 repr。"""
+    """Write one result, using ``repr`` for opaque non-JSON verdict values."""
     out_dir.mkdir(parents=True, exist_ok=True)
-    path = out_dir / "result.json"  # 固定文件名,时间维度由输出目录（默认 outputs/<时间戳>）承担
+    path = out_dir / "result.json"
     path.write_text(json.dumps(asdict(result), ensure_ascii=False, indent=2, default=repr))
     return path
 
 
-# ---------- CLI ----------
+# --- CLI ---
 
 
 def main() -> None:
@@ -176,7 +171,7 @@ def main() -> None:
         "--out-dir",
         type=Path,
         default=Path("outputs") / datetime.now(UTC).strftime("%Y%m%d_%H%M%S"),
-    )  # 输出目录，默认 outputs/<时间戳>（parse_args 时求值一次，每次运行独立目录）
+    )
     args = ap.parse_args()
 
     module = load_bank(args.bank)

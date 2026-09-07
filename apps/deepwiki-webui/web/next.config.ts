@@ -5,7 +5,7 @@ const TARGET_SERVER_BASE_URL = process.env.SERVER_BASE_URL || 'http://localhost:
 const nextConfig: NextConfig = {
   /* config options here */
   output: 'standalone',
-  // 消费共享包 @gh-puller/ui 纯源码组件(无构建,exports 直指 ui/src/index.ts)
+  // The shared UI package exports source directly, so Next.js must transpile it.
   transpilePackages: ['@gh-puller/ui'],
   // Optimize build for Docker
   experimental: {

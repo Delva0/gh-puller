@@ -6,7 +6,7 @@ import TargetSelector from './TargetSelector';
 import TokenInput from './TokenInput';
 import type { TargetConfig } from './target';
 
-// UI 语言域收窄为 en/zh(仅此两语种有语言包;多语言由后端生成 wiki 时按 selectedLanguage 定)
+// UI localization supports en/zh; selectedLanguage independently controls generated wiki output.
 const SUPPORTED_LANGUAGES: Record<string, string> = { en: 'English', zh: 'Mandarin Chinese (中文)' };
 
 interface ConfigurationModalProps {
@@ -24,7 +24,7 @@ interface ConfigurationModalProps {
   isComprehensiveView: boolean;
   setIsComprehensiveView: (value: boolean) => void;
 
-  // Target (generator/provider/model + 请求态凭证)
+  // Target selection, including request-scoped credentials
   target: TargetConfig;
   setTarget: (value: TargetConfig) => void;
 

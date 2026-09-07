@@ -1,67 +1,50 @@
-"""全局运行参数(统一入口):gh_puller 包内环境变量单点在读,deepwiki/agent/graphify/benchmark 共用。
+"""Read process-wide configuration shared by ``gh_puller`` subpackages.
 
-deepwiki 引擎(以及其调用的子流程)的 env 缺省不直接读 os.environ,一律从本模块
-import 常量;子进程注入/直读类变量(FALKORDB_PASSWORD 等)与凭证类进程环境由
-各自消费方直读,不在本模块。
-benchmark 评测相关 key 见文末分节。
-
-仅各 app 消费的 env 不在本模块(归属各自的 app 模块,app 侧自行快照)。
-
-已删除的历史快照(常量无消费方;env 变量名仍有效):
-- 凭证/模型名组 ANTHROPIC_API_KEY / ANTHROPIC_BASE_URL、OPENAI_API_KEY / OPENAI_BASE_URL、
-  DEEPSEEK_API_KEY / DEEPSEEK_BASE_URL、CC_MODEL / DSH_MODEL / CODEX_MODEL / LLM_MODEL ——
-  由 agent SDK/生成器直读进程环境(app 侧 load_dotenv 兜底),说明见 apps/deepwiki-webui/web/README.md;
-- 死名 DEEPWIKI_PROVIDER、GRAPHIFY_OUT、GRAPHIFY_MCP_PYTHON(webui 图封装层退役:
-  消费方 apps/deepwiki-webui/server/generators.py 已迁 gh-puller-mcp)、AGENT_MONITOR_PORT(退役)。
+Values are captured at import time. Credentials and settings owned by one application
+remain with that application or its underlying SDK.
 """
 
 import os
 
-# ---- DSH process locations ----
-DSH_HOME = os.path.expanduser(os.environ.get("DSH_HOME", "~/.gh-puller/dsh-home"))
-DSH_BIN = os.path.expanduser(os.environ.get("DSH_BIN", ""))
-DSH_SESSION_ROOT = os.path.expanduser(os.environ.get("DSH_SESSION_ROOT", "~/.gh-puller/dsh-sessions"))
-# runtime 进程 cwd(也是它读取 .env 的加载点):必须远离任务 checkout —— 仓库自带
-# .env(可含 DEEPSEEK_*/其它字面键)会注入子进程(隔离链上唯一真实泄漏口,runtime_cwd
-# 缺省 = 任务仓库 cwd)。cc 路径无此面(SDK 不做 cwd .env 加载)。
-DSH_RUNTIME_CWD = os.path.expanduser(os.environ.get("DSH_RUNTIME_CWD", "~/.gh-puller/dsh-runtime"))
 
-# ---- 产物根目录:repos/ 克隆目录、图产物索引根、wiki/ 缓存容器(内部按项目分 <repo_key>/ 文件夹) ----
-DEEPWIKI_ROOT = os.path.expanduser(os.environ.get("DEEPWIKI_ROOT", "~/.gh-puller/deepwiki"))
+def _path(name: str, default: str) -> str:
+    return os.path.expanduser(os.environ.get(name, default))
 
-# ---- chat 输入上限的粗略估算(不引 tiktoken:以字符数/4 近似 token) ----
+
+# --- Agent adapters ---
+
+DSH_HOME = _path("DSH_HOME", "~/.gh-puller/dsh-home")
+DSH_BIN = _path("DSH_BIN", "")
+DSH_SESSION_ROOT = _path("DSH_SESSION_ROOT", "~/.gh-puller/dsh-sessions")
+# DSH loads .env from its runtime directory, so keep it outside task checkouts.
+DSH_RUNTIME_CWD = _path("DSH_RUNTIME_CWD", "~/.gh-puller/dsh-runtime")
+
+
+# --- DeepWiki ---
+
+DEEPWIKI_ROOT = _path("DEEPWIKI_ROOT", "~/.gh-puller/deepwiki")
+# Chat estimates tokens as four characters each and avoids a tokenizer dependency.
 CHAT_TOKEN_LIMIT_ESTIMATE = int(os.environ.get("DEEPWIKI_CHAT_TOKEN_LIMIT", "7500"))
 
-# ---- agent 流式监控(文件观测默认恒开;Web/WS 经 AGENT_MONITOR_WEBUI_URL,OTel 经 AGENT_MONITOR_PHOENIX_URL) ----
-# 两 URL 均逗号分隔多地址(每地址一个 sink 实例,预留);空 → 不启用该类 sink。
-# 新 OTel 后端(如 AGENT_MONITOR_LANGFUSE_URL,默认 "")= 此处一个常量 + sinks._OTEL_BACKENDS 表一条。
-# 该目录即会话 jsonl 落盘根(无 sessions 子层):~/.gh-puller/generator-sessions/<uuid>.jsonl;
-# hub(apps/agent-monitor/server/hub.py)为同一目录的读端(共享契约,单点在本模块)。
-AGENT_MONITOR_DIR = os.path.expanduser(os.environ.get("AGENT_MONITOR_DIR", "~/.gh-puller/generator-sessions"))
-# 文件 sink 事件粒度开关:0(缺省)→ 非流式事件流投影(逐行跳过 assistant/chunk,
-# 防日志膨胀;文件 seq 允许洞);1 → 原始事件流(全量 taxonomy 逐行落盘,seq 稠密)
+
+# --- Agent monitoring ---
+
+# The file sink and monitor hub share this flat directory of session JSONL files.
+AGENT_MONITOR_DIR = _path("AGENT_MONITOR_DIR", "~/.gh-puller/generator-sessions")
+# Compact logs omit model deltas; raw logs retain the complete event sequence.
 AGENT_MONITOR_FILE_RAW = os.environ.get("AGENT_MONITOR_FILE_RAW", "0") == "1"
-# 默认 = 内部 agent-monitor hub(apps/agent-monitor;hub 端口经 uvicorn CLI --port 指定,默认 8765)
 AGENT_MONITOR_WEBUI_URL = os.environ.get("AGENT_MONITOR_WEBUI_URL", "ws://localhost:8765/ws")
-# 会话心跳:静默超时(无落盘事件)的补发间隔。租约判态见 gh_puller/agent/events.py 会话
-# 保活;LEASE 缺省在 hub 侧 AGENT_MONITOR_LEASE_SECS,需 ≥ 3~5×HEARTBEAT,HEARTBEAT=0
-# 可退化为纯事件 mtime 语义。
+# Zero disables heartbeats; the monitor lease should remain several times longer.
 AGENT_MONITOR_HEARTBEAT_SECS = int(os.environ.get("AGENT_MONITOR_HEARTBEAT_SECS", "30"))
-# 启用条件:端点可达(ensure_bus 构建时 TCP 探活)+ opentelemetry 可导入
 AGENT_MONITOR_PHOENIX_URL = os.environ.get("AGENT_MONITOR_PHOENIX_URL", "http://localhost:6006/")
-# OTel 导出 service.name(缺省 gh-puller;OtelSink 构建读用)
 OTEL_SERVICE_NAME = os.environ.get("OTEL_SERVICE_NAME", "gh-puller")
 
-# ---- benchmark 评测(单题超时/评测器选择与端点) ----
-TIMEOUT = 3600.0  # 单题超时(秒,1 小时):参赛方 ask 与评测器评分的统一上限
 
-# 评测器选择:claude 切到 Claude Code 评测器;缺省 LLM 评测器
+# --- Benchmark ---
+
+TIMEOUT = 3600.0  # Shared limit for participant requests and evaluator calls.
 JUDGE_EVALUATOR = os.environ.get("JUDGE_EVALUATOR", "llm")
-
-# LLM 评测器:vLLM OpenAI 兼容端点与评分模型(可被构造参数覆盖)
 LLM_JUDGE_URL = os.environ.get("LLM_JUDGE_URL", "http://localhost:8000/v1")
 LLM_JUDGE_MODEL = os.environ.get("LLM_JUDGE_MODEL", "Qwen2.5-7B-Instruct")
-LLM_JUDGE_API_KEY = os.environ.get("LLM_JUDGE_API_KEY", "")  # 端点认证密钥,留空不发 Authorization
-
-# Claude 评测器:评分模型(缺省用 SDK 默认模型;凭证由 SDK 直读进程环境)
+LLM_JUDGE_API_KEY = os.environ.get("LLM_JUDGE_API_KEY", "")
 CLAUDE_JUDGE_MODEL = os.environ.get("CLAUDE_JUDGE_MODEL", "")

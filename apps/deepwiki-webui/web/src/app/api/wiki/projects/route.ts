@@ -16,7 +16,7 @@ interface DeleteProjectCachePayload {
   repo: string;
   repo_type: string;
   language: string;
-  /** 公开 target 摘要(列尾 digest8;缺省=旧格式无摘要缓存) */
+  /** Public target digest suffix; absent for legacy cache entries. */
   digest?: string;
 }
 

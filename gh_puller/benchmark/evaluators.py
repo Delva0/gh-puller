@@ -1,20 +1,8 @@
-"""评测器(自动化评测基础设施):LLM(vLLM API)/Claude Code(SDK)/Human(web 评审)。
+"""Provide LLM, Claude Code, and browser-based benchmark evaluators.
 
-评测器是底层静态工具,只有 evaluate 接口、无生命周期,被题库(上层)随意调用;
-三种评测器(LLM/Claude/Human)结构兼容即可,无需继承(见 Evaluator)。
-入参/输出约定由各实现自定(question/ref/answer 均为 Any),统一见各类 docstring:
-- LLMEvaluator(半抽象基类):机制(HTTP 调用、解析失败重试、降级输出)由基类提供,
-  system/user prompt、请求参数与判定解析是扩展点,由应用层题库以子类挂接,
-  如 judges/vllm_mechanism/utils.py 的 auto_* 提示词与 coerce_verdict。
-  模型地址与型号可用环境变量 LLM_JUDGE_URL / LLM_JUDGE_MODEL 覆盖,或由题库构造时传参。
-- ClaudeEvaluator(半抽象基类):机制(SDK 会话、无状态逐题)由基类提供,
-  agent 配置(options)、查询文本与判定解析是扩展点,由应用层题库以子类挂接,
-  如 judges/vllm_mechanism/utils.py 的 auto_* 提示词与 MCP_SERVERS/SKILLS。
-  模型可用环境变量 CLAUDE_JUDGE_MODEL 覆盖(缺省用 SDK 默认模型),需要 ANTHROPIC_API_KEY。
-- HumanEvaluator:入参三字符串,输出评审表单数据(结构由 judge_schema 定义);
-  server 为其内部实现细节:首次 evaluate 时惰性起服并等待前端连接,后续复用,
-  不对上层暴露生命周期。
-任一失败不得抛出,降级输出 {"dimensions": {}, "overall": 0, "reason": "评测失败: ..."}。
+Question banks specialize the automated evaluators through prompt, inference, and
+verdict hooks. Automated failures produce a zero-score verdict instead of aborting the
+benchmark.
 """
 
 import asyncio
@@ -34,17 +22,12 @@ from gh_puller.envs import TIMEOUT as GLOBAL_TIMEOUT
 
 __all__ = ["ClaudeEvaluator", "Evaluator", "HumanEvaluator", "LLMEvaluator"]
 
-# 单题评分超时:connect 短(端点不可达时快速降级),read 取全局单题超时上限
+# Fail quickly on unreachable endpoints while allowing a full evaluation response.
 TIMEOUT = httpx.Timeout(connect=5.0, read=GLOBAL_TIMEOUT, write=30.0, pool=5.0)
 
 
 class Evaluator(Protocol):
-    """评测器协议。
-
-    name: 评测器标识,写入 judgment["evaluator"]。
-    evaluate: 评判单题,返回 JSON 可序列化 dict。题库负责拆字段、组装上下文,
-    把返回 dict 原样放进 judgment。
-    """
+    """Evaluate one answer and return a JSON-serializable verdict."""
 
     name: str
 
@@ -53,7 +36,7 @@ class Evaluator(Protocol):
 
 
 class LLMEvaluator:
-    """vLLM 服务上的评分模型逐题评分(半抽象基类:请求体由题库子类提供)。"""
+    """Evaluate answers with an OpenAI-compatible scoring model."""
 
     name = "llm"
 
@@ -77,7 +60,7 @@ class LLMEvaluator:
         return {}
 
     def coerce(self, data) -> dict:
-        """判定规范化(维度补齐/限幅);题库子类必须提供。"""
+        """Normalize a model verdict; question-bank subclasses must implement it."""
         raise NotImplementedError
 
     async def evaluate(self, question: str, ref: str, answer: str) -> dict:
@@ -86,7 +69,7 @@ class LLMEvaluator:
         parameters = self.request_parameters(question, ref, answer)
         headers = {"Authorization": f"Bearer {LLM_JUDGE_API_KEY}"} if LLM_JUDGE_API_KEY else None
         last_err: Exception | None = None
-        for nudge in (False, True):  # 解析失败重试 1 次(第二次追加"只输出 JSON"提示)
+        for nudge in (False, True):  # Retry invalid output once with a JSON-only reminder.
             turn = f"{prompt}\n\n{self.retry_nudge}" if nudge else prompt
             try:
                 llm = OpenAI(
@@ -101,13 +84,13 @@ class LLMEvaluator:
                 async with llm.session(session_name="judge:llm"):
                     content = await llm.result(turn, timeout=TIMEOUT, headers=headers)
                 return self.coerce(json.loads(content))
-            except Exception as e:  # 网络/HTTP/解析失败:继续下一轮,耗尽后降级
+            except Exception as e:  # Exhaust both transport and parsing retries before degrading.
                 last_err = e
         return {"dimensions": {}, "overall": 0, "reason": f"评测失败: {type(last_err).__name__}: {last_err}"}
 
 
 class ClaudeEvaluator:
-    """headless Claude agent 逐题评分(半抽象基类:agent 配置由题库子类提供)。"""
+    """Evaluate answers in independent headless Claude Code sessions."""
 
     name = "claude"
 
@@ -115,15 +98,15 @@ class ClaudeEvaluator:
         self.model = model or CLAUDE_JUDGE_MODEL
 
     def make_options(self, question: str, ref: str, answer: str) -> ClaudeAgentOptions:
-        """agent 配置组装(system_prompt/工具授权/模型等);题库子类必须提供。"""
+        """Build SDK options; question-bank subclasses must implement it."""
         raise NotImplementedError
 
     def user_prompt(self, question: str, ref: str, answer: str) -> str:
-        """单题请求文本(query);题库子类必须提供。"""
+        """Build one request; question-bank subclasses must implement it."""
         raise NotImplementedError
 
     def coerce(self, data) -> dict:
-        """判定规范化(维度补齐/限幅);题库子类必须提供。"""
+        """Normalize an SDK verdict; question-bank subclasses must implement it."""
         raise NotImplementedError
 
     async def evaluate(self, question: str, ref: str, answer: str) -> dict:
@@ -134,7 +117,7 @@ class ClaudeEvaluator:
             async with gen.session(session_name="judge:claude"):
                 result = await gen.result(self.user_prompt(question, ref, answer))
             return self.coerce(json.loads(result))
-        except Exception as e:  # SDK/解析异常:降级输出,不抛出
+        except Exception as e:  # Evaluation failures become a verdict rather than aborting the run.
             return {"dimensions": {}, "overall": 0, "reason": f"评测失败: {type(e).__name__}: {e}"}
 
 
@@ -231,26 +214,26 @@ setInterval(poll, 500);
 poll();
 </script>
 </body>
-</html>"""  # noqa: E501 - 内嵌 JS 评审页原文,单行语义不拆
+</html>"""  # noqa: E501 - Embedded review page is kept as one literal.
 
 
 class HumanEvaluator:
-    """逐题人工评审:题目/参考答案要点/参赛方回答展示于页面,表单提交数据即本题评判。"""
+    """Collect one schema-validated human verdict per answer in a browser."""
 
     name = "human"
 
     def __init__(self, judge_schema: dict, host: str = "127.0.0.1", port: int = 8002):
-        self.judge_schema = judge_schema  # 评审表单 JSON Schema(web UI 按其渲染表单)
+        self.judge_schema = judge_schema
         self.host = host
-        self.port = port  # 与参赛方默认端口(8001)区分
-        self._ready = False  # server 是否已启动且前端已连接
-        self._connected = asyncio.Event()  # 前端页面建立连接
-        self._current: dict = {}  # 当前待评审题(question/ref/answer)
-        self._fut: asyncio.Future | None = None  # 当前题的提交 future
-        self._count = 0  # 已提交题数
+        self.port = port
+        self._ready = False
+        self._connected = asyncio.Event()
+        self._current: dict = {}
+        self._fut: asyncio.Future | None = None
+        self._count = 0
 
     async def evaluate(self, question: str, ref: str, answer: str) -> dict:
-        """展示本题并等待评审者提交;表单数据(已按 judge_schema 校验)即本题评判结果。"""
+        """Display one answer and wait for its schema-validated verdict."""
         await self._ensure_server()
         self._current = {
             "index": self._count,
@@ -259,27 +242,27 @@ class HumanEvaluator:
             "answer": answer,
         }
         self._fut = asyncio.get_running_loop().create_future()
-        data = await self._fut  # POST /submit 校验通过后 resolve
+        data = await self._fut
         self._count += 1
         return data
 
     async def _ensure_server(self) -> None:
-        """惰性起服:启动 uvicorn 并等待前端建立连接;已就绪则 no-op。"""
+        """Start the review server lazily and wait for its first browser client."""
         if self._ready:
             return
         app = self._make_app()
         server = uvicorn.Server(uvicorn.Config(app, host=self.host, port=self.port, log_level="warning"))
         task = asyncio.create_task(server.serve())
-        while not server.started:  # 端口监听就绪后再打印 URL
-            if task.done():  # 启动失败(如端口占用)则抛出
+        while not server.started:
+            if task.done():  # Propagate startup failures such as an occupied port.
                 await task
             await asyncio.sleep(0.05)
         print(f"[{self.name} evaluator] 评审页面:http://{self.host}:{self.port}(浏览器打开后开始逐题评审)", flush=True)
-        await self._connected.wait()  # 等待前端建立连接
+        await self._connected.wait()
         self._ready = True
 
     def _make_app(self) -> FastAPI:
-        """构建评审页面与交互接口(闭包引用本实例)。"""
+        """Build review routes closed over this evaluator's state."""
         app = FastAPI()
 
         @app.get("/")
@@ -292,7 +275,7 @@ class HumanEvaluator:
 
         @app.get("/state")
         async def state() -> dict:
-            self._connected.set()  # 页面首次轮询即视为连接建立
+            self._connected.set()
             if self._current:
                 return {"index": self._current["index"], **self._current}
             return {"index": -1}

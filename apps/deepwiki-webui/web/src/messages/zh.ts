@@ -1,5 +1,5 @@
-// 语言包(zh):扁平点号键,经 @gh-puller/ui LanguageProvider extraMessages 注入;
-// 缺键回退 en(缺 0 键),再由键名兜底;form.*/common.* 键已上收 ui 基础字典
+// Application-specific Chinese messages injected into the shared LanguageProvider.
+// Missing entries fall back to English, then to the key; shared entries live in @gh-puller/ui.
 export default {
   "common.appName": "DeepWiki-Open",
   "common.tagline": "AI驱动的文档",

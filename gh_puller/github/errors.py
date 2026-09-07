@@ -1,18 +1,18 @@
-"""定义 GitHub 拉取边界中可由调用方识别的失败类型。
+"""Define caller-visible failures at the GitHub collection boundary.
 
-本模块不执行恢复或决定归档事务；client 产生 API 失败，syncer 根据状态码判断
-直接观测到的父对象缺失，其余恢复契约见 ``gh_puller.github``。
+The client produces API failures, while the syncer interprets status codes for directly
+observed missing parents. Recovery and archive transactions live elsewhere.
 """
 
 
 class GitHubAPIError(RuntimeError):
-    """GitHub 返回不可恢复响应或不一致数据。
+    """Report an unrecoverable GitHub response or inconsistent data.
 
     Args:
-        message: 面向操作者的失败说明。
-        status_code: HTTP 状态或原子操作映射的等价状态；本地验证和未分类的
-            GraphQL 失败为 None。
-        url: 失败 HTTP request 的最终 URL；本地验证失败时为 None。
+        message: Operator-facing failure description.
+        status_code: HTTP status or equivalent operation status. Local validation and
+            unclassified GraphQL failures use ``None``.
+        url: Final URL of the failed HTTP request, or ``None`` for local validation.
     """
 
     def __init__(

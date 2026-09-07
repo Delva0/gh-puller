@@ -1,13 +1,14 @@
-"""编排立即发布、可断点恢复的 GitHub Issue/PR 增量观测。
+"""Orchestrate immediate, recoverable incremental observations of issues and PRs.
 
-同步入口在调用前冻结 cycle 起点 S。冷启动遍历全部 Issue/PR；后续从已提交
-checkpoint 的重叠边界筛选父对象和评论变更信号。两者均按不可变的创建时间升序
-遍历。每个目录页及其任务先落 SQLite，再由 API 与 Git 两个独立有界通道消费。
-一个事实集合完成后立即追加观测；cycle 仅在目录闭合且所有任务完成后把内部
-discovery checkpoint 推进到 S。
+Each run freezes a cycle boundary. Cold starts enumerate every parent item; later runs
+scan overlapping committed checkpoints for parent and comment signals in immutable
+creation order. Directory pages and tasks reach SQLite before independent bounded API
+and Git workers consume them. Complete fact sets publish immediately, while the
+discovery checkpoint advances only after the directory and every task close.
 
-发现信号并不覆盖 GitHub 的全部可变子资源。拉取器不主动寻找静默删除或无信号的
-旧对象变化，但一旦父对象被选择，就重新观测其全部已承诺事实集合。
+GitHub signals do not cover every mutable child resource. Silent deletions and
+unsignaled old changes are not proactively sought, but selecting a parent observes all
+promised fact collections again.
 """
 
 from __future__ import annotations
@@ -106,16 +107,16 @@ async def sync(
 
 
 class GitHubSyncer:
-    """执行一个可随时调用并阻塞到完成的增量同步操作。
+    """Run an incremental synchronization operation to completion.
 
     Args:
-        config: 仓库、SQLite、Git 对象库和请求并发策略。
-        api: 测试或宿主注入的 GitHub 读取对象。
-        git: 测试或宿主注入的 Git 对象库。
-        now: 记录实际读取窗口和 cycle 边界的时区时钟。
-        sleep: Git 网络重试使用的异步等待函数。
-        observer: 不参与事实发布的同步进度接收器。
-        runtime: 与维护流程共享的依赖装配；通常由同步器自行构造。
+        config: Repository, SQLite, Git store, and request-concurrency policy.
+        api: GitHub reader injected by tests or a host.
+        git: Git object store injected by tests or a host.
+        now: Aware clock used for real read windows and cycle boundaries.
+        sleep: Async wait function used by Git transport retries.
+        observer: Progress receiver that does not participate in fact publication.
+        runtime: Dependency assembly shared with maintenance, normally built internally.
     """
 
     def __init__(

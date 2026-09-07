@@ -3,7 +3,7 @@ import { NextResponse } from 'next/server';
 // The target backend server base URL, derived from environment variable or defaulted.
 const TARGET_SERVER_BASE_URL = process.env.SERVER_BASE_URL || 'http://localhost:8001';
 
-// 统一 target 配置(注册表直出):generator/provider/model 选择器前端唯一真源。
+// The registry response is the UI's source of truth for target selectors.
 export async function GET() {
   try {
     const targetUrl = `${TARGET_SERVER_BASE_URL}/generators/config`;

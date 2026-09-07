@@ -4,7 +4,7 @@ import React, { useEffect, useRef, useState } from 'react';
 import mermaid, { type MermaidConfig } from 'mermaid';
 // We'll use dynamic import for svg-pan-zoom
 
-// 惰性配置(模块级无副作用:未消费此组件的应用不会捆入 mermaid)
+// Lazy initialization keeps module loading side-effect free for consumers that omit Mermaid.
 let _initialized = false;
 const mermaidConfig: MermaidConfig = {
   startOnLoad: true,
@@ -184,7 +184,7 @@ interface MermaidLabels {
   rendering: string;
 }
 
-// 文案缺省保留日语原文(历史行为);消费方可经 labels 覆盖
+// Japanese defaults remain overridable through labels.
 const DEFAULT_LABELS: MermaidLabels = {
   title: '図表表示',
   renderingError: '図表レンダリングエラー',
@@ -488,7 +488,7 @@ const Mermaid: React.FC<MermaidProps> = ({ chart, className = '', zoomingEnabled
           />
 
           {!zoomingEnabled && (
-            /* 悬浮缩放提示 chrome(重叠在图上,保持自身明暗),豁免 token 化 */
+            /* Keep the overlaid zoom hint independently legible in both themes. */
             <div className="absolute top-2 right-2 bg-gray-700/70 dark:bg-gray-900/70 text-white p-1.5 rounded-md opacity-0 group-hover:opacity-100 transition-opacity duration-200 flex items-center gap-1.5 text-xs shadow-md pointer-events-none">
               <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                 <circle cx="11" cy="11" r="8"></circle>

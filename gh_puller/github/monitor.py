@@ -1,7 +1,8 @@
-"""将 systemd、journald 与 SQLite 状态投影为只读 writer 视图。
+"""Project systemd, journald, and SQLite state into a read-only writer view.
 
-SQLite 提供可恢复的目录、任务和事实进度；journald 只补充当前阶段、配额、等待与
-错误。状态命令不访问 GitHub，也不修改归档。
+SQLite provides durable discovery, task, and fact progress. Journald adds only current
+phase, quota, wait, and error details. Status commands never access GitHub or mutate an
+archive.
 """
 
 from __future__ import annotations

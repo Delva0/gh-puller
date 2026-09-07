@@ -1,4 +1,4 @@
-"""核心引擎包:deepwiki 生成 / agent 调用 / benchmark 评测,共享层 utils.py + envs.py。
+"""Provide GitHub archiving, code graph, Agent, DeepWiki, and benchmark engines.
 
-边界:本包是引擎层,无 HTTP 端点;端点层在 apps/<app>/server。各子包职责见其 __init__ 的模块 docstring。
+HTTP endpoints belong to the applications under ``apps`` rather than this package.
 """

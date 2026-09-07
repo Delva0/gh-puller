@@ -1,32 +1,34 @@
 [project]
 name = "gh-puller"
 version = "0.1.0"
-description = "Add your description here"
+description = "Incremental GitHub archives and code knowledge tooling"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "aiosqlite>=0.20",
-    "claude-agent-sdk>=0.2.142",
-    "dash>=4.4.0",
-    "dash-cytoscape>=1.0.2",
-    "fastapi>=0.139.0",
-    "flask",
     "httpx",
-    "jsonschema>=4.26.0",
-    "networkx>=3.4",
-    "openai>=2.45.0",
+    "python-dotenv",
+]
+
+[project.optional-dependencies]
+agent = [
+    "claude-agent-sdk>=0.2.142",
     "openai-codex>=0.147.0",
     "opentelemetry-api>=1.44.0",
     "opentelemetry-exporter-otlp-proto-http>=1.44.0",
     "opentelemetry-sdk>=1.44.0",
-    "python-dateutil",
-    "python-dotenv",
-    "scipy>=1.18.0",
-    "tenacity>=9.1.4",
-    "uvicorn[standard]>=0.51.0",
     "websockets>=16.1",
 ]
-
+benchmark = [
+    "claude-agent-sdk>=0.2.142",
+    "fastapi>=0.139.0",
+    "jsonschema>=4.26.0",
+    "tenacity>=9.1.4",
+    "uvicorn[standard]>=0.51.0",
+]
+codebase = [
+    "networkx>=3.4",
+]
 
 [project.scripts]
 benchmark = "gh_puller.benchmark.pipeline:main"
@@ -35,12 +37,33 @@ benchmark = "gh_puller.benchmark.pipeline:main"
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
-
 [tool.setuptools.packages.find]
 include = ["gh_puller*"]
 
 [[tool.uv.index]]
 url = "https://pypi.org/simple"
+
+[tool.uv.sources]
+deepseek-harness-sdk = { path = "../deepseek-harness/python/sdk", editable = true }
+deepseek-harness-runtime-bin = { path = "../deepseek-harness/python/sdk-runtime", editable = true }
+
+[dependency-groups]
+dev = [
+    "gh-puller[agent,benchmark,codebase]",
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+]
+dsh = [
+    "deepseek-harness-sdk",
+]
+
+[tool.pytest.ini_options]
+addopts = "-m 'not real'"
+markers = [
+    "integration: deterministic tests crossing process, socket, or storage boundaries",
+    "real: opt-in tests requiring local agents, credentials, or paid providers",
+]
+testpaths = ["tests"]
 
 [tool.ruff]
 line-length = 120
@@ -67,27 +90,3 @@ convention = "google"
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["S101", "S108", "INP001", "D100", "D104"]
-
-[tool.uv.sources]
-deepseek-harness-sdk = { path = "../deepseek-harness/python/sdk", editable = true }
-deepseek-harness-runtime-bin = { path = "../deepseek-harness/python/sdk-runtime", editable = true }
-
-[dependency-groups]
-dev = [
-    "pytest>=9.1.1",
-    "pytest-asyncio>=1.4.0",
-]
-dsh = [
-    "deepseek-harness-sdk",
-]
-
-# 根 pytest 只跑 tests/:apps/* 是独立 uv 项目(各自 pyproject+venv,按 AGENTS.md
-# 约定单独跑);裸 `uv run pytest` 会连带收集 apps/archive/playground 的 tests,
-# 触发 pytest_plugins 非顶层等 collection 错误。
-[tool.pytest.ini_options]
-addopts = "-m 'not real'"
-markers = [
-    "integration: deterministic tests crossing process, socket, or storage boundaries",
-    "real: opt-in tests requiring local agents, credentials, or paid providers",
-]
-testpaths = ["tests"]

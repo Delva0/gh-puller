@@ -1,18 +1,18 @@
 /*
- * @gh-puller/ui 主题真源(宿主共享)
+ * Shared source of truth for @gh-puller/ui themes.
  *
- * 设计原则:组件 `theme-agnostic`(CSS-variable tokens),配色由本文件单一决定。
- * 宿主入口 css 以相对路径 @import 本文件(必须与 @import "tailwindcss" 同一条
- * Tailwind 处理链,否则 @theme inline / @custom-variant 不生效):
+ * Components consume CSS variable tokens and remain theme-agnostic. Host stylesheets import this
+ * file through the same Tailwind pipeline as `tailwindcss`; otherwise `@theme inline` and
+ * `@custom-variant` are inactive:
  *   - apps/deepwiki-webui/web/src/app/globals.css
- *     @import "../../../../../ui/src/styles/theme.css"; (App 目录 → 仓库根,5 层)
+ *     @import "../../../../../ui/src/styles/theme.css";
  *   - apps/agent-monitor/web/src/styles.css
- *     @import "../../../../ui/src/styles/theme.css"; (src 目录 → 仓库根,4 层)
- * 宿主 css 中不要重复定义本文件出现的令牌/变体/风格类。
- * (注意:html,body,#root 高度骨架与 body{margin:0} 属宿主私有,不入本文件。)
+ *     @import "../../../../ui/src/styles/theme.css";
+ * Hosts must not redefine shared tokens, variants, or component styles. Page-height scaffolding
+ * and body margin resets remain host-specific.
  */
 
-/* 暗色模式统一走 data-theme 属性(next-themes attribute="data-theme"),非 .dark class */
+/* Dark mode uses the next-themes data-theme attribute rather than a .dark class. */
 @custom-variant dark (&:where([data-theme="dark"], [data-theme="dark"] *));
 
 :root {
@@ -162,7 +162,7 @@ html[data-theme='dark'] .paper-texture {
   -webkit-line-clamp: 3;
 }
 
-/* 运行中状态点的呼吸闪烁(StateBadge 用;原 agent-monitor styles.css,统一收口于此) */
+/* StateBadge animation for running sessions. */
 .dot-blink {
   animation: dot-blink 1.2s ease-in-out infinite;
 }
@@ -170,16 +170,14 @@ html[data-theme='dark'] .paper-texture {
   50% { opacity: 0.2; }
 }
 
-/* ThemeToggle 语义挂点(组件样式已全内联,此定义仅为兜底占位) */
+/* ThemeToggle semantic hook and fallback styling. */
 .theme-toggle-button {
   cursor: pointer;
   background: transparent;
   border: none;
 }
 
-/* ThemeToggle 日/月图标:可见性由 [data-theme] 决定,组件内类名保持静态
-   (SSR 时 next-themes theme 为 undefined、客户端首渲染却是 localStorage 值,
-   任何依赖 theme 的 className 都会水合不一致)。切换时由 transition 过渡。 */
+/* Keep ThemeToggle icon classes static for SSR; data-theme controls visibility and transitions. */
 .theme-toggle-moon {
   opacity: 0;
 }

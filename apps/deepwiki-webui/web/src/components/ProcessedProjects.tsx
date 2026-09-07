@@ -18,7 +18,7 @@ interface ProcessedProject {
   // Present for the merged tasks list: 'completed' for cached wikis, otherwise
   // a queued/in-progress task (pending | indexing | determining_structure | generating).
   status?: string;
-  /** 公开 target 摘要(列尾 digest8;删除时精确命中缓存文件) */
+  /** Public target digest suffix used to identify the exact cache entry. */
   digest?: string;
 }
 

@@ -1,5 +1,5 @@
-// 语言包(en):扁平点号键,经 @gh-puller/ui LanguageProvider extraMessages 注入;
-// form.*/common.* 键已上收 ui 基础字典,本文件保留应用私有文案
+// Application-specific English messages injected into the shared LanguageProvider.
+// Shared form.* and common.* entries live in @gh-puller/ui.
 export default {
   "common.appName": "DeepWiki-Open",
   "common.tagline": "AI-powered documentation",

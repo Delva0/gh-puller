@@ -72,5 +72,5 @@ TOOL = ToolDef(
 
 @register
 def search_graph(arguments: dict, config: ServerConfig) -> types.CallToolResult:
-    """Search graph：默认透传 CBM 后端；具体定制在此扩展。"""
+    """Pass graph search through to the CBM backend."""
     return passthrough(TOOL, arguments, config)

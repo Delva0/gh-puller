@@ -47,5 +47,5 @@ TOOL = ToolDef(
 
 @register
 def detect_changes(arguments: dict, config: ServerConfig) -> types.CallToolResult:
-    """Detect changes：默认透传 CBM 后端；具体定制在此扩展。"""
+    """Pass change detection through to the CBM backend."""
     return passthrough(TOOL, arguments, config)

@@ -1,24 +1,9 @@
-"""wiki 任务调度与执行(runtime 包装;webui 后端专属,不在 gh_puller 包内)。
+"""Schedule resumable wiki generation for the DeepWiki WebUI.
 
-携带 App 进程级状态并驱动 gh_puller 引擎的 wiki 主流程:
-- 任务注册表/单例 registry(进程级任务表、同 key join 去重、并发信号量、TTL 迟移除);
-- 任务运行时 WikiTask(内存态:状态/进度/运行时 asyncio.Task 引用);
-- 主流程 generate_repo_wiki 一套(索引→结构→页面→成品缓存)与进度落盘投影
-  _persist_state(模块级写锁,与页生成并发串行化)。
-
-职责边界(与包的边界):
-- 生成协议/提示词/生成器缓存、契约模型、内容渲染与引用后处理(render)、缓存与状态文件 IO、
-  判等摘要族属引擎(gh_puller.deepwiki,本模块白名单直连);索引服务与 gh-puller-mcp 组装
-  属本 app 的 generators 模块(runtime_config 注入覆盖构造参数集);cache/主流程函数/
-  render 保持各自职责的纯化,任务 runtime 语义(状态机/去重/续跑合并/进度投影)都在本模块。
-- **零内容业务**:本模块不拼链接、不剥围栏、不做引用后处理、不组装缓存模型
-  (save_generated_wiki 在引擎缓存层)—— 编排只做"调主流程函数 → 回写进度"。
-- 本模块是外部消费者而非包内模块:引擎符号顶部绑名 import(同 app.py 现状);
-  模块自身符号(如 _WIKI_TASK_TTL_SECONDS、generate_repo_wiki、_persist_state)在内部
-  一律**调用时经模块全局解析**(测试 monkeypatch 位点,不得实例捕获或模块级快照)。
-
-导入副作用(都在本模块;引擎导入零副作用):调度 env 快照、
-状态写锁、成品缓存目录创建、registry 单例。
+This application layer owns task state, deduplication, concurrency, progress snapshots,
+and pipeline orchestration. The engine owns generated content and cache primitives;
+``generators`` owns indexing and MCP assembly. Importing this module creates the cache
+root, process locks, and the registry singleton.
 """
 
 from __future__ import annotations
@@ -59,9 +44,7 @@ from pydantic import BaseModel, ConfigDict, Field, computed_field, field_validat
 
 from generators import ensure_index, index_ready, runtime_config
 
-# ---------------------------------------------------------------------------
-# 任务调度常量(本 app 专属 env,导入期快照,同 gh_puller.envs 原式;monkeypatch 模块全局)
-# ---------------------------------------------------------------------------
+# --- Runtime state ---
 
 _MAX_CONCURRENT_WIKI_TASKS = int(os.environ.get(
     "DEEPWIKI_MAX_CONCURRENT_WIKI_TASKS", max(1, (os.cpu_count() or 2) // 2)))
@@ -69,27 +52,20 @@ _WIKI_PAGE_CONCURRENCY = max(1, int(os.environ.get("DEEPWIKI_WIKI_PAGE_CONCURREN
 _WIKI_PAGE_RETRIES = max(0, int(os.environ.get("DEEPWIKI_WIKI_PAGE_RETRIES", "2")))
 _WIKI_TASK_TTL_SECONDS = int(os.environ.get("DEEPWIKI_WIKI_TASK_TTL_SECONDS", "300"))
 
-# 状态写锁:并发页生成器的落盘写串行化(asyncio 3.10+ 的 Lock 不再绑定 loop,模块级安全)
+# Serialize snapshots produced by concurrent page workers.
 _state_write_lock = asyncio.Lock()
-# 后台任务强引用集:防 asyncio.Task 被垃圾回收(RUF006 语义;任务完成后自清)
+# Retain delayed-removal tasks until their completion callbacks release them.
 _background_tasks: set[asyncio.Task] = set()
-# 引擎导入零副作用(不再建目录),deepwiki 根(缓存根 = 项目文件夹顶层)创建由本模块(App 进程)负责
 os.makedirs(wiki_cache_dir(), exist_ok=True)
 
 
-# ---------------------------------------------------------------------------
-# 任务运行时模型(runtime 包装;引擎协议只收 request,见 pipeline.py 契约)
-# ---------------------------------------------------------------------------
+# --- Task model ---
 
 
 class WikiTask(BaseModel):
-    """单个仓库生成任务的进程内运行时状态(状态/进度/运行时 asyncio.Task 引用)。
+    """Hold in-process state and progress for one repository generation."""
 
-    request 为纯 dict(引擎零 Request 概念);出网契约由 app 响应模型
-    (schemas.WikiTaskStatus/Summary)校验序列化。
-    """
-
-    model_config = ConfigDict(arbitrary_types_allowed=True)  # 允许 asyncio.Task 字段
+    model_config = ConfigDict(arbitrary_types_allowed=True)
 
     status: TaskStatus = TaskStatus.PENDING
     error: str | None = None
@@ -99,9 +75,9 @@ class WikiTask(BaseModel):
     request: dict[str, Any]
     pages_done: int = 0
     current_page_ids: list[str] = Field(default_factory=list)
-    generated_pages: dict[str, WikiPage] = Field(default_factory=dict)  # 完成页就地累积(续跑=已生成页)
+    generated_pages: dict[str, WikiPage] = Field(default_factory=dict)
     wiki_structure: WikiStructureModel | None = None
-    default_branch: str = "main"  # 结构确定时记录(进度/展示;URL 单源见 PreparedRepo)
+    default_branch: str = "main"
 
     @computed_field
     @property
@@ -121,10 +97,7 @@ class WikiTask(BaseModel):
 
     @property
     def key(self) -> str:
-        """注册表去重键 = repo 键 + target 判等摘要。
-
-        同一仓库/语言下不同 target 的任务可并发并存(隔离生成产物与续跑状态)。
-        """
+        """Return the repository key plus its credential-free target digest."""
         t = strip_creds(self.request["target"])
         return f"{self.repo_key}@{generator_digest(t.get('generator'), t.get('generator_config'))}"
 
@@ -164,10 +137,7 @@ class WikiTask(BaseModel):
         }
 
 
-# ---------------------------------------------------------------------------
-# 通用异步任务注册表(全仓唯一消费者即本模块,不再留底层抽象;类型钉为 WikiTask)。
-# 提交语义:按 key 去重并入(join)/缓存胜/落盘续跑/并发信号量/TTL 迟移除。
-# ---------------------------------------------------------------------------
+# --- Task registry ---
 
 
 class TaskSubmitResult(BaseModel):
@@ -176,7 +146,7 @@ class TaskSubmitResult(BaseModel):
     created: bool = False
     joined: bool = False
     from_cache: bool = False
-    resumed: bool = False  # 从落盘状态续跑(同仓库再提交命中生成状态)
+    resumed: bool = False
 
     @field_validator("status", mode="before")
     @classmethod
@@ -186,16 +156,11 @@ class TaskSubmitResult(BaseModel):
         return value
 
 
-# HTTP 提交响应模型(仅 server/api 消费;与 TaskSubmitResult 同一形状)
 WikiTaskSubmitResult = TaskSubmitResult
 
 
 class TaskRegistry:
-    """通用异步任务注册表:按 key 去重并入(join)/缓存胜/落盘续跑/并发信号量/TTL 迟移除。
-
-    提交语义的业务差异全部经由子类钩子注入(见各钩子默认实现);
-    基类默认:无缓存、无续跑、run 须子类实现。
-    """
+    """Deduplicate, resume, limit, and eventually evict asynchronous tasks."""
 
     def __init__(self, max_concurrent: int = 1, ttl_seconds: float = 300):
         self._tasks: dict[str, WikiTask] = {}
@@ -229,7 +194,7 @@ class TaskRegistry:
             if exist_task and not exist_task.status.is_terminal():
                 return TaskSubmitResult(task_id=key, status=exist_task.status, joined=True)
             if await self.is_cached(task):
-                # 缓存胜:清理陈旧落盘状态(成功写缓存后删状态前崩溃的残留)。
+                # A complete cache wins over stale resume state left by a crash.
                 await self.on_cache_hit(task)
                 return TaskSubmitResult(task_id=key, status=TaskStatus.COMPLETED, from_cache=True)
             resumed = await self.load_resume(task)
@@ -256,36 +221,34 @@ class TaskRegistry:
         _background_tasks.add(bg_task)
         bg_task.add_done_callback(_background_tasks.discard)
 
-    # ------------------------------------------------------------------
-    # 子类钩子协议
-    # ------------------------------------------------------------------
+    # --- Subclass hooks ---
 
     async def run(self, task: WikiTask) -> None:
-        """执行任务本体(子类必须实现;调用时解析,支持模块全局 monkeypatch)。"""
+        """Run a task; subclasses must implement this hook."""
         raise NotImplementedError
 
     async def is_cached(self, task: WikiTask) -> bool:
-        """磁盘上是否有完整成品缓存(命中则快速返回,不再执行)。"""
+        """Return whether a complete result is already cached."""
         return False
 
     async def on_cache_hit(self, task: WikiTask) -> None:
-        """缓存命中时的清理动作(默认无;wiki 用于清除陈旧续跑状态)。"""
+        """Clean up after a cache hit; the base implementation does nothing."""
         return
 
     async def load_resume(self, task: WikiTask) -> WikiTask | None:
-        """从落盘状态恢复并返回重建的任务(默认无续跑)。"""
+        """Rebuild a task from persisted state when available."""
         return None
 
     def _ttl_seconds(self) -> float:
-        """TTL call-time 解析(默认构造参数;子类可读模块全局以支持测试 monkeypatch)。"""
+        """Resolve the eviction delay at scheduling time."""
         return self._ttl
 
 
 class WikiTaskRegistry(TaskRegistry):
-    """wiki 专属提交语义(缓存胜/续跑/生成器执行)经钩子注入;TTL 读模块全局供测试 monkeypatch。"""
+    """Implement cache, resume, generation, and dynamic TTL hooks for wiki tasks."""
 
     async def run(self, task: WikiTask) -> None:
-        await generate_repo_wiki(task)  # 调用时经模块全局解析(monkeypatch 生效)
+        await generate_repo_wiki(task)  # Resolve at call time for test substitution.
 
     async def is_cached(self, task: WikiTask) -> bool:
         r = task.request
@@ -298,7 +261,7 @@ class WikiTaskRegistry(TaskRegistry):
         )
         if cache is None:
             return False
-        # 判等身份与缓存内记录对齐(旧缓存字段缺失/旧契约 → 判不匹配,重新生成)
+        # Legacy records without matching identity must regenerate.
         if cache_generator_matches(cache, t.get("generator"), t.get("generator_config")):
             return True
         log(
@@ -328,11 +291,10 @@ class WikiTaskRegistry(TaskRegistry):
         )
         if state is None:
             return None
-        # 状态文件按 target 摘要隔离(同仓库不同 target 并存);凭证从当前提交合并
-        # (落盘状态只存公开三元组,见 _persist_state)
+        # Resume files are isolated by target digest; credentials come from this request.
         merged = {**state["request"], "target": merge_creds(state["request"].get("target"), r["target"])}
         return WikiTask(
-            request=merged,  # dict → BaseModel 校验重建
+            request=merged,
             status=(
                 TaskStatus.GENERATING
                 if state.get("wiki_structure") is not None
@@ -341,14 +303,14 @@ class WikiTaskRegistry(TaskRegistry):
             pages_done=len(state.get("generated_pages") or {}),
             wiki_structure=deepwiki.wiki_structure_of(state.get("wiki_structure")),
             default_branch=state.get("default_branch", "main"),
-            submitted_at=state["submitted_at"],  # 保留原始提交时间
+            submitted_at=state["submitted_at"],
             generated_pages={
                 k: deepwiki.WikiPage(**v) for k, v in (state.get("generated_pages") or {}).items()
             },
         )
 
     def _ttl_seconds(self) -> float:
-        # call-time 读模块全局:tests monkeypatch tasks._WIKI_TASK_TTL_SECONDS
+        # Resolve at call time so tests can replace the module setting.
         return _WIKI_TASK_TTL_SECONDS
 
 
@@ -358,10 +320,7 @@ registry = WikiTaskRegistry(
 )
 
 
-# ---------------------------------------------------------------------------
-# 进度落盘投影(引擎持久化层只留 IO 原语,从 live 任务组装快照 +
-# 锁串行属任务 runtime 语义)
-# ---------------------------------------------------------------------------
+# --- Progress persistence ---
 
 
 def strip_creds(config: dict) -> dict:
@@ -387,17 +346,13 @@ def merge_creds(base: dict, other: dict | None) -> dict:
 
 
 async def _persist_state(task: WikiTask) -> None:
-    """把任务当前进度落盘(结构/已完成页/状态);并发写由模块锁串行。
-
-    落盘即剥离凭证:request.target 存 strip_creds(只含判等身份字段),
-    续跑合并用户重新提交的凭证(见 WikiTaskRegistry.load_resume)。
-    """
+    """Persist a credential-free task snapshot under the module write lock."""
     req = dict(task.request)
-    req["target"] = strip_creds(task.request["target"])  # strip → 公开三元组(仅判等身份字段)
+    req["target"] = strip_creds(task.request["target"])
     state = {
         "version": 1,
         "request": req,
-        "status": task.status,  # str Enum;json.dumps 序列化为字面字符串,读回由 BaseModel 校验转回
+        "status": task.status,
         "wiki_structure": dataclasses.asdict(task.wiki_structure) if task.wiki_structure else None,
         "generated_pages": {pid: dataclasses.asdict(pg) for pid, pg in task.generated_pages.items()},
         "default_branch": task.default_branch,
@@ -411,50 +366,40 @@ async def _persist_state(task: WikiTask) -> None:
         )
 
 
-# ---------------------------------------------------------------------------
-# wiki 主流程(驱动一个任务走完状态机:索引 → 结构 → 页面 → 成品缓存)
-# ---------------------------------------------------------------------------
+# --- Generation pipeline ---
 
 
 @dataclass
 class PreparedRepo:
-    """一次生成所需的仓库态上下文(单源:默认分支只准备一次,主流程共用)。"""
+    """Hold repository state prepared once for the generation pipeline."""
 
     repo: Repo
     default_branch: str
 
 
 async def _prepare_repo(repo: Repo) -> PreparedRepo:
-    """仓库态运行时准备(默认分支);克隆与索引由 ensure_index 承担。"""
+    """Resolve repository state shared by structure and page generation."""
     default_branch = await asyncio.to_thread(detect_default_branch, repo.save_path)
     return PreparedRepo(repo=repo, default_branch=default_branch)
 
 
 async def generate_repo_wiki(task: WikiTask) -> None:
-    """驱动一个任务走完状态机(索引 → 结构 → 页面 → 缓存),失败置 FAILED。
-
-    进度中途落盘(resume_*):结构确定后与每页完成后各写一次,
-    失败/取消也尽力写;同仓库再次提交时从落盘状态续跑(见 TaskRegistry.submit)。
-    """
+    """Drive indexing, structure, pages, and cache while persisting resumable progress."""
     r = task.request
     try:
-        await _persist_state(task)  # 入口即落盘:中断于索引/结构阶段的也能续跑
+        await _persist_state(task)
         repo = Repo(r["repo_url"], r["type"], access_token=r.get("token"))
-        # 覆盖构造参数集:gh-puller-mcp 工具桌配置原 generator_config 基础上注入
         gc = runtime_config(r["target"].get("generator"), r["target"].get("generator_config"), repo=repo)
-        # 索引:只建一次(v1 无增量;已存在即跳过)
         if not index_ready(repo):
             task.status = TaskStatus.INDEXING
             log(f"索引中: {task.repo_key}")
             await ensure_index(repo)
-        # 仓库态(分支):结构确定与页面生成共用同一次准备
         prepared = await _prepare_repo(repo)
 
         if task.wiki_structure is None or needs_structure_regenerate(
             project_key=task.repo_key,
             generator=r["target"].get("generator"), generator_config=gc,
         ):
-            # 续跑:结构已落盘(以缓存文件为准,被删则强制重生成)则跳过生成器调用
             task.status = TaskStatus.DETERMINING_STRUCTURE
             task.wiki_structure = await _determine_structure(task, prepared, gc)
             await _persist_state(task)
@@ -467,17 +412,17 @@ async def generate_repo_wiki(task: WikiTask) -> None:
                 repo=prepared.repo,
                 structure=task.wiki_structure, default_branch=prepared.default_branch,
             ),
-        )  # 以文件为权威覆盖落盘 state 旧文本
+        )
         pages = await _generate_pages(task, prepared, gc)
 
         if not await save_generated_wiki(
             r["owner"], r["repo"], r["type"], r["repo_url"],
             task.wiki_structure, pages, language=r["language"],
             generator=r["target"].get("generator"),
-            # 成品身份字段取自公开形态(strip 后与提交侧同源;运行形态 gc 只服务 SDK 装配)
+            # Persist public selection identity, not runtime-injected tool configuration.
             generator_config=strip_creds(r["target"]).get("generator_config"),
         ):
-            raise RuntimeError("写 wiki 缓存失败")  # 不删状态:再提交仅重试写缓存
+            raise RuntimeError("写 wiki 缓存失败")  # Keep resume state so a resubmit retries the write.
         t = strip_creds(r["target"])
         await delete_resume_state(
             r["owner"], r["repo"], r["type"], r["language"],
@@ -487,22 +432,22 @@ async def generate_repo_wiki(task: WikiTask) -> None:
         )
         task.status = TaskStatus.COMPLETED
         log(f"wiki 任务完成: {task.repo_key}")
-    except asyncio.CancelledError:  # Ctrl+C/停机:尽力持久化一次后重新抛出
+    except asyncio.CancelledError:  # Persist once during shutdown, then preserve cancellation.
         await _persist_state(task)
         raise
     except Exception as e:
         task.status = TaskStatus.FAILED
         task.error = str(e)
-        await _persist_state(task)  # FAILED 也落盘,后续提交可续跑
+        await _persist_state(task)
         log(f"wiki 任务失败: {task.repo_key} - {e}")
 
 
 async def _determine_structure(
     task: WikiTask, prepared: PreparedRepo, gc: dict,
 ) -> WikiStructureModel:
-    """确定 wiki 结构(单一生成器管道);失败上抛使任务 FAILED。"""
+    """Determine the wiki structure and propagate failures to the task state machine."""
     r = task.request
-    task.default_branch = prepared.default_branch  # 记录(进度/展示;URL 单源见 PreparedRepo)
+    task.default_branch = prepared.default_branch
     return await determine_structure(
         generator=r["target"].get("generator"), generator_config=gc,
         repo=prepared.repo, owner=r["owner"], repo_name=r["repo"],
@@ -513,7 +458,7 @@ async def _determine_structure(
 async def _generate_page(
     task: WikiTask, page: WikiPage, prepared: PreparedRepo, gc: dict,
 ) -> WikiPage:
-    """生成单个页面(编排:取仓库上下文;内容与终态格式化收在主流程函数内)。"""
+    """Generate one finalized page through the engine."""
     r = task.request
     content = await generate_page(
         generator=r["target"].get("generator"), generator_config=gc,
@@ -535,7 +480,7 @@ async def _generate_page_with_retry(
                 raise asyncio.CancelledError from e
             last_error = e
             log(f"页面 {page.id} 生成失败(尝试 {attempt + 1}/{_WIKI_PAGE_RETRIES + 1}): {e}")
-    # 重试耗尽:回退错误占位页,保证整个 wiki 仍能完成
+    # A persisted placeholder lets the rest of the wiki complete after retry exhaustion.
     content = f"Error generating content: {last_error}"
     r = task.request
     write_error_page(
@@ -547,18 +492,18 @@ async def _generate_page_with_retry(
 
 
 def _pending_pages(structure: WikiStructureModel, done: dict[str, WikiPage]) -> list[WikiPage]:
-    """按结构顺序返回尚未生成的页面(done: 已完成页 id → 页)。"""
+    """Return unfinished pages in structure order."""
     return [p for p in structure.pages if p.id not in done]
 
 
 async def _generate_pages(
     task: WikiTask, prepared: PreparedRepo, gc: dict,
 ) -> dict[str, WikiPage]:
-    """有界并发 + 每页重试地生成所有页面;续跑跳过已落盘的页,每页完成后立即落盘。"""
+    """Generate unfinished pages with bounded concurrency and per-page retries."""
     structure = task.wiki_structure
-    assert structure is not None  # noqa: S101 - 内部不变量窄化(结构在上游已确定),非运行时校验
+    assert structure is not None  # noqa: S101 - Narrow an invariant established upstream.
     sema = asyncio.Semaphore(_WIKI_PAGE_CONCURRENCY)
-    task.pages_done = len(task.generated_pages)  # 续跑:从恢复的完成数起步
+    task.pages_done = len(task.generated_pages)
     pending = _pending_pages(structure, task.generated_pages)
 
     async def one(page: WikiPage) -> None:
@@ -572,7 +517,7 @@ async def _generate_pages(
                 with contextlib.suppress(ValueError):
                     task.current_page_ids.remove(page.id)
                 task.pages_done += 1
-            await _persist_state(task)  # 每页完成即落盘(锁内串行写)
+            await _persist_state(task)
 
     await asyncio.gather(*(one(page) for page in pending))
     return task.generated_pages

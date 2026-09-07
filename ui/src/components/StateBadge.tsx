@@ -1,4 +1,4 @@
-// 会话状态徽章:running(绿点闪烁)/completed(灰)/aborted(红);配色由消费方 Tailwind 约定
+// State colors rely on the consuming application's Tailwind theme.
 interface StateBadgeProps {
   state: string;
   label?: string;

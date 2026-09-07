@@ -171,7 +171,7 @@ export default function RepoWikiPage() {
   // unmount / refresh and avoid leaking connections.
   const taskUnsubRef = useRef<null | (() => void)>(null);
 
-  // Target state(公开三元组 + 请求态凭证;凭证仅存当前标签页 sessionStorage)
+  // Public target and request-scoped credentials; credentials stay in this tab.
   const repoCredsKey = `${repoType}_${owner}_${repo}`;
   const [targetConfig, setTargetConfig] = useState<TargetConfig>(() => ({
     generator: generatorParam || '',
@@ -180,7 +180,7 @@ export default function RepoWikiPage() {
     model: modelParam || '',
     ...loadCreds(repoCredsKey),
   }));
-  // 凭证仅存当前标签页 sessionStorage(URL/localStorage 只保留公开三元组)
+  // Keep credentials in session storage; URLs and local storage hold public fields only.
   useEffect(() => {
     saveCreds(repoCredsKey, { api_key: targetConfig.api_key, base_url: targetConfig.base_url });
   }, [targetConfig.api_key, targetConfig.base_url, repoCredsKey]);
@@ -284,9 +284,8 @@ export default function RepoWikiPage() {
   const loadWikiFromServerCache = useCallback(async (): Promise<boolean> => {
     setLoadingMessage(t("loading.fetchingCache"));
     try {
-      // 缓存按提交侧同款 target 派生判等摘要(buildTargetRequest 会补注册表缺省,
-      // 如 cc 的 configDefault);raw 空参会让服务端按 env 缺省解析,与生成时的
-      // 摘要不一致 → 报"已缓存但加载失败"。
+      // Match submission-time target normalization, including registry defaults,
+      // so cache lookup derives the same digest as generation.
       const cachedTarget = await buildTargetRequest(targetConfig);
       const params = new URLSearchParams({
         owner: effectiveRepoInfo.owner,
@@ -674,8 +673,8 @@ export default function RepoWikiPage() {
     setIsLoading(true); // Show loading indicator immediately
 
     try {
-      // 与 loadWikiFromServerCache 同款:删除须命中与生成时一致的摘要
-      // (buildTargetRequest 补注册表缺省),否则刷新后重新提交仍 from_cache=true。
+      // Delete by the same normalized target digest used for cache loading;
+      // otherwise resubmission would return the untouched cache entry.
       const target = await buildTargetRequest(targetConfig);
       const params = new URLSearchParams({
         owner: effectiveRepoInfo.owner,

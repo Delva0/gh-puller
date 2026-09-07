@@ -1,22 +1,18 @@
-"""HTTP 边界数据模型(FastAPI 请求/响应校验;验证只属于端点层)。
+"""Validate DeepWiki HTTP requests and responses at the application boundary.
 
-引擎(gh_puller.deepwiki)是纯数据/纯函数(零 pydantic,无 Request 概念):
-本模块即 wire 契约的唯一验证面 —— 请求族(含 list|str 换行归一化 validator)、
-响应族(含计算字段 name 与 ProcessedProjectEntry 的 submittedAt 键)。
+The engine remains free of Pydantic and request objects; this module is the sole wire
+schema authority.
 """
 
 from __future__ import annotations
 
 from typing import Any, Literal
 
-# pydantic 在模型构建期按模块命名空间解析字段注解,RepoType/TaskStatus 必须是
-# 真实模块级名字,不能收进 TYPE_CHECKING 块(否则运行时报 class not found)。
-from gh_puller.utils import RepoType, TaskStatus  # noqa: TC002 - pydantic 运行时解析注解需此名
+# Pydantic resolves these annotations from the runtime module namespace.
+from gh_puller.utils import RepoType, TaskStatus  # noqa: TC002 - Required during model construction.
 from pydantic import BaseModel, Field, computed_field, field_validator
 
-# ---------------------------------------------------------------------------
-# 请求族(HTTP 入参;与 deepwiki-open api/schemas 同形)
-# ---------------------------------------------------------------------------
+# --- Requests ---
 
 
 class RepoRequestBase(BaseModel):
@@ -25,8 +21,7 @@ class RepoRequestBase(BaseModel):
     token: str | None = Field(None, description="PAT for private repositories")
     target: dict[str, Any] = Field(
         default_factory=dict,
-        description="target 请求形态:generator + generator_config(file 类:config_path;"
-                    "object 类:provider/model/凭证;api_key/base_url 仅请求态不落盘)",
+        description="Generator selection and configuration; credentials are request-only",
     )
     language: str = Field("en", description="Language for content generation")
     excluded_dirs: list[str] = Field(
@@ -55,7 +50,7 @@ class RepoRequestBase(BaseModel):
     )
     @classmethod
     def validate_path(cls, value: list[str] | str) -> list[str]:
-        """list 或换行分隔字符串(前端以字符串发送;边界处归一化为 list)。"""
+        """Normalize a list or newline-delimited frontend string to a list."""
         if isinstance(value, str):
             value = [p.strip() for p in value.split("\n") if p.strip()]
         return value
@@ -77,7 +72,7 @@ class ChatCompletionRequest(RepoRequestBase):
 
 
 class RepoPrepareRequest(RepoRequestBase):
-    """POST /repo/prepare 的请求体(索引预热,无消息)。"""
+    """Validate an index-warmup request without chat messages."""
 
 
 class WikiTaskRequest(RepoRequestBase):
@@ -98,9 +93,7 @@ class AuthorizationConfig(BaseModel):
     code: str = Field(..., description="Authorization code")
 
 
-# ---------------------------------------------------------------------------
-# 响应族(HTTP 出参;字段名即 wire 键 —— camelCase 原样保留前端契约)
-# ---------------------------------------------------------------------------
+# --- Responses ---
 
 
 class RepoInfo(BaseModel):
@@ -161,7 +154,7 @@ class WikiTaskSummary(BaseModel):
     repo_type: str
     language: str
     status: TaskStatus
-    # 列尾公开 target 摘要(同一仓库多 target 并存;缺省无摘要=旧格式兼容)
+    # Legacy cache names have no public target digest suffix.
     digest: str = ""
     pages_done: int = Field(default=0, ge=0)
     pages_total: int = Field(default=0, ge=0)

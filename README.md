@@ -94,6 +94,10 @@ uv run -m gh_puller.codebase build \
 `@gh-puller/ui` 使用根 `pnpm-lock.yaml`。进入子项目时，请采用其 README 中的
 `uv --directory ...` 或 `pnpm --dir ...` 命令。
 
+发布包默认只安装 GitHub 归档依赖；Agent、评测和代码图入口分别对应 `agent`、
+`benchmark`、`codebase` extras。仓库的默认 `dev` 组会安装这三组依赖；本地 DSH SDK
+仍通过 `uv sync --group dsh` 单独启用。
+
 ```bash
 uv sync --frozen
 pnpm test

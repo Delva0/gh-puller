@@ -1,25 +1,18 @@
-"""chat 主线:一次 chat 问答的流式应答(纯文本 chunk 序列,协议同 deepwiki-open research_chat)。
+"""Stream DeepWiki chat answers through a configured Agent adapter.
 
-入口 chat_stream 恒走单一生成器管道(_chat);本主线专用 helper:历史转写、
-continuation 回退、深研究模板常量(前端匹配契约见本文件常量注释)。
-跨功能通用 helper 在 utils,经本模块属性调用(utils.xxx 调用时取 ——
-monkeypatch 活性)。
+This module owns conversation rendering and the deep-research response contract.
+Shared generator configuration remains in :mod:`.utils`.
 """
 
 from __future__ import annotations
 
-from .. import envs  # 模块对象绑定:属性一律调用时取(patch/强刷活性)
+from .. import envs  # Read attributes at call time so reloads and patches stay visible.
 from ..utils import Repo, _estimate_tokens
 from . import utils
 from .utils import log
 
-# ---------------------------------------------------------------------------
-# 深研究模板(折叠版:一次回答完成整轮研究。标题字符串必须逐字匹配前端
-# Ask.tsx 的提取/完成判定正则
-# (Research Plan / Research Update {n} / Final Conclusion);禁 "## Next Steps"
-# (它会截断 plan 提取并影响完成判定)与 "## Conclusion"/"## Summary"
-# (完成判定的次选触发词)。)
-# ---------------------------------------------------------------------------
+# Ask.tsx parses these headings verbatim to track and complete a research response.
+# Additional conclusion or next-step headings would trigger its fallback matchers.
 
 _DEEP_RESEARCH_ONE_SHOT_PROMPT = """<role>
 You are an expert code analyst examining the {repo_type} repository: {repo_url} ({repo_name}).
@@ -38,15 +31,13 @@ IMPORTANT:You MUST respond in {language_name} language.
 - NEVER write "## Next Steps"; NEVER respond with "Continue the research".
 - Do NOT use "## Conclusion" or "## Summary" as section headings (only "## Final Conclusion").
 - Focus EXCLUSIVELY on the user's query; cite specific files and code sections when relevant.
-</guidelines>"""  # noqa: E501 - prompt 原文移植,单行语义不拆
+</guidelines>"""  # noqa: E501 - Preserve the upstream prompt as a single literal.
 
-# ---------------------------------------------------------------------------
-# Natural conversation history rendering
-# ---------------------------------------------------------------------------
+# --- Conversation rendering ---
 
 
 def _render_natural_history(messages: list[dict]) -> str:
-    """对话历史自然转写(无 <turn>/<conversation_history> 伪标签);输入过大时省略历史。"""
+    """Render prior turns naturally, omitting history when the latest input is too large."""
     history_parts: list[str] = []
     if len(messages) > 1:
         last = messages[-1]
@@ -65,7 +56,7 @@ def _render_natural_history(messages: list[dict]) -> str:
 
 
 def _resolve_chat_continuation(last: dict, messages: list[dict]) -> None:
-    """continuation 回退(移植 research.py):末条含 continue+research 时换回首个用户消息(就地改 last['content'])。"""
+    """Replace a research-continuation request with the original user question."""
     if "continue" in last.get("content", "").lower() and "research" in last.get("content", "").lower():
         for msg in messages:
             if msg.get("role") == "user" and "continue" not in msg.get("content", "").lower():
@@ -73,38 +64,29 @@ def _resolve_chat_continuation(last: dict, messages: list[dict]) -> None:
                 break
 
 
-# ---------------------------------------------------------------------------
-# 实现(单一生成器管道:一次回答完成;无协议级轮转)
-# ---------------------------------------------------------------------------
+# --- Generation ---
 
 
 async def _chat(
     *, generator: str | None = None, generator_config: dict | None = None, repo: Repo, messages: list[dict],
     language: str = "en", research_iteration: int = 1,
 ):
-    """一次 chat 问答的流式应答(纯文本 chunk 序列,前后端协议同原 research_chat);
-
-    现代模式:一次提问,generator 内部多轮工具调用完成,不做协议级轮转。
-    """
+    """Stream one complete answer without protocol-level research turns."""
     if not messages:
         raise ValueError("No messages provided")
     last = messages[-1]
     if last.get("role") != "user":
         raise ValueError("Last message must be from the user")
 
-    # 注:未索引的前置校验属端点守卫,已上移到应用层,生成器内不再重复
     fmt = utils.prompt_fmt(repo, language=language)
     is_deep = last.get("mode") == "deep_research"
     if is_deep:
-        # 折叠:一次回答完成整轮研究(生成器内部多轮工具调用);continuation 回退
-        # 保留作偏差兜底(首轮缺 Final Conclusion 时前端续跑轮为同一问题重跑)
+        # Reuse the original question when the frontend retries an incomplete response.
         _resolve_chat_continuation(last, messages)
         system = _DEEP_RESEARCH_ONE_SHOT_PROMPT.format(**fmt)
     else:
         system = utils._SIMPLE_CHAT_SYSTEM_PROMPT.format(**fmt)
 
-    # 对话历史自然转写(无 <turn> 伪标签);输入过大时省略历史。引擎不传
-    # context 类"假日志"事件(监控事件由适配器内 EventRecorder 发布)。
     adapter = utils.adapt_generator(generator, generator_config=generator_config, system_prompt=system, repo=repo)
     history = _render_natural_history(messages)
 
@@ -115,22 +97,29 @@ async def _chat(
         async with adapter.session(session_name=f"chat:{repo.name}", run_id=f"chat:{repo.name}"):
             async for chunk in adapter.stream(prompt):
                 yield chunk
-    except Exception as e:  # 执行期失败降级为可读错误文本(同原 stream_and_fallback 语义)
-        err = utils.failure(e)  # RequestFailedError 先转「generator 执行失败」再降级(同原包装时序)
+    except Exception as e:  # The streaming protocol represents runtime failures as text.
+        err = utils.failure(e)
         log(f"chat 生成器错误: {err}")
         yield f"\n\n(抱歉,本次请求处理失败: {err})"
-
-
-# ---------------------------------------------------------------------------
-# 服务入口(端点层从 app.py 直呼)
-# ---------------------------------------------------------------------------
 
 
 async def chat_stream(
     *, generator: str | None = None, generator_config: dict | None = None, repo: Repo, messages: list[dict],
     language: str = "en", research_iteration: int = 1,
 ):
-    """一次 chat 问答的流式应答(纯文本 chunk 序列,前后端协议同原 research_chat);单一生成器管道。"""
+    """Stream one DeepWiki-compatible chat answer.
+
+    Args:
+        generator: Registered Agent adapter name, or the default when omitted.
+        generator_config: Adapter-specific construction options.
+        repo: Repository available to the Agent.
+        messages: Ordered conversation messages ending with a user message.
+        language: Response language code.
+        research_iteration: Compatibility field retained for the endpoint contract.
+
+    Yields:
+        Plain-text response chunks.
+    """
     async for chunk in _chat(
         generator=generator, generator_config=generator_config, repo=repo, messages=messages,
         language=language, research_iteration=research_iteration,

@@ -1,4 +1,4 @@
-// 共享包中文文案(扁平键;en.ts 为键结构母本,新增键须两侧同步;缺键回退 en)
+// Flat Chinese catalog keyed from en.ts; missing entries fall back to English.
 export default {
   'app.title': 'agent 监控',
   'sidebar.search': '搜索会话…',
@@ -51,8 +51,8 @@ export default {
   'meta.steps': '步',
   'meta.chars': '字',
   'meta.usage': 'tokens',
-  // 共享组件(配置表单/wiki 型选择等)文案:从 deepwiki-webui extraMessages 上收;
-  // 缺键(如 enterIncludedDirs/filterMode 等 web 侧本就无 zh 值)回退 en,行为不变
+  // Shared control messages for configuration and wiki selectors.
+  // Intentionally missing translations such as path inclusion controls fall back to English.
   'common.cancel': '取消',
   'common.generateWiki': '生成Wiki',
   'common.processing': '处理中...',

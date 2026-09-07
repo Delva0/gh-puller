@@ -1,10 +1,9 @@
-# ui 为本项目共享 UI 组件包(@gh-puller/ui,自持 package.json,apps 经 workspace:* 依赖);
-# 与根 pyproject.toml / uv.lock 共存,uv 管 Python、pnpm 管 JS
+# pnpm owns JavaScript dependencies; uv independently owns Python dependencies.
 packages:
   - ui
   - apps/deepwiki-webui/web
   - apps/agent-monitor/web
-  # dsh 插件(TS 源 + vitest,构建产物 lib/ 提交;server/ 为 Python 侧,由 uv 管)
+  # The DSH plugin commits its built library; uv owns its Python server.
   - apps/dsh-gh-puller
 allowBuilds:
   esbuild: true
@@ -12,7 +11,7 @@ allowBuilds:
   '@swc/core': true
   sharp: true
 
-# 单版本固化:micromark-util-types 的 .d.ts 被 micromark-extension-math 增强,
-# 双版本并存会让 TokenTypeMap 增强与 Effects 类型分裂(见 vendor 面板编译)。
+# micromark-extension-math augments these types; duplicate versions split the
+# TokenTypeMap augmentation from Effects in the vendored panel build.
 overrides:
   micromark-util-types: 2.0.2

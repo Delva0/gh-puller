@@ -12,12 +12,12 @@ import {
 } from './target';
 
 interface TargetSelectorProps {
-  /** 注册表配置加载器(可注入;缺省 GET /api/generators/config) */
+  /** Optional registry loader; defaults to GET /api/generators/config. */
   loadConfig?: () => Promise<GeneratorsConfig>;
   value: TargetConfig;
   onChange: (value: TargetConfig) => void;
 
-  // File filter configuration(原 UserSelector 继承的过滤面,结构不变)
+  // Optional file-filter controls
   showFileFilters?: boolean;
   excludedDirs?: string;
   setExcludedDirs?: (value: string) => void;
@@ -30,12 +30,11 @@ interface TargetSelectorProps {
 }
 
 /**
- * Generator → 生成器配置的 target selector(按注册表 configKind 渲染):
- * - file 类(cc/dsh/codex):config_path 输入(各 CLI 原生配置文件;模型/凭证/端点随文件);
- * - object 类(llm):Provider → Model → API Key / Base URL。
- * 消费方只管 TargetConfig(公开部分 + object 类请求态凭证);切换 generator 后按
- * 注册表补齐对应 kind 的缺省并清空他类字段;凭证输入不落 URL/localStorage
- * (会话层由调用方存);file 类不携带凭证字段(后端 422 语义)。
+ * Selects an agent target according to the registry config kind.
+ *
+ * File generators accept a native CLI config path. Object generators accept provider, model,
+ * and request-scoped credentials. Generator changes apply kind defaults and discard fields from
+ * the previous kind. Consumers must not persist credentials in URLs or localStorage.
  */
 export default function TargetSelector({
   loadConfig = DEFAULT_LOAD_GENERATORS_CONFIG,
@@ -63,7 +62,7 @@ export default function TargetSelector({
 
   const update = (patch: Partial<TargetConfig>) => onChange({ ...value, ...patch });
 
-  // 侧边态:provider 已选但当前 generator 不支持 → 重置为该 generator 默认
+  // A generator switch can briefly leave the previously selected provider out of scope.
   const selectedGenerator = config?.generators.find((g) => g.id === value.generator);
   const selectedProvider = config?.providers.find((p) => p.id === value.provider);
 
@@ -94,14 +93,14 @@ export default function TargetSelector({
       }
     };
     fetchConfig();
-    // loadConfig 未入 deps:缺省为模块级常量(稳定引用);消费方注入时须同样传稳定引用
+    // loadConfig is intentionally omitted; injected loaders must be stable like the default.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [value.generator, onChange]);
 
   const handleGeneratorChange = (newGenerator: string) => {
     const gen = config?.generators.find((g: GeneratorConfigItem) => g.id === newGenerator);
     if (gen?.configKind === 'file') {
-      // file 类:全新对象(仅 config_path;不携 object 类字段/凭证 —— 后端 422 语义)
+      // A fresh file target drops object fields and credentials as required by backend validation.
       onChange({ generator: newGenerator, config_path: gen.configDefault || '' });
       return;
     }
@@ -288,7 +287,7 @@ tsconfig.spec.json
           )}
         </div>
 
-        {/* file 类:生成器配置 = 各 CLI 原生配置文件路径(模型/凭证/端点随文件,服务端纯透传) */}
+        {/* File generators pass their native config path through to the CLI or SDK. */}
         {selectedGenerator?.configKind === 'file' && (
           <div>
             <label htmlFor="config-path-input" className="block text-xs font-medium text-[var(--foreground)] mb-1.5">
@@ -359,7 +358,7 @@ tsconfig.spec.json
               )}
             </div>
 
-            {/* API Key / Base URL(请求态,仅本次会话) */}
+            {/* API key and base URL remain request-scoped for this session. */}
             <div>
               <label htmlFor="api-key-input" className="block text-xs font-medium text-[var(--foreground)] mb-1.5">
                 {t("form.apiKey")}
@@ -538,5 +537,4 @@ tsconfig.spec.json
   );
 }
 
-// 兼容旧出口名(UserSelector → TargetSelector;消费方已迁移,不再新增用法)
 export { strippedTarget };

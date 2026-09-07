@@ -1,8 +1,8 @@
-"""持久化上游仓库与 PR 代码对象并生成可离线解析的 Git 引用。
+"""Persist upstream and PR objects behind durable, offline-readable Git refs.
 
-本模块管理与 SQLite 事实库一一对应的 bare Git 对象库。GitHub 讨论语义由
-syncer 拉取；本模块保存标准上游 refs、不可变历史 pins，以及 PR refs 可达的
-commit、tree 与 blob。它不提供工作区或下游派生写入。
+Each bare object store pairs with one SQLite fact archive. The syncer owns GitHub
+discussion semantics; this module stores upstream refs, immutable historical pins, and
+objects reachable from PR refs. It provides neither worktrees nor downstream writes.
 """
 
 from __future__ import annotations
@@ -80,11 +80,11 @@ _LOG = logging.getLogger(__name__)
 
 
 class GitStoreError(RuntimeError):
-    """持久化 Git 对象库无法建立或验证所需快照。"""
+    """Report failure to establish or validate a required Git snapshot."""
 
 
 class TransientGitStoreError(GitStoreError):
-    """单次 Git fetch 因可重试的传输错误失败。"""
+    """Report a retryable transport failure from one Git fetch."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,17 +129,18 @@ class _RemoteRefObservation:
 
 
 class GitObjectStore:
-    """管理一个仓库专属的 bare Git 对象库。
+    """Manage a repository-specific bare Git object store.
 
     Args:
-        path: 与 SQLite 事实库配套的 bare Git 目录。
-        repository: 固定绑定的 GitHub ``owner/repo``。
-        remote_url: Git fetch 使用的远端地址。
-        upstream_synced: 配套事实库是否已证明当前 cycle 完成上游 refs 同步。
-        ref_batch_size: 单次 Git 传输包含的同远端精确 refs 上限。
-        token: HTTPS 远端的 GitHub token；不会写入 Git 配置。
-        sleep: 瞬时 Git 传输错误的可取消退避等待器。
-        now: 记录逐来源获取尝试窗口的时区时钟。
+        path: Bare Git directory paired with the SQLite fact archive.
+        repository: Permanently bound GitHub ``owner/repo``.
+        remote_url: Remote used for Git fetches.
+        upstream_synced: Whether the fact archive proves upstream refs were synchronized
+            in the current cycle.
+        ref_batch_size: Maximum exact refs from one remote in a single transfer.
+        token: GitHub token for HTTPS remotes; never written to Git configuration.
+        sleep: Cancelable backoff waiter for transient Git transport failures.
+        now: Aware clock used to record per-source fetch-attempt windows.
     """
 
     def __init__(
@@ -174,11 +175,11 @@ class GitObjectStore:
         heartbeat: Callable[[], None] | None = None,
         retry: Callable[[float], None] | None = None,
     ) -> dict[str, Any]:
-        """同步并固定当前上游 branches 与 tags。
+        """Synchronize and pin current upstream branches and tags.
 
         Args:
-            heartbeat: Git 网络操作未结束时周期调用的带外观察器。
-            retry: 瞬时 Git 传输错误发生时接收退避秒数的观察器。
+            heartbeat: Out-of-band observer called while Git network work remains active.
+            retry: Observer receiving backoff seconds after transient transport failures.
         """
         async with self._lock:
             await self._prepare(heartbeat)
@@ -413,13 +414,14 @@ class GitObjectStore:
         retry: Callable[[float], None] | None = None,
         retry_transient: bool = True,
     ) -> None:
-        """批量取得随后将被固定的 PR refs。
+        """Fetch a batch of PR refs that will subsequently be pinned.
 
         Args:
-            pulls: 当前 API 消费批次中 PR number 到 detail 对象的映射。
-            heartbeat: Git 网络操作未结束时周期调用的带外观察器。
-            retry: 瞬时 Git 传输错误发生时接收退避秒数的观察器。
-            retry_transient: 为 False 时将 PR ref 的瞬时失败交还调用方拆批。
+            pulls: PR-number to detail mapping from the current API-consumption batch.
+            heartbeat: Out-of-band observer called while Git network work remains active.
+            retry: Observer receiving backoff seconds after transient transport failures.
+            retry_transient: When false, return transient PR-ref failures so the caller
+                can split the batch.
         """
         selected = sorted(pulls)
         if not selected:
@@ -464,21 +466,23 @@ class GitObjectStore:
         heartbeat: Callable[[], None] | None = None,
         retry: Callable[[float], None] | None = None,
     ) -> dict[str, Any]:
-        """固定一个 PR 当前可达的精确 Git 对象。
+        """Pin the exact Git objects currently reachable for one PR.
 
         Args:
-            number: Repository-local PR number。
-            pull: GitHub PR detail 原始对象。
-            heartbeat: 补取 Git 对象未结束时周期调用的带外观察器。
-            retry: 瞬时 Git 传输错误发生时接收退避秒数的观察器。
+            number: Repository-local PR number.
+            pull: Raw GitHub PR detail object.
+            heartbeat: Out-of-band observer called while missing objects are fetched.
+            retry: Observer receiving backoff seconds after transient transport failures.
 
         Returns:
-            base/head 都可达时返回可交给 ``git diff`` 的完整快照；
-            否则固定仍可达的对象并显式标记不可用的比较。API 声明的
-            landing 仅在对象已可达时一同固定。
+            A complete snapshot suitable for ``git diff`` when base and head are
+            reachable. Otherwise, reachable objects are pinned and unavailable
+            comparisons are explicit. API-declared landing commits are pinned only when
+            already reachable.
 
         Raises:
-            GitStoreError: SHA 非法、可达历史存在多个 merge-base，或引用无法持久化。
+            GitStoreError: A SHA is invalid, reachable history has multiple merge bases,
+                or refs cannot be persisted.
         """
         base_sha = _nested_sha(pull, "base", number)
         head_sha = _nested_sha(pull, "head", number)
@@ -1164,25 +1168,25 @@ class GitObjectStore:
 
 
 def git_store_path(database: Path) -> Path:
-    """返回一个 SQLite 事实库固定对应的 Git 对象库路径。
+    """Return the Git object-store path paired with a SQLite fact archive.
 
     Args:
-        database: SQLite 事实库路径。
+        database: SQLite fact-archive path.
 
     Returns:
-        在原路径后追加 ``.git`` 的 bare Git 目录。
+        Bare Git directory formed by appending ``.git`` to the original path.
     """
     return Path(f"{Path(database)}.git")
 
 
 def default_git_url(repository: str) -> str:
-    """返回 GitHub.com 仓库的 HTTPS Git URL。
+    """Return the HTTPS Git URL for a GitHub.com repository.
 
     Args:
-        repository: GitHub ``owner/repo``。
+        repository: GitHub ``owner/repo``.
 
     Returns:
-        不含凭据的公开 Git URL。
+        Public Git URL without credentials.
     """
     return f"https://github.com/{repository}.git"
 

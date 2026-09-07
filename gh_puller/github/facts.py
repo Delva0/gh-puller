@@ -1,7 +1,7 @@
-"""把 GraphQL 原始节点映射为拉取器稳定消费的事实结构。
+"""Map raw GraphQL nodes to stable facts consumed by the collector.
 
-本模块不发起网络请求、选择配额或持久化数据。client 负责证明分页完整后调用
-这些纯映射，并把未改写的 GraphQL 节点与映射结果一同交给 syncer。
+These pure mappings neither issue requests nor choose quotas or persist data. The client
+proves pagination completeness and passes both raw nodes and mapped facts to the syncer.
 """
 
 from __future__ import annotations

@@ -32,5 +32,5 @@ TOOL = ToolDef(
 
 @register
 def delete_project(arguments: dict, config: ServerConfig) -> types.CallToolResult:
-    """Delete project：默认透传 CBM 后端；具体定制在此扩展。"""
+    """Pass project deletion through to the CBM backend."""
     return passthrough(TOOL, arguments, config)

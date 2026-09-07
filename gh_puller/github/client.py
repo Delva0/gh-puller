@@ -1,7 +1,7 @@
-"""提供遵守 GitHub 限流恢复契约的异步 API 读取层。
+"""Provide asynchronous GitHub API reads with quota-aware recovery.
 
-本模块只负责 HTTP、条件校验、分页、仓库对象计数、PR 关闭关系与重试，不
-解释 Issue/PR 数据，也不写归档。观测水位与持久化契约见 ``gh_puller.github``。
+This module owns HTTP, validators, pagination, repository counts, closing references,
+and retries. It neither interprets issue and PR facts nor writes archives.
 """
 
 from __future__ import annotations
@@ -97,19 +97,19 @@ class GitHubResource:
 
 
 class GitHubAPI:
-    """异步 GitHub REST 与 GraphQL 客户端。
+    """Read GitHub REST and GraphQL APIs asynchronously.
 
     Args:
-        token: GitHub token；空值只允许访问公开资源并使用匿名限额。
-        base_url: REST API 根地址，支持 GitHub Enterprise。
-        graphql_url: GraphQL API 地址；None 从 REST 根地址推导。
-        api_version: 发送到 ``X-GitHub-Api-Version`` 的版本。
-        timeout: 单次请求超时秒数。
-        client: 测试或宿主注入的 ``httpx.AsyncClient``；其生命周期和传输恢复
-            由调用方负责。
-        sleep: 限流与退避使用的异步等待函数。
-        now: 计算限流恢复时刻使用的 UTC 时钟。
-        progress: HTTP 尝试、配额与等待的同步带外观察器。
+        token: GitHub token. Empty values use anonymous public-resource quotas.
+        base_url: REST API root, including GitHub Enterprise deployments.
+        graphql_url: GraphQL endpoint, or ``None`` to derive it from the REST root.
+        api_version: Value sent in ``X-GitHub-Api-Version``.
+        timeout: Per-request timeout in seconds.
+        client: Injected ``httpx.AsyncClient`` whose lifecycle and transport recovery
+            remain the caller's responsibility.
+        sleep: Async wait function used for quotas and backoff.
+        now: UTC clock used to calculate quota recovery times.
+        progress: Synchronous out-of-band observer for attempts, quotas, and waits.
     """
 
     def __init__(
@@ -153,7 +153,7 @@ class GitHubAPI:
         self.request_count = 0
 
     async def close(self) -> None:
-        """关闭由本对象创建的 HTTP client；注入的 client 由调用方管理。"""
+        """Close the internally created client while leaving injected clients open."""
         if self._owns_client:
             await self._client.aclose()
 
@@ -181,15 +181,15 @@ class GitHubAPI:
         params: Mapping[str, Any] | None = None,
         accept: str | None = None,
     ) -> Any:
-        """读取单个 JSON 响应。
+        """Read one JSON response.
 
         Args:
-            path: 相对 API 路径或 GitHub ``Link`` 返回的绝对 URL。
-            params: 查询参数。
-            accept: 覆盖默认 full JSON media type。
+            path: Relative API path or absolute URL from a GitHub ``Link`` header.
+            params: Query parameters.
+            accept: Override for the default full-JSON media type.
 
         Returns:
-            GitHub 返回的原始 JSON 值。
+            Unmodified JSON returned by GitHub.
         """
         response = await self._request("GET", path, params=params, accept=accept)
         try:
@@ -206,17 +206,20 @@ class GitHubAPI:
         params: Mapping[str, Any] | None = None,
         accept: str | None = None,
     ) -> tuple[Any, dict[str, Any] | None]:
-        """用 HTTP validator 校验并读取单个 JSON 响应。
+        """Validate and read one JSON response through HTTP validators.
 
         Args:
-            path: 相对 API 路径。
-            previous: 与 cache 同一次成功响应的未改写 JSON；None 强制完整读取。
-            cache: 本客户端产生并与 previous 原子持久化的传输元数据。
-            params: 查询参数。
-            accept: 覆盖默认 full JSON media type。
+            path: Relative API path.
+            previous: Unmodified JSON paired with ``cache``, or ``None`` to force a
+                complete read.
+            cache: Transport metadata produced by this client and persisted atomically
+                with ``previous``.
+            params: Query parameters.
+            accept: Override for the default full-JSON media type.
 
         Returns:
-            当前原始 JSON 及其新传输元数据。304 返回 previous；200 总是解析新响应。
+            Current raw JSON and new transport metadata. A 304 reuses ``previous``;
+            a 200 always parses the new response.
         """
         return await self._get_json_cached(
             path,
@@ -267,15 +270,15 @@ class GitHubAPI:
         params: Mapping[str, Any] | None = None,
         accept: str | None = None,
     ) -> GitHubPage:
-        """读取一个可独立持久化的 GitHub REST page。
+        """Read one independently persistable GitHub REST page.
 
         Args:
-            path: 首页相对路径或 GitHub ``Link`` 返回的绝对 URL。
-            params: 仅用于首页的查询参数；``per_page`` 缺省固定为 100。
-            accept: 覆盖默认 JSON media type。
+            path: Initial relative path or absolute URL from a GitHub ``Link`` header.
+            params: First-page parameters; ``per_page`` defaults to 100.
+            accept: Override for the default JSON media type.
 
         Returns:
-            当前页原始对象与服务端给出的不透明下一页 URL。
+            Raw objects from this page and the opaque next-page URL from the server.
         """
         query = None if params is None else dict(params)
         if query is not None:
@@ -293,18 +296,18 @@ class GitHubAPI:
         params: Mapping[str, Any] | None = None,
         page_observer: Callable[[int], None] | None = None,
     ) -> list[dict[str, Any]]:
-        """沿 GitHub ``Link`` 响应头读取完整列表。
+        """Read a complete list by following GitHub ``Link`` headers.
 
         Args:
-            path: 首个分页 API 路径。
-            params: 首页查询参数；``per_page`` 缺省固定为 GitHub 上限 100。
-            page_observer: 每个已验证页面的条目数同步观察器。
+            path: First paginated API path.
+            params: First-page parameters; ``per_page`` defaults to GitHub's limit of 100.
+            page_observer: Synchronous observer receiving each validated page size.
 
         Returns:
-            按服务端顺序拼接、字段不裁剪的所有条目。
+            Every unmodified item in server order.
 
         Raises:
-            GitHubAPIError: 任一分页响应不是 JSON 对象数组。
+            GitHubAPIError: A page is not an array of JSON objects.
         """
         items, _ = await self.paginate_cached(
             path,
@@ -324,21 +327,21 @@ class GitHubAPI:
         params: Mapping[str, Any] | None = None,
         page_observer: Callable[[int], None] | None = None,
     ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
-        """逐页校验一个已有完整集合，变化时重新完整分页。
+        """Validate a cached collection page by page and repaginate on change.
 
         Args:
-            path: 首个分页 API 路径。
-            previous: 与 cache 配对的完整旧集合。
-            cache: 本客户端产生并与 previous 配对的分页 validator 元数据。
-            params: 首页查询参数；``per_page`` 固定为 100。
-            page_observer: 每个已验证页面的条目数同步观察器。
+            path: First paginated API path.
+            previous: Complete previous collection paired with ``cache``.
+            cache: Pagination validator metadata produced by this client.
+            params: First-page parameters; ``per_page`` is fixed at 100.
+            page_observer: Synchronous observer receiving each validated page size.
 
         Returns:
-            当前完整集合及其分页传输元数据。末页恰好为 100 条时不产生缓存，
-            使后续请求必须探测可能新增的下一页。
+            Current complete collection and pagination metadata. A full 100-item final
+            page is not cached, forcing later calls to probe for a newly added page.
 
         Raises:
-            GitHubAPIError: 任一 200 响应不是 JSON 对象数组。
+            GitHubAPIError: A 200 response is not an array of JSON objects.
         """
         return await self._paginate_cached(
             path,
@@ -469,15 +472,15 @@ class GitHubAPI:
         return json.dumps(payload, default=str, sort_keys=True, separators=(",", ":"))
 
     async def repository_item_count(self, owner: str, repo: str) -> int | None:
-        """读取仓库当前 Issue 与 PR 的精确总数。
+        """Read the repository's exact current issue and pull-request count.
 
         Args:
-            owner: 仓库 owner。
-            repo: 仓库名。
+            owner: Repository owner.
+            repo: Repository name.
 
         Returns:
-            两类对象的 GraphQL ``totalCount`` 之和；匿名客户端返回 None。该值只
-            用作冷启动进度估计。
+            Sum of both GraphQL ``totalCount`` values. Anonymous clients return
+            ``None``. The count is used only for cold-start progress.
         """
         if not self._authenticated:
             return None
@@ -504,17 +507,19 @@ class GitHubAPI:
         previous: dict[str, Any] | None,
         cache: dict[str, Any] | None,
     ) -> GitHubResource:
-        """读取一个 PR 的稳定详情事实，并自动选择主配额池。
+        """Read stable PR details while selecting the primary quota pool.
 
         Args:
-            owner: 仓库 owner。
-            repo: 仓库名。
-            number: 仓库内 PR number。
-            previous: 与 cache 配对的上一版稳定详情；None 表示冷读取。
-            cache: 本操作先前返回的 REST validator；GraphQL 结果没有 validator。
+            owner: Repository owner.
+            repo: Repository name.
+            number: Repository-local PR number.
+            previous: Previous stable details paired with ``cache``, or ``None`` for a
+                cold read.
+            cache: REST validator returned by this operation. GraphQL results have none.
 
         Returns:
-            REST 兼容的稳定详情、事实来源、来源原文与可复用 validator。
+            REST-compatible stable details, fact source, raw source, and reusable
+            validator.
         """
         if number < 1:
             raise ValueError("number must be positive")
@@ -557,17 +562,18 @@ class GitHubAPI:
         previous: list[dict[str, Any]] | None,
         cache: dict[str, Any] | None,
     ) -> GitHubResource:
-        """读取一个 PR 的完整 review 集合，并自动选择主配额池。
+        """Read a complete PR review collection using the primary quota pool.
 
         Args:
-            owner: 仓库 owner。
-            repo: 仓库名。
-            number: 仓库内 PR number。
-            previous: 与 cache 配对的上一版稳定集合；None 表示冷读取。
-            cache: 本操作先前返回的 REST 分页 validator。
+            owner: Repository owner.
+            repo: Repository name.
+            number: Repository-local PR number.
+            previous: Previous stable collection paired with ``cache``, or ``None`` for
+                a cold read.
+            cache: REST pagination validator returned by this operation.
 
         Returns:
-            REST 兼容的稳定 review 集合、事实来源、来源原文与 validator。
+            REST-compatible stable reviews, fact source, raw source, and validator.
         """
         if number < 1:
             raise ValueError("number must be positive")
@@ -613,20 +619,21 @@ class GitHubAPI:
         previous: list[dict[str, Any]] | None,
         cache: dict[str, Any] | None,
     ) -> GitHubResource:
-        """读取一个 PR 的完整 commit 集合，并自动选择主配额池。
+        """Read a complete PR commit collection using the primary quota pool.
 
         Args:
-            owner: 仓库 owner。
-            repo: 仓库名。
-            number: 仓库内 PR number。
-            expected: PR detail 声明的 commit 总数。
-            base: REST comparison 回退使用的 base SHA。
-            head: REST comparison 回退使用的 head SHA。
-            previous: 与 cache 配对的上一版稳定集合；None 表示冷读取。
-            cache: 本操作先前返回的 REST 分页 validator。
+            owner: Repository owner.
+            repo: Repository name.
+            number: Repository-local PR number.
+            expected: Commit count declared by PR details.
+            base: Base SHA for REST comparison fallback.
+            head: Head SHA for REST comparison fallback.
+            previous: Previous stable collection paired with ``cache``, or ``None`` for
+                a cold read.
+            cache: REST pagination validator returned by this operation.
 
         Returns:
-            REST 兼容的稳定 commit 集合、事实来源、来源原文与 validator。
+            REST-compatible stable commits, fact source, raw source, and validator.
         """
         if number < 1 or expected < 1:
             raise ValueError("number and expected must be positive")
@@ -682,17 +689,18 @@ class GitHubAPI:
         previous: list[dict[str, Any]] | None,
         cache: dict[str, Any] | None,
     ) -> GitHubResource:
-        """读取一个 PR 的完整 review-comment 集合，并自动选择主配额池。
+        """Read a complete PR review-comment collection using the primary quota pool.
 
         Args:
-            owner: 仓库 owner。
-            repo: 仓库名。
-            number: 仓库内 PR number。
-            previous: 与 cache 配对的上一版稳定集合；None 表示冷读取。
-            cache: 本操作先前返回的 REST 分页 validator。
+            owner: Repository owner.
+            repo: Repository name.
+            number: Repository-local PR number.
+            previous: Previous stable collection paired with ``cache``, or ``None`` for
+                a cold read.
+            cache: REST pagination validator returned by this operation.
 
         Returns:
-            REST 兼容的稳定 review-comment 集合、来源、来源原文与 validator。
+            REST-compatible stable review comments, source, raw source, and validator.
         """
         if number < 1:
             raise ValueError("number must be positive")
@@ -823,17 +831,18 @@ class GitHubAPI:
         previous: list[dict[str, Any]] | None,
         cache: dict[str, Any] | None,
     ) -> GitHubResource:
-        """读取一个 Issue/PR 的完整 conversation-comment 集合并选择配额池。
+        """Read a complete issue or PR conversation-comment collection.
 
         Args:
-            owner: 仓库 owner。
-            repo: 仓库名。
-            number: 仓库内 Issue/PR number。
-            previous: 与 cache 配对的上一版稳定集合；None 表示冷读取。
-            cache: 本操作先前返回的 REST 分页 validator。
+            owner: Repository owner.
+            repo: Repository name.
+            number: Repository-local issue or PR number.
+            previous: Previous stable collection paired with ``cache``, or ``None`` for
+                a cold read.
+            cache: REST pagination validator returned by this operation.
 
         Returns:
-            REST 兼容的稳定 comment 集合、来源、来源原文与 validator。
+            REST-compatible stable comments, source, raw source, and validator.
         """
         if number < 1:
             raise ValueError("number must be positive")
@@ -875,16 +884,17 @@ class GitHubAPI:
         previous: list[dict[str, Any]] | None,
         cache: dict[str, Any] | None,
     ) -> GitHubResource:
-        """读取一个 reactable 的完整 reaction 集合并选择配额池。
+        """Read a complete reaction collection for one reactable object.
 
         Args:
-            path: REST reaction collection 的相对路径。
-            node_id: 同一 reactable 的 GraphQL node ID；None 使操作固定使用 REST。
-            previous: 与 cache 配对的上一版稳定集合；None 表示冷读取。
-            cache: 本操作先前返回的 REST 分页 validator。
+            path: Relative REST reaction-collection path.
+            node_id: GraphQL node id for the same object, or ``None`` to force REST.
+            previous: Previous stable collection paired with ``cache``, or ``None`` for
+                a cold read.
+            cache: REST pagination validator returned by this operation.
 
         Returns:
-            REST 兼容的稳定 reaction 集合、来源、来源原文与 validator。
+            REST-compatible stable reactions, source, raw source, and validator.
         """
 
         async def rest(wait_primary: bool) -> GitHubResource:
@@ -926,19 +936,19 @@ class GitHubAPI:
         base: str,
         head: str,
     ) -> list[dict[str, Any]]:
-        """通过可分页 comparison 读取两个 commit 之间的完整列表。
+        """Read all commits between two revisions through paginated comparison.
 
         Args:
-            owner: 仓库 owner。
-            repo: 仓库名。
-            base: comparison 的 base commit SHA。
-            head: comparison 的 head commit SHA。
+            owner: Repository owner.
+            repo: Repository name.
+            base: Base commit SHA for comparison.
+            head: Head commit SHA for comparison.
 
         Returns:
-            按 GitHub comparison 顺序排列、字段不裁剪的 commit 对象。
+            Unmodified commit objects in GitHub comparison order.
 
         Raises:
-            GitHubAPIError: 分页的总数、cursor 或 commit identity 不一致。
+            GitHubAPIError: Page totals, cursors, or commit identities are inconsistent.
         """
         return await self._compare_commits(
             owner,
@@ -1020,19 +1030,20 @@ class GitHubAPI:
         repo: str,
         numbers: Sequence[int],
     ) -> dict[int, list[dict[str, Any]]]:
-        """读取 GitHub 标记为可能由一批 PR 关闭的 Issue。
+        """Read issues GitHub marks as potentially closed by a batch of PRs.
 
         Args:
-            owner: PR 所属仓库 owner。
-            repo: PR 所属仓库名。
-            numbers: 至多 100 个不同的正整数 PR number。
+            owner: Owner of the PR repository.
+            repo: Name of the PR repository.
+            numbers: Up to 100 distinct positive PR numbers.
 
         Returns:
-            每个输入 PR 对应的完整 GraphQL ``closingIssuesReferences`` 节点列表。
+            Complete GraphQL ``closingIssuesReferences`` nodes for every input PR.
 
         Raises:
-            GitHubAPIError: 客户端未认证，或 GraphQL 返回不完整或不一致的数据。
-            ValueError: numbers 违反批量调用约束。
+            GitHubAPIError: The client is anonymous or GraphQL data is incomplete or
+                inconsistent.
+            ValueError: ``numbers`` violates the batch constraints.
         """
         batch = list(numbers)
         if not batch:

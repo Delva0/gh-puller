@@ -1,10 +1,10 @@
-"""增量观测并离线保存 GitHub Issue、PR 与关联 Git 对象。
+"""Incrementally observe and archive GitHub issues, pull requests, and Git objects.
 
-每个语义完整的事实集合在真实读取窗口闭合后立即追加到 SQLite；同步 cycle 只负责
-发现游标、任务恢复和内部 checkpoint，maintenance job 独立承载定向刷新与补采。
-历史读取按观测时刻选择事实，不存在仓库级 target 快照或覆盖更新。静默删除及
-GitHub 未暴露变更信号的旧子资源采用尽力而为语义；一旦 Issue/PR 被发现，全部
-已承诺集合都会重新观测。
+Each complete fact collection is appended after its real read window closes. Sync
+cycles own discovery and recovery checkpoints, while maintenance jobs perform targeted
+refreshes. Historical reads select observations by time instead of overwriting a
+repository snapshot. Silent deletions and changes without GitHub signals are best
+effort; once a parent item is selected, all promised collections are observed again.
 """
 
 from .client import GitHubAPI

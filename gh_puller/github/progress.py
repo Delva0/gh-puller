@@ -1,7 +1,7 @@
-"""提供不参与事实发布的 GitHub 操作进度事件与控制台呈现。
+"""Emit disposable progress signals for GitHub operations and console display.
 
-进度是可丢弃的带外信号；SQLite 中的 cycle、任务和观测才是恢复依据。API 客户端
-在响应、重试和限流等待时更新配额，执行器负责阶段与 Git 心跳。
+SQLite cycles, tasks, and observations remain the recovery authority. The API client
+reports responses, retries, and quota waits; executors report phases and Git heartbeats.
 """
 
 from __future__ import annotations
@@ -157,13 +157,13 @@ class _SyncProgressTracker:
 
 
 class ConsoleProgress:
-    """将同步进度呈现到终端或结构化日志。
+    """Render synchronization progress to a terminal or structured log.
 
     Args:
-        stream: 输出流；None 使用 stderr，避免污染最终 stdout JSON。
-        interval: 同一阶段普通更新的最小输出间隔秒数。
-        tty: 是否覆写单行终端状态；None 使用输出流的 ``isatty``。
-        monotonic: 节流使用的单调时钟。
+        stream: Output stream, or stderr when omitted to preserve stdout JSON.
+        interval: Minimum seconds between ordinary updates in one phase.
+        tty: Whether to overwrite one terminal line, or infer from ``isatty``.
+        monotonic: Monotonic clock used for throttling.
     """
 
     def __init__(

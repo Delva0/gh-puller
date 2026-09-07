@@ -24,8 +24,8 @@ import css from './HoverCard.module.css'
  * @param props.disabled - suppress opening; turning true closes an open card.
  * @param props.copyText - optional primary value copied by activation and
  * included in the card's accessible name.
- * @param props.copyLabel - accessible activation-label prefix (default "复制").
- * @param props.copiedLabel - visible success label (default "复制成功").
+ * @param props.copyLabel - accessible activation-label prefix.
+ * @param props.copiedLabel - visible success label.
  * @returns anchor wrapper with the conditional portaled card.
  */
 export function HoverCard({

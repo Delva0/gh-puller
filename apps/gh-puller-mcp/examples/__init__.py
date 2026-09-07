@@ -1,1 +1,1 @@
-"""gh_puller_mcp 示例脚本目录(运行式演示,非测试;LLM 真实调用属有意行为)。"""
+"""Contain executable gh_puller_mcp examples that make real LLM calls."""

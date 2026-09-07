@@ -1,7 +1,8 @@
-"""定义 GitHub GraphQL 原子读取操作的静态查询文档。
+"""Define static GraphQL documents for atomic GitHub read operations.
 
-本模块不执行网络请求或解释响应；游标闭合、事实映射与配额选择由 client 负责。
-查询只选择归档承诺的字段，GraphQL 来源原文由调用操作随稳定事实一同返回。
+The client owns cursor closure, fact mapping, and quota selection. Queries select only
+fields promised by the archive, and each operation returns raw GraphQL sources beside
+stable facts.
 """
 
 REPOSITORY_ITEM_COUNT = """

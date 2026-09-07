@@ -12,7 +12,7 @@ export interface CodeTarget {
 
 interface CodeViewerProps {
   isOpen: boolean;
-  /** 取文件内容(fetch 由调用方内置,ui 不绑定后端契约) */
+  /** Loads file content without binding the shared UI to a backend contract. */
   loadFile: (filePath: string) => Promise<string>;
   // Files available as tabs (the set of files cited by the codemap).
   files: string[];

@@ -4,8 +4,8 @@ import remarkGfm from 'remark-gfm';
 import remarkMath from 'remark-math';
 import rehypeRaw from 'rehype-raw';
 import rehypeKatex from 'rehype-katex';
-// PrismLight + 显式 registerLanguage:避免整包 re-export 带来的 hljs 异步语言动态导入
-// (vite-plugin-singlefile 强制 inlineDynamicImports 会把它们静态解析,需 highlight.js 依赖)
+// Explicit PrismLight registration avoids dynamic Highlight.js imports from the package barrel.
+// vite-plugin-singlefile would otherwise resolve them statically under inlineDynamicImports.
 import PrismLight from 'react-syntax-highlighter/dist/esm/prism-light';
 const SyntaxHighlighter = PrismLight;
 import tomorrow from 'react-syntax-highlighter/dist/esm/styles/prism/tomorrow';
@@ -41,7 +41,7 @@ interface MermaidProps {
 
 interface MarkdownProps {
   content: string;
-  /** mermaid 图谱渲染组件(由消费方注入本地实现;不传时 mermaid 代码块按普通代码块处理) */
+  /** Optional local Mermaid renderer; omitted renderers leave Mermaid blocks as ordinary code. */
   mermaidComponent?: React.ComponentType<MermaidProps>;
 }
 
@@ -157,7 +157,7 @@ const Markdown: React.FC<MarkdownProps> = ({ content, mermaidComponent: MermaidC
       const match = /language-(\w+)/.exec(className || '');
       const codeContent = children ? String(children).replace(/\n$/, '') : '';
 
-      // Handle Mermaid diagrams(经注入组件渲染,如 webui 的 Mermaid.tsx)
+      // Render Mermaid diagrams through the consumer-provided component.
       if (!inline && match && match[1] === 'mermaid' && MermaidComponent) {
         return (
           <div className="my-8 bg-[var(--card-bg)] rounded-md overflow-hidden shadow-sm">
@@ -174,7 +174,7 @@ const Markdown: React.FC<MarkdownProps> = ({ content, mermaidComponent: MermaidC
       if (!inline && match) {
         return (
           <div className="my-6 rounded-md overflow-hidden text-sm shadow-sm">
-            {/* 代码块 chrome 保持深色岛:与 tomorrow 语法主题底色一体,豁免 token 化 */}
+            {/* Keep the code-block chrome aligned with the dark Tomorrow syntax theme. */}
             <div className="bg-gray-800 text-gray-200 px-5 py-2 text-sm flex justify-between items-center">
               <span>{match[1]}</span>
               <button

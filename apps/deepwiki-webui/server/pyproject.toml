@@ -1,12 +1,12 @@
 [project]
 name = "gh-puller-webui-api"
 version = "0.1.0"
-description = "DeepWiki 兼容后端 HTTP 服务(端点层);引擎与任务复用 gh_puller"
+description = "DeepWiki-compatible HTTP backend powered by gh-puller"
 requires-python = ">=3.13"
 dependencies = [
     "claude-agent-sdk>=0.2.142",
     "fastapi>=0.139.0",
-    "gh-puller",
+    "gh-puller[agent]",
     "mcp>=2.1.1",
     "python-dotenv>=1.2.3",
     "uvicorn[standard]>=0.51.0",
@@ -17,7 +17,7 @@ dependencies = [
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
-# 平铺布局多顶层模块,须显式声明,否则 setuptools 自动发现拒绝构建
+# Flat layout has multiple top-level modules, so declare them explicitly.
 [tool.setuptools]
 py-modules = ["app", "generators", "schemas", "tasks"]
 

@@ -32,5 +32,5 @@ TOOL = ToolDef(
 
 @register
 def get_graph_schema(arguments: dict, config: ServerConfig) -> types.CallToolResult:
-    """Get graph schema：默认透传 CBM 后端；具体定制在此扩展。"""
+    """Pass graph-schema reads through to the CBM backend."""
     return passthrough(TOOL, arguments, config)

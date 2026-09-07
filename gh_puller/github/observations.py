@@ -1,13 +1,12 @@
-"""持久化细粒度 GitHub 事实观测与可恢复的同步执行状态。
+"""Persist fine-grained GitHub observations and recoverable execution state.
 
-一条观测对应一次语义闭合的 API、Git 或派生读取，而不是单字段、HTTP 页或仓库级
-快照。``observed_from`` 与 ``observed_until`` 给出真实读取窗口；同一事实后续观测
-只追加，不覆盖历史。当前状态按读取窗口结束时刻选择，写入较晚的旧观测不会倒退
-事实头。
+Each observation represents one semantically complete API, Git, or derived read rather
+than a field, HTTP page, or repository snapshot. Read windows are explicit, history is
+append-only, and current state follows the latest window end rather than write order.
 
-同步 cycle 只承载发现游标、任务恢复和内部 checkpoint；maintenance job 独立承载
-定向刷新与补采。事实一经闭合便独立发布，无需等待所属操作完成。请求失败属于任务
-执行状态，不进入事实观测流。
+Sync cycles own discovery cursors, task recovery, and internal checkpoints. Maintenance
+jobs own targeted refreshes. Complete facts publish independently; request failures
+remain execution state and never enter the observation stream.
 """
 
 from __future__ import annotations
@@ -202,12 +201,12 @@ class FactObservation:
 
 
 class ObservationArchive:
-    """单写者 SQLite 观测事实库。
+    """Store observations in a single-writer SQLite archive.
 
     Args:
-        path: 新格式 SQLite 文件路径；父目录按需创建。
-        repository: 此数据库固定绑定的 GitHub ``owner/repo``。
-        git_store: 配套 bare Git 对象库；None 使用 ``PATH.git``。
+        path: SQLite archive path whose parent is created as needed.
+        repository: GitHub ``owner/repo`` permanently bound to this database.
+        git_store: Matching bare Git object store, or ``PATH.git`` when omitted.
     """
 
     def __init__(

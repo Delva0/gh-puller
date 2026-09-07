@@ -79,7 +79,7 @@ type ConversationTurn = ChatTurn | CodemapTurn;
 
 interface AskProps {
   repoInfo: RepoInfo;
-  /** 统一 target(公开三元组 + 请求态凭证);随请求体嵌套下发,不再用扁平 provider/model */
+  /** Unified generation target, including request-scoped credentials. */
   target?: TargetConfig;
   language?: string;
   onRef?: (ref: { clearConversation: () => void }) => void;
@@ -114,7 +114,7 @@ const Ask: React.FC<AskProps> = ({
   const [codemapPhaseStatus, setCodemapPhaseStatus] =
     useState<Record<CodemapPhase, PhaseStatus>>(IDLE_PHASES);
 
-  // Target(generator/provider/model + 请求态凭证)选择状态
+  // Local generation target and request-scoped credentials.
   const [localTarget, setLocalTarget] = useState<TargetConfig>(target);
   const [isModelSelectionModalOpen, setIsModelSelectionModalOpen] = useState(false);
   const [isComprehensiveView, setIsComprehensiveView] = useState(true);
@@ -526,8 +526,7 @@ const Ask: React.FC<AskProps> = ({
         // every request falls back to HTTP (the WebSocket never connects).
         const iter = requestBody.research_iteration ?? 1;
         if (iter === 1) {
-          // Reset to iteration 1; whether research continues is decided by the
-          // effect above (agent 折叠路首轮含 ## Final Conclusion 即停)。
+          // Reset to iteration 1; the effect above detects complete agent output.
           setResearchComplete(false);
           setResearchIteration(1);
         } else if (iter >= 5) {
@@ -557,8 +556,8 @@ const Ask: React.FC<AskProps> = ({
   // Effect to continue research when response is updated
   useEffect(() => {
     if (deepResearch && response && !isLoading && !researchComplete) {
-      // Agent(cc)路折叠:第 1 轮即产出全篇,以含 ## Final Conclusion 判定完成;
-      // LLM 路第 1 轮(FIRST 模板)不含该标题,照旧自动推进后续迭代。
+      // Agent output may complete in round one, while the iterative LLM path
+      // omits this heading from its first-round template.
       const isComplete = researchIteration === 1
         ? response.includes('## Final Conclusion')
         : checkIfResearchComplete(response);
@@ -828,8 +827,7 @@ const Ask: React.FC<AskProps> = ({
           if (fallbackActiveRef.current) return;
           // If deep research is enabled, check if we should continue
           if (deepResearch) {
-            // Reset to iteration 1. Whether research continues is decided by
-            // the effect below (agent 折叠路首轮含 ## Final Conclusion 即停)。
+            // Reset to iteration 1; the effect below detects complete agent output.
             setResearchComplete(false);
             setResearchIteration(1);
             // The continueResearch function will be triggered by the useEffect.
