@@ -763,6 +763,96 @@ async def test_missing_repository_ref_is_recorded_without_fetching_pack(
 
 
 @pytest.mark.asyncio
+async def test_missing_fork_is_recorded_without_fetching_pack(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    _source_repository(source, 1)
+    missing = "f" * 40
+    remote = "https://github.com/deleted/widgets.git"
+    repository_source = CommitFetchSource(
+        "repository-ref",
+        remote,
+        "refs/heads/feature",
+        "deleted/widgets",
+        7,
+    )
+    real_command = git_store_module._command
+    commands: list[Sequence[str]] = []
+
+    async def missing_repository(command: Sequence[str], **kwargs: Any) -> str:
+        commands.append(command)
+        if len(command) > 4 and command[3] == "ls-remote" and command[4] == remote:
+            raise GitStoreError(
+                "git ls-remote failed: remote: Repository not found.\n"
+                "fatal: repository 'https://github.com/deleted/widgets.git/' not found",
+            )
+        return await real_command(command, **kwargs)
+
+    monkeypatch.setattr(git_store_module, "_command", missing_repository)
+    retained = await GitObjectStore(
+        tmp_path / "facts.sqlite3.git",
+        "acme/widgets",
+        str(source),
+    ).retain_commits((missing,), sources={missing: (repository_source,)})
+
+    attempt = next(
+        item
+        for item in retained[missing]["attempts"]
+        if item["kind"] == "repository-ref"
+    )
+    assert retained[missing]["status"] == "unavailable"
+    assert attempt["outcome"] == "unavailable"
+    assert attempt["preflight"]["outcome"] == "absent"
+    assert "Repository not found" in attempt["error"]
+    assert not any(_is_fetch(command) and remote in command for command in commands)
+
+
+@pytest.mark.asyncio
+async def test_fork_deleted_after_preflight_is_a_source_absence(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    _source_repository(source, 1)
+    remote = "https://github.com/deleted/widgets.git"
+    repository_source = CommitFetchSource(
+        "repository-ref",
+        remote,
+        "refs/heads/feature",
+        "deleted/widgets",
+        7,
+    )
+    real_command = git_store_module._command
+
+    async def deleted_during_fetch(command: Sequence[str], **kwargs: Any) -> str:
+        if _is_fetch(command) and remote in command:
+            raise GitStoreError(
+                "git fetch failed: remote: Repository not found.\n"
+                "fatal: repository 'https://github.com/deleted/widgets.git/' not found",
+            )
+        return await real_command(command, **kwargs)
+
+    monkeypatch.setattr(git_store_module, "_command", deleted_during_fetch)
+    store = GitObjectStore(
+        tmp_path / "facts.sqlite3.git",
+        "acme/widgets",
+        str(source),
+    )
+    await store._prepare()
+
+    errors = await store._fetch_source_batch(
+        (repository_source,),
+        refetch=False,
+        heartbeat=None,
+        retry=None,
+    )
+
+    assert "Repository not found" in (errors[repository_source] or "")
+
+
+@pytest.mark.asyncio
 async def test_repository_ref_preflight_is_bounded_and_parallel(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

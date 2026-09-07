@@ -43,6 +43,10 @@ _TRANSIENT_FETCH_STATUS = re.compile(
 )
 _MISSING_PULL_REF = re.compile(r"couldn't find remote ref refs/pull/(\d+)/head", re.IGNORECASE)
 _MISSING_REMOTE_REF = re.compile(r"couldn't find remote ref (\S+)", re.IGNORECASE)
+_MISSING_REPOSITORY = re.compile(
+    r"(?:remote:\s*)?repository not found|fatal: repository .+ not found",
+    re.IGNORECASE,
+)
 _TRANSIENT_FETCH_MARKERS = (
     "connection closed",
     "connection reset",
@@ -276,7 +280,13 @@ class GitObjectStore:
                 for source, _ in batch:
                     observation = repository_observations.get(source)
                     equivalent = _equivalent_pull_ref(source, observation, pull_tips)
-                    if observation is not None and observation.error is None and observation.sha is None:
+                    if (
+                        observation is not None
+                        and observation.error is not None
+                        and _is_missing_repository(observation.error)
+                    ):
+                        errors[source] = observation.error
+                    elif observation is not None and observation.error is None and observation.sha is None:
                         errors[source] = f"git ls-remote found no advertised ref {source.remote_ref}"
                     elif equivalent is not None:
                         errors[source] = None
@@ -772,7 +782,7 @@ class GitObjectStore:
                 raise
             return await split()
         except GitStoreError as exc:
-            if not _is_known_source_absence(exc):
+            if not _is_known_source_absence(exc, sources[0].kind):
                 if len(sources) > 1:
                     raise GitStoreError(
                         f"Git source batch from {sources[0].repository} failed: {exc}",
@@ -781,6 +791,8 @@ class GitObjectStore:
                 raise GitStoreError(
                     f"{source.kind} {source.repository} {source.remote_ref} failed: {exc}",
                 ) from exc
+            if _is_missing_repository(exc):
+                return dict.fromkeys(sources, str(exc))
             if len(sources) == 1:
                 return {sources[0]: str(exc)}
             return await split()
@@ -1293,7 +1305,11 @@ def _preflight_record(
 ) -> dict[str, Any] | None:
     if observation is None:
         return None
-    outcome = "inconclusive" if observation.error is not None else "absent"
+    outcome = (
+        "inconclusive"
+        if observation.error is not None and not _is_missing_repository(observation.error)
+        else "absent"
+    )
     result: dict[str, Any] = {
         "method": "git-ls-remote-tip-v1",
         "observed_from": observation.observed_from,
@@ -1404,8 +1420,14 @@ def _is_transient_fetch_failure(error: GitStoreError) -> bool:
     )
 
 
-def _is_known_source_absence(error: GitStoreError) -> bool:
-    return _MISSING_REMOTE_REF.search(str(error)) is not None
+def _is_known_source_absence(error: GitStoreError, source_kind: str) -> bool:
+    return _MISSING_REMOTE_REF.search(str(error)) is not None or (
+        source_kind == "repository-ref" and _is_missing_repository(error)
+    )
+
+
+def _is_missing_repository(error: GitStoreError | str) -> bool:
+    return _MISSING_REPOSITORY.search(str(error)) is not None
 
 
 def _is_incomplete_closure(error: GitStoreError) -> bool:
