@@ -1,48 +1,48 @@
 ---
 name: docs-style-constraints
-description: Create or substantially revise maintainable, repository-grounded Markdown documentation under docs/ with durable source-path citations, verified commands and links, and diagrams or tables only when they improve understanding. Use for full pages or significant edits, not typo-only changes or files outside docs/.
+description: Create or substantially revise maintainable, repository-grounded Markdown documentation under docs/ with verified commands and links, reader-oriented source navigation, and diagrams or tables only when they improve understanding. Use for full pages or significant edits, not typo-only changes or files outside docs/.
 ---
 
 # Project Documentation
 
-Create Markdown under `docs/` that is ready to commit as written and remains useful as the repository evolves. Treat the file written to disk as the final artifact: never rely on DeepWiki prompt substitution, citation rewriting, or any other post-processing step.
+Create Markdown under `docs/` that is complete on disk, ready to commit as written, and useful as the repository evolves. The document carries its own links, citations, and final wording independently of later processing.
 
-Follow the user's requested scope and the applicable `AGENTS.md`. Do not modify implementation code merely to make it agree with the documentation unless the user separately requests that change.
+Documentation changes follow the user's requested scope and the applicable `AGENTS.md`. Implementation work belongs to a separately requested scope.
+
+## Decision Standard
+
+A document contains every concept whose absence could change how a reader operates the feature, interprets its data or results, or judges its guarantees and limits. Once those concepts are present, reduce cognitive load through ordering, grouping, precise names, progressive detail, and source navigation. Compress implementation detail that does not affect those reader outcomes.
 
 ## Scope
 
 - Apply the full contract to new pages and substantial revisions.
-- For a focused edit, preserve the existing page structure and update the affected claims, citations, source inventory, links, and examples without rewriting unrelated sections.
+- For a focused edit, preserve the existing page structure and limit changes to the affected claims, citations, source inventory, links, and examples.
 - Use the requested document path and language. If either is unspecified, infer a clear `docs/` path and match the predominant language of related project documentation.
 
 ## Research Before Writing
 
-1. Read the applicable `AGENTS.md`, the existing target page when present, and closely related pages under `docs/`.
-2. Trace the topic through its canonical implementation, public entry points, configuration, tests, and operational surfaces. Read source contents rather than relying on filenames or search snippets.
-3. Choose the smallest sufficient set of authoritative source packages or files. Prefer one cohesive package boundary that summarizes the evidence; do not split it into child packages or files merely because several internals were inspected. Narrow the path only when the broader package would obscure ownership. Name an individual file only when the document discusses that file, one of its symbols, or a contract that has no useful package-level boundary. There is no minimum source count. Every selected path must materially support the document.
+1. Read the existing target page when present, and closely related pages under `docs/`.
+2. Trace the topic through its canonical implementation, public entry points, configuration, tests, and operational surfaces. Read the complete passages that establish each material claim.
+3. Identify the cohesive repository boundaries that own the documented behavior and the narrower sources needed to verify specific claims.
 4. Separate repository behavior from external contracts. Use current primary documentation for an external API or tool when it is necessary to explain that contract, and cite it with a normal working URL.
-5. Omit unsupported claims. If an unresolved fact is essential, report the uncertainty instead of filling it with conventional behavior or inference.
+5. State each claim only as strongly as its evidence allows. Make essential unresolved uncertainty explicit.
 
 ## Editorial Focus
 
-Write a technical article, not an implementation inventory. Its value comes from a clear engineering point of view: explain the few ideas that let a reader understand, use, or reason about the subject.
+Write a technical article around one central question or design claim. Include a concept when the Decision Standard says it can affect the reader's outcome, and connect supporting concepts to that center before adding their detail.
 
-- Establish one central question or design claim, then keep only sections that advance it.
-- Prefer a small number of stable concepts, boundaries, or trade-offs over exhaustive coverage.
-- Do not enumerate complete event taxonomies, protocol fields, environment variables, internal modules, or test cases unless the page is explicitly intended as a reference.
-- Select one representative flow, example, table, or diagram when it carries the argument. Do not present several views of the same design.
-- Keep introductions short, avoid recap conclusions, and remove details that a reader can discover directly from the cited source without losing the article's argument.
-- Never increase length merely to demonstrate research completeness. Source research should improve the precision of the prose, not appear wholesale in the prose.
+- For an explanatory page, select the protocol fields, configuration, modules, and examples needed to operate or reason correctly. For a reference page, provide the complete set promised by its scope.
+- Give each flow, example, table, or diagram a distinct explanatory job. Multiple views earn their place when they expose materially different relationships.
+- Introduce a concept before details that depend on it, and put qualifications next to the claim they constrain.
+- Let source research increase the precision of the explanation rather than the visible size of its implementation inventory.
 
 ## Full-Page Structure
 
-For a new page or substantial rewrite, start with this source inventory. Do not place a preface before it.
+A new page or substantial rewrite starts with this source inventory:
 
 ```markdown
 <details>
 <summary>Relevant sources</summary>
-
-The following source packages were used as context for this document:
 
 - [gh_puller/deepwiki/](../gh_puller/deepwiki/)
 - [tests/](../tests/)
@@ -51,71 +51,67 @@ The following source packages were used as context for this document:
 # Page Title
 ```
 
-Replace the example entries with all and only the repository packages or files materially used for the page.
+Replace the example entries with the relevant source boundaries selected under Reader-Oriented Source Citations.
 
-- Keep the visible label as the full repository-relative path; never shorten it to a bare package or filename.
+- Use the full repository-relative path as the visible label.
 - Calculate each link target relative to the documentation file. The examples above are correct for a page directly under `docs/`; adjust the leading `../` segments for nested pages.
-- Prefer a package directory when it sufficiently identifies the owner of the documented behavior. Link to a file only when the prose explicitly names that file or a symbol it owns, or when a broader package would make the evidence ambiguous.
 - Put the H1 title immediately after the inventory.
 - Follow with a concise introduction explaining the feature's purpose, scope, and place in the project.
-- Organize the body by the topic's actual concepts using H2 and H3 headings. Do not force a fixed section list.
-- Add a conclusion only when it contributes information instead of repeating the introduction.
+- Organize the body by the topic's actual concepts using H2 and H3 headings. Each heading should name one cohesive idea, and unfamiliar terms are defined where they first matter. Let the subject determine the section structure.
+- Include a conclusion when it contributes information beyond the introduction.
 
-Do not add or rebuild the full-page wrapper for a typo-only or similarly narrow edit.
+A focused edit retains the existing page wrapper unless its scope genuinely requires a structural change.
 
-## Durable Source Citations
+## Reader-Oriented Source Citations
 
-Ground implementation-specific claims, commands, diagrams, tables, and examples in the repository sources. Place a consolidated citation after the paragraph or block it supports:
+The source inventory maps the page to the cohesive repository areas that establish it. A section-level citation supplies a shorter route to an implementation owner when that route materially helps the reader.
+
+Select a source path in two stages. First verify that its contents establish the claim; this defines the accurate candidates. Among equally accurate candidates, choose the highest-level cohesive directory that lets a reader locate the owner without searching unrelated subsystems. Select a file when no directory preserves that precision. Accuracy determines the candidates, and reader effort breaks ties.
+
+When a precise citation has reader value, place it after the cohesive claim or block it supports:
 
 ```markdown
 Sources: [gh_puller/deepwiki/](../gh_puller/deepwiki/); [tests/](../tests/)
 ```
 
-- Keep the full repository-relative path visible and use a non-empty link target relative to the documentation file.
-- Cite the owning package by default. Narrow the citation to a file and name relevant classes, functions, configuration keys, or commands in inline code only when that materially improves navigation or supports a file-specific claim.
-- Treat symbol names as plain text. Do not invent source-code heading anchors.
-- Never cite line numbers or line ranges. They drift under ordinary edits and can silently point at unrelated code.
-- Every local citation must appear in the source inventory, and every inventory entry must support at least one significant part of the page. A file citation is covered only by that exact file entry, not by an inventory entry for its parent package.
-- Consolidate shared citations at paragraph, table, diagram, or section granularity. Do not append the same citation to every sentence.
-- When updating a page, recheck the entire source inventory and remove paths that no longer support the document.
+- Let the inventory carry evidence shared across the page. Place a more precise citation at the nearest paragraph, table, diagram, or section whose concentrated ownership makes it useful.
+- Show the full repository-relative path and end the link at a stable directory or file. Refer to relevant symbols as plain text.
+- Cover every section-level citation with an inventory entry. An inventory directory covers its descendants, and every inventory entry supports a significant part of the page.
 
 ## Content That Ages Well
 
-- Describe only the current design, behavior, and usage. Keep migration history, removed behavior, and implementation chronology in commits or changelogs.
+- Describe the current design, behavior, and usage. Place migration history and implementation chronology in commits or changelogs.
 - Define each core concept or contract in one authoritative documentation location. Link to that location from other pages instead of maintaining parallel explanations.
 - Prefer stable responsibilities, boundaries, invariants, data flow, failure semantics, and public usage over incidental call sequences or private helper inventories.
-- Do not freeze volatile counts, exhaustive field lists, defaults, or implementation details into prose unless readers need them as a current reference. When included, verify every value and cite its owning source.
-- Use tables for genuine mappings or comparisons. Do not turn ordinary prose into a table merely to appear comprehensive.
+- Include volatile counts, exhaustive field lists, defaults, and implementation details when readers need them as a current reference. Verify each included value against its owning source and add precise provenance when useful.
+- Use tables for genuine mappings or comparisons and prose for linear explanations.
 - Keep code excerpts short and necessary. Prefer verified commands and configuration examples over copied implementation bodies.
-- Use repository-relative example paths and placeholder secrets. Avoid developer-machine absolute paths unless an absolute deployment path is itself part of the documented contract.
-- Use precise technical language without marketing claims, filler, acknowledgements, or generic summaries.
+- Use repository-relative example paths and placeholder secrets; use absolute deployment paths when they are part of the documented contract.
 
 ## Commands and Examples
 
 - Run Python through UV. Use `uv run ...` at the repository root and `uv --directory <subproject> run ...` for a subproject.
 - Use `pnpm --dir <subproject> ...` for a frontend subproject.
-- Never express subproject commands as `cd <path> && <command>`.
 - Verify flags, defaults, environment variables, filenames, and output examples against the current CLI, configuration source, or tests.
 - Keep comments inside code examples in English.
-- Run documented commands only when doing so is safe and proportionate. Otherwise validate them against their implementation and state clearly in the task handoff that they were not executed.
+- Run documented commands when execution is safe and proportionate. For other commands, validate them against their implementation and identify that validation method in the task handoff.
 
 ## Diagrams and Navigation
 
 - Use a diagram only when it materially clarifies a multi-step flow, architecture, ownership boundary, hierarchy, or state transition.
-- Model stable responsibilities and interactions rather than every private function. Explain the diagram briefly and cite the sources that establish it.
-- Use `flowchart TD` or `graph TD` for flow diagrams; do not use left-to-right flow. Keep node labels concise.
+- Model stable responsibilities and interactions rather than every private function. Explain the diagram briefly; cite its implementation source only when that improves navigation.
+- Use `flowchart TD` or `graph TD` to orient flow diagrams from top to bottom. Keep node labels concise.
 - In sequence diagrams, declare all participants before messages and use sequence-diagram message syntax with colon-separated labels.
-- Link to another project document only when the target file exists. Prefer a file-level relative link; add a heading anchor only when the specific section matters and the anchor has been verified.
+- Link to existing project documents with file-level relative paths, adding a verified heading anchor when the specific section matters.
 - Use descriptive labels for external links and prefer primary, authoritative sources.
 
 ## Final Verification
 
-Before finishing:
+Before handoff:
 
-1. Re-read the page as a user-facing explanation and remove statements that describe an earlier implementation or an unsupported future design.
-2. Resolve every local Markdown target from the document's directory and confirm that the file exists.
-3. Confirm that cross-document anchors and external links used by the change are valid.
-4. Check that there are no empty Markdown link destinations, line-number citations, unresolved placeholders, stale source inventory entries, or bare-filename citations.
-5. Confirm that every material implementation claim, diagram, table, and operational command has sufficient evidence without citation spam.
-6. Compare commands and examples with the current implementation and run safe, relevant validation where useful.
-7. Review the final diff for accidental edits outside the requested documentation scope.
+1. Compare every material behavior, guarantee, limit, diagram, table, and example with its owning source.
+2. Resolve every local Markdown destination from the document's directory and verify each referenced heading anchor. Check material external links when the task depends on them.
+3. Confirm that the source inventory accurately covers the page, each section citation is covered by it, and each listed path still provides useful evidence.
+4. Execute safe, proportionate commands. Otherwise verify them against the CLI, configuration, or tests and report that method in the handoff.
+5. Read the page in order and confirm that every outcome-changing concept is present, introduced before use, and distinguished from neighboring concepts.
+6. Review the final diff against the requested documentation scope.

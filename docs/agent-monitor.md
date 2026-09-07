@@ -1,8 +1,6 @@
 <details>
 <summary>Relevant sources</summary>
 
-The following source packages and files were used as context for this document:
-
 - [gh_puller/agent/](../gh_puller/agent/)
 - [apps/agent-monitor/server/](../apps/agent-monitor/server/)
 - [apps/agent-monitor/web/](../apps/agent-monitor/web/)

@@ -12,6 +12,8 @@ wheels/
 # Local environment
 .env
 .vscode
+
+# Local Experiment
 playground/
 archive/
 
@@ -19,6 +21,7 @@ archive/
 archives/
 logs/
 outputs/
+build/
 
 # Test / lint caches
 .pytest_cache/
