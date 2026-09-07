@@ -19,10 +19,10 @@ from ..base import BaseAgent, RequestFailedError
 from ..context import instruction, system_message, tool_defs
 from ..events import (
     EventRecorder,
-    _normalize_usage,
     function_call_item,
     function_output_item,
     message_item,
+    normalize_usage,
     reasoning_item,
     text_message,
 )
@@ -347,7 +347,7 @@ def _project_dsh_chunk(event_recorder: EventRecorder, proj: _DshProj, chunk: dic
     if ctype == "usage":
         usage = chunk.get("usage")
         if usage:
-            proj.usage = _normalize_usage(usage)
+            proj.usage = normalize_usage(usage)
             event_recorder.result_usage = proj.usage
         return []
     if ctype == "finish":

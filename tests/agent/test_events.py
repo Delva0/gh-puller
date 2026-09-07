@@ -186,7 +186,8 @@ async def test_otel_uses_request_and_call_correlations() -> None:
         _event("model/delta/text", 3, requestId="r1", index=0, text="ok"),
         _event("model/response", 4, requestId="r1",
                output=[text_message("assistant", "ok")],
-               usage={"input": 2, "output": 1}),
+               usage={"input": 2, "output": 1, "cacheRead": 0, "reasoning": 0},
+               rawUsage={"prompt_tokens": 2, "completion_tokens": 1}),
         _event("tool/start", 5, callId="c1", name="read", arguments={"path": "a"}),
         _event("tool/end", 6, callId="c1", error={"type": "IOError", "message": "bad"}),
         _event("session/end", 7, outcome="failed", durationMs=2),
@@ -197,5 +198,40 @@ async def test_otel_uses_request_and_call_correlations() -> None:
     assert spans["run"].attributes["gh_puller.agent"] == "x"
     assert spans["model:r1"].attributes["gen_ai.request.model"] == "m"
     assert spans["model:r1"].attributes["gh_puller.text_preview"] == "ok"
+    assert spans["model:r1"].attributes["gh_puller.cache_read_tokens"] == 0
+    assert spans["model:r1"].attributes["gh_puller.reasoning_tokens"] == 0
+    assert json.loads(spans["model:r1"].attributes["gh_puller.usage.raw"]) == {
+        "prompt_tokens": 2, "completion_tokens": 1,
+    }
+    assert "gh_puller.cache_write_tokens" not in spans["model:r1"].attributes
     assert spans["tool:read"].status.status_code is StatusCode.ERROR
     assert spans["run"].status.status_code is StatusCode.ERROR
+
+
+@pytest.mark.asyncio
+async def test_otel_preserves_structured_session_failure():
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    sink = OtelSink("", tracer=provider.get_tracer("test"))
+    for event in [
+        _event("session/start", 0, label="run"),
+        _event("session/error", 1, scope="agent", reasonCode="budget_exhausted", phase="run",
+               error={"type": "RequestFailedError", "message": "budget reached"}),
+        _event("session/error", 2, scope="agent", reasonCode="error", phase="cleanup",
+               error={"type": "RuntimeError", "message": "cleanup failed"}),
+        _event("session/end", 3, outcome="failed", reasonCode="budget_exhausted", phase="run", durationMs=2,
+               usage={"input": 0}, rawUsage={"prompt_tokens": 0}),
+    ]:
+        await sink.consume(event)
+    root, = exporter.get_finished_spans()
+    assert root.status.status_code is StatusCode.ERROR
+    assert root.status.description == "RequestFailedError: budget reached"
+    assert root.attributes["gh_puller.error_reason_code"] == "budget_exhausted"
+    assert root.attributes["gh_puller.reason_code"] == "budget_exhausted"
+    assert root.attributes["gh_puller.error_phase"] == root.attributes["gh_puller.failure_phase"] == "run"
+    assert json.loads(root.attributes["gh_puller.usage"]) == {"input": 0}
+    assert json.loads(root.attributes["gh_puller.usage.raw"]) == {"prompt_tokens": 0}
+    assert [json.loads(event.attributes["gh_puller.error.data"])["phase"] for event in root.events] == [
+        "run", "cleanup",
+    ]

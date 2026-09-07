@@ -189,6 +189,7 @@ async def test_openai_normalizes_one_complete_inference(monkeypatch, tmp_path) -
         ],
         "model": "actual",
         "usage": {"input": 2, "output": 3},
+        "rawUsage": {"prompt_tokens": 2, "completion_tokens": 3},
         "stopReason": "tool_calls",
     }
     config = next(event for event in events if event["type"] == "agent/set")["data"]["config"]

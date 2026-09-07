@@ -12,9 +12,9 @@ from ..base import BaseAgent, RequestFailedError
 from ..context import OPAQUE, instruction, mcps, system_message, tool_defs
 from ..events import (
     EventRecorder,
-    _normalize_usage,
     function_call_item,
     message_item,
+    normalize_usage,
     reasoning_item,
     text_message,
 )
@@ -264,7 +264,7 @@ def _handle_opencode_line(event_recorder: EventRecorder, st: _OpencodeSynth, evt
         usage = {"input_tokens": tokens.get("input"), "output_tokens": tokens.get("output"),
                  "cache_read_input_tokens": cache.get("read")}
         if any(v is not None for v in usage.values()):
-            st.usage = _normalize_usage(usage)
+            st.usage = normalize_usage(usage)
             event_recorder.result_usage = st.usage
         cost = part.get("cost")
         if isinstance(cost, (int, float)):

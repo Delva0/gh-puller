@@ -3,18 +3,28 @@
 import contextlib
 import sys
 from collections.abc import AsyncIterator
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from .. import envs
 from .events import EventRecorder, _session_id
+
+if TYPE_CHECKING:
+    from .events import FailureReason
 
 
 class RequestFailedError(Exception):
     """Report an Agent failure with a caller-readable detail string."""
 
-    def __init__(self, detail: Any):
+    def __init__(self, detail: Any, *, reason_code: "FailureReason" = "error"):
+        """Report an adapter-classified failure without implementing a stopping policy.
+
+        Args:
+            detail: Caller-visible failure detail.
+            reason_code: Canonical classification; see gh_puller.agent.events.
+        """
         super().__init__(detail)
         self.detail = str(detail)
+        self.reason_code = reason_code
 
 
 class BaseAgent:
@@ -47,22 +57,36 @@ class BaseAgent:
         self._event_recorder = event_recorder
         ok = False
         try:
-            heartbeat_secs = envs.AGENT_MONITOR_HEARTBEAT_SECS
-            if heartbeat_secs and heartbeat_secs > 0:
-                event_recorder.start_keepwarm(heartbeat_secs)
-            await self._enter()
+            try:
+                heartbeat_secs = envs.AGENT_MONITOR_HEARTBEAT_SECS
+                if heartbeat_secs and heartbeat_secs > 0:
+                    event_recorder.start_keepwarm(heartbeat_secs)
+                await self._enter()
+            except BaseException as exc:  # Cancellation is a terminal observation, not a swallowed error.
+                event_recorder.error(exc, phase="initialize")
+                raise
             try:
                 yield
-            except Exception as exc:
-                event_recorder.error(exc)
+            except BaseException as exc:  # Preserve caller cancellation while still observing it.
+                event_recorder.error(exc, phase="run")
                 raise
             finally:
-                await self._exit(sys.exc_info())
+                try:
+                    await self._exit(sys.exc_info())
+                except BaseException as exc:  # A cleanup failure must not hide the preceding run failure.
+                    event_recorder.error(exc, phase="cleanup")
+                    raise
             ok = True
         finally:
-            await event_recorder.stop_keepwarm()
-            event_recorder.finish(ok)
-            self._event_recorder = None
+            try:
+                await event_recorder.stop_keepwarm()
+            except BaseException as exc:  # Footer delivery is also required when cleanup is interrupted.
+                ok = False
+                event_recorder.error(exc, phase="cleanup")
+                raise
+            finally:
+                event_recorder.finish(ok)
+                self._event_recorder = None
 
     def _require_event_recorder(self) -> EventRecorder:
         """Return the active recorder or reject a call outside ``session``."""
@@ -71,7 +95,7 @@ class BaseAgent:
         return self._event_recorder
 
     async def _enter(self) -> None:
-        """Subclass hook: enter the client (same semantics as its `__aenter__`)."""
+        """Enter the client; the hook owns rollback if initialization fails."""
         raise NotImplementedError
 
     async def _exit(self, exc) -> None:

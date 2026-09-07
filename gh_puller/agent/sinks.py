@@ -270,6 +270,8 @@ class OtelSink:
             "gen_ai.usage.output_tokens": usage.get("output"),
             "gh_puller.cache_read_tokens": usage.get("cacheRead"),
             "gh_puller.cache_write_tokens": usage.get("cacheWrite"),
+            "gh_puller.reasoning_tokens": usage.get("reasoning"),
+            "gh_puller.usage.raw": d.get("rawUsage"),
             "gh_puller.stop_reason": d.get("stopReason"),
             "gh_puller.text_chars": len(text),
             "gh_puller.text_preview": truncate(text, 300)[1],
@@ -318,10 +320,19 @@ class OtelSink:
 
     def _on_error(self, state: dict, evt: dict) -> None:
         d = evt["data"]
+        state["root"].add_event("session/error", {"gh_puller.error.data": json.dumps(d, ensure_ascii=False)},
+                                timestamp=_ns(evt.get("ts")))
+        if state["error"] is not None:
+            return
         error = d.get("error") or {}
         detail = f"{error.get('type', '')}: {error.get('message', '')}".strip(": ")
         state["error"] = detail
-        _attrs(state["root"], {"gh_puller.error": detail, "gh_puller.error_scope": d.get("scope")})
+        _attrs(state["root"], {
+            "gh_puller.error": detail,
+            "gh_puller.error_scope": d.get("scope"),
+            "gh_puller.error_reason_code": d.get("reasonCode"),
+            "gh_puller.error_phase": d.get("phase"),
+        })
         state["root"].set_status(self._trace.Status(self._trace.StatusCode.ERROR, detail[:300]))
 
     def _on_session_end(self, session: str, evt: dict) -> None:
@@ -337,6 +348,10 @@ class OtelSink:
         _attrs(root, {
             "gh_puller.duration_ms": d.get("durationMs"),
             "gh_puller.outcome": d.get("outcome"),
+            "gh_puller.reason_code": d.get("reasonCode"),
+            "gh_puller.failure_phase": d.get("phase"),
+            "gh_puller.usage": d.get("usage"),
+            "gh_puller.usage.raw": d.get("rawUsage"),
             "gh_puller.turns": state["turns"],
             "gh_puller.steps": state["steps"],
         })

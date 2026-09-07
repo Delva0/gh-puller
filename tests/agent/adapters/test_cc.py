@@ -198,6 +198,7 @@ async def test_claude_fragments_share_one_model_response(monkeypatch, tmp_path) 
         ],
         "model": "actual",
         "usage": {"input": 2, "output": 1},
+        "rawUsage": {"input": 2, "output": 1},
         "stopReason": "end_turn",
     }
     assert _context_labels(fold_state(events)["context"]) == [

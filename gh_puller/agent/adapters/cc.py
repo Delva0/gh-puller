@@ -6,8 +6,8 @@ from ..base import BaseAgent, RequestFailedError
 from ..context import OPAQUE, instruction, mcps, skill_list, system_message, tool_defs
 from ..events import (
     EventRecorder,
-    _normalize_usage,
     function_call_item,
+    normalize_usage,
     reasoning_item,
     text_message,
 )
@@ -262,7 +262,7 @@ def _handle_assistant_message(event_recorder: EventRecorder, state: _ClaudeSynth
         state.message_id = message_id
     if model := getattr(msg, "model", None):
         state.message_model = model
-    if usage := _normalize_usage(getattr(msg, "usage", None)):
+    if usage := normalize_usage(getattr(msg, "usage", None)):
         state.message_usage = {**(state.message_usage or {}), **usage}
     if stop_reason := getattr(msg, "stop_reason", None):
         state.message_stop_reason = stop_reason

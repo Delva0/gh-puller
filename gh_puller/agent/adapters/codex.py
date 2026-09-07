@@ -10,9 +10,9 @@ from ..base import BaseAgent, RequestFailedError
 from ..context import OPAQUE, instruction, mcps, system_message, tool_defs
 from ..events import (
     EventRecorder,
-    _normalize_usage,
     function_call_item,
     message_item,
+    normalize_usage,
     reasoning_item,
     text_message,
 )
@@ -465,8 +465,8 @@ def _handle_codex_notification(event_recorder: EventRecorder, st: _CodexSynth, n
         usage = getattr(payload, "token_usage", None) or {}
         latest = getattr(usage, "last", None)
         total = getattr(usage, "total", None)
-        st.usage = _normalize_usage(latest)
-        st.total_usage = _normalize_usage(total) or st.usage
+        st.usage = normalize_usage(latest)
+        st.total_usage = normalize_usage(total) or st.usage
         event_recorder.result_usage = st.total_usage
         return []
     return []

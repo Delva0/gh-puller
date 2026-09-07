@@ -116,6 +116,7 @@ async def test_opencode_normalizes_reasoning_message_and_tool(tmp_path) -> None:
         ],
         "model": "actual-1",
         "usage": {"input": 2, "output": 3},
+        "rawUsage": {"input": 2, "output": 3},
         "stopReason": "tool-calls",
     }
     assert _context_at_requests(events) == [

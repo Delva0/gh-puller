@@ -9,12 +9,26 @@ markers and never affect the fold.
 
 Configuration and effect remain separate facts. Credential-shaped Agent configuration
 fields are redacted before reaching any sink.
+
+``usage`` contains recognized token counters; an absent counter is unknown, while
+an explicit zero remains zero. ``rawUsage`` preserves the adapter-supplied counter
+record before normalization, with credential-shaped fields redacted. Model counters
+describe one response; ``result_meta`` supplies a replacement backend summary, not
+an increment. The recorder does not infer or accumulate session totals.
+
+Session ``outcome`` remains completed/failed. ``reasonCode`` distinguishes completed,
+error, cancelled, timeout and adapter-reported budget_exhausted; ``phase`` locates a
+failure at initialize, run or cleanup. The first failure determines the footer;
+later cleanup failures remain separate session/error events. ``stopReason`` is the
+backend's model stop reason, independent of session termination.
 """
 
 import asyncio
 import json
 import time
 import uuid
+from dataclasses import asdict, is_dataclass
+from typing import Literal
 
 from gh_puller.utils import _log
 
@@ -35,6 +49,8 @@ EVENT_TYPES = frozenset({
     "agent/set", "context/set",
     "model/request", "model/response", "tool/start", "tool/end",
 }) | CONTEXT_APPEND_TYPES | DELTA_TYPES
+FailureReason = Literal["error", "cancelled", "timeout", "budget_exhausted"]
+FailurePhase = Literal["initialize", "run", "cleanup"]
 
 
 def _agent_facet(event_type: str) -> str | None:
@@ -310,9 +326,17 @@ def _value(value, keys: tuple[str, ...]):
     return None
 
 
-def _normalize_usage(value) -> dict | None:
-    """Normalize provider counters, omitting absent and all-zero reports."""
-    if not value:
+def normalize_usage(value) -> dict | None:
+    """Map adapter counters to the canonical usage contract; see this module.
+
+    Args:
+        value: Mapping or SDK counter object. Canonical and flat aliases take
+            precedence over nested chat-completion or response token details.
+
+    Returns:
+        Recognized nonnegative integer counters, or None if none were reported.
+    """
+    if value is None:
         return None
     mapping = {
         "input": ("input", "input_tokens", "prompt_tokens", "inputTokens"),
@@ -327,7 +351,25 @@ def _normalize_usage(value) -> dict | None:
     }
     result = {name: token for name, keys in mapping.items()
               if (token := _value(value, keys)) is not None}
-    return result if any(result.values()) else None
+    for name, groups, field in (
+        ("cacheRead", ("prompt_tokens_details", "input_tokens_details"), "cached_tokens"),
+        ("reasoning", ("completion_tokens_details", "output_tokens_details"), "reasoning_tokens"),
+    ):
+        if name not in result and (token := _value(_value(value, groups), (field,))) is not None:
+            result[name] = token
+    return {name: token for name, token in result.items() if type(token) is int and token >= 0} or None
+
+
+def _raw_usage(value):
+    if value is None:
+        return None
+    if hasattr(value, "model_dump"):
+        value = value.model_dump(mode="json")
+    elif is_dataclass(value):
+        value = asdict(value)
+    elif not isinstance(value, dict) and hasattr(value, "__dict__"):
+        value = vars(value)
+    return _redacted(value) if isinstance(value, dict) else None
 
 
 _active_bus: "EventBus | None" = None
@@ -379,7 +421,10 @@ class EventRecorder:
         self.step_open = False
         self.ended = False
         self.reason: str | None = None
+        self.reason_code: FailureReason | None = None
+        self.failure_phase: FailurePhase | None = None
         self.result_usage: dict | None = None
+        self.result_raw_usage: dict | None = None
         self.result_stop_reason: str | None = None
         self.result_cost_usd: float | None = None
         self._keepwarm_task: asyncio.Task | None = None
@@ -517,6 +562,7 @@ class EventRecorder:
             The explicit or allocated request id.
         """
         self.result_usage = None
+        self.result_raw_usage = None
         self.result_stop_reason = None
         self.result_cost_usd = None
         if request_id is None:
@@ -585,10 +631,12 @@ class EventRecorder:
         data = {"requestId": request_id, "output": output}
         if model:
             data["model"] = model
-        normalized = _normalize_usage(usage)
-        if normalized:
+        normalized = normalize_usage(usage)
+        if normalized is not None:
             data["usage"] = normalized
             self.result_usage = normalized
+        if (raw := _raw_usage(usage)) is not None:
+            data["rawUsage"] = raw
         if stop_reason:
             data["stopReason"] = stop_reason
             self.result_stop_reason = stop_reason
@@ -659,20 +707,35 @@ class EventRecorder:
         Args:
             message: Backend result exposing optional usage, reason, and cost.
         """
-        self.result_usage = _normalize_usage(getattr(message, "usage", None))
+        usage = getattr(message, "usage", None)
+        self.result_usage = normalize_usage(usage)
+        self.result_raw_usage = _raw_usage(usage)
         self.result_stop_reason = getattr(message, "stop_reason", None)
         self.result_cost_usd = getattr(message, "total_cost_usd", None)
 
-    def error(self, exc: Exception, scope: str = "agent") -> None:
+    def error(self, exc: BaseException, scope: str = "agent", *, phase: FailurePhase | None = None) -> None:
         """Record an unhandled session error.
 
         Args:
             exc: Failure exposed to the caller.
             scope: Component that failed.
+            phase: Lifecycle stage supplied by the owner; omission leaves it unknown.
         """
-        self.reason = str(exc)[:2000]
-        self.event("session/error", scope=scope,
-                   error={"type": type(exc).__name__, "message": str(exc)})
+        if isinstance(exc, asyncio.CancelledError):
+            code = "cancelled"
+        elif isinstance(exc, TimeoutError):
+            code = "timeout"
+        else:
+            code = getattr(exc, "reason_code", "error")
+        if self.reason_code is None:
+            self.reason = str(exc)[:2000] or type(exc).__name__
+            self.reason_code = code
+            self.failure_phase = phase
+        data = {"scope": scope, "reasonCode": code,
+                "error": {"type": type(exc).__name__, "message": str(exc)}}
+        if phase is not None:
+            data["phase"] = phase
+        self.event("session/error", **data)
 
     def finish(self, ok: bool) -> None:
         """Close managed markers and publish the terminal event once.
@@ -689,11 +752,16 @@ class EventRecorder:
         outcome = "completed" if ok else "failed"
         self.end_turn(outcome=outcome, reason="final_response" if ok else "error")
         data = {"outcome": outcome,
+                "reasonCode": "completed" if ok else self.reason_code or "error",
                 "durationMs": int((time.monotonic() - self.started_at) * 1000)}
         if self.reason:
             data["reason"] = self.reason
         if self.result_usage:
             data["usage"] = self.result_usage
+        if self.result_raw_usage is not None:
+            data["rawUsage"] = self.result_raw_usage
+        if self.failure_phase is not None and not ok:
+            data["phase"] = self.failure_phase
         if self.result_stop_reason:
             data["stopReason"] = self.result_stop_reason
         if self.result_cost_usd is not None:
