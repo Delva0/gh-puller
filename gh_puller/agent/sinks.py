@@ -84,7 +84,10 @@ class WsSink:
     """
 
     def __init__(self, url: str):
+        import websockets  # Optional sink dependency must fail before its task is detached.
+
         self.url = url
+        self._connect = websockets.connect
         self._q: asyncio.Queue[dict] = asyncio.Queue()
         self._task = asyncio.create_task(self._run())
 
@@ -93,12 +96,10 @@ class WsSink:
         _put_event(self._q, evt)
 
     async def _run(self) -> None:
-        import websockets  # Lazy optional sink dependency.
-
         wait = 1
         while True:
             try:
-                async with websockets.connect(self.url, ping_interval=20) as ws:
+                async with self._connect(self.url, ping_interval=20) as ws:
                     wait = 1
                     while True:
                         first = await self._q.get()
@@ -111,6 +112,10 @@ class WsSink:
                 _log(f"ws sink 未连接({wait}s 后重试): {exc}")
                 await asyncio.sleep(wait)
                 wait = min(wait * 2, 30)
+
+    def close(self) -> None:
+        """Cancel the reconnecting sender without waiting for remote delivery."""
+        self._task.cancel()
 
 
 def _ns(ts) -> int | None:
@@ -446,6 +451,7 @@ _cfg = {
 }
 _bus: EventBus | None = None
 _file_sinks: list[FileSink] = []
+_ws_sinks: list[WsSink] = []
 
 
 def configure(*, file_dir=None, ws_urls=None, otel_urls=None, raw=None) -> None:
@@ -472,11 +478,14 @@ def configure(*, file_dir=None, ws_urls=None, otel_urls=None, raw=None) -> None:
 
 def shutdown() -> None:
     """Stop the process-wide observation bus after all Agent sessions have ended."""
-    global _bus, _file_sinks
+    global _bus, _file_sinks, _ws_sinks
     if _bus is not None:
         _bus.shutdown()
         _bus = None
+    for sink in _ws_sinks:
+        sink.close()
     _file_sinks = []
+    _ws_sinks = []
     set_active_bus(None)
 
 
@@ -499,7 +508,7 @@ def ensure_bus() -> EventBus:
     opentelemetry importable (OtelSink construction defect → ImportError downgrade).
     Failing conditions log and skip the instance.
     """
-    global _bus, _file_sinks
+    global _bus, _file_sinks, _ws_sinks
     if _bus is None:
         b = EventBus()
         fs = FileSink(_cfg["file_dir"], raw=_cfg["raw"])
@@ -509,7 +518,13 @@ def ensure_bus() -> EventBus:
             if not _url_reachable(url):
                 _log(f"ws sink 未启用: 端口不可达 {url}")
                 continue
-            b.add(WsSink(url).consume)
+            try:
+                sink = WsSink(url)
+            except ImportError as exc:
+                _log(f"ws sink 未启用(缺依赖): {exc}")
+                continue
+            _ws_sinks.append(sink)
+            b.add(sink.consume)
         for url in _cfg["otel_urls"]:
             traces_url = _otel_traces_url(url)
             if not _url_reachable(url):

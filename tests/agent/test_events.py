@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import sys
 
 import pytest
 from opentelemetry.sdk.trace import TracerProvider
@@ -10,6 +11,7 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanE
 from opentelemetry.trace import StatusCode
 
 from gh_puller import agent
+from gh_puller.agent import sinks
 from gh_puller.agent.events import EventBus, EventRecorder, fold_state, set_active_bus, text_message
 from gh_puller.agent.sinks import FileSink, OtelSink
 from tests.agent._support import (
@@ -53,6 +55,37 @@ async def test_event_bus_can_flush_a_lossless_raw_sink() -> None:
     await bus.flush()
     assert received == [{"type": "model/delta/text", "index": index} for index in range(5100)]
     bus.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_missing_optional_ws_dependency_is_skipped(monkeypatch, tmp_path) -> None:
+    monkeypatch.setitem(sys.modules, "websockets", None)
+    monkeypatch.setattr(sinks, "_url_reachable", lambda _url: True)
+    sinks.configure(file_dir=tmp_path, ws_urls=["ws://monitor.invalid/ws"], otel_urls=[])
+    assert sinks.ensure_bus().enabled
+    sinks.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_closes_the_ws_sender(monkeypatch, tmp_path) -> None:
+    closed = []
+
+    class Sink:
+        def __init__(self, url):
+            self.url = url
+
+        async def consume(self, _event):
+            return None
+
+        def close(self):
+            closed.append(self.url)
+
+    monkeypatch.setattr(sinks, "WsSink", Sink)
+    monkeypatch.setattr(sinks, "_url_reachable", lambda _url: True)
+    sinks.configure(file_dir=tmp_path, ws_urls=["ws://monitor.invalid/ws"], otel_urls=[])
+    sinks.ensure_bus()
+    sinks.shutdown()
+    assert closed == ["ws://monitor.invalid/ws"]
 
 
 @pytest.mark.asyncio
