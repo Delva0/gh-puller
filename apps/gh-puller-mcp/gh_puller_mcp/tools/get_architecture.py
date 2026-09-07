@@ -44,5 +44,5 @@ TOOL = ToolDef(
 
 @register
 def get_architecture(arguments: dict, config: ServerConfig) -> types.CallToolResult:
-    """Get architecture：默认透传 cbm cli；具体定制在此扩展。"""
+    """Get architecture：默认透传 CBM 后端；具体定制在此扩展。"""
     return passthrough(TOOL, arguments, config)

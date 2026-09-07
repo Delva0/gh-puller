@@ -34,5 +34,5 @@ TOOL = ToolDef(
 
 @register
 def ingest_traces(arguments: dict, config: ServerConfig) -> types.CallToolResult:
-    """Ingest traces：默认透传 cbm cli；具体定制在此扩展。"""
+    """Ingest traces：默认透传 CBM 后端；具体定制在此扩展。"""
     return passthrough(TOOL, arguments, config)

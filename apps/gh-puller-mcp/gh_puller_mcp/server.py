@@ -9,7 +9,7 @@ assembly:
 * the verbatim tool surface (profiles, C-style pagination, annotations),
 * the CallToolResult envelope rules (structuredContent three-state),
 * the prompt templates and their -32602 validation,
-* the `cli` passthrough bridge.
+* the persistent native MCP bridge.
 
 Intentional divergences from the C server (documented in README):
 * tools/call with a missing name is rejected by the SDK (-32602 Invalid
@@ -140,7 +140,7 @@ def dispatch_tool_call(name: str, arguments: dict, config: ServerConfig) -> type
     """tools/call in C dispatch order; every path returns an SDK CallToolResult.
 
     The implementation is the per-tool fn registered via @register (default:
-    passthrough to the cbm CLI); this layer keeps the protocol semantics
+    passthrough to the persistent CBM backend); this layer keeps the protocol semantics
     (profile filtering, legacy alias, unknown-tool envelope, error synthesis).
     """
     if not tool_allowed(config.profile, name):
@@ -219,7 +219,7 @@ async def _on_list_tools(config: ServerConfig, handler_ctx, params) -> types.Lis
 
 async def _on_call_tool(config: ServerConfig, handler_ctx, params) -> types.CallToolResult:
     arguments = params.arguments if params.arguments is not None else {}
-    return dispatch_tool_call(params.name, arguments, config)
+    return await anyio.to_thread.run_sync(dispatch_tool_call, params.name, arguments, config)
 
 
 async def _on_list_prompts(config: ServerConfig, handler_ctx, params) -> types.ListPromptsResult:
@@ -255,7 +255,10 @@ def run_server(config: ServerConfig | None = None) -> None:
         async with stdio_server() as (read_stream, write_stream):
             await build_server(config).run(read_stream, write_stream, initialization_options=None)
 
-    anyio.run(serve)
+    try:
+        anyio.run(serve)
+    finally:
+        config.backend.close()
 
 
 def run_server_http(
@@ -270,7 +273,12 @@ def run_server_http(
     for any other bind it stays off so remote hosts are accepted.
     """
     config = config or ServerConfig()
-    app = build_server(config).streamable_http_app(
-        streamable_http_path=path, json_response=True, stateless_http=True, host=host,
-    )
-    uvicorn.run(app, host=host, port=port)
+    try:
+        if config.call_tool is None:
+            config.backend.start()
+        app = build_server(config).streamable_http_app(
+            streamable_http_path=path, json_response=True, stateless_http=True, host=host,
+        )
+        uvicorn.run(app, host=host, port=port)
+    finally:
+        config.backend.close()

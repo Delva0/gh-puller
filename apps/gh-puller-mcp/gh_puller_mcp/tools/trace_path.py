@@ -62,5 +62,5 @@ TOOL = ToolDef(
 
 @register
 def trace_path(arguments: dict, config: ServerConfig) -> types.CallToolResult:
-    """Trace path：默认透传 cbm cli；具体定制在此扩展。"""
+    """Trace path：默认透传 CBM 后端；具体定制在此扩展。"""
     return passthrough(TOOL, arguments, config)

@@ -4,8 +4,8 @@ In-process: `streamable_http_app` via starlette TestClient (no real socket, no
 real backend — `ServerConfig(call_tool=...)` stub). Covers the custom path,
 stateless bare calls (no initialize), plain-JSON responses, envelope passthrough
 and the host semantics (localhost auto DNS-rebinding protection vs 0.0.0.0).
-Process-level: the real `python -m gh_puller_mcp --http ...` subprocess with the
-fake backend shim, driven over a real socket.
+Process-level: the real `python -m gh_puller_mcp --http ...` subprocess with a
+persistent fake backend frontend, driven over a real socket.
 """
 
 from __future__ import annotations
@@ -16,8 +16,10 @@ import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -30,11 +32,25 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 HTTP_SHIM = """
 import json, sys
 
-tool = [a for a in sys.argv[1:] if not a.startswith("-")][-1]
-payload = json.load(sys.stdin) if not sys.stdin.isatty() else {}
-data = json.dumps({"tool": tool, "args": payload}, ensure_ascii=False, separators=(",", ":"))
-sys.stdout.write(json.dumps({"content": [{"type": "text", "text": data}],
-                             "structuredContent": json.loads(data), "isError": False}))
+if "--version" in sys.argv:
+    print("codebase-memory-mcp 0.10.8")
+    raise SystemExit
+
+for line in sys.stdin:
+    request = json.loads(line)
+    method = request.get("method")
+    if method == "notifications/initialized":
+        continue
+    if method == "initialize":
+        result = {"protocolVersion": "2024-11-05",
+                  "serverInfo": {"name": "codebase-memory-mcp", "version": "0.10.8"}}
+    else:
+        tool = request["params"]["name"]
+        payload = request["params"]["arguments"]
+        data = json.dumps({"tool": tool, "args": payload}, ensure_ascii=False, separators=(",", ":"))
+        result = {"content": [{"type": "text", "text": data}],
+                  "structuredContent": json.loads(data), "isError": False}
+    print(json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": result}), flush=True)
 """
 
 
@@ -89,6 +105,35 @@ def test_http_tools_list_and_unknown_tool(stub_call_tool) -> None:
         assert unknown["structuredContent"] == {"error": "unknown tool: bogus"}
 
 
+def test_slow_tool_call_does_not_block_http_event_loop() -> None:
+    entered = threading.Event()
+    release = threading.Event()
+
+    def slow_call(tool: str, arguments: dict) -> dict:
+        entered.set()
+        release.wait(timeout=2)
+        return {"content": [{"type": "text", "text": '{"ok":true}'}], "isError": False}
+
+    app = make_app(ServerConfig(version="0.10.8", call_tool=slow_call))
+    with TestClient(app) as client, ThreadPoolExecutor(max_workers=1) as executor:
+        pending = executor.submit(
+            client.post,
+            "/gh-puller/graph",
+            json=rpc("tools/call", {"name": "list_projects", "arguments": {}}),
+        )
+        assert entered.wait(timeout=1)
+        timer = threading.Timer(0.8, release.set)
+        timer.start()
+        started = time.monotonic()
+        tools = client.post("/gh-puller/graph", json=rpc("tools/list", {}))
+        elapsed = time.monotonic() - started
+        release.set()
+        timer.join()
+        assert pending.result(timeout=1).status_code == 200
+        assert tools.status_code == 200
+        assert elapsed < 0.4
+
+
 def test_http_profile_scout_filters_surface(stub_call_tool) -> None:
     config = ServerConfig(profile="scout", call_tool=stub_call_tool({"content": [], "isError": False}))
     app = make_app(config)
@@ -137,7 +182,7 @@ def post(port: int, path: str, payload: dict) -> dict:
 
 
 @pytest.mark.integration
-def test_http_cli_smoke_real_socket(shim) -> None:
+def test_http_persistent_backend_smoke_real_socket(shim) -> None:
     port = free_port()
     env = os.environ.copy()
     env["GH_PULLER_MCP_BINARY"] = shim(HTTP_SHIM)

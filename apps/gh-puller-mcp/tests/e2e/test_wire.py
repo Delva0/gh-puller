@@ -3,7 +3,8 @@
 These drive the real subprocess over newline-framed JSON-RPC, covering the
 handshake, tools.list both shapes, envelope passthrough, prompts, and the
 documented SDK divergences (missing tool name -> -32602, resources not served).
-Backend is a fake `codebase-memory-mcp` shim pointed at via GH_PULLER_MCP_BINARY.
+Backend is a persistent fake `codebase-memory-mcp` frontend pointed at via
+GH_PULLER_MCP_BINARY.
 """
 
 from __future__ import annotations
@@ -30,11 +31,25 @@ INIT_PARAMS = {
 OK_SHIM = """
 import json, sys
 
-tool = [a for a in sys.argv[1:] if not a.startswith("-")][-1]
-payload = json.load(sys.stdin) if not sys.stdin.isatty() else {}
-data = json.dumps({"tool": tool, "args": payload}, ensure_ascii=False, separators=(",", ":"))
-sys.stdout.write(json.dumps({"content": [{"type": "text", "text": data}],
-                             "structuredContent": json.loads(data), "isError": False}))
+if "--version" in sys.argv:
+    print("codebase-memory-mcp 0.10.8")
+    raise SystemExit
+
+for line in sys.stdin:
+    request = json.loads(line)
+    method = request.get("method")
+    if method == "notifications/initialized":
+        continue
+    if method == "initialize":
+        result = {"protocolVersion": "2024-11-05",
+                  "serverInfo": {"name": "codebase-memory-mcp", "version": "0.10.8"}}
+    else:
+        tool = request["params"]["name"]
+        payload = request["params"]["arguments"]
+        data = json.dumps({"tool": tool, "args": payload}, ensure_ascii=False, separators=(",", ":"))
+        result = {"content": [{"type": "text", "text": data}],
+                  "structuredContent": json.loads(data), "isError": False}
+    print(json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": result}), flush=True)
 """
 
 

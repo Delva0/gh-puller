@@ -1,7 +1,7 @@
 """Verbatim MCP surface data for the codebase-memory-mcp re-implementation.
 
-Source of truth: /home/delva/projects/codebase-memory-mcp/src/mcp/mcp.c at v0.10.8 (== HEAD for the
-MCP surface). Extracted once, mechanically, from:
+Source of truth: src/mcp/mcp.c from codebase-memory-mcp v0.10.8. Extracted
+once, mechanically, from:
   * TOOLS[] table                     lines 376-701  (split per-tool into gh_puller_mcp/tools/)
   * TOOL_ANNOTATIONS[]                lines 710-731  (read_only/destructive/idempotent/open_world)
   * analysis_tools[]/scout_tools[]    lines 782-790

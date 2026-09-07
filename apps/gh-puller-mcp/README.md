@@ -1,14 +1,16 @@
 # gh-puller MCP
 
-gh-puller 的 MCP 服务器,提供代码库知识图谱工具桌:15 个工具、`explore_codebase`/`review_change_impact` 提示词、analysis/scout 工具面档位。工具面与 `codebase-memory-mcp` v0.10.8 的 C 服务器 1:1(面随官方版本锁定;`tests/test_manifest.py` 对 C 源码有字节级再提取守门);实现按工具逐文件:`gh_puller_mcp/tools/<tool>.py` 捆绑该工具的逐字面数据(`TOOL = ToolDef(...)`)+ 行为(`@register` 函数,缺省 `passthrough`),`manifest.py` 只留协议常量/提示词/指令并聚合成 `TOOLS`/`TOOL_ANNOTATIONS`。扩展或定制某个工具只改那一个文件(只改行为,schema 受守门保护)。
+gh-puller 的 MCP 服务器,提供代码库知识图谱工具桌:15 个工具、`explore_codebase`/`review_change_impact` 提示词、analysis/scout 工具面档位。工具面固定为 `codebase-memory-mcp` v0.10.8 的 C 服务器版本;可选的 `tests/e2e/test_manifest_source.py` 会从显式指定的该版本 C 源码重新提取并校验字节一致性。实现按工具逐文件:`gh_puller_mcp/tools/<tool>.py` 捆绑该工具的逐字面数据(`TOOL = ToolDef(...)`)+ 行为(`@register` 函数,缺省 `passthrough`),`manifest.py` 只留协议常量/提示词/指令并聚合成 `TOOLS`/`TOOL_ANNOTATIONS`。扩展或定制某个工具只改那一个文件(只改行为,schema 受守门保护)。
 
-后端机制:每个工具调用作为子进程透传给客户端二进制:
+后端是一个随本服务存活的原生 MCP frontend:
 
 ```
-codebase-memory-mcp cli --json <tool>          # args on stdin as JSON
+MCP client ──stdio/HTTP──> gh-puller-mcp ──persistent stdio MCP──> codebase-memory-mcp ──IPC──> shared daemon
 ```
 
-`--json` 让 CLI 把原始 MCP `CallToolResult` 信封(content / structuredContent / isError)打印到 stdout;信封 `isError` 时退出码为 1。stdout 信封原样透传。wire/protocol 机制(stdio framing、JSON-RPC、handshake、notifications、unknown-method 错误)来自官方 **`mcp` SDK**(PyPI `mcp` 2.x,`uv add mcp`);本包只保留 codebase-memory-mcp 特有语义:逐字工具面 / 档位 / 分页规则、信封规则、提示词模板和 `cli` 透传。协议面拷贝自 **codebase-memory-mcp v0.10.8**(面级已验证 `v0.10.8 == HEAD`;C 源码 `src/mcp/mcp.c` 是 ground truth)。
+服务只启动并初始化一次 `codebase-memory-mcp`，随后在同一条 newline-framed MCP 流上发送 `tools/call`，原样转发原生 `CallToolResult` 信封(content / structuredContent / isError)。这个 frontend 会复用或启动 CBM 的共享 daemon，并以持续会话阻止 session-managed daemon 在相邻请求之间退出；服务关闭时 EOF 释放会话。CBM 自带的 `cli` 是 one-shot daemon client：每个进程都会连接 daemon，无其他会话时还会启动一个临时 daemon，完成后立即断开，因此不用于服务热路径。
+
+面向调用方的 wire/protocol 机制(stdio framing、JSON-RPC、handshake、notifications、unknown-method 错误)来自官方 **`mcp` SDK**(PyPI `mcp` 2.x,`uv add mcp`);本包只保留 codebase-memory-mcp 特有语义:逐字工具面 / 档位 / 分页规则、信封规则、提示词模板和持久后端桥接。协议面以 **codebase-memory-mcp v0.10.8** 的 `src/mcp/mcp.c` 为 ground truth;不宣称跟随当前 HEAD。
 
 ## Run
 
@@ -19,9 +21,10 @@ uv --directory apps/gh-puller-mcp run python -m gh_puller_mcp [--tool-profile an
 
 * 默认档位 `all` 暴露 15 个工具;`analysis`(11)/`scout`(7)收紧工具面并切换 `initialize` 指令,与 C 服务器的 `--tool-profile` 完全一致。
 * `--binary`(或 env `GH_PULLER_MCP_BINARY`)覆盖二进制;解析序:flag → env → `shutil.which("codebase-memory-mcp")` → `~/.local/bin/codebase-memory-mcp`。
-* 环境继承(`CBM_CACHE_DIR`、`CBM_RUNTIME_DIR` 决定缓存根与 CLI 所附着的守护进程)。
+* 环境继承(`CBM_CACHE_DIR` 决定索引根，`CBM_RUNTIME_DIR` 决定 daemon rendezvous；相同账户、build、cache 和 runtime 的 CBM 会话共享 daemon)。
 * 干净 EOF / framing 停止退出码 0(对应 C 服务器);bad flags 退出码 2。
-* 每次工具调用花费约 1.9 s(C 二进制自身启动)加上它的结果;无缓存、无重试。
+* stdio 模式在第一次合法工具调用时启动后端，随后复用至 EOF；HTTP 模式在监听端口前完成后端初始化，因此请求不承担 CBM 进程、build fingerprint 或 daemon 冷启动成本。
+* 工具请求不自动重试；超时或后端退出会结束当前 frontend，下一次调用可建立新会话。
 * `--http` 切到 Streamable HTTP 传输(stdio 仍是缺省;`--tool-profile` 等旗标组合照常生效),语义见下节。
 
 ## HTTP 传输(Streamable HTTP,跨机暴露)
@@ -31,6 +34,7 @@ uv --directory apps/gh-puller-mcp run python -m gh_puller_mcp --http --host 0.0.
 ```
 
 * 形态是**单端点 MCP JSON-RPC**(`tools/list`、`tools/call`、`prompts/*`…),不是每工具一个 URL;`json_response`(每次 POST 回纯 JSON,无 SSE 流)与 `stateless_http`(无会话、免 `initialize` 握手,每个 POST 独立)由实现定死,不暴露开关。
+* HTTP 请求无调用方会话，但后端有服务级持续会话。工具调用在线程中等待后端，uvicorn event loop 仍可响应 `ping`、`tools/list` 和其他连接；一个原生 frontend 按序执行工具调用。
 * 任意 HTTP 客户端可直接 POST;MCP 客户端(streamable http)连同一端点:
 
 ```bash
@@ -61,8 +65,8 @@ No tool declares `outputSchema` (deliberate: the C server omits it to keep `stru
 * `initialize` capabilities carry the SDK's `experimental` key (and would advertise `resources`/`logging`/`completions` if their handlers were registered).
 * `tools/call` with a *missing* `name` is rejected by the SDK with `-32602 Invalid request parameters` (the C server returned an `isError` envelope "missing tool name").
 * `resources/list` / `resources/templates/list` are not served (-32601; the C server returned empty arrays) and not advertised.
-* No background auto-index / watcher registration on `initialize` (a C-only side effect invisible in any response); no C-style HTTP UI / daemon mode (`--port` 9749 UI out of scope — the `--http` transport serves the MCP protocol itself over Streamable HTTP instead, see Run); the SDK stdio loop is serial too and `notifications/cancelled` is a no-op.
-* On a subprocess failure the server synthesizes an envelope with `"backend error: …"` (the C server never fails this way locally).
+* 持久后端是普通的 C frontend 会话，因此沿用 CBM daemon 的 session context、auto-watch 和后台任务语义；本服务不提供 C UI / daemon 控制面(`--port` 9749 UI 不在范围内，`--http` 暴露的是 Streamable HTTP MCP)。外层 SDK 的 `notifications/cancelled` 仍是 no-op。
+* 后端启动、传输或超时失败时，服务器合成 `"backend error: …"` 信封；不会重放可能已经执行的工具请求。
 
 ## Tests
 
@@ -79,8 +83,56 @@ with the configured oracle binary and re-extracts the tool table from the explic
 ## Manual smoke
 
 ```bash
-printf '%s' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}\n' \
-  | uv --directory apps/gh-puller-mcp run python -m gh_puller_mcp --debug
-# then list_projects(limit=1); its content[0].text must be byte-identical to:
-echo '{"limit":1}' | codebase-memory-mcp cli --json list_projects   # (content[0].text)
+uv --directory apps/gh-puller-mcp run python - <<'PY'
+import json
+import os
+import subprocess
+import sys
+import tempfile
+
+with tempfile.TemporaryDirectory() as cache_dir, tempfile.TemporaryDirectory() as runtime_dir:
+    env = os.environ.copy()
+    env["CBM_CACHE_DIR"] = cache_dir
+    env["CBM_RUNTIME_DIR"] = runtime_dir
+    process = subprocess.Popen(
+        [sys.executable, "-m", "gh_puller_mcp"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+        env=env,
+    )
+    assert process.stdin is not None
+    assert process.stdout is not None
+
+    def request(message):
+        process.stdin.write(json.dumps(message) + "\n")
+        process.stdin.flush()
+        return json.loads(process.stdout.readline())
+
+    print(request({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": {"name": "readme-smoke", "version": "1"},
+        },
+    }))
+    process.stdin.write(json.dumps({
+        "jsonrpc": "2.0",
+        "method": "notifications/initialized",
+    }) + "\n")
+    process.stdin.flush()
+    response = request({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/call",
+        "params": {"name": "list_projects", "arguments": {"limit": 1}},
+    })
+    assert response["result"].get("isError") is not True
+    print(response)
+    process.stdin.close()
+    raise SystemExit(process.wait(timeout=15))
+PY
 ```

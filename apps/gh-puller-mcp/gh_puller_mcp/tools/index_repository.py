@@ -53,5 +53,5 @@ TOOL = ToolDef(
 
 @register
 def index_repository(arguments: dict, config: ServerConfig) -> types.CallToolResult:
-    """Index repository：默认透传 cbm cli；具体定制在此扩展。"""
+    """Index repository：默认透传 CBM 后端；具体定制在此扩展。"""
     return passthrough(TOOL, arguments, config)

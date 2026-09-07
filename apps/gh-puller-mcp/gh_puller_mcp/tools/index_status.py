@@ -43,5 +43,5 @@ TOOL = ToolDef(
 
 @register
 def index_status(arguments: dict, config: ServerConfig) -> types.CallToolResult:
-    """Index status：默认透传 cbm cli；具体定制在此扩展。"""
+    """Index status：默认透传 CBM 后端；具体定制在此扩展。"""
     return passthrough(TOOL, arguments, config)

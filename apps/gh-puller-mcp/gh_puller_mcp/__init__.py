@@ -2,8 +2,8 @@
 
 The MCP surface (15 tools, prompts, tool profiles) is reproduced verbatim from
 src/mcp/mcp.c of codebase-memory-mcp v0.10.8; every tool call is delegated to the
-binary's only CLI interface: ``codebase-memory-mcp cli --json <tool>``. Wire and
-protocol machinery (stdio framing, JSON-RPC) come from the official `mcp` SDK.
+binary through one persistent native MCP frontend. Wire and protocol machinery
+(stdio framing, JSON-RPC) come from the official `mcp` SDK.
 """
 
 from __future__ import annotations

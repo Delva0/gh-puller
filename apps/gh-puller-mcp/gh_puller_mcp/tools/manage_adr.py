@@ -35,5 +35,5 @@ TOOL = ToolDef(
 
 @register
 def manage_adr(arguments: dict, config: ServerConfig) -> types.CallToolResult:
-    """Manage ADR：默认透传 cbm cli；具体定制在此扩展。"""
+    """Manage ADR：默认透传 CBM 后端；具体定制在此扩展。"""
     return passthrough(TOOL, arguments, config)

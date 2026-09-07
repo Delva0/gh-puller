@@ -4,7 +4,7 @@
   input_schema/annotations) extracted from the C server's TOOLS[] table.
 * `register` binds a module's TOOL to its implementation fn (fn name must
   equal the tool name); `passthrough` is the default implementation — run the
-  tool through `codebase-memory-mcp cli --json` and forward its envelope.
+  tool through the persistent native MCP frontend and forward its envelope.
 * The CallToolResult envelope (structuredContent three-state) is built here so
   the C server's rules live at exactly one place.
 """
@@ -84,7 +84,7 @@ def _call_tool_result(envelope: dict) -> types.CallToolResult:
 
 
 def passthrough(tool: ToolDef, arguments: dict, config: ServerConfig) -> types.CallToolResult:
-    """Default implementation: delegate to the cbm CLI and forward its envelope."""
+    """Delegate to the persistent CBM frontend and forward its envelope."""
     try:
         return _call_tool_result(
             _invoke(config, tool.name, arguments if arguments is not None else {}),
