@@ -1,0 +1,36 @@
+# Build the KGA-to-CBM native query helper against the transport-neutral CBM engine.
+
+CBM_ROOT ?= ../codebase-memory-mcp
+BUILD_DIR ?= build/native
+TARGET = $(BUILD_DIR)/gh-puller-cbm-helper
+CBM_ENGINE = $(CBM_ROOT)/build/c/libcbm-engine.a
+CBM_MIMALLOC = $(CBM_ROOT)/build/c/prod_mimalloc.o
+
+CC ?= cc
+CFLAGS = -std=c11 -D_DEFAULT_SOURCE -D_GNU_SOURCE -O2 -Wall -Wextra -Werror \
+	-Wno-unused-parameter -Wno-sign-compare -Wdate-time \
+	-I$(CBM_ROOT)/src -I$(CBM_ROOT)/vendored \
+	-I$(CBM_ROOT)/vendored/sqlite3 -I$(CBM_ROOT)/vendored/mimalloc/include
+LDFLAGS = -lm -lstdc++ -lpthread -lz -Wl,-z,noexecstack -Wl,-z,separate-code
+SOURCES = native/cbm_archive_helper.c native/kga_reader.c
+OBJECTS = $(addprefix $(BUILD_DIR)/,$(SOURCES:.c=.o))
+DEPS = $(OBJECTS:.o=.d)
+
+.PHONY: native-helper cbm-engine
+
+native-helper: $(TARGET)
+	$(TARGET) --version
+
+cbm-engine:
+	$(MAKE) -C $(CBM_ROOT) -f Makefile.cbm cbm-engine build/c/prod_mimalloc.o
+
+$(BUILD_DIR)/%.o: %.c Makefile.native
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
+
+$(TARGET): $(OBJECTS) cbm-engine
+	$(CC) $(CFLAGS) -o $@ $(OBJECTS) $(CBM_ENGINE) $(CBM_MIMALLOC) $(LDFLAGS)
+	@if nm $@ | grep -Eq 'tree_sitter_|cbm_mcp_server_|cbm_daemon_|cbm_pipeline_run'; then \
+		echo "ERROR: native helper links a forbidden CBM subsystem"; exit 1; fi
+
+-include $(DEPS)
