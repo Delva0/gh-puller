@@ -5,6 +5,8 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import time
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -78,6 +80,46 @@ def test_frontend_is_reused_across_calls(shim, tmp_path) -> None:
         backend.call_tool("list_projects", {})
         backend.call_tool("get_graph_schema", {"project": "p"})
     assert starts.read_text().splitlines() == ["start"]
+
+
+def test_indexing_frontend_does_not_block_queries(shim, tmp_path) -> None:
+    started = tmp_path / "index-started"
+    exe = shim(
+        f"""
+import json, sys, time
+
+for line in sys.stdin:
+    request = json.loads(line)
+    method = request.get("method")
+    if method == "notifications/initialized":
+        continue
+    if method == "initialize":
+        result = {{"serverInfo": {{"version": "0.10.8"}}}}
+    else:
+        tool = request["params"]["name"]
+        if tool == "index_repository":
+            with open({str(started)!r}, "w") as stream:
+                stream.write("started")
+            time.sleep(1.5)
+        result = {{"structuredContent": {{"tool": tool}}, "isError": False}}
+    print(json.dumps({{"jsonrpc": "2.0", "id": request["id"], "result": result}}), flush=True)
+""",
+    )
+    with running_backend(exe) as backend:
+        backend.start()
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(backend.call_tool, "index_repository", {"repo_path": "/repo"})
+            deadline = time.monotonic() + 2
+            while not started.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert started.exists()
+            begin = time.monotonic()
+            result = backend.call_tool("list_projects", {})
+            elapsed = time.monotonic() - begin
+            assert future.result(timeout=3)["isError"] is False
+
+    assert result["structuredContent"] == {"tool": "list_projects"}
+    assert elapsed < 0.5
 
 
 def test_error_envelope_is_returned(shim) -> None:

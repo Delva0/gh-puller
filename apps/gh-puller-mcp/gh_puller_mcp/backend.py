@@ -1,9 +1,9 @@
-"""Persistent stdio bridge to one daemon-backed codebase-memory-mcp frontend.
+"""Persistent stdio bridges to daemon-backed codebase-memory-mcp frontends.
 
-The frontend is started once per gh-puller-mcp server and kept until shutdown.
-It owns the supported CBM daemon connection, while this module serializes tool
-requests over its newline-framed MCP stream and preserves CallToolResult
-envelopes verbatim.
+The primary query frontend is started once per gh-puller-mcp server. A dedicated
+indexing frontend starts lazily so a long index_repository call cannot occupy the
+query stream. Each stream is serialized independently, and both preserve native
+CallToolResult envelopes verbatim.
 """
 
 from __future__ import annotations
@@ -245,13 +245,15 @@ class _PersistentClient:
 
 
 class Backend:
-    """Own one persistent native MCP frontend for the server lifetime."""
+    """Own isolated persistent query and indexing frontends."""
 
     def __init__(self, config: BackendConfig | None = None) -> None:
         self._config = config or BackendConfig()
         self._version: str | None = None
         self._client: _PersistentClient | None = None
+        self._index_client: _PersistentClient | None = None
         self._lock = threading.RLock()
+        self._index_lock = threading.RLock()
         self._closed = False
 
     @property
@@ -294,7 +296,7 @@ class Backend:
         return self._version
 
     def start(self) -> None:
-        """Start and initialize the native frontend once."""
+        """Start and initialize the primary query frontend once."""
         with self._lock:
             self._ensure_client()
 
@@ -311,31 +313,45 @@ class Backend:
         Raises:
             BackendError: The frontend could not start or complete the request.
         """
-        with self._lock:
-            client = self._ensure_client()
+        indexing = tool_name == "index_repository"
+        lock = self._index_lock if indexing else self._lock
+        with lock:
+            client = self._ensure_client(indexing=indexing)
             try:
                 return client.call_tool(tool_name, arguments, self._config.timeout)
             except BackendError:
                 if not client.alive:
-                    self._client = None
+                    if indexing:
+                        self._index_client = None
+                    else:
+                        self._client = None
                 raise
 
     def close(self) -> None:
-        """Close the frontend and release its daemon session."""
+        """Close both frontends and release their daemon sessions."""
         with self._lock:
             self._closed = True
             client, self._client = self._client, None
             if client is not None:
                 client.close()
+        with self._index_lock:
+            client, self._index_client = self._index_client, None
+            if client is not None:
+                client.close()
 
-    def _ensure_client(self) -> _PersistentClient:
+    def _ensure_client(self, *, indexing: bool = False) -> _PersistentClient:
         if self._closed:
             raise BackendError("backend is closed")
-        if self._client is not None and self._client.alive:
-            return self._client
-        if self._client is not None:
-            self._client.close()
-        self._client = _PersistentClient(self.resolve_binary(), self._config)
-        if self._client.version:
-            self._version = self._client.version
-        return self._client
+        client = self._index_client if indexing else self._client
+        if client is not None and client.alive:
+            return client
+        if client is not None:
+            client.close()
+        client = _PersistentClient(self.resolve_binary(), self._config)
+        if indexing:
+            self._index_client = client
+        else:
+            self._client = client
+        if client.version:
+            self._version = client.version
+        return client
