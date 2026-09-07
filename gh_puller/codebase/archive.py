@@ -812,6 +812,49 @@ class Archive(PageStore):
         edges = self._records(TreeRef.from_json(item.get("edge_root")), "edges")
         return GraphRows(nodes, edges)
 
+    def _restorable_manifest(self, commit: str | None = None) -> tuple[dict, str]:
+        """Validate the metadata needed before any exact CBM restoration."""
+        sha = self.latest_commit if commit is None else commit
+        if sha not in self._entries:
+            raise KeyError(sha)
+        item = self._entries[sha]
+        if item.get("graph_fidelity_version") != GRAPH_FIDELITY_VERSION:
+            raise ArchiveError(f"snapshot {sha} has no verified CBM fidelity boundary")
+        project = item.get("cbm_project")
+        if not isinstance(project, str) or not project:
+            raise ArchiveError(f"snapshot {sha} has no CBM project identity")
+        nodes, edges = item.get("nodes"), item.get("edges")
+        if type(nodes) is not int or nodes < 1 or type(edges) is not int or edges < 0:
+            raise ArchiveError(f"snapshot {sha} has invalid row counts")
+        try:
+            node_root = TreeRef.from_json(item.get("node_root"))
+            edge_root = TreeRef.from_json(item.get("edge_root"))
+        except (KeyError, TypeError) as exc:
+            raise ArchiveError(f"snapshot {sha} has invalid graph roots") from exc
+        for root in (node_root, edge_root):
+            if root is None:
+                continue
+            valid_hash = (
+                isinstance(root.logical_hash, str)
+                and len(root.logical_hash) == 64
+                and all(byte in "0123456789abcdef" for byte in root.logical_hash)
+            )
+            if (
+                type(root.offset) is not int
+                or root.offset < len(MAGIC)
+                or type(root.count) is not int
+                or root.count < 1
+                or not valid_hash
+            ):
+                raise ArchiveError(f"snapshot {sha} has invalid graph roots")
+        if node_root is None or node_root.count != nodes or (edge_root is None) != (edges == 0):
+            raise ArchiveError(f"snapshot {sha} row counts do not match its roots")
+        if edge_root is not None and edge_root.count != edges:
+            raise ArchiveError(f"snapshot {sha} row counts do not match its roots")
+        if item.get("graph_digest") != graph_digest(node_root, edge_root):
+            raise ArchiveError(f"snapshot {sha} has an invalid graph digest")
+        return item, project
+
     def verify_snapshot(self, commit: str | None = None) -> None:
         """Verify that one snapshot can be restored exactly into CBM.
 
@@ -824,16 +867,9 @@ class Archive(PageStore):
                 its row counts, project identity, JSON, or graph-closure contract.
             KeyError: The requested commit is absent from this reader's view.
         """
-        sha = self.latest_commit if commit is None else commit
-        if sha not in self._entries:
-            raise KeyError(sha)
-        item = self._entries[sha]
-        if item.get("graph_fidelity_version") != GRAPH_FIDELITY_VERSION:
-            raise ArchiveError(f"snapshot {sha} has no verified CBM fidelity boundary")
-        project = item.get("cbm_project")
-        if not isinstance(project, str) or not project:
-            raise ArchiveError(f"snapshot {sha} has no CBM project identity")
-        rows = self.load_rows(sha)
+        item, project = self._restorable_manifest(commit)
+        rows = self.load_rows(item["sha"])
+        sha = item["sha"]
         if item.get("nodes") != len(rows.nodes) or item.get("edges") != len(rows.edges):
             raise ArchiveError(f"snapshot {sha} row counts do not match its manifest")
         try:

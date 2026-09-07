@@ -1,9 +1,8 @@
-"""Start a persistent CBM frontend and expose its query tools to Python.
+"""Expose persistent CBM query backends through one synchronous Python facade.
 
-The client resolves the same immutable CBM executable used by archive builds and
-owns one stdio MCP session.  It deliberately keeps tool arguments open-ended so
-new CBM schema fields do not require an SDK release, while the common graph-query
-methods request machine-readable responses.
+Current-project tools use the authenticated MCP executable. Archive-backed
+``query_graph`` calls use the compact native helper after an explicit load, while
+open-ended MCP arguments keep new server fields independent of SDK releases.
 """
 
 from __future__ import annotations
@@ -14,11 +13,14 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Self
 
 from .binary import CBMBinary, resolve_cbm_binary
+from .cbm_native import NativeArchiveTransport, NativeHelper
 from .cbm_transport import CBMTransportError, PersistentMCPTransport
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
     from types import TracebackType
+
+    from .archive import Archive
 
 
 class _ClientMonitor:
@@ -63,7 +65,7 @@ def _json_object(name: str, result: dict[str, Any]) -> dict[str, Any]:
 
 
 class CBMClient:
-    """A synchronous, thread-safe client backed by one persistent MCP frontend."""
+    """A synchronous facade over native archive queries and CBM MCP tools."""
 
     def __init__(
         self,
@@ -72,10 +74,11 @@ class CBMClient:
         manifest: str | Path | None = None,
         registry: str | Path | None = None,
         cache_root: str | Path | None = None,
+        native_helper: NativeHelper | str | Path | None = None,
         timeout: float = 120,
         environment: Mapping[str, str] | None = None,
     ):
-        """Resolve CBM and complete MCP initialization before returning.
+        """Resolve the selected backend and initialize its persistent process.
 
         Args:
             binary: Pinned binary identity, explicit executable, or command name.
@@ -84,7 +87,10 @@ class CBMClient:
             registry: Registry root used for default manifest resolution.
             cache_root: CBM database directory. ``None`` honors ``CBM_CACHE_DIR``
                 and then uses CBM's per-user default.
-            timeout: Maximum seconds for each MCP request.
+            native_helper: Helper for archive-backed queries. An explicit value
+                selects native-only startup and defers MCP until an MCP tool is
+                requested. ``None`` preserves eager MCP startup.
+            timeout: Maximum seconds for each backend request or cache lock.
             environment: Environment overrides passed to CBM and used during
                 executable and cache resolution.
         """
@@ -92,40 +98,76 @@ class CBMClient:
             raise ValueError("CBM timeout must be positive")
         overrides = dict(environment or {})
         values = {**os.environ, **overrides}
-        identity = (
-            binary
-            if isinstance(binary, CBMBinary)
-            else resolve_cbm_binary(binary, manifest=manifest, registry=registry, environ=values)
-        )
-        identity.verify_unchanged()
         resolved_cache = (
             Path(cache_root).expanduser() if cache_root is not None else default_cbm_cache(values)
         ).resolve()
-        monitor = _ClientMonitor()
-        self.binary = identity
         self.cache_root = resolved_cache
-        self._monitor = monitor
-        self._transport = PersistentMCPTransport(
-            identity.path,
-            resolved_cache,
-            timeout,
-            monitor,
-            overrides,
-        )
+        self.timeout = timeout
+        self._overrides = overrides
+        self._values = values
+        self._binary_input = binary
+        self._manifest = manifest
+        self._registry = registry
+        self._binary_identity = binary if isinstance(binary, CBMBinary) else None
+        self._native_helper = native_helper
+        self._monitor = _ClientMonitor()
+        self._transport: PersistentMCPTransport | None = None
+        self._native_transport: NativeArchiveTransport | None = None
+        if native_helper is None:
+            self._mcp()
+
+    @property
+    def binary(self) -> CBMBinary:
+        """Return the resolved CBM executable used by the MCP fallback."""
+        if self._binary_identity is None:
+            self._binary_identity = resolve_cbm_binary(
+                self._binary_input,
+                manifest=self._manifest,
+                registry=self._registry,
+                environ=self._values,
+            )
+        self._binary_identity.verify_unchanged()
+        return self._binary_identity
+
+    def _mcp(self) -> PersistentMCPTransport:
+        if self._transport is None:
+            self._transport = PersistentMCPTransport(
+                self.binary.path,
+                self.cache_root,
+                self.timeout,
+                self._monitor,
+                self._overrides,
+            )
+        return self._transport
+
+    def _native(self) -> NativeArchiveTransport:
+        if self._native_transport is None:
+            self._native_transport = NativeArchiveTransport(
+                self._native_helper,
+                self.cache_root,
+                self.timeout,
+                self._overrides,
+            )
+        return self._native_transport
 
     @property
     def pid(self) -> int:
         """Return the persistent MCP frontend process ID."""
-        return self._transport.process.pid
+        return self._mcp().process.pid
+
+    @property
+    def native_pid(self) -> int:
+        """Return the persistent native archive helper process ID."""
+        return self._native().pid
 
     @property
     def instructions(self) -> str:
         """Return optional query guidance advertised by the CBM server."""
-        return self._transport.instructions
+        return self._mcp().instructions
 
     def list_tools(self) -> list[dict[str, Any]]:
         """Return all tool definitions advertised by the live CBM server."""
-        return self._transport.list_tools()
+        return self._mcp().list_tools()
 
     def call_tool(self, name: str, arguments: Mapping[str, object] | None = None) -> dict[str, Any]:
         """Call any CBM tool and return its raw MCP result envelope.
@@ -134,7 +176,7 @@ class CBMClient:
             name: Advertised MCP tool name.
             arguments: Tool-specific arguments. ``None`` sends an empty object.
         """
-        return self._transport.call_tool(name, dict(arguments or {}))
+        return self._mcp().call_tool(name, dict(arguments or {}))
 
     def call_json_tool(self, name: str, arguments: Mapping[str, object] | None = None) -> dict[str, Any]:
         """Call a tool whose logical response is a JSON object.
@@ -171,10 +213,38 @@ class CBMClient:
             **options: Additional ``query_graph`` fields such as ``graph`` and
                 ``max_rows``.
         """
-        return self.call_json_tool(
-            "query_graph",
-            {"project": project, "query": query, **options, "format": "json"},
-        )
+        native = self._native_transport
+        if native is not None and native.loaded_project == project:
+            unsupported = options.keys() - {"graph", "max_rows"}
+            if unsupported:
+                raise CBMTransportError(f"native query_graph does not support options: {sorted(unsupported)}")
+            graph = options.get("graph", "code")
+            max_rows = options.get("max_rows", 0)
+            if not isinstance(graph, str) or type(max_rows) is not int:
+                raise CBMTransportError("native query_graph requires string graph and integer max_rows")
+            return native.query_graph(project=project, query=query, graph=graph, max_rows=max_rows)
+        return self.call_json_tool("query_graph", {"project": project, "query": query, **options, "format": "json"})
+
+    def load_archive(
+        self,
+        archive: str | Path | Archive,
+        commit: str | None = None,
+        *,
+        allow_incomplete: bool = True,
+    ) -> dict[str, Any]:
+        """Load one KGA snapshot into the native query engine.
+
+        Args:
+            archive: KGA path or an already captured :class:`Archive` reader.
+            commit: Exact archived commit. ``None`` selects the captured latest.
+            allow_incomplete: For path inputs, accept the writer's final durable
+                checkpoint while the archive is still being built.
+
+        Returns:
+            Loaded graph identity, row counts, cache path, and whether the store
+            was materialized during this call.
+        """
+        return self._native().load_archive(archive, commit, allow_incomplete=allow_incomplete)
 
     def trace_path(self, *, project: str, function_name: str, **options: object) -> dict[str, Any]:
         """Trace calls, data flow, or cross-service paths from one symbol.
@@ -192,8 +262,11 @@ class CBMClient:
         )
 
     def close(self) -> None:
-        """Finish or terminate the frontend and release its pipes."""
-        self._transport.close()
+        """Finish active native and MCP processes and release their pipes."""
+        if self._native_transport is not None:
+            self._native_transport.close()
+        if self._transport is not None:
+            self._transport.close()
 
     def __enter__(self) -> Self:
         return self
