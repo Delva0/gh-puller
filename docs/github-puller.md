@@ -459,9 +459,10 @@ refs/github-archive/commits/<sha>
 The upstream repository is synchronized once per cycle. If a PR head is already in
 that graph, no separate PR fetch is needed. Otherwise the writer fetches the original
 PR head, which preserves open and closed-unmerged histories as well as pre-squash or
-pre-rebase commits when GitHub still exposes them. Batched PR fetches start at
-`--git-batch-size`; structured-commit sources sharing one remote use the same bound.
-Both recursively split on transient transfer failure.
+pre-rebase commits when GitHub still exposes them. The PR snapshot lane uses
+`--git-batch-size` (default 8); structured-commit sources sharing one remote use
+`--git-ref-batch-size` (default 16). Both recursively split on transient transfer
+failure.
 
 The writer keeps Git lookup cost bounded as evidence accumulates. It packs loose
 refs after 256 additions, runs Git's incremental multi-pack maintenance at 64 pack
@@ -579,8 +580,9 @@ uv run -m gh_puller.github schedule \
 ```
 
 The interval is a positive integer followed by `s`, `m`, `h`, or `d`. Other relevant
-controls are `--concurrency`, `--git-batch-size`, `--overlap-seconds`,
-`--request-timeout`, `--git-url`, `--git-destination`, and `--no-progress`.
+controls are `--concurrency`, `--git-batch-size`, `--git-ref-batch-size`,
+`--overlap-seconds`, `--request-timeout`, `--git-url`, `--git-destination`, and
+`--no-progress`.
 
 ### Managed Linux service
 

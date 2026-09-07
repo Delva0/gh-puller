@@ -143,7 +143,7 @@ class GitObjectStore:
         remote_url: str,
         *,
         upstream_synced: bool = False,
-        ref_batch_size: int = 8,
+        ref_batch_size: int = 16,
         token: str | None = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         now: Callable[[], datetime] = lambda: datetime.now(UTC),

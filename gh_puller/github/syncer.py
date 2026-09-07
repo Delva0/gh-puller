@@ -55,6 +55,7 @@ class GitHubSyncConfig:
     api_version: str = "2022-11-28"
     concurrency: int = 8
     git_batch_size: int = 8
+    git_ref_batch_size: int = 16
     request_timeout: float = 30.0
     overlap_seconds: int = 2
     git_url: str | None = None
@@ -64,8 +65,8 @@ class GitHubSyncConfig:
         owner, separator, repo = self.repository.partition("/")
         if not separator or not owner or not repo or "/" in repo:
             raise ValueError("repository must be 'owner/repo'")
-        if self.concurrency < 1 or self.git_batch_size < 1:
-            raise ValueError("concurrency and git_batch_size must be positive")
+        if self.concurrency < 1 or self.git_batch_size < 1 or self.git_ref_batch_size < 1:
+            raise ValueError("concurrency and Git batch sizes must be positive")
         if self.overlap_seconds < 1:
             raise ValueError("overlap_seconds must be positive")
         if self.git_url == "":

@@ -71,6 +71,11 @@ def test_parser_exposes_only_current_runtime_commands(tmp_path: Path) -> None:
 
     assert once.command == "once"
     assert not hasattr(once, "target")
+    assert (once.git_batch_size, once.git_ref_batch_size) == (8, 16)
+    assert (cli._config(once).git_batch_size, cli._config(once).git_ref_batch_size) == (
+        8,
+        16,
+    )
     assert schedule.command == "schedule"
     assert (refresh.command, refresh.pull, refresh.families) == (
         "refresh",
