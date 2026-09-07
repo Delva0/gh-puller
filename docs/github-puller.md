@@ -460,7 +460,8 @@ The upstream repository is synchronized once per cycle. If a PR head is already 
 that graph, no separate PR fetch is needed. Otherwise the writer fetches the original
 PR head, which preserves open and closed-unmerged histories as well as pre-squash or
 pre-rebase commits when GitHub still exposes them. Batched PR fetches start at
-`--git-batch-size` and recursively split on transient transfer failure.
+`--git-batch-size`; structured-commit sources sharing one remote use the same bound.
+Both recursively split on transient transfer failure.
 
 `comparison_kind=merge_base` names the unique merge base for an offline PR diff.
 `empty_tree` represents unrelated histories. `unavailable` records which required

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import subprocess
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -78,6 +79,29 @@ def _stored_git(path: Path, *arguments: str) -> str:
 
 def _is_fetch(command: Sequence[str]) -> bool:
     return len(command) > 3 and command[1] == "--git-dir" and command[3] == "fetch"
+
+
+def _pull_source(repository: Path, number: int) -> CommitFetchSource:
+    return CommitFetchSource(
+        "pull-ref",
+        str(repository),
+        f"refs/pull/{number}/head",
+        "acme/widgets",
+        number,
+    )
+
+
+def _pull_fetch_sizes(
+    commands: Sequence[Sequence[str]],
+    repository: Path | None = None,
+) -> list[int]:
+    return [
+        sum("refs/pull/" in argument for argument in command)
+        for command in commands
+        if _is_fetch(command)
+        and (repository is None or str(repository) in command)
+        and any("refs/pull/" in argument for argument in command)
+    ]
 
 
 def _remove_loose_object(path: Path, oid: str) -> None:
@@ -432,6 +456,138 @@ async def test_structured_commit_is_fetched_from_its_known_pull_ref(
     assert retained[head]["attempts"][-1]["ref"] == "refs/pull/7/head"
     assert retained[head]["attempts"][-1]["outcome"] == "available"
     assert not any("+refs/heads/*:refs/heads/*" in command for command in commands)
+
+
+@pytest.mark.asyncio
+async def test_batched_source_fetch_matches_serial_source_attribution(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    base, _ = _source_repository(source, 1)
+    _git(source, "checkout", "--quiet", "--detach", base)
+    (source / "middle.txt").write_text("middle\n")
+    _git(source, "add", "middle.txt")
+    _git(source, "commit", "--quiet", "-m", "middle")
+    middle = _git(source, "rev-parse", "HEAD")
+    (source / "second.txt").write_text("second\n")
+    _git(source, "add", "second.txt")
+    _git(source, "commit", "--quiet", "-m", "second pull")
+    second_head = _git(source, "rev-parse", "HEAD")
+    _git(source, "update-ref", "refs/pull/8/head", second_head)
+    first_source = _pull_source(source, 7)
+    second_source = _pull_source(source, 8)
+    routes = {middle: (first_source,), second_head: (second_source,)}
+    real_command = git_store_module._command
+    commands: list[Sequence[str]] = []
+
+    async def record(command: Sequence[str], **kwargs: Any) -> str:
+        commands.append(command)
+        return await real_command(command, **kwargs)
+
+    monkeypatch.setattr(git_store_module, "_command", record)
+    def fixed_now() -> datetime:
+        return datetime(2026, 9, 7, tzinfo=UTC)
+
+    serial_path = tmp_path / "serial.git"
+    batched_path = tmp_path / "batched.git"
+    serial = await GitObjectStore(
+        serial_path,
+        "acme/widgets",
+        str(source),
+        ref_batch_size=1,
+        now=fixed_now,
+    ).retain_commits((middle, second_head), sources=routes)
+    batched = await GitObjectStore(
+        batched_path,
+        "acme/widgets",
+        str(source),
+        ref_batch_size=8,
+        now=fixed_now,
+    ).retain_commits((middle, second_head), sources=routes)
+
+    assert batched == serial
+    assert _pull_fetch_sizes(commands, serial_path) == [1, 1]
+    assert _pull_fetch_sizes(commands, batched_path) == [2]
+    assert {middle, second_head} <= set(
+        _stored_git(batched_path, "rev-list", "--all").splitlines(),
+    )
+
+
+@pytest.mark.asyncio
+async def test_source_batch_isolates_a_missing_remote_ref(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    _, head = _source_repository(source, 1)
+    missing = "f" * 40
+    sources = {
+        head: (_pull_source(source, 7),),
+        missing: (_pull_source(source, 8),),
+    }
+    real_command = git_store_module._command
+    commands: list[Sequence[str]] = []
+
+    async def record(command: Sequence[str], **kwargs: Any) -> str:
+        commands.append(command)
+        return await real_command(command, **kwargs)
+
+    monkeypatch.setattr(git_store_module, "_command", record)
+    retained = await GitObjectStore(
+        tmp_path / "facts.sqlite3.git",
+        "acme/widgets",
+        str(source),
+        ref_batch_size=8,
+    ).retain_commits((head, missing), sources=sources)
+
+    assert _pull_fetch_sizes(commands) == [2, 1, 1]
+    assert retained[head]["status"] == "available"
+    assert retained[missing]["status"] == "unavailable"
+    assert "couldn't find remote ref refs/pull/8/head" in retained[missing]["attempts"][1]["error"]
+
+
+@pytest.mark.asyncio
+async def test_transient_source_batch_failure_splits_before_retry(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    base, first_head = _source_repository(source, 1)
+    _git(source, "checkout", "--quiet", "--detach", base)
+    (source / "second.txt").write_text("second\n")
+    _git(source, "add", "second.txt")
+    _git(source, "commit", "--quiet", "-m", "second pull")
+    second_head = _git(source, "rev-parse", "HEAD")
+    _git(source, "update-ref", "refs/pull/8/head", second_head)
+    sources = {
+        first_head: (_pull_source(source, 7),),
+        second_head: (_pull_source(source, 8),),
+    }
+    real_command = git_store_module._command
+    fetch_sizes: list[int] = []
+    failed = False
+
+    async def disconnect_batch(command: Sequence[str], **kwargs: Any) -> str:
+        nonlocal failed
+        if _is_fetch(command) and any("refs/pull/" in argument for argument in command):
+            size = sum("refs/pull/" in argument for argument in command)
+            fetch_sizes.append(size)
+            if size > 1 and not failed:
+                failed = True
+                raise GitStoreError("git fetch failed: RPC failed; curl 56 connection reset")
+        return await real_command(command, **kwargs)
+
+    monkeypatch.setattr(git_store_module, "_command", disconnect_batch)
+    retained = await GitObjectStore(
+        tmp_path / "facts.sqlite3.git",
+        "acme/widgets",
+        str(source),
+        ref_batch_size=8,
+    ).retain_commits((first_head, second_head), sources=sources)
+
+    assert fetch_sizes == [2, 1, 1]
+    assert {result["status"] for result in retained.values()} == {"available"}
 
 
 @pytest.mark.asyncio

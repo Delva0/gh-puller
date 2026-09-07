@@ -108,6 +108,10 @@ class CommitFetchSource:
             raise ValueError("invalid commit fetch source")
 
 
+type _SourceGroup = tuple[CommitFetchSource, tuple[str, ...]]
+type _SourceBatch = tuple[_SourceGroup, ...]
+
+
 class GitObjectStore:
     """管理一个仓库专属的 bare Git 对象库。
 
@@ -116,6 +120,7 @@ class GitObjectStore:
         repository: 固定绑定的 GitHub ``owner/repo``。
         remote_url: Git fetch 使用的远端地址。
         upstream_synced: 配套事实库是否已证明当前 cycle 完成上游 refs 同步。
+        ref_batch_size: 单次 Git 传输包含的同远端精确 refs 上限。
         token: HTTPS 远端的 GitHub token；不会写入 Git 配置。
         sleep: 瞬时 Git 传输错误的可取消退避等待器。
         now: 记录逐来源获取尝试窗口的时区时钟。
@@ -128,13 +133,17 @@ class GitObjectStore:
         remote_url: str,
         *,
         upstream_synced: bool = False,
+        ref_batch_size: int = 8,
         token: str | None = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         now: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
+        if ref_batch_size < 1:
+            raise ValueError("ref_batch_size must be positive")
         self.path = Path(path)
         self.repository = repository
         self.remote_url = remote_url
+        self._ref_batch_size = ref_batch_size
         self._token = token
         self._sleep = sleep
         self._now = now
@@ -213,43 +222,72 @@ class GitObjectStore:
                     ),
                 )
             pending = {sha for sha in selected if _reconstruction_outcome(verification.get(sha)) != "available"}
-            staging = set()
-            for source, targets in _source_groups(routes, pending):
-                active = tuple(sha for sha in targets if sha in pending)
-                if not active:
+            source_groups = _source_groups(routes, pending)
+            staging = {
+                source_staging_ref(_source_identity(source))
+                for source, _ in source_groups
+            }
+            for planned in _source_batches(
+                source_groups,
+                pending,
+                self._ref_batch_size,
+            ):
+                batch = tuple(
+                    (source, targets)
+                    for source, targets in planned
+                    if any(sha in pending for sha in targets)
+                )
+                if not batch:
                     continue
                 observed_from = self._time()
-                ref = source_staging_ref(_source_identity(source))
-                staging.add(ref)
-                error = await self._fetch_source(
-                    source,
-                    ref,
-                    refetch=any(verification.get(sha) is not None for sha in active),
+                errors = await self._fetch_sources(
+                    tuple(source for source, _ in batch),
+                    refetch=any(
+                        verification.get(sha) is not None
+                        for _, targets in batch
+                        for sha in targets
+                        if sha in pending
+                    ),
                     heartbeat=heartbeat,
                     retry=retry,
                 )
-                checked = await self._reconstruction(active, heartbeat)
-                observed_until = self._time()
-                for sha in active:
-                    state = checked.get(sha)
-                    outcome = _reconstruction_outcome(state)
-                    attempts[sha].append(
-                        _attempt(
-                            source.kind,
-                            source.repository,
-                            source.remote_ref,
-                            observed_from,
-                            observed_until,
-                            outcome,
-                            error or _verification_error(state),
-                            source.resource_number,
-                        ),
+                for source, targets in batch:
+                    active = tuple(sha for sha in targets if sha in pending)
+                    if not active:
+                        continue
+                    error = errors[source]
+                    candidates = active
+                    if error is None and len(batch) > 1:
+                        candidates = await self._reachable_commits(
+                            source_staging_ref(_source_identity(source)),
+                            active,
+                        )
+                    checked = (
+                        {}
+                        if error is not None
+                        else await self._reconstruction(candidates, heartbeat)
                     )
-                    if state is not None:
-                        obtained[sha] = source.kind
-                        verification[sha] = state
-                    if outcome == "available":
-                        pending.remove(sha)
+                    observed_until = self._time()
+                    for sha in active:
+                        state = checked.get(sha)
+                        outcome = _reconstruction_outcome(state)
+                        attempts[sha].append(
+                            _attempt(
+                                source.kind,
+                                source.repository,
+                                source.remote_ref,
+                                observed_from,
+                                observed_until,
+                                outcome,
+                                error or _verification_error(state),
+                                source.resource_number,
+                            ),
+                        )
+                        if state is not None:
+                            obtained[sha] = source.kind
+                            verification[sha] = state
+                        if outcome == "available":
+                            pending.remove(sha)
             before_upstream = set(pending)
             if before_upstream:
                 observed_from = self._time()
@@ -551,36 +589,96 @@ class GitObjectStore:
             if not lines[2 * index].endswith(" commit") or not lines[2 * index + 1].endswith(" tree")
         }
 
-    async def _fetch_source(
+    async def _fetch_sources(
         self,
-        source: CommitFetchSource,
-        staging_ref: str,
+        sources: tuple[CommitFetchSource, ...],
         *,
         refetch: bool,
         heartbeat: Callable[[], None] | None,
         retry: Callable[[float], None] | None,
-    ) -> str | None:
-        await self._delete_ref(staging_ref)
-        remote = "origin" if source.remote_url == self.remote_url else source.remote_url
+    ) -> dict[CommitFetchSource, str | None]:
+        if not sources or len({source.remote_url for source in sources}) != 1:
+            raise ValueError("Git source batches require one shared remote")
+        for source in sources:
+            await self._delete_ref(source_staging_ref(_source_identity(source)))
+        return await self._fetch_source_batch(
+            sources,
+            refetch=refetch,
+            heartbeat=heartbeat,
+            retry=retry,
+        )
+
+    async def _fetch_source_batch(
+        self,
+        sources: tuple[CommitFetchSource, ...],
+        *,
+        refetch: bool,
+        heartbeat: Callable[[], None] | None,
+        retry: Callable[[float], None] | None,
+    ) -> dict[CommitFetchSource, str | None]:
+        remote_url = sources[0].remote_url
+        remote = "origin" if remote_url == self.remote_url else remote_url
+
+        async def split() -> dict[CommitFetchSource, str | None]:
+            middle = len(sources) // 2
+            first = await self._fetch_source_batch(
+                sources[:middle],
+                refetch=refetch,
+                heartbeat=heartbeat,
+                retry=retry,
+            )
+            second = await self._fetch_source_batch(
+                sources[middle:],
+                refetch=refetch,
+                heartbeat=heartbeat,
+                retry=retry,
+            )
+            return first | second
+
         try:
             await self._git(
                 "fetch",
                 "--quiet",
+                "--atomic",
                 "--no-tags",
                 "--no-write-fetch-head",
                 *(("--refetch",) if refetch else ()),
                 remote,
-                f"+{source.remote_ref}:{staging_ref}",
+                *(
+                    f"+{source.remote_ref}:{source_staging_ref(_source_identity(source))}"
+                    for source in sources
+                ),
                 heartbeat=heartbeat,
                 retry=retry,
+                retry_transient=len(sources) == 1,
             )
+        except TransientGitStoreError:
+            if len(sources) == 1:
+                raise
+            return await split()
         except GitStoreError as exc:
             if not _is_known_source_absence(exc):
+                if len(sources) > 1:
+                    raise GitStoreError(
+                        f"Git source batch from {sources[0].repository} failed: {exc}",
+                    ) from exc
+                source = sources[0]
                 raise GitStoreError(
                     f"{source.kind} {source.repository} {source.remote_ref} failed: {exc}",
                 ) from exc
-            return str(exc)
-        return None
+            if len(sources) == 1:
+                return {sources[0]: str(exc)}
+            return await split()
+        return dict.fromkeys(sources)
+
+    async def _reachable_commits(
+        self,
+        ref: str,
+        shas: Sequence[str],
+    ) -> tuple[str, ...]:
+        """Keep batch-fetched targets attributable to one exact source ref."""
+        history = set((await self._git("rev-list", ref)).splitlines())
+        return tuple(sha for sha in shas if sha in history)
 
     async def _verify_commits(
         self,
@@ -948,7 +1046,7 @@ def default_git_url(repository: str) -> str:
 def _source_groups(
     routes: Mapping[str, Sequence[CommitFetchSource]],
     missing: set[str],
-) -> list[tuple[CommitFetchSource, tuple[str, ...]]]:
+) -> list[_SourceGroup]:
     grouped: dict[CommitFetchSource, set[str]] = {}
     for sha in missing:
         for source in routes[sha]:
@@ -966,6 +1064,36 @@ def _source_groups(
             ),
         )
     ]
+
+
+def _source_batches(
+    groups: Sequence[_SourceGroup],
+    pending: set[str],
+    limit: int,
+) -> tuple[_SourceBatch, ...]:
+    """Group transport-compatible refs without mixing one target's sources."""
+    batches: list[_SourceBatch] = []
+    current: list[_SourceGroup] = []
+    targets: set[str] = set()
+    remote_url: str | None = None
+    for source, selected in groups:
+        active = set(selected).intersection(pending)
+        if not active:
+            continue
+        if current and (
+            len(current) >= limit
+            or source.remote_url != remote_url
+            or not targets.isdisjoint(active)
+        ):
+            batches.append(tuple(current))
+            current = []
+            targets = set()
+        current.append((source, selected))
+        targets.update(active)
+        remote_url = source.remote_url
+    if current:
+        batches.append(tuple(current))
+    return tuple(batches)
 
 
 def _source_identity(source: CommitFetchSource) -> str:

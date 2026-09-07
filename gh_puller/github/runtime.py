@@ -200,6 +200,7 @@ class _RuntimeConfig(Protocol):
     graphql_url: str | None
     api_version: str
     request_timeout: float
+    git_batch_size: int
     git_url: str | None
     git_destination: Path | None
 
@@ -271,6 +272,7 @@ class GitHubRuntime:
             self.config.repository,
             self.config.git_url or default_git_url(self.config.repository),
             upstream_synced=upstream_synced,
+            ref_batch_size=self.config.git_batch_size,
             token=_token(self.config.token),
             sleep=self._sleep,
             now=self._now,
