@@ -73,6 +73,11 @@ def _archive(database: Path) -> monitor.ArchiveState:
             ("parent", 699, 1_200),
             ("pull-git", 1, 1),
         ),
+        task_rate=monitor.TaskRate(
+            501,
+            _EVENT_AT - timedelta(minutes=5),
+            _EVENT_AT,
+        ),
         parents_completed=699,
         parents_total=1_200,
         observations=8_500,
@@ -128,6 +133,7 @@ def test_detail_combines_durable_work_and_disposable_quota(tmp_path: Path) -> No
     assert "PARENTS     parents [###########---------] 699/1,200" in output
     assert "TASKS       tasks [###########---------] 700/1,202" in output
     assert "GIT TASKS   commits=0/1 pulls=1/1" in output
+    assert "RATE        recent 6,000 tasks/h over 5m00s; last 3s ago" in output
     assert "FACTS       current=7,900 observations=8,500" in output
     assert "LATEST      issue-comments issue:42" in output
     assert (
@@ -228,6 +234,7 @@ async def test_archive_progress_is_recovered_without_journal(tmp_path: Path) -> 
     assert state.discovery_complete
     assert (state.parents_completed, state.parents_total) == (1, 2)
     assert state.task_counts == (("parent", 1, 2),)
+    assert state.task_rate is None
     assert (state.observations, state.current_facts) == (1, 1)
     assert state.last_error == "GitHubAPIError: transient"
     assert state.latest is not None and state.latest[:2] == ("issue", "issue:1")

@@ -28,6 +28,7 @@ if TYPE_CHECKING:
 _UNIT = re.compile(r"gh-puller-([0-9a-f]{12}|[0-9a-f]{64})\.service\Z")
 _PROGRESS_TYPE = "github_sync_progress"
 _JOURNAL_LINES = 512
+_RECENT_TASK_SAMPLE = 2_048
 _WEEKDAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 _OVERVIEW_WIDTHS = (12, 4, 16, 14, 9, 11, 7)
 
@@ -83,6 +84,7 @@ class ArchiveState:
     tasks_completed: int
     tasks_total: int
     task_counts: tuple[tuple[str, int, int], ...]
+    task_rate: TaskRate | None
     parents_completed: int
     parents_total: int
     observations: int
@@ -108,6 +110,15 @@ class MaintenanceState:
     outcomes: tuple[tuple[str, int], ...]
     latest: tuple[str, str, datetime] | None
     last_error: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class TaskRate:
+    """Bounded durable sample of recent task completions."""
+
+    completions: int
+    observed_from: datetime
+    observed_until: datetime
 
 
 @dataclass(frozen=True, slots=True)
@@ -334,6 +345,7 @@ def _archive_state(path: Path) -> tuple[ArchiveState | None, str | None]:
                 tasks_completed=tasks[0],
                 tasks_total=tasks[1],
                 task_counts=task_counts,
+                task_rate=_recent_task_rate(connection, cycle_id),
                 parents_completed=parents[0],
                 parents_total=parents[1],
                 observations=int(connection.execute("SELECT COUNT(*) FROM fact_observations").fetchone()[0]),
@@ -380,6 +392,29 @@ def _task_counts(
         (cycle_id,),
     )
     return tuple((str(row[0]), int(row[1]), int(row[2])) for row in rows)
+
+
+def _recent_task_rate(
+    connection: sqlite3.Connection,
+    cycle_id: int | None,
+) -> TaskRate | None:
+    if cycle_id is None:
+        return None
+    rows = connection.execute(
+        """
+        SELECT completed_at FROM sync_tasks
+        WHERE cycle_id = ? AND completed_at IS NOT NULL
+        ORDER BY completed_at DESC LIMIT ?
+        """,
+        (cycle_id, _RECENT_TASK_SAMPLE),
+    ).fetchall()
+    if len(rows) < 2:
+        return None
+    observed_until = _required_time(rows[0][0], "recent task completion")
+    observed_from = _required_time(rows[-1][0], "recent task completion")
+    if observed_from >= observed_until:
+        return None
+    return TaskRate(len(rows), observed_from, observed_until)
 
 
 def _maintenance_state(connection: sqlite3.Connection) -> MaintenanceState | None:
@@ -500,6 +535,7 @@ def _render_detail(
         ("PARENTS", _parents(archive, 20)),
         ("TASKS", _tasks(archive, 20)),
         ("GIT TASKS", _git_tasks(archive)),
+        ("RATE", _task_rate(archive, observed_at)),
         ("FACTS", _facts(archive)),
         ("LATEST", _latest(archive, zone)),
         ("QUOTA", _quota(progress, zone)),
@@ -666,6 +702,16 @@ def _git_tasks(archive: ArchiveState | None) -> str:
         f"commits={commits[0]:,}/{commits[1]:,} "
         f"pulls={pulls[0]:,}/{pulls[1]:,}"
     )
+
+
+def _task_rate(archive: ArchiveState | None, now: datetime) -> str:
+    if archive is None or archive.task_rate is None:
+        return "-"
+    sample = archive.task_rate
+    seconds = (sample.observed_until - sample.observed_from).total_seconds()
+    per_hour = (sample.completions - 1) * 3_600 / seconds
+    age = _age(sample.observed_until, now)
+    return f"recent {per_hour:,.0f} tasks/h over {_duration(seconds)}; last {age} ago"
 
 
 def _facts(archive: ArchiveState | None) -> str:
