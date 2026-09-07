@@ -23,6 +23,14 @@ from ..events import (
 _CUMULATIVE_TEXT = True
 
 
+@contextlib.contextmanager
+def _opencode_temp_dir():
+    root = Path(tempfile.gettempdir()) / "gh-puller" / "opencode"
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="call-", dir=root) as path:
+        yield path
+
+
 class OpenCodeConfig(TypedDict, total=False):
     """Configuration mapped to OpenCode CLI and injected JSON settings."""
 
@@ -373,7 +381,7 @@ class OpenCode(BaseAgent):
         event_recorder.append_context(text_message("user", prompt))
         event_recorder.begin_step()
         st = _OpencodeSynth(event_recorder.model_request())
-        with tempfile.TemporaryDirectory(prefix="gh-puller-opencode-") as tmp:
+        with _opencode_temp_dir() as tmp:
             instruction_path = None
             if system_prompt := config.get("system_prompt"):
                 path = Path(tmp) / "instructions.md"
@@ -404,7 +412,7 @@ class OpenCode(BaseAgent):
         event_recorder.append_context(text_message("user", prompt))
         event_recorder.begin_step()
         st = _OpencodeSynth(event_recorder.model_request())
-        with tempfile.TemporaryDirectory(prefix="gh-puller-opencode-") as tmp:
+        with _opencode_temp_dir() as tmp:
             instruction_path = None
             if system_prompt := config.get("system_prompt"):
                 path = Path(tmp) / "instructions.md"
