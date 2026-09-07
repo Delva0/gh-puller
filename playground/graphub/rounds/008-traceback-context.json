@@ -1,0 +1,198 @@
+{
+  "id": "R008",
+  "kind": "traceback-context-and-symbol-scope",
+  "hypothesis": "The first complete traceback segment can isolate actionable diagnostic text from later wrappers; CBM symbol-range histories may improve ranking relative to file histories when both use the same observed stack frames.",
+  "decision": "accept-reproducible-controls-and-source-adapter; reject-default-retrieval-promotion",
+  "scope": {
+    "repository": "vllm-project/vllm",
+    "github": "/home/delva/projects/gh-puller/archives/vllm-v10.sqlite3",
+    "archive": "/home/delva/projects/gh-puller/build/vllm-topo-10000/archive.kga",
+    "cutoff": 1399844,
+    "graph_count": 12050,
+    "selected_digest": "88e26a1d35379d0d869bc016cab05380819d6e06cdcaf3156ab7f498b48d45b8",
+    "graph_identity_digest": "001ccef07c5941dee9c969152a07cebb972679318adb703b7f0cc4a30c37ed59",
+    "cbm_sha256": "9af6ba26b2e594e802f98e86f284f65f976e6afb90cd863ad017ecc499777aed"
+  },
+  "sampling": {
+    "procedure": "R000 and R007 previously observed cases are development evidence. The four R007 reserved cases remain untouched until a primary policy is frozen. No source thread or exclusion changes are required for the R007 text corpus.",
+    "development": [10772, 21846, 11858, 12054, 14351, 14034, 15640, 17313, 9832, 6910, 19909, 16655, 6885, 7216, 16715, 19432, 19733, 9967, 20609, 12687],
+    "held_out": [18503, 11312, 10389, 15483],
+    "known_regression": [29049]
+  },
+  "pre_registered_controls": {
+    "text_all": "R007 primary-message lexical RRF on the complete input.",
+    "text_first": "The same lexical query functions and RRF on the first segment containing at least one parsed frame and a Python exception diagnostic. Preserve the leading log preamble in segment zero, including native compiler errors. If no segment is complete, retain the whole input and mark the fallback.",
+    "baseline": "R007 round-robin of text_all, terminal raw-file history and source-and-kind-filtered entity-file history.",
+    "first_raw": "Round-robin of text_first, raw-file histories from the selected first complete segment, and the same typed entity-file lane.",
+    "first_symbol": "Same as first_raw, replacing only the code lane with native CBM same-qualified-name upper-symbol range histories for the selected frames.",
+    "all_raw": "Same as first_raw, using raw-file histories from every observed stack frame.",
+    "all_symbol": "Same as all_raw, replacing only the code lane with native CBM same-qualified-name upper-symbol range histories.",
+    "first_upper_file": "Matched coverage control for first_symbol: identical lower/upper symbol pairs, but whole-file history at each upper counterpart path rather than line-range history.",
+    "all_upper_file": "Matched coverage control for all_symbol, retaining exactly the same lower/upper symbol pairs and upper paths.",
+    "candidate_budgets": [10, 20, 30],
+    "primary_budget": 20,
+    "lane_candidate_limit": 100,
+    "version_interval": "Reported commit exclusively through the frozen upper commit inclusively; native Git owns traversal.",
+    "query_inputs": "Only verbatim log regions, their parsed frames, native CBM responses and frozen source identities. No issue title, closing reference or known changed file enters query construction."
+  },
+  "primary_policy_selection": {
+    "eligible": ["first_raw", "all_raw", "first_symbol", "all_symbol"],
+    "rule": "Choose the largest number of development merged-reference case hits at budget 20; break ties in eligible-list order, preferring raw-file controls and narrower segment selection. Freeze the winner before reserved-case inspection. The matched upper-file methods are ablation controls, not selection candidates.",
+    "promotion": "Selection is not promotion. Independently review the winning evidence and evaluate the frozen winner on the reserved cases without retuning."
+  },
+  "frozen_primary_policy": {
+    "name": "first_raw",
+    "frozen_at_utc": "2026-09-06 21:26:47 UTC",
+    "reserved_inputs_inspected": false,
+    "development_merged_case_denominator": 18,
+    "development_budget_20_hits": {"text_all": 2, "text_first": 3, "baseline": 4, "first_raw": 8, "first_symbol": 7, "all_raw": 8, "all_symbol": 7, "first_upper_file": 8, "all_upper_file": 8},
+    "known_case_regressions": [21846, 17313],
+    "code_sha256": {
+      "episode_search.py": "b7e60a14f1c19372f56b431617d4317184ba3adc2225c01506f29bad859f8195",
+      "future_search.py": "48c4c63713d873471ab2485ded741f7756d6b0198a508942c0c21a0866c1f84a"
+    },
+    "note": "The whole-file control wins the registered primary metric. Symbol ranges improve some individual ranks but lose a constructor-related change outside the observed method body. No default promotion or graph-only gain is claimed."
+  },
+  "acceptance": [
+    "Verify source slices, frame membership, input identities and identical text corpus exclusions.",
+    "Compare symbol and raw-file histories with exactly matched frame selection and candidate budgets.",
+    "Keep missing upper symbols, unresolved reported coordinates, graph coverage and correspondence uncertainty visible.",
+    "Separate candidate relevance from exact landing-pointer validity and demonstrate any claimed gain with specific changed-code evidence.",
+    "Select and freeze one primary policy using development evidence before inspecting reserved-case inputs or results; report all controls without tuning on validation ranks.",
+    "Run regression, native evidence, deterministic replay and cost gates before a local research commit. Failed promotion remains a reportable research outcome."
+  ],
+  "input_support": {
+    "first_reserved_probe_exit": 1,
+    "failure": "PR 34528 closing-link observation 213905 has a complete imported payload without an envelope repository field. The repository is bound by archive_meta, not that optional field.",
+    "amendment": "Validate relation ownership against archive_meta.repository and reject a conflicting envelope repository when supplied. Check the registered archive owner before probing. Query construction and the frozen ranking code were unchanged; no validation case was replaced.",
+    "new_ownership_regression_tests": 5,
+    "previous_20_case_references_exactly_equal": true,
+    "reserved_case_probe_exact_replay_equal": true
+  },
+  "gates": {
+    "frozen_source_selection_equal": true,
+    "frozen_policy_hashes_equal": true,
+    "source_cases_verified": 24,
+    "parsed_frames_verified": 570,
+    "frame_statuses": {"resolved": 353, "unresolved": 26, "external": 191},
+    "segments_verified": 50,
+    "selected_frame_memberships_verified": 295,
+    "matched_symbol_and_upper_file_scope_pairs": 216,
+    "all_frame_raw_and_symbol_ranking_parity_with_native_history_controls": true,
+    "candidate_budgets_deduplication_and_source_thread_exclusions_verified": true,
+    "ranked_evidence_items_verified": 18802,
+    "first_parent_git": {"commits": 1976, "commit_file_pairs": 3087},
+    "episode_text_source_documents_verified": {"known_development": 1506, "known_validation": 936, "fresh_development": 1634, "reserved_validation": 777},
+    "episode_landing_pointers_verified": {"known_development": 1585, "known_validation": 1507, "fresh_development": 1851, "reserved_validation": 908},
+    "reserved_native_relationship_rows": 164,
+    "reserved_native_name_or_relationship_truncations": 0,
+    "reserved_projection_dangling_edges_by_case": {"18503": 19, "11312": 17, "10389": 8, "15483": 19},
+    "reserved_queried_seed_or_returned_endpoint_dangling_overlap": 0,
+    "reserved_retained_projection_round_trip": true,
+    "reserved_upper_symbols": {"requested_distinct": 31, "resolved_distinct": 14},
+    "logical_replays_equal": 9,
+    "replay_normalization": "Remove only seconds and query_seconds recursively. Three development episode outputs and all six reserved pipeline outputs are equal. The case probe is also exactly equal without normalization.",
+    "experiment_tests_passed": 132,
+    "codebase_and_github_tests_passed": 224,
+    "ruff": "passed: repository and explicit playground/graphub",
+    "default_promotion": false,
+    "research_acceptance": "Source integrity, native evidence, controlled ablations and deterministic replay pass. Validation does not establish a retrieval improvement; accepting the research record does not promote its policy."
+  },
+  "results": {
+    "budget_order": [10, 20, 30],
+    "development_merged_case_denominator": 18,
+    "development_case_hits": {
+      "text_all": [2, 2, 2], "text_first": [3, 3, 3], "baseline": [1, 4, 5],
+      "first_raw": [4, 8, 9], "all_raw": [4, 8, 9],
+      "first_symbol": [5, 7, 8], "all_symbol": [5, 7, 8],
+      "first_upper_file": [5, 8, 9], "all_upper_file": [5, 8, 9]
+    },
+    "reserved_validation": {
+      "cases": 4,
+      "merged_case_denominator": 3,
+      "merged_case_hits_for_every_registered_method": [0, 0, 0],
+      "merged_references_inside_the_search_interval": 1,
+      "all_reference_case_hits": {"text_all": [0, 1, 1], "text_first": [1, 1, 1], "baseline": [0, 0, 0], "first_raw": [1, 1, 1]},
+      "unmerged_proposal": {"issue": 11312, "pull": 11380, "text_all_rank": 17, "text_first_rank": 3, "frozen_first_raw_rank": 5},
+      "interpretation": "The frozen winner fails the merged-reference validation metric. A useful unmerged proposal improves lexically; it is not an observed landed fix. Keep all original cases and the three-case denominator instead of removing boundary failures after retrieval."
+    },
+    "counterfactuals": [
+      {"issue": 21846, "pull": 21922, "baseline_rank": 2, "first_raw_rank_within_30": null, "finding": "Whole-stack file breadth dilutes a useful terminal-file result."},
+      {"issue": 17313, "pull": 17623, "baseline_rank": 18, "first_raw_rank_within_30": null, "finding": "The same broader file lane causes a second known-case regression."},
+      {"issue": 6910, "pull": 6930, "first_raw_rank": 6, "first_upper_file_rank": 2, "first_symbol_rank_within_30": null, "finding": "The fix changes a constructor's projector setup outside the observed forward method. Narrow ranges lose class context."},
+      {"issue": 19909, "pull": 19929, "first_raw_rank": 14, "first_upper_file_rank": 14, "first_symbol_rank": 2, "finding": "Native symbol-range history improves ordering relative to the exact matched whole-file scope."},
+      {"issue": 7216, "pull": 7219, "first_raw_rank": 10, "first_upper_file_rank": 2, "first_symbol_rank": 2, "finding": "The gain comes from counterpart coverage filtering, not line-range precision."},
+      {"issue": 19432, "pull": 19549, "first_raw_rank": 11, "first_upper_file_rank": 8, "first_symbol_rank": 2, "finding": "The _update_states change demonstrates range precision beyond matched file filtering."},
+      {"issue": 19733, "pull": 20058, "text_all_full_ranking_rank": 67, "text_first_rank": 3, "first_raw_rank": 5, "finding": "The main benefit is selected diagnostic text; duplicate lexical-arm votes remain a confound."}
+    ],
+    "additional_binding_validation": "The native node-kind control rejects API prose bound to a Readme Section in issues 10389 and 15483. This confirms an evidence-type correction, not a new runtime identity or retrieval hit."
+  },
+  "reserved_reference_audit": [
+    {
+      "issue": 18503, "pull": 18504, "category": "before_or_in_reported",
+      "reported_ref": "v0.9.0", "reported_commit": "58738772410c5e0d60b61db39538a9b313d2d7ad",
+      "reported_commit_time": "2025-05-27T09:05:37-07:00",
+      "issue_created_at": "2025-05-21T20:10:09Z",
+      "landing": "51797775c3ffc1277be750eb046c8030f8eca280", "merged_at": "2025-05-22T04:17:03Z",
+      "finding": "The native Olmo2Model.load_weights patch tracks loaded parameters. It is already an ancestor of the reported release tag, whose commit postdates both issue and fix. The version string does not establish the deployed Git revision."
+    },
+    {
+      "issue": 11312, "pull": 11380, "category": "unmerged_proposal",
+      "head": "66e4127e197ce1bd065cf6fef61756544182ca99",
+      "finding": "The proposed sampling-parameter clone and XGrammar processor deepcopy address shared matcher state. A populated merge_commit_sha field on an unmerged PR is not a landing."
+    },
+    {
+      "issue": 10389, "pull": 12848, "category": "inside_interval",
+      "landing": "ef533d25fba4b5ef8b4da9369de718c0773b9bce",
+      "finding": "The native patch only changes CMakeLists.txt's vllm-flash-attn Git pin from d4e09037abf588af1ec47d0e966b237ee376876c to 720c94869cf2e0ff5a706e9c7f1dce0939686ade. The PR links external flash-attention PR 42; that external implementation has not been verified. The input itself warns that asynchronous CUDA errors can misidentify the stack origin."
+    },
+    {
+      "issue": 15483, "pull": 34528, "category": "after_upper",
+      "landing": "dbf0da817adf06edf9906d666de7be788dfb66d6", "merged_at": "2026-02-25T03:33:34Z",
+      "finding": "The engine pause/sleep cleanup changes ten files. The Git objects and GitHub facts are present, but the commit is later than the frozen graph endpoint. Unmerged middleware proposal 16536 is another explicit reference, not a landed repair."
+    }
+  ],
+  "replay": {
+    "run_directory": "playground/graphub/runs",
+    "episode_development_prefixes": ["r008-known-development", "r008-known-validation", "r008-fresh-development"],
+    "development_repeat_suffix": "-verified.json",
+    "reserved_prefix": "r008-heldout",
+    "reserved_pipeline_suffixes": ["probe", "entity", "lexical", "future", "bindings", "episodes"],
+    "reserved_repeat_suffix": "-replay.json",
+    "text_index_sha256": "37bd6a44332d6070ee5dcca2567083893d124ab38f44f3a788a3ef554f0f1ee4",
+    "landing_index_sha256": "ee3fcfd6b7ac61438b71556df8b8ea8f048f8e70581a7c9033899b04cbd75c32",
+    "command_template": "uv --directory /home/delva/projects/gh-puller-graphub-research run --project /home/delva/projects/gh-puller --offline --no-sync python -B -m playground.graphub.episode_search --cases <probe.json> --lexical <lexical.json> --temporal <future.json> --bindings <bindings.json> --index playground/graphub/runs/text-1399844-r007.sqlite3 --landing-index playground/graphub/runs/landings-1399844.sqlite3 --round playground/graphub/rounds/008-traceback-context.json --out <output.json>"
+  },
+  "cost": {
+    "reserved_probe_wall_seconds": [59.97, 61.06],
+    "reserved_entity_original_wall_seconds": 90.91,
+    "reserved_temporal_wall_seconds": [39.66, 39.68],
+    "reserved_episode_wall_seconds": [29.08, 28.50],
+    "reserved_episode_max_rss_kib": [164200, 163792],
+    "largest_measured_stage_max_rss_kib": 846664,
+    "native_first_parent_audit_wall_seconds": 33.64,
+    "archived_snapshots_live_at_once": 1,
+    "note": "Episode ablations reuse captured CBM counterpart queries and Git range histories, but execute and verify their own text queries, matched file histories and landing lookups. These stage costs are not an end-to-end latency claim. No graph archive copy or reindex was performed."
+  },
+  "limitations": [
+    "First complete segment is a structural heuristic, not proof of exception causality or process identity.",
+    "Same-qualified-name endpoints are candidate correspondences, not established symbol lineage.",
+    "The fixed lexical control counts first-error and last-error arms separately even when their query expressions coincide. Segment selection can change these duplicate votes; this round does not attribute all lexical gains solely to causal isolation.",
+    "A changed file already present in the raw stack is not new graph-topology coverage.",
+    "Small availability-biased single-repository sample and closing-reference labels do not establish general retrieval accuracy or demonstrated fixes.",
+    "The three merged validation references include one prior-to-tag fix and one post-graph-endpoint fix. Snapshot coverage is not a valid universal bound on searchable Git/GitHub evidence.",
+    "Native node and edge preservation, absence of query truncation, and no observed dangling-endpoint overlap do not establish semantic graph correctness. R003 broad incident/import seed construction remains an unpromoted control."
+  ],
+  "next": {
+    "id": "R009",
+    "hypothesis": "Separating code snapshot selection from factual change search can recover relevant historical fixes and unmerged proposals without requiring code graphs for every changed commit.",
+    "first_action": "Inspect frozen Git-ref, pull-git and pull-file/comparison assets before choosing a rebuildable change index or new traversal policy.",
+    "controls": [
+      "Retain reported versions as evidence with explicit uncertainty; never invent a runtime commit from a release string.",
+      "Use a frozen observed Git endpoint for any extended history; do not silently follow the live repository tip.",
+      "Keep proposed comparisons and verified mainline landings distinct, with exact source identities and base/head semantics.",
+      "Treat all 24 evaluated cases as development evidence. Freeze the next retrieval policy before selecting or inspecting fresh validation inputs.",
+      "Investigate build-dependency and class-context gaps independently; do not claim external dependency implementation from a local pin change alone."
+    ]
+  }
+}

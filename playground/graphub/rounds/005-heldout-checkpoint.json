@@ -1,0 +1,152 @@
+{
+  "id": "R005",
+  "kind": "equal-budget-held-out-checkpoint",
+  "baseline_commit": "88d06ed",
+  "registration": "rounds/004-import-coverage.json: next",
+  "scope": "rounds/000-data-boundary.json",
+  "decision": {
+    "frozen_hybrid_as_default": "rejected",
+    "contextual_entity_binding_quality_gate": "failed",
+    "compact_cbm_coordinate_compatibility_fix": "accepted",
+    "commit_purpose": "Correctness fix, reusable independent diff gate, and a reproducible negative retrieval checkpoint; no retrieval-default promotion"
+  },
+  "protocol": {
+    "development_cases": [10772, 21846, 11858, 12054, 14351, 14034, 15640, 17313],
+    "held_out_cases": [9832, 6910, 19909, 16655],
+    "lane_order": ["primary lexical RRF", "terminal raw-traceback file history", "diagnostic exact-name candidate file history"],
+    "combination": "Registered round-robin with exact thread deduplication and at most 100 candidates per lane",
+    "primary_candidate_budget": 20,
+    "secondary_candidate_budgets": [10, 30],
+    "ranking_parameters_changed_after_held_out_retrieval": false,
+    "oracle_control": "Best individual lexical arm is diagnostic only, not an implementable ranking policy",
+    "blindness_limit": "Initial source catalog and some inputs were inspected. A legal native-response parsing failure was corrected after held-out evaluation began; no case was removed and no relevance parameter was tuned."
+  },
+  "results": {
+    "metric": "Cases with an explicitly linked, merged reference PR in the unique-thread candidate budget; not exhaustive recall or demonstrated fix success",
+    "development_cases_with_merged_references": 7,
+    "development_hits": {
+      "10": {"text": 2, "hybrid": 1},
+      "20": {"text": 2, "hybrid": 4},
+      "30": {"text": 2, "hybrid": 5}
+    },
+    "held_out_cases_with_merged_references": 4,
+    "held_out_hits": {
+      "10": {"text": 0, "hybrid": 0},
+      "20": {"text": 0, "hybrid": 1},
+      "30": {"text": 0, "hybrid": 1}
+    },
+    "primary_budget_case_ranks": {
+      "9832": {"reference": 10169, "text": null, "hybrid": null},
+      "6910": {"reference": 6930, "text": null, "hybrid": null},
+      "19909": {"reference": 19929, "text": null, "hybrid": null},
+      "16655": {"reference": 16618, "text": null, "hybrid": 15}
+    },
+    "held_out_text_oracle": {"case": 19909, "reference": 19929, "frame_names_rank": 18, "rrf_rank": 35}
+  },
+  "evidence_review": {
+    "all_four_reference_landings": "Merged after the reported version, descendants of that version, and ancestors of the frozen upper commit; exact closing and landing sources were verified",
+    "9832": {
+      "reference_landing": "f83feccd7f661d0a582f9c0cb0bc9f802f4d995e",
+      "inspection": "PR 10169 suppresses GPTQ quantization for Qwen2-VL vision modules. The selected first log includes a Windows temporary-file PermissionError and registry failure. The issue title concerns unexpected GPTQ weights, but the closing link does not establish a fix for the extracted error episode.",
+      "entity_file_rank": 22,
+      "label_policy": "Retained in the registered denominator, with direct applicability explicitly uncertain"
+    },
+    "6910": {
+      "reference_landing": "c66c7f86aca956014d9ec6cc7a3e6001037e4655",
+      "inspection": "PR 6930 replaces the PaliGemma projector's sharded ColumnParallelLinear with nn.Linear. This is source-consistent with the reported tensor-width mismatch, without an executed runtime reproduction.",
+      "diagnostic_controls": {"terminal_trace_file": null, "stack_trace_file": 3, "symbol_incident": 1},
+      "native_edge": "PaliGemmaForConditionalGeneration.forward CALLS merge_vision_embeddings at paligemma.py:259; CBM reports confidence 0.97 and strategy lsp_callable_alias",
+      "topology_limit": "The caller file is already present in the traceback. This does not prove incremental coverage beyond raw stack coordinates."
+    },
+    "19909": {
+      "reference_landing": "4671ac6e2ae9975ac305f767fc21e47d6ffde448",
+      "inspection": "The benchmark invokes an outdated Marlin argument layout; PR 19929 updates the benchmark caller, including the missing argument positions and scalar-type handling. The terminal failure is in _custom_ops.py, which the PR does not modify.",
+      "diagnostic_controls": {"terminal_trace_file": null, "stack_trace_file": 7, "stack_upper_symbol": 1},
+      "symbol_limit": "The upper-symbol control uses the upper snapshot's interval and same qualified name, not a proven continuous lineage"
+    },
+    "16655": {
+      "reference_landing": "5b1aca2ae39b4bcdd04d916ec55bfc87f98d4835",
+      "inspection": "PR 16618 corrects GLM4 residual/layer-normalization handling and tuple unpacking, consistent with Tensor-versus-tuple failure in the log. Its unrelated model-name documentation edit also happens to retrieve the PR.",
+      "retrieved_anchor": "graphub-probe.docs.source.models.supported_models.vLLM",
+      "query_term_origin": "The vLLM token occurs inside an environment directory in the serialized traceback",
+      "entity_file_rank": 5,
+      "hybrid_rank": 15,
+      "diagnostic_controls": {"terminal_trace_file": null, "stack_trace_file": 2, "stack_upper_symbol": 2},
+      "binding_judgment": "A real documentation edit and exact source pointer do not validate the environment-path-to-document-title association; the sole hybrid gain is not accepted as a sound entity link"
+    }
+  },
+  "compatibility_fix": {
+    "failure": "The first held-out entity query returned Folder rows with empty line strings, causing the compact-row decoder to raise ValueError before any ranking",
+    "native_source": "70197504068a380a94323dd12acb2b5be52e83e5: src/mcp/mcp.c, sg_lines_str",
+    "native_contract": "Nodes without positive line information emit an empty display",
+    "fix": "Decode empty coordinates as zero; preserve the node and retain existing Git-file membership checks, so folders do not become file histories",
+    "unchanged_recorded_development_queries": 45,
+    "complete_development_entity_replay_equal": true,
+    "development_entity_logical_digest": "2cb42a0996c36d0668e3d7ef7e1a4781ad41329ca23123a61484501856c895dc"
+  },
+  "gates": {
+    "case_input_replay_equal": true,
+    "lexical_temporal_entity_and_checkpoint_replays_equal": true,
+    "digest_encoding": "sha256(json.dumps(logical_result, sort_keys=True).encode()); remove run seconds, case seconds, case query_seconds, and generated seconds when present",
+    "logical_digests": {
+      "inputs": "104352694150762d9bdb8f2c0da73f90dfaa7fc7743be32e862eb8a7ff7a5db1",
+      "lexical": "2822e0b396a81ed85bd07954ba452de802d5b5f4f3f4f3f4b76ebb12c3521e4cbd4e",
+      "temporal": "1073dcc2731e7421cc87b7faa0d828e82480afb7da7c0e27b3039008ffd5f316",
+      "entity": "f01b5ee1a99ea5c5e9944f9d8e045d70de75c9d08e1469272ec2b02dd970fc40",
+      "checkpoint": "4a16b40891faf7baa7011d2b8043de458e6ccf62f2ddb46b1e1d261a913180d3"
+    },
+    "experiment_tests_passed": 67,
+    "ruff": "passed: repository and explicit playground/graphub",
+    "source_text_documents_verified": 954,
+    "landing_pointers_verified_per_run": {"temporal": 1507, "entity": 2384},
+    "candidate_evidence_items_checked": 4977,
+    "independent_first_parent_diff": {"commits": 955, "commit_file_pairs": 1534, "seconds": 10.2717},
+    "native_query_predicate_rows_verified": 562,
+    "truncated_relationship_queries": 0,
+    "known_omitted_edges_touching_seed_or_returned_endpoints": 0,
+    "excluded_source_threads": 13,
+    "frame_statuses": {"resolved": 35, "unresolved": 2, "no_repository_path": 14},
+    "production_changes": false
+  },
+  "cost": {
+    "wall_seconds": {"input_probe": [59.14, 58.51], "lexical": [32.66, 23.32], "temporal": [64.48, 69.36], "entity": [151.47, 145.37]},
+    "reported_internal_seconds": {"temporal": [56.7186, 61.4970], "entity": [136.4068, 130.2077]},
+    "maximum_temporary_archived_snapshot_bytes": 106418176,
+    "maximum_rss_kib_reported_by_time": 1085856,
+    "simultaneous_archived_snapshot_projections": 1,
+    "interpretation": "These component runs include projection, verification and unchanged diagnostic arms, including rejected broad arms. They are not optimized warm query latency or a single measured end-to-end pipeline. Source pulls and other machine work continue concurrently."
+  },
+  "limitations": [
+    "Only four availability-biased held-out cases from one repository; no cross-repository effectiveness or statistical significance claim.",
+    "Closing links and issue-level titles need error-episode relevance auditing. Removing a mismatched case after seeing results would change the registered test.",
+    "Recorded static-edge predicates and exact Git/source checks do not prove semantic indexing completeness, runtime identity or causality.",
+    "The broad stack and upper-symbol results are exploratory diagnostics here, not a post-hoc replacement for the frozen policy.",
+    "No real agent, GPU execution, native C modification, source write, push or merge."
+  ],
+  "artifacts": {
+    "inputs": "runs/heldout-probe.json",
+    "lexical": "runs/heldout-lexical.json",
+    "temporal": "runs/heldout-future.json",
+    "entity": "runs/heldout-entity.json",
+    "checkpoint": "runs/heldout-checkpoint.json",
+    "evidence_gates": "runs/heldout-evidence-gates.json",
+    "replay_gates": "runs/heldout-replay-gates.json",
+    "native_failure": "runs/heldout-entity-failure.json",
+    "development_compatibility_replay": "runs/development-entity-lines-replay.json",
+    "landing_cost": "runs/landing-cost-diagnosis.json"
+  },
+  "next": {
+    "id": "R006",
+    "hypothesis": "A small downstream landing index can eliminate repeated full GitHub payload scans without changing candidate sets, ranking or provenance",
+    "measured_motivation": "Five requested commits cause 58,035 payload decodes. Frozen selection takes about 9 seconds and the profiled landing lookup about 19 seconds; complete pull and pull-git payloads total about 158 MB compressed.",
+    "implementation_boundary": "Rebuild only from the frozen offline GitHub facts into a new disposable downstream SQLite index. Preserve pull-git preference, exact SHA-to-PR links, source observation IDs, digests and JSON pointers. No source writes or production query API redesign.",
+    "gates": [
+      "Equality with the scanning implementation over all observed landing targets and recorded development query sets, including absent targets",
+      "Synthetic latest-incomplete, publication-cutoff, ordering-tie, unmerged, duplicate-source, corruption and source-boundary tests",
+      "Exact per-hit canonical-source verification with no older-complete fallback",
+      "Replay-equal candidates and source pointers; no ranking or held-out relevance tuning",
+      "Separate one-time construction from repeated lookup costs; report index size and peak resource usage"
+    ],
+    "later_relevance_work": "Use fresh development experiments for span- and node-kind-aware entity candidates and contextual stack evidence. Do not silently reuse this held-out checkpoint as an untouched test after learning from it."
+  }
+}

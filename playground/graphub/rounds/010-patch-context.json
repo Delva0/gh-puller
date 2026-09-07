@@ -1,0 +1,187 @@
+{
+  "id": "R010",
+  "kind": "source-context-and-native-patch-hunks",
+  "hypothesis": "Literal source context at a CBM-resolved traceback frame adds diagnostic constraints absent from the log and improves ordering of the same candidate PRs by native patch-hunk evidence.",
+  "decision": "accept-native-patch-evidence-and-negative-controls; reject-bag-of-words-policy-promotion",
+  "scope": {
+    "repository": "vllm-project/vllm",
+    "github": "/home/delva/projects/gh-puller/archives/vllm-v10.sqlite3",
+    "archive": "/home/delva/projects/gh-puller/build/vllm-topo-10000/archive.kga",
+    "cutoff": 1399844,
+    "graph_count": 12050,
+    "selected_digest": "88e26a1d35379d0d869bc016cab05380819d6e06cdcaf3156ab7f498b48d45b8",
+    "graph_identity_digest": "001ccef07c5941dee9c969152a07cebb972679318adb703b7f0cc4a30c37ed59",
+    "cbm_sha256": "9af6ba26b2e594e802f98e86f284f65f976e6afb90cd863ad017ecc499777aed"
+  },
+  "sampling": {
+    "development": [10772, 21846, 11858, 12054, 14351, 14034, 15640, 17313, 9832, 6910, 19909, 16655, 6885, 7216, 16715, 19432, 19733, 9967, 20609, 12687, 18503, 11312, 10389, 15483],
+    "held_out": [],
+    "known_regression": [29049],
+    "note": "All cases are known development evidence. Do not inspect fresh cases or promote a default in this round."
+  },
+  "pre_registered_controls": {
+    "pool": "Round-robin, distinct-thread budget 100: R008 first-segment text, R009 first_raw_landing_bm25, typed_entities_landing_bm25, first_raw_proposal_bm25, typed_entities_proposal_bm25. Reuse the sealed R009 index and identical source-thread exclusions. No references enter pool construction.",
+    "source": "Use the last natively resolved frame in the R008 first complete segment. Read the exact reported-commit blob, taking five lines before and after the reported line, clamped to the native CBM symbol. This is a literal context window, not a causal slice or runtime-commit proof.",
+    "log_terms": "ASCII identifiers of at least three characters, lowercased, from the selected segment's primary diagnostic messages. No issue title or PR metadata supplies terms.",
+    "source_terms": "The identical tokenizer on the exact source window; combine with log terms by set union. No language parser, inferred symbol or handwritten dependency traversal is introduced.",
+    "patches": "Read every complete proposal/landing comparison for each pool PR. Git owns hunk construction with three context lines, Myers diff, no indent heuristic, no rename detection, no external diff or text conversion. Headers and function-heading hints do not supply tokens.",
+    "arms": ["pool_order", "log_delta", "log_context", "source_delta", "source_context"],
+    "ranking": "Candidate-local BM25, k1=1.2 and b=0.75, with a hunk as the document. Delta includes added/deleted lines; context additionally includes unchanged hunk lines. A PR receives its maximum hunk score, retaining the winning comparison identity and line evidence. Break score ties by original pool order. Candidates without readable token-bearing hunks keep their original pool slots; missing evidence is not a negative score.",
+    "budgets": [10, 20, 30],
+    "primary_budget": 20,
+    "limits": {"candidate_prs": 100, "changed_files_per_comparison": 200, "blob_bytes": 4194304, "native_workers": 4},
+    "cost_limits": "Limits apply before patch content reads. Oversized or unavailable comparisons remain explicit and do not become empty changes. Binary files and gitlinks are not interpreted as source hunks."
+  },
+  "acceptance": [
+    "Revalidate source log slices and captured native frame decoding; source windows retain exact commit, blob, path and line identities.",
+    "Compare every textual hunk line against its before/after Git blob, including context and missing final newlines. Validate raw file identities against the sealed change index.",
+    "Test arbitrary byte paths, additions/deletions, multiple hunks, mode/type changes, binary files, gitlinks, missing blobs, limits and malformed hunk framing.",
+    "Keep candidate pools, exclusions and budgets identical across arms. Verify that reference labels cannot affect source terms, candidate construction or ranking.",
+    "Report closing-reference ranks separately from static symptom/patch applicability. R009's issue 9832 remains an applicability caution regardless of rank.",
+    "Run deterministic native replay, source gates, research tests, production regression, lint and measured cost gates before committing. A negative ranking result is acceptable research, not a default promotion."
+  ],
+  "implementation": {
+    "native_protocol": "Read exact raw file/blob metadata before content. Per-file literal pathspecs avoid interpreting quoted patch headers. Preserve added, deleted and unchanged lines with side coordinates, including missing final newlines and type-change sections.",
+    "independent_line_gate": "Check each emitted line against its exact Git blob coordinate. After removing all declared deleted/added positions, the remaining old/new byte-line sequences must be equal; duplicate changed positions are rejected. Matching a few returned lines cannot hide omitted changes.",
+    "fixture_findings": [
+      "Git context-format options imply patch output even with --raw; keep them out of the size-preflight command so it cannot read blobs prematurely.",
+      "A regular-file to symlink change can produce two patch sections for one raw file record. Literal per-file reads preserve the correct identity without parsing display-quoted paths.",
+      "Pin full blob IDs in patch headers so a growing object store cannot change abbreviated identities, and pin the native Git locale for machine-readable diagnostics."
+    ],
+    "metadata_correction": "The first fresh-development and known-validation pilots omitted the file count from file-limit summaries. Preserve that count and repeat both groups with -verified outputs before independent replay. Query terms, candidate pools, scoring and reference ranks were unchanged.",
+    "graph_use": "Re-decode captured native CBM responses and read exact Git source blobs. No new graph queries, projections, archive copies or code graphs were created.",
+    "git_version": "2.43.0"
+  },
+  "gates": {
+    "source_cases_verified": 24,
+    "captured_native_source_bindings_checked": 22,
+    "source_windows_without_resolved_frames": 2,
+    "retrieved_native_change_lanes_replayed": 96,
+    "same_distinct_candidate_pool_and_unavailable_slots_across_arms": true,
+    "proof_totals_across_cases": {"source_observations": 3150, "comparisons": 2631, "file_relations": 111569},
+    "compared_pairs_after_within_case_deduplication": 2629,
+    "hunk_documents": 46023,
+    "verified_blob_line_sides_after_within_case_pair_deduplication": 2093022,
+    "count_boundary": "These totals repeat evidence shared across cases. Hunk documents also retain distinct proposal/landing comparison identities when their native pair is equal.",
+    "complete_artifact_replay_groups_equal": 4,
+    "replay_normalization": "Remove only seconds recursively. All other fields, including source windows, comparison states, hunk identities, line bytes, scores, rankings, input digests and source proof counts are equal.",
+    "experiment_tests_passed": 178,
+    "codebase_and_github_tests_passed": 224,
+    "ruff": "passed: repository and explicit playground/graphub",
+    "change_index_sha256_unchanged": "7933852d20d0bc1daae00508cc54df7ed3d864f560278d7aa75170ea8e6ebad8",
+    "promotion_effect_gate": "failed",
+    "default_promotion": false,
+    "research_acceptance": "Evidence reconstruction, source verification, fixed controls, native replay and regression gates pass. The ranking hypothesis fails; only the evidence reader and reproducible negative experiment are accepted."
+  },
+  "results": {
+    "known_development_cases": 24,
+    "merged_case_denominator": 21,
+    "merged_reference_cases_present_in_candidate_pool": 9,
+    "all_reference_prs_present_in_candidate_pool": 12,
+    "budget_order": [10, 20, 30],
+    "merged_reference_case_hits": {
+      "pool_order": [3, 5, 8], "log_delta": [1, 1, 2], "log_context": [1, 1, 4],
+      "source_delta": [0, 2, 2], "source_context": [0, 3, 5]
+    },
+    "interpretation": "The source-context arm improves over its weak log-only hunk control but loses to the same pool's original order: 3/21 versus 5/21 at budget 20. Pool coverage limits any reranker to 9/21 even at budget 100. This experiment neither improves overall search nor demonstrates causal repair accuracy.",
+    "counterfactuals": [
+      {"issue": 9967, "pull": 10795, "pool_rank": 3, "source_context_rank": 17,
+       "finding": "The source window contains the relevant bitsandbytes_stacked_params_mapping attribute, but additive scoring also rewards generic loader, class and exception prose. Top competitors include broader loader changes, a new platform file and a deleted worker base file. An informative term does not make the whole window an effective query."},
+      {"issue": 9832, "pull": 10169, "pool_rank": 23, "log_delta_rank": 4, "log_context_rank": 10,
+       "source_delta_rank": 12, "source_context_rank": 18,
+       "finding": "The R009 closing-reference applicability caution survives: quantization code does not establish a fix for the extracted Windows subprocess/permission error. Promoting this association improves the closing-reference metric without demonstrating the requested repair."},
+      {"issue": 19909, "pull": 19929, "pool_rank": 2, "source_delta_rank": 12, "source_context_rank": 15,
+       "finding": "Source terms recover the linked patch relative to log-only patch scoring, but all patch rerankers degrade the existing candidate order."},
+      {"issue": 19733, "pull": 20058, "pool_rank": 7, "log_context_rank": 27,
+       "source_context_rank_within_30": null,
+       "finding": "Useful selected diagnostic text is diluted by patch scoring."},
+      {"issue": 15640, "pull": 16496, "merged": false, "pool_rank": 3, "log_context_rank": 20,
+       "source_context_rank_within_30": null,
+       "finding": "The verified unmerged proposal also regresses; it remains proposed code rather than a demonstrated duplicate-ID fix."},
+      {"issue": 11312, "pull": 11380, "merged": false, "every_arm_rank": 7,
+       "finding": "Missing proposal code leaves the text candidate in its fixed slot. This retained text hit is not a patch-ranking gain."}
+    ]
+  },
+  "posthoc_source_coordinate_audit": {
+    "method": "For each selected frame, take the physical line following its File record, strip the exact logger/indent prefix preceding File when present, and compare stripped text with the Git line at the reported coordinate. This audit does not alter registered terms or rankings.",
+    "selected_windows": 22,
+    "exact_printed_statement_matches": 19,
+    "different_printed_statement": 2,
+    "not_available_to_physical_next_line_method": 1,
+    "findings": [
+      {"issue": 16715, "reported_ref": "v0.8.4", "commit": "dc1b4a6f1300003ae27f033afbdff5e2683721ce",
+       "file": "vllm/config.py", "reported_line": 413,
+       "printed": "self.multimodal_config = self._init_multimodal_config(",
+       "native_at_reported_line": "self.disable_sliding_window = disable_sliding_window",
+       "exact_statement_lines_in_native_file": [489],
+       "native_symbol": "graphub-probe.vllm.config.ModelConfig.__init__",
+       "finding": "Both coordinates are inside the same CBM constructor. Symbol containment cannot validate the reported line or identify the deployed revision."},
+      {"issue": 18503, "reported_ref": "v0.9.0", "commit": "58738772410c5e0d60b61db39538a9b313d2d7ad",
+       "file": "vllm/model_executor/model_loader/default_loader.py", "reported_line": 288,
+       "printed": "raise ValueError(", "native_at_reported_line": "if weights_not_loaded:",
+       "exact_statement_lines_in_native_file": [289],
+       "finding": "A one-line offset still lies in the selected window. This is coordinate drift, not proof of which runtime version produced the log."},
+      {"issue": 16655,
+       "finding": "The selected frame occurs inside a serialized traceback. A physical-next-line comparison is unavailable rather than a proven source mismatch."}
+    ]
+  },
+  "availability_and_cost": {
+    "comparison_visits": {"complete_patch": 2569, "sealed_endpoint_unavailable": 796, "file_limit": 58, "blob_limit": 4},
+    "native_text_file_visits": 17520,
+    "real_binary_or_gitlink_patch_visits": 0,
+    "binary_and_gitlink_coverage": "Independent native fixtures only; do not imply empirical coverage in the real candidate sample.",
+    "file_limit_observed_counts": {"minimum": 202, "maximum": 4531},
+    "blob_limit_observed_bytes": 28408344,
+    "candidate_slots_without_readable_token_hunks": 467,
+    "total_candidate_slots": 2400,
+    "native_patch_bytes_after_within_case_pair_deduplication": 93103822,
+    "original_and_replay_wall_seconds": {
+      "known-development": [105.08, 103.86], "known-validation": [41.84, 43.70],
+      "fresh-development": [103.31, 107.87], "boundary-development": [49.63, 55.48]
+    },
+    "largest_probe_max_rss_kib": 556400,
+    "largest_original_case_native_patch_read_seconds": 11.9892271499848,
+    "original_artifact_bytes": 89131473,
+    "cost_boundary": "At most two independent evaluation processes overlapped, each with four native workers. Wall times include exhaustive pool inspection, scoring, source proof and artifact serialization, but reuse captured CBM/text inputs. They are not end-to-end agent latency or an isolated production benchmark. Large winning hunks make verbose research artifacts unsuitable as unbounded tool responses.",
+    "real_agent_runs": 0,
+    "canonical_writes": 0
+  },
+  "replay": {
+    "directory": "playground/graphub/runs",
+    "originals": {
+      "known-development": "r010-known-development.json",
+      "known-validation": "r010-known-validation-verified.json",
+      "fresh-development": "r010-fresh-development-verified.json",
+      "boundary-development": "r010-boundary-development.json"
+    },
+    "repeat_template": "r010-<group>-replay.json",
+    "logical_sha256": {
+      "known-development": "a8b106e84090ebf3f245af0278825ba098c8dde08ffe12c2de52733bbaf8d37b",
+      "known-validation": "198a06f9a427d8a47d3e40020afc2f2de18611e710038284b575ddee014a6e4f",
+      "fresh-development": "47594ddb01802b93b002e35511d72660369e089938c83e6f5ac911f4a2371748",
+      "boundary-development": "fec42987e477942cb853bb92b9ad7d216d961aed4b62e4eda4801f7dcf436f44"
+    },
+    "digest_encoding": "Recursively remove seconds, then json.dumps with sort_keys=True, separators=(',', ':') and default ASCII escaping; SHA-256 the UTF-8 bytes.",
+    "method_sha256": {
+      "change_git.py": "733941d58d3e966b2abfa1dacb3e36d921efc7d3816a7a5760e67eaeed0f62d6",
+      "patch_evidence.py": "674973eca0aaa778331f378fb5a5500c0d1b92c46390aac794247e2bdafea9ad",
+      "patch_probe.py": "ca96a9097d2e3c5b010e7927d62c44861a00c5e5083e1ca1913260abee78c48c"
+    },
+    "command_template": "uv --directory /home/delva/projects/gh-puller-graphub-research run --project /home/delva/projects/gh-puller --offline --no-sync python -B -m playground.graphub.patch_probe --cases <probe.json> --episodes <r008-episodes.json> --changes <r009-changes.json> --index playground/graphub/runs/changes-1399844-r009.sqlite3 --round playground/graphub/rounds/010-patch-context.json --out <output.json>"
+  },
+  "limitations": [
+    "All cases are known, availability-biased evidence from one repository. No held-out or cross-repository ranking generalization is established.",
+    "The first complete segment may be a wrapper, and primary diagnostic strings can contain command/path context. Plain tokenization does not inherit R007's source-role filtering.",
+    "A fixed source window is not a causal slice. Generic words, comments and unrelated neighboring conditions can dominate additive similarity.",
+    "The candidate-local hunk corpus retains separate proposal/landing identities, including identical native pairs. Maximum scoring avoids summing their votes, but document-frequency statistics are not PR-balanced.",
+    "No temporal filter or printed-statement alignment was added during the registered run. A related patch or a symbol containing a reported line does not establish applicability to the deployed version.",
+    "The absence of searchable patch hunks means unknown or non-textual evidence, not an irrelevant candidate. Large comparisons outside the fixed limits are not inspected partially."
+  ],
+  "next": {
+    "id": "R011",
+    "hypothesis": "Preserved printed statements can qualify or contradict CBM frame bindings and make source context more trustworthy before it is used to constrain change search.",
+    "first_action": "Audit all captured frames, not only selected leaves, against their native symbol candidates and exact Git blobs. Distinguish exact-coordinate matches, unique nearby matches, ambiguity, serialized logs and missing statements without inventing a runtime commit or silently shifting reported coordinates.",
+    "subsequent_direction": "After input alignment is understood, test explicit conjunctions over symbol scope and changed/context patch fields instead of adding more unconstrained ranking terms. Keep query semantics composable for external agents and cap returned evidence size.",
+    "validation": "Freeze any new alignment or retrieval policy before inspecting fresh cases. A real agent test, when warranted, must use the existing observable subsystem and remain low frequency."
+  }
+}

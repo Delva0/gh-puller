@@ -1,0 +1,174 @@
+{
+  "id": "R009",
+  "kind": "snapshot-independent-change-evidence",
+  "hypothesis": "Exact PR comparison and landing evidence can be indexed without a code graph at each changed commit, separating retrieval coverage from code-snapshot coverage.",
+  "decision": "accept-source-verified-change-index-and-query-controls; reject-default-policy-promotion",
+  "scope": {
+    "repository": "vllm-project/vllm",
+    "github": "/home/delva/projects/gh-puller/archives/vllm-v10.sqlite3",
+    "archive": "/home/delva/projects/gh-puller/build/vllm-topo-10000/archive.kga",
+    "cutoff": 1399844,
+    "graph_count": 12050,
+    "selected_digest": "88e26a1d35379d0d869bc016cab05380819d6e06cdcaf3156ab7f498b48d45b8",
+    "graph_identity_digest": "001ccef07c5941dee9c969152a07cebb972679318adb703b7f0cc4a30c37ed59",
+    "cbm_sha256": "9af6ba26b2e594e802f98e86f284f65f976e6afb90cd863ad017ecc499777aed"
+  },
+  "sampling": {
+    "development": [10772, 21846, 11858, 12054, 14351, 14034, 15640, 17313, 9832, 6910, 19909, 16655, 6885, 7216, 16715, 19432, 19733, 9967, 20609, 12687, 18503, 11312, 10389, 15483],
+    "held_out": [],
+    "known_regression": [29049],
+    "note": "All evaluated cases are known development evidence. This round establishes evidence reconstruction and query coverage, not held-out ranking generalization."
+  },
+  "pre_registered_controls": [
+    "Use the same frozen latest-subject selection and exact payload digests. Independent source families may support reconstruction; do not restore an older complete observation hidden by a newer incomplete observation in the same family.",
+    "Keep proposal merge-base/head differences distinct from first-parent landing differences. A proposal does not imply unmerged state, and a populated merge_commit_sha on an unmerged PR is not landing evidence.",
+    "Retain conflicting observed endpoint pairs separately. Equivalent pairs may share native computation, but source provenance remains available.",
+    "Measure object readability during reconstruction; do not relabel it as historical availability at the source observation time.",
+    "Compare native batched diffs against independent per-pair Git diffs, including empty changes, unrelated histories, multiple merge bases, missing objects, root commits, modes, submodules and byte-exact path boundaries.",
+    "Code inputs remain captured raw stack paths and native CBM bindings. No reference PR or known changed file may construct a retrieval query.",
+    "Evaluate exact path overlap and changed-file BM25 as fixed controls, with primary budget 20 and secondary budgets 10 and 30. Collapse to distinct PRs before applying budgets and exclude the same 25 source threads.",
+    "Report code-graph-independent coverage separately from ranking quality, and never count an unreadable comparison as an empty diff."
+  ],
+  "acceptance": [
+    "Source ownership, field pointers, native boundaries and file changes are independently verified.",
+    "The index remains a rebuildable derived structure; canonical Git/SQLite data are never modified.",
+    "Native batch and individual Git results agree, all query hits retain source and comparison identities, and sealed-index query replay is deterministic.",
+    "Real-data build/query costs, unavailable evidence and regression results remain visible before any local research commit.",
+    "No default promotion without an independent later ranking validation."
+  ],
+  "implementation": {
+    "boundary": "Proposal differences use exact observed base/head endpoints and a native unique merge base or empty tree. Landing differences use an observed landing commit against its first parent, or the empty tree for a root. No mutable refs or graph endpoint constrain these comparisons.",
+    "index": "SQLite comparison records retain every equivalent source alias; conflicting endpoint pairs remain separate. Native name-status changes use byte-exact paths. Exact overlap and file BM25 collapse comparisons to distinct PRs before applying a budget.",
+    "native_fixture_findings": [
+      "diff-tree --stdin with two commit IDs treats the second as a synthetic parent of the first, reversing the intended before/after direction. Peel both endpoints to tree IDs and verify each exact tree-pair header.",
+      "A missing commit in the batch protocol can be skipped with success. Preflight exact objects and reject missing output markers instead of interpreting the result as an empty change.",
+      "A successful file diff does not imply all blobs are present. Missing blobs and missing subtrees have separate native fixtures; complete denotes the file-difference query only."
+    ],
+    "graph_use": "Reuse captured source-verified CBM bindings. No additional graph projection, archive copy, code graph construction or synthetic traversal was performed."
+  },
+  "index": {
+    "artifact": "playground/graphub/runs/changes-1399844-r009.sqlite3",
+    "bytes": 103612416,
+    "changes": 52385,
+    "file_relations": 493717,
+    "distinct_native_pairs": 43499,
+    "coverage": {
+      "landing": {"complete": 18768, "endpoint_unavailable": 7},
+      "proposal": {"complete": 24784, "endpoint_unavailable": 8826}
+    },
+    "rows_digest": "74fcd839336ee981ae46e99d46df9bcba5fab25d11bf664d340c118cecf168e4",
+    "object_readability_digest": "6a6675200e10110c5db222ece1812dc0571d6db104b3c0c87f2f4a776e94fe1e",
+    "file_sha256": "7933852d20d0bc1daae00508cc54df7ed3d864f560278d7aa75170ea8e6ebad8"
+  },
+  "gates": {
+    "frozen_source_selection_equal": true,
+    "source_records_reconstructed": 52385,
+    "source_observations_verified": 58010,
+    "source_field_pointers_verified": 214512,
+    "independent_individual_native_pairs": 43499,
+    "file_relations_verified": 493717,
+    "retrieval_verification_totals_across_cases": {"source_observations": 11847, "changes": 8458, "files": 4179184},
+    "retrieval_verification_note": "Counts repeat evidence shared across cases. Each query result has exact source semantics, a separately reconstructed native boundary and full-file-diff equality; the full index audit separately covers every complete pair.",
+    "sealed_index_replay_groups_equal": 4,
+    "replay_normalization": "Remove only seconds recursively. All other fields in each complete original/replay artifact are equal.",
+    "stable_fixture_independent_builds_byte_identical": true,
+    "experiment_tests_passed": 157,
+    "codebase_and_github_tests_passed": 224,
+    "codebase_and_github_test_seconds": 69.06,
+    "ruff": "passed: repository and explicit playground/graphub",
+    "default_promotion": false
+  },
+  "results": {
+    "metric": "A case hits if any explicitly linked merged PR is in the distinct-PR budget. This is a closing-reference retrieval measure, not demonstrated symptom resolution.",
+    "known_development_cases": 24,
+    "merged_case_denominator": 21,
+    "budget_order": [10, 20, 30],
+    "merged_case_hits": {
+      "text_first": [3, 3, 3], "r008_first_raw": [4, 8, 9],
+      "first_raw_landing_overlap": [0, 0, 0], "first_raw_landing_bm25": [3, 3, 4],
+      "first_raw_proposal_overlap": [0, 0, 0], "first_raw_proposal_bm25": [0, 0, 0],
+      "typed_entities_landing_overlap": [0, 0, 1], "typed_entities_landing_bm25": [3, 3, 4],
+      "typed_entities_proposal_overlap": [0, 0, 0], "typed_entities_proposal_bm25": [0, 0, 0],
+      "first_with_entities_landing_overlap": [0, 0, 0], "first_with_entities_landing_bm25": [5, 5, 6],
+      "first_with_entities_proposal_overlap": [0, 0, 0], "first_with_entities_proposal_bm25": [0, 0, 0],
+      "text_plus_first_raw_landing_overlap": [2, 3, 3], "text_plus_first_raw_landing_bm25": [4, 6, 6],
+      "text_plus_first_raw_proposal_overlap": [2, 3, 3], "text_plus_first_raw_proposal_bm25": [2, 3, 3],
+      "text_plus_typed_entities_landing_overlap": [2, 3, 3], "text_plus_typed_entities_landing_bm25": [4, 5, 5],
+      "text_plus_typed_entities_proposal_overlap": [2, 3, 3], "text_plus_typed_entities_proposal_bm25": [2, 3, 3],
+      "text_plus_first_with_entities_landing_overlap": [1, 3, 3], "text_plus_first_with_entities_landing_bm25": [3, 7, 7],
+      "text_plus_first_with_entities_proposal_overlap": [1, 3, 3], "text_plus_first_with_entities_proposal_bm25": [1, 3, 3]
+    },
+    "interpretation": "Snapshot-independent file evidence improves particular cases but the text-plus-union BM25 control hits 7/21 at budget 20 versus R008's 8/21. No new default or held-out generalization claim is justified."
+  },
+  "qualitative_evidence": [
+    {
+      "issue": 9967, "pull": 10795, "kind": "static-symptom-aligned-patch",
+      "typed_entity_landing_bm25_rank": 1, "text_plus_typed_rank": 2,
+      "source_observation": 1314285, "source_digest": "c9a098f5ea60cd3bb39fc9228423dcea101e4a76b96d68dc5a39bf76bae45493",
+      "before": "0590ec3fd9857063c43c80df281e24c16c51b2ec", "after": "b18c9bbaba6e1c6dfb92fe52e5a6cb22dd6bfa81",
+      "finding": "The BitsAndBytes loader raises the reported unsupported-quantization AttributeError when the model lacks bitsandbytes_stacked_params_mapping. The log names LlavaForConditionalGeneration; its native CBM class file lies outside the raw stack paths. The one-file, nine-line landing patch adds exactly that class attribute. This aligns a static precondition and patch, but no model execution was performed."
+    },
+    {
+      "issue": 9832, "pull": 10169, "kind": "closing-reference-applicability-caution",
+      "typed_entity_landing_bm25_rank": 5,
+      "source_observation": 1326567, "source_digest": "42c095fa61fddeeeecf66b7ddc826adf5e31ead3709a76517fbf82d9be6049fb",
+      "landing": "f83feccd7f661d0a582f9c0cb0bc9f802f4d995e",
+      "finding": "The extracted Windows registry subprocess log contains PermissionError for a temporary file and an unsupported-architecture wrapper. The explicitly closing patch instead disables GPTQ quantization for the Qwen2-VL visual module. Shared model identity and an authentic closing link do not establish a fix for this extracted error. Preserve the registered reference metric, but do not count this as a demonstrated causal gain."
+    },
+    {
+      "issue": 15640, "pull": 16496, "kind": "unmerged-proposal-evidence",
+      "first_raw_proposal_bm25_rank": 1, "text_plus_first_raw_proposal_bm25_rank": 2,
+      "source_observation": 1200880, "source_digest": "f963480dfd241212a71f69f58e116b21134bcdf8d7e9d3558dfb7f1ae71986c3",
+      "before": "4d022cbc757e89b2296daf3b33303eeea4ba4a62", "after": "ccd21e1993a0bb1b3624c436f6a671e00cc36d53",
+      "finding": "The native proposal changes V1 profiling and engine compatibility in two files. This is useful retrievable proposed code, not an observed landed fix; its mechanism for the input's duplicate request-ID error remains unverified."
+    },
+    {
+      "issue": 15483, "pull": 34528, "kind": "exact-path-coverage-gap",
+      "finding": "Both proposal and landing are reconstructable beyond the graph endpoint, but neither has an exact path intersection with any registered query-path control. Extending history alone cannot repair the V0 stack versus V1 pause/sleep patch mismatch."
+    }
+  ],
+  "availability": {
+    "missing_to_readable_endpoints_during_full_audit": 12,
+    "live_rebuild_claim": "The fixed SQLite selection does not freeze the concurrently growing Git object store. A later full rebuild may legitimately gain complete records. Only the stable fixture has byte-identical rebuild evidence; real queries replay against this sealed index.",
+    "reference_prs": 27,
+    "reference_complete_landing_records": 21,
+    "reference_complete_proposal_records": 2,
+    "reference_unavailable_proposal_records": 25,
+    "unavailable_proposals_with_neither_pull_git_nor_commit_object_observation_at_cutoff": 25,
+    "upstream": "No new source schema is required by this experiment. Missing reference heads are unobserved at the cutoff, not declared permanently unavailable; existing pull-git/commit-object acquisition can supply them. Canonical data were not fetched or modified."
+  },
+  "cost": {
+    "build_wall_seconds": 262.58,
+    "build_max_rss_kib": 674820,
+    "full_native_source_gate_wall_seconds": 225.92,
+    "full_native_source_gate_max_rss_kib": 677328,
+    "query_calls": 288,
+    "nonempty_query_calls": 204,
+    "query_only_seconds": {
+      "overlap": {"median": 0.022649, "p95": 0.034326, "max": 0.038480},
+      "bm25": {"median": 0.022056, "p95": 0.034944, "max": 0.044871}
+    },
+    "query_cost_boundary": "Excludes startup, index attestation, source/native verification and CBM input resolution. This is not end-to-end agent latency.",
+    "probe_original_replay_wall_seconds": {
+      "known-development": [119.95, 121.92], "known-validation": [92.17, 92.29],
+      "fresh-development": [139.22, 142.46], "boundary-development": [86.84, 83.28]
+    },
+    "probe_peak_rss_kib": 158616,
+    "real_agent_runs": 0
+  },
+  "replay": {
+    "run_directory": "playground/graphub/runs",
+    "probe_prefixes": ["r009-known-development", "r009-known-validation", "r009-fresh-development", "r009-boundary-development"],
+    "repeat_suffix": "-replay.json",
+    "full_gate_artifact": "r009-full-index-gates.json",
+    "build_command_template": "uv --directory /home/delva/projects/gh-puller-graphub-research run --project /home/delva/projects/gh-puller --offline --no-sync python -B -m playground.graphub.change_index --round playground/graphub/rounds/009-change-evidence.json --out <new-index.sqlite3>",
+    "probe_command_template": "uv --directory /home/delva/projects/gh-puller-graphub-research run --project /home/delva/projects/gh-puller --offline --no-sync python -B -m playground.graphub.change_probe --cases <probe.json> --episodes <episodes.json> --bindings <bindings.json> --index <index.sqlite3> --round playground/graphub/rounds/009-change-evidence.json --out <output.json>",
+    "gate_command_template": "uv --directory /home/delva/projects/gh-puller-graphub-research run --project /home/delva/projects/gh-puller --offline --no-sync python -B -m playground.graphub.change_gates --index <index.sqlite3> --round playground/graphub/rounds/009-change-evidence.json --out <gate.json>"
+  },
+  "next": {
+    "id": "R010",
+    "hypothesis": "Source-preserved diagnostic constraints and exact patch changes can distinguish symptom-aligned candidates from merely related files or closing references.",
+    "first_action": "Inspect source-code preconditions and native patches on known cases before choosing a minimal query or reranking control. Do not infer applicability from a closing link or introduce a new code graph.",
+    "validation": "Keep all 24 cases as development evidence. Freeze any selected policy before inspecting fresh inputs; retain a separate assessment of reference applicability instead of retroactively editing hit counts."
+  }
+}

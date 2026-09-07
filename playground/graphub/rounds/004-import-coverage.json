@@ -1,0 +1,94 @@
+{
+  "id": "R004",
+  "kind": "native-import-path-and-index-coverage-diagnosis",
+  "baseline_commit": "45dcd21",
+  "registration": "rounds/003-diagnostic-entities.json",
+  "hypothesis": "A bounded directed import chain from explicit compiler coordinates adds relevant change evidence beyond direct file history.",
+  "decision": {
+    "retrieval_promotion": "rejected",
+    "native_include_coverage_gate": "failed",
+    "commit_purpose": "Validated capability reproduction and negative evidence, not a passing retrieval optimization"
+  },
+  "results": {
+    "development_cases": 8,
+    "cases_with_native_repository_coordinates": 1,
+    "case_without_coordinates_policy": "Retain explicit empty controls without projecting an irrelevant snapshot",
+    "native_paths_at_depth_1": 1,
+    "native_paths_at_depth_2": 0,
+    "case": 14034,
+    "candidate_counts_for_depth_0_1_2": [3, 5, 5],
+    "reference_pr": 14051,
+    "reference_retrieved": false,
+    "equal_budget_gain": false
+  },
+  "diagnosis": {
+    "observed_path": ["csrc/cpu/attention.cpp", "csrc/cpu/cpu_types.hpp"],
+    "first_include_source_line": 1,
+    "dispatcher_git_blob": "a71815106133a4ce981ba2363ec931aa98ac62e5",
+    "dispatcher_source": "The archived Git blob contains an include guard and conditional includes for x86, POWER9 and ARM headers.",
+    "archived_graph_query": "Both File-qualified-name and whole-file outgoing queries return only DEFINES relationships for the dispatcher; the architecture header nodes themselves exist.",
+    "fresh_full_index_fixtures": {
+      "top_level": {"expected_targets": 2, "observed_targets": 2},
+      "include_guard": {"expected_targets": 2, "observed_targets": 0},
+      "conditional": {"expected_targets": 2, "observed_targets": 0}
+    },
+    "fresh_fixture_skipped_or_partial_counts": 0,
+    "native_index_source_commit": "70197504068a380a94323dd12acb2b5be52e83e5",
+    "native_index_source": "internal/cbm/extract_imports.c: parse_c_imports",
+    "source_behavior": "The cursor visits only root children and next siblings; it does not descend into preprocessor conditional or include-guard nodes.",
+    "scope_of_proof": "A fresh full index of the pinned binary reproduces missing nested includes independently of historical archive construction. This does not identify every historical build's executable.",
+    "required_cbm_change": "Extract nested C/C++ static include possibilities, preserve target identity and source locations, and distinguish conditional reachability from active build configuration. Add full-index regressions for include guards and preprocessor branches.",
+    "github_source_gap": false,
+    "native_source_or_archive_modified": false
+  },
+  "gates": {
+    "source_inputs_and_frozen_boundaries_verified": true,
+    "path_replay_equal": true,
+    "path_logical_digest_without_run_and_case_seconds": "da9def36cc24f221bb34f2ab940c0554e1bc0bd7fa789ec9c4553fd2db3f36e3",
+    "fresh_index_capability_replay_equal": true,
+    "capability_logical_digest_without_fixture_seconds": "76e6fd1cb36fe75c52c5dc08f0b740df0564adcd40b5363630cbe6527425866f",
+    "native_capability_gate_exit_code": 1,
+    "landing_source_observations_verified": 5,
+    "first_parent_commit_file_pairs_verified": 6,
+    "native_path_tests": "A separate hand-authored graph verifies direction, edge types, parallel aliases, exact path depth and truncation in the actual CBM query engine.",
+    "experiment_tests_passed": 62,
+    "ruff": "passed: repository and explicit playground/graphub",
+    "production_changes": false,
+    "cost": {
+      "eight_case_seconds": [40.5427, 40.2128],
+      "archived_snapshot_projections": 1,
+      "archived_snapshot_projection_bytes": 47513600,
+      "fresh_index_fixture_files_each": 4,
+      "fixture_seconds_each_approximately": 7,
+      "fixture_and_replay_processes_isolated": true
+    }
+  },
+  "limitations": [
+    "Only one development case contains usable native compiler coordinates; it cannot establish general effectiveness of import-path retrieval.",
+    "An empty graph query is not negative evidence of dependency absence. Successful parse and row round-trip do not establish semantic indexing completeness.",
+    "The capability gate intentionally fails on the pinned CBM. No missing edge was injected into the source archive or retrieval results.",
+    "No C changes, upstream source writes, all-history reindexing, agent runs or pushes."
+  ],
+  "artifacts": {
+    "result": "runs/development-import-paths.json",
+    "replay": "runs/development-import-paths-replay.json",
+    "capability": "runs/include-capability.json",
+    "capability_gated": "runs/include-capability-gated.json"
+  },
+  "next": {
+    "id": "R005",
+    "kind": "fixed-retrieval-checkpoint-and-held-out-evaluation",
+    "scope": "rounds/000-data-boundary.json",
+    "development_cases": [10772, 21846, 11858, 12054, 14351, 14034, 15640, 17313],
+    "held_out_cases": [9832, 6910, 19909, 16655],
+    "lane_order": ["primary lexical RRF", "terminal raw-traceback file history", "diagnostic exact-name candidate file history"],
+    "candidate_combination": "Round-robin in the registered lane order, with exact thread deduplication and at most 100 source candidates per lane",
+    "primary_candidate_budget": 20,
+    "secondary_candidate_budgets": [10, 30],
+    "controls": ["primary lexical RRF at identical unique-thread budgets", "best individual lexical arm as an explicitly oracle control"],
+    "unchanged_parameters": "Primary-diagnostic extraction, lexical arm construction and RRF constant, fixed version horizon, file-history semantics and temporal ranking remain those of R001-R003.",
+    "report": "Per-case known-reference ranks, merged/proposal distinctions, applicability, unresolved evidence and cold cost; no exhaustive-recall or fix-success claim",
+    "held_out_policy": "No parameter changes after held-out retrieval begins. Failures inform a subsequent development round, not retroactive checkpoint tuning.",
+    "blindness_limit": "The source catalog and some inputs were inspected during the initial audit; this is held-out retrieval evaluation, not a fully blinded study."
+  }
+}

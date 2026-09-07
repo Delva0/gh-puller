@@ -1,0 +1,98 @@
+{
+  "id": "R000",
+  "kind": "measurement-and-isolation",
+  "hypothesis": "A fixed publication cursor and fixed graph commit prefix make evidence selection reproducible while both sources append; isolated CBM runtime preserves query results without interfering with other sessions.",
+  "decision": "accept",
+  "scope": {
+    "repository": "vllm-project/vllm",
+    "github": "/home/delva/projects/gh-puller/archives/vllm-v10.sqlite3",
+    "archive": "/home/delva/projects/gh-puller/build/vllm-topo-10000/archive.kga",
+    "cutoff": 1399844,
+    "graph_count": 12050,
+    "selected_digest": "88e26a1d35379d0d869bc016cab05380819d6e06cdcaf3156ab7f498b48d45b8",
+    "graph_identity_digest": "001ccef07c5941dee9c969152a07cebb972679318adb703b7f0cc4a30c37ed59",
+    "cbm_sha256": "9af6ba26b2e594e802f98e86f284f65f976e6afb90cd863ad017ecc499777aed"
+  },
+  "gates": {
+    "frozen_asset_replay_equal": true,
+    "audit_logical_digest": "2314d8304180d9a38007d0601e57039cc54a135c0f3eea2bd25d3e9f2a12d5e9",
+    "original_case_replay_equal": true,
+    "original_case": {
+      "issue": 29049,
+      "cutoff": 1371376,
+      "ref": "v0.11.1",
+      "logical_digest": "69507cae3fb99d245cb1ec3ab5408b4796f524881e15436cb4f5af8d45e008b3"
+    },
+    "observations_verified": 525,
+    "landing_references_verified": 471,
+    "lexical_documents_verified": 53,
+    "experiment_tests_passed": 19,
+    "codebase_and_github_tests_passed": 224,
+    "ruff": "passed: repository and explicit playground/graphub",
+    "cost": {
+      "baseline_cold_seconds": 144.6906,
+      "audit_seconds": [
+        23.3304,
+        24.0952
+      ],
+      "projected_snapshots": 1,
+      "projection_bytes": 101871616,
+      "performance_improvement_claim": false
+    }
+  },
+  "findings": [
+    "A live GitHub publication cutoff alone does not freeze an independently growing code graph archive.",
+    "CBM runtime rendezvous must be isolated separately from its temporary cache.",
+    "Version metadata retains development, post-release and explicit revision suffixes; prose mentioning a working version is not the failing revision.",
+    "Missing or non-complete observations must not be replaced with older complete observations."
+  ],
+  "sampling": {
+    "issues": 14313,
+    "traceback_issues": 2835,
+    "metadata_with_mentioned_graph_tag": 422,
+    "graph_tag_and_closing_relation": 69,
+    "initial_eligible_pool": 63,
+    "procedure": "Require one mentioned archived tag, at least one parsed frame and exception, and an explicit closing relation; order by sha256(repository + '#' + issue_number). This is availability-biased, not representative of all issues.",
+    "development": [
+      10772,
+      21846,
+      11858,
+      12054,
+      14351,
+      14034,
+      15640,
+      17313
+    ],
+    "held_out": [
+      9832,
+      6910,
+      19909,
+      16655
+    ],
+    "known_regression": [
+      29049
+    ]
+  },
+  "limitations": [
+    "Closing relations are candidate relevance anchors, not verified fixes.",
+    "Graph manifest roots are verified; the whole graph archive has not been independently reindexed or semantically validated.",
+    "The original snapshot has 40 dangling edges; its disposable CBM projection omits and reports them.",
+    "No cross-repository generalization or end-to-end bug resolution claim.",
+    "Cold timings include preprocessing and concurrent machine load; they are not warm query latency."
+  ],
+  "next": {
+    "id": "R001",
+    "hypothesis": "Real-case input and reference auditing will expose failures hidden by the single-case experiment; a shared frozen text corpus should permit cheap, leakage-controlled repeated comparison.",
+    "acceptance": [
+      "Preserve source identities and full error inputs.",
+      "Audit reference PR evidence and version applicability before judging relevance.",
+      "Exclude every benchmark source thread from all retrieval arms.",
+      "Record unresolved coordinates and missing graph coverage rather than selecting successful cases after running retrieval."
+    ],
+    "mutation_scope": [
+      "playground/graphub",
+      "gh_puller/github and gh_puller/codebase only when an experiment establishes the need"
+    ],
+    "commit_policy": "Only local commits after evidence, correctness, regression and cost gates appropriate to the change; no pushes, merges, source mutations or all-history graph copies."
+  }
+}
