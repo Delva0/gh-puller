@@ -463,6 +463,11 @@ pre-rebase commits when GitHub still exposes them. Batched PR fetches start at
 `--git-batch-size`; structured-commit sources sharing one remote use the same bound.
 Both recursively split on transient transfer failure.
 
+The writer keeps Git lookup cost bounded as evidence accumulates. It packs loose
+refs after 256 additions, runs Git's incremental multi-pack maintenance at 64 pack
+files, and refreshes the commit graph with either operation. These are derived-index
+and physical-layout changes: ref names, object IDs, and SQLite facts do not change.
+
 `comparison_kind=merge_base` names the unique merge base for an offline PR diff.
 `empty_tree` represents unrelated histories. `unavailable` records which required
 objects could not be obtained without claiming a complete diff. A landing ref is

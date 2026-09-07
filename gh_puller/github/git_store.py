@@ -27,11 +27,13 @@ from .archive_format import (
 from .schema import GIT_LAYOUT_VERSION
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable, Mapping, Sequence
+    from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 
 _SHA = re.compile(r"[0-9a-f]{40,64}\Z")
 _HEARTBEAT_SECONDS = 2.0
 _FETCH_RETRY_CEILING = 30.0
+_LOOSE_REF_MAINTENANCE_THRESHOLD = 256
+_PACK_MAINTENANCE_THRESHOLD = 64
 _TRANSIENT_FETCH_STATUS = re.compile(
     r"\bcurl (?:5|6|7|18|28|35|52|55|56|92)\b"
     r"|(?:returned error|http code)[: ]+(?:408|429|5\d\d)\b",
@@ -173,8 +175,9 @@ class GitObjectStore:
             retry: 瞬时 Git 传输错误发生时接收退避秒数的观察器。
         """
         async with self._lock:
-            await self._prepare()
+            await self._prepare(heartbeat)
             await self._sync_upstream(heartbeat=heartbeat, retry=retry, force=True)
+            await self._maintain(heartbeat)
             return await self._ref_observation()
 
     async def retain_commits(
@@ -211,7 +214,7 @@ class GitObjectStore:
             raise ValueError("commit sources contain an unrequested SHA")
         routes = {sha: tuple(dict.fromkeys(supplied.get(sha, ()))) for sha in selected}
         async with self._lock:
-            await self._prepare()
+            await self._prepare(heartbeat)
             attempts: dict[str, list[dict[str, Any]]] = {sha: [] for sha in selected}
             obtained = dict.fromkeys(selected, "existing")
             observed_from = self._time()
@@ -379,6 +382,7 @@ class GitObjectStore:
                 )
             for ref in staging:
                 await self._delete_ref(ref)
+            await self._maintain(heartbeat)
             return {
                 sha: _retention_result(
                     sha,
@@ -409,7 +413,7 @@ class GitObjectStore:
         if not selected:
             return
         async with self._lock:
-            await self._prepare()
+            await self._prepare(heartbeat)
             await self._sync_upstream(heartbeat=heartbeat, retry=retry)
             missing = await self._missing_commits(
                 tuple(_nested_sha(pulls[number], "head", number) for number in selected),
@@ -469,7 +473,7 @@ class GitObjectStore:
         value = pull.get("merge_commit_sha")
         landing_sha = value if pull.get("merged") is True and isinstance(value, str) and _SHA.fullmatch(value) else None
         async with self._lock:
-            await self._prepare()
+            await self._prepare(heartbeat)
             await self._sync_upstream(heartbeat=heartbeat, retry=retry)
             pinnable_landing_sha = await self._available_commit(landing_sha)
             try:
@@ -1040,7 +1044,10 @@ class GitObjectStore:
     async def _delete_ref(self, ref: str) -> None:
         await self._git("update-ref", "-d", ref)
 
-    async def _prepare(self) -> None:
+    async def _prepare(
+        self,
+        heartbeat: Callable[[], None] | None = None,
+    ) -> None:
         if self._ready:
             return
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -1071,9 +1078,23 @@ class GitObjectStore:
         if not remote.strip():
             await self._git("remote", "add", "origin", self.remote_url)
         await self._git("config", "gc.auto", "0")
-        if sum(1 for _ in (self.path / "objects" / "pack").glob("*.idx")) > 1:
-            await self._git("multi-pack-index", "write")
+        await self._maintain(heartbeat)
         self._ready = True
+
+    async def _maintain(
+        self,
+        heartbeat: Callable[[], None] | None,
+    ) -> None:
+        tasks = _maintenance_tasks(self.path)
+        if not tasks:
+            return
+        await self._git(
+            "maintenance",
+            "run",
+            "--quiet",
+            *(f"--task={task}" for task in tasks),
+            heartbeat=heartbeat,
+        )
 
     async def _git(
         self,
@@ -1150,6 +1171,29 @@ def default_git_url(repository: str) -> str:
         不含凭据的公开 Git URL。
     """
     return f"https://github.com/{repository}.git"
+
+
+def _maintenance_tasks(path: Path) -> tuple[str, ...]:
+    pack_refs = _contains_at_least(
+        (item for item in (path / "refs").rglob("*") if item.is_file()),
+        _LOOSE_REF_MAINTENANCE_THRESHOLD,
+    )
+    repack = _contains_at_least(
+        (path / "objects" / "pack").glob("*.pack"),
+        _PACK_MAINTENANCE_THRESHOLD,
+    )
+    tasks = []
+    if pack_refs:
+        tasks.append("pack-refs")
+    if repack:
+        tasks.append("incremental-repack")
+    if tasks:
+        tasks.append("commit-graph")
+    return tuple(tasks)
+
+
+def _contains_at_least(items: Iterable[object], limit: int) -> bool:
+    return any(count >= limit for count, _ in enumerate(items, start=1))
 
 
 def _source_groups(

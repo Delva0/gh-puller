@@ -141,6 +141,73 @@ def test_git_token_is_scoped_to_the_managed_origin(tmp_path: Path) -> None:
     assert token not in environment["GIT_CONFIG_VALUE_1"]
 
 
+def test_git_maintenance_plan_tracks_loose_refs_and_pack_count(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(git_store_module, "_LOOSE_REF_MAINTENANCE_THRESHOLD", 2)
+    monkeypatch.setattr(git_store_module, "_PACK_MAINTENANCE_THRESHOLD", 2)
+    refs = tmp_path / "refs" / "heads"
+    packs = tmp_path / "objects" / "pack"
+    refs.mkdir(parents=True)
+    packs.mkdir(parents=True)
+    (refs / "one").write_text("one\n")
+    (packs / "one.pack").touch()
+
+    assert git_store_module._maintenance_tasks(tmp_path) == ()
+
+    (refs / "two").write_text("two\n")
+    assert git_store_module._maintenance_tasks(tmp_path) == (
+        "pack-refs",
+        "commit-graph",
+    )
+
+    (packs / "two.pack").touch()
+    assert git_store_module._maintenance_tasks(tmp_path) == (
+        "pack-refs",
+        "incremental-repack",
+        "commit-graph",
+    )
+
+
+@pytest.mark.asyncio
+async def test_git_maintenance_packs_refs_without_changing_tips(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    base, _ = _source_repository(source, 1)
+    path = tmp_path / "facts.sqlite3.git"
+    store = GitObjectStore(path, "acme/widgets", str(source))
+    await store.sync_upstream()
+    _stored_git(path, "update-ref", "refs/github-archive/commits/" + base, base)
+    before = _stored_git(path, "for-each-ref", "--format=%(refname) %(objectname)")
+    real_command = git_store_module._command
+    commands: list[Sequence[str]] = []
+
+    async def record(command: Sequence[str], **kwargs: Any) -> str:
+        commands.append(command)
+        return await real_command(command, **kwargs)
+
+    monkeypatch.setattr(git_store_module, "_command", record)
+    monkeypatch.setattr(git_store_module, "_LOOSE_REF_MAINTENANCE_THRESHOLD", 1)
+    await store._maintain(None)
+
+    assert _stored_git(path, "for-each-ref", "--format=%(refname) %(objectname)") == before
+    assert not any(item.is_file() for item in (path / "refs").rglob("*"))
+    assert (path / "packed-refs").is_file()
+    assert any(
+        command[3:7]
+        == (
+            "maintenance",
+            "run",
+            "--quiet",
+            "--task=pack-refs",
+        )
+        for command in commands
+    )
+
+
 @pytest.mark.asyncio
 async def test_git_store_reconstructs_more_than_three_thousand_changed_files(tmp_path: Path) -> None:
     source = tmp_path / "source"
