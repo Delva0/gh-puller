@@ -28,6 +28,7 @@ def write_fake_cbm(
     hang_on_tool: bool = False,
     confirm_force_full: bool = True,
     confirm_incremental_controls: bool = True,
+    instructions: str | None = None,
 ) -> None:
     delay = "time.sleep(60)" if hang_on_tool else ""
     path.write_text(
@@ -39,6 +40,7 @@ import time
 
 confirm_force_full = {confirm_force_full!r}
 confirm_incremental_controls = {confirm_incremental_controls!r}
+instructions = {instructions!r}
 
 def make_payload(arguments):
     requested_force_full = bool(arguments.get("force_full"))
@@ -69,6 +71,8 @@ for line in sys.stdin:
         continue
     if request["method"] == "initialize":
         result = {{"protocolVersion": "2024-11-05", "capabilities": {{}}, "serverInfo": {{}}}}
+        if instructions is not None:
+            result["instructions"] = instructions
     elif request["method"] == "tools/call":
         {delay}
         result = make_payload(request["params"].get("arguments", {{}}))
@@ -131,6 +135,27 @@ def test_cli_transport_remains_available_as_control(tmp_path):
     assert execution["pid"] != os.getpid()
     assert monitor.child_pid is None
     assert monitor.samples == 2
+
+
+@pytest.mark.parametrize("instructions", [None, "", "Use search_graph, then inspect exact source."])
+def test_persistent_mcp_preserves_optional_server_instructions(tmp_path, instructions):
+    binary = tmp_path / "fake-cbm"
+    write_fake_cbm(binary, instructions=instructions)
+    transport = PersistentMCPTransport(binary, tmp_path / "cache", 5, FakeMonitor())
+    try:
+        assert transport.instructions == (instructions or "")
+        assert transport.call_tool("search_graph", {})["content"]
+    finally:
+        transport.close()
+
+
+def test_invalid_server_instructions_close_the_failed_session(tmp_path):
+    binary = tmp_path / "fake-cbm"
+    write_fake_cbm(binary, instructions=42)
+    monitor = FakeMonitor()
+    with pytest.raises(CBMTransportError, match="instructions must be text"):
+        PersistentMCPTransport(binary, tmp_path / "cache", 5, monitor)
+    assert monitor.child_pid is None
 
 
 def test_persistent_mcp_timeout_terminates_process(tmp_path):

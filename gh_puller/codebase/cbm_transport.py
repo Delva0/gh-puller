@@ -281,7 +281,7 @@ class PersistentMCPTransport:
         self._stdout_thread.start()
         self._stderr_thread.start()
         try:
-            self._request(
+            initialized = self._request(
                 "initialize",
                 {
                     "protocolVersion": "2024-11-05",
@@ -290,6 +290,9 @@ class PersistentMCPTransport:
                 },
                 min(timeout, 60),
             )
+            self._instructions = initialized.get("instructions", "")
+            if not isinstance(self._instructions, str):
+                raise CBMTransportError("CBM MCP initialization instructions must be text")
             self._notify("notifications/initialized", {})
         except Exception:
             self._terminate()
@@ -298,6 +301,11 @@ class PersistentMCPTransport:
     @property
     def name(self) -> str:
         return "persistent-mcp"
+
+    @property
+    def instructions(self) -> str:
+        """Return optional server guidance; callers own its presentation to an agent."""
+        return self._instructions
 
     def _stderr_text(self) -> str:
         return "".join(self._stderr_tail)[-4000:]
