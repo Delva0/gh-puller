@@ -120,6 +120,7 @@ async def test_tools_list_exposes_only_checklist_contract(registry: SnapshotRegi
     assert [tool["name"] for tool in tools] == list(CHECKLIST_TOOLS)
     assert all("version" in tool["inputSchema"]["properties"] for tool in tools)
     trace = next(tool for tool in tools if tool["name"] == "trace_path")
+    assert "property nodes" in trace["description"]
     assert "repeat the same call" in trace["description"]
     detect = next(tool for tool in tools if tool["name"] == "detect_changes")
     assert detect["inputSchema"]["required"] == ["project", "diff"]
@@ -170,8 +171,94 @@ async def test_forwarded_call_resolves_explicit_rc_version(registry: SnapshotReg
         ),
     )
 
-    assert upstream.calls[0][1]["project"] == "vllm-kb-vllm-ascend-0.23.0"
-    assert "version" not in upstream.calls[0][1]
+    assert upstream.calls[0][0] == "search_graph"
+    assert upstream.calls[-1][1]["project"] == "vllm-kb-vllm-ascend-0.23.0"
+    assert "version" not in upstream.calls[-1][1]
+
+
+@pytest.mark.asyncio
+async def test_property_trace_includes_attribute_relationships(registry: SnapshotRegistry) -> None:
+    class PropertyUpstream(FakeUpstream):
+        async def call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+            self.calls.append((name, arguments))
+            if name == "search_graph":
+                return _envelope(
+                    {
+                        "rows": [
+                            {
+                                "name": "registry",
+                                "qn": "vllm-kb-vllm-0.23.0.vllm.config.ModelConfig.registry",
+                                "label": "Method",
+                                "decorator_tags": '["property"]',
+                            },
+                        ],
+                    },
+                )
+            return _envelope({"callers": {"cols": ["qn"], "rows": []}})
+
+    upstream = PropertyUpstream()
+    await Adapter(registry, upstream).handle(
+        _call(
+            "trace_path",
+            {
+                "project": VLLM_PROJECT,
+                "version": "0.23.0",
+                "function_name": "vllm-kb-vllm-0.23.0.vllm.config.ModelConfig.registry",
+                "direction": "inbound",
+            },
+        ),
+    )
+
+    assert upstream.calls == [
+        (
+            "search_graph",
+            {
+                "project": "vllm-kb-vllm-0.23.0",
+                "name_pattern": "^registry$",
+                "fields": ["decorator_tags", "decorators"],
+                "limit": 51,
+                "format": "json",
+                "qn_pattern": "^vllm\\-kb\\-vllm\\-0\\.23\\.0\\.vllm\\.config\\.ModelConfig\\.registry$",
+            },
+        ),
+        (
+            "trace_path",
+            {
+                "project": "vllm-kb-vllm-0.23.0",
+                "function_name": "vllm-kb-vllm-0.23.0.vllm.config.ModelConfig.registry",
+                "direction": "inbound",
+                "format": "json",
+                "edge_types": ["CALLS", "USAGE", "WRITES"],
+            },
+        ),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_explicit_trace_edge_types_bypass_property_adaptation(registry: SnapshotRegistry) -> None:
+    upstream = FakeUpstream()
+    await Adapter(registry, upstream).handle(
+        _call(
+            "trace_path",
+            {
+                "project": VLLM_PROJECT,
+                "function_name": "vllm.config.ModelConfig.registry",
+                "edge_types": ["CALLS"],
+            },
+        ),
+    )
+
+    assert upstream.calls == [
+        (
+            "trace_path",
+            {
+                "project": "vllm-kb-vllm-0.23.0",
+                "function_name": "vllm.config.ModelConfig.registry",
+                "edge_types": ["CALLS"],
+                "format": "json",
+            },
+        ),
+    ]
 
 
 @pytest.mark.asyncio

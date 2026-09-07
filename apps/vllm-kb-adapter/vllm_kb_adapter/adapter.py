@@ -8,6 +8,7 @@ online coordinator and expose its state in the ordinary tool result.
 from __future__ import annotations
 
 import json
+import re
 from collections import Counter
 from pathlib import PurePosixPath
 from typing import TYPE_CHECKING, Any
@@ -37,6 +38,8 @@ _JSON_FORMAT_TOOLS = frozenset(("search_graph", "search_code", "trace_path", "qu
 _IMPACT_CEILING = 5000
 _MAX_CHANGED_FILES = 128
 _MAX_DEPTH = 10
+_PROPERTY_EDGE_TYPES = ("CALLS", "USAGE", "WRITES")
+_PROPERTY_FIELDS = ("decorator_tags", "decorators")
 
 
 class Adapter:
@@ -58,6 +61,7 @@ class Adapter:
         self.registry = registry
         self.upstream = upstream
         self.indexes = indexes
+        self._property_cache: dict[tuple[str, str], bool] = {}
 
     async def handle(self, request: Any) -> dict[str, Any]:
         """Handle one stateless JSON-RPC request.
@@ -117,6 +121,8 @@ class Adapter:
         forwarded["project"] = snapshot.index_name
         if name in _JSON_FORMAT_TOOLS:
             forwarded["format"] = "json"
+        if name == "trace_path":
+            await self._adapt_property_trace(snapshot, forwarded)
         result = await self.upstream.call_tool(name, forwarded)
         return normalize_result(name, result)
 
@@ -245,6 +251,82 @@ class Adapter:
             return None
         return await self.indexes.prepare(snapshot)
 
+    async def _adapt_property_trace(self, snapshot: Snapshot, arguments: dict[str, Any]) -> None:
+        if "edge_types" in arguments or arguments.get("mode", "calls") != "calls":
+            return
+        function_name = arguments.get("function_name")
+        if not isinstance(function_name, str):
+            return
+        key = (snapshot.index_name, function_name)
+        is_property = self._property_cache.get(key)
+        if is_property is None:
+            is_property = await self._is_property(snapshot, function_name)
+            if is_property is not None:
+                self._property_cache[key] = is_property
+        if is_property:
+            arguments["edge_types"] = list(_PROPERTY_EDGE_TYPES)
+
+    async def _is_property(self, snapshot: Snapshot, function_name: str) -> bool | None:
+        short_name = function_name.rsplit(".", 1)[-1]
+        search_arguments = {
+            "project": snapshot.index_name,
+            "name_pattern": f"^{re.escape(short_name)}$",
+            "fields": list(_PROPERTY_FIELDS),
+            "limit": 51,
+            "format": "json",
+        }
+        if function_name != short_name:
+            search_arguments["qn_pattern"] = f"^{re.escape(function_name)}$"
+        result = await self.upstream.call_tool(
+            "search_graph",
+            search_arguments,
+        )
+        if result.get("isError"):
+            return None
+        data = structured_content(normalize_result("search_graph", result))
+        if data is None or not isinstance(data.get("rows"), list):
+            return None
+        if function_name == short_name and data.get("has_more"):
+            return False
+        matches = [
+            row
+            for row in data["rows"]
+            if isinstance(row, dict)
+            and row.get("name") == short_name
+            and (
+                function_name == short_name
+                or row.get("qn") == function_name
+                or row.get("qualified_name") == function_name
+            )
+        ]
+        return len(matches) == 1 and _property_node(matches[0])
+
+
+def _property_node(row: dict[str, Any]) -> bool:
+    label = row.get("label")
+    if isinstance(label, str) and label.casefold() in {"attribute", "field", "property"}:
+        return True
+    decorators = (*_strings(row.get("decorator_tags")), *_strings(row.get("decorators")))
+    return any(_decorator_name(value) in {"property", "cached_property"} for value in decorators)
+
+
+def _strings(value: Any) -> tuple[str, ...]:
+    if isinstance(value, list):
+        return tuple(item for item in value if isinstance(item, str))
+    if not isinstance(value, str):
+        return ()
+    try:
+        decoded = json.loads(value)
+    except ValueError:
+        return (value,)
+    if isinstance(decoded, list):
+        return tuple(item for item in decoded if isinstance(item, str))
+    return (decoded,) if isinstance(decoded, str) else ()
+
+
+def _decorator_name(value: str) -> str:
+    return value.strip().removeprefix("@").split("(", 1)[0].rsplit(".", 1)[-1]
+
 
 def _public_tool(tool: dict[str, Any]) -> dict[str, Any]:
     public = dict(tool)
@@ -280,6 +362,11 @@ def _public_tool(tool: dict[str, Any]) -> dict[str, Any]:
         schema["required"] = ["project", "diff"]
     description = public.get("description")
     if isinstance(description, str):
+        if public.get("name") == "trace_path":
+            description += (
+                " Default calls-mode traces automatically include USAGE and WRITES for property nodes unless "
+                "edge_types is explicit."
+            )
         description += (
             " A missing selected index returns its asynchronous index_repository state; repeat the same call."
         )
