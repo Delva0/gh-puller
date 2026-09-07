@@ -49,6 +49,59 @@ creating a new, honestly timed observation.
 
 Sources: [gh_puller/github/observations.py](../gh_puller/github/observations.py); [gh_puller/github/collector.py](../gh_puller/github/collector.py)
 
+### Tasks, parents, and facts
+
+A task is a durable instruction for the writer; a fact observation is archived data.
+`parent` is one task kind, named for the Issue or PR whose comments, events, reviews,
+and other child resources it gathers. It is not a fact hierarchy or a promise that
+every related family is ready.
+
+```text
+task -> one or more idempotent publications -> fact observations
+                                               (family, subject_key)
+```
+
+One task may publish several fact identities, and later cycles may publish new
+observations for the same identity. Each publication is atomic, but a parent publishes
+its families as their source operations close rather than holding them for one
+Issue/PR-wide transaction.
+
+| Task kind | Work scope | Direct fact output | Follow-up work |
+| --- | --- | --- | --- |
+| `parent` | One selected Issue or PR | The API and derived families described below | A PR with complete `pull` detail enqueues `pull-git`; structured commit IDs enqueue `commit-object`; a PR without a persisted catalog item also enqueues `closing-issues`. |
+| `closing-issues` | PRs grouped from one catalog page, or one PR without a persisted catalog item | One `(pull-closing-issues, pull:N)` observation per PR | None. |
+| `git-refs` | The repository once per cycle | One `(git-refs, repository)` observation | None. |
+| `pull-git` | One PR | One `(pull-git, pull:N)` observation | None. |
+| `commit-object` | One commit ID; execution may batch many tasks | One `(commit-object, commit:SHA)` observation | None. |
+
+With a readable `issue` root, both Issue and PR parents directly observe `issue`,
+`issue-comments`, `issue-events`, `issue-timeline`, `issue-reactions`, per-comment
+`issue-comment-reactions`, and `commit-references` derived from complete timeline and
+event sources. An Issue parent additionally observes `issue-relations`. A PR parent
+instead adds `pull`, `pull-reviews`, `pull-review-threads`, `pull-review-comments`,
+per-comment `pull-review-comment-reactions`, `pull-commits`, and
+`pull-requested-reviewers`; its complete reviews, review threads, review comments,
+and pull commits also produce `commit-references`.
+
+The catalog page creates one `closing-issues` task for all PR numbers on that page so
+one GraphQL operation can serve several PRs. If a comment signal causes a PR parent
+to run before this cycle has persisted a catalog item for that PR, the parent
+enqueues a single-PR equivalent. Both paths publish the same fact identity.
+
+If the root or a dependency has non-complete coverage, the parent records the
+conclusion it can support and may omit dependent families. Consequently, status
+counts have deliberately operational meanings:
+
+| Status field | Meaning |
+| --- | --- |
+| `PARENTS` | Completed and total `parent` tasks in the displayed cycle. |
+| `TASKS` | Completed and total tasks of every kind in that cycle. |
+| `GIT TASKS` | The `pull-git` and `commit-object` subsets of `TASKS`. |
+| `FACTS current` | Distinct `(family, subject_key)` heads across the archive. |
+| `FACTS observations` | All immutable fact versions across the archive. |
+
+Sources: [gh_puller/github/collector.py](../gh_puller/github/collector.py); [gh_puller/github/syncer.py](../gh_puller/github/syncer.py); [gh_puller/github/monitor.py](../gh_puller/github/monitor.py)
+
 ### Families and API requests
 
 A family is a semantic completeness boundary for readers, not an HTTP endpoint,
@@ -621,11 +674,13 @@ scripts/github-puller-daemon.sh logs archives/vllm.sqlite3
 
 The detail view combines systemd and journald with read-only SQLite state. Its quota
 values are the latest response headers already observed by the writer; status makes
-no GitHub request. `watch` keeps one monitor process alive and reuses archive statistics
-until the database or its WAL changes. `core_aux` is local bookkeeping for reaction and requested-reviewer
-REST routes whose observed headers use a different effective window; it is not a
-promised extra GitHub quota pool. Durable discovery, maintenance, task, fact,
-checkpoint, and last-error state remains visible even when no process is running.
+no GitHub request. `watch` keeps one monitor process alive and reuses archive
+statistics until the database or its WAL changes. `core_aux` is local bookkeeping
+for reaction and requested-reviewer REST routes whose observed headers use a
+different effective window; it is not a promised extra GitHub quota pool. Durable
+discovery, maintenance, task, fact, checkpoint, and last-error state remains visible
+even when no process is running. The operational counters use the definitions in
+[Tasks, parents, and facts](#tasks-parents-and-facts).
 
 `uninstall` removes only the unit and control policy. SQLite, Git objects, `.env`, the
 environment, and source tree remain:
