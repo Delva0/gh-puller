@@ -9,10 +9,9 @@ effort; once a parent item is selected, all promised collections are observed ag
 
 from .api_contract import GitHubAPIError
 from .client import GitHubAPI
-from .git_store import GitStoreError, TransientGitStoreError, git_store_path
+from .git_store import GitStoreError, TransientGitStoreError
 from .maintenance import (
     REFRESH_FAMILIES,
-    GitHubMaintainer,
     MaintenanceResult,
     backfill,
     refresh,
@@ -20,20 +19,14 @@ from .maintenance import (
 from .observations import (
     Coverage,
     FactObservation,
-    MaintenanceJob,
-    MaintenanceTask,
-    ObservationArchive,
     Origin,
-    SyncCycle,
-    SyncTask,
     iter_current_facts,
     iter_facts_as_of,
     iter_observations,
 )
-from .progress import ConsoleProgress, ProgressObserver, RateQuota, SyncProgress
+from .progress import ProgressObserver, RateQuota, SyncProgress
 from .syncer import (
     GitHubSyncConfig,
-    GitHubSyncer,
     IncompleteGitHubDataError,
     SyncResult,
     sync,
@@ -41,30 +34,21 @@ from .syncer import (
 
 __all__ = [
     "REFRESH_FAMILIES",
-    "ConsoleProgress",
     "Coverage",
     "FactObservation",
     "GitHubAPI",
     "GitHubAPIError",
-    "GitHubMaintainer",
     "GitHubSyncConfig",
-    "GitHubSyncer",
     "GitStoreError",
     "IncompleteGitHubDataError",
-    "MaintenanceJob",
     "MaintenanceResult",
-    "MaintenanceTask",
-    "ObservationArchive",
     "Origin",
     "ProgressObserver",
     "RateQuota",
-    "SyncCycle",
     "SyncProgress",
     "SyncResult",
-    "SyncTask",
     "TransientGitStoreError",
     "backfill",
-    "git_store_path",
     "iter_current_facts",
     "iter_facts_as_of",
     "iter_observations",
