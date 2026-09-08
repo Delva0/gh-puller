@@ -6,10 +6,9 @@
  * references before handing leaf-sized batches to the generic CBM importer.
  */
 #include "kga_reader.h"
+#include "kga_sha256.h"
 
-#include "engine/graph_import.h"
-#include "foundation/profile.h"
-#include "foundation/sha256.h"
+#include "sdk/sdk.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -21,6 +20,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 #include <zlib.h>
 
@@ -44,13 +44,42 @@ typedef struct {
 typedef struct {
     int descriptor;
     uint64_t limit;
-    cbm_graph_import_t *import;
+    cbm_sdk_import_t *import;
     char *error;
     size_t error_size;
 } import_context_t;
 
-typedef cbm_graph_import_node_t node_item_t;
-typedef cbm_graph_import_edge_t edge_item_t;
+typedef cbm_sdk_node_t node_item_t;
+typedef cbm_sdk_edge_t edge_item_t;
+
+typedef struct {
+    struct timespec started;
+    bool active;
+} profile_span_t;
+
+static profile_span_t profile_start(void) {
+    const char *profile = getenv("CBM_PROFILE");
+    profile_span_t span = {.active = profile && profile[0] && profile[0] != '0'};
+    if (span.active) {
+        (void)clock_gettime(CLOCK_MONOTONIC, &span.started);
+    }
+    return span;
+}
+
+static void profile_finish(const char *subphase, profile_span_t span, long items) {
+    if (!span.active) {
+        return;
+    }
+    struct timespec finished;
+    (void)clock_gettime(CLOCK_MONOTONIC, &finished);
+    long microseconds = (finished.tv_sec - span.started.tv_sec) * 1000000L +
+                        (finished.tv_nsec - span.started.tv_nsec) / 1000L;
+    long rate = microseconds > 0 ? (long)((double)items * 1000000.0 / (double)microseconds) : 0;
+    (void)fprintf(stderr,
+                  "level=info msg=prof phase=kga_import sub=%s ms=%ld us=%ld items=%ld "
+                  "rate_per_s=%ld\n",
+                  subphase, microseconds / 1000L, microseconds, items, rate);
+}
 
 static int fail(char *error, size_t error_size, const char *format, ...) {
     if (error && error_size > 0) {
@@ -180,11 +209,8 @@ static int page_read(import_context_t *context, const ghp_kga_root_t *reference,
     page->raw[raw_size] = '\0';
     page->raw_size = (size_t)raw_size;
 
-    unsigned char digest[CBM_SHA256_DIGEST_LEN];
-    cbm_sha256_ctx sha256;
-    cbm_sha256_init(&sha256);
-    cbm_sha256_update(&sha256, page->raw, page->raw_size);
-    cbm_sha256_final(&sha256, digest);
+    unsigned char digest[GHP_SHA256_DIGEST_SIZE];
+    ghp_sha256(page->raw, page->raw_size, digest);
     if (memcmp(digest, header + KGA_FRAME_DIGEST_OFFSET, sizeof(digest)) != 0) {
         page_free(page);
         return fail(context->error, context->error_size, "page digest mismatch at %llu",
@@ -303,7 +329,7 @@ static int import_node_leaf(import_context_t *context, yyjson_val *entries, uint
     yyjson_val *entry;
     yyjson_arr_foreach(entries, index, maximum, entry) {
         yyjson_val *attributes = yyjson_arr_get(entry, 1);
-        cbm_graph_import_node_t *row = &items[index];
+        cbm_sdk_node_t *row = &items[index];
         if (!yyjson_is_arr(entry) || yyjson_arr_size(entry) != 2 || !yyjson_is_obj(attributes) ||
             !(row->qualified_name = json_string(yyjson_arr_get(entry, 0))) ||
             !(row->label = json_string(yyjson_obj_get(attributes, "label"))) ||
@@ -329,9 +355,9 @@ static int import_node_leaf(import_context_t *context, yyjson_val *entries, uint
             goto cleanup;
         }
     }
-    cbm_graph_import_status_t imported = cbm_graph_import_add_nodes(
-        context->import, items, (size_t)count, context->error, context->error_size);
-    status = imported == CBM_GRAPH_IMPORT_OK ? 0 : -1;
+    cbm_sdk_status_t imported = cbm_sdk_import_add_nodes(context->import, items, (size_t)count,
+                                                         context->error, context->error_size);
+    status = imported == CBM_SDK_OK ? 0 : -1;
 
 cleanup:
     for (size_t item = 0; item < (size_t)count; item++) {
@@ -356,7 +382,7 @@ static int import_edge_leaf(import_context_t *context, yyjson_val *entries, uint
     yyjson_arr_foreach(entries, index, maximum, entry) {
         yyjson_val *identity = yyjson_arr_get(entry, 0);
         yyjson_val *attributes = yyjson_arr_get(entry, 1);
-        cbm_graph_import_edge_t *row = &items[index];
+        cbm_sdk_edge_t *row = &items[index];
         if (!yyjson_is_arr(entry) || yyjson_arr_size(entry) != 2 || !yyjson_is_arr(identity) ||
             yyjson_arr_size(identity) != 4 || !yyjson_is_obj(attributes) ||
             !(row->source = json_string(yyjson_arr_get(identity, 0))) ||
@@ -381,9 +407,9 @@ static int import_edge_leaf(import_context_t *context, yyjson_val *entries, uint
             goto cleanup;
         }
     }
-    cbm_graph_import_status_t imported = cbm_graph_import_add_edges(
-        context->import, items, (size_t)count, context->error, context->error_size);
-    status = imported == CBM_GRAPH_IMPORT_OK ? 0 : -1;
+    cbm_sdk_status_t imported = cbm_sdk_import_add_edges(context->import, items, (size_t)count,
+                                                         context->error, context->error_size);
+    status = imported == CBM_SDK_OK ? 0 : -1;
 
 cleanup:
     for (size_t item = 0; item < (size_t)count; item++) {
@@ -499,19 +525,19 @@ int ghp_kga_import_snapshot(const ghp_kga_snapshot_t *snapshot, char *error, siz
         return fail(error, error_size, "KGA archive identity changed before native load");
     }
 
-    cbm_graph_import_options_t options = {
+    cbm_sdk_import_options_t options = {
         .project = snapshot->project,
         .root_path = snapshot->archive_path,
         .source_digest = snapshot->graph_digest,
-        .final_db_path = snapshot->database_path,
+        .database_path = snapshot->database_path,
         .node_count = snapshot->node_count,
         .edge_count = snapshot->edge_count,
         .unordered_identities = true,
         .prevalidated_unique_identities = true,
     };
-    cbm_graph_import_t *import = NULL;
-    cbm_graph_import_status_t begun = cbm_graph_import_begin(&options, &import, error, error_size);
-    if (begun != CBM_GRAPH_IMPORT_OK) {
+    cbm_sdk_import_t *import = NULL;
+    cbm_sdk_status_t begun = cbm_sdk_import_begin(&options, &import, error, error_size);
+    if (begun != CBM_SDK_OK) {
         (void)close(descriptor);
         return -1;
     }
@@ -522,23 +548,22 @@ int ghp_kga_import_snapshot(const ghp_kga_snapshot_t *snapshot, char *error, siz
         .error = error,
         .error_size = error_size,
     };
-    CBM_PROF_START(nodes_started);
+    profile_span_t nodes_started = profile_start();
     int result = import_tree(&context, &snapshot->node_root, "nodes", NULL, 0);
-    CBM_PROF_END_N("kga_import", "nodes", nodes_started, snapshot->node_count);
+    profile_finish("nodes", nodes_started, snapshot->node_count);
     if (result == 0 && snapshot->edge_root.present) {
-        CBM_PROF_START(edges_started);
+        profile_span_t edges_started = profile_start();
         result = import_tree(&context, &snapshot->edge_root, "edges", NULL, 0);
-        CBM_PROF_END_N("kga_import", "edges", edges_started, snapshot->edge_count);
+        profile_finish("edges", edges_started, snapshot->edge_count);
     }
     if (result == 0) {
-        CBM_PROF_START(finish_started);
-        if (cbm_graph_import_finish(import, NULL, error, error_size) != CBM_GRAPH_IMPORT_OK) {
+        profile_span_t finish_started = profile_start();
+        if (cbm_sdk_import_finish(import, NULL, error, error_size) != CBM_SDK_OK) {
             result = -1;
         }
-        CBM_PROF_END_N("kga_import", "finish", finish_started,
-                       snapshot->node_count + snapshot->edge_count);
+        profile_finish("finish", finish_started, snapshot->node_count + snapshot->edge_count);
     }
-    cbm_graph_import_free(import);
+    cbm_sdk_import_free(import);
     (void)close(descriptor);
     return result;
 }

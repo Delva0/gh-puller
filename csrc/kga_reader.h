@@ -1,5 +1,5 @@
 /*
- * kga_reader.h — Stream one immutable KGA graph snapshot into the CBM engine.
+ * kga_reader.h — Stream one immutable KGA graph snapshot through the CBM SDK.
  *
  * Python owns archive index and commit selection. This boundary receives only
  * the captured file identity and Merkle roots; bulk pages stay in native code.

@@ -1,36 +1,35 @@
-# Build the KGA-to-CBM tool helper against the transport-neutral CBM engine.
+# Build the KGA-to-CBM tool helper against the public CBM SDK.
 
 CBM_ROOT ?= ../codebase-memory-mcp
 BUILD_DIR ?= build/native
 CSRC_DIR = csrc
 TARGET = $(BUILD_DIR)/gh-puller-cbm-helper
-CBM_ENGINE = $(CBM_ROOT)/build/c/libcbm-engine.a
+CBM_SDK = $(CBM_ROOT)/build/c/libcbm-sdk.a
 CBM_MIMALLOC = $(CBM_ROOT)/build/c/prod_mimalloc.o
 
 CC ?= cc
 CFLAGS = -std=c11 -D_DEFAULT_SOURCE -D_GNU_SOURCE -O2 -Wall -Wextra -Werror \
 	-Wno-unused-parameter -Wno-sign-compare -Wdate-time \
-	-I$(CBM_ROOT)/src -I$(CBM_ROOT)/vendored \
-	-I$(CBM_ROOT)/vendored/sqlite3 -I$(CBM_ROOT)/vendored/mimalloc/include
+	-I$(CBM_ROOT)/src -I$(CBM_ROOT)/vendored
 LDFLAGS = -lm -lstdc++ -lpthread -lz -Wl,-z,noexecstack -Wl,-z,separate-code
-SOURCES = cbm_archive_helper.c kga_reader.c
+SOURCES = cbm_archive_helper.c kga_reader.c kga_sha256.c
 OBJECTS = $(SOURCES:%.c=$(BUILD_DIR)/%.o)
 DEPS = $(OBJECTS:.o=.d)
 
-.PHONY: native-helper cbm-engine
+.PHONY: native-helper cbm-sdk
 
 native-helper: $(TARGET)
 	$(TARGET) --version
 
-cbm-engine:
-	$(MAKE) -C $(CBM_ROOT) -f Makefile.cbm cbm-engine build/c/prod_mimalloc.o
+cbm-sdk:
+	$(MAKE) -C $(CBM_ROOT) -f Makefile.cbm cbm-sdk build/c/prod_mimalloc.o
 
 $(BUILD_DIR)/%.o: $(CSRC_DIR)/%.c Makefile.native
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
 
-$(TARGET): $(OBJECTS) cbm-engine
-	$(CC) $(CFLAGS) -o $@ $(OBJECTS) $(CBM_ENGINE) $(CBM_MIMALLOC) $(LDFLAGS)
+$(TARGET): $(OBJECTS) cbm-sdk
+	$(CC) $(CFLAGS) -o $@ $(OBJECTS) $(CBM_SDK) $(CBM_MIMALLOC) $(LDFLAGS)
 	@if nm $@ | grep -Eq 'tree_sitter_|cbm_mcp_server_|cbm_daemon_|cbm_pipeline_run'; then \
 		echo "ERROR: native helper links a forbidden CBM subsystem"; exit 1; fi
 

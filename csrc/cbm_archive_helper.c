@@ -1,5 +1,5 @@
 /*
- * cbm_archive_helper.c — Serve persistent KGA loads through the native CBM engine.
+ * cbm_archive_helper.c — Serve persistent KGA loads through the public CBM SDK.
  *
  * Control messages are length-prefixed JSON. Graph rows never cross the
  * protocol: the helper reads KGA pages directly and keeps the resulting
@@ -7,10 +7,7 @@
  */
 #include "kga_reader.h"
 
-#include "engine/tool_runtime.h"
-#include "foundation/log.h"
-#include "foundation/profile.h"
-#include "store/store.h"
+#include "sdk/sdk.h"
 
 #include <limits.h>
 #include <stdbool.h>
@@ -29,8 +26,7 @@ enum {
 };
 
 typedef struct {
-    cbm_store_t *store;
-    char *project;
+    cbm_sdk_graph_t *graph;
     char *database_path;
     char *graph_digest;
     int node_count;
@@ -129,13 +125,13 @@ static char *hello_response(uint64_t id) {
     yyjson_mut_arr_add_str(document, capabilities, "archive-load");
     yyjson_mut_arr_add_str(document, capabilities, "tool-call");
     yyjson_mut_val *tools = yyjson_mut_arr(document);
-    for (size_t index = 0; index < cbm_engine_tool_count(); index++) {
-        yyjson_mut_arr_add_str(document, tools, cbm_engine_tool_name(index));
+    for (size_t index = 0; index < cbm_sdk_graph_tool_count(); index++) {
+        yyjson_mut_arr_add_str(document, tools, cbm_sdk_graph_tool_name(index));
     }
     yyjson_mut_obj_add_int(document, result, "protocol", NATIVE_PROTOCOL_VERSION);
     yyjson_mut_obj_add_int(document, result, "kga_format", KGA_FORMAT_VERSION);
     yyjson_mut_obj_add_int(document, result, "graph_fidelity", KGA_FIDELITY_VERSION);
-    yyjson_mut_obj_add_int(document, result, "store_format", CBM_INDEX_FORMAT_VERSION);
+    yyjson_mut_obj_add_int(document, result, "store_format", cbm_sdk_store_format_version());
     yyjson_mut_obj_add_val(document, result, "capabilities", capabilities);
     yyjson_mut_obj_add_val(document, result, "tools", tools);
     yyjson_mut_obj_add_val(document, root, "result", result);
@@ -198,29 +194,25 @@ static bool parse_snapshot(yyjson_val *parameters, ghp_kga_snapshot_t *snapshot,
 }
 
 static void session_clear(helper_session_t *session) {
-    cbm_store_close(session->store);
-    free(session->project);
+    cbm_sdk_graph_close(session->graph);
     free(session->database_path);
     free(session->graph_digest);
     memset(session, 0, sizeof(*session));
 }
 
-static bool session_install(helper_session_t *session, cbm_store_t *store, const char *project,
+static bool session_install(helper_session_t *session, cbm_sdk_graph_t *graph,
                             const char *database_path, const char *graph_digest, int node_count,
                             int edge_count) {
-    char *saved_project = strdup(project);
     char *saved_database = strdup(database_path);
     char *saved_digest = strdup(graph_digest);
-    if (!saved_project || !saved_database || !saved_digest) {
-        free(saved_project);
+    if (!saved_database || !saved_digest) {
         free(saved_database);
         free(saved_digest);
-        cbm_store_close(store);
+        cbm_sdk_graph_close(graph);
         return false;
     }
     session_clear(session);
-    session->store = store;
-    session->project = saved_project;
+    session->graph = graph;
     session->database_path = saved_database;
     session->graph_digest = saved_digest;
     session->node_count = node_count;
@@ -228,18 +220,19 @@ static bool session_install(helper_session_t *session, cbm_store_t *store, const
     return true;
 }
 
-static cbm_store_t *open_expected_store(const ghp_kga_snapshot_t *snapshot) {
-    cbm_store_t *store = cbm_store_open_path_query(snapshot->database_path);
-    cbm_project_t project = {0};
-    if (!store || cbm_store_get_project(store, snapshot->project, &project) != CBM_STORE_OK ||
-        cbm_store_count_nodes(store, snapshot->project) != snapshot->node_count ||
-        cbm_store_count_edges(store, snapshot->project) != snapshot->edge_count) {
-        cbm_project_free_fields(&project);
-        cbm_store_close(store);
+static cbm_sdk_graph_t *open_expected_graph(const ghp_kga_snapshot_t *snapshot) {
+    cbm_sdk_graph_t *graph = NULL;
+    int nodes = 0;
+    int edges = 0;
+    char error[256];
+    if (cbm_sdk_graph_open(snapshot->database_path, snapshot->project, &graph, error,
+                           sizeof(error)) != CBM_SDK_OK ||
+        cbm_sdk_graph_counts(graph, &nodes, &edges) != CBM_SDK_OK ||
+        nodes != snapshot->node_count || edges != snapshot->edge_count) {
+        cbm_sdk_graph_close(graph);
         return NULL;
     }
-    cbm_project_free_fields(&project);
-    return store;
+    return graph;
 }
 
 static char *load_response(uint64_t id, helper_session_t *session, yyjson_val *parameters) {
@@ -248,25 +241,26 @@ static char *load_response(uint64_t id, helper_session_t *session, yyjson_val *p
     if (!parse_snapshot(parameters, &snapshot, &reuse)) {
         return error_response(id, "invalid_request", "invalid archive load parameters");
     }
-    bool already_loaded = session->store && strcmp(session->project, snapshot.project) == 0 &&
+    bool already_loaded = session->graph &&
+                          strcmp(cbm_sdk_graph_project(session->graph), snapshot.project) == 0 &&
                           strcmp(session->database_path, snapshot.database_path) == 0 &&
                           strcmp(session->graph_digest, snapshot.graph_digest) == 0;
     bool materialized = false;
     if (!already_loaded) {
-        cbm_store_t *candidate = reuse ? open_expected_store(&snapshot) : NULL;
+        cbm_sdk_graph_t *candidate = reuse ? open_expected_graph(&snapshot) : NULL;
         if (!candidate) {
             char error[1024];
             if (ghp_kga_import_snapshot(&snapshot, error, sizeof(error)) != 0) {
                 return error_response(id, "archive_load_failed", error);
             }
             materialized = true;
-            candidate = open_expected_store(&snapshot);
+            candidate = open_expected_graph(&snapshot);
         }
         if (!candidate) {
             return error_response(id, "store_open_failed", "materialized CBM store is invalid");
         }
-        if (!session_install(session, candidate, snapshot.project, snapshot.database_path,
-                             snapshot.graph_digest, snapshot.node_count, snapshot.edge_count)) {
+        if (!session_install(session, candidate, snapshot.database_path, snapshot.graph_digest,
+                             snapshot.node_count, snapshot.edge_count)) {
             return error_response(id, "allocation_failed", "cannot retain loaded graph state");
         }
     }
@@ -290,12 +284,12 @@ static char *load_response(uint64_t id, helper_session_t *session, yyjson_val *p
 static char *tool_response(uint64_t id, helper_session_t *session, yyjson_val *parameters) {
     const char *name = NULL;
     yyjson_val *arguments = NULL;
-    if (!yyjson_is_obj(parameters) ||
-        !(name = json_string(yyjson_obj_get(parameters, "name"))) || !name[0] ||
-        !(arguments = yyjson_obj_get(parameters, "arguments")) || !yyjson_is_obj(arguments)) {
+    if (!yyjson_is_obj(parameters) || !(name = json_string(yyjson_obj_get(parameters, "name"))) ||
+        !name[0] || !(arguments = yyjson_obj_get(parameters, "arguments")) ||
+        !yyjson_is_obj(arguments)) {
         return error_response(id, "invalid_request", "tool call requires name and arguments");
     }
-    if (!session->store) {
+    if (!session->graph) {
         return error_response(id, "no_graph", "load an archive graph before calling a tool");
     }
 
@@ -303,14 +297,14 @@ static char *tool_response(uint64_t id, helper_session_t *session, yyjson_val *p
     if (!arguments_json) {
         return error_response(id, "allocation_failed", "cannot encode tool arguments");
     }
-    cbm_engine_tool_result_t tool_result = {0};
-    cbm_engine_tool_status_t status = cbm_engine_call_tool(
-        session->store, session->project, name, arguments_json, &tool_result);
+    cbm_sdk_result_t tool_result = {0};
+    cbm_sdk_status_t status =
+        cbm_sdk_graph_call(session->graph, name, arguments_json, &tool_result);
     free(arguments_json);
-    if (status != CBM_ENGINE_TOOL_OK) {
-        char *response = error_response(id, cbm_engine_tool_status_code(status),
+    if (status != CBM_SDK_OK) {
+        char *response = error_response(id, cbm_sdk_status_code(status),
                                         tool_result.error ? tool_result.error : "tool call failed");
-        cbm_engine_tool_result_free(&tool_result);
+        cbm_sdk_result_free(&tool_result);
         return response;
     }
     size_t result_size = strlen(tool_result.json);
@@ -324,7 +318,7 @@ static char *tool_response(uint64_t id, helper_session_t *session, yyjson_val *p
             response = NULL;
         }
     }
-    cbm_engine_tool_result_free(&tool_result);
+    cbm_sdk_result_free(&tool_result);
     return response;
 }
 
@@ -419,8 +413,7 @@ int main(int argc, char **argv) {
         (void)fprintf(stderr, "usage: %s [--version]\n", argv[0]);
         return 2;
     }
-    cbm_log_init_from_env();
-    cbm_profile_init();
+    cbm_sdk_initialize_from_env();
     (void)setvbuf(stdout, NULL, _IONBF, 0);
 
     helper_session_t session = {0};
