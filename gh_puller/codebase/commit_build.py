@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING
 
 from .errors import BuildError
 from .git_tree import changed_paths, materialize_full
+from .graph_reader import GraphReader
 from .kga_recorder import KGACommit
 
 if TYPE_CHECKING:
@@ -21,7 +22,6 @@ if TYPE_CHECKING:
 
     from .build_plan import BuildPlan
     from .cbm_runner import CBMRunner
-    from .graph_reader import GraphReader
     from .kga_recorder import KGARecorder
 
 
@@ -56,13 +56,12 @@ def _recover_committed_pending(runner: CBMRunner, recorder: KGARecorder) -> None
 
 
 def build_commit(
-    repo: str | Path,
     target: CommitTarget,
     plan: BuildPlan,
-    runner: CBMRunner,
-    reader: GraphReader,
     recorder: KGARecorder,
     *,
+    repo: str | Path,
+    runner: CBMRunner,
     force_snapshot: bool = False,
     metadata: Mapping[str, object] | None = None,
     on_stage: Callable[[str], None] | None = None,
@@ -70,12 +69,11 @@ def build_commit(
     """Build one selected Git commit into a specified KGA.
 
     Args:
-        repo: Source Git repository containing ``target``.
         target: Commit identity, archive position, and preceding selected commit.
         plan: CBM coverage and full/delta policy for this commit only.
-        runner: Reusable CBM process and build state owner.
-        reader: Exact reader bound to the runner's published project database.
         recorder: KGA transaction receiving this generation.
+        repo: Source Git repository containing ``target``.
+        runner: Reusable CBM process and build state owner.
         force_snapshot: Disable the generation-diff optimization for this commit.
         metadata: Additional immutable CBM provenance stored in the manifest.
         on_stage: Optional callback receiving materialize, index, capture, and record stages.
@@ -84,11 +82,10 @@ def build_commit(
         Durable manifest, stage timings, and CBM execution evidence.
 
     Raises:
-        BuildError: Components disagree about the project, archive position, or
-            an interrupted commit.
+        BuildError: The target disagrees with the archive position or an
+            interrupted commit.
     """
-    if reader.db_path != runner.db_path or reader.project != runner.project:
-        raise BuildError("graph reader is not bound to the CBM runner")
+    reader = GraphReader(runner.db_path, runner.project)
     if target.ordinal != len(recorder.commits):
         raise BuildError(
             f"commit ordinal {target.ordinal} does not match KGA position {len(recorder.commits)}",

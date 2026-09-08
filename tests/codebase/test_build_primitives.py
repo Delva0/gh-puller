@@ -164,23 +164,20 @@ def test_build_commit_is_the_shared_full_and_delta_operation(tmp_path):
     second = git(repo, "rev-parse", "HEAD")
 
     runner = PublishingRunner(tmp_path / "runner")
-    reader = GraphReader(runner.db_path, runner.project)
     recorder = KGARecorder(tmp_path / "archive.kga")
     full = build_commit(
-        repo,
         CommitTarget(0, first, (), None),
         BuildPlan(route="full"),
-        runner,
-        reader,
         recorder,
+        repo=repo,
+        runner=runner,
     )
     delta = build_commit(
-        repo,
         CommitTarget(1, second, (first,), first),
         BuildPlan(route="delta"),
-        runner,
-        reader,
         recorder,
+        repo=repo,
+        runner=runner,
     )
     recorder.finalize()
 
@@ -207,24 +204,21 @@ def test_build_commit_recovers_a_cbm_generation_pending_kga_capture(tmp_path):
     second = git(repo, "rev-parse", "HEAD")
 
     runner = PublishingRunner(tmp_path / "runner")
-    reader = GraphReader(runner.db_path, runner.project)
     recorder = KGARecorder(tmp_path / "archive.kga")
     build_commit(
-        repo,
         CommitTarget(0, first, (), None),
         BuildPlan(route="full"),
-        runner,
-        reader,
         recorder,
+        repo=repo,
+        runner=runner,
     )
     runner.pending_commit = second
     result = build_commit(
-        repo,
         CommitTarget(1, second, (first,), first),
         BuildPlan(route="delta"),
-        runner,
-        reader,
         recorder,
+        repo=repo,
+        runner=runner,
     )
     recorder.finalize()
 

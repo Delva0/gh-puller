@@ -25,7 +25,6 @@ from .cbm_transport import CBMTransportError
 from .commit_build import CommitTarget, build_commit
 from .errors import BuildError
 from .git_tree import TreeError
-from .graph_reader import GraphReader
 from .incremental_config import IncrementalConfig, IncrementalConfigError, add_incremental_arguments
 from .kga_recorder import KGARecorder
 
@@ -318,7 +317,6 @@ def _build_repository(options: BuildOptions, build_dir: Path, plans: PlanSelecto
             memory_limit=options.memory_limit,
             transport=options.cbm_transport,
         )
-        reader = GraphReader(runner.db_path, project)
         recorder = KGARecorder(archive_path, compression_level=options.compression_level)
         resume_aligned = recorder.latest_commit is not None and runner.current_commit == recorder.latest_commit
 
@@ -330,12 +328,11 @@ def _build_repository(options: BuildOptions, build_dir: Path, plans: PlanSelecto
             plan_key = f"{plan.analysis_mode}:{plan.route}:{plan.incremental.digest()[:12]}"
             plan_counts[plan_key] = plan_counts.get(plan_key, 0) + 1
             result = build_commit(
-                repo,
                 target,
                 plan,
-                runner,
-                reader,
                 recorder,
+                repo=repo,
+                runner=runner,
                 force_snapshot=binary_upgrade,
                 on_stage=lambda stage, commit_sha=sha: progress.stage(commit_sha, stage),
             )
