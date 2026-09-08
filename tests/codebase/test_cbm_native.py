@@ -120,6 +120,7 @@ def write_archive(path: Path, project: str = "native-test") -> tuple[dict, Graph
         {
             (project, newline, "CONTAINS", ""): {"properties": {}},
             (project, bang, "CONTAINS", ""): {"properties": {}},
+            (newline, bang, "CALLS", ""): {"properties": {}},
         },
     )
     writer = ArchiveWriter(path)
@@ -318,6 +319,11 @@ def test_real_native_helper_restores_exact_rows_and_reuses_cache(tmp_path):
         searched = first.search_graph(loaded, label="Function", fields=["ratio"], limit=10)
         ranked = first.search_graph(loaded, query="native needle", limit=10)
         schema = first.call_json_tool("get_graph_schema", target=loaded)
+        traced = first.trace_path(
+            loaded,
+            function_name="newline",
+            direction="outbound",
+        )
         restored = load_rows(loaded.database_path, "real-native")
     with CBMClient(native_helper=helper, cache_root=cache, timeout=30) as second:
         reused = second.load_archive(archive_path)
@@ -338,6 +344,10 @@ def test_real_native_helper_restores_exact_rows_and_reuses_cache(tmp_path):
     assert ranked["search_mode"] == "bm25"
     assert ranked["rows"][0][0] == "real-native.mod.unit.a\n"
     assert {item["label"] for item in schema["node_labels"]} >= {"Project", "Function"}
+    assert traced["callees_total"] == 1
+    assert traced["callees"]["groups"] == [
+        {"qn_prefix": "real-native.mod.unit", "rows": [["a!", 1]]},
+    ]
     assert reused.materialized is False
 
 
