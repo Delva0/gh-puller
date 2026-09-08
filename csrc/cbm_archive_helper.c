@@ -1,9 +1,9 @@
 /*
- * cbm_archive_helper.c — Serve persistent KGA loads through the public CBM SDK.
+ * cbm_archive_helper.c — Serve native CBM operations through the public SDK.
  *
  * Control messages are length-prefixed JSON. Bulk snapshot rows never cross the
- * protocol: the helper reads KGA pages directly and keeps the resulting
- * immutable SQLite store open across queries.
+ * protocol: the compact build reads KGA pages and keeps the resulting immutable
+ * store open, while the full build also exposes the repository pipeline.
  */
 #include "kga_reader.h"
 
@@ -18,8 +18,13 @@
 
 #include <yyjson/yyjson.h>
 
+#ifdef GHP_NATIVE_INDEXING
+#define NATIVE_PROTOCOL_VERSION 7
+#else
+#define NATIVE_PROTOCOL_VERSION 6
+#endif
+
 enum {
-    NATIVE_PROTOCOL_VERSION = 6,
     KGA_FORMAT_VERSION = 5,
     KGA_GRAPH_FIDELITY_VERSION = 2,
     KGA_COVERAGE_FIDELITY_VERSION = 1,
@@ -129,6 +134,12 @@ static char *hello_response(uint64_t id) {
     yyjson_mut_arr_add_str(document, capabilities, "archive-load");
     yyjson_mut_arr_add_str(document, capabilities, "tool-call");
     yyjson_mut_arr_add_str(document, capabilities, "graph-compare");
+#ifdef GHP_NATIVE_INDEXING
+    yyjson_mut_arr_add_str(document, capabilities, "repository-index");
+    yyjson_mut_arr_add_str(document, capabilities, "project-delete");
+    yyjson_mut_arr_add_str(document, capabilities, "granular-delta-controls");
+    yyjson_mut_arr_add_str(document, capabilities, "force-full-route");
+#endif
     yyjson_mut_val *tools = yyjson_mut_arr(document);
     for (size_t index = 0; index < cbm_sdk_graph_tool_count(); index++) {
         yyjson_mut_arr_add_str(document, tools, cbm_sdk_graph_tool_name(index));
@@ -374,6 +385,166 @@ static char *sdk_result_response(uint64_t id, cbm_sdk_status_t status, cbm_sdk_r
     return response;
 }
 
+#ifdef GHP_NATIVE_INDEXING
+typedef struct {
+    cbm_sdk_index_options_t options;
+    cbm_sdk_index_delta_options_t delta;
+    const char **targets;
+} parsed_index_t;
+
+static bool json_bool(yyjson_val *value, bool *output) {
+    if (!yyjson_is_bool(value)) {
+        return false;
+    }
+    *output = yyjson_get_bool(value);
+    return true;
+}
+
+static bool parse_index_mode(const char *mode, cbm_sdk_index_mode_t *output) {
+    if (strcmp(mode, "full") == 0) {
+        *output = CBM_SDK_INDEX_FULL;
+    } else if (strcmp(mode, "moderate") == 0) {
+        *output = CBM_SDK_INDEX_MODERATE;
+    } else if (strcmp(mode, "fast") == 0) {
+        *output = CBM_SDK_INDEX_FAST;
+    } else if (strcmp(mode, "cross-repo-intelligence") == 0) {
+        *output = CBM_SDK_INDEX_CROSS_REPO;
+    } else {
+        return false;
+    }
+    return true;
+}
+
+static bool parse_delta_options(yyjson_val *value, cbm_sdk_index_delta_options_t *options) {
+    const char *closure_overflow = NULL;
+    const char *dependent_scope = NULL;
+    const char *new_surface = NULL;
+    const char *pair_outputs = NULL;
+    const char *pair_input_missing = NULL;
+    if (!yyjson_is_obj(value) ||
+        !(closure_overflow = json_string(yyjson_obj_get(value, "closure_overflow"))) ||
+        !(dependent_scope = json_string(yyjson_obj_get(value, "dependent_scope"))) ||
+        !(new_surface = json_string(yyjson_obj_get(value, "new_surface"))) ||
+        !(pair_outputs = json_string(yyjson_obj_get(value, "pair_outputs"))) ||
+        !(pair_input_missing = json_string(yyjson_obj_get(value, "pair_input_missing"))) ||
+        !json_int(yyjson_obj_get(value, "closure_cost_percent"), &options->closure_cost_percent) ||
+        !json_int(yyjson_obj_get(value, "reference_fanout_cap"), &options->reference_fanout_cap) ||
+        !json_int(yyjson_obj_get(value, "pair_refresh_budget"), &options->lazy_pair_budget) ||
+        (strcmp(closure_overflow, "full") != 0 && strcmp(closure_overflow, "repair") != 0) ||
+        (strcmp(dependent_scope, "file") != 0 && strcmp(dependent_scope, "symbol") != 0) ||
+        (strcmp(new_surface, "full") != 0 && strcmp(new_surface, "bounded") != 0) ||
+        (strcmp(pair_outputs, "eager") != 0 && strcmp(pair_outputs, "lazy") != 0) ||
+        (strcmp(pair_input_missing, "full") != 0 && strcmp(pair_input_missing, "skip") != 0)) {
+        return false;
+    }
+    options->struct_size = sizeof(*options);
+    options->repair_over_budget = strcmp(closure_overflow, "repair") == 0;
+    options->symbol_dependents = strcmp(dependent_scope, "symbol") == 0;
+    options->bounded_new_surface = strcmp(new_surface, "bounded") == 0;
+    options->lazy_pair_outputs = strcmp(pair_outputs, "lazy") == 0;
+    options->skip_pair_input_missing = strcmp(pair_input_missing, "skip") == 0;
+    return true;
+}
+
+static bool parse_index_targets(yyjson_val *value, parsed_index_t *parsed) {
+    if (!yyjson_is_arr(value)) {
+        return false;
+    }
+    size_t count = yyjson_arr_size(value);
+    if (count == 0 || count > 4096) {
+        return false;
+    }
+    parsed->targets = calloc(count, sizeof(*parsed->targets));
+    if (!parsed->targets) {
+        return false;
+    }
+    size_t index = 0;
+    size_t maximum = 0;
+    yyjson_val *target = NULL;
+    yyjson_arr_foreach(value, index, maximum, target) {
+        if (!(parsed->targets[index] = json_string(target)) || !parsed->targets[index][0]) {
+            return false;
+        }
+    }
+    parsed->options.target_projects = parsed->targets;
+    parsed->options.target_project_count = count;
+    return true;
+}
+
+static bool parse_index(yyjson_val *parameters, parsed_index_t *parsed) {
+    memset(parsed, 0, sizeof(*parsed));
+    const char *mode = NULL;
+    bool persistence = false;
+    bool force_full = false;
+    if (!yyjson_is_obj(parameters) ||
+        !(parsed->options.repo_path = json_string(yyjson_obj_get(parameters, "repo_path"))) ||
+        !(parsed->options.project = json_string(yyjson_obj_get(parameters, "project"))) ||
+        !(mode = json_string(yyjson_obj_get(parameters, "mode"))) ||
+        !json_bool(yyjson_obj_get(parameters, "persistence"), &persistence) ||
+        !json_bool(yyjson_obj_get(parameters, "force_full"), &force_full) ||
+        !parsed->options.repo_path[0] || !parsed->options.project[0] ||
+        !parse_index_mode(mode, &parsed->options.mode)) {
+        return false;
+    }
+    parsed->options.struct_size = sizeof(parsed->options);
+    parsed->options.persistence = persistence;
+    parsed->options.force_full = force_full;
+    yyjson_val *delta = yyjson_obj_get(parameters, "incremental_controls");
+    if (delta && !yyjson_is_null(delta)) {
+        if (!parse_delta_options(delta, &parsed->delta)) {
+            return false;
+        }
+        parsed->options.delta = &parsed->delta;
+    }
+    if (parsed->options.mode == CBM_SDK_INDEX_CROSS_REPO) {
+        parsed->options.cache_directory =
+            json_string(yyjson_obj_get(parameters, "cache_directory"));
+        return parsed->options.cache_directory && parsed->options.cache_directory[0] &&
+               parse_index_targets(yyjson_obj_get(parameters, "target_projects"), parsed);
+    }
+    parsed->options.database_path = json_string(yyjson_obj_get(parameters, "database_path"));
+    return parsed->options.database_path && parsed->options.database_path[0];
+}
+
+static char *index_response(uint64_t id, helper_session_t *session, yyjson_val *parameters) {
+    parsed_index_t parsed;
+    if (!parse_index(parameters, &parsed)) {
+        free(parsed.targets);
+        return error_response(id, "invalid_request", "invalid repository index parameters");
+    }
+    char error[1024];
+    cbm_sdk_index_t *index = NULL;
+    cbm_sdk_status_t status = cbm_sdk_index_begin(&parsed.options, &index, error, sizeof(error));
+    free(parsed.targets);
+    if (status != CBM_SDK_OK) {
+        return error_response(id, cbm_sdk_status_code(status), error);
+    }
+    session_clear(session);
+    cbm_sdk_result_t result = {0};
+    status = cbm_sdk_index_run(index, &result);
+    cbm_sdk_index_free(index);
+    return sdk_result_response(id, status, &result);
+}
+
+static char *delete_response(uint64_t id, helper_session_t *session, yyjson_val *parameters) {
+    const char *database_path = NULL;
+    const char *project = NULL;
+    if (!yyjson_is_obj(parameters) ||
+        !(database_path = json_string(yyjson_obj_get(parameters, "database_path"))) ||
+        !(project = json_string(yyjson_obj_get(parameters, "project"))) || !database_path[0] ||
+        !project[0]) {
+        return error_response(id, "invalid_request",
+                              "project delete requires database_path and project");
+    }
+    if (session->database_path && strcmp(session->database_path, database_path) == 0) {
+        session_clear(session);
+    }
+    cbm_sdk_result_t result = {0};
+    cbm_sdk_status_t status = cbm_sdk_delete_project(database_path, project, &result);
+    return sdk_result_response(id, status, &result);
+}
+#endif
+
 static char *tool_response(uint64_t id, helper_session_t *session, yyjson_val *parameters) {
     const char *name = NULL;
     yyjson_val *arguments = NULL;
@@ -478,6 +649,14 @@ static char *dispatch_request(helper_session_t *session, yyjson_val *request, bo
     if (strcmp(method, "compare") == 0) {
         return compare_response(id, parameters);
     }
+#ifdef GHP_NATIVE_INDEXING
+    if (strcmp(method, "index") == 0) {
+        return index_response(id, session, parameters);
+    }
+    if (strcmp(method, "delete") == 0) {
+        return delete_response(id, session, parameters);
+    }
+#endif
     if (strcmp(method, "shutdown") == 0) {
         *shutdown = true;
         yyjson_mut_val *root = NULL;

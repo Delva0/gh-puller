@@ -95,6 +95,7 @@ class BuildOptions:
     memory_limit: int | None = None
     timeout: int = 3600
     cbm_transport: str = "persistent-mcp"
+    target_projects: tuple[str, ...] = ()
     allow_cbm_upgrade: bool = False
 
 
@@ -227,6 +228,7 @@ def _legacy_plan(options: BuildOptions) -> BuildPlan:
             analysis_mode=options.mode,
             route="full" if options.force_full else "delta",
             incremental=options.incremental,
+            target_projects=options.target_projects,
         )
     except (IncrementalConfigError, ValueError) as exc:
         raise BuildError(f"invalid build plan: {exc}") from exc
@@ -608,11 +610,21 @@ def add_build_arguments(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help="ask CBM to bypass noop/delta routing for every selected commit",
     )
+    parser.add_argument(
+        "--target-project",
+        action="append",
+        default=[],
+        help="cross-repository target project; repeat for multiple targets",
+    )
     parser.add_argument("--compression-level", type=int, default=1)
     parser.add_argument("--max-commits", type=int)
     parser.add_argument("--memory-limit", type=int)
     parser.add_argument("--timeout", type=int, default=3600)
-    parser.add_argument("--cbm-transport", choices=("cli", "persistent-mcp"), default="persistent-mcp")
+    parser.add_argument(
+        "--cbm-transport",
+        choices=("native", "cli", "persistent-mcp"),
+        default="persistent-mcp",
+    )
     parser.add_argument(
         "--allow-cbm-upgrade",
         action="store_true",
@@ -642,6 +654,7 @@ def _options_from_namespace(args: argparse.Namespace) -> BuildOptions:
         memory_limit=args.memory_limit,
         timeout=args.timeout,
         cbm_transport=args.cbm_transport,
+        target_projects=tuple(args.target_project),
         allow_cbm_upgrade=bool(args.allow_cbm_upgrade),
     )
 

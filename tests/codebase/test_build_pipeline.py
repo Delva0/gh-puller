@@ -4,6 +4,9 @@ import json
 import os
 import sqlite3
 import subprocess
+from pathlib import Path
+
+import pytest
 
 import gh_puller.codebase.cbm._runner as runner_module
 from gh_puller.codebase.archive import Archive
@@ -62,13 +65,22 @@ class PublishingClient:
     def capabilities(self):
         return frozenset({"persistent-mcp", "granular-delta-controls", "force-full-route"})
 
-    def index_repository(self, tree, project, mode, *, force_full, incremental_controls):
+    def index_repository(
+        self,
+        tree,
+        project,
+        mode,
+        *,
+        force_full,
+        incremental_controls,
+        target_projects,
+    ):
         self.cache_root.mkdir(parents=True, exist_ok=True)
         database = self.cache_root / f"{project}.db"
         replacement = self.cache_root / f".{project}.next"
         write_generation(replacement, project, (tree / "symbol.txt").read_text().strip())
         os.replace(replacement, database)
-        self.calls.append((mode, force_full, incremental_controls))
+        self.calls.append((mode, force_full, incremental_controls, target_projects))
         return {"route": "full" if force_full else "closure_repair"}
 
     def delete_project(self, project):
@@ -133,3 +145,45 @@ def test_repository_pipeline_selects_a_plan_for_each_commit(tmp_path, monkeypatc
     assert len(clients) == 1
     assert len(clients[0].calls) == 3
     assert clients[0].closed
+
+
+@pytest.mark.integration
+def test_repository_pipeline_uses_native_index_sdk_end_to_end(tmp_path):
+    binary = os.environ.get("GH_PULLER_TEST_CBM_BINARY")
+    helper = os.environ.get("GH_PULLER_TEST_CBM_NATIVE_INDEX_HELPER")
+    if binary is None or helper is None:
+        pytest.skip("real CBM binary and native index helper not configured")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    git(repo, "init")
+    git(repo, "config", "user.email", "test@example.com")
+    git(repo, "config", "user.name", "Test")
+    commits = []
+    for symbol in ("first_symbol", "second_symbol"):
+        (repo / "main.py").write_text(f"def {symbol}():\n    return 1\n")
+        git(repo, "add", ".")
+        git(repo, "commit", "-m", symbol)
+        commits.append(git(repo, "rev-parse", "HEAD"))
+    project = f"native-pipeline-{tmp_path.name}"
+    options = BuildOptions(
+        repo,
+        tmp_path / "build",
+        binary=Path(binary),
+        project_name=project,
+        memory_limit=1 << 60,
+        cbm_transport="native",
+    )
+
+    assert build_repository(
+        options,
+        lambda target: BuildPlan(route="full" if target.ordinal == 0 else "delta"),
+    ) == 0
+
+    with Archive(tmp_path / "build" / "archive.kga") as archive:
+        assert archive.commit_ids() == tuple(commits)
+        rows = archive.load_rows(commits[-1])
+    summary = json.loads((tmp_path / "build" / "summary.json").read_text())
+    assert any(node["name"] == "second_symbol" for node in rows.nodes.values())
+    assert not any(node["name"] == "first_symbol" for node in rows.nodes.values())
+    assert summary["cbm_transport"] == "native"
+    assert summary["cleanup"]["project_deleted"] is True

@@ -132,7 +132,7 @@ class CBMRunner:
             timeout: Maximum seconds for one CBM request.
             memory_limit: Aggregate runner and child RSS ceiling; omission reserves
                 one GiB for the host.
-            transport: Reusable persistent MCP or one-process-per-call CLI adapter.
+            transport: Native SDK, reusable MCP, or one-process-per-call CLI index path.
         """
         self.binary = binary
         self.project = project
@@ -156,7 +156,8 @@ class CBMRunner:
             self._client = CBMClient(
                 binary,
                 cache_root=self.cache_root,
-                daemon_transport=transport,
+                daemon_transport=transport if transport != "native" else "persistent-mcp",
+                index_backend=transport,
                 timeout=timeout,
                 resource_monitor=self.monitor,
             )
@@ -221,6 +222,7 @@ class CBMRunner:
             plan.analysis_mode,
             force_full=plan.force_full,
             incremental_controls=plan.incremental.to_dict(),
+            target_projects=plan.target_projects or None,
         )
 
     def mark_archived(self, sha: str) -> None:

@@ -10,6 +10,7 @@ from gh_puller.codebase import (
     CBMBinaryError,
     CBMClient,
     CBMTransportError,
+    IncrementalConfig,
 )
 from gh_puller.codebase.archive import (
     COVERAGE_FIDELITY_VERSION,
@@ -23,7 +24,23 @@ from gh_puller.codebase.cbm._native import NativeArchiveTransport
 from gh_puller.codebase.store import GraphRows, load_coverage, load_rows
 
 
-def write_fake_helper(path: Path, *, hang_on_query: bool = False) -> None:
+def write_fake_helper(
+    path: Path,
+    *,
+    hang_on_query: bool = False,
+    indexing: bool = False,
+) -> None:
+    protocol = 7 if indexing else 6
+    capabilities = ["archive-load", "tool-call", "graph-compare"]
+    if indexing:
+        capabilities.extend(
+            [
+                "repository-index",
+                "project-delete",
+                "granular-delta-controls",
+                "force-full-route",
+            ],
+        )
     path.write_text(
         f"""#!/usr/bin/env python3
 import json
@@ -34,7 +51,7 @@ import sys
 import time
 
 if sys.argv[1:] == ["--version"]:
-    print("gh-puller-cbm-helper 6")
+    print("gh-puller-cbm-helper {protocol}")
     raise SystemExit(0)
 
 def read_exact(size):
@@ -60,9 +77,9 @@ while True:
         with Path(log).open("a") as stream:
             stream.write(json.dumps(request) + "\\n")
     if method == "hello":
-        result = {{"protocol": 6, "kga_format": 5, "graph_fidelity": 2,
+        result = {{"protocol": {protocol}, "kga_format": 5, "graph_fidelity": 2,
                   "coverage_fidelity": 1, "store_format": 1, "sdk_abi": 2,
-                  "capabilities": ["archive-load", "tool-call", "graph-compare"],
+                  "capabilities": {capabilities!r},
                   "tools": ["query_graph", "get_graph_schema", "index_status"]}}
     elif method == "load":
         Path(params["database_path"]).touch()
@@ -96,6 +113,13 @@ while True:
         result = {{"schema_version": 1, "base": params["base"],
                   "target": params["target"], "limit": params["limit"],
                   "scan_limit": params["scan_limit"]}}
+    elif method == "index":
+        route = "full" if params["force_full"] else "closure_repair"
+        result = {{"project": params["project"], "status": "indexed",
+                  "incremental_controls": params["incremental_controls"],
+                  "index_execution": {{"route": route}}}}
+    elif method == "delete":
+        result = {{"project": params["project"], "deleted": True}}
     elif method == "shutdown":
         respond({{"id": ident, "ok": True, "result": {{}}}})
         break
@@ -372,6 +396,69 @@ def test_client_native_query_does_not_resolve_or_start_mcp(tmp_path):
         assert client._daemon_backend is None
 
 
+def test_client_native_index_uses_full_helper_without_resolving_mcp(tmp_path, monkeypatch):
+    helper = tmp_path / "fake-index-helper"
+    log = tmp_path / "requests.jsonl"
+    write_fake_helper(helper, indexing=True)
+    controls = {
+        "closure_overflow": "repair",
+        "closure_cost_percent": 20,
+        "dependent_scope": "symbol",
+        "new_surface": "bounded",
+        "reference_fanout_cap": 64,
+        "pair_outputs": "lazy",
+        "pair_refresh_budget": 10000,
+        "pair_input_missing": "skip",
+    }
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    monkeypatch.setenv("NATIVE_REQUEST_LOG", str(log))
+
+    with CBMClient(
+        tmp_path / "missing-cbm",
+        native_index_helper=helper,
+        cache_root=tmp_path / "cache",
+        index_backend="native",
+        timeout=5,
+    ) as client:
+        assert {"repository-index", "granular-delta-controls", "force-full-route"} <= client.capabilities()
+        execution = client.index_repository(
+            tree,
+            "native-build",
+            "full",
+            force_full=True,
+            incremental_controls=controls,
+        )
+        cross_execution = client.index_repository(
+            tree,
+            "native-build",
+            "cross-repo-intelligence",
+            incremental_controls=controls,
+            target_projects=["dependency"],
+        )
+        deleted, _detail = client.delete_project("native-build")
+        assert execution["route"] == "full"
+        assert cross_execution["route"] == "closure_repair"
+        assert deleted is True
+        assert client._daemon_backend is None
+
+    index_request = next(item for item in requests(log) if item["method"] == "index")
+    assert index_request["params"] == {
+        "repo_path": str(tree),
+        "database_path": str(tmp_path / "cache" / "native-build.db"),
+        "cache_directory": str(tmp_path / "cache"),
+        "project": "native-build",
+        "mode": "full",
+        "persistence": False,
+        "force_full": True,
+        "incremental_controls": controls,
+        "target_projects": [],
+    }
+    cross_request = [item for item in requests(log) if item["method"] == "index"][1]
+    assert cross_request["params"]["incremental_controls"] is None
+    assert cross_request["params"]["target_projects"] == ["dependency"]
+
+
 def test_client_rejects_archive_handle_after_loading_another_generation(tmp_path):
     helper = tmp_path / "fake-helper"
     first_archive = tmp_path / "first.kga"
@@ -417,6 +504,39 @@ def test_native_query_timeout_terminates_helper(tmp_path):
 
     assert transport.process.poll() is not None
     transport.close()
+
+
+@pytest.mark.integration
+def test_real_native_index_helper_publishes_and_deletes_graph(tmp_path):
+    configured = os.environ.get("GH_PULLER_TEST_CBM_NATIVE_INDEX_HELPER")
+    if configured is None:
+        pytest.skip("real native index helper not configured")
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    (tree / "main.py").write_text("def native_symbol():\n    return 42\n")
+    cache = tmp_path / "cache"
+
+    with CBMClient(
+        tmp_path / "unused-cbm",
+        native_index_helper=Path(configured),
+        cache_root=cache,
+        index_backend="native",
+        timeout=120,
+    ) as client:
+        execution = client.index_repository(
+            tree,
+            "native-index",
+            "full",
+            force_full=True,
+            incremental_controls=IncrementalConfig().to_dict(),
+        )
+        rows = load_rows(cache / "native-index.db", "native-index")
+        deleted, _detail = client.delete_project("native-index")
+
+    assert execution == {"route": "full", "reason": "explicit_force_full"}
+    assert any(node["name"] == "native_symbol" for node in rows.nodes.values())
+    assert deleted is True
+    assert not (cache / "native-index.db").exists()
 
 
 @pytest.mark.integration

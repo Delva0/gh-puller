@@ -1,10 +1,12 @@
-# Build the KGA-to-CBM tool helper against the public CBM SDK.
+# Build compact query and full indexing helpers against the public CBM SDK.
 
 CBM_ROOT ?= ../codebase-memory-mcp
 BUILD_DIR ?= build/native
 CSRC_DIR = csrc
-TARGET = $(BUILD_DIR)/gh-puller-cbm-helper
+QUERY_TARGET = $(BUILD_DIR)/gh-puller-cbm-helper
+INDEX_TARGET = $(BUILD_DIR)/gh-puller-cbm-index-helper
 CBM_SDK = $(CBM_ROOT)/build/c/libcbm-sdk.a
+CBM_SDK_FULL = $(CBM_ROOT)/build/c/libcbm-sdk-full.a
 CBM_MIMALLOC = $(CBM_ROOT)/build/c/prod_mimalloc.o
 
 CC ?= cc
@@ -12,25 +14,41 @@ CFLAGS = -std=c11 -D_DEFAULT_SOURCE -D_GNU_SOURCE -O2 -Wall -Wextra -Werror \
 	-Wno-unused-parameter -Wno-sign-compare -Wdate-time \
 	-I$(CBM_ROOT)/src -I$(CBM_ROOT)/vendored
 LDFLAGS = -lm -lstdc++ -lpthread -lz -Wl,-z,noexecstack -Wl,-z,separate-code
-SOURCES = cbm_archive_helper.c kga_reader.c kga_sha256.c
-OBJECTS = $(SOURCES:%.c=$(BUILD_DIR)/%.o)
-DEPS = $(OBJECTS:.o=.d)
+COMMON_SOURCES = kga_reader.c kga_sha256.c
+COMMON_OBJECTS = $(COMMON_SOURCES:%.c=$(BUILD_DIR)/%.o)
+QUERY_OBJECTS = $(BUILD_DIR)/cbm_archive_helper.o $(COMMON_OBJECTS)
+INDEX_OBJECTS = $(BUILD_DIR)/index/cbm_archive_helper.o $(COMMON_OBJECTS)
+DEPS = $(QUERY_OBJECTS:.o=.d) $(INDEX_OBJECTS:.o=.d)
 
-.PHONY: native-helper cbm-sdk
+.PHONY: native-helper native-query-helper native-index-helper cbm-sdk
 
-native-helper: $(TARGET)
-	$(TARGET) --version
+native-helper: native-query-helper native-index-helper
+
+native-query-helper: $(QUERY_TARGET)
+	$(QUERY_TARGET) --version
+
+native-index-helper: $(INDEX_TARGET)
+	$(INDEX_TARGET) --version
 
 cbm-sdk:
-	$(MAKE) -C $(CBM_ROOT) -f Makefile.cbm cbm-sdk build/c/prod_mimalloc.o
+	$(MAKE) -C $(CBM_ROOT) -f Makefile.cbm cbm-sdk cbm-sdk-full build/c/prod_mimalloc.o
 
 $(BUILD_DIR)/%.o: $(CSRC_DIR)/%.c Makefile.native
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
 
-$(TARGET): $(OBJECTS) cbm-sdk
-	$(CC) $(CFLAGS) -o $@ $(OBJECTS) $(CBM_SDK) $(CBM_MIMALLOC) $(LDFLAGS)
+$(BUILD_DIR)/index/cbm_archive_helper.o: $(CSRC_DIR)/cbm_archive_helper.c Makefile.native
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) -DGHP_NATIVE_INDEXING -MMD -MP -c -o $@ $<
+
+$(QUERY_TARGET): $(QUERY_OBJECTS) cbm-sdk
+	$(CC) $(CFLAGS) -o $@ $(QUERY_OBJECTS) $(CBM_SDK) $(CBM_MIMALLOC) $(LDFLAGS)
 	@if nm $@ | grep -Eq 'tree_sitter_|cbm_mcp_server_|cbm_daemon_|cbm_pipeline_run'; then \
-		echo "ERROR: native helper links a forbidden CBM subsystem"; exit 1; fi
+		echo "ERROR: native query helper links a forbidden CBM subsystem"; exit 1; fi
+
+$(INDEX_TARGET): $(INDEX_OBJECTS) cbm-sdk
+	$(CC) $(CFLAGS) -o $@ $(INDEX_OBJECTS) $(CBM_SDK_FULL) $(CBM_MIMALLOC) $(LDFLAGS)
+	@if nm $@ | grep -Eq 'cbm_mcp_server_|cbm_daemon_|cbm_cli_|cbm_watcher_'; then \
+		echo "ERROR: native index helper links a frontend subsystem"; exit 1; fi
 
 -include $(DEPS)

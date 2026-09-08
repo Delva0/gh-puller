@@ -17,7 +17,7 @@ from contextlib import suppress
 from typing import TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Mapping, Sequence
     from pathlib import Path
 
 _DELTA_ARGUMENTS = frozenset(
@@ -101,6 +101,7 @@ def _index_arguments(
     mode: str,
     force_full: bool,
     incremental_controls: Mapping[str, str | int] | None,
+    target_projects: Sequence[str] | None,
 ) -> dict:
     arguments = {
         "repo_path": str(tree),
@@ -111,6 +112,8 @@ def _index_arguments(
     }
     if incremental_controls is not None:
         arguments.update({f"delta_{key}": value for key, value in incremental_controls.items()})
+    if target_projects is not None:
+        arguments["target_projects"] = list(target_projects)
     return arguments
 
 
@@ -206,10 +209,18 @@ class CLITransport:
         *,
         force_full: bool = False,
         incremental_controls: Mapping[str, str | int] | None = None,
+        target_projects: Sequence[str] | None = None,
     ) -> dict:
         envelope = self.call_tool(
             "index_repository",
-            _index_arguments(tree, project, mode, force_full, incremental_controls),
+            _index_arguments(
+                tree,
+                project,
+                mode,
+                force_full,
+                incremental_controls,
+                target_projects,
+            ),
         )
         return _checked_index_execution(envelope, force_full, incremental_controls)
 
@@ -414,10 +425,18 @@ class PersistentMCPTransport:
         *,
         force_full: bool = False,
         incremental_controls: Mapping[str, str | int] | None = None,
+        target_projects: Sequence[str] | None = None,
     ) -> dict:
         result = self.call_tool(
             "index_repository",
-            _index_arguments(tree, project, mode, force_full, incremental_controls),
+            _index_arguments(
+                tree,
+                project,
+                mode,
+                force_full,
+                incremental_controls,
+                target_projects,
+            ),
         )
         return _checked_index_execution(result, force_full, incremental_controls)
 

@@ -1,9 +1,8 @@
 """Implement the synchronous client exported by the CBM package facade.
 
-Build and daemon tools use a selectable MCP or CLI backend. Archive tools use
-the compact native runtime, while open-ended arguments keep new server fields
-independent of SDK releases. Backend process and protocol mechanics remain in
-private sibling modules.
+Each API selects its native, persistent MCP, or CLI backend without exposing
+transport mechanics. Open-ended tool arguments keep new server fields
+independent of SDK releases; private sibling modules own each process protocol.
 """
 
 from __future__ import annotations
@@ -20,9 +19,10 @@ from ._daemon import (
     CLITransport,
     PersistentMCPTransport,
     ResourceMonitorLike,
+    _checked_index_execution,
     make_transport,
 )
-from ._native import NativeArchiveTransport, NativeHelper
+from ._native import NativeArchiveTransport, NativeHelper, NativeIndexTransport
 from .binary import CBMBinary, resolve_cbm_binary
 
 if TYPE_CHECKING:
@@ -109,7 +109,9 @@ class CBMClient:
         registry: str | Path | None = None,
         cache_root: str | Path | None = None,
         native_helper: NativeHelper | str | Path | None = None,
+        native_index_helper: NativeHelper | str | Path | None = None,
         daemon_transport: str = "persistent-mcp",
+        index_backend: str | None = None,
         timeout: float = 120,
         environment: Mapping[str, str] | None = None,
         resource_monitor: ResourceMonitorLike | None = None,
@@ -123,10 +125,14 @@ class CBMClient:
             registry: Registry root used for default manifest resolution.
             cache_root: CBM database directory. ``None`` honors ``CBM_CACHE_DIR``
                 and then uses CBM's per-user default.
-            native_helper: Helper for archive-backed tools. ``None`` uses the
+            native_helper: Compact helper for archive-backed tools. ``None`` uses the
                 normal environment, local-build, and ``PATH`` resolution order.
+            native_index_helper: Full SDK helper for indexing. ``None`` uses its
+                independent environment, local-build, and ``PATH`` resolution order.
             daemon_transport: Persistent MCP or one-process-per-call CLI backend
                 used by daemon operations.
+            index_backend: Native, persistent MCP, or CLI implementation used by
+                repository indexing. ``None`` follows ``daemon_transport``.
             timeout: Maximum seconds for each backend request or cache lock.
             environment: Environment overrides passed to CBM and used during
                 executable and cache resolution.
@@ -135,6 +141,11 @@ class CBMClient:
         """
         if timeout <= 0:
             raise ValueError("CBM timeout must be positive")
+        if daemon_transport not in {"cli", "persistent-mcp"}:
+            raise ValueError(f"unknown CBM daemon transport: {daemon_transport}")
+        selected_index_backend = daemon_transport if index_backend is None else index_backend
+        if selected_index_backend not in {"native", "cli", "persistent-mcp"}:
+            raise ValueError(f"unknown CBM index backend: {selected_index_backend}")
         overrides = dict(environment or {})
         values = {**os.environ, **overrides}
         resolved_cache = (
@@ -149,11 +160,15 @@ class CBMClient:
         self._registry = registry
         self._binary_identity = binary if isinstance(binary, CBMBinary) else None
         self._native_helper = native_helper
+        self._native_index_helper = native_index_helper
         self.daemon_transport = daemon_transport
+        self.index_backend = selected_index_backend
         self._monitor = resource_monitor or _ClientMonitor()
         self._backend_lock = threading.Lock()
         self._daemon_backend: CLITransport | PersistentMCPTransport | None = None
+        self._index_daemon_backend: CLITransport | PersistentMCPTransport | None = None
         self._native_transport: NativeArchiveTransport | None = None
+        self._native_index_transport: NativeIndexTransport | None = None
 
     @property
     def binary(self) -> CBMBinary:
@@ -188,6 +203,21 @@ class CBMClient:
             raise CBMTransportError("server metadata requires the persistent-mcp backend")
         return backend
 
+    def _index_daemon(self) -> CLITransport | PersistentMCPTransport:
+        if self.index_backend == self.daemon_transport:
+            return self._daemon()
+        with self._backend_lock:
+            if self._index_daemon_backend is None:
+                self._index_daemon_backend = make_transport(
+                    self.index_backend,
+                    self.binary.path,
+                    self.cache_root,
+                    self.timeout,
+                    self._monitor,
+                    self._overrides,
+                )
+        return self._index_daemon_backend
+
     def _native(self) -> NativeArchiveTransport:
         with self._backend_lock:
             if self._native_transport is None:
@@ -196,8 +226,21 @@ class CBMClient:
                     self.cache_root,
                     self.timeout,
                     self._overrides,
+                    self._monitor,
                 )
         return self._native_transport
+
+    def _native_index(self) -> NativeIndexTransport:
+        with self._backend_lock:
+            if self._native_index_transport is None:
+                self._native_index_transport = NativeIndexTransport(
+                    self._native_index_helper,
+                    self.cache_root,
+                    self.timeout,
+                    self._overrides,
+                    self._monitor,
+                )
+        return self._native_index_transport
 
     @property
     def pid(self) -> int:
@@ -227,8 +270,10 @@ class CBMClient:
         return GraphTarget(project)
 
     def capabilities(self) -> frozenset[str]:
-        """Return build capabilities advertised through the daemon backend."""
-        return self._daemon().capabilities()
+        """Return capabilities advertised by the selected indexing backend."""
+        if self.index_backend == "native":
+            return self._native_index().capabilities
+        return self._index_daemon().capabilities()
 
     def index_repository(
         self,
@@ -238,8 +283,9 @@ class CBMClient:
         *,
         force_full: bool = False,
         incremental_controls: Mapping[str, str | int] | None = None,
+        target_projects: Sequence[str] | None = None,
     ) -> dict[str, Any]:
-        """Publish one repository graph through the selected daemon backend.
+        """Publish one repository graph through the selected indexing backend.
 
         Args:
             tree: Materialized repository tree to analyze.
@@ -248,25 +294,56 @@ class CBMClient:
             force_full: Require CBM to confirm a full-build route.
             incremental_controls: Delta-policy overrides whose acknowledgement
                 must be confirmed by CBM.
+            target_projects: Projects matched by cross-repository intelligence.
 
         Returns:
             Machine-readable route evidence reported by CBM.
         """
-        return self._daemon().index(
-            Path(tree),
+        tree_path = Path(tree)
+        cross_repo = mode == "cross-repo-intelligence"
+        if cross_repo and not target_projects:
+            raise ValueError("cross-repo-intelligence requires target projects")
+        if cross_repo and force_full:
+            raise ValueError("cross-repo-intelligence has no full-build route")
+        if not cross_repo and target_projects:
+            raise ValueError("target projects require cross-repo-intelligence mode")
+        effective_controls = None if cross_repo else incremental_controls
+        if self.index_backend == "native":
+            result = self._native_index().index_repository(
+                tree_path,
+                self.cache_root / f"{project}.db",
+                project,
+                mode,
+                force_full=force_full,
+                incremental_controls=effective_controls,
+                target_projects=target_projects,
+            )
+            return _checked_index_execution(result, force_full, effective_controls)
+        return self._index_daemon().index(
+            tree_path,
             project,
             mode,
             force_full=force_full,
-            incremental_controls=incremental_controls,
+            incremental_controls=effective_controls,
+            target_projects=target_projects,
         )
 
     def delete_project(self, project: str) -> tuple[bool, str]:
-        """Delete one daemon-owned CBM project.
+        """Delete one project through the backend that indexed it.
 
         Args:
             project: Exact CBM project name to delete.
         """
-        return self._daemon().delete_project(project)
+        if self.index_backend == "native":
+            try:
+                result = self._native_index().delete_project(
+                    self.cache_root / f"{project}.db",
+                    project,
+                )
+            except CBMTransportError as exc:
+                return False, str(exc)[-1000:]
+            return True, json.dumps(result, ensure_ascii=False)[-1000:]
+        return self._index_daemon().delete_project(project)
 
     def call_tool(
         self,
@@ -556,6 +633,10 @@ class CBMClient:
         """Finish active native and daemon processes and release their pipes."""
         if self._native_transport is not None:
             self._native_transport.close()
+        if self._native_index_transport is not None:
+            self._native_index_transport.close()
+        if self._index_daemon_backend is not None:
+            self._index_daemon_backend.close()
         if self._daemon_backend is not None:
             self._daemon_backend.close()
 

@@ -109,12 +109,22 @@ class BuildPlan:
     analysis_mode: AnalysisMode = "full"
     route: BuildRoute = "delta"
     incremental: IncrementalConfig = field(default_factory=IncrementalConfig)
+    target_projects: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if self.analysis_mode not in {"full", "moderate", "fast", "cross-repo-intelligence"}:
             raise ValueError(f"invalid CBM analysis mode: {self.analysis_mode!r}")
         if self.route not in {"delta", "full"}:
             raise ValueError(f"invalid CBM build route: {self.route!r}")
+        if self.analysis_mode == "cross-repo-intelligence":
+            if not self.target_projects:
+                raise ValueError("cross-repo-intelligence requires target projects")
+            if self.force_full:
+                raise ValueError("cross-repo-intelligence has no full-build route")
+            if "*" in self.target_projects and self.target_projects != ("*",):
+                raise ValueError("cross-repository wildcard must be the only target")
+        elif self.target_projects:
+            raise ValueError("target projects require cross-repo-intelligence mode")
         self.incremental.validate()
 
     @property
@@ -131,7 +141,7 @@ class BuildPlan:
 
     def metadata(self) -> dict:
         """Return stable per-commit provenance for the KGA manifest."""
-        return {
+        metadata = {
             "cbm_analysis_mode": self.analysis_mode,
             "cbm_requested_route": self.route,
             "cbm_incremental": {
@@ -140,6 +150,9 @@ class BuildPlan:
                 "options": self.incremental.to_dict(),
             },
         }
+        if self.target_projects:
+            metadata["cbm_target_projects"] = list(self.target_projects)
+        return metadata
 
 
 def add_incremental_arguments(parser: argparse.ArgumentParser) -> None:

@@ -38,8 +38,17 @@ class FakeClient:
     def capabilities(self):
         return frozenset({"persistent-mcp", "granular-delta-controls", "force-full-route"})
 
-    def index_repository(self, tree, project, mode, *, force_full, incremental_controls):
-        self.calls.append((tree, project, mode, force_full, incremental_controls))
+    def index_repository(
+        self,
+        tree,
+        project,
+        mode,
+        *,
+        force_full,
+        incremental_controls,
+        target_projects,
+    ):
+        self.calls.append((tree, project, mode, force_full, incremental_controls, target_projects))
         return {"route": "full" if force_full else "closure_repair"}
 
     def delete_project(self, project):
@@ -105,16 +114,29 @@ def git(repo, *arguments):
 def test_build_plan_separates_analysis_mode_from_route():
     delta = BuildPlan(analysis_mode="fast")
     full = BuildPlan(route="full")
+    cross_repo = BuildPlan(
+        analysis_mode="cross-repo-intelligence",
+        target_projects=("target",),
+    )
 
     assert delta.force_full is False
     assert delta.metadata()["cbm_requested_route"] == "delta"
     assert full.force_full is True
     assert full.required_capabilities() == {"granular-delta-controls", "force-full-route"}
+    assert cross_repo.metadata()["cbm_target_projects"] == ["target"]
 
     with pytest.raises(ValueError, match="analysis mode"):
         BuildPlan(analysis_mode="invalid")
     with pytest.raises(ValueError, match="build route"):
         BuildPlan(route="invalid")
+    with pytest.raises(ValueError, match="requires target projects"):
+        BuildPlan(analysis_mode="cross-repo-intelligence")
+    with pytest.raises(ValueError, match="no full-build route"):
+        BuildPlan(
+            analysis_mode="cross-repo-intelligence",
+            route="full",
+            target_projects=("target",),
+        )
 
 
 def test_cbm_runner_reuses_client_across_commit_plans(tmp_path, monkeypatch):

@@ -1,8 +1,9 @@
-"""Implement the private native archive backend and immutable store cache.
+"""Implement private native engine backends and the immutable store cache.
 
-This module owns helper authentication, framed control messages, cross-process
-materialization locks, and cache identity. KGA parsing remains in the native
-helper; public tool routing remains in :mod:`.client`.
+This module owns helper authentication, framed control messages, native index
+requests, cross-process materialization locks, and cache identity. KGA parsing
+and CBM algorithms remain in the helpers; public routing remains in
+:mod:`.client`.
 """
 
 from __future__ import annotations
@@ -25,14 +26,16 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, BinaryIO, Self
 
 from ..archive import COVERAGE_FIDELITY_VERSION, GRAPH_FIDELITY_VERSION, Archive
-from ._daemon import CBMTransportError
+from ._daemon import CBMTransportError, ResourceMonitorLike
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator, Mapping
+    from collections.abc import Iterator, Mapping, Sequence
 
-_PROTOCOL_VERSION = 6
+_ARCHIVE_PROTOCOL_VERSION = 6
+_INDEX_PROTOCOL_VERSION = 7
 _RESPONSE_MAX_BYTES = 256 << 20
-_HELPER_ENV = "GH_PULLER_CODEBASE_CBM_HELPER"
+_ARCHIVE_HELPER_ENV = "GH_PULLER_CODEBASE_CBM_HELPER"
+_INDEX_HELPER_ENV = "GH_PULLER_CODEBASE_CBM_INDEX_HELPER"
 _CACHE_SCHEMA = 4
 _STREAM_CLOSED = object()
 
@@ -73,12 +76,16 @@ def resolve_native_helper(
     helper: str | Path | NativeHelper | None = None,
     *,
     environ: Mapping[str, str] | None = None,
+    environment_key: str = _ARCHIVE_HELPER_ENV,
+    local_name: str = "gh-puller-cbm-helper",
 ) -> NativeHelper:
-    """Resolve and authenticate the native archive helper.
+    """Resolve and authenticate one native helper.
 
     Args:
         helper: Explicit executable path, command name, or pinned identity.
         environ: Environment used for the helper override and executable lookup.
+        environment_key: Variable naming this helper when no path is explicit.
+        local_name: Executable name used for local-build and ``PATH`` lookup.
 
     Returns:
         Executable identity pinned to its current inode and bytes.
@@ -90,19 +97,19 @@ def resolve_native_helper(
         helper.verify_unchanged()
         return helper
     values = os.environ if environ is None else environ
-    configured = helper if helper is not None else values.get(_HELPER_ENV)
+    configured = helper if helper is not None else values.get(environment_key)
     candidate: Path | None = None
     if configured is not None:
         raw = os.fspath(configured)
         located = shutil.which(raw, path=values.get("PATH")) if os.sep not in raw else None
         candidate = Path(located or raw).expanduser().resolve()
     else:
-        local = Path(__file__).resolve().parents[2] / "build" / "native" / "gh-puller-cbm-helper"
-        located = shutil.which("gh-puller-cbm-helper", path=values.get("PATH"))
+        local = Path(__file__).resolve().parents[3] / "build" / "native" / local_name
+        located = shutil.which(local_name, path=values.get("PATH"))
         candidate = local if local.exists() else Path(located).resolve() if located else None
     if candidate is None:
         raise CBMTransportError(
-            f"no native CBM helper: pass native_helper, set {_HELPER_ENV}, or build Makefile.native",
+            f"no native CBM helper: pass its path, set {environment_key}, or build Makefile.native",
         )
     try:
         status = candidate.stat()
@@ -158,6 +165,14 @@ class NativeArchiveTransport:
         cache_root: Path,
         timeout: float,
         environment: Mapping[str, str] | None = None,
+        monitor: ResourceMonitorLike | None = None,
+        *,
+        helper_environment_key: str = _ARCHIVE_HELPER_ENV,
+        helper_filename: str = "gh-puller-cbm-helper",
+        protocol: int = _ARCHIVE_PROTOCOL_VERSION,
+        required_capabilities: frozenset[str] = frozenset(
+            {"archive-load", "tool-call", "graph-compare"},
+        ),
     ):
         """Start the helper and negotiate the fixed native protocol.
 
@@ -166,15 +181,26 @@ class NativeArchiveTransport:
             cache_root: Parent directory for engine-versioned immutable stores.
             timeout: Maximum seconds for one lock wait or helper request.
             environment: Environment passed to helper resolution and execution.
+            monitor: Optional build-owned resource monitor.
+            helper_environment_key: Environment override for this helper kind.
+            helper_filename: Local and ``PATH`` executable name.
+            protocol: Exact framed protocol version required from the helper.
+            required_capabilities: Features required during negotiation.
         """
         if timeout <= 0:
             raise ValueError("native CBM timeout must be positive")
         overrides = dict(environment or {})
         values = {**os.environ, **overrides}
-        self.helper = resolve_native_helper(helper, environ=values)
+        self.helper = resolve_native_helper(
+            helper,
+            environ=values,
+            environment_key=helper_environment_key,
+            local_name=helper_filename,
+        )
         self.helper.verify_unchanged()
         self.cache_root = cache_root
         self.timeout = timeout
+        self.monitor = monitor
         self._responses: queue.Queue[object] = queue.Queue()
         self._stderr = deque(maxlen=80)
         self._request_lock = threading.Lock()
@@ -193,24 +219,26 @@ class NativeArchiveTransport:
             bufsize=0,
             env=helper_environment,
         )
+        if self.monitor is not None:
+            self.monitor.child_pid = self.process.pid
         self._stdout_thread = threading.Thread(target=self._stdout_loop, daemon=True)
         self._stderr_thread = threading.Thread(target=self._stderr_loop, daemon=True)
         self._stdout_thread.start()
         self._stderr_thread.start()
         try:
-            hello = self._request("hello", {"protocol": _PROTOCOL_VERSION})
+            hello = self._request("hello", {"protocol": protocol})
             capabilities = hello.get("capabilities")
             tools = hello.get("tools")
             store_format = hello.get("store_format")
             sdk_abi = hello.get("sdk_abi")
             if (
-                hello.get("protocol") != _PROTOCOL_VERSION
+                hello.get("protocol") != protocol
                 or hello.get("kga_format") != 5
                 or hello.get("graph_fidelity") != GRAPH_FIDELITY_VERSION
                 or hello.get("coverage_fidelity") != COVERAGE_FIDELITY_VERSION
                 or not isinstance(capabilities, list)
                 or not all(isinstance(item, str) for item in capabilities)
-                or not {"archive-load", "tool-call", "graph-compare"} <= set(capabilities)
+                or not required_capabilities <= set(capabilities)
                 or not isinstance(tools, list)
                 or not tools
                 or not all(isinstance(item, str) and item for item in tools)
@@ -272,6 +300,8 @@ class NativeArchiveTransport:
                 stream.close()
         self._stdout_thread.join(timeout=2)
         self._stderr_thread.join(timeout=2)
+        if self.monitor is not None and self.monitor.child_pid == self.process.pid:
+            self.monitor.child_pid = None
 
     def _request(self, method: str, parameters: Mapping[str, object], *, timeout: float | None = None) -> dict:
         if self._closed:
@@ -319,6 +349,11 @@ class NativeArchiveTransport:
             result = response.get("result")
             if not isinstance(result, dict):
                 raise CBMTransportError("native CBM helper returned a non-object result")
+            if self.monitor is not None:
+                self.monitor.sample()
+                if self.monitor.exceeded:
+                    self._terminate()
+                    raise CBMTransportError("memory limit exceeded while running CBM")
             return result
 
     def _cache_paths(self, digest: str) -> tuple[Path, Path, Path]:
@@ -491,6 +526,95 @@ class NativeArchiveTransport:
 
     def __exit__(self, *_args) -> None:
         self.close()
+
+
+class NativeIndexTransport(NativeArchiveTransport):
+    """Run repository indexing in a persistent crash-isolated native helper."""
+
+    def __init__(
+        self,
+        helper: str | Path | NativeHelper | None,
+        cache_root: Path,
+        timeout: float,
+        environment: Mapping[str, str] | None = None,
+        monitor: ResourceMonitorLike | None = None,
+    ):
+        """Start the full SDK helper without changing the compact query helper.
+
+        Args:
+            helper: Explicit full helper or its normal resolution order.
+            cache_root: CBM database directory owned by this client.
+            timeout: Maximum seconds for one native operation.
+            environment: Environment overrides passed to the helper.
+            monitor: Optional build-owned resource monitor.
+        """
+        super().__init__(
+            helper,
+            cache_root,
+            timeout,
+            environment,
+            monitor,
+            helper_environment_key=_INDEX_HELPER_ENV,
+            helper_filename="gh-puller-cbm-index-helper",
+            protocol=_INDEX_PROTOCOL_VERSION,
+            required_capabilities=frozenset(
+                {
+                    "repository-index",
+                    "project-delete",
+                    "granular-delta-controls",
+                    "force-full-route",
+                },
+            ),
+        )
+
+    def index_repository(
+        self,
+        tree: Path,
+        database_path: Path,
+        project: str,
+        mode: str,
+        *,
+        force_full: bool,
+        incremental_controls: Mapping[str, str | int] | None,
+        target_projects: Sequence[str] | None,
+    ) -> dict[str, Any]:
+        """Run one typed SDK indexing request and return its logical JSON result.
+
+        Args:
+            tree: Materialized repository tree analyzed by CBM.
+            database_path: Explicit normal-mode publication path.
+            project: Stable CBM project receiving the graph.
+            mode: CBM analysis mode, including cross-repository matching.
+            force_full: Bypass CBM's incremental routing.
+            incremental_controls: Complete delta policy, or ``None`` for CBM defaults.
+            target_projects: Cross-repository targets; required only by that mode.
+        """
+        return self._request(
+            "index",
+            {
+                "repo_path": str(tree),
+                "database_path": str(database_path),
+                "cache_directory": str(self.cache_root),
+                "project": project,
+                "mode": mode,
+                "persistence": False,
+                "force_full": force_full,
+                "incremental_controls": dict(incremental_controls) if incremental_controls else None,
+                "target_projects": list(target_projects or ()),
+            },
+        )
+
+    def delete_project(self, database_path: Path, project: str) -> dict[str, Any]:
+        """Delete a native-index project and its SQLite sidecars.
+
+        Args:
+            database_path: Exact database published by the indexing helper.
+            project: Project expected inside that database.
+        """
+        return self._request(
+            "delete",
+            {"database_path": str(database_path), "project": project},
+        )
 
 
 @contextmanager
