@@ -30,12 +30,14 @@ def write_fake_helper(
     hang_on_query: bool = False,
     indexing: bool = False,
 ) -> None:
-    protocol = 7 if indexing else 6
+    protocol = 8 if indexing else 6
     capabilities = ["archive-load", "tool-call", "graph-compare"]
     if indexing:
         capabilities.extend(
             [
                 "repository-index",
+                "project-open",
+                "project-list",
                 "project-delete",
                 "granular-delta-controls",
                 "force-full-route",
@@ -118,6 +120,10 @@ while True:
         result = {{"project": params["project"], "status": "indexed",
                   "incremental_controls": params["incremental_controls"],
                   "index_execution": {{"route": route}}}}
+    elif method == "open":
+        result = {{"project": params["project"], "nodes": 3, "edges": 2}}
+    elif method == "list":
+        result = {{"projects": [{{"name": "native-build"}}], "total": 1, "returned": 1}}
     elif method == "delete":
         result = {{"project": params["project"], "deleted": True}}
     elif method == "shutdown":
@@ -436,9 +442,15 @@ def test_client_native_index_uses_full_helper_without_resolving_mcp(tmp_path, mo
             incremental_controls=controls,
             target_projects=["dependency"],
         )
+        graph = client.project_graph("native-build", source_root=tree)
+        queried = client.query_graph(graph, query="MATCH (n) RETURN n")
+        projects = client.list_projects(include_details=True)
         deleted, _detail = client.delete_project("native-build")
         assert execution["route"] == "full"
         assert cross_execution["route"] == "closure_repair"
+        assert graph.nodes == 3
+        assert queried["rows"] == [["native", "native-build"]]
+        assert projects["projects"] == [{"name": "native-build"}]
         assert deleted is True
         assert client._daemon_backend is None
 
@@ -487,7 +499,7 @@ def test_client_rejects_archive_handle_after_loading_another_generation(tmp_path
         assert compared["scan_limit"] == 100
         with pytest.raises(CBMTransportError, match="no longer loaded"):
             client.query_graph(first, query="MATCH (n) RETURN n")
-        with pytest.raises(CBMTransportError, match="cannot compare archive and daemon"):
+        with pytest.raises(CBMTransportError, match="cannot compare native and daemon"):
             client.compare_graphs(first, client.daemon_graph("second"))
 
 
@@ -504,6 +516,14 @@ def test_native_query_timeout_terminates_helper(tmp_path):
 
     assert transport.process.poll() is not None
     transport.close()
+
+
+def test_native_project_binding_rejects_cache_path_escape(tmp_path):
+    with (
+        CBMClient(index_backend="native", cache_root=tmp_path) as client,
+        pytest.raises(ValueError, match="invalid CBM project"),
+    ):
+        client.project_graph("../outside")
 
 
 @pytest.mark.integration
@@ -530,10 +550,19 @@ def test_real_native_index_helper_publishes_and_deletes_graph(tmp_path):
             force_full=True,
             incremental_controls=IncrementalConfig().to_dict(),
         )
+        graph = client.project_graph("native-index", source_root=tree)
+        queried = client.query_graph(
+            graph,
+            query="MATCH (n:Function) RETURN n.name",
+            max_rows=10,
+        )
+        projects = client.list_projects(include_details=True)
         rows = load_rows(cache / "native-index.db", "native-index")
         deleted, _detail = client.delete_project("native-index")
 
     assert execution == {"route": "full", "reason": "explicit_force_full"}
+    assert ["native_symbol"] in queried["rows"]
+    assert any(project["name"] == "native-index" for project in projects["projects"])
     assert any(node["name"] == "native_symbol" for node in rows.nodes.values())
     assert deleted is True
     assert not (cache / "native-index.db").exists()

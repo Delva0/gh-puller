@@ -42,7 +42,7 @@ class _ClientMonitor:
 
 @dataclass(frozen=True, slots=True)
 class GraphTarget:
-    """Identify a mutable graph project served by the configured daemon backend."""
+    """Identify a project-bound target for CBM graph tools."""
 
     project: str
 
@@ -65,6 +65,16 @@ class ArchiveGraph(GraphTarget):
     materialized: bool
 
 
+@dataclass(frozen=True, slots=True)
+class NativeProjectGraph(GraphTarget):
+    """Identify a mutable project currently open in the native index engine."""
+
+    database_path: Path
+    source_root: Path | None
+    nodes: int
+    edges: int
+
+
 def default_cbm_cache(environ: Mapping[str, str] | None = None) -> Path:
     """Return the cache directory shared with CBM.
 
@@ -75,6 +85,20 @@ def default_cbm_cache(environ: Mapping[str, str] | None = None) -> Path:
     values = os.environ if environ is None else environ
     configured = values.get("CBM_CACHE_DIR")
     return Path(configured).expanduser() if configured else Path.home() / ".cache" / "codebase-memory-mcp"
+
+
+def _project_database(cache_root: Path, project: str) -> Path:
+    if (
+        not project
+        or project.startswith(".")
+        or ".." in project
+        or any(
+            not (character.isascii() and (character.isalnum() or character in "-_."))
+            for character in project
+        )
+    ):
+        raise ValueError(f"invalid CBM project name: {project!r}")
+    return cache_root / f"{project}.db"
 
 
 def _json_object(name: str, result: dict[str, Any]) -> dict[str, Any]:
@@ -253,6 +277,11 @@ class CBMClient:
         return self._native().pid
 
     @property
+    def native_index_pid(self) -> int:
+        """Return the persistent full-SDK helper process ID."""
+        return self._native_index().pid
+
+    @property
     def instructions(self) -> str:
         """Return optional query guidance advertised by the CBM server."""
         return self._mcp().instructions
@@ -268,6 +297,38 @@ class CBMClient:
             project: Exact mutable CBM project name.
         """
         return GraphTarget(project)
+
+    def project_graph(
+        self,
+        project: str,
+        *,
+        source_root: str | Path | None = None,
+    ) -> GraphTarget:
+        """Bind an indexed project to the backend that produced it.
+
+        Args:
+            project: Exact mutable CBM project name.
+            source_root: Matching checkout for native tools that inspect source.
+
+        Returns:
+            A native project handle or the configured daemon graph binding.
+        """
+        if self.index_backend != "native":
+            if self.index_backend != self.daemon_transport:
+                raise CBMTransportError(
+                    "project graph requires index_backend to match daemon_transport",
+                )
+            return self.daemon_graph(project)
+        database_path = _project_database(self.cache_root, project)
+        resolved_source = Path(source_root).resolve() if source_root is not None else None
+        result = self._native_index().open_project(database_path, project, resolved_source)
+        return NativeProjectGraph(
+            project,
+            database_path,
+            resolved_source,
+            result["nodes"],
+            result["edges"],
+        )
 
     def capabilities(self) -> frozenset[str]:
         """Return capabilities advertised by the selected indexing backend."""
@@ -318,7 +379,7 @@ class CBMClient:
         if self.index_backend == "native":
             result = self._native_index().index_repository(
                 tree_path,
-                self.cache_root / f"{project}.db",
+                _project_database(self.cache_root, project),
                 project,
                 mode,
                 force_full=force_full,
@@ -344,13 +405,26 @@ class CBMClient:
         if self.index_backend == "native":
             try:
                 result = self._native_index().delete_project(
-                    self.cache_root / f"{project}.db",
+                    _project_database(self.cache_root, project),
                     project,
                 )
             except CBMTransportError as exc:
                 return False, str(exc)[-1000:]
             return True, json.dumps(result, ensure_ascii=False)[-1000:]
         return self._index_daemon().delete_project(project)
+
+    def list_projects(self, **options: object) -> dict[str, Any]:
+        """List projects through the selected indexing backend.
+
+        Args:
+            **options: Native CBM pagination and detail fields.
+        """
+        if self.index_backend == "native":
+            return self._native_index().list_projects(options)
+        return _json_object(
+            "list_projects",
+            self._index_daemon().call_tool("list_projects", dict(options)),
+        )
 
     def call_tool(
         self,
@@ -383,6 +457,28 @@ class CBMClient:
                 raise CBMTransportError("archive graph is no longer loaded by this CBM client")
             if name not in native.tools:
                 raise CBMTransportError(f"native CBM tool is not supported for this archive graph: {name}")
+            logical = native.call_tool(name, values)
+            return {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": json.dumps(logical, ensure_ascii=False, separators=(",", ":")),
+                    },
+                ],
+                "structuredContent": logical,
+                "isError": False,
+            }
+        if isinstance(target, NativeProjectGraph):
+            native = self._native_index_transport
+            if (
+                native is None
+                or native.loaded_project != target.project
+                or native.loaded_database_path != target.database_path
+                or native.loaded_source_root != target.source_root
+            ):
+                raise CBMTransportError("native project graph is no longer open by this CBM client")
+            if name not in native.tools:
+                raise CBMTransportError(f"native CBM tool is not supported for this project: {name}")
             logical = native.call_tool(name, values)
             return {
                 "content": [
@@ -615,8 +711,16 @@ class CBMClient:
         Raises:
             CBMTransportError: Archive and daemon graph kinds are mixed.
         """
-        if isinstance(base, ArchiveGraph) and isinstance(target, ArchiveGraph):
-            return self._native().compare_graphs(
+        if isinstance(base, (ArchiveGraph, NativeProjectGraph)) and isinstance(
+            target,
+            (ArchiveGraph, NativeProjectGraph),
+        ):
+            native = (
+                self._native()
+                if isinstance(base, ArchiveGraph) and isinstance(target, ArchiveGraph)
+                else self._native_index()
+            )
+            return native.compare_graphs(
                 base_database=base.database_path,
                 base_project=base.project,
                 target_database=target.database_path,
@@ -624,8 +728,11 @@ class CBMClient:
                 limit=limit,
                 scan_limit=scan_limit,
             )
-        if isinstance(base, ArchiveGraph) or isinstance(target, ArchiveGraph):
-            raise CBMTransportError("cannot compare archive and daemon graphs")
+        if isinstance(base, (ArchiveGraph, NativeProjectGraph)) or isinstance(
+            target,
+            (ArchiveGraph, NativeProjectGraph),
+        ):
+            raise CBMTransportError("cannot compare native and daemon graphs")
         return self.call_json_tool(
             "compare_graphs",
             {

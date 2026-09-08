@@ -26,6 +26,7 @@ from .cbm import (
     GraphTarget,
     IncrementalConfig,
     IncrementalConfigError,
+    NativeProjectGraph,
     default_cbm_cache,
     resolve_cbm_binary,
 )
@@ -51,6 +52,7 @@ __all__ = [
     "IncrementalConfig",
     "IncrementalConfigError",
     "KGARecorder",
+    "NativeProjectGraph",
     "build_archive",
     "build_commit",
     "build_repository",

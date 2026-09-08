@@ -32,7 +32,7 @@ if TYPE_CHECKING:
     from collections.abc import Iterator, Mapping, Sequence
 
 _ARCHIVE_PROTOCOL_VERSION = 6
-_INDEX_PROTOCOL_VERSION = 7
+_INDEX_PROTOCOL_VERSION = 8
 _RESPONSE_MAX_BYTES = 256 << 20
 _ARCHIVE_HELPER_ENV = "GH_PULLER_CODEBASE_CBM_HELPER"
 _INDEX_HELPER_ENV = "GH_PULLER_CODEBASE_CBM_INDEX_HELPER"
@@ -221,6 +221,8 @@ class NativeArchiveTransport:
         self._next_id = 1
         self._closed = False
         self.loaded_project: str | None = None
+        self.loaded_database_path: Path | None = None
+        self.loaded_source_root: Path | None = None
         self.loaded_digest: str | None = None
         self.loaded_materialization_digest: str | None = None
         helper_environment = dict(values)
@@ -460,6 +462,7 @@ class NativeArchiveTransport:
                     raise CBMTransportError("native CBM helper returned the wrong loaded graph identity")
                 _write_marker(marker, expected_marker)
             self.loaded_project = project
+            self.loaded_database_path = database
             self.loaded_digest = manifest["graph_digest"]
             self.loaded_materialization_digest = materialization
             return {**result, "database_path": str(database)}
@@ -574,6 +577,8 @@ class NativeIndexTransport(NativeArchiveTransport):
             required_capabilities=frozenset(
                 {
                     "repository-index",
+                    "project-open",
+                    "project-list",
                     "project-delete",
                     "granular-delta-controls",
                     "force-full-route",
@@ -603,6 +608,7 @@ class NativeIndexTransport(NativeArchiveTransport):
             incremental_controls: Complete delta policy, or ``None`` for CBM defaults.
             target_projects: Cross-repository targets; required only by that mode.
         """
+        self._clear_loaded()
         return self._request(
             "index",
             {
@@ -618,6 +624,51 @@ class NativeIndexTransport(NativeArchiveTransport):
             },
         )
 
+    def open_project(
+        self,
+        database_path: Path,
+        project: str,
+        source_root: Path | None = None,
+    ) -> dict[str, Any]:
+        """Bind an indexed mutable project to native graph tools.
+
+        Args:
+            database_path: Exact project database opened with mutation support.
+            project: Project expected inside that database.
+            source_root: Matching checkout used by tools that read source text.
+        """
+        result = self._request(
+            "open",
+            {
+                "database_path": str(database_path),
+                "project": project,
+                "source_root": str(source_root) if source_root is not None else None,
+            },
+        )
+        if (
+            result.get("project") != project
+            or type(result.get("nodes")) is not int
+            or type(result.get("edges")) is not int
+        ):
+            raise CBMTransportError("native CBM helper opened the wrong project")
+        self.loaded_project = project
+        self.loaded_database_path = database_path
+        self.loaded_source_root = source_root
+        self.loaded_digest = None
+        self.loaded_materialization_digest = None
+        return result
+
+    def list_projects(self, arguments: Mapping[str, object] | None = None) -> dict[str, Any]:
+        """List projects from this transport's explicit cache directory.
+
+        Args:
+            arguments: Native pagination and detail options.
+        """
+        return self._request(
+            "list",
+            {"cache_directory": str(self.cache_root), "arguments": dict(arguments or {})},
+        )
+
     def delete_project(self, database_path: Path, project: str) -> dict[str, Any]:
         """Delete a native-index project and its SQLite sidecars.
 
@@ -625,10 +676,19 @@ class NativeIndexTransport(NativeArchiveTransport):
             database_path: Exact database published by the indexing helper.
             project: Project expected inside that database.
         """
+        if self.loaded_project == project and self.loaded_database_path == database_path:
+            self._clear_loaded()
         return self._request(
             "delete",
             {"database_path": str(database_path), "project": project},
         )
+
+    def _clear_loaded(self) -> None:
+        self.loaded_project = None
+        self.loaded_database_path = None
+        self.loaded_source_root = None
+        self.loaded_digest = None
+        self.loaded_materialization_digest = None
 
 
 @contextmanager

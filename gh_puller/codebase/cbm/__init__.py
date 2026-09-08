@@ -6,7 +6,14 @@ helper, and build-runner implementations remain private sibling modules.
 
 from ._runner import CBMRunner
 from .binary import CBMBinary, CBMBinaryError, resolve_cbm_binary
-from .client import ArchiveGraph, CBMClient, CBMTransportError, GraphTarget, default_cbm_cache
+from .client import (
+    ArchiveGraph,
+    CBMClient,
+    CBMTransportError,
+    GraphTarget,
+    NativeProjectGraph,
+    default_cbm_cache,
+)
 from .plan import BuildPlan, IncrementalConfig, IncrementalConfigError
 
 __all__ = [
@@ -20,6 +27,7 @@ __all__ = [
     "GraphTarget",
     "IncrementalConfig",
     "IncrementalConfigError",
+    "NativeProjectGraph",
     "default_cbm_cache",
     "resolve_cbm_binary",
 ]

@@ -19,7 +19,7 @@
 #include <yyjson/yyjson.h>
 
 #ifdef GHP_NATIVE_INDEXING
-#define NATIVE_PROTOCOL_VERSION 7
+#define NATIVE_PROTOCOL_VERSION 8
 #else
 #define NATIVE_PROTOCOL_VERSION 6
 #endif
@@ -34,6 +34,7 @@ enum {
 typedef struct {
     cbm_sdk_graph_t *graph;
     char *database_path;
+    char *source_root;
     char *graph_digest;
     char *materialization_digest;
     int node_count;
@@ -136,6 +137,8 @@ static char *hello_response(uint64_t id) {
     yyjson_mut_arr_add_str(document, capabilities, "graph-compare");
 #ifdef GHP_NATIVE_INDEXING
     yyjson_mut_arr_add_str(document, capabilities, "repository-index");
+    yyjson_mut_arr_add_str(document, capabilities, "project-open");
+    yyjson_mut_arr_add_str(document, capabilities, "project-list");
     yyjson_mut_arr_add_str(document, capabilities, "project-delete");
     yyjson_mut_arr_add_str(document, capabilities, "granular-delta-controls");
     yyjson_mut_arr_add_str(document, capabilities, "force-full-route");
@@ -264,6 +267,7 @@ static bool parse_snapshot(yyjson_val *parameters, ghp_kga_snapshot_t *snapshot,
 static void session_clear(helper_session_t *session) {
     cbm_sdk_graph_close(session->graph);
     free(session->database_path);
+    free(session->source_root);
     free(session->graph_digest);
     free(session->materialization_digest);
     memset(session, 0, sizeof(*session));
@@ -543,6 +547,86 @@ static char *delete_response(uint64_t id, helper_session_t *session, yyjson_val 
     cbm_sdk_status_t status = cbm_sdk_delete_project(database_path, project, &result);
     return sdk_result_response(id, status, &result);
 }
+
+static char *open_response(uint64_t id, helper_session_t *session, yyjson_val *parameters) {
+    const char *database_path = NULL;
+    const char *project = NULL;
+    const char *source_root = NULL;
+    yyjson_val *source_value = NULL;
+    if (!yyjson_is_obj(parameters) ||
+        !(database_path = json_string(yyjson_obj_get(parameters, "database_path"))) ||
+        !(project = json_string(yyjson_obj_get(parameters, "project"))) || !database_path[0] ||
+        !project[0]) {
+        return error_response(id, "invalid_request",
+                              "project open requires database_path and project");
+    }
+    source_value = yyjson_obj_get(parameters, "source_root");
+    if (source_value && !yyjson_is_null(source_value) &&
+        (!(source_root = json_string(source_value)) || !source_root[0])) {
+        return error_response(id, "invalid_request",
+                              "source_root must be a non-empty string or null");
+    }
+
+    char error[1024];
+    cbm_sdk_graph_t *graph = NULL;
+    cbm_sdk_status_t status =
+        cbm_sdk_graph_open_writable(database_path, project, &graph, error, sizeof(error));
+    if (status != CBM_SDK_OK) {
+        return error_response(id, cbm_sdk_status_code(status), error);
+    }
+    int nodes = 0;
+    int edges = 0;
+    status = cbm_sdk_graph_counts(graph, &nodes, &edges);
+    char *saved_database = strdup(database_path);
+    char *saved_source = source_root ? strdup(source_root) : NULL;
+    if (status != CBM_SDK_OK || !saved_database || (source_root && !saved_source)) {
+        cbm_sdk_graph_close(graph);
+        free(saved_database);
+        free(saved_source);
+        return error_response(
+            id, status == CBM_SDK_OK ? "allocation_failed" : cbm_sdk_status_code(status),
+            status == CBM_SDK_OK ? "cannot retain opened project" : "cannot count project graph");
+    }
+    session_clear(session);
+    session->graph = graph;
+    session->database_path = saved_database;
+    session->source_root = saved_source;
+    session->node_count = nodes;
+    session->edge_count = edges;
+
+    yyjson_mut_val *root = NULL;
+    yyjson_mut_doc *document = response_document(id, true, &root);
+    if (!document) {
+        session_clear(session);
+        return NULL;
+    }
+    yyjson_mut_val *result = yyjson_mut_obj(document);
+    yyjson_mut_obj_add_str(document, result, "project", project);
+    yyjson_mut_obj_add_int(document, result, "nodes", nodes);
+    yyjson_mut_obj_add_int(document, result, "edges", edges);
+    yyjson_mut_obj_add_val(document, root, "result", result);
+    return document_json(document);
+}
+
+static char *list_response(uint64_t id, yyjson_val *parameters) {
+    const char *cache_directory = NULL;
+    yyjson_val *arguments = NULL;
+    if (!yyjson_is_obj(parameters) ||
+        !(cache_directory = json_string(yyjson_obj_get(parameters, "cache_directory"))) ||
+        !(arguments = yyjson_obj_get(parameters, "arguments")) || !cache_directory[0] ||
+        !yyjson_is_obj(arguments)) {
+        return error_response(id, "invalid_request",
+                              "project list requires cache_directory and arguments");
+    }
+    char *arguments_json = yyjson_val_write(arguments, YYJSON_WRITE_NOFLAG, NULL);
+    if (!arguments_json) {
+        return error_response(id, "allocation_failed", "cannot encode project list arguments");
+    }
+    cbm_sdk_result_t result = {0};
+    cbm_sdk_status_t status = cbm_sdk_list_projects(cache_directory, arguments_json, &result);
+    free(arguments_json);
+    return sdk_result_response(id, status, &result);
+}
 #endif
 
 static char *tool_response(uint64_t id, helper_session_t *session, yyjson_val *parameters) {
@@ -562,7 +646,12 @@ static char *tool_response(uint64_t id, helper_session_t *session, yyjson_val *p
         return error_response(id, "allocation_failed", "cannot encode tool arguments");
     }
     cbm_sdk_result_t result = {0};
-    cbm_sdk_status_t status = cbm_sdk_graph_call(session->graph, name, arguments_json, &result);
+    cbm_sdk_graph_call_options_t options = {
+        .struct_size = sizeof(options),
+        .source_root = session->source_root,
+    };
+    cbm_sdk_status_t status =
+        cbm_sdk_graph_call_with_options(session->graph, name, arguments_json, &options, &result);
     free(arguments_json);
     return sdk_result_response(id, status, &result);
 }
@@ -655,6 +744,12 @@ static char *dispatch_request(helper_session_t *session, yyjson_val *request, bo
     }
     if (strcmp(method, "delete") == 0) {
         return delete_response(id, session, parameters);
+    }
+    if (strcmp(method, "open") == 0) {
+        return open_response(id, session, parameters);
+    }
+    if (strcmp(method, "list") == 0) {
+        return list_response(id, parameters);
     }
 #endif
     if (strcmp(method, "shutdown") == 0) {
