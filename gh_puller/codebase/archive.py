@@ -83,6 +83,16 @@ def _key_path(key) -> tuple[str]:
     return (".".join(components[:3]),)
 
 
+def _record_map(records: Iterable[tuple], tree: str) -> dict:
+    result = {}
+    for raw_key, value in records:
+        key = _key_value(raw_key)
+        if key in result:
+            raise ArchiveError(f"duplicate {tree} identity: {key!r}")
+        result[key] = value
+    return result
+
+
 @dataclass(frozen=True)
 class FrameInfo:
     offset: int
@@ -607,26 +617,38 @@ class RadixTree:
         if not changes:
             return root
         prepared = [(key, value, _key_path(key)) for key, value in changes.items()]
-        return self._update(root, 0, prepared)
+        return self._update(root, 0, prepared, None)
 
     def build(self, records: Iterable[tuple]) -> TreeRef | None:
-        return self.apply(None, dict(records))
+        return self.apply(None, _record_map(records, self.tree))
 
     def _page(self, ref: TreeRef) -> dict:
         self.pages_read += 1
         return self.store.read_page(ref)
 
-    def _update(self, ref: TreeRef | None, depth: int, changes: list[tuple]) -> TreeRef | None:
+    def _update(
+        self,
+        ref: TreeRef | None,
+        depth: int,
+        changes: list[tuple],
+        shard: str | None,
+    ) -> TreeRef | None:
         if depth == TRIE_DEPTH:
+            if shard is None:
+                raise ArchiveError("KGA leaf has no identity shard")
             entries = {}
             if ref is not None:
                 page = self._page(ref)
                 if page.get("kind") != "leaf":
                     raise ArchiveError("expected leaf page")
-                entries = {_key_value(key): value for key, value in page["entries"]}
+                entries = _record_map(page["entries"], self.tree)
+                if any(_key_path(key) != (shard,) for key in entries):
+                    raise ArchiveError(f"{self.tree} identity is stored in the wrong shard")
             for key, value, _ in changes:
                 if value is None:
-                    entries.pop(key, None)
+                    if key not in entries:
+                        raise ArchiveError(f"cannot delete absent {self.tree} identity: {key!r}")
+                    del entries[key]
                 else:
                     entries[key] = value
             if not entries:
@@ -644,12 +666,15 @@ class RadixTree:
             page = self._page(ref)
             if page.get("kind") != "branch" or page.get("depth") != depth:
                 raise ArchiveError("expected branch page")
-            children = {slot: TreeRef.from_json(child) for slot, child in page["children"]}
+            children = {
+                slot: TreeRef.from_json(child)
+                for slot, child in _record_map(page["children"], f"{self.tree} shard").items()
+            }
         grouped: dict[str, list] = {}
         for change in changes:
             grouped.setdefault(change[2][depth], []).append(change)
         for slot, group in grouped.items():
-            child = self._update(children.get(slot), depth + 1, group)
+            child = self._update(children.get(slot), depth + 1, group, slot)
             if child is None:
                 children.pop(slot, None)
             else:
@@ -781,17 +806,33 @@ class Archive(PageStore):
 
     def _records(self, ref: TreeRef | None, tree: str) -> dict:
         records = {}
-        stack: list[TreeRef | _PageRef] = [] if ref is None else [ref]
+        stack: list[tuple[TreeRef | _PageRef, str | None]] = [] if ref is None else [(ref, None)]
         while stack:
-            page = self._typed_page(stack.pop(), tree)
+            reference, shard = stack.pop()
+            page = self._typed_page(reference, tree)
             if isinstance(page, _BranchPage):
-                stack.extend(child for _, child in reversed(page.children))
+                if shard is not None or page.depth != 0:
+                    raise ArchiveError(f"invalid {tree} branch depth")
+                children = _record_map(page.children, f"{tree} shard")
+                stack.extend((child, slot) for slot, child in reversed(tuple(children.items())))
             elif isinstance(page, dict) and page["kind"] != "leaf":
-                stack.extend(TreeRef.from_json(child) for _, child in reversed(page["children"]))
-            elif isinstance(page, dict) and tree == "edges":
-                records.update((tuple(key), value) for key, value in page["entries"])
+                if page["kind"] != "branch" or shard is not None or page.get("depth") != 0:
+                    raise ArchiveError(f"invalid {tree} branch page")
+                children = _record_map(page["children"], f"{tree} shard")
+                stack.extend(
+                    (TreeRef.from_json(child), slot) for slot, child in reversed(tuple(children.items()))
+                )
             else:
-                records.update(page["entries"] if isinstance(page, dict) else page.entries)
+                depth = page.get("depth") if isinstance(page, dict) else page.depth
+                if shard is None or depth != TRIE_DEPTH:
+                    raise ArchiveError(f"invalid {tree} leaf depth")
+                entries = _record_map(page["entries"] if isinstance(page, dict) else page.entries, tree)
+                if any(_key_path(key) != (shard,) for key in entries):
+                    raise ArchiveError(f"{tree} identity is stored in the wrong shard")
+                duplicate = records.keys() & entries.keys()
+                if duplicate:
+                    raise ArchiveError(f"duplicate {tree} identity: {next(iter(duplicate))!r}")
+                records.update(entries)
         return records
 
     def load_rows(self, commit: str | None = None) -> GraphRows:

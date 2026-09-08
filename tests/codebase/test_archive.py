@@ -131,6 +131,21 @@ def test_no_changes_reuses_root_without_writing(tmp_path):
     writer.close_incomplete()
 
 
+def test_radix_tree_rejects_duplicate_build_identities(tmp_path):
+    writer = ArchiveWriter(tmp_path / "archive.kga")
+    with pytest.raises(ArchiveError, match="duplicate nodes identity"):
+        RadixTree(writer, "nodes").build([("a", {"v": 1}), ("a", {"v": 2})])
+    writer.close_incomplete()
+
+
+def test_radix_tree_rejects_deleting_absent_identity(tmp_path):
+    writer = ArchiveWriter(tmp_path / "archive.kga")
+    root = RadixTree(writer, "nodes").build({"a": {"v": 1}}.items())
+    with pytest.raises(ArchiveError, match="cannot delete absent nodes identity"):
+        RadixTree(writer, "nodes").apply(root, {"b": None})
+    writer.close_incomplete()
+
+
 def test_page_cache_is_bounded_by_raw_bytes(tmp_path):
     writer = ArchiveWriter(tmp_path / "archive.kga", cache_bytes=400)
     tree = RadixTree(writer, "nodes")
