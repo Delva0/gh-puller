@@ -12,7 +12,7 @@ from gh_puller.codebase import (
     CBMTransportError,
 )
 from gh_puller.codebase.archive import GRAPH_FIDELITY_VERSION, RadixTree, graph_digest
-from gh_puller.codebase.cbm_native import NativeArchiveTransport
+from gh_puller.codebase.cbm._native import NativeArchiveTransport
 from gh_puller.codebase.store import GraphRows, load_rows
 
 

@@ -1,14 +1,13 @@
-"""Build and read durable, random-access code graph archives.
+"""Expose public APIs for building and querying durable code graph archives.
 
-The package owns the archive format and user-facing build API.  CBM executable
-optimization and acceptance live in the persistent-digraph laboratory; this package
-only resolves a promoted, content-addressed executable through :mod:`.binary`.
+The package owns KGA persistence and repository build orchestration. Its
+``cbm`` subpackage contains the unified client boundary while hiding daemon and
+native protocol implementations.
 """
 
 from .archive import Archive, ArchiveError, ArchiveWriter, KGARecorder
 from .binary import CBMBinary, CBMBinaryError, resolve_cbm_binary
-from .build_plan import BuildPlan, IncrementalConfig, IncrementalConfigError
-from .cbm_build import (
+from .build import (
     BuildError,
     BuildOptions,
     CommitBuildResult,
@@ -17,8 +16,8 @@ from .cbm_build import (
     build_commit,
     build_repository,
 )
-from .cbm_runner import CBMRunner
-from .cbm_sdk import ArchiveGraph, CBMClient, CBMTransportError, GraphTarget, default_cbm_cache
+from .build_plan import BuildPlan, IncrementalConfig, IncrementalConfigError
+from .cbm import ArchiveGraph, CBMClient, CBMRunner, CBMTransportError, GraphTarget, default_cbm_cache
 from .store import GraphReader
 
 __all__ = [

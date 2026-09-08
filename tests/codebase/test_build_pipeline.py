@@ -5,10 +5,10 @@ import os
 import sqlite3
 import subprocess
 
-import gh_puller.codebase.cbm_runner as runner_module
+import gh_puller.codebase.cbm._runner as runner_module
 from gh_puller.codebase.archive import Archive
+from gh_puller.codebase.build import BuildOptions, build_repository
 from gh_puller.codebase.build_plan import BuildPlan
-from gh_puller.codebase.cbm_build import BuildOptions, build_repository
 
 SCHEMA = """
 CREATE TABLE projects(name TEXT PRIMARY KEY);

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import argparse
 
-from .cbm_build import add_build_arguments, run_from_namespace
+from .build import add_build_arguments, run_from_namespace
 
 
 def main() -> int:

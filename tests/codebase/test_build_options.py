@@ -3,7 +3,7 @@ import json
 import pytest
 
 from gh_puller.codebase.archive import Archive, ArchiveError, ArchiveWriter, RadixTree, graph_digest
-from gh_puller.codebase.cbm_build import (
+from gh_puller.codebase.build import (
     GRAPH_FIDELITY_VERSION,
     BuildError,
     BuildOptions,
@@ -12,7 +12,7 @@ from gh_puller.codebase.cbm_build import (
     _validate_resume_fidelity,
     prepare_output_dir,
 )
-from gh_puller.codebase.cbm_transport import index_execution_from_envelope
+from gh_puller.codebase.cbm._daemon import index_execution_from_envelope
 from gh_puller.codebase.store import GraphRows
 
 

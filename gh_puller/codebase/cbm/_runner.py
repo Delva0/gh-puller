@@ -1,8 +1,8 @@
-"""Own one reusable CBM process and its build-scoped filesystem state.
+"""Own build-scoped filesystem state around one reusable CBM client.
 
-The runner accepts per-commit :class:`.BuildPlan` values and exposes only the
-published database path and execution metadata. Graph extraction and KGA
-encoding remain separate responsibilities.
+The runner accepts per-commit build plans and exposes only the published
+database path and execution metadata. Graph extraction and KGA encoding remain
+outside this package.
 """
 
 from __future__ import annotations
@@ -16,11 +16,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Self
 
-from .cbm_sdk import CBMClient, CBMTransportError
+from .client import CBMClient, CBMTransportError
 
 if TYPE_CHECKING:
-    from .binary import CBMBinary
-    from .build_plan import BuildPlan
+    from ..binary import CBMBinary
+    from ..build_plan import BuildPlan
 
 
 def _total_memory() -> int:

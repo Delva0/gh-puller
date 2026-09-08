@@ -1,4 +1,8 @@
-"""CBM indexing transports used by the persistent archive builder."""
+"""Implement private MCP and CLI daemon backends for the unified CBM client.
+
+This module owns subprocess protocols, request lifetimes, and daemon response
+validation. Backend selection and public operations remain in :mod:`.client`.
+"""
 
 from __future__ import annotations
 

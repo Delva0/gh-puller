@@ -1,8 +1,8 @@
-"""Drive the persistent native KGA-to-CBM helper and its immutable store cache.
+"""Implement the private native archive backend and immutable store cache.
 
 This module owns helper authentication, framed control messages, cross-process
 materialization locks, and cache identity. KGA parsing remains in the native
-helper; public tool routing remains in :mod:`.cbm_sdk`.
+helper; public tool routing remains in :mod:`.client`.
 """
 
 from __future__ import annotations
@@ -24,8 +24,8 @@ from hashlib import sha256
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, BinaryIO, Self
 
-from .archive import GRAPH_FIDELITY_VERSION, Archive
-from .cbm_transport import CBMTransportError
+from ..archive import GRAPH_FIDELITY_VERSION, Archive
+from ._daemon import CBMTransportError
 
 if TYPE_CHECKING:
     from collections.abc import Iterator, Mapping

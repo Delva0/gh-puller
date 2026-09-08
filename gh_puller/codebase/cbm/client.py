@@ -1,8 +1,9 @@
-"""Expose every CBM execution path through one synchronous Python facade.
+"""Implement the synchronous client exported by the CBM package facade.
 
 Build and daemon tools use a selectable MCP or CLI backend. Archive tools use
 the compact native runtime, while open-ended arguments keep new server fields
-independent of SDK releases. Upper layers depend only on this module.
+independent of SDK releases. Backend process and protocol mechanics remain in
+private sibling modules.
 """
 
 from __future__ import annotations
@@ -14,21 +15,21 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Self
 
-from .binary import CBMBinary, resolve_cbm_binary
-from .cbm_native import NativeArchiveTransport, NativeHelper
-from .cbm_transport import (
+from ..binary import CBMBinary, resolve_cbm_binary
+from ._daemon import (
     CBMTransportError,
     CLITransport,
     PersistentMCPTransport,
     ResourceMonitorLike,
     make_transport,
 )
+from ._native import NativeArchiveTransport, NativeHelper
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
     from types import TracebackType
 
-    from .archive import Archive
+    from ..archive import Archive
 
 
 class _ClientMonitor:

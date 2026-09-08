@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from gh_puller.codebase.cbm_transport import (
+from gh_puller.codebase.cbm._daemon import (
     CBMTransportError,
     CLITransport,
     PersistentMCPTransport,

@@ -6,11 +6,11 @@ import subprocess
 
 import pytest
 
-import gh_puller.codebase.cbm_runner as runner_module
+import gh_puller.codebase.cbm._runner as runner_module
 from gh_puller.codebase.archive import Archive, KGACommit, KGARecorder
+from gh_puller.codebase.build import CommitTarget, build_commit
 from gh_puller.codebase.build_plan import BuildPlan
-from gh_puller.codebase.cbm_build import CommitTarget, build_commit
-from gh_puller.codebase.cbm_runner import CBMRunner
+from gh_puller.codebase.cbm import CBMRunner
 from gh_puller.codebase.store import GraphReader
 
 SCHEMA = """
