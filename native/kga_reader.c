@@ -273,7 +273,24 @@ static int compare_edges(const void *left, const void *right) {
     return 0;
 }
 
-static int import_node_leaf(import_context_t *context, yyjson_val *entries, uint64_t count) {
+static bool shard_matches(const char *identity, const char *shard) {
+    if (!identity || !shard) {
+        return false;
+    }
+    const char *cursor = identity;
+    unsigned dots = 0;
+    while (*cursor && dots < 3) {
+        if (*cursor == '.') {
+            dots++;
+        }
+        cursor++;
+    }
+    size_t length = dots == 3 ? (size_t)(cursor - identity - 1) : (size_t)(cursor - identity);
+    return strlen(shard) == length && memcmp(identity, shard, length) == 0;
+}
+
+static int import_node_leaf(import_context_t *context, yyjson_val *entries, uint64_t count,
+                            const char *shard) {
     if (!yyjson_is_arr(entries) || yyjson_arr_size(entries) != count || count > SIZE_MAX) {
         return fail(context->error, context->error_size, "invalid node leaf entries");
     }
@@ -293,7 +310,8 @@ static int import_node_leaf(import_context_t *context, yyjson_val *entries, uint
             !(row->name = json_string(yyjson_obj_get(attributes, "name"))) ||
             !(row->file_path = json_string(yyjson_obj_get(attributes, "file_path"))) ||
             !json_int32(yyjson_obj_get(attributes, "start_line"), &row->start_line) ||
-            !json_int32(yyjson_obj_get(attributes, "end_line"), &row->end_line)) {
+            !json_int32(yyjson_obj_get(attributes, "end_line"), &row->end_line) ||
+            !shard_matches(row->qualified_name, shard)) {
             fail(context->error, context->error_size, "invalid node row in KGA leaf");
             goto cleanup;
         }
@@ -305,6 +323,12 @@ static int import_node_leaf(import_context_t *context, yyjson_val *entries, uint
         }
     }
     qsort(items, (size_t)count, sizeof(*items), compare_nodes);
+    for (size_t item = 1; item < (size_t)count; item++) {
+        if (compare_nodes(&items[item - 1], &items[item]) == 0) {
+            fail(context->error, context->error_size, "duplicate node identity in KGA leaf");
+            goto cleanup;
+        }
+    }
     cbm_graph_import_status_t imported = cbm_graph_import_add_nodes(
         context->import, items, (size_t)count, context->error, context->error_size);
     status = imported == CBM_GRAPH_IMPORT_OK ? 0 : -1;
@@ -317,7 +341,8 @@ cleanup:
     return status;
 }
 
-static int import_edge_leaf(import_context_t *context, yyjson_val *entries, uint64_t count) {
+static int import_edge_leaf(import_context_t *context, yyjson_val *entries, uint64_t count,
+                            const char *shard) {
     if (!yyjson_is_arr(entries) || yyjson_arr_size(entries) != count || count > SIZE_MAX) {
         return fail(context->error, context->error_size, "invalid edge leaf entries");
     }
@@ -337,7 +362,8 @@ static int import_edge_leaf(import_context_t *context, yyjson_val *entries, uint
             !(row->source = json_string(yyjson_arr_get(identity, 0))) ||
             !(row->target = json_string(yyjson_arr_get(identity, 1))) ||
             !(row->type = json_string(yyjson_arr_get(identity, 2))) ||
-            !(row->local_name = json_string(yyjson_arr_get(identity, 3)))) {
+            !(row->local_name = json_string(yyjson_arr_get(identity, 3))) ||
+            !shard_matches(row->source, shard)) {
             fail(context->error, context->error_size, "invalid edge row in KGA leaf");
             goto cleanup;
         }
@@ -349,6 +375,12 @@ static int import_edge_leaf(import_context_t *context, yyjson_val *entries, uint
         }
     }
     qsort(items, (size_t)count, sizeof(*items), compare_edges);
+    for (size_t item = 1; item < (size_t)count; item++) {
+        if (compare_edges(&items[item - 1], &items[item]) == 0) {
+            fail(context->error, context->error_size, "duplicate edge identity in KGA leaf");
+            goto cleanup;
+        }
+    }
     cbm_graph_import_status_t imported = cbm_graph_import_add_edges(
         context->import, items, (size_t)count, context->error, context->error_size);
     status = imported == CBM_GRAPH_IMPORT_OK ? 0 : -1;
@@ -362,7 +394,7 @@ cleanup:
 }
 
 static int import_tree(import_context_t *context, const ghp_kga_root_t *reference, const char *tree,
-                       unsigned depth) {
+                       const char *shard, unsigned depth) {
     if (depth >= KGA_MAX_TREE_DEPTH) {
         return fail(context->error, context->error_size, "KGA tree exceeds depth limit");
     }
@@ -387,10 +419,18 @@ static int import_tree(import_context_t *context, const ghp_kga_root_t *referenc
 
     int status = -1;
     if (strcmp(kind, "leaf") == 0) {
+        if (depth != 1 || !shard) {
+            fail(context->error, context->error_size, "invalid KGA leaf depth");
+            goto done;
+        }
         yyjson_val *entries = yyjson_obj_get(root, "entries");
-        status = strcmp(tree, "nodes") == 0 ? import_node_leaf(context, entries, count)
-                                            : import_edge_leaf(context, entries, count);
+        status = strcmp(tree, "nodes") == 0 ? import_node_leaf(context, entries, count, shard)
+                                            : import_edge_leaf(context, entries, count, shard);
     } else if (strcmp(kind, "branch") == 0) {
+        if (depth != 0 || shard) {
+            fail(context->error, context->error_size, "invalid KGA branch depth");
+            goto done;
+        }
         yyjson_val *children = yyjson_obj_get(root, "children");
         if (!yyjson_is_arr(children)) {
             fail(context->error, context->error_size, "invalid KGA branch children");
@@ -412,7 +452,7 @@ static int import_tree(import_context_t *context, const ghp_kga_root_t *referenc
             }
             previous_slot = slot;
             total += child_reference.count;
-            if (import_tree(context, &child_reference, tree, depth + 1) != 0) {
+            if (import_tree(context, &child_reference, tree, slot, depth + 1) != 0) {
                 goto done;
             }
         }
@@ -471,6 +511,7 @@ int ghp_kga_import_snapshot(const ghp_kga_snapshot_t *snapshot, ghp_kga_import_r
         .node_count = snapshot->node_count,
         .edge_count = snapshot->edge_count,
         .unordered_identities = true,
+        .prevalidated_unique_identities = true,
         .drop_missing_edge_endpoints = snapshot->repair_legacy,
     };
     cbm_graph_import_t *import = NULL;
@@ -487,11 +528,11 @@ int ghp_kga_import_snapshot(const ghp_kga_snapshot_t *snapshot, ghp_kga_import_r
         .error_size = error_size,
     };
     CBM_PROF_START(nodes_started);
-    int result = import_tree(&context, &snapshot->node_root, "nodes", 0);
+    int result = import_tree(&context, &snapshot->node_root, "nodes", NULL, 0);
     CBM_PROF_END_N("kga_import", "nodes", nodes_started, snapshot->node_count);
     if (result == 0 && snapshot->edge_root.present) {
         CBM_PROF_START(edges_started);
-        result = import_tree(&context, &snapshot->edge_root, "edges", 0);
+        result = import_tree(&context, &snapshot->edge_root, "edges", NULL, 0);
         CBM_PROF_END_N("kga_import", "edges", edges_started, snapshot->edge_count);
     }
     if (result == 0) {

@@ -191,6 +191,54 @@ def write_legacy_archive(path: Path) -> tuple[dict, GraphRows]:
     return manifest, rows
 
 
+def write_missharded_archive(path: Path) -> None:
+    writer = ArchiveWriter(path)
+    entry = [
+        "__project__",
+        {
+            "label": "Project",
+            "name": "__project__",
+            "file_path": "",
+            "start_line": 0,
+            "end_line": 0,
+            "properties": {},
+        },
+    ]
+    leaf = writer.store_page(
+        {"tree": "nodes", "kind": "leaf", "depth": 1, "count": 1, "entries": [entry]},
+        {"tree": "nodes", "kind": "leaf", "depth": 1, "entries": [entry]},
+    )
+    node_root = writer.store_page(
+        {
+            "tree": "nodes",
+            "kind": "branch",
+            "depth": 0,
+            "count": 1,
+            "children": [["wrong", {"logical_hash": leaf.logical_hash, "count": 1}]],
+        },
+        {
+            "tree": "nodes",
+            "kind": "branch",
+            "depth": 0,
+            "children": [["wrong", leaf.to_json()]],
+        },
+    )
+    writer.commit(
+        {
+            "sha": "missharded",
+            "parents": [],
+            "node_root": node_root.to_json(),
+            "edge_root": None,
+            "nodes": 1,
+            "edges": 0,
+            "graph_digest": graph_digest(node_root, None),
+            "graph_fidelity_version": GRAPH_FIDELITY_VERSION,
+            "cbm_project": "__project__",
+        },
+    )
+    writer.finalize()
+
+
 def requests(path: Path) -> list[dict]:
     return [json.loads(line) for line in path.read_text().splitlines()]
 
@@ -380,6 +428,22 @@ def test_real_native_helper_repairs_legacy_rows_and_reuses_cache(tmp_path):
     assert {row[0] for row in queried["rows"]} == {"earlier", "later"}
     assert reused["materialized"] is False
     assert reused["dropped_edges"] == 1
+
+
+@pytest.mark.integration
+def test_real_native_helper_rejects_missharded_identity(tmp_path):
+    configured = os.environ.get("GH_PULLER_TEST_CBM_NATIVE_HELPER")
+    if configured is None:
+        pytest.skip("real native helper not configured")
+    archive_path = tmp_path / "archive.kga"
+    write_missharded_archive(archive_path)
+
+    with CBMClient(
+        native_helper=Path(configured),
+        cache_root=tmp_path / "cache",
+        timeout=30,
+    ) as client, pytest.raises(CBMTransportError, match="invalid node row in KGA leaf"):
+        client.load_archive(archive_path)
 
 
 @pytest.mark.integration
