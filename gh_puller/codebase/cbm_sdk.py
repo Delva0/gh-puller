@@ -237,7 +237,6 @@ class CBMClient:
         commit: str | None = None,
         *,
         allow_incomplete: bool = True,
-        repair_legacy: bool = False,
     ) -> dict[str, Any]:
         """Load one KGA snapshot into the native query engine.
 
@@ -246,20 +245,12 @@ class CBMClient:
             commit: Exact archived commit. ``None`` selects the captured latest.
             allow_incomplete: For path inputs, accept the writer's final durable
                 checkpoint while the archive is still being built.
-            repair_legacy: Explicitly make a pre-fidelity snapshot queryable by
-                dropping and reporting edges whose endpoints are absent. This is
-                compatibility repair, not exact restoration.
 
         Returns:
             Loaded graph identity, row counts, cache path, and whether the store
             was materialized during this call.
         """
-        return self._native().load_archive(
-            archive,
-            commit,
-            allow_incomplete=allow_incomplete,
-            repair_legacy=repair_legacy,
-        )
+        return self._native().load_archive(archive, commit, allow_incomplete=allow_incomplete)
 
     def trace_path(self, *, project: str, function_name: str, **options: object) -> dict[str, Any]:
         """Trace calls, data flow, or cross-service paths from one symbol.

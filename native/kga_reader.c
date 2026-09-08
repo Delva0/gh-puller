@@ -470,11 +470,7 @@ done:
     return status;
 }
 
-int ghp_kga_import_snapshot(const ghp_kga_snapshot_t *snapshot, ghp_kga_import_result_t *output,
-                            char *error, size_t error_size) {
-    if (output) {
-        memset(output, 0, sizeof(*output));
-    }
+int ghp_kga_import_snapshot(const ghp_kga_snapshot_t *snapshot, char *error, size_t error_size) {
     if (error && error_size > 0) {
         error[0] = '\0';
     }
@@ -512,7 +508,6 @@ int ghp_kga_import_snapshot(const ghp_kga_snapshot_t *snapshot, ghp_kga_import_r
         .edge_count = snapshot->edge_count,
         .unordered_identities = true,
         .prevalidated_unique_identities = true,
-        .drop_missing_edge_endpoints = snapshot->repair_legacy,
     };
     cbm_graph_import_t *import = NULL;
     cbm_graph_import_status_t begun = cbm_graph_import_begin(&options, &import, error, error_size);
@@ -537,14 +532,8 @@ int ghp_kga_import_snapshot(const ghp_kga_snapshot_t *snapshot, ghp_kga_import_r
     }
     if (result == 0) {
         CBM_PROF_START(finish_started);
-        cbm_graph_import_result_t imported = {0};
-        if (cbm_graph_import_finish(import, &imported, error, error_size) != CBM_GRAPH_IMPORT_OK) {
+        if (cbm_graph_import_finish(import, NULL, error, error_size) != CBM_GRAPH_IMPORT_OK) {
             result = -1;
-        } else if (output) {
-            output->node_count = imported.node_count;
-            output->edge_count = imported.edge_count;
-            output->input_edge_count = imported.input_edge_count;
-            output->dropped_edge_count = imported.dropped_edge_count;
         }
         CBM_PROF_END_N("kga_import", "finish", finish_started,
                        snapshot->node_count + snapshot->edge_count);

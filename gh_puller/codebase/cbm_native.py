@@ -30,10 +30,10 @@ from .cbm_transport import CBMTransportError
 if TYPE_CHECKING:
     from collections.abc import Iterator, Mapping
 
-_PROTOCOL_VERSION = 3
+_PROTOCOL_VERSION = 4
 _RESPONSE_MAX_BYTES = 256 << 20
 _HELPER_ENV = "GH_PULLER_CODEBASE_CBM_HELPER"
-_CACHE_SCHEMA = 2
+_CACHE_SCHEMA = 3
 _STREAM_CLOSED = object()
 
 
@@ -330,7 +330,6 @@ class NativeArchiveTransport:
         commit: str | None = None,
         *,
         allow_incomplete: bool = True,
-        repair_legacy: bool = False,
     ) -> dict[str, Any]:
         """Materialize and retain one archived commit without Python graph rows.
 
@@ -339,10 +338,6 @@ class NativeArchiveTransport:
             commit: Exact archived commit. ``None`` selects the captured latest.
             allow_incomplete: When opening a path, accept its final durable writer
                 checkpoint instead of requiring a final footer.
-            repair_legacy: Explicitly load a pre-fidelity snapshot by using its
-                historical normalized project identity and dropping only edges
-                whose endpoints are absent. The returned counts disclose every
-                dropped row; this mode does not claim exact restoration.
 
         Returns:
             Loaded identity, row counts, materialization status, and cache path.
@@ -350,26 +345,19 @@ class NativeArchiveTransport:
         owned = not isinstance(archive, Archive)
         reader = Archive(archive, allow_incomplete=allow_incomplete) if owned else archive
         try:
-            manifest, project, legacy = reader._restorable_manifest(
-                commit,
-                repair_legacy=repair_legacy,
-            )
-            if legacy and "legacy-repair" not in self.capabilities:
-                raise CBMTransportError("native CBM helper does not support legacy repair")
+            manifest, project = reader._restorable_manifest(commit)
             status = os.fstat(reader._reader.fd)
             archive_path = reader.path.resolve(strict=True)
             database, marker, lock = self._cache_paths(manifest["graph_digest"])
-            fidelity = 1 if legacy else manifest["graph_fidelity_version"]
-            marker_identity = {
+            expected_marker = {
                 "schema": _CACHE_SCHEMA,
                 "helper_sha256": self.helper.sha256,
                 "store_format": self.store_format,
                 "graph_digest": manifest["graph_digest"],
                 "project": project,
                 "nodes": manifest["nodes"],
-                "input_edges": manifest["edges"],
-                "graph_fidelity": fidelity,
-                "repair_legacy": legacy,
+                "edges": manifest["edges"],
+                "graph_fidelity": manifest["graph_fidelity_version"],
             }
             parameters = {
                 "archive_path": str(archive_path),
@@ -381,51 +369,26 @@ class NativeArchiveTransport:
                 "database_path": str(database),
                 "node_count": manifest["nodes"],
                 "edge_count": manifest["edges"],
-                "graph_fidelity": fidelity,
-                "repair_legacy": legacy,
+                "graph_fidelity": manifest["graph_fidelity_version"],
                 "node_root": manifest["node_root"],
                 "edge_root": manifest["edge_root"],
             }
             with _exclusive_lock(lock, self.timeout):
-                cached_edges = _cached_edge_count(
-                    _read_marker(marker),
-                    marker_identity,
-                    input_edges=manifest["edges"],
-                    repair_legacy=legacy,
-                )
-                reuse = database.is_file() and cached_edges is not None
-                parameters["reuse"] = reuse
-                if reuse:
-                    parameters["stored_edge_count"] = cached_edges
+                parameters["reuse"] = database.is_file() and _read_marker(marker) == expected_marker
                 result = self._request("load", parameters)
                 expected_result = {
                     "project": project,
                     "graph_digest": manifest["graph_digest"],
                     "nodes": manifest["nodes"],
-                    "input_edges": manifest["edges"],
-                    "graph_fidelity": fidelity,
-                    "legacy_repaired": legacy,
+                    "edges": manifest["edges"],
+                    "graph_fidelity": manifest["graph_fidelity_version"],
                 }
-                edges = result.get("edges")
-                dropped_edges = result.get("dropped_edges")
-                counts_valid = (
-                    type(edges) is int
-                    and edges >= 0
-                    and type(dropped_edges) is int
-                    and dropped_edges >= 0
-                    and edges + dropped_edges == manifest["edges"]
-                    and (legacy or dropped_edges == 0)
-                )
                 if (
                     any(result.get(key) != value for key, value in expected_result.items())
                     or type(result.get("materialized")) is not bool
-                    or not counts_valid
                 ):
                     raise CBMTransportError("native CBM helper returned the wrong loaded graph identity")
-                _write_marker(
-                    marker,
-                    {**marker_identity, "edges": edges, "dropped_edges": dropped_edges},
-                )
+                _write_marker(marker, expected_marker)
             self.loaded_project = project
             self.loaded_digest = manifest["graph_digest"]
             return {**result, "database_path": str(database)}
@@ -503,29 +466,6 @@ def _read_marker(path: Path) -> object:
         return json.loads(path.read_text())
     except (OSError, json.JSONDecodeError):
         return None
-
-
-def _cached_edge_count(
-    value: object,
-    identity: Mapping[str, object],
-    *,
-    input_edges: int,
-    repair_legacy: bool,
-) -> int | None:
-    if not isinstance(value, dict) or any(value.get(key) != expected for key, expected in identity.items()):
-        return None
-    edges = value.get("edges")
-    dropped = value.get("dropped_edges")
-    if (
-        type(edges) is not int
-        or edges < 0
-        or type(dropped) is not int
-        or dropped < 0
-        or edges + dropped != input_edges
-        or (not repair_legacy and dropped != 0)
-    ):
-        return None
-    return edges
 
 
 def _write_marker(path: Path, value: Mapping[str, object]) -> None:

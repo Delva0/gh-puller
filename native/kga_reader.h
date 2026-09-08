@@ -32,19 +32,10 @@ typedef struct {
     ghp_kga_root_t edge_root;
     int node_count;
     int edge_count;
-    bool repair_legacy;
 } ghp_kga_snapshot_t;
-
-typedef struct {
-    int node_count;
-    int edge_count;
-    int input_edge_count;
-    int dropped_edge_count;
-} ghp_kga_import_result_t;
 
 /* Validate every referenced frame and publish one complete SQLite generation.
  */
-int ghp_kga_import_snapshot(const ghp_kga_snapshot_t *snapshot, ghp_kga_import_result_t *output,
-                            char *error, size_t error_size);
+int ghp_kga_import_snapshot(const ghp_kga_snapshot_t *snapshot, char *error, size_t error_size);
 
 #endif /* GH_PULLER_NATIVE_KGA_READER_H */
