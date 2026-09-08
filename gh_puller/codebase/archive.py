@@ -34,6 +34,7 @@ if TYPE_CHECKING:
 # they are not the Python package or product version.
 FORMAT_VERSION = 5
 GRAPH_FIDELITY_VERSION = 2
+_LEGACY_CBM_PROJECT = "__project__"
 MAGIC = b"KGA5\r\n\x1a\n"
 FOOTER_MAGIC = b"KGA5IDX!"
 CHECKPOINT_MAGIC = b"KGA5CP!!"
@@ -812,16 +813,23 @@ class Archive(PageStore):
         edges = self._records(TreeRef.from_json(item.get("edge_root")), "edges")
         return GraphRows(nodes, edges)
 
-    def _restorable_manifest(self, commit: str | None = None) -> tuple[dict, str]:
-        """Validate the metadata needed before any exact CBM restoration."""
+    def _restorable_manifest(
+        self,
+        commit: str | None = None,
+        *,
+        repair_legacy: bool = False,
+    ) -> tuple[dict, str, bool]:
+        """Validate native restoration metadata without materializing graph rows."""
         sha = self.latest_commit if commit is None else commit
         if sha not in self._entries:
             raise KeyError(sha)
         item = self._entries[sha]
-        if item.get("graph_fidelity_version") != GRAPH_FIDELITY_VERSION:
+        fidelity = item.get("graph_fidelity_version")
+        legacy = fidelity is None and repair_legacy
+        if fidelity != GRAPH_FIDELITY_VERSION and not legacy:
             raise ArchiveError(f"snapshot {sha} has no verified CBM fidelity boundary")
-        project = item.get("cbm_project")
-        if not isinstance(project, str) or not project:
+        project = _LEGACY_CBM_PROJECT if legacy else item.get("cbm_project")
+        if not legacy and (not isinstance(project, str) or not project):
             raise ArchiveError(f"snapshot {sha} has no CBM project identity")
         nodes, edges = item.get("nodes"), item.get("edges")
         if type(nodes) is not int or nodes < 1 or type(edges) is not int or edges < 0:
@@ -853,7 +861,7 @@ class Archive(PageStore):
             raise ArchiveError(f"snapshot {sha} row counts do not match its roots")
         if item.get("graph_digest") != graph_digest(node_root, edge_root):
             raise ArchiveError(f"snapshot {sha} has an invalid graph digest")
-        return item, project
+        return item, project, legacy
 
     def verify_snapshot(self, commit: str | None = None) -> None:
         """Verify that one snapshot can be restored exactly into CBM.
@@ -867,7 +875,7 @@ class Archive(PageStore):
                 its row counts, project identity, JSON, or graph-closure contract.
             KeyError: The requested commit is absent from this reader's view.
         """
-        item, project = self._restorable_manifest(commit)
+        item, project, _legacy = self._restorable_manifest(commit)
         rows = self.load_rows(item["sha"])
         sha = item["sha"]
         if item.get("nodes") != len(rows.nodes) or item.get("edges") != len(rows.edges):

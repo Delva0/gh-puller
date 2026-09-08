@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from gh_puller.codebase import Archive, ArchiveWriter, CBMClient, CBMTransportError
+from gh_puller.codebase import Archive, ArchiveError, ArchiveWriter, CBMClient, CBMTransportError
 from gh_puller.codebase.archive import GRAPH_FIDELITY_VERSION, RadixTree, graph_digest
 from gh_puller.codebase.cbm_native import NativeArchiveTransport
 from gh_puller.codebase.store import GraphRows, load_rows
@@ -21,7 +21,7 @@ import sys
 import time
 
 if sys.argv[1:] == ["--version"]:
-    print("gh-puller-cbm-helper 2")
+    print("gh-puller-cbm-helper 3")
     raise SystemExit(0)
 
 def read_exact(size):
@@ -47,13 +47,18 @@ while True:
         with Path(log).open("a") as stream:
             stream.write(json.dumps(request) + "\\n")
     if method == "hello":
-        result = {{"protocol": 2, "kga_format": 5, "graph_fidelity": 2, "store_format": 1,
-                  "capabilities": ["archive-load", "tool-call"],
+        result = {{"protocol": 3, "kga_format": 5, "graph_fidelity": 2, "store_format": 1,
+                  "capabilities": ["archive-load", "legacy-repair", "tool-call"],
                   "tools": ["query_graph", "get_graph_schema"]}}
     elif method == "load":
         Path(params["database_path"]).touch()
+        edges = params.get("stored_edge_count", params["edge_count"])
         result = {{"project": params["project"], "graph_digest": params["graph_digest"],
-                  "nodes": params["node_count"], "edges": params["edge_count"],
+                  "nodes": params["node_count"], "edges": edges,
+                  "input_edges": params["edge_count"],
+                  "dropped_edges": params["edge_count"] - edges,
+                  "graph_fidelity": params["graph_fidelity"],
+                  "legacy_repaired": params["repair_legacy"],
                   "materialized": not params["reuse"]}}
     elif method == "call":
         name = params["name"]
@@ -134,6 +139,58 @@ def write_archive(path: Path, project: str = "native-test") -> tuple[dict, Graph
     return manifest, rows
 
 
+def write_legacy_archive(path: Path) -> tuple[dict, GraphRows]:
+    project = "__project__"
+    rows = GraphRows(
+        {
+            project: {
+                "label": "Project",
+                "name": project,
+                "file_path": "",
+                "start_line": 0,
+                "end_line": 0,
+                "properties": {},
+            },
+            "a.b...": {
+                "label": "Function",
+                "name": "later",
+                "file_path": "later.py",
+                "start_line": 1,
+                "end_line": 2,
+                "properties": {},
+            },
+            "a.b.$": {
+                "label": "Function",
+                "name": "earlier",
+                "file_path": "earlier.py",
+                "start_line": 3,
+                "end_line": 4,
+                "properties": {},
+            },
+        },
+        {
+            (project, "a.b...", "CONTAINS", ""): {"properties": {}},
+            (project, "a.b.$", "CONTAINS", ""): {"properties": {}},
+            ("a.b...", "a.b.missing", "CALLS", ""): {"properties": {}},
+        },
+    )
+    writer = ArchiveWriter(path)
+    node_root = RadixTree(writer, "nodes").build(rows.nodes.items())
+    edge_root = RadixTree(writer, "edges").build(rows.edges.items())
+    manifest = {
+        "sha": "legacy-one",
+        "parents": [],
+        "node_root": node_root.to_json(),
+        "edge_root": edge_root.to_json(),
+        "nodes": len(rows.nodes),
+        "edges": len(rows.edges),
+        "graph_digest": graph_digest(node_root, edge_root),
+    }
+    writer.commit(manifest)
+    writer.finalize()
+    return manifest, rows
+
+
 def requests(path: Path) -> list[dict]:
     return [json.loads(line) for line in path.read_text().splitlines()]
 
@@ -179,6 +236,32 @@ def test_native_cache_is_reused_by_a_new_helper_process(tmp_path):
 
     loads = [item for item in requests(log) if item["method"] == "load"]
     assert [item["params"]["reuse"] for item in loads] == [False, True]
+
+
+def test_legacy_archive_repair_is_explicit_and_disclosed(tmp_path):
+    helper = tmp_path / "fake-helper"
+    log = tmp_path / "requests.jsonl"
+    archive_path = tmp_path / "archive.kga"
+    write_fake_helper(helper)
+    write_legacy_archive(archive_path)
+
+    with NativeArchiveTransport(
+        helper,
+        tmp_path / "cache",
+        5,
+        {"NATIVE_REQUEST_LOG": str(log)},
+    ) as transport:
+        with pytest.raises(ArchiveError, match="no verified CBM fidelity"):
+            transport.load_archive(archive_path)
+        loaded = transport.load_archive(archive_path, repair_legacy=True)
+
+    load_request = next(item for item in requests(log) if item["method"] == "load")
+    assert loaded["project"] == "__project__"
+    assert loaded["graph_fidelity"] == 1
+    assert loaded["legacy_repaired"] is True
+    assert loaded["input_edges"] == 3
+    assert loaded["dropped_edges"] == 0
+    assert load_request["params"]["repair_legacy"] is True
 
 
 def test_client_native_query_does_not_resolve_or_start_mcp(tmp_path):
@@ -254,6 +337,49 @@ def test_real_native_helper_restores_exact_rows_and_reuses_cache(tmp_path):
     assert any(row[2] == "native needle" for row in queried["rows"])
     assert {item["label"] for item in schema["node_labels"]} >= {"Project", "Function"}
     assert reused["materialized"] is False
+
+
+@pytest.mark.integration
+def test_real_native_helper_repairs_legacy_rows_and_reuses_cache(tmp_path):
+    configured = os.environ.get("GH_PULLER_TEST_CBM_NATIVE_HELPER")
+    if configured is None:
+        pytest.skip("real native helper not configured")
+    archive_path = tmp_path / "archive.kga"
+    _manifest, archived = write_legacy_archive(archive_path)
+    expected = GraphRows(
+        archived.nodes,
+        {
+            key: value
+            for key, value in archived.edges.items()
+            if key[0] in archived.nodes and key[1] in archived.nodes
+        },
+    )
+    cache = tmp_path / "cache"
+
+    with CBMClient(native_helper=Path(configured), cache_root=cache, timeout=30) as first:
+        with pytest.raises(ArchiveError, match="no verified CBM fidelity"):
+            first.load_archive(archive_path)
+        loaded = first.load_archive(archive_path, repair_legacy=True)
+        queried = first.query_graph(
+            project="__project__",
+            query="MATCH (n:Function) RETURN n.name",
+            max_rows=10,
+        )
+        restored = load_rows(loaded["database_path"], "__project__")
+    with CBMClient(native_helper=Path(configured), cache_root=cache, timeout=30) as second:
+        reused = second.load_archive(archive_path, repair_legacy=True)
+
+    assert loaded["materialized"] is True
+    assert loaded["nodes"] == 3
+    assert loaded["input_edges"] == 3
+    assert loaded["edges"] == 2
+    assert loaded["dropped_edges"] == 1
+    assert loaded["graph_fidelity"] == 1
+    assert loaded["legacy_repaired"] is True
+    assert restored == expected
+    assert {row[0] for row in queried["rows"]} == {"earlier", "later"}
+    assert reused["materialized"] is False
+    assert reused["dropped_edges"] == 1
 
 
 @pytest.mark.integration

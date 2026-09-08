@@ -22,8 +22,9 @@
 #include <yyjson/yyjson.h>
 
 enum {
-    NATIVE_PROTOCOL_VERSION = 2,
+    NATIVE_PROTOCOL_VERSION = 3,
     KGA_FORMAT_VERSION = 5,
+    KGA_LEGACY_FIDELITY_VERSION = 1,
     KGA_FIDELITY_VERSION = 2,
     REQUEST_MAX_BYTES = 8 << 20,
 };
@@ -33,6 +34,11 @@ typedef struct {
     char *project;
     char *database_path;
     char *graph_digest;
+    int node_count;
+    int edge_count;
+    int input_edge_count;
+    int dropped_edge_count;
+    int graph_fidelity;
 } helper_session_t;
 
 static bool digest_valid(const char *digest) {
@@ -125,6 +131,7 @@ static char *hello_response(uint64_t id) {
     yyjson_mut_val *result = yyjson_mut_obj(document);
     yyjson_mut_val *capabilities = yyjson_mut_arr(document);
     yyjson_mut_arr_add_str(document, capabilities, "archive-load");
+    yyjson_mut_arr_add_str(document, capabilities, "legacy-repair");
     yyjson_mut_arr_add_str(document, capabilities, "tool-call");
     yyjson_mut_val *tools = yyjson_mut_arr(document);
     for (size_t index = 0; index < cbm_engine_tool_count(); index++) {
@@ -161,12 +168,14 @@ static bool parse_root(yyjson_val *value, ghp_kga_root_t *root) {
     return true;
 }
 
-static bool parse_snapshot(yyjson_val *parameters, ghp_kga_snapshot_t *snapshot, bool *reuse) {
+static bool parse_snapshot(yyjson_val *parameters, ghp_kga_snapshot_t *snapshot, bool *reuse,
+                           int *stored_edge_count) {
     memset(snapshot, 0, sizeof(*snapshot));
     uint64_t device = 0;
     uint64_t inode = 0;
     uint64_t captured_size = 0;
     int fidelity = 0;
+    *stored_edge_count = -1;
     if (!yyjson_is_obj(parameters) ||
         !(snapshot->archive_path = json_string(yyjson_obj_get(parameters, "archive_path"))) ||
         !json_u64(yyjson_obj_get(parameters, "archive_device"), &device) ||
@@ -179,19 +188,39 @@ static bool parse_snapshot(yyjson_val *parameters, ghp_kga_snapshot_t *snapshot,
         !json_int(yyjson_obj_get(parameters, "node_count"), &snapshot->node_count) ||
         !json_int(yyjson_obj_get(parameters, "edge_count"), &snapshot->edge_count) ||
         !json_int(yyjson_obj_get(parameters, "graph_fidelity"), &fidelity) ||
-        fidelity != KGA_FIDELITY_VERSION ||
         !parse_root(yyjson_obj_get(parameters, "node_root"), &snapshot->node_root) ||
         !parse_root(yyjson_obj_get(parameters, "edge_root"), &snapshot->edge_root)) {
         return false;
     }
     yyjson_val *reuse_value = yyjson_obj_get(parameters, "reuse");
-    if (reuse_value && !yyjson_is_bool(reuse_value)) {
+    yyjson_val *repair_value = yyjson_obj_get(parameters, "repair_legacy");
+    yyjson_val *stored_edges_value = yyjson_obj_get(parameters, "stored_edge_count");
+    if ((reuse_value && !yyjson_is_bool(reuse_value)) ||
+        (repair_value && !yyjson_is_bool(repair_value)) ||
+        (stored_edges_value &&
+         (!json_int(stored_edges_value, stored_edge_count) || *stored_edge_count < 0))) {
+        return false;
+    }
+    bool repair_legacy = repair_value && yyjson_get_bool(repair_value);
+    if (!((fidelity == KGA_FIDELITY_VERSION && !repair_legacy) ||
+          (fidelity == KGA_LEGACY_FIDELITY_VERSION && repair_legacy)) ||
+        (repair_legacy && strcmp(snapshot->project, "__project__") != 0) ||
+        *stored_edge_count > snapshot->edge_count ||
+        (!repair_legacy && *stored_edge_count >= 0 &&
+         *stored_edge_count != snapshot->edge_count)) {
         return false;
     }
     snapshot->archive_device = device;
     snapshot->archive_inode = inode;
     snapshot->captured_size = captured_size;
+    snapshot->repair_legacy = repair_legacy;
     *reuse = reuse_value && yyjson_get_bool(reuse_value);
+    if (!repair_legacy && *stored_edge_count < 0) {
+        *stored_edge_count = snapshot->edge_count;
+    }
+    if (*reuse && *stored_edge_count < 0) {
+        return false;
+    }
     return true;
 }
 
@@ -204,7 +233,8 @@ static void session_clear(helper_session_t *session) {
 }
 
 static bool session_install(helper_session_t *session, cbm_store_t *store, const char *project,
-                            const char *database_path, const char *graph_digest) {
+                            const char *database_path, const char *graph_digest,
+                            const ghp_kga_import_result_t *imported, int graph_fidelity) {
     char *saved_project = strdup(project);
     char *saved_database = strdup(database_path);
     char *saved_digest = strdup(graph_digest);
@@ -220,15 +250,20 @@ static bool session_install(helper_session_t *session, cbm_store_t *store, const
     session->project = saved_project;
     session->database_path = saved_database;
     session->graph_digest = saved_digest;
+    session->node_count = imported->node_count;
+    session->edge_count = imported->edge_count;
+    session->input_edge_count = imported->input_edge_count;
+    session->dropped_edge_count = imported->dropped_edge_count;
+    session->graph_fidelity = graph_fidelity;
     return true;
 }
 
-static cbm_store_t *open_expected_store(const ghp_kga_snapshot_t *snapshot) {
+static cbm_store_t *open_expected_store(const ghp_kga_snapshot_t *snapshot, int edge_count) {
     cbm_store_t *store = cbm_store_open_path_query(snapshot->database_path);
     cbm_project_t project = {0};
     if (!store || cbm_store_get_project(store, snapshot->project, &project) != CBM_STORE_OK ||
         cbm_store_count_nodes(store, snapshot->project) != snapshot->node_count ||
-        cbm_store_count_edges(store, snapshot->project) != snapshot->edge_count) {
+        cbm_store_count_edges(store, snapshot->project) != edge_count) {
         cbm_project_free_fields(&project);
         cbm_store_close(store);
         return NULL;
@@ -240,28 +275,44 @@ static cbm_store_t *open_expected_store(const ghp_kga_snapshot_t *snapshot) {
 static char *load_response(uint64_t id, helper_session_t *session, yyjson_val *parameters) {
     ghp_kga_snapshot_t snapshot;
     bool reuse = false;
-    if (!parse_snapshot(parameters, &snapshot, &reuse)) {
+    int stored_edge_count = -1;
+    if (!parse_snapshot(parameters, &snapshot, &reuse, &stored_edge_count)) {
         return error_response(id, "invalid_request", "invalid archive load parameters");
     }
+    int graph_fidelity = snapshot.repair_legacy ? KGA_LEGACY_FIDELITY_VERSION
+                                                : KGA_FIDELITY_VERSION;
     bool already_loaded = session->store && strcmp(session->project, snapshot.project) == 0 &&
                           strcmp(session->database_path, snapshot.database_path) == 0 &&
-                          strcmp(session->graph_digest, snapshot.graph_digest) == 0;
+                          strcmp(session->graph_digest, snapshot.graph_digest) == 0 &&
+                          session->input_edge_count == snapshot.edge_count &&
+                          session->graph_fidelity == graph_fidelity;
     bool materialized = false;
     if (!already_loaded) {
-        cbm_store_t *candidate = reuse ? open_expected_store(&snapshot) : NULL;
+        ghp_kga_import_result_t imported = {
+            .node_count = snapshot.node_count,
+            .edge_count = stored_edge_count,
+            .input_edge_count = snapshot.edge_count,
+            .dropped_edge_count = snapshot.edge_count - stored_edge_count,
+        };
+        cbm_store_t *candidate = reuse ? open_expected_store(&snapshot, stored_edge_count) : NULL;
         if (!candidate) {
             char error[1024];
-            if (ghp_kga_import_snapshot(&snapshot, error, sizeof(error)) != 0) {
+            if (ghp_kga_import_snapshot(&snapshot, &imported, error, sizeof(error)) != 0) {
                 return error_response(id, "archive_load_failed", error);
             }
             materialized = true;
-            candidate = open_expected_store(&snapshot);
+            candidate = open_expected_store(&snapshot, imported.edge_count);
         }
-        if (!candidate) {
+        if (!candidate || imported.node_count != snapshot.node_count ||
+            imported.input_edge_count != snapshot.edge_count || imported.edge_count < 0 ||
+            imported.dropped_edge_count < 0 ||
+            imported.edge_count + imported.dropped_edge_count != snapshot.edge_count ||
+            (!snapshot.repair_legacy && imported.dropped_edge_count != 0)) {
+            cbm_store_close(candidate);
             return error_response(id, "store_open_failed", "materialized CBM store is invalid");
         }
         if (!session_install(session, candidate, snapshot.project, snapshot.database_path,
-                             snapshot.graph_digest)) {
+                             snapshot.graph_digest, &imported, graph_fidelity)) {
             return error_response(id, "allocation_failed", "cannot retain loaded graph state");
         }
     }
@@ -274,8 +325,13 @@ static char *load_response(uint64_t id, helper_session_t *session, yyjson_val *p
     yyjson_mut_val *result = yyjson_mut_obj(document);
     yyjson_mut_obj_add_str(document, result, "project", snapshot.project);
     yyjson_mut_obj_add_str(document, result, "graph_digest", snapshot.graph_digest);
-    yyjson_mut_obj_add_int(document, result, "nodes", snapshot.node_count);
-    yyjson_mut_obj_add_int(document, result, "edges", snapshot.edge_count);
+    yyjson_mut_obj_add_int(document, result, "nodes", session->node_count);
+    yyjson_mut_obj_add_int(document, result, "edges", session->edge_count);
+    yyjson_mut_obj_add_int(document, result, "input_edges", session->input_edge_count);
+    yyjson_mut_obj_add_int(document, result, "dropped_edges", session->dropped_edge_count);
+    yyjson_mut_obj_add_int(document, result, "graph_fidelity", session->graph_fidelity);
+    yyjson_mut_obj_add_bool(document, result, "legacy_repaired",
+                            session->graph_fidelity == KGA_LEGACY_FIDELITY_VERSION);
     yyjson_mut_obj_add_bool(document, result, "materialized", materialized);
     yyjson_mut_obj_add_val(document, root, "result", result);
     return document_json(document);
