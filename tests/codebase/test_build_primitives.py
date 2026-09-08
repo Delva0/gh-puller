@@ -5,8 +5,10 @@ import sqlite3
 
 import pytest
 
+import gh_puller.codebase.cbm_runner as runner_module
 from gh_puller.codebase.archive import Archive
 from gh_puller.codebase.build_plan import BuildPlan
+from gh_puller.codebase.cbm_runner import CBMRunner
 from gh_puller.codebase.graph_reader import GraphReader
 from gh_puller.codebase.kga_recorder import KGACommit, KGARecorder
 
@@ -20,6 +22,35 @@ CREATE TABLE edges (
  local_name_gen TEXT GENERATED ALWAYS AS (
    CASE WHEN type='IMPORTS' THEN coalesce(json_extract(properties,'$.local_name'),'') ELSE '' END));
 """
+
+
+class FakeBinary:
+    def __init__(self, path):
+        self.path = path
+        self.sha256 = "binary"
+        self.checks = 0
+
+    def verify_unchanged(self):
+        self.checks += 1
+
+
+class FakeTransport:
+    def __init__(self):
+        self.calls = []
+        self.closed = False
+
+    def capabilities(self):
+        return frozenset({"persistent-mcp", "granular-delta-controls", "force-full-route"})
+
+    def index(self, tree, project, mode, *, force_full, incremental_controls):
+        self.calls.append((tree, project, mode, force_full, incremental_controls))
+        return {"route": "full" if force_full else "closure_repair"}
+
+    def delete_project(self, project):
+        return True, project
+
+    def close(self):
+        self.closed = True
 
 
 def write_store(path, symbol, *, value):
@@ -52,6 +83,28 @@ def test_build_plan_separates_analysis_mode_from_route():
         BuildPlan(analysis_mode="invalid")
     with pytest.raises(ValueError, match="build route"):
         BuildPlan(route="invalid")
+
+
+def test_cbm_runner_reuses_transport_across_commit_plans(tmp_path, monkeypatch):
+    transport = FakeTransport()
+    monkeypatch.setattr(runner_module, "make_transport", lambda *_args, **_kwargs: transport)
+    binary = FakeBinary(tmp_path / "cbm")
+    runner = CBMRunner(
+        binary,
+        "p",
+        tmp_path / "cache",
+        tmp_path / "work",
+        memory_limit=1 << 60,
+    )
+
+    assert runner.index(BuildPlan(analysis_mode="fast"))["route"] == "closure_repair"
+    assert runner.index(BuildPlan(route="full"))["route"] == "full"
+    runner.mark_archived("commit")
+    assert runner.current_commit == "commit"
+    assert [call[3] for call in transport.calls] == [False, True]
+    assert binary.checks == 3
+    runner.close()
+    assert transport.closed
 
 
 def test_graph_reader_and_recorder_preserve_full_and_diff_generations(tmp_path):
@@ -93,4 +146,3 @@ def test_graph_reader_and_recorder_preserve_full_and_diff_generations(tmp_path):
         assert set(archive.load_rows("c2").nodes) == {"p", "p.b"}
         archive.verify_snapshot("c1")
         archive.verify_snapshot("c2")
-
