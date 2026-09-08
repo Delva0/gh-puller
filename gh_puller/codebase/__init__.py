@@ -18,8 +18,7 @@ from .cbm_build import (
     build_repository,
 )
 from .cbm_runner import CBMRunner
-from .cbm_sdk import CBMClient, default_cbm_cache
-from .cbm_transport import CBMTransportError
+from .cbm_sdk import CBMClient, CBMTransportError, default_cbm_cache
 from .store import GraphReader
 
 __all__ = [

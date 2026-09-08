@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Self
 
-from .cbm_transport import CBMTransportError, make_transport
+from .cbm_sdk import CBMClient, CBMTransportError
 
 if TYPE_CHECKING:
     from .binary import CBMBinary
@@ -109,7 +109,7 @@ class ResourceUsage:
 
 
 class CBMRunner:
-    """Reuse one CBM transport across independently planned commit builds."""
+    """Reuse one CBM client across independently planned commit builds."""
 
     def __init__(
         self,
@@ -149,22 +149,24 @@ class CBMRunner:
             limit,
         )
         self.monitor.start()
-        self._transport = None
+        self._client: CBMClient | None = None
         self._closed = False
         try:
-            binary.verify_unchanged()
             started = time.monotonic()
-            self._transport = make_transport(
-                transport,
-                binary.path,
-                self.cache_root,
-                timeout,
-                self.monitor,
+            self._client = CBMClient(
+                binary,
+                cache_root=self.cache_root,
+                daemon_transport=transport,
+                timeout=timeout,
+                resource_monitor=self.monitor,
             )
-            self.capabilities = self._transport.capabilities()
+            self.capabilities = self._client.capabilities()
             self.transport_name = transport
             self.startup_seconds = round(time.monotonic() - started, 3)
         except BaseException:
+            if self._client is not None:
+                self._client.close()
+                self._client = None
             self.monitor.stop()
             raise
 
@@ -211,10 +213,9 @@ class CBMRunner:
             required.add("persistent-mcp")
         if missing := required - self.capabilities:
             raise CBMTransportError(f"CBM binary lacks required capabilities: {sorted(missing)}")
-        if self._transport is None:
+        if self._client is None:
             raise CBMTransportError("CBM runner is closed")
-        self.binary.verify_unchanged()
-        return self._transport.index(
+        return self._client.index_repository(
             self.tree,
             self.project,
             plan.analysis_mode,
@@ -247,10 +248,10 @@ class CBMRunner:
         os.replace(temporary, self.pending_path)
 
     def delete_project(self) -> tuple[bool, str]:
-        """Delete the runner's CBM project through the active transport."""
-        if self._transport is None:
+        """Delete the runner's CBM project through its client."""
+        if self._client is None:
             return False, "CBM runner is closed"
-        return self._transport.delete_project(self.project)
+        return self._client.delete_project(self.project)
 
     def cleanup_work_dir(self) -> None:
         """Remove only this runner's explicitly configured work directory."""
@@ -258,13 +259,13 @@ class CBMRunner:
             shutil.rmtree(self.work_dir)
 
     def close(self) -> None:
-        """Stop the transport and resource sampler without deleting build state."""
+        """Stop the client and resource sampler without deleting build state."""
         if self._closed:
             return
         self._closed = True
-        if self._transport is not None:
-            self._transport.close()
-            self._transport = None
+        if self._client is not None:
+            self._client.close()
+            self._client = None
         self.monitor.stop()
 
     def __enter__(self) -> Self:

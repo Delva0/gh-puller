@@ -242,18 +242,18 @@ def test_client_native_query_does_not_resolve_or_start_mcp(tmp_path):
         cache_root=tmp_path / "cache",
         timeout=5,
     ) as client:
-        assert client._transport is None
+        assert client._daemon_backend is None
         project = client.load_archive(archive_path)["project"]
         result = client.query_graph(project=project, query="MATCH (n) RETURN n")
         schema = client.call_json_tool("get_graph_schema", {"project": project})
         assert result["rows"] == [["native", project]]
         assert result["pid"] == client.native_pid
         assert schema["node_labels"][0]["label"] == "Function"
-        assert client._transport is None
+        assert client._daemon_backend is None
 
         with pytest.raises(CBMTransportError, match="not supported for the loaded archive"):
             client.call_json_tool("trace_path", {"project": project, "function_name": "main"})
-        assert client._transport is None
+        assert client._daemon_backend is None
 
 
 def test_native_query_timeout_terminates_helper(tmp_path):

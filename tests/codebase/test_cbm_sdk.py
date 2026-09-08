@@ -84,7 +84,7 @@ def test_client_starts_once_and_exposes_json_queries(tmp_path):
         assert query["arguments"]["format"] == "json"
         assert trace["arguments"]["format"] == "json"
 
-    assert client._transport.process.returncode == 0
+    assert client._daemon_backend.process.returncode == 0
 
 
 def test_json_call_supports_legacy_text_and_rejects_tree_output(tmp_path):

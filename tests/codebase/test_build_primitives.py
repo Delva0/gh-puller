@@ -29,13 +29,9 @@ class FakeBinary:
     def __init__(self, path):
         self.path = path
         self.sha256 = "binary"
-        self.checks = 0
-
-    def verify_unchanged(self):
-        self.checks += 1
 
 
-class FakeTransport:
+class FakeClient:
     def __init__(self):
         self.calls = []
         self.closed = False
@@ -43,7 +39,7 @@ class FakeTransport:
     def capabilities(self):
         return frozenset({"persistent-mcp", "granular-delta-controls", "force-full-route"})
 
-    def index(self, tree, project, mode, *, force_full, incremental_controls):
+    def index_repository(self, tree, project, mode, *, force_full, incremental_controls):
         self.calls.append((tree, project, mode, force_full, incremental_controls))
         return {"route": "full" if force_full else "closure_repair"}
 
@@ -122,9 +118,9 @@ def test_build_plan_separates_analysis_mode_from_route():
         BuildPlan(route="invalid")
 
 
-def test_cbm_runner_reuses_transport_across_commit_plans(tmp_path, monkeypatch):
-    transport = FakeTransport()
-    monkeypatch.setattr(runner_module, "make_transport", lambda *_args, **_kwargs: transport)
+def test_cbm_runner_reuses_client_across_commit_plans(tmp_path, monkeypatch):
+    client = FakeClient()
+    monkeypatch.setattr(runner_module, "CBMClient", lambda *_args, **_kwargs: client)
     binary = FakeBinary(tmp_path / "cbm")
     work = tmp_path / "work"
     work.mkdir()
@@ -142,10 +138,9 @@ def test_cbm_runner_reuses_transport_across_commit_plans(tmp_path, monkeypatch):
     assert runner.index(BuildPlan(route="full"))["route"] == "full"
     runner.mark_archived("commit")
     assert runner.current_commit == "commit"
-    assert [call[3] for call in transport.calls] == [False, True]
-    assert binary.checks == 3
+    assert [call[3] for call in client.calls] == [False, True]
     runner.close()
-    assert transport.closed
+    assert client.closed
 
 
 def test_build_commit_is_the_shared_full_and_delta_operation(tmp_path):

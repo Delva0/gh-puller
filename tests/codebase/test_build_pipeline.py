@@ -53,7 +53,7 @@ def write_generation(path, project, symbol):
     connection.close()
 
 
-class PublishingTransport:
+class PublishingClient:
     def __init__(self, cache_root):
         self.cache_root = cache_root
         self.calls = []
@@ -62,7 +62,7 @@ class PublishingTransport:
     def capabilities(self):
         return frozenset({"persistent-mcp", "granular-delta-controls", "force-full-route"})
 
-    def index(self, tree, project, mode, *, force_full, incremental_controls):
+    def index_repository(self, tree, project, mode, *, force_full, incremental_controls):
         self.cache_root.mkdir(parents=True, exist_ok=True)
         database = self.cache_root / f"{project}.db"
         replacement = self.cache_root / f".{project}.next"
@@ -95,14 +95,14 @@ def test_repository_pipeline_selects_a_plan_for_each_commit(tmp_path, monkeypatc
     binary.write_text("#!/bin/sh\necho codebase-memory-mcp test\n")
     binary.chmod(0o755)
     cache = tmp_path / "cache"
-    transports = []
+    clients = []
 
-    def make_transport(_name, _binary, cache_root, _timeout, _monitor, _environment=None):
-        transport = PublishingTransport(cache_root)
-        transports.append(transport)
-        return transport
+    def make_client(_binary, *, cache_root, **_kwargs):
+        client = PublishingClient(cache_root)
+        clients.append(client)
+        return client
 
-    monkeypatch.setattr(runner_module, "make_transport", make_transport)
+    monkeypatch.setattr(runner_module, "CBMClient", make_client)
     monkeypatch.setenv("CBM_CACHE_DIR", str(cache))
     routes = ("full", "delta", "full")
     options = BuildOptions(
@@ -130,7 +130,6 @@ def test_repository_pipeline_selects_a_plan_for_each_commit(tmp_path, monkeypatc
     summary = json.loads((tmp_path / "build" / "summary.json").read_text())
     assert summary["cbm_build_plan"] == "per-commit"
     assert sum(summary["cbm_plan_counts"].values()) == 3
-    assert len(transports) == 1
-    assert len(transports[0].calls) == 3
-    assert transports[0].closed
-
+    assert len(clients) == 1
+    assert len(clients[0].calls) == 3
+    assert clients[0].closed

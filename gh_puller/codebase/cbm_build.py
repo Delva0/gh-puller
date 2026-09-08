@@ -34,7 +34,7 @@ from .archive import (
 from .binary import CBMBinaryError, resolve_cbm_binary
 from .build_plan import BuildPlan, IncrementalConfig, IncrementalConfigError, add_incremental_arguments
 from .cbm_runner import CBMRunner
-from .cbm_transport import CBMTransportError
+from .cbm_sdk import CBMTransportError
 from .git_tree import TreeError, changed_paths, materialize_full
 from .store import GraphReader
 

@@ -1,20 +1,27 @@
-"""Expose persistent CBM query backends through one synchronous Python facade.
+"""Expose every CBM execution path through one synchronous Python facade.
 
-Current-project tools use the authenticated MCP executable. Tools supported by
-the compact native runtime operate on an explicitly loaded archive generation,
-while open-ended arguments keep new server fields independent of SDK releases.
+Build and daemon tools use a selectable MCP or CLI backend. Archive tools use
+the compact native runtime, while open-ended arguments keep new server fields
+independent of SDK releases. Upper layers depend only on this module.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import threading
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Self
 
 from .binary import CBMBinary, resolve_cbm_binary
 from .cbm_native import NativeArchiveTransport, NativeHelper
-from .cbm_transport import CBMTransportError, PersistentMCPTransport
+from .cbm_transport import (
+    CBMTransportError,
+    CLITransport,
+    PersistentMCPTransport,
+    ResourceMonitorLike,
+    make_transport,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -65,7 +72,7 @@ def _json_object(name: str, result: dict[str, Any]) -> dict[str, Any]:
 
 
 class CBMClient:
-    """A synchronous facade over native archive and current-project CBM tools."""
+    """Route CBM operations to native, persistent MCP, or one-shot CLI backends."""
 
     def __init__(
         self,
@@ -75,10 +82,12 @@ class CBMClient:
         registry: str | Path | None = None,
         cache_root: str | Path | None = None,
         native_helper: NativeHelper | str | Path | None = None,
+        daemon_transport: str = "persistent-mcp",
         timeout: float = 120,
         environment: Mapping[str, str] | None = None,
+        resource_monitor: ResourceMonitorLike | None = None,
     ):
-        """Resolve the selected backend and initialize its persistent process.
+        """Configure lazily initialized backends and their shared runtime state.
 
         Args:
             binary: Pinned binary identity, explicit executable, or command name.
@@ -87,12 +96,15 @@ class CBMClient:
             registry: Registry root used for default manifest resolution.
             cache_root: CBM database directory. ``None`` honors ``CBM_CACHE_DIR``
                 and then uses CBM's per-user default.
-            native_helper: Helper for archive-backed tools. An explicit value
-                selects native-only startup and defers MCP until an MCP tool is
-                requested. ``None`` preserves eager MCP startup.
+            native_helper: Helper for archive-backed tools. ``None`` uses the
+                normal environment, local-build, and ``PATH`` resolution order.
+            daemon_transport: Persistent MCP or one-process-per-call CLI backend
+                used by daemon operations.
             timeout: Maximum seconds for each backend request or cache lock.
             environment: Environment overrides passed to CBM and used during
                 executable and cache resolution.
+            resource_monitor: Optional build-owned process and memory monitor.
+                Omission uses a no-op monitor suitable for direct SDK calls.
         """
         if timeout <= 0:
             raise ValueError("CBM timeout must be positive")
@@ -110,15 +122,15 @@ class CBMClient:
         self._registry = registry
         self._binary_identity = binary if isinstance(binary, CBMBinary) else None
         self._native_helper = native_helper
-        self._monitor = _ClientMonitor()
-        self._transport: PersistentMCPTransport | None = None
+        self.daemon_transport = daemon_transport
+        self._monitor = resource_monitor or _ClientMonitor()
+        self._backend_lock = threading.Lock()
+        self._daemon_backend: CLITransport | PersistentMCPTransport | None = None
         self._native_transport: NativeArchiveTransport | None = None
-        if native_helper is None:
-            self._mcp()
 
     @property
     def binary(self) -> CBMBinary:
-        """Return the resolved CBM executable used by the MCP fallback."""
+        """Return the authenticated executable used by daemon operations."""
         if self._binary_identity is None:
             self._binary_identity = resolve_cbm_binary(
                 self._binary_input,
@@ -129,25 +141,35 @@ class CBMClient:
         self._binary_identity.verify_unchanged()
         return self._binary_identity
 
+    def _daemon(self) -> CLITransport | PersistentMCPTransport:
+        with self._backend_lock:
+            binary = self.binary
+            if self._daemon_backend is None:
+                self._daemon_backend = make_transport(
+                    self.daemon_transport,
+                    binary.path,
+                    self.cache_root,
+                    self.timeout,
+                    self._monitor,
+                    self._overrides,
+                )
+        return self._daemon_backend
+
     def _mcp(self) -> PersistentMCPTransport:
-        if self._transport is None:
-            self._transport = PersistentMCPTransport(
-                self.binary.path,
-                self.cache_root,
-                self.timeout,
-                self._monitor,
-                self._overrides,
-            )
-        return self._transport
+        backend = self._daemon()
+        if not isinstance(backend, PersistentMCPTransport):
+            raise CBMTransportError("server metadata requires the persistent-mcp backend")
+        return backend
 
     def _native(self) -> NativeArchiveTransport:
-        if self._native_transport is None:
-            self._native_transport = NativeArchiveTransport(
-                self._native_helper,
-                self.cache_root,
-                self.timeout,
-                self._overrides,
-            )
+        with self._backend_lock:
+            if self._native_transport is None:
+                self._native_transport = NativeArchiveTransport(
+                    self._native_helper,
+                    self.cache_root,
+                    self.timeout,
+                    self._overrides,
+                )
         return self._native_transport
 
     @property
@@ -168,6 +190,48 @@ class CBMClient:
     def list_tools(self) -> list[dict[str, Any]]:
         """Return all tool definitions advertised by the live CBM server."""
         return self._mcp().list_tools()
+
+    def capabilities(self) -> frozenset[str]:
+        """Return build capabilities advertised through the daemon backend."""
+        return self._daemon().capabilities()
+
+    def index_repository(
+        self,
+        tree: str | Path,
+        project: str,
+        mode: str,
+        *,
+        force_full: bool = False,
+        incremental_controls: Mapping[str, str | int] | None = None,
+    ) -> dict[str, Any]:
+        """Publish one repository graph through the selected daemon backend.
+
+        Args:
+            tree: Materialized repository tree to analyze.
+            project: Stable CBM project receiving the generation.
+            mode: CBM analysis coverage mode.
+            force_full: Require CBM to confirm a full-build route.
+            incremental_controls: Delta-policy overrides whose acknowledgement
+                must be confirmed by CBM.
+
+        Returns:
+            Machine-readable route evidence reported by CBM.
+        """
+        return self._daemon().index(
+            Path(tree),
+            project,
+            mode,
+            force_full=force_full,
+            incremental_controls=incremental_controls,
+        )
+
+    def delete_project(self, project: str) -> tuple[bool, str]:
+        """Delete one daemon-owned CBM project.
+
+        Args:
+            project: Exact CBM project name to delete.
+        """
+        return self._daemon().delete_project(project)
 
     def call_tool(self, name: str, arguments: Mapping[str, object] | None = None) -> dict[str, Any]:
         """Call any CBM tool and return a backend-neutral result envelope.
@@ -192,7 +256,7 @@ class CBMClient:
                 "structuredContent": logical,
                 "isError": False,
             }
-        return self._mcp().call_tool(name, values)
+        return self._daemon().call_tool(name, values)
 
     def call_json_tool(self, name: str, arguments: Mapping[str, object] | None = None) -> dict[str, Any]:
         """Call a tool whose logical response is a JSON object.
@@ -268,11 +332,11 @@ class CBMClient:
         )
 
     def close(self) -> None:
-        """Finish active native and MCP processes and release their pipes."""
+        """Finish active native and daemon processes and release their pipes."""
         if self._native_transport is not None:
             self._native_transport.close()
-        if self._transport is not None:
-            self._transport.close()
+        if self._daemon_backend is not None:
+            self._daemon_backend.close()
 
     def __enter__(self) -> Self:
         return self
