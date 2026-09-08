@@ -7,10 +7,13 @@ only resolves a promoted, content-addressed executable through :mod:`.binary`.
 
 from .archive import Archive, ArchiveError, ArchiveWriter
 from .binary import CBMBinary, CBMBinaryError, resolve_cbm_binary
+from .build_plan import BuildPlan
 from .cbm_build import BuildError, BuildOptions, build_archive
 from .cbm_sdk import CBMClient, default_cbm_cache
 from .cbm_transport import CBMTransportError
+from .graph_reader import GraphReader
 from .incremental_config import IncrementalConfig, IncrementalConfigError
+from .kga_recorder import KGARecorder
 
 __all__ = [
     "Archive",
@@ -18,12 +21,15 @@ __all__ = [
     "ArchiveWriter",
     "BuildError",
     "BuildOptions",
+    "BuildPlan",
     "CBMBinary",
     "CBMBinaryError",
     "CBMClient",
     "CBMTransportError",
+    "GraphReader",
     "IncrementalConfig",
     "IncrementalConfigError",
+    "KGARecorder",
     "build_archive",
     "default_cbm_cache",
     "resolve_cbm_binary",
