@@ -9,6 +9,7 @@
 
 #include "engine/query.h"
 #include "foundation/log.h"
+#include "foundation/profile.h"
 #include "store/store.h"
 
 #include <limits.h>
@@ -444,6 +445,7 @@ int main(int argc, char **argv) {
         return 2;
     }
     cbm_log_init_from_env();
+    cbm_profile_init();
     (void)setvbuf(stdout, NULL, _IONBF, 0);
 
     helper_session_t session = {0};

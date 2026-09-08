@@ -8,6 +8,7 @@
 #include "kga_reader.h"
 
 #include "engine/graph_import.h"
+#include "foundation/profile.h"
 #include "foundation/sha256.h"
 
 #include <errno.h>
@@ -281,8 +282,9 @@ static int import_node_leaf(import_context_t *context, yyjson_val *entries, uint
         return fail(context->error, context->error_size, "cannot allocate node leaf");
     }
     int status = -1;
-    for (size_t index = 0; index < (size_t)count; index++) {
-        yyjson_val *entry = yyjson_arr_get(entries, index);
+    size_t index, maximum;
+    yyjson_val *entry;
+    yyjson_arr_foreach(entries, index, maximum, entry) {
         yyjson_val *attributes = yyjson_arr_get(entry, 1);
         cbm_graph_import_node_t *row = &items[index];
         if (!yyjson_is_arr(entry) || yyjson_arr_size(entry) != 2 || !yyjson_is_obj(attributes) ||
@@ -308,8 +310,8 @@ static int import_node_leaf(import_context_t *context, yyjson_val *entries, uint
     status = imported == CBM_GRAPH_IMPORT_OK ? 0 : -1;
 
 cleanup:
-    for (size_t index = 0; index < (size_t)count; index++) {
-        free((void *)items[index].properties_json);
+    for (size_t item = 0; item < (size_t)count; item++) {
+        free((void *)items[item].properties_json);
     }
     free(items);
     return status;
@@ -324,8 +326,9 @@ static int import_edge_leaf(import_context_t *context, yyjson_val *entries, uint
         return fail(context->error, context->error_size, "cannot allocate edge leaf");
     }
     int status = -1;
-    for (size_t index = 0; index < (size_t)count; index++) {
-        yyjson_val *entry = yyjson_arr_get(entries, index);
+    size_t index, maximum;
+    yyjson_val *entry;
+    yyjson_arr_foreach(entries, index, maximum, entry) {
         yyjson_val *identity = yyjson_arr_get(entry, 0);
         yyjson_val *attributes = yyjson_arr_get(entry, 1);
         cbm_graph_import_edge_t *row = &items[index];
@@ -351,8 +354,8 @@ static int import_edge_leaf(import_context_t *context, yyjson_val *entries, uint
     status = imported == CBM_GRAPH_IMPORT_OK ? 0 : -1;
 
 cleanup:
-    for (size_t index = 0; index < (size_t)count; index++) {
-        free((void *)items[index].properties_json);
+    for (size_t item = 0; item < (size_t)count; item++) {
+        free((void *)items[item].properties_json);
     }
     free(items);
     return status;
@@ -477,13 +480,21 @@ int ghp_kga_import_snapshot(const ghp_kga_snapshot_t *snapshot, char *error, siz
         .error = error,
         .error_size = error_size,
     };
+    CBM_PROF_START(nodes_started);
     int result = import_tree(&context, &snapshot->node_root, "nodes", 0);
+    CBM_PROF_END_N("kga_import", "nodes", nodes_started, snapshot->node_count);
     if (result == 0 && snapshot->edge_root.present) {
+        CBM_PROF_START(edges_started);
         result = import_tree(&context, &snapshot->edge_root, "edges", 0);
+        CBM_PROF_END_N("kga_import", "edges", edges_started, snapshot->edge_count);
     }
-    if (result == 0 &&
-        cbm_graph_import_finish(import, NULL, error, error_size) != CBM_GRAPH_IMPORT_OK) {
-        result = -1;
+    if (result == 0) {
+        CBM_PROF_START(finish_started);
+        if (cbm_graph_import_finish(import, NULL, error, error_size) != CBM_GRAPH_IMPORT_OK) {
+            result = -1;
+        }
+        CBM_PROF_END_N("kga_import", "finish", finish_started,
+                       snapshot->node_count + snapshot->edge_count);
     }
     cbm_graph_import_free(import);
     (void)close(descriptor);
