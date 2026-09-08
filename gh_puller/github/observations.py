@@ -22,12 +22,12 @@ from typing import TYPE_CHECKING, Any, Self
 
 import aiosqlite
 
+from .archive_format import ARCHIVE_SCHEMA_VERSION, FACT_SCHEMAS, GIT_LAYOUT_VERSION, SCHEMA
 from .commit_references import (
     COMMIT_REFERENCE_SOURCE_FAMILIES,
     commit_reference_index_rows,
     commit_reference_provenance,
 )
-from .schema import ARCHIVE_SCHEMA_VERSION, FACT_SCHEMAS, GIT_LAYOUT_VERSION, SCHEMA
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Collection, Iterable

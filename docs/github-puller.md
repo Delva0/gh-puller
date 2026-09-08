@@ -450,7 +450,7 @@ The durable SQLite relations are grouped by responsibility:
 | `commit_reference_index` | Rebuildable acceleration index over immutable structured-reference facts. |
 | `fact_schemas`, `archive_meta` | Format registry and archive binding. |
 
-Sources: [gh_puller/github/schema.py](../gh_puller/github/schema.py); [gh_puller/github/observations.py](../gh_puller/github/observations.py)
+Sources: [gh_puller/github/archive_format.py](../gh_puller/github/archive_format.py); [gh_puller/github/observations.py](../gh_puller/github/observations.py)
 
 ### Git evidence
 

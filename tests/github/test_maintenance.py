@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any
 
 import pytest
 
+from gh_puller.github.archive_format import FACT_SCHEMAS
 from gh_puller.github.commit_references import (
     commit_reference_payload,
     observation_commit_references,
@@ -21,7 +22,6 @@ from gh_puller.github.observations import (
     Origin,
     iter_observations,
 )
-from gh_puller.github.schema import FACT_SCHEMAS
 from gh_puller.github.syncer import GitHubSyncConfig
 from tests.github._puller_support import _BASE, _T0, Clock, FakeAPI, FakeGitStore
 

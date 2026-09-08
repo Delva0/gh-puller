@@ -37,7 +37,6 @@ from .family_plan import (
     refresh_request,
     validate_commit_sha,
 )
-from .locking import archive_lock
 from .observations import (
     Coverage,
     FactObservation,
@@ -47,7 +46,7 @@ from .observations import (
     TaskDraft,
 )
 from .progress import _SyncProgressTracker
-from .runtime import GitHubRuntime
+from .runtime import GitHubRuntime, archive_lock
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Sequence

@@ -23,7 +23,6 @@ from urllib.parse import urlencode
 
 from .collector import GitHubFactCollector, _validate_issue
 from .collector import IncompleteGitHubDataError as _IncompleteGitHubDataError
-from .locking import archive_lock
 from .observations import (
     DiscoveryItemDraft,
     ObservationArchive,
@@ -32,7 +31,7 @@ from .observations import (
     TaskDraft,
 )
 from .progress import ProgressObserver, _SyncProgressTracker
-from .runtime import GitHubAPIReader, GitHubRuntime, GitObjectWriter
+from .runtime import GitHubAPIReader, GitHubRuntime, GitObjectWriter, archive_lock
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable

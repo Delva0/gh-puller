@@ -8,7 +8,10 @@ the configured request, retry, authentication, and storage policy.
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import os
+from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
 from .client import GitHubAPI, GitHubPage, GitHubResource
@@ -20,9 +23,8 @@ from .git_store import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable, Mapping, Sequence
+    from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
     from datetime import datetime
-    from pathlib import Path
 
     from .progress import APIProgressObserver
 
@@ -284,3 +286,27 @@ def _token(configured: str | None) -> str | None:
         "GITHUB_TOKEN",
     )
     return value or None
+
+
+@asynccontextmanager
+async def archive_lock(destination: Path) -> AsyncIterator[None]:
+    """Acquire the single-writer lock for an archive pair.
+
+    Args:
+        destination: SQLite archive path that identifies the pair.
+    """
+    destination = Path(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    path = destination.parent / f".{destination.name}.lock"
+    file = path.open("a+")
+    try:
+        while True:
+            try:
+                fcntl.flock(file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                await asyncio.sleep(0.1)
+        yield
+    finally:
+        fcntl.flock(file.fileno(), fcntl.LOCK_UN)
+        file.close()

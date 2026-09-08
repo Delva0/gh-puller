@@ -22,8 +22,8 @@ from datetime import UTC, datetime, tzinfo
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from .archive_format import ARCHIVE_SCHEMA_VERSION
 from .progress import RateQuota
-from .schema import ARCHIVE_SCHEMA_VERSION
 
 if TYPE_CHECKING:
     from collections.abc import Sequence

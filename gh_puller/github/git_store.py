@@ -18,13 +18,13 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from .archive_format import (
+    GIT_LAYOUT_VERSION,
     commit_ref,
     pull_ref,
     pull_staging_ref,
     source_staging_ref,
     upstream_ref,
 )
-from .schema import GIT_LAYOUT_VERSION
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
