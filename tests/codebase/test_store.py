@@ -65,6 +65,37 @@ def test_load_rows_rejects_ambiguous_property_json(tmp_path):
         load_rows(path, "p")
 
 
+@pytest.mark.parametrize(
+    ("column", "message"),
+    [
+        ("file_path", "invalid file path"),
+        ("start_line", "invalid source lines"),
+        ("end_line", "invalid source lines"),
+        ("properties", "unsupported type NoneType"),
+    ],
+)
+def test_load_rows_rejects_null_fields_instead_of_filling(tmp_path, column, message):
+    path = tmp_path / "graph.db"
+    write_store(path, "{}")
+    with sqlite3.connect(path) as connection, connection:
+        connection.execute(
+            f"UPDATE nodes SET {column}=NULL WHERE qualified_name='p.a'",  # noqa: S608 - fixed columns.
+        )
+
+    with pytest.raises(ExtractionError, match=message):
+        load_rows(path, "p")
+
+
+def test_load_rows_rejects_invalid_stored_edge_endpoints(tmp_path):
+    path = tmp_path / "graph.db"
+    write_store(path, "{}")
+    with sqlite3.connect(path) as connection, connection:
+        connection.execute("DELETE FROM nodes WHERE qualified_name='p.a'")
+
+    with pytest.raises(ExtractionError, match="1 invalid edge endpoints"):
+        load_rows(path, "p")
+
+
 def test_validate_rows_rejects_edge_identity_drift():
     node = {
         "label": "Project",

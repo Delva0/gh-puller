@@ -13,7 +13,7 @@ import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 
-from .store import _edge_attributes, _node_attributes
+from .store import _edge_row, _node_row
 
 
 @dataclass(frozen=True)
@@ -82,14 +82,15 @@ class PinnedGeneration:
             nodes[key] = (
                 None
                 if node_id is None
-                else _node_attributes(
+                else _node_row(
+                    key,
                     label,
                     name,
                     file_path,
                     start_line,
                     end_line,
                     properties,
-                )
+                )[1]
             )
 
         # Node IDs are generation-local. Materialize their exact FQN mapping once,
@@ -108,7 +109,7 @@ class PinnedGeneration:
         edge_rows = list(
             connection.execute(
                 """
-            SELECT source.qualified_name,target.qualified_name,old.type,COALESCE(old.local_name_gen,'')
+            SELECT source.qualified_name,target.qualified_name,old.type,old.local_name_gen
               FROM main.edges old
               JOIN main.nodes source ON source.id=old.source_id
               JOIN main.nodes target ON target.id=old.target_id
@@ -117,10 +118,10 @@ class PinnedGeneration:
               LEFT JOIN current.edges new
                 ON new.source_id=source_map.new_id AND new.target_id=target_map.new_id
                AND new.type=old.type
-               AND COALESCE(new.local_name_gen,'')=COALESCE(old.local_name_gen,'')
+               AND new.local_name_gen=old.local_name_gen
              WHERE old.project=? AND (new.id IS NULL OR old.properties IS NOT new.properties)
             UNION ALL
-            SELECT source.qualified_name,target.qualified_name,new.type,COALESCE(new.local_name_gen,'')
+            SELECT source.qualified_name,target.qualified_name,new.type,new.local_name_gen
               FROM current.edges new
               JOIN current.nodes source ON source.id=new.source_id
               JOIN current.nodes target ON target.id=new.target_id
@@ -129,7 +130,7 @@ class PinnedGeneration:
               LEFT JOIN main.edges old
                 ON old.source_id=source_map.old_id AND old.target_id=target_map.old_id
                AND old.type=new.type
-               AND COALESCE(old.local_name_gen,'')=COALESCE(new.local_name_gen,'')
+               AND old.local_name_gen=new.local_name_gen
              WHERE new.project=? AND old.id IS NULL
             """,
                 (self.project, self.project),
@@ -148,10 +149,10 @@ class PinnedGeneration:
               LEFT JOIN current.nodes s ON s.project=? AND s.qualified_name=k.source
               LEFT JOIN current.nodes t ON t.project=? AND t.qualified_name=k.target
               LEFT JOIN current.edges e ON e.project=? AND e.source_id=s.id AND e.target_id=t.id
-                                       AND e.type=k.type AND COALESCE(e.local_name_gen,'')=k.local
+                                       AND e.type=k.type AND e.local_name_gen=k.local
             """,
             (self.project, self.project, self.project),
         ):
             key = (source, target, edge_type, local)
-            edges[key] = None if edge_id is None else _edge_attributes(properties)
+            edges[key] = None if edge_id is None else _edge_row(*key, properties)[1]
         return ChangeSet(nodes, edges)

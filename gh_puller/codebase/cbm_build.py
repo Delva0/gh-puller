@@ -356,14 +356,14 @@ def _validate_resume_force_full(last_item: dict | None, force_full: bool) -> Non
         )
 
 
-def _validate_resume_binary(last_item: dict | None, digest: str, allow_upgrade: bool) -> None:
+def _validate_resume_binary(last_item: dict | None, digest: str, allow_upgrade: bool) -> bool:
     if last_item is None:
-        return
+        return False
     recorded = last_item.get("cbm_binary_sha256")
     if recorded == digest:
-        return
+        return False
     if allow_upgrade:
-        return
+        return True
     if recorded is None:
         raise BuildError("archive predates CBM binary recording; resume once with --allow-cbm-upgrade")
     raise BuildError(
@@ -372,14 +372,16 @@ def _validate_resume_binary(last_item: dict | None, digest: str, allow_upgrade: 
     )
 
 
-def _requires_full_snapshot_anchor(last_item: dict | None, binary_digest: str, project: str) -> bool:
+def _validate_resume_fidelity(last_item: dict | None, project: str) -> None:
     if last_item is None:
-        return True
-    return (
-        last_item.get("graph_fidelity_version") != GRAPH_FIDELITY_VERSION
-        or last_item.get("cbm_binary_sha256") != binary_digest
-        or last_item.get("cbm_project") != project
-    )
+        return
+    if last_item.get("graph_fidelity_version") != GRAPH_FIDELITY_VERSION:
+        raise BuildError("archive has not passed the one-time graph fidelity migration")
+    recorded = last_item.get("cbm_project")
+    if recorded != project:
+        raise BuildError(
+            f"CBM project differs from the archive: recorded={recorded!r}, requested={project!r}",
+        )
 
 
 def build(args) -> int:
@@ -428,15 +430,16 @@ def build(args) -> int:
         existing.verify_snapshot()
         print(json.dumps({"archive": str(archive_path), "commits": existing_count, "verified": True}))
         return 0
-    _validate_resume_binary(
+    identity = sha256(f"gh-puller-codebase:{repo}:{build_dir}".encode()).hexdigest()[:12]
+    project = args.project_name or f"cbm-archive-{_slug(repo.name)}-{identity}"
+    _validate_resume_fidelity(last_existing_item, project)
+    binary_upgrade = _validate_resume_binary(
         last_existing_item,
         cbm_binary.sha256,
         bool(getattr(args, "allow_cbm_upgrade", False)),
     )
 
     cache_root = Path(os.environ.get("CBM_CACHE_DIR") or Path.home() / ".cache" / "codebase-memory-mcp")
-    identity = sha256(f"gh-puller-codebase:{repo}:{build_dir}".encode()).hexdigest()[:12]
-    project = args.project_name or f"cbm-archive-{_slug(repo.name)}-{identity}"
     scratch = Path(tempfile.gettempdir()) / f"{project}-work"
     tree, state_path = scratch / "tree", scratch / "current-sha"
     db_path = cache_root / f"{project}.db"
@@ -478,7 +481,7 @@ def build(args) -> int:
         )
         last_item = writer.commits[-1] if writer.commits else None
         node_root, edge_root = _root(last_item, "node_root"), _root(last_item, "edge_root")
-        full_snapshot_anchor = _requires_full_snapshot_anchor(last_item, cbm_binary.sha256, project)
+        full_snapshot_anchor = binary_upgrade
 
         if last_item:
             last_sha = last_item["sha"]

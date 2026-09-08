@@ -6,8 +6,8 @@ from gh_puller.codebase.archive import Archive, ArchiveError, ArchiveWriter, Rad
 from gh_puller.codebase.cbm_build import (
     GRAPH_FIDELITY_VERSION,
     BuildError,
-    _requires_full_snapshot_anchor,
     _validate_resume_binary,
+    _validate_resume_fidelity,
     _validate_resume_force_full,
     prepare_output_dir,
 )
@@ -75,10 +75,10 @@ def test_resume_force_full_is_explicit_and_backward_compatible():
 
 
 def test_resume_pins_cbm_digest_unless_upgrade_is_explicit():
-    _validate_resume_binary(None, "new", False)
-    _validate_resume_binary({"cbm_binary_sha256": "same"}, "same", False)
-    _validate_resume_binary({"sha": "legacy"}, "new", True)
-    _validate_resume_binary({"cbm_binary_sha256": "old"}, "new", True)
+    assert _validate_resume_binary(None, "new", False) is False
+    assert _validate_resume_binary({"cbm_binary_sha256": "same"}, "same", False) is False
+    assert _validate_resume_binary({"sha": "legacy"}, "new", True) is True
+    assert _validate_resume_binary({"cbm_binary_sha256": "old"}, "new", True) is True
 
     with pytest.raises(BuildError, match="predates"):
         _validate_resume_binary({"sha": "legacy"}, "new", False)
@@ -86,14 +86,16 @@ def test_resume_pins_cbm_digest_unless_upgrade_is_explicit():
         _validate_resume_binary({"cbm_binary_sha256": "old"}, "new", False)
 
 
-def test_resume_reanchors_untrusted_or_semantically_changed_graphs():
-    assert _requires_full_snapshot_anchor(None, "binary", "p")
-    assert _requires_full_snapshot_anchor({"sha": "legacy"}, "binary", "p")
+def test_resume_requires_explicitly_migrated_graph_identity():
+    _validate_resume_fidelity(None, "p")
     trusted = {
         "graph_fidelity_version": GRAPH_FIDELITY_VERSION,
         "cbm_binary_sha256": "same",
         "cbm_project": "p",
     }
-    assert _requires_full_snapshot_anchor({**trusted, "cbm_binary_sha256": "old"}, "new", "p")
-    assert _requires_full_snapshot_anchor(trusted, "same", "renamed")
-    assert not _requires_full_snapshot_anchor(trusted, "same", "p")
+    _validate_resume_fidelity(trusted, "p")
+
+    with pytest.raises(BuildError, match="one-time graph fidelity migration"):
+        _validate_resume_fidelity({"sha": "legacy"}, "p")
+    with pytest.raises(BuildError, match="project differs"):
+        _validate_resume_fidelity(trusted, "renamed")

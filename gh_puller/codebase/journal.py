@@ -2,8 +2,8 @@
 
 The journal contains generation-local row ids, not graph values. This module
 expands those candidates against the pinned previous generation and the newly
-published generation, then applies the same normalized value comparison used
-by the full generation diff.
+published generation, then applies the same exact value comparison used by the
+full generation diff.
 """
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ from contextlib import closing
 from typing import TYPE_CHECKING
 
 from .generation_diff import ChangeSet, PinnedGeneration
-from .store import ExtractionError, _edge_attributes, _node_attributes
+from .store import ExtractionError, _edge_row, _node_row
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -60,17 +60,25 @@ def candidate_counts(db_path: str | Path, project: str) -> dict[str, int]:
     return {"nodes": node_count, "edges": edge_count}
 
 
-def _node_value(row: tuple) -> dict | None:
+def _node_value(qualified_name: str, row: tuple) -> dict | None:
     node_id, label, name, file_path, start_line, end_line, properties = row
     if node_id is None:
         return None
-    return _node_attributes(label, name, file_path, start_line, end_line, properties)
+    return _node_row(
+        qualified_name,
+        label,
+        name,
+        file_path,
+        start_line,
+        end_line,
+        properties,
+    )[1]
 
 
-def _edge_value(edge_id, properties) -> dict | None:
+def _edge_value(key: tuple, edge_id, properties) -> dict | None:
     if edge_id is None:
         return None
-    return _edge_attributes(properties)
+    return _edge_row(*key, properties)[1]
 
 
 def _prepare_candidates(connection: sqlite3.Connection, project: str) -> None:
@@ -127,8 +135,7 @@ def _prepare_candidates(connection: sqlite3.Connection, project: str) -> None:
     for schema in ("main", "current"):
         query = f"""
             INSERT OR IGNORE INTO journal_edge_keys
-            SELECT source.qualified_name,target.qualified_name,edge.type,
-                   COALESCE(edge.local_name_gen,'')
+            SELECT source.qualified_name,target.qualified_name,edge.type,edge.local_name_gen
               FROM current.cbm_delta_changed_edges candidate
               JOIN {schema}.edges edge
                 ON edge.project=candidate.project AND edge.id=candidate.edge_id
@@ -143,8 +150,7 @@ def _prepare_candidates(connection: sqlite3.Connection, project: str) -> None:
         for endpoint in ("source_id", "target_id"):
             query = f"""
                 INSERT OR IGNORE INTO journal_edge_keys
-                SELECT source.qualified_name,target.qualified_name,edge.type,
-                       COALESCE(edge.local_name_gen,'')
+                SELECT source.qualified_name,target.qualified_name,edge.type,edge.local_name_gen
                   FROM journal_identity_node_ids changed
                   JOIN {schema}.edges edge ON edge.{endpoint}=changed.node_id
                   JOIN {schema}.nodes source ON source.id=edge.source_id
@@ -200,8 +206,8 @@ def changes_after_publish(previous: PinnedGeneration) -> ChangeSet:
         )
         for row in rows:
             key = row[0]
-            old_value = _node_value(row[1:8])
-            new_value = _node_value(row[8:15])
+            old_value = _node_value(key, row[1:8])
+            new_value = _node_value(key, row[8:15])
             if old_value != new_value:
                 nodes[key] = new_value
 
@@ -218,14 +224,14 @@ def changes_after_publish(previous: PinnedGeneration) -> ChangeSet:
                 ON old_target.project=? AND old_target.qualified_name=key.target
               LEFT JOIN main.edges old
                 ON old.project=? AND old.source_id=old_source.id AND old.target_id=old_target.id
-               AND old.type=key.type AND COALESCE(old.local_name_gen,'')=key.local
+               AND old.type=key.type AND old.local_name_gen=key.local
               LEFT JOIN current.nodes new_source
                 ON new_source.project=? AND new_source.qualified_name=key.source
               LEFT JOIN current.nodes new_target
                 ON new_target.project=? AND new_target.qualified_name=key.target
               LEFT JOIN current.edges new
                 ON new.project=? AND new.source_id=new_source.id AND new.target_id=new_target.id
-               AND new.type=key.type AND COALESCE(new.local_name_gen,'')=key.local
+               AND new.type=key.type AND new.local_name_gen=key.local
             """,
             (previous.project,) * 6,
         )
@@ -236,8 +242,8 @@ def changes_after_publish(previous: PinnedGeneration) -> ChangeSet:
                 edge_type,
                 local,
             )
-            old_value = _edge_value(old_id, old_props)
-            new_value = _edge_value(new_id, new_props)
+            old_value = _edge_value(key, old_id, old_props)
+            new_value = _edge_value(key, new_id, new_props)
             if old_value != new_value:
                 edges[key] = new_value
         return ChangeSet(nodes, edges)
