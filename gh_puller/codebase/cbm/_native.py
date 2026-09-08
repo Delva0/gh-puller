@@ -30,7 +30,7 @@ from ._daemon import CBMTransportError
 if TYPE_CHECKING:
     from collections.abc import Iterator, Mapping
 
-_PROTOCOL_VERSION = 5
+_PROTOCOL_VERSION = 6
 _RESPONSE_MAX_BYTES = 256 << 20
 _HELPER_ENV = "GH_PULLER_CODEBASE_CBM_HELPER"
 _CACHE_SCHEMA = 4
@@ -202,6 +202,7 @@ class NativeArchiveTransport:
             capabilities = hello.get("capabilities")
             tools = hello.get("tools")
             store_format = hello.get("store_format")
+            sdk_abi = hello.get("sdk_abi")
             if (
                 hello.get("protocol") != _PROTOCOL_VERSION
                 or hello.get("kga_format") != 5
@@ -209,17 +210,20 @@ class NativeArchiveTransport:
                 or hello.get("coverage_fidelity") != COVERAGE_FIDELITY_VERSION
                 or not isinstance(capabilities, list)
                 or not all(isinstance(item, str) for item in capabilities)
-                or not {"archive-load", "tool-call"} <= set(capabilities)
+                or not {"archive-load", "tool-call", "graph-compare"} <= set(capabilities)
                 or not isinstance(tools, list)
                 or not tools
                 or not all(isinstance(item, str) and item for item in tools)
                 or type(store_format) is not int
                 or store_format < 1
+                or type(sdk_abi) is not int
+                or sdk_abi < 2
             ):
                 raise CBMTransportError("native CBM helper advertised an incompatible protocol")
             self.capabilities = frozenset(capabilities)
             self.tools = frozenset(tools)
             self.store_format = store_format
+            self.sdk_abi = sdk_abi
         except BaseException:
             self.close()
             raise
@@ -426,6 +430,36 @@ class NativeArchiveTransport:
         return self.call_tool(
             "query_graph",
             {"project": project, "query": query, "graph": graph, "max_rows": max_rows},
+        )
+
+    def compare_graphs(
+        self,
+        *,
+        base_database: Path,
+        base_project: str,
+        target_database: Path,
+        target_project: str,
+        limit: int,
+        scan_limit: int,
+    ) -> dict[str, Any]:
+        """Compare two materialized archive generations with request-scoped handles.
+
+        Args:
+            base_database: Materialized database for the older generation.
+            base_project: Project bound inside the base database.
+            target_database: Materialized database for the newer generation.
+            target_project: Project bound inside the target database.
+            limit: Maximum returned entries per change set.
+            scan_limit: Maximum combined rows scanned per node or edge phase.
+        """
+        return self._request(
+            "compare",
+            {
+                "base": {"database_path": str(base_database), "project": base_project},
+                "target": {"database_path": str(target_database), "project": target_project},
+                "limit": limit,
+                "scan_limit": scan_limit,
+            },
         )
 
     def call_tool(self, name: str, arguments: Mapping[str, object] | None = None) -> dict[str, Any]:

@@ -37,6 +37,7 @@ for line in sys.stdin:
             {"name": "trace_path"},
             {"name": "get_architecture"},
             {"name": "index_status"},
+            {"name": "compare_graphs"},
         ]}
     elif method == "tools/call":
         name = request["params"]["name"]
@@ -79,6 +80,12 @@ def test_client_starts_once_and_exposes_json_queries(tmp_path):
         trace = client.trace_path(graph, function_name="demo.main", direction="outbound")
         architecture = client.get_architecture(graph, aspects=["structure"])
         status = client.index_status(graph, verbose=True)
+        comparison = client.compare_graphs(
+            client.daemon_graph("base"),
+            graph,
+            limit=3,
+            scan_limit=50,
+        )
 
         assert client.instructions == "Query before reading source."
         assert client.binary.path == binary.resolve()
@@ -90,6 +97,7 @@ def test_client_starts_once_and_exposes_json_queries(tmp_path):
             "trace_path",
             "get_architecture",
             "index_status",
+            "compare_graphs",
         ]
         assert {
             search["pid"],
@@ -98,6 +106,7 @@ def test_client_starts_once_and_exposes_json_queries(tmp_path):
             trace["pid"],
             architecture["pid"],
             status["pid"],
+            comparison["pid"],
         } == {pid}
         assert search["arguments"] == {
             "project": "demo",
@@ -115,6 +124,12 @@ def test_client_starts_once_and_exposes_json_queries(tmp_path):
             "format": "json",
         }
         assert status["arguments"] == {"project": "demo", "verbose": True}
+        assert comparison["arguments"] == {
+            "base_project": "base",
+            "target_project": "demo",
+            "limit": 3,
+            "scan_limit": 50,
+        }
 
     assert client._daemon_backend.process.returncode == 0
 

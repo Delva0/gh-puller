@@ -19,7 +19,7 @@
 #include <yyjson/yyjson.h>
 
 enum {
-    NATIVE_PROTOCOL_VERSION = 5,
+    NATIVE_PROTOCOL_VERSION = 6,
     KGA_FORMAT_VERSION = 5,
     KGA_GRAPH_FIDELITY_VERSION = 2,
     KGA_COVERAGE_FIDELITY_VERSION = 1,
@@ -128,6 +128,7 @@ static char *hello_response(uint64_t id) {
     yyjson_mut_val *capabilities = yyjson_mut_arr(document);
     yyjson_mut_arr_add_str(document, capabilities, "archive-load");
     yyjson_mut_arr_add_str(document, capabilities, "tool-call");
+    yyjson_mut_arr_add_str(document, capabilities, "graph-compare");
     yyjson_mut_val *tools = yyjson_mut_arr(document);
     for (size_t index = 0; index < cbm_sdk_graph_tool_count(); index++) {
         yyjson_mut_arr_add_str(document, tools, cbm_sdk_graph_tool_name(index));
@@ -137,6 +138,7 @@ static char *hello_response(uint64_t id) {
     yyjson_mut_obj_add_int(document, result, "graph_fidelity", KGA_GRAPH_FIDELITY_VERSION);
     yyjson_mut_obj_add_int(document, result, "coverage_fidelity", KGA_COVERAGE_FIDELITY_VERSION);
     yyjson_mut_obj_add_int(document, result, "store_format", cbm_sdk_store_format_version());
+    yyjson_mut_obj_add_int(document, result, "sdk_abi", cbm_sdk_abi_version());
     yyjson_mut_obj_add_val(document, result, "capabilities", capabilities);
     yyjson_mut_obj_add_val(document, result, "tools", tools);
     yyjson_mut_obj_add_val(document, root, "result", result);
@@ -346,6 +348,32 @@ static char *load_response(uint64_t id, helper_session_t *session, yyjson_val *p
     return document_json(document);
 }
 
+static char *sdk_result_response(uint64_t id, cbm_sdk_status_t status, cbm_sdk_result_t *result) {
+    if (status != CBM_SDK_OK) {
+        char *response = error_response(id, cbm_sdk_status_code(status),
+                                        result->error ? result->error : "SDK call failed");
+        cbm_sdk_result_free(result);
+        return response;
+    }
+    if (!result->json) {
+        cbm_sdk_result_free(result);
+        return error_response(id, "allocation_failed", "SDK call returned no result");
+    }
+    size_t result_size = strlen(result->json);
+    size_t capacity = result_size + 96;
+    char *response = malloc(capacity);
+    if (response) {
+        int written = snprintf(response, capacity, "{\"id\":%llu,\"ok\":true,\"result\":%s}",
+                               (unsigned long long)id, result->json);
+        if (written < 0 || (size_t)written >= capacity) {
+            free(response);
+            response = NULL;
+        }
+    }
+    cbm_sdk_result_free(result);
+    return response;
+}
+
 static char *tool_response(uint64_t id, helper_session_t *session, yyjson_val *parameters) {
     const char *name = NULL;
     yyjson_val *arguments = NULL;
@@ -362,29 +390,63 @@ static char *tool_response(uint64_t id, helper_session_t *session, yyjson_val *p
     if (!arguments_json) {
         return error_response(id, "allocation_failed", "cannot encode tool arguments");
     }
-    cbm_sdk_result_t tool_result = {0};
-    cbm_sdk_status_t status =
-        cbm_sdk_graph_call(session->graph, name, arguments_json, &tool_result);
+    cbm_sdk_result_t result = {0};
+    cbm_sdk_status_t status = cbm_sdk_graph_call(session->graph, name, arguments_json, &result);
     free(arguments_json);
+    return sdk_result_response(id, status, &result);
+}
+
+static bool parse_graph_reference(yyjson_val *value, const char **database_path,
+                                  const char **project) {
+    return yyjson_is_obj(value) &&
+           (*database_path = json_string(yyjson_obj_get(value, "database_path"))) &&
+           (*project = json_string(yyjson_obj_get(value, "project"))) && (*database_path)[0] &&
+           (*project)[0];
+}
+
+static char *compare_response(uint64_t id, yyjson_val *parameters) {
+    const char *base_database = NULL;
+    const char *base_project = NULL;
+    const char *target_database = NULL;
+    const char *target_project = NULL;
+    uint64_t limit = 0;
+    uint64_t scan_limit = 0;
+    yyjson_val *limit_value =
+        yyjson_is_obj(parameters) ? yyjson_obj_get(parameters, "limit") : NULL;
+    yyjson_val *scan_limit_value =
+        yyjson_is_obj(parameters) ? yyjson_obj_get(parameters, "scan_limit") : NULL;
+    if (!yyjson_is_obj(parameters) ||
+        !parse_graph_reference(yyjson_obj_get(parameters, "base"), &base_database, &base_project) ||
+        !parse_graph_reference(yyjson_obj_get(parameters, "target"), &target_database,
+                               &target_project) ||
+        (limit_value && !json_u64(limit_value, &limit)) ||
+        (scan_limit_value && !json_u64(scan_limit_value, &scan_limit))) {
+        return error_response(id, "invalid_request", "invalid graph comparison parameters");
+    }
+
+    char error[1024];
+    cbm_sdk_graph_t *base = NULL;
+    cbm_sdk_status_t status =
+        cbm_sdk_graph_open(base_database, base_project, &base, error, sizeof(error));
     if (status != CBM_SDK_OK) {
-        char *response = error_response(id, cbm_sdk_status_code(status),
-                                        tool_result.error ? tool_result.error : "tool call failed");
-        cbm_sdk_result_free(&tool_result);
-        return response;
+        return error_response(id, cbm_sdk_status_code(status), error);
     }
-    size_t result_size = strlen(tool_result.json);
-    size_t capacity = result_size + 96;
-    char *response = malloc(capacity);
-    if (response) {
-        int written = snprintf(response, capacity, "{\"id\":%llu,\"ok\":true,\"result\":%s}",
-                               (unsigned long long)id, tool_result.json);
-        if (written < 0 || (size_t)written >= capacity) {
-            free(response);
-            response = NULL;
-        }
+    cbm_sdk_graph_t *target = NULL;
+    status = cbm_sdk_graph_open(target_database, target_project, &target, error, sizeof(error));
+    if (status != CBM_SDK_OK) {
+        cbm_sdk_graph_close(base);
+        return error_response(id, cbm_sdk_status_code(status), error);
     }
-    cbm_sdk_result_free(&tool_result);
-    return response;
+
+    cbm_sdk_graph_compare_options_t options = {
+        .limit = limit,
+        .scan_limit = scan_limit,
+    };
+    cbm_sdk_result_t result = {0};
+    status = cbm_sdk_graph_compare(base, target, &options, &result);
+    cbm_sdk_graph_close(target);
+    cbm_sdk_graph_close(base);
+    return sdk_result_response(id, status, &result);
 }
 
 static char *dispatch_request(helper_session_t *session, yyjson_val *request, bool *shutdown) {
@@ -412,6 +474,9 @@ static char *dispatch_request(helper_session_t *session, yyjson_val *request, bo
     }
     if (strcmp(method, "call") == 0) {
         return tool_response(id, session, parameters);
+    }
+    if (strcmp(method, "compare") == 0) {
+        return compare_response(id, parameters);
     }
     if (strcmp(method, "shutdown") == 0) {
         *shutdown = true;

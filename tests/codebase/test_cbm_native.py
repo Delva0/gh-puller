@@ -34,7 +34,7 @@ import sys
 import time
 
 if sys.argv[1:] == ["--version"]:
-    print("gh-puller-cbm-helper 5")
+    print("gh-puller-cbm-helper 6")
     raise SystemExit(0)
 
 def read_exact(size):
@@ -60,9 +60,9 @@ while True:
         with Path(log).open("a") as stream:
             stream.write(json.dumps(request) + "\\n")
     if method == "hello":
-        result = {{"protocol": 5, "kga_format": 5, "graph_fidelity": 2,
-                  "coverage_fidelity": 1, "store_format": 1,
-                  "capabilities": ["archive-load", "tool-call"],
+        result = {{"protocol": 6, "kga_format": 5, "graph_fidelity": 2,
+                  "coverage_fidelity": 1, "store_format": 1, "sdk_abi": 2,
+                  "capabilities": ["archive-load", "tool-call", "graph-compare"],
                   "tools": ["query_graph", "get_graph_schema", "index_status"]}}
     elif method == "load":
         Path(params["database_path"]).touch()
@@ -92,6 +92,10 @@ while True:
         else:
             result = {{"node_labels": [{{"label": "Function", "count": 2}}],
                       "edge_types": []}}
+    elif method == "compare":
+        result = {{"schema_version": 1, "base": params["base"],
+                  "target": params["target"], "limit": params["limit"],
+                  "scan_limit": params["scan_limit"]}}
     elif method == "shutdown":
         respond({{"id": ident, "ok": True, "result": {{}}}})
         break
@@ -111,42 +115,53 @@ def write_archive(
     *,
     with_coverage: bool = False,
     coverage_generation: str = "original-cbm-generation",
+    extra_node: str | None = None,
 ) -> tuple[dict, GraphRows]:
     newline = f"{project}.mod.unit.a\n"
     bang = f"{project}.mod.unit.a!"
-    rows = GraphRows(
-        {
-            project: {
-                "label": "Project",
-                "name": project,
-                "file_path": "",
-                "start_line": 0,
-                "end_line": 0,
-                "properties": {},
-            },
-            newline: {
-                "label": "Function",
-                "name": "newline",
-                "file_path": "newline.py",
-                "start_line": 3,
-                "end_line": 7,
-                "properties": {"docstring": "native needle", "nested": {"unicode": "图"}},
-            },
-            bang: {
-                "label": "Function",
-                "name": "bang",
-                "file_path": "bang.py",
-                "start_line": 11,
-                "end_line": 13,
-                "properties": {"ratio": 1.25},
-            },
+    nodes = {
+        project: {
+            "label": "Project",
+            "name": project,
+            "file_path": "",
+            "start_line": 0,
+            "end_line": 0,
+            "properties": {},
         },
-        {
-            (project, newline, "CONTAINS", ""): {"properties": {}},
-            (project, bang, "CONTAINS", ""): {"properties": {}},
-            (newline, bang, "CALLS", ""): {"properties": {}},
+        newline: {
+            "label": "Function",
+            "name": "newline",
+            "file_path": "newline.py",
+            "start_line": 3,
+            "end_line": 7,
+            "properties": {"docstring": "native needle", "nested": {"unicode": "图"}},
         },
-    )
+        bang: {
+            "label": "Function",
+            "name": "bang",
+            "file_path": "bang.py",
+            "start_line": 11,
+            "end_line": 13,
+            "properties": {"ratio": 1.25},
+        },
+    }
+    edges = {
+        (project, newline, "CONTAINS", ""): {"properties": {}},
+        (project, bang, "CONTAINS", ""): {"properties": {}},
+        (newline, bang, "CALLS", ""): {"properties": {}},
+    }
+    if extra_node is not None:
+        qualified_name = f"{project}.mod.unit.{extra_node}"
+        nodes[qualified_name] = {
+            "label": "Function",
+            "name": extra_node,
+            "file_path": f"{extra_node}.py",
+            "start_line": 1,
+            "end_line": 2,
+            "properties": {},
+        }
+        edges[(project, qualified_name, "CONTAINS", "")] = {"properties": {}}
+    rows = GraphRows(nodes, edges)
     writer = ArchiveWriter(path)
     node_root = RadixTree(writer, "nodes").build(rows.nodes.items())
     edge_root = RadixTree(writer, "edges").build(rows.edges.items())
@@ -368,12 +383,25 @@ def test_client_rejects_archive_handle_after_loading_another_generation(tmp_path
     with CBMClient(native_helper=helper, cache_root=tmp_path / "cache", timeout=5) as client:
         first = client.load_archive(first_archive)
         second = client.load_archive(second_archive)
+        compared = client.compare_graphs(first, second, limit=4, scan_limit=100)
 
         assert client.query_graph(second, query="MATCH (n) RETURN n")["rows"] == [
             ["native", "second"],
         ]
+        assert compared["base"] == {
+            "database_path": str(first.database_path),
+            "project": "first",
+        }
+        assert compared["target"] == {
+            "database_path": str(second.database_path),
+            "project": "second",
+        }
+        assert compared["limit"] == 4
+        assert compared["scan_limit"] == 100
         with pytest.raises(CBMTransportError, match="no longer loaded"):
             client.query_graph(first, query="MATCH (n) RETURN n")
+        with pytest.raises(CBMTransportError, match="cannot compare archive and daemon"):
+            client.compare_graphs(first, client.daemon_graph("second"))
 
 
 def test_native_query_timeout_terminates_helper(tmp_path):
@@ -501,6 +529,46 @@ def test_real_native_helper_restores_exact_rows_and_reuses_cache(tmp_path):
     assert status["not_indexed"]["dirs"] == ["vendor"]
     assert "git" not in status
     assert reused.materialized is False
+
+
+@pytest.mark.integration
+def test_real_native_helper_compares_archive_generations(tmp_path):
+    configured = os.environ.get("GH_PULLER_TEST_CBM_NATIVE_HELPER")
+    if configured is None:
+        pytest.skip("real native helper not configured")
+    project = "compare-native"
+    base_archive = tmp_path / "base.kga"
+    target_archive = tmp_path / "target.kga"
+    write_archive(base_archive, project)
+    write_archive(target_archive, project, extra_node="added")
+
+    with CBMClient(
+        native_helper=Path(configured),
+        cache_root=tmp_path / "cache",
+        timeout=30,
+    ) as client:
+        base = client.load_archive(base_archive)
+        target = client.load_archive(target_archive)
+        compared = client.compare_graphs(base, target, limit=10, scan_limit=100)
+
+    assert base.project == target.project == project
+    assert base.database_path != target.database_path
+    assert compared["base"]["project"] == project
+    assert compared["target"]["project"] == project
+    assert compared["nodes"]["added"]["total"] == 1
+    assert compared["nodes"]["added"]["items"] == [
+        {
+            "qualified_name": f"{project}.mod.unit.added",
+            "label": "Function",
+            "file_path": "added.py",
+        },
+    ]
+    assert compared["nodes"]["removed"]["total"] == 0
+    assert compared["edges"]["added"]["total"] == 1
+    assert compared["edges"]["added"]["items"][0]["target"]["qualified_name"] == (
+        f"{project}.mod.unit.added"
+    )
+    assert compared["edges"]["removed"]["total"] == 0
 
 
 @pytest.mark.integration

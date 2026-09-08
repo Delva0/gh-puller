@@ -512,6 +512,46 @@ class CBMClient:
             target=target,
         )
 
+    def compare_graphs(
+        self,
+        base: GraphTarget,
+        target: GraphTarget,
+        *,
+        limit: int = 200,
+        scan_limit: int = 2_000_000,
+    ) -> dict[str, Any]:
+        """Compare stable node and edge identities across two graph generations.
+
+        Args:
+            base: Older daemon project or materialized archive generation.
+            target: Newer graph from the same backend kind.
+            limit: Maximum returned entries per change set.
+            scan_limit: Maximum combined rows scanned per node or edge phase.
+
+        Raises:
+            CBMTransportError: Archive and daemon graph kinds are mixed.
+        """
+        if isinstance(base, ArchiveGraph) and isinstance(target, ArchiveGraph):
+            return self._native().compare_graphs(
+                base_database=base.database_path,
+                base_project=base.project,
+                target_database=target.database_path,
+                target_project=target.project,
+                limit=limit,
+                scan_limit=scan_limit,
+            )
+        if isinstance(base, ArchiveGraph) or isinstance(target, ArchiveGraph):
+            raise CBMTransportError("cannot compare archive and daemon graphs")
+        return self.call_json_tool(
+            "compare_graphs",
+            {
+                "base_project": base.project,
+                "target_project": target.project,
+                "limit": limit,
+                "scan_limit": scan_limit,
+            },
+        )
+
     def close(self) -> None:
         """Finish active native and daemon processes and release their pipes."""
         if self._native_transport is not None:
