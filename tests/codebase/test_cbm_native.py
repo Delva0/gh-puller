@@ -340,7 +340,7 @@ def test_client_native_query_does_not_resolve_or_start_mcp(tmp_path):
         assert client._daemon_backend is None
         graph = client.load_archive(archive_path)
         result = client.query_graph(graph, query="MATCH (n) RETURN n")
-        schema = client.call_json_tool("get_graph_schema", target=graph)
+        schema = client.get_graph_schema(graph)
         status = client.index_status(graph)
         assert result["rows"] == [["native", graph.project]]
         assert result["pid"] == client.native_pid
@@ -410,7 +410,7 @@ def test_real_native_helper_restores_exact_rows_and_reuses_cache(tmp_path):
         )
         searched = first.search_graph(loaded, label="Function", fields=["ratio"], limit=10)
         ranked = first.search_graph(loaded, query="native needle", limit=10)
-        schema = first.call_json_tool("get_graph_schema", target=loaded)
+        schema = first.get_graph_schema(loaded)
         traced = first.trace_path(
             loaded,
             function_name="newline",

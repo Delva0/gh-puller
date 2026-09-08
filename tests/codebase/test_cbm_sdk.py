@@ -33,6 +33,7 @@ for line in sys.stdin:
         result = {"tools": [
             {"name": "search_graph"},
             {"name": "query_graph"},
+            {"name": "get_graph_schema"},
             {"name": "trace_path"},
             {"name": "get_architecture"},
             {"name": "index_status"},
@@ -74,6 +75,7 @@ def test_client_starts_once_and_exposes_json_queries(tmp_path):
         graph = client.daemon_graph("demo")
         search = client.search_graph(graph, label="Function", limit=4)
         query = client.query_graph(graph, query="MATCH (n) RETURN n LIMIT 1")
+        schema = client.get_graph_schema(graph)
         trace = client.trace_path(graph, function_name="demo.main", direction="outbound")
         architecture = client.get_architecture(graph, aspects=["structure"])
         status = client.index_status(graph, verbose=True)
@@ -84,6 +86,7 @@ def test_client_starts_once_and_exposes_json_queries(tmp_path):
         assert [tool["name"] for tool in client.list_tools()] == [
             "search_graph",
             "query_graph",
+            "get_graph_schema",
             "trace_path",
             "get_architecture",
             "index_status",
@@ -91,6 +94,7 @@ def test_client_starts_once_and_exposes_json_queries(tmp_path):
         assert {
             search["pid"],
             query["pid"],
+            schema["pid"],
             trace["pid"],
             architecture["pid"],
             status["pid"],
@@ -103,6 +107,7 @@ def test_client_starts_once_and_exposes_json_queries(tmp_path):
         }
         assert query["arguments"]["query"] == "MATCH (n) RETURN n LIMIT 1"
         assert query["arguments"]["format"] == "json"
+        assert schema["arguments"] == {"project": "demo"}
         assert trace["arguments"]["format"] == "json"
         assert architecture["arguments"] == {
             "project": "demo",

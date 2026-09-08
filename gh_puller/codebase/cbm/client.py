@@ -366,6 +366,15 @@ class CBMClient:
             target=target,
         )
 
+    def get_graph_schema(self, target: GraphTarget) -> dict[str, Any]:
+        """Return labels, relationship types, and their available properties.
+
+        Args:
+            target: Graph and backend selected by :meth:`daemon_graph` or
+                :meth:`load_archive`.
+        """
+        return self.call_json_tool("get_graph_schema", target=target)
+
     def load_archive(
         self,
         archive: str | Path | Archive,
