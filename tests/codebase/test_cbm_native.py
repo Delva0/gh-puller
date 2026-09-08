@@ -4,7 +4,13 @@ from pathlib import Path
 
 import pytest
 
-from gh_puller.codebase import Archive, ArchiveWriter, CBMClient, CBMTransportError
+from gh_puller.codebase import (
+    Archive,
+    ArchiveWriter,
+    CBMBinaryError,
+    CBMClient,
+    CBMTransportError,
+)
 from gh_puller.codebase.archive import GRAPH_FIDELITY_VERSION, RadixTree, graph_digest
 from gh_puller.codebase.cbm_native import NativeArchiveTransport
 from gh_puller.codebase.store import GraphRows, load_rows
@@ -243,17 +249,38 @@ def test_client_native_query_does_not_resolve_or_start_mcp(tmp_path):
         timeout=5,
     ) as client:
         assert client._daemon_backend is None
-        project = client.load_archive(archive_path)["project"]
-        result = client.query_graph(project=project, query="MATCH (n) RETURN n")
-        schema = client.call_json_tool("get_graph_schema", {"project": project})
-        assert result["rows"] == [["native", project]]
+        graph = client.load_archive(archive_path)
+        result = client.query_graph(graph, query="MATCH (n) RETURN n")
+        schema = client.call_json_tool("get_graph_schema", target=graph)
+        assert result["rows"] == [["native", graph.project]]
         assert result["pid"] == client.native_pid
         assert schema["node_labels"][0]["label"] == "Function"
         assert client._daemon_backend is None
 
-        with pytest.raises(CBMTransportError, match="not supported for the loaded archive"):
-            client.call_json_tool("trace_path", {"project": project, "function_name": "main"})
+        with pytest.raises(CBMBinaryError, match="does not exist"):
+            client.query_graph(client.daemon_graph(graph.project), query="MATCH (n) RETURN n")
+        with pytest.raises(CBMTransportError, match="not supported for this archive graph"):
+            client.call_json_tool("trace_path", {"function_name": "main"}, target=graph)
         assert client._daemon_backend is None
+
+
+def test_client_rejects_archive_handle_after_loading_another_generation(tmp_path):
+    helper = tmp_path / "fake-helper"
+    first_archive = tmp_path / "first.kga"
+    second_archive = tmp_path / "second.kga"
+    write_fake_helper(helper)
+    write_archive(first_archive, "first")
+    write_archive(second_archive, "second")
+
+    with CBMClient(native_helper=helper, cache_root=tmp_path / "cache", timeout=5) as client:
+        first = client.load_archive(first_archive)
+        second = client.load_archive(second_archive)
+
+        assert client.query_graph(second, query="MATCH (n) RETURN n")["rows"] == [
+            ["native", "second"],
+        ]
+        with pytest.raises(CBMTransportError, match="no longer loaded"):
+            client.query_graph(first, query="MATCH (n) RETURN n")
 
 
 def test_native_query_timeout_terminates_helper(tmp_path):
@@ -284,17 +311,17 @@ def test_real_native_helper_restores_exact_rows_and_reuses_cache(tmp_path):
     with CBMClient(native_helper=helper, cache_root=cache, timeout=30) as first:
         loaded = first.load_archive(archive_path)
         queried = first.query_graph(
-            project="real-native",
+            loaded,
             query="MATCH (n:Function) RETURN n.name, n.file_path, n.docstring",
             max_rows=10,
         )
-        schema = first.call_json_tool("get_graph_schema", {"project": "real-native"})
-        restored = load_rows(loaded["database_path"], "real-native")
+        schema = first.call_json_tool("get_graph_schema", target=loaded)
+        restored = load_rows(loaded.database_path, "real-native")
     with CBMClient(native_helper=helper, cache_root=cache, timeout=30) as second:
         reused = second.load_archive(archive_path)
 
-    assert loaded["materialized"] is True
-    assert loaded["graph_digest"] == manifest["graph_digest"]
+    assert loaded.materialized is True
+    assert loaded.graph_digest == manifest["graph_digest"]
     assert restored == expected
     assert {tuple(row[:2]) for row in queried["rows"]} == {
         ("bang", "bang.py"),
@@ -302,7 +329,7 @@ def test_real_native_helper_restores_exact_rows_and_reuses_cache(tmp_path):
     }
     assert any(row[2] == "native needle" for row in queried["rows"])
     assert {item["label"] for item in schema["node_labels"]} >= {"Project", "Function"}
-    assert reused["materialized"] is False
+    assert reused.materialized is False
 
 
 @pytest.mark.integration
@@ -369,11 +396,11 @@ def test_real_native_helper_reads_captured_prefix_while_writer_appends(tmp_path)
             timeout=30,
         ) as client:
             loaded = client.load_archive(captured)
-            queried = client.query_graph(project=project, query="MATCH (n:Project) RETURN n.name")
+            queried = client.query_graph(loaded, query="MATCH (n:Project) RETURN n.name")
     finally:
         captured.close()
         writer.close_incomplete()
 
-    assert loaded["nodes"] == 1
-    assert loaded["edges"] == 0
+    assert loaded.nodes == 1
+    assert loaded.edges == 0
     assert queried["rows"] == [[project]]

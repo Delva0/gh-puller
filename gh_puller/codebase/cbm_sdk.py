@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import threading
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Self
 
@@ -36,6 +37,28 @@ class _ClientMonitor:
 
     def sample(self) -> None:
         return
+
+
+@dataclass(frozen=True, slots=True)
+class GraphTarget:
+    """Identify a mutable graph project served by the configured daemon backend."""
+
+    project: str
+
+
+@dataclass(frozen=True, slots=True)
+class ArchiveGraph(GraphTarget):
+    """Identify one immutable KGA generation loaded by the native backend.
+
+    A handle becomes stale when its client loads a different archive generation.
+    """
+
+    graph_digest: str
+    database_path: Path
+    nodes: int
+    edges: int
+    graph_fidelity: int
+    materialized: bool
 
 
 def default_cbm_cache(environ: Mapping[str, str] | None = None) -> Path:
@@ -191,6 +214,14 @@ class CBMClient:
         """Return all tool definitions advertised by the live CBM server."""
         return self._mcp().list_tools()
 
+    def daemon_graph(self, project: str) -> GraphTarget:
+        """Bind a project to the configured daemon backend.
+
+        Args:
+            project: Exact mutable CBM project name.
+        """
+        return GraphTarget(project)
+
     def capabilities(self) -> frozenset[str]:
         """Return build capabilities advertised through the daemon backend."""
         return self._daemon().capabilities()
@@ -233,18 +264,37 @@ class CBMClient:
         """
         return self._daemon().delete_project(project)
 
-    def call_tool(self, name: str, arguments: Mapping[str, object] | None = None) -> dict[str, Any]:
+    def call_tool(
+        self,
+        name: str,
+        arguments: Mapping[str, object] | None = None,
+        *,
+        target: GraphTarget | None = None,
+    ) -> dict[str, Any]:
         """Call any CBM tool and return a backend-neutral result envelope.
 
         Args:
             name: Advertised MCP tool name.
             arguments: Tool-specific arguments. ``None`` sends an empty object.
+            target: Explicit graph binding. Archive handles select native;
+                daemon handles and omission select the configured daemon backend.
         """
         values = dict(arguments or {})
-        native = self._native_transport
-        if native is not None and values.get("project") == native.loaded_project:
+        if target is not None:
+            supplied_project = values.get("project")
+            if supplied_project is not None and supplied_project != target.project:
+                raise CBMTransportError("CBM graph target disagrees with the tool project")
+            values["project"] = target.project
+        if isinstance(target, ArchiveGraph):
+            native = self._native_transport
+            if (
+                native is None
+                or native.loaded_project != target.project
+                or native.loaded_digest != target.graph_digest
+            ):
+                raise CBMTransportError("archive graph is no longer loaded by this CBM client")
             if name not in native.tools:
-                raise CBMTransportError(f"native CBM tool is not supported for the loaded archive: {name}")
+                raise CBMTransportError(f"native CBM tool is not supported for this archive graph: {name}")
             logical = native.call_tool(name, values)
             return {
                 "content": [
@@ -258,12 +308,19 @@ class CBMClient:
             }
         return self._daemon().call_tool(name, values)
 
-    def call_json_tool(self, name: str, arguments: Mapping[str, object] | None = None) -> dict[str, Any]:
+    def call_json_tool(
+        self,
+        name: str,
+        arguments: Mapping[str, object] | None = None,
+        *,
+        target: GraphTarget | None = None,
+    ) -> dict[str, Any]:
         """Call a tool whose logical response is a JSON object.
 
         Args:
             name: Advertised MCP tool name.
             arguments: Tool-specific arguments. ``None`` sends an empty object.
+            target: Optional explicit graph/backend binding.
 
         Returns:
             Parsed ``structuredContent``, with a text-content fallback for older
@@ -272,28 +329,38 @@ class CBMClient:
         Raises:
             CBMTransportError: The call fails or its response is not a JSON object.
         """
-        return _json_object(name, self.call_tool(name, arguments))
+        return _json_object(name, self.call_tool(name, arguments, target=target))
 
-    def search_graph(self, *, project: str, **filters: object) -> dict[str, Any]:
+    def search_graph(self, target: GraphTarget, **filters: object) -> dict[str, Any]:
         """Run CBM structured, BM25, or semantic graph search.
 
         Args:
-            project: CBM project name to query.
+            target: Graph and backend selected by :meth:`daemon_graph` or
+                :meth:`load_archive`.
             **filters: Native ``search_graph`` fields such as ``query``, ``label``,
                 ``name_pattern``, ``limit``, and ``offset``.
         """
-        return self.call_json_tool("search_graph", {"project": project, **filters, "format": "json"})
+        return self.call_json_tool(
+            "search_graph",
+            {**filters, "format": "json"},
+            target=target,
+        )
 
-    def query_graph(self, *, project: str, query: str, **options: object) -> dict[str, Any]:
+    def query_graph(self, target: GraphTarget, *, query: str, **options: object) -> dict[str, Any]:
         """Run a read-only Cypher-like query against a CBM graph.
 
         Args:
-            project: CBM project name to query.
+            target: Graph and backend selected by :meth:`daemon_graph` or
+                :meth:`load_archive`.
             query: Native CBM graph query.
             **options: Additional ``query_graph`` fields such as ``graph`` and
                 ``max_rows``.
         """
-        return self.call_json_tool("query_graph", {"project": project, "query": query, **options, "format": "json"})
+        return self.call_json_tool(
+            "query_graph",
+            {"query": query, **options, "format": "json"},
+            target=target,
+        )
 
     def load_archive(
         self,
@@ -301,7 +368,7 @@ class CBMClient:
         commit: str | None = None,
         *,
         allow_incomplete: bool = True,
-    ) -> dict[str, Any]:
+    ) -> ArchiveGraph:
         """Load one KGA snapshot into the native query engine.
 
         Args:
@@ -311,16 +378,32 @@ class CBMClient:
                 checkpoint while the archive is still being built.
 
         Returns:
-            Loaded graph identity, row counts, cache path, and whether the store
-            was materialized during this call.
+            Immutable native graph handle containing its identity, row counts,
+            cache path, and materialization status.
         """
-        return self._native().load_archive(archive, commit, allow_incomplete=allow_incomplete)
+        result = self._native().load_archive(archive, commit, allow_incomplete=allow_incomplete)
+        return ArchiveGraph(
+            project=result["project"],
+            graph_digest=result["graph_digest"],
+            database_path=Path(result["database_path"]),
+            nodes=result["nodes"],
+            edges=result["edges"],
+            graph_fidelity=result["graph_fidelity"],
+            materialized=result["materialized"],
+        )
 
-    def trace_path(self, *, project: str, function_name: str, **options: object) -> dict[str, Any]:
+    def trace_path(
+        self,
+        target: GraphTarget,
+        *,
+        function_name: str,
+        **options: object,
+    ) -> dict[str, Any]:
         """Trace calls, data flow, or cross-service paths from one symbol.
 
         Args:
-            project: CBM project name to query.
+            target: Graph and backend selected by :meth:`daemon_graph` or
+                :meth:`load_archive`.
             function_name: Qualified or discoverable function name used as the
                 traversal origin.
             **options: Native ``trace_path`` fields such as ``direction``, ``depth``,
@@ -328,7 +411,8 @@ class CBMClient:
         """
         return self.call_json_tool(
             "trace_path",
-            {"project": project, "function_name": function_name, **options, "format": "json"},
+            {"function_name": function_name, **options, "format": "json"},
+            target=target,
         )
 
     def close(self) -> None:

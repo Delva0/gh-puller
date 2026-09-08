@@ -65,9 +65,10 @@ def test_client_starts_once_and_exposes_json_queries(tmp_path):
 
     with CBMClient(binary, cache_root=tmp_path / "cache", timeout=5) as client:
         pid = client.pid
-        search = client.search_graph(project="demo", label="Function", limit=4)
-        query = client.query_graph(project="demo", query="MATCH (n) RETURN n LIMIT 1")
-        trace = client.trace_path(project="demo", function_name="demo.main", direction="outbound")
+        graph = client.daemon_graph("demo")
+        search = client.search_graph(graph, label="Function", limit=4)
+        query = client.query_graph(graph, query="MATCH (n) RETURN n LIMIT 1")
+        trace = client.trace_path(graph, function_name="demo.main", direction="outbound")
 
         assert client.instructions == "Query before reading source."
         assert client.binary.path == binary.resolve()

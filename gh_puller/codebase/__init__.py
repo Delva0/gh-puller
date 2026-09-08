@@ -18,12 +18,13 @@ from .cbm_build import (
     build_repository,
 )
 from .cbm_runner import CBMRunner
-from .cbm_sdk import CBMClient, CBMTransportError, default_cbm_cache
+from .cbm_sdk import ArchiveGraph, CBMClient, CBMTransportError, GraphTarget, default_cbm_cache
 from .store import GraphReader
 
 __all__ = [
     "Archive",
     "ArchiveError",
+    "ArchiveGraph",
     "ArchiveWriter",
     "BuildError",
     "BuildOptions",
@@ -36,6 +37,7 @@ __all__ = [
     "CommitBuildResult",
     "CommitTarget",
     "GraphReader",
+    "GraphTarget",
     "IncrementalConfig",
     "IncrementalConfigError",
     "KGARecorder",
