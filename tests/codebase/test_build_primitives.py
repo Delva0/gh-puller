@@ -127,14 +127,18 @@ def test_cbm_runner_reuses_transport_across_commit_plans(tmp_path, monkeypatch):
     transport = FakeTransport()
     monkeypatch.setattr(runner_module, "make_transport", lambda *_args, **_kwargs: transport)
     binary = FakeBinary(tmp_path / "cbm")
+    work = tmp_path / "work"
+    work.mkdir()
+    (work / "current-sha").write_text("untrusted-legacy-state")
     runner = CBMRunner(
         binary,
         "p",
         tmp_path / "cache",
-        tmp_path / "work",
+        work,
         memory_limit=1 << 60,
     )
 
+    assert runner.current_commit is None
     assert runner.index(BuildPlan(analysis_mode="fast"))["route"] == "closure_repair"
     assert runner.index(BuildPlan(route="full"))["route"] == "full"
     runner.mark_archived("commit")
@@ -185,6 +189,49 @@ def test_build_commit_is_the_shared_full_and_delta_operation(tmp_path):
     assert [plan.route for plan in runner.plans] == ["full", "delta"]
     with Archive(tmp_path / "archive.kga") as archive:
         assert set(archive.load_rows(first).nodes) == {"p", "p.a"}
+        assert set(archive.load_rows(second).nodes) == {"p", "p.b"}
+
+
+def test_build_commit_recovers_a_cbm_generation_pending_kga_capture(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    git(repo, "init")
+    git(repo, "config", "user.email", "test@example.com")
+    git(repo, "config", "user.name", "Test")
+    (repo / "symbol.txt").write_text("a")
+    git(repo, "add", ".")
+    git(repo, "commit", "-m", "first")
+    first = git(repo, "rev-parse", "HEAD")
+    (repo / "symbol.txt").write_text("b")
+    git(repo, "commit", "-am", "second")
+    second = git(repo, "rev-parse", "HEAD")
+
+    runner = PublishingRunner(tmp_path / "runner")
+    reader = GraphReader(runner.db_path, runner.project)
+    recorder = KGARecorder(tmp_path / "archive.kga")
+    build_commit(
+        repo,
+        CommitTarget(0, first, (), None),
+        BuildPlan(route="full"),
+        runner,
+        reader,
+        recorder,
+    )
+    runner.pending_commit = second
+    result = build_commit(
+        repo,
+        CommitTarget(1, second, (first,), first),
+        BuildPlan(route="delta"),
+        runner,
+        reader,
+        recorder,
+    )
+    recorder.finalize()
+
+    assert result.manifest["generation_diff_source"] == "full_snapshot"
+    assert runner.current_commit == second
+    assert runner.pending_commit is None
+    with Archive(tmp_path / "archive.kga") as archive:
         assert set(archive.load_rows(second).nodes) == {"p", "p.b"}
 
 
