@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import os
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Self
 
@@ -67,12 +67,13 @@ class ArchiveGraph(GraphTarget):
 
 @dataclass(frozen=True, slots=True)
 class NativeProjectGraph(GraphTarget):
-    """Identify a mutable project currently open in the native index engine."""
+    """Identify a mutable project currently open in one native engine."""
 
     database_path: Path
     source_root: Path | None
     nodes: int
     edges: int
+    _transport: NativeArchiveTransport = field(repr=False, compare=False)
 
 
 def default_cbm_cache(environ: Mapping[str, str] | None = None) -> Path:
@@ -92,10 +93,7 @@ def _project_database(cache_root: Path, project: str) -> Path:
         not project
         or project.startswith(".")
         or ".." in project
-        or any(
-            not (character.isascii() and (character.isalnum() or character in "-_."))
-            for character in project
-        )
+        or any(not (character.isascii() and (character.isalnum() or character in "-_.")) for character in project)
     ):
         raise ValueError(f"invalid CBM project name: {project!r}")
     return cache_root / f"{project}.db"
@@ -266,6 +264,16 @@ class CBMClient:
                 )
         return self._native_index_transport
 
+    def _native_project(self, database_path: Path) -> NativeArchiveTransport:
+        for transport in (self._native_index_transport, self._native_transport):
+            if (
+                transport is not None
+                and transport.loaded_database_path == database_path
+                and transport.loaded_digest is None
+            ):
+                return transport
+        return self._native_index_transport or self._native()
+
     @property
     def pid(self) -> int:
         """Return the persistent MCP frontend process ID."""
@@ -321,13 +329,15 @@ class CBMClient:
             return self.daemon_graph(project)
         database_path = _project_database(self.cache_root, project)
         resolved_source = Path(source_root).resolve() if source_root is not None else None
-        result = self._native_index().open_project(database_path, project, resolved_source)
+        native = self._native_project(database_path)
+        result = native.open_project(database_path, project, resolved_source)
         return NativeProjectGraph(
             project,
             database_path,
             resolved_source,
             result["nodes"],
             result["edges"],
+            native,
         )
 
     def capabilities(self) -> frozenset[str]:
@@ -403,11 +413,9 @@ class CBMClient:
             project: Exact CBM project name to delete.
         """
         if self.index_backend == "native":
+            database_path = _project_database(self.cache_root, project)
             try:
-                result = self._native_index().delete_project(
-                    _project_database(self.cache_root, project),
-                    project,
-                )
+                result = self._native_project(database_path).delete_project(database_path, project)
             except CBMTransportError as exc:
                 return False, str(exc)[-1000:]
             return True, json.dumps(result, ensure_ascii=False)[-1000:]
@@ -420,7 +428,8 @@ class CBMClient:
             **options: Native CBM pagination and detail fields.
         """
         if self.index_backend == "native":
-            return self._native_index().list_projects(options)
+            native = self._native_index_transport or self._native()
+            return native.list_projects(options)
         return _json_object(
             "list_projects",
             self._index_daemon().call_tool("list_projects", dict(options)),
@@ -469,9 +478,13 @@ class CBMClient:
                 "isError": False,
             }
         if isinstance(target, NativeProjectGraph):
-            native = self._native_index_transport
+            native = target._transport
             if (
-                native is None
+                native
+                not in {
+                    self._native_transport,
+                    self._native_index_transport,
+                }
                 or native.loaded_project != target.project
                 or native.loaded_database_path != target.database_path
                 or native.loaded_source_root != target.source_root
@@ -715,11 +728,21 @@ class CBMClient:
             target,
             (ArchiveGraph, NativeProjectGraph),
         ):
-            native = (
-                self._native()
-                if isinstance(base, ArchiveGraph) and isinstance(target, ArchiveGraph)
-                else self._native_index()
-            )
+            project_targets = tuple(item for item in (base, target) if isinstance(item, NativeProjectGraph))
+            if any(
+                item._transport
+                not in {
+                    self._native_transport,
+                    self._native_index_transport,
+                }
+                for item in project_targets
+            ):
+                raise CBMTransportError("native project graph belongs to another CBM client")
+            native = self._native_transport
+            if native is None and project_targets:
+                native = project_targets[0]._transport
+            if native is None:
+                native = self._native()
             return native.compare_graphs(
                 base_database=base.database_path,
                 base_project=base.project,

@@ -31,7 +31,7 @@ from ._daemon import CBMTransportError, ResourceMonitorLike
 if TYPE_CHECKING:
     from collections.abc import Iterator, Mapping, Sequence
 
-_ARCHIVE_PROTOCOL_VERSION = 6
+_ARCHIVE_PROTOCOL_VERSION = 7
 _INDEX_PROTOCOL_VERSION = 8
 _RESPONSE_MAX_BYTES = 256 << 20
 _ARCHIVE_HELPER_ENV = "GH_PULLER_CODEBASE_CBM_HELPER"
@@ -185,7 +185,14 @@ class NativeArchiveTransport:
         helper_filename: str = "gh-puller-cbm-helper",
         protocol: int = _ARCHIVE_PROTOCOL_VERSION,
         required_capabilities: frozenset[str] = frozenset(
-            {"archive-load", "tool-call", "graph-compare"},
+            {
+                "archive-load",
+                "tool-call",
+                "graph-compare",
+                "project-open",
+                "project-list",
+                "project-delete",
+            },
         ),
     ):
         """Start the helper and negotiate the fixed native protocol.
@@ -463,12 +470,79 @@ class NativeArchiveTransport:
                 _write_marker(marker, expected_marker)
             self.loaded_project = project
             self.loaded_database_path = database
+            self.loaded_source_root = None
             self.loaded_digest = manifest["graph_digest"]
             self.loaded_materialization_digest = materialization
             return {**result, "database_path": str(database)}
         finally:
             if owned:
                 reader.close()
+
+    def open_project(
+        self,
+        database_path: Path,
+        project: str,
+        source_root: Path | None = None,
+    ) -> dict[str, Any]:
+        """Bind an indexed mutable project to native graph tools.
+
+        Args:
+            database_path: Exact project database opened with mutation support.
+            project: Project expected inside that database.
+            source_root: Matching checkout used by tools that read source text.
+        """
+        result = self._request(
+            "open",
+            {
+                "database_path": str(database_path),
+                "project": project,
+                "source_root": str(source_root) if source_root is not None else None,
+            },
+        )
+        if (
+            result.get("project") != project
+            or type(result.get("nodes")) is not int
+            or type(result.get("edges")) is not int
+        ):
+            raise CBMTransportError("native CBM helper opened the wrong project")
+        self.loaded_project = project
+        self.loaded_database_path = database_path
+        self.loaded_source_root = source_root
+        self.loaded_digest = None
+        self.loaded_materialization_digest = None
+        return result
+
+    def list_projects(self, arguments: Mapping[str, object] | None = None) -> dict[str, Any]:
+        """List projects from this transport's explicit cache directory.
+
+        Args:
+            arguments: Native pagination and detail options.
+        """
+        return self._request(
+            "list",
+            {"cache_directory": str(self.cache_root), "arguments": dict(arguments or {})},
+        )
+
+    def delete_project(self, database_path: Path, project: str) -> dict[str, Any]:
+        """Delete a mutable project and its SQLite sidecars.
+
+        Args:
+            database_path: Exact database published by the indexing helper.
+            project: Project expected inside that database.
+        """
+        if self.loaded_project == project and self.loaded_database_path == database_path:
+            self._clear_loaded()
+        return self._request(
+            "delete",
+            {"database_path": str(database_path), "project": project},
+        )
+
+    def _clear_loaded(self) -> None:
+        self.loaded_project = None
+        self.loaded_database_path = None
+        self.loaded_source_root = None
+        self.loaded_digest = None
+        self.loaded_materialization_digest = None
 
     def query_graph(self, *, project: str, query: str, graph: str = "code", max_rows: int = 0) -> dict[str, Any]:
         """Query the loaded immutable CBM store directly.
@@ -623,72 +697,6 @@ class NativeIndexTransport(NativeArchiveTransport):
                 "target_projects": list(target_projects or ()),
             },
         )
-
-    def open_project(
-        self,
-        database_path: Path,
-        project: str,
-        source_root: Path | None = None,
-    ) -> dict[str, Any]:
-        """Bind an indexed mutable project to native graph tools.
-
-        Args:
-            database_path: Exact project database opened with mutation support.
-            project: Project expected inside that database.
-            source_root: Matching checkout used by tools that read source text.
-        """
-        result = self._request(
-            "open",
-            {
-                "database_path": str(database_path),
-                "project": project,
-                "source_root": str(source_root) if source_root is not None else None,
-            },
-        )
-        if (
-            result.get("project") != project
-            or type(result.get("nodes")) is not int
-            or type(result.get("edges")) is not int
-        ):
-            raise CBMTransportError("native CBM helper opened the wrong project")
-        self.loaded_project = project
-        self.loaded_database_path = database_path
-        self.loaded_source_root = source_root
-        self.loaded_digest = None
-        self.loaded_materialization_digest = None
-        return result
-
-    def list_projects(self, arguments: Mapping[str, object] | None = None) -> dict[str, Any]:
-        """List projects from this transport's explicit cache directory.
-
-        Args:
-            arguments: Native pagination and detail options.
-        """
-        return self._request(
-            "list",
-            {"cache_directory": str(self.cache_root), "arguments": dict(arguments or {})},
-        )
-
-    def delete_project(self, database_path: Path, project: str) -> dict[str, Any]:
-        """Delete a native-index project and its SQLite sidecars.
-
-        Args:
-            database_path: Exact database published by the indexing helper.
-            project: Project expected inside that database.
-        """
-        if self.loaded_project == project and self.loaded_database_path == database_path:
-            self._clear_loaded()
-        return self._request(
-            "delete",
-            {"database_path": str(database_path), "project": project},
-        )
-
-    def _clear_loaded(self) -> None:
-        self.loaded_project = None
-        self.loaded_database_path = None
-        self.loaded_source_root = None
-        self.loaded_digest = None
-        self.loaded_materialization_digest = None
 
 
 @contextmanager

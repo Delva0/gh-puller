@@ -30,15 +30,19 @@ def write_fake_helper(
     hang_on_query: bool = False,
     indexing: bool = False,
 ) -> None:
-    protocol = 8 if indexing else 6
-    capabilities = ["archive-load", "tool-call", "graph-compare"]
+    protocol = 8 if indexing else 7
+    capabilities = [
+        "archive-load",
+        "tool-call",
+        "graph-compare",
+        "project-open",
+        "project-list",
+        "project-delete",
+    ]
     if indexing:
         capabilities.extend(
             [
                 "repository-index",
-                "project-open",
-                "project-list",
-                "project-delete",
                 "granular-delta-controls",
                 "force-full-route",
             ],
@@ -453,6 +457,7 @@ def test_client_native_index_uses_full_helper_without_resolving_mcp(tmp_path, mo
         assert projects["projects"] == [{"name": "native-build"}]
         assert deleted is True
         assert client._daemon_backend is None
+        assert client._native_transport is None
 
     index_request = next(item for item in requests(log) if item["method"] == "index")
     assert index_request["params"] == {
@@ -469,6 +474,44 @@ def test_client_native_index_uses_full_helper_without_resolving_mcp(tmp_path, mo
     cross_request = [item for item in requests(log) if item["method"] == "index"][1]
     assert cross_request["params"]["incremental_controls"] is None
     assert cross_request["params"]["target_projects"] == ["dependency"]
+
+
+def test_client_queries_existing_project_without_full_helper(tmp_path, monkeypatch):
+    helper = tmp_path / "fake-helper"
+    log = tmp_path / "requests.jsonl"
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    write_fake_helper(helper)
+    monkeypatch.setenv("NATIVE_REQUEST_LOG", str(log))
+
+    with CBMClient(
+        tmp_path / "missing-cbm",
+        native_helper=helper,
+        native_index_helper=tmp_path / "missing-index-helper",
+        cache_root=tmp_path / "cache",
+        index_backend="native",
+        timeout=5,
+    ) as client:
+        graph = client.project_graph("native-query", source_root=tree)
+        queried = client.query_graph(graph, query="MATCH (n) RETURN n")
+        projects = client.list_projects(include_details=True)
+        deleted, _detail = client.delete_project("native-query")
+
+        assert queried["rows"] == [["native", "native-query"]]
+        assert projects["projects"] == [{"name": "native-build"}]
+        assert deleted is True
+        assert client._native_index_transport is None
+        with pytest.raises(CBMTransportError, match="no longer open"):
+            client.query_graph(graph, query="MATCH (n) RETURN n")
+
+    assert [item["method"] for item in requests(log)] == [
+        "hello",
+        "open",
+        "call",
+        "list",
+        "delete",
+        "shutdown",
+    ]
 
 
 def test_client_rejects_archive_handle_after_loading_another_generation(tmp_path):
@@ -529,8 +572,9 @@ def test_native_project_binding_rejects_cache_path_escape(tmp_path):
 @pytest.mark.integration
 def test_real_native_index_helper_publishes_and_deletes_graph(tmp_path):
     configured = os.environ.get("GH_PULLER_TEST_CBM_NATIVE_INDEX_HELPER")
-    if configured is None:
-        pytest.skip("real native index helper not configured")
+    configured_query = os.environ.get("GH_PULLER_TEST_CBM_NATIVE_HELPER")
+    if configured is None or configured_query is None:
+        pytest.skip("real native query and index helpers not configured")
     tree = tmp_path / "tree"
     tree.mkdir()
     (tree / "main.py").write_text("def native_symbol():\n    return 42\n")
@@ -558,10 +602,28 @@ def test_real_native_index_helper_publishes_and_deletes_graph(tmp_path):
         )
         projects = client.list_projects(include_details=True)
         rows = load_rows(cache / "native-index.db", "native-index")
+        assert client._native_transport is None
+
+    with CBMClient(
+        tmp_path / "unused-cbm",
+        native_helper=Path(configured_query),
+        native_index_helper=tmp_path / "missing-index-helper",
+        cache_root=cache,
+        index_backend="native",
+        timeout=120,
+    ) as client:
+        reopened = client.project_graph("native-index", source_root=tree)
+        reopened_query = client.query_graph(
+            reopened,
+            query="MATCH (n:Function) RETURN n.name",
+            max_rows=10,
+        )
         deleted, _detail = client.delete_project("native-index")
+        assert client._native_index_transport is None
 
     assert execution == {"route": "full", "reason": "explicit_force_full"}
     assert ["native_symbol"] in queried["rows"]
+    assert ["native_symbol"] in reopened_query["rows"]
     assert any(project["name"] == "native-index" for project in projects["projects"])
     assert any(node["name"] == "native_symbol" for node in rows.nodes.values())
     assert deleted is True
@@ -620,14 +682,8 @@ def test_real_native_helper_restores_exact_rows_and_reuses_cache(tmp_path):
         ("newline.py", "parse_partial"): "3-4, 6-6",
         ("vendor", "not_indexed_dir"): "excluded subtree",
     }
-    assert {
-        key: value
-        for key, value in restored_coverage.metadata.items()
-        if key != "generation"
-    } == {
-        key: value
-        for key, value in manifest["coverage_metadata"].items()
-        if key != "generation"
+    assert {key: value for key, value in restored_coverage.metadata.items() if key != "generation"} == {
+        key: value for key, value in manifest["coverage_metadata"].items() if key != "generation"
     }
     assert {tuple(row[:2]) for row in queried["rows"]} == {
         ("bang", "bang.py"),
@@ -714,9 +770,7 @@ def test_real_native_helper_compares_archive_generations(tmp_path):
     ]
     assert compared["nodes"]["removed"]["total"] == 0
     assert compared["edges"]["added"]["total"] == 1
-    assert compared["edges"]["added"]["items"][0]["target"]["qualified_name"] == (
-        f"{project}.mod.unit.added"
-    )
+    assert compared["edges"]["added"]["items"][0]["target"]["qualified_name"] == (f"{project}.mod.unit.added")
     assert compared["edges"]["removed"]["total"] == 0
 
 

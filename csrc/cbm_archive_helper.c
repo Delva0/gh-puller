@@ -21,7 +21,7 @@
 #ifdef GHP_NATIVE_INDEXING
 #define NATIVE_PROTOCOL_VERSION 8
 #else
-#define NATIVE_PROTOCOL_VERSION 6
+#define NATIVE_PROTOCOL_VERSION 7
 #endif
 
 enum {
@@ -135,11 +135,11 @@ static char *hello_response(uint64_t id) {
     yyjson_mut_arr_add_str(document, capabilities, "archive-load");
     yyjson_mut_arr_add_str(document, capabilities, "tool-call");
     yyjson_mut_arr_add_str(document, capabilities, "graph-compare");
-#ifdef GHP_NATIVE_INDEXING
-    yyjson_mut_arr_add_str(document, capabilities, "repository-index");
     yyjson_mut_arr_add_str(document, capabilities, "project-open");
     yyjson_mut_arr_add_str(document, capabilities, "project-list");
     yyjson_mut_arr_add_str(document, capabilities, "project-delete");
+#ifdef GHP_NATIVE_INDEXING
+    yyjson_mut_arr_add_str(document, capabilities, "repository-index");
     yyjson_mut_arr_add_str(document, capabilities, "granular-delta-controls");
     yyjson_mut_arr_add_str(document, capabilities, "force-full-route");
 #endif
@@ -529,6 +529,7 @@ static char *index_response(uint64_t id, helper_session_t *session, yyjson_val *
     cbm_sdk_index_free(index);
     return sdk_result_response(id, status, &result);
 }
+#endif
 
 static char *delete_response(uint64_t id, helper_session_t *session, yyjson_val *parameters) {
     const char *database_path = NULL;
@@ -627,7 +628,6 @@ static char *list_response(uint64_t id, yyjson_val *parameters) {
     free(arguments_json);
     return sdk_result_response(id, status, &result);
 }
-#endif
 
 static char *tool_response(uint64_t id, helper_session_t *session, yyjson_val *parameters) {
     const char *name = NULL;
@@ -742,6 +742,7 @@ static char *dispatch_request(helper_session_t *session, yyjson_val *request, bo
     if (strcmp(method, "index") == 0) {
         return index_response(id, session, parameters);
     }
+#endif
     if (strcmp(method, "delete") == 0) {
         return delete_response(id, session, parameters);
     }
@@ -751,7 +752,6 @@ static char *dispatch_request(helper_session_t *session, yyjson_val *request, bo
     if (strcmp(method, "list") == 0) {
         return list_response(id, parameters);
     }
-#endif
     if (strcmp(method, "shutdown") == 0) {
         *shutdown = true;
         yyjson_mut_val *root = NULL;
