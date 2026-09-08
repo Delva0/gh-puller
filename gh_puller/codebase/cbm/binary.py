@@ -1,4 +1,4 @@
-"""Resolve an immutable, provenance-bearing CBM executable for archive builds.
+"""Resolve immutable, provenance-bearing executables for CBM client backends.
 
 The accepted manifest is a local deployment pointer, not a build result.  It names
 one content-addressed executable that passed the laboratory gates.  A build resolves

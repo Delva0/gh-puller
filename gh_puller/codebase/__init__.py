@@ -6,7 +6,6 @@ native protocol implementations.
 """
 
 from .archive import Archive, ArchiveError, ArchiveWriter, KGARecorder
-from .binary import CBMBinary, CBMBinaryError, resolve_cbm_binary
 from .build import (
     BuildError,
     BuildOptions,
@@ -16,8 +15,20 @@ from .build import (
     build_commit,
     build_repository,
 )
-from .build_plan import BuildPlan, IncrementalConfig, IncrementalConfigError
-from .cbm import ArchiveGraph, CBMClient, CBMRunner, CBMTransportError, GraphTarget, default_cbm_cache
+from .cbm import (
+    ArchiveGraph,
+    BuildPlan,
+    CBMBinary,
+    CBMBinaryError,
+    CBMClient,
+    CBMRunner,
+    CBMTransportError,
+    GraphTarget,
+    IncrementalConfig,
+    IncrementalConfigError,
+    default_cbm_cache,
+    resolve_cbm_binary,
+)
 from .store import GraphReader
 
 __all__ = [

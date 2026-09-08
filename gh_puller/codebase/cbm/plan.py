@@ -1,8 +1,8 @@
 """Define and validate the CBM indexing policy applied to one commit.
 
-The immutable policy is shared by the build orchestrator and reusable CBM
-runner. Command-line parsing lives here only to construct that same policy;
-execution and persistence remain outside this module.
+The immutable policy is shared by archive build orchestration and the private
+CBM runner. Command-line parsing constructs that same policy; execution and KGA
+persistence remain outside this module.
 """
 
 from __future__ import annotations

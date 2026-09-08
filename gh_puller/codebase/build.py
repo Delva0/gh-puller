@@ -31,9 +31,16 @@ from .archive import (
     KGACommit,
     KGARecorder,
 )
-from .binary import CBMBinaryError, resolve_cbm_binary
-from .build_plan import BuildPlan, IncrementalConfig, IncrementalConfigError, add_incremental_arguments
-from .cbm import CBMRunner, CBMTransportError
+from .cbm import (
+    BuildPlan,
+    CBMBinaryError,
+    CBMRunner,
+    CBMTransportError,
+    IncrementalConfig,
+    IncrementalConfigError,
+    resolve_cbm_binary,
+)
+from .cbm.plan import add_incremental_arguments
 from .git_tree import TreeError, changed_paths, materialize_full
 from .store import GraphReader
 

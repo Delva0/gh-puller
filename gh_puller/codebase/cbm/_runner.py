@@ -19,8 +19,8 @@ from typing import TYPE_CHECKING, Self
 from .client import CBMClient, CBMTransportError
 
 if TYPE_CHECKING:
-    from ..binary import CBMBinary
-    from ..build_plan import BuildPlan
+    from .binary import CBMBinary
+    from .plan import BuildPlan
 
 
 def _total_memory() -> int:

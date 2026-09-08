@@ -3,7 +3,7 @@ from dataclasses import replace
 
 import pytest
 
-from gh_puller.codebase.build_plan import (
+from gh_puller.codebase.cbm.plan import (
     BuildPlan,
     IncrementalConfig,
     IncrementalConfigError,

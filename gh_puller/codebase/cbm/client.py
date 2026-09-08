@@ -15,7 +15,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Self
 
-from ..binary import CBMBinary, resolve_cbm_binary
 from ._daemon import (
     CBMTransportError,
     CLITransport,
@@ -24,6 +23,7 @@ from ._daemon import (
     make_transport,
 )
 from ._native import NativeArchiveTransport, NativeHelper
+from .binary import CBMBinary, resolve_cbm_binary
 
 if TYPE_CHECKING:
     from collections.abc import Mapping

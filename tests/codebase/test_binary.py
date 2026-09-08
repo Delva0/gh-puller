@@ -7,7 +7,7 @@ from hashlib import sha256
 
 import pytest
 
-from gh_puller.codebase.binary import CBMBinaryError, resolve_cbm_binary
+from gh_puller.codebase.cbm.binary import CBMBinaryError, resolve_cbm_binary
 
 
 def _executable(path, body: str = "codebase-memory-mcp test"):
