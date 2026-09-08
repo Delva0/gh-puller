@@ -8,7 +8,7 @@ only resolves a promoted, content-addressed executable through :mod:`.binary`.
 from .archive import Archive, ArchiveError, ArchiveWriter
 from .binary import CBMBinary, CBMBinaryError, resolve_cbm_binary
 from .build_plan import BuildPlan
-from .cbm_build import BuildError, BuildOptions, build_archive
+from .cbm_build import BuildError, BuildOptions, build_archive, build_repository
 from .cbm_runner import CBMRunner
 from .cbm_sdk import CBMClient, default_cbm_cache
 from .cbm_transport import CBMTransportError
@@ -37,6 +37,7 @@ __all__ = [
     "KGARecorder",
     "build_archive",
     "build_commit",
+    "build_repository",
     "default_cbm_cache",
     "resolve_cbm_binary",
 ]

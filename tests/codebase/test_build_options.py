@@ -6,9 +6,10 @@ from gh_puller.codebase.archive import Archive, ArchiveError, ArchiveWriter, Rad
 from gh_puller.codebase.cbm_build import (
     GRAPH_FIDELITY_VERSION,
     BuildError,
+    BuildOptions,
+    _legacy_plan,
     _validate_resume_binary,
     _validate_resume_fidelity,
-    _validate_resume_force_full,
     prepare_output_dir,
 )
 from gh_puller.codebase.cbm_transport import index_execution_from_envelope
@@ -60,18 +61,12 @@ def test_index_execution_returns_none_when_old_cbm_does_not_report_it():
     assert index_execution_from_envelope({"content": [{"type": "text", "text": "{}"}]}) is None
 
 
-def test_resume_force_full_is_explicit_and_backward_compatible():
-    _validate_resume_force_full(None, True)
-    _validate_resume_force_full({"sha": "legacy"}, False)
-    _validate_resume_force_full(
-        {"sha": "current", "cbm_force_full": True},
-        True,
-    )
+def test_legacy_force_full_becomes_one_constant_commit_plan(tmp_path):
+    options = BuildOptions(tmp_path, tmp_path, mode="fast", force_full=True)
+    plan = _legacy_plan(options)
 
-    with pytest.raises(BuildError, match="does not match"):
-        _validate_resume_force_full({"sha": "legacy"}, True)
-    with pytest.raises(BuildError, match="does not match"):
-        _validate_resume_force_full({"sha": "invalid", "cbm_force_full": "yes"}, True)
+    assert plan.analysis_mode == "fast"
+    assert plan.route == "full"
 
 
 def test_resume_pins_cbm_digest_unless_upgrade_is_explicit():

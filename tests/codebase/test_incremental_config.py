@@ -3,11 +3,7 @@ from dataclasses import replace
 
 import pytest
 
-from gh_puller.codebase.cbm_build import (
-    BuildError,
-    _incremental_metadata,
-    _validate_resume_incremental_config,
-)
+from gh_puller.codebase.build_plan import BuildPlan
 from gh_puller.codebase.incremental_config import (
     IncrementalConfig,
     IncrementalConfigError,
@@ -87,25 +83,15 @@ def test_invalid_combinations_fail_before_cbm_starts(config, message):
         config.validate()
 
 
-def test_resume_requires_the_recorded_granular_configuration():
-    config = replace(
+def test_incremental_configuration_is_recorded_per_commit_plan():
+    first = replace(
         IncrementalConfig(),
         closure_overflow="repair",
         dependent_scope="symbol",
     )
-    item = {"sha": "commit", "cbm_incremental": _incremental_metadata(config)}
+    second = IncrementalConfig()
 
-    _validate_resume_incremental_config(item, config)
-    with pytest.raises(BuildError, match="do not match"):
-        _validate_resume_incremental_config(item, IncrementalConfig())
-
-
-def test_legacy_archive_can_only_resume_with_strict_defaults():
-    legacy_item = {"sha": "commit"}
-
-    _validate_resume_incremental_config(legacy_item, IncrementalConfig())
-    with pytest.raises(BuildError, match="predates incremental-config"):
-        _validate_resume_incremental_config(
-            legacy_item,
-            replace(IncrementalConfig(), pair_outputs="lazy"),
-        )
+    first_metadata = BuildPlan(incremental=first).metadata()["cbm_incremental"]
+    second_metadata = BuildPlan(incremental=second).metadata()["cbm_incremental"]
+    assert first_metadata["options"] == first.to_dict()
+    assert first_metadata["digest"] != second_metadata["digest"]

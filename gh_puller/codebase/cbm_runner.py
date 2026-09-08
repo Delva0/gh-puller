@@ -140,6 +140,7 @@ class CBMRunner:
         self.work_dir = Path(work_dir)
         self.tree = self.work_dir / "tree"
         self.state_path = self.work_dir / "current-sha"
+        self.state_version_path = self.work_dir / "state-version"
         self.pending_path = self.work_dir / "pending-sha"
         self.db_path = self.cache_root / f"{project}.db"
         limit = memory_limit or max(1 << 30, _total_memory() - (1 << 30))
@@ -171,6 +172,8 @@ class CBMRunner:
     def current_commit(self) -> str | None:
         """Return the last commit durably paired with the KGA by the caller."""
         try:
+            if self.state_version_path.read_text().strip() != "1":
+                return None
             value = self.state_path.read_text().strip()
         except OSError:
             return None
@@ -229,6 +232,7 @@ class CBMRunner:
         temporary = self.state_path.with_suffix(".tmp")
         temporary.write_text(sha)
         os.replace(temporary, self.state_path)
+        self.state_version_path.write_text("1")
         self.pending_path.unlink(missing_ok=True)
 
     def begin_commit(self, sha: str) -> None:
