@@ -186,6 +186,7 @@ def build_commit(
         capture = reader.capture(
             previous,
             force_snapshot=force_snapshot,
+            force_coverage_snapshot=not recorder.has_coverage_snapshot,
             unchanged=execution.get("route") == "noop",
         )
         timings["generation_diff_seconds"] = time.monotonic() - started

@@ -1,4 +1,4 @@
-"""Read exact graph snapshots and changes from published CBM SQLite stores.
+"""Read exact graph and coverage snapshots from published CBM SQLite stores.
 
 Production rows retain full qualified names and treat properties as opaque JSON
 objects. Full extraction and POSIX pinned-generation comparison expose the same
@@ -16,6 +16,8 @@ from pathlib import Path
 from .graph import EdgeKey, SnapshotGraph
 
 # --- Exact row contract ---
+
+CoverageKey = tuple[str, str]
 
 
 class ExtractionError(Exception):
@@ -35,6 +37,23 @@ class GraphRows:
     @property
     def edge_count(self) -> int:
         return len(self.edges)
+
+
+@dataclass(frozen=True, slots=True)
+class CoverageSnapshot:
+    """Exact coverage rows and run metadata from one published generation."""
+
+    rows: dict[CoverageKey, str]
+    metadata: dict[str, object]
+
+
+@dataclass(frozen=True, slots=True)
+class CoverageCapture:
+    """Complete coverage rows or exact mutations plus current run metadata."""
+
+    rows: dict[CoverageKey, str | None]
+    metadata: dict[str, object]
+    snapshot: bool
 
 
 def _reject_constant(value: str):
@@ -130,6 +149,58 @@ def _edge_row(source, target, edge_type, local_name, properties):
     value = {"properties": _parse_properties(properties)}
     _validate_edge(key, value)
     return key, value
+
+
+def _text(value: object, field: str) -> str:
+    if isinstance(value, bytes):
+        try:
+            value = value.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ExtractionError(f"CBM {field} is not UTF-8") from exc
+    if not isinstance(value, str) or "\0" in value:
+        raise ExtractionError(f"CBM {field} is not exact text")
+    return value
+
+
+def _coverage_row(rel_path: object, kind: object, detail: object) -> tuple[CoverageKey, str]:
+    return (_text(rel_path, "coverage path"), _text(kind, "coverage kind")), _text(
+        detail,
+        "coverage detail",
+    )
+
+
+def validate_coverage(snapshot: CoverageSnapshot, project: str) -> None:
+    """Validate the exact persisted coverage contract accepted by CBM import.
+
+    Args:
+        snapshot: Complete coverage rows and metadata to validate.
+        project: Project identity that must match the metadata row.
+
+    Raises:
+        ExtractionError: Coverage contains a value the CBM SDK cannot restore.
+    """
+    metadata = snapshot.metadata
+    strings = ("project", "generation", "index_mode", "recorded_at", "recording_status")
+    if not isinstance(metadata, dict) or any(
+        not isinstance(metadata.get(name), str) or "\0" in metadata[name] for name in strings
+    ):
+        raise ExtractionError("CBM coverage metadata has invalid text fields")
+    if metadata["project"] != project:
+        raise ExtractionError("CBM coverage metadata has the wrong project")
+    integers = ("ignored_files_stored", "ignored_files_total", "coverage_version")
+    if any(type(metadata.get(name)) is not int or metadata[name] < 0 for name in integers):
+        raise ExtractionError("CBM coverage metadata has invalid integer fields")
+    if metadata["coverage_version"] < 1 or type(metadata.get("hash_records_complete")) is not bool:
+        raise ExtractionError("CBM coverage metadata has invalid version fields")
+    for key, detail in snapshot.rows.items():
+        if (
+            not isinstance(key, tuple)
+            or len(key) != 2
+            or any(not isinstance(value, str) or "\0" in value for value in key)
+            or not isinstance(detail, str)
+            or "\0" in detail
+        ):
+            raise ExtractionError(f"CBM coverage row has invalid values: {key!r}")
 
 
 def _project(connection: sqlite3.Connection, project: str) -> str:
@@ -237,6 +308,171 @@ def load_rows(db_path: str | Path, project: str) -> GraphRows:
     return GraphRows(nodes=dict(iter_nodes(db_path, project)), edges=dict(iter_edges(db_path, project)))
 
 
+def _coverage_prefix(connection: sqlite3.Connection, schema: str) -> str | None:
+    if schema not in {"main", "current"}:
+        raise ValueError(f"unsupported SQLite schema {schema!r}")
+    prefix = "" if schema == "main" else "current."
+    tables = {
+        row[0]
+        for row in connection.execute(
+            f"SELECT name FROM {prefix}sqlite_master "  # noqa: S608 - fixed internal schema.
+            "WHERE type='table' AND name IN ('index_coverage','index_coverage_meta')",
+        )
+    }
+    if not tables:
+        return None
+    if tables != {"index_coverage", "index_coverage_meta"}:
+        raise ExtractionError("CBM coverage tables are incomplete")
+    return prefix
+
+
+def _coverage_metadata_from(
+    connection: sqlite3.Connection,
+    project: str,
+    prefix: str,
+) -> dict[str, object] | None:
+
+    metadata_row = connection.execute(
+        f"SELECT CAST(project AS BLOB),CAST(generation AS BLOB),"  # noqa: S608 - fixed internal schema.
+        "CAST(index_mode AS BLOB),CAST(recorded_at AS BLOB),CAST(recording_status AS BLOB),"
+        "ignored_files_stored,ignored_files_total,coverage_version,hash_records_complete "
+        f"FROM {prefix}index_coverage_meta WHERE project=?",
+        (project,),
+    ).fetchone()
+    if metadata_row is None:
+        count = connection.execute(
+            f"SELECT count(*) FROM {prefix}index_coverage WHERE project=?",  # noqa: S608 - fixed internal schema.
+            (project,),
+        ).fetchone()[0]
+        if count:
+            raise ExtractionError("CBM coverage rows have no generation metadata")
+        return None
+    if type(metadata_row[8]) is not int or metadata_row[8] not in {0, 1}:
+        raise ExtractionError("CBM coverage metadata has an invalid hash-record flag")
+    metadata = {
+        "project": _text(metadata_row[0], "coverage project"),
+        "generation": _text(metadata_row[1], "coverage generation"),
+        "index_mode": _text(metadata_row[2], "coverage index mode"),
+        "recorded_at": _text(metadata_row[3], "coverage recorded time"),
+        "recording_status": _text(metadata_row[4], "coverage recording status"),
+        "ignored_files_stored": metadata_row[5],
+        "ignored_files_total": metadata_row[6],
+        "coverage_version": metadata_row[7],
+        "hash_records_complete": metadata_row[8] == 1,
+    }
+    validate_coverage(CoverageSnapshot({}, metadata), project)
+    return metadata
+
+
+def _coverage_rows_from(
+    connection: sqlite3.Connection,
+    project: str,
+    prefix: str,
+) -> dict[CoverageKey, str]:
+    rows = {}
+    query = (
+        f"SELECT CAST(rel_path AS BLOB),CAST(kind AS BLOB),CAST(detail AS BLOB) "  # noqa: S608 - fixed internal schema.
+        f"FROM {prefix}index_coverage WHERE project=? ORDER BY rel_path,kind"
+    )
+    for raw in connection.execute(query, (project,)):
+        key, detail = _coverage_row(*raw)
+        if key in rows:
+            raise ExtractionError(f"CBM coverage identity is duplicated: {key!r}")
+        rows[key] = detail
+    return rows
+
+
+def _coverage_snapshot_from(
+    connection: sqlite3.Connection,
+    project: str,
+    *,
+    schema: str = "main",
+) -> CoverageSnapshot | None:
+    prefix = _coverage_prefix(connection, schema)
+    if prefix is None:
+        return None
+    metadata = _coverage_metadata_from(connection, project, prefix)
+    if metadata is None:
+        return None
+    snapshot = CoverageSnapshot(_coverage_rows_from(connection, project, prefix), metadata)
+    validate_coverage(snapshot, project)
+    return snapshot
+
+
+def _coverage_changes_after_publish(
+    connection: sqlite3.Connection,
+    project: str,
+    *,
+    force_snapshot: bool,
+) -> CoverageCapture | None:
+    current_prefix = _coverage_prefix(connection, "current")
+    if current_prefix is None:
+        return None
+    metadata = _coverage_metadata_from(connection, project, current_prefix)
+    if metadata is None:
+        return None
+    previous_prefix = _coverage_prefix(connection, "main")
+    previous_metadata = (
+        _coverage_metadata_from(connection, project, previous_prefix)
+        if previous_prefix is not None
+        else None
+    )
+    if force_snapshot or previous_metadata is None:
+        return CoverageCapture(
+            _coverage_rows_from(connection, project, current_prefix),
+            metadata,
+            True,
+        )
+
+    keys = list(
+        connection.execute(
+            """
+            SELECT old.rel_path,old.kind
+              FROM main.index_coverage old
+              LEFT JOIN current.index_coverage new
+                ON new.project=old.project AND new.rel_path=old.rel_path AND new.kind=old.kind
+             WHERE old.project=? AND (new.project IS NULL OR old.detail IS NOT new.detail)
+            UNION ALL
+            SELECT new.rel_path,new.kind
+              FROM current.index_coverage new
+              LEFT JOIN main.index_coverage old
+                ON old.project=new.project AND old.rel_path=new.rel_path AND old.kind=new.kind
+             WHERE new.project=? AND old.project IS NULL
+            """,
+            (project, project),
+        ),
+    )
+    connection.execute(
+        "CREATE TEMP TABLE changed_coverage("
+        "rel_path TEXT,kind TEXT,PRIMARY KEY(rel_path,kind))",
+    )
+    connection.executemany("INSERT INTO changed_coverage VALUES (?,?)", keys)
+    rows = {}
+    for rel_path, kind, present, detail in connection.execute(
+        """
+        SELECT keys.rel_path,keys.kind,current.project,CAST(current.detail AS BLOB)
+          FROM changed_coverage keys
+          LEFT JOIN current.index_coverage current
+            ON current.project=? AND current.rel_path=keys.rel_path AND current.kind=keys.kind
+        """,
+        (project,),
+    ):
+        key = (_text(rel_path, "coverage path"), _text(kind, "coverage kind"))
+        rows[key] = None if present is None else _text(detail, "coverage detail")
+    return CoverageCapture(rows, metadata, False)
+
+
+def load_coverage(db_path: str | Path, project: str) -> CoverageSnapshot | None:
+    """Load coverage metadata when the published CBM generation records it."""
+    connection = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    connection.execute("PRAGMA query_only=ON")
+    try:
+        _project(connection, project)
+        return _coverage_snapshot_from(connection, project)
+    finally:
+        connection.close()
+
+
 def rows_to_snapshot(rows: GraphRows) -> SnapshotGraph:
     """Convert extracted rows to the archive's exact graph value."""
     return SnapshotGraph(
@@ -252,10 +488,11 @@ def rows_to_snapshot(rows: GraphRows) -> SnapshotGraph:
 
 @dataclass(frozen=True)
 class ChangeSet:
-    """Exact node and edge mutations between two published generations."""
+    """Exact graph and coverage mutations between two published generations."""
 
     nodes: dict[str, dict | None]
     edges: dict[tuple, dict | None]
+    coverage: CoverageCapture | None = None
 
     @property
     def count(self) -> int:
@@ -287,7 +524,7 @@ class PinnedGeneration:
         """Release the pinned read transaction and old SQLite inode."""
         self.connection.close()
 
-    def changes_after_publish(self) -> ChangeSet:
+    def changes_after_publish(self, *, force_coverage_snapshot: bool = False) -> ChangeSet:
         """Return exact row mutations after CBM replaces the database pathname."""
         connection = self.connection
         connection.execute("ATTACH DATABASE ? AS current", (str(self.db_path),))
@@ -402,22 +639,33 @@ class PinnedGeneration:
         ):
             key = (source, target, edge_type, local)
             edges[key] = None if edge_id is None else _edge_row(*key, properties)[1]
-        return ChangeSet(nodes, edges)
+        coverage = _coverage_changes_after_publish(
+            connection,
+            self.project,
+            force_snapshot=force_coverage_snapshot,
+        )
+        return ChangeSet(nodes, edges, coverage)
 
 
 @dataclass(frozen=True, slots=True)
 class GraphCapture:
-    """Rows needed to reproduce one complete published CBM graph."""
+    """Rows needed to reproduce one complete published CBM generation."""
 
     nodes: dict
     edges: dict
     snapshot: bool
     source: str
+    coverage: CoverageCapture | None = None
 
     @property
     def changed_rows(self) -> int:
         """Return the number of row mutations carried by this capture."""
         return len(self.nodes) + len(self.edges)
+
+    @property
+    def changed_coverage_rows(self) -> int:
+        """Return the number of coverage mutations carried by this capture."""
+        return len(self.coverage.rows) if self.coverage is not None else 0
 
 
 class GraphReader:
@@ -467,13 +715,18 @@ class GraphReader:
             dict(iter_edges(self.db_path, self.project)),
         )
         validate_rows(rows, self.project)
-        return GraphCapture(rows.nodes, rows.edges, True, source)
+        coverage = load_coverage(self.db_path, self.project)
+        coverage_capture = (
+            CoverageCapture(coverage.rows, coverage.metadata, True) if coverage is not None else None
+        )
+        return GraphCapture(rows.nodes, rows.edges, True, source, coverage_capture)
 
     def capture(
         self,
         previous: PinnedGeneration | None,
         *,
         force_snapshot: bool = False,
+        force_coverage_snapshot: bool = False,
         unchanged: bool = False,
     ) -> GraphCapture:
         """Capture the current graph through the safest available path.
@@ -481,6 +734,7 @@ class GraphReader:
         Args:
             previous: Generation pinned before CBM published the current graph.
             force_snapshot: Ignore an available predecessor and read every row.
+            force_coverage_snapshot: Read every coverage row even when graph diffing.
             unchanged: Trust CBM's explicit no-op result when a predecessor exists.
 
         Returns:
@@ -490,6 +744,18 @@ class GraphReader:
             source = "full_snapshot_anchor" if force_snapshot else "full_snapshot"
             return self.snapshot(source=source)
         if unchanged:
-            return GraphCapture({}, {}, False, "noop")
-        changes = previous.changes_after_publish()
-        return GraphCapture(changes.nodes, changes.edges, False, "full_generation")
+            current = load_coverage(self.db_path, self.project)
+            coverage = (
+                CoverageCapture(
+                    current.rows if force_coverage_snapshot else {},
+                    current.metadata,
+                    force_coverage_snapshot,
+                )
+                if current is not None
+                else None
+            )
+            return GraphCapture({}, {}, False, "noop", coverage)
+        changes = previous.changes_after_publish(
+            force_coverage_snapshot=force_coverage_snapshot,
+        )
+        return GraphCapture(changes.nodes, changes.edges, False, "full_generation", changes.coverage)

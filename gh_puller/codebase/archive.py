@@ -1,4 +1,4 @@
-"""Store and record durable graph snapshots in append-only Merkle radix trees.
+"""Store exact CBM graph and coverage snapshots in append-only Merkle trees.
 
 One writer holds an advisory lock while independent readers capture immutable file
 prefixes. Commit checkpoints publish roots only after their referenced frames exist;
@@ -23,7 +23,14 @@ from typing import TYPE_CHECKING, Any, Self
 import msgspec
 
 from .graph import SnapshotGraph, snapshot_to_networkx
-from .store import ExtractionError, GraphRows, rows_to_snapshot, validate_rows
+from .store import (
+    CoverageSnapshot,
+    ExtractionError,
+    GraphRows,
+    rows_to_snapshot,
+    validate_coverage,
+    validate_rows,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Mapping, Sequence
@@ -37,6 +44,7 @@ if TYPE_CHECKING:
 # they are not the Python package or product version.
 FORMAT_VERSION = 5
 GRAPH_FIDELITY_VERSION = 2
+COVERAGE_FIDELITY_VERSION = 1
 MAGIC = b"KGA5\r\n\x1a\n"
 FOOTER_MAGIC = b"KGA5IDX!"
 CHECKPOINT_MAGIC = b"KGA5CP!!"
@@ -80,8 +88,10 @@ def _key_bytes(key) -> bytes:
     return _json_bytes(_key_json(key))
 
 
-def _key_path(key) -> tuple[str]:
+def _key_path(key, tree: str) -> tuple[str]:
     identity = key[0] if isinstance(key, tuple) else key
+    if tree == "coverage":
+        return (str(identity).split("/", 1)[0] or ".",)
     components = str(identity).split(".")
     return (".".join(components[:3]),)
 
@@ -150,8 +160,17 @@ class _EdgeLeafPage(msgspec.Struct, tag="leaf", tag_field="kind"):
     count: int
 
 
+class _CoverageLeafPage(msgspec.Struct, tag="leaf", tag_field="kind"):
+    tree: str
+    depth: int
+    entries: list[tuple[tuple[str, str], str]]
+    logical_hash: str
+    count: int
+
+
 _NODE_PAGE_DECODER = msgspec.json.Decoder(_BranchPage | _NodeLeafPage)
 _EDGE_PAGE_DECODER = msgspec.json.Decoder(_BranchPage | _EdgeLeafPage)
+_COVERAGE_PAGE_DECODER = msgspec.json.Decoder(_BranchPage | _CoverageLeafPage)
 
 
 class _ReadFile:
@@ -619,7 +638,7 @@ class RadixTree:
     def apply(self, root: TreeRef | None, changes: dict) -> TreeRef | None:
         if not changes:
             return root
-        prepared = [(key, value, _key_path(key)) for key, value in changes.items()]
+        prepared = [(key, value, _key_path(key, self.tree)) for key, value in changes.items()]
         return self._update(root, 0, prepared, None)
 
     def build(self, records: Iterable[tuple]) -> TreeRef | None:
@@ -645,7 +664,7 @@ class RadixTree:
                 if page.get("kind") != "leaf":
                     raise ArchiveError("expected leaf page")
                 entries = _record_map(page["entries"], self.tree)
-                if any(_key_path(key) != (shard,) for key in entries):
+                if any(_key_path(key, self.tree) != (shard,) for key in entries):
                     raise ArchiveError(f"{self.tree} identity is stored in the wrong shard")
             for key, value, _ in changes:
                 if value is None:
@@ -705,6 +724,82 @@ def graph_digest(node_root: TreeRef | None, edge_root: TreeRef | None) -> str:
         "edges": edge_root.logical_hash if edge_root else None,
     }
     return sha256(_json_bytes(value)).hexdigest()
+
+
+def coverage_digest(root: TreeRef | None, metadata: Mapping[str, object]) -> str:
+    """Return the logical identity of exact coverage rows and metadata."""
+    value = {
+        "format": "cbm-coverage-snapshot-v1",
+        "root": root.logical_hash if root else None,
+        "metadata": metadata,
+    }
+    return sha256(_json_bytes(value)).hexdigest()
+
+
+def materialization_digest(graph: str, coverage: str) -> str:
+    """Return the cache identity of one complete restorable CBM store."""
+    return sha256(
+        _json_bytes(
+            {
+                "format": "cbm-materialization-v1",
+                "graph": graph,
+                "coverage": coverage,
+            },
+        ),
+    ).hexdigest()
+
+
+def _coverage_manifest(item: dict) -> tuple[TreeRef | None, dict[str, object]] | None:
+    version = item.get("coverage_fidelity_version")
+    fields = {
+        "coverage_root",
+        "coverage_rows",
+        "coverage_metadata",
+        "coverage_digest",
+        "materialization_digest",
+    }
+    sha = item.get("sha", "unknown")
+    if version is None:
+        if fields & item.keys():
+            raise ArchiveError(f"snapshot {sha} has incomplete coverage fidelity metadata")
+        return None
+    if version != COVERAGE_FIDELITY_VERSION:
+        raise ArchiveError(f"snapshot {sha} has unsupported coverage fidelity")
+    project = item.get("cbm_project")
+    count = item.get("coverage_rows")
+    metadata = item.get("coverage_metadata")
+    if not isinstance(project, str) or not project or type(count) is not int or count < 0:
+        raise ArchiveError(f"snapshot {sha} has invalid coverage metadata")
+    try:
+        root = TreeRef.from_json(item.get("coverage_root"))
+    except (KeyError, TypeError) as exc:
+        raise ArchiveError(f"snapshot {sha} has an invalid coverage root") from exc
+    if (root is None) != (count == 0):
+        raise ArchiveError(f"snapshot {sha} coverage count does not match its root")
+    if root is not None:
+        valid_hash = (
+            isinstance(root.logical_hash, str)
+            and len(root.logical_hash) == 64
+            and all(byte in "0123456789abcdef" for byte in root.logical_hash)
+        )
+        if (
+            type(root.offset) is not int
+            or root.offset < len(MAGIC)
+            or type(root.count) is not int
+            or root.count != count
+            or not valid_hash
+        ):
+            raise ArchiveError(f"snapshot {sha} has an invalid coverage root")
+    try:
+        validate_coverage(CoverageSnapshot({}, metadata), project)
+    except ExtractionError as exc:
+        raise ArchiveError(f"snapshot {sha} has invalid coverage metadata: {exc}") from exc
+    digest = coverage_digest(root, metadata)
+    if item.get("coverage_digest") != digest:
+        raise ArchiveError(f"snapshot {sha} has an invalid coverage digest")
+    if item.get("materialization_digest") != materialization_digest(item.get("graph_digest"), digest):
+        raise ArchiveError(f"snapshot {sha} has an invalid materialization digest")
+    return root, metadata
 
 
 class Archive(PageStore):
@@ -792,7 +887,11 @@ class Archive(PageStore):
             self._cache.move_to_end(key)
             return page
         _, raw = self._read_page_frame(ref)
-        decoder = _NODE_PAGE_DECODER if tree == "nodes" else _EDGE_PAGE_DECODER
+        decoder = {
+            "nodes": _NODE_PAGE_DECODER,
+            "edges": _EDGE_PAGE_DECODER,
+            "coverage": _COVERAGE_PAGE_DECODER,
+        }[tree]
         try:
             page = decoder.decode(raw)
         except msgspec.DecodeError:
@@ -830,7 +929,7 @@ class Archive(PageStore):
                 if shard is None or depth != TRIE_DEPTH:
                     raise ArchiveError(f"invalid {tree} leaf depth")
                 entries = _record_map(page["entries"] if isinstance(page, dict) else page.entries, tree)
-                if any(_key_path(key) != (shard,) for key in entries):
+                if any(_key_path(key, tree) != (shard,) for key in entries):
                     raise ArchiveError(f"{tree} identity is stored in the wrong shard")
                 duplicate = records.keys() & entries.keys()
                 if duplicate:
@@ -855,6 +954,32 @@ class Archive(PageStore):
         nodes = self._records(TreeRef.from_json(item.get("node_root")), "nodes")
         edges = self._records(TreeRef.from_json(item.get("edge_root")), "edges")
         return GraphRows(nodes, edges)
+
+    def load_coverage(self, commit: str | None = None) -> CoverageSnapshot | None:
+        """Materialize exact coverage rows and metadata when recorded.
+
+        Args:
+            commit: Exact archived commit ID. Omission selects the captured latest.
+
+        Returns:
+            The coverage snapshot, or ``None`` for a legacy graph-only commit.
+        """
+        sha = self.latest_commit if commit is None else commit
+        if sha not in self._entries:
+            raise KeyError(sha)
+        item = self._entries[sha]
+        coverage = _coverage_manifest(item)
+        if coverage is None:
+            return None
+        root, metadata = coverage
+        snapshot = CoverageSnapshot(self._records(root, "coverage"), deepcopy(metadata))
+        try:
+            validate_coverage(snapshot, item["cbm_project"])
+        except ExtractionError as exc:
+            raise ArchiveError(f"snapshot {sha} has invalid coverage rows: {exc}") from exc
+        if len(snapshot.rows) != item["coverage_rows"]:
+            raise ArchiveError(f"snapshot {sha} coverage count does not match its manifest")
+        return snapshot
 
     def _restorable_manifest(self, commit: str | None = None) -> tuple[dict, str]:
         """Validate native restoration metadata without materializing graph rows."""
@@ -897,6 +1022,7 @@ class Archive(PageStore):
             raise ArchiveError(f"snapshot {sha} row counts do not match its roots")
         if item.get("graph_digest") != graph_digest(node_root, edge_root):
             raise ArchiveError(f"snapshot {sha} has an invalid graph digest")
+        _coverage_manifest(item)
         return item, project
 
     def verify_snapshot(self, commit: str | None = None) -> None:
@@ -920,6 +1046,7 @@ class Archive(PageStore):
             validate_rows(rows, project)
         except ExtractionError as exc:
             raise ArchiveError(f"snapshot {sha} is not restorable: {exc}") from exc
+        self.load_coverage(sha)
 
     def load_raw(self, commit: str | None = None) -> SnapshotGraph:
         return rows_to_snapshot(self.load_rows(commit))
@@ -940,6 +1067,7 @@ class Archive(PageStore):
             edge_root = TreeRef.from_json(item.get("edge_root"))
             if graph_digest(node_root, edge_root) != item["graph_digest"]:
                 raise ArchiveError(f"root digest mismatch at {item['sha']}")
+            _coverage_manifest(item)
 
     def verify_index(self) -> None:
         """Verify the final index frame and every manifest's logical roots."""
@@ -951,6 +1079,7 @@ class Archive(PageStore):
             edge_root = TreeRef.from_json(item.get("edge_root"))
             if graph_digest(node_root, edge_root) != item["graph_digest"]:
                 raise ArchiveError(f"root digest mismatch at {item['sha']}")
+            _coverage_manifest(item)
 
 
 # --- Graph generation recorder ---
@@ -989,6 +1118,10 @@ class KGARecorder:
         last = self.writer.commits[-1] if self.writer.commits else None
         self.node_root = self._root(last, "node_root")
         self.edge_root = self._root(last, "edge_root")
+        coverage = _coverage_manifest(last) if last else None
+        self.coverage_root = coverage[0] if coverage else None
+        self.coverage_metadata = deepcopy(coverage[1]) if coverage else None
+        self.coverage_recorded = coverage is not None
 
     @staticmethod
     def _root(item: dict | None, name: str) -> TreeRef | None:
@@ -1003,6 +1136,11 @@ class KGARecorder:
     def latest_commit(self) -> str | None:
         """Return the latest archived commit identity, if any."""
         return self.writer.commits[-1]["sha"] if self.writer.commits else None
+
+    @property
+    def has_coverage_snapshot(self) -> bool:
+        """Return whether the current KGA head has an exact coverage attachment."""
+        return self.coverage_recorded
 
     def append(
         self,
@@ -1037,8 +1175,45 @@ class KGARecorder:
         edge_tree = RadixTree(self.writer, "edges")
         self.node_root = node_tree.apply(self.node_root, capture.nodes)
         self.edge_root = edge_tree.apply(self.edge_root, capture.edges)
+        coverage_tree = RadixTree(self.writer, "coverage")
+        coverage_fields = {}
+        if capture.coverage is None:
+            if self.coverage_recorded:
+                raise ExtractionError("published CBM generation lost its coverage attachment")
+        else:
+            coverage = capture.coverage
+            if coverage.snapshot:
+                if any(value is None for value in coverage.rows.values()):
+                    raise ExtractionError("complete coverage snapshot contains deletions")
+                self.coverage_root = None
+            elif not self.coverage_recorded:
+                raise ExtractionError("coverage mutations have no complete archive predecessor")
+            validate_coverage(
+                CoverageSnapshot(
+                    {key: "" if value is None else value for key, value in coverage.rows.items()},
+                    coverage.metadata,
+                ),
+                project,
+            )
+            self.coverage_root = coverage_tree.apply(self.coverage_root, coverage.rows)
+            self.coverage_metadata = dict(coverage.metadata)
+            self.coverage_recorded = True
+            coverage_identity = coverage_digest(self.coverage_root, self.coverage_metadata)
+            graph_identity = graph_digest(self.node_root, self.edge_root)
+            coverage_fields = {
+                "coverage_root": self.coverage_root.to_json() if self.coverage_root else None,
+                "coverage_rows": self.coverage_root.count if self.coverage_root else 0,
+                "coverage_metadata": self.coverage_metadata,
+                "coverage_digest": coverage_identity,
+                "materialization_digest": materialization_digest(
+                    graph_identity,
+                    coverage_identity,
+                ),
+                "coverage_fidelity_version": COVERAGE_FIDELITY_VERSION,
+            }
         manifest = {
             **metadata,
+            **coverage_fields,
             "ordinal": commit.ordinal,
             "sha": commit.sha,
             "parents": list(commit.parents),
@@ -1049,8 +1224,11 @@ class KGARecorder:
             "graph_digest": graph_digest(self.node_root, self.edge_root),
             "changed_files": commit.changed_files,
             "changed_rows": capture.changed_rows,
-            "pages_read": node_tree.pages_read + edge_tree.pages_read,
-            "pages_written": node_tree.pages_written + edge_tree.pages_written,
+            "changed_coverage_rows": capture.changed_coverage_rows,
+            "pages_read": node_tree.pages_read + edge_tree.pages_read + coverage_tree.pages_read,
+            "pages_written": node_tree.pages_written
+            + edge_tree.pages_written
+            + coverage_tree.pages_written,
             "generation_diff_source": capture.source,
             "graph_fidelity_version": GRAPH_FIDELITY_VERSION,
             "cbm_project": project,

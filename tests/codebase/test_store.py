@@ -4,7 +4,15 @@ import sqlite3
 
 import pytest
 
-from gh_puller.codebase.store import ExtractionError, GraphRows, load_rows, validate_rows
+from gh_puller.codebase.store import (
+    CoverageSnapshot,
+    ExtractionError,
+    GraphRows,
+    load_coverage,
+    load_rows,
+    validate_coverage,
+    validate_rows,
+)
 
 SCHEMA = """
 CREATE TABLE projects(name TEXT PRIMARY KEY);
@@ -112,3 +120,45 @@ def test_validate_rows_rejects_edge_identity_drift():
 
     with pytest.raises(ExtractionError, match="inconsistent identity"):
         validate_rows(rows, "p")
+
+
+def test_load_coverage_preserves_rows_and_generation_metadata(tmp_path):
+    path = tmp_path / "graph.db"
+    write_store(path, "{}")
+    with sqlite3.connect(path) as connection, connection:
+        connection.executescript(
+            """
+            CREATE TABLE index_coverage(
+              project TEXT,rel_path TEXT,kind TEXT,detail TEXT,
+              PRIMARY KEY(project,rel_path,kind));
+            CREATE TABLE index_coverage_meta(
+              project TEXT PRIMARY KEY,generation TEXT,index_mode TEXT,recorded_at TEXT,
+              recording_status TEXT,ignored_files_stored INTEGER,ignored_files_total INTEGER,
+              coverage_version INTEGER,hash_records_complete INTEGER);
+            """,
+        )
+        connection.execute(
+            "INSERT INTO index_coverage VALUES ('p','src/a.py','parse_partial','4-8,10')",
+        )
+        connection.execute(
+            "INSERT INTO index_coverage_meta VALUES "
+            "('p','generation-1','delta','2026-09-08T00:00:00Z','complete',2,3,3,1)",
+        )
+
+    coverage = load_coverage(path, "p")
+
+    assert coverage == CoverageSnapshot(
+        {("src/a.py", "parse_partial"): "4-8,10"},
+        {
+            "project": "p",
+            "generation": "generation-1",
+            "index_mode": "delta",
+            "recorded_at": "2026-09-08T00:00:00Z",
+            "recording_status": "complete",
+            "ignored_files_stored": 2,
+            "ignored_files_total": 3,
+            "coverage_version": 3,
+            "hash_records_complete": True,
+        },
+    )
+    validate_coverage(coverage, "p")

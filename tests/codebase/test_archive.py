@@ -8,11 +8,13 @@ from gh_puller.codebase.archive import (
     Archive,
     ArchiveError,
     ArchiveWriter,
+    KGACommit,
+    KGARecorder,
     RadixTree,
     TreeRef,
     graph_digest,
 )
-from gh_puller.codebase.store import GraphRows
+from gh_puller.codebase.store import CoverageCapture, GraphCapture, GraphRows
 
 
 def commit_rows(writer, sha, parents, rows, node_root=None, edge_root=None):
@@ -129,6 +131,87 @@ def test_no_changes_reuses_root_without_writing(tmp_path):
     assert unchanged.apply(root, {}) == root
     assert unchanged.pages_written == 0
     writer.close_incomplete()
+
+
+def test_recorder_applies_exact_coverage_snapshots_and_deltas(tmp_path):
+    path = tmp_path / "archive.kga"
+    recorder = KGARecorder(path)
+    project = {
+        "label": "Project",
+        "name": "p",
+        "file_path": "",
+        "start_line": 0,
+        "end_line": 0,
+        "properties": {},
+    }
+    first_metadata = {
+        "project": "p",
+        "generation": "generation-1",
+        "index_mode": "full",
+        "recorded_at": "2026-09-08T00:00:00Z",
+        "recording_status": "complete",
+        "ignored_files_stored": 1,
+        "ignored_files_total": 1,
+        "coverage_version": 3,
+        "hash_records_complete": True,
+    }
+    first = recorder.append(
+        KGACommit(0, "c1", (), None),
+        GraphCapture(
+            {"p": project},
+            {},
+            True,
+            "full_snapshot",
+            CoverageCapture(
+                {
+                    ("src/a.py", "parse_partial"): "1-2",
+                    ("vendor", "not_indexed_dir"): "excluded subtree",
+                },
+                first_metadata,
+                True,
+            ),
+        ),
+        project="p",
+        metadata={},
+    )
+    second_metadata = {**first_metadata, "generation": "generation-2", "index_mode": "delta"}
+    second = recorder.append(
+        KGACommit(1, "c2", ("c1",), 1),
+        GraphCapture(
+            {},
+            {},
+            False,
+            "full_generation",
+            CoverageCapture(
+                {
+                    ("src/a.py", "parse_partial"): "8-9",
+                    ("vendor", "not_indexed_dir"): None,
+                    ("docs", "not_indexed_dir"): "excluded subtree",
+                },
+                second_metadata,
+                False,
+            ),
+        ),
+        project="p",
+        metadata={},
+    )
+    recorder.finalize()
+
+    with Archive(path) as archive:
+        assert archive.load_coverage("c1").rows == {
+            ("src/a.py", "parse_partial"): "1-2",
+            ("vendor", "not_indexed_dir"): "excluded subtree",
+        }
+        assert archive.load_coverage("c2").rows == {
+            ("docs", "not_indexed_dir"): "excluded subtree",
+            ("src/a.py", "parse_partial"): "8-9",
+        }
+        archive.verify_snapshot("c2")
+    assert first["coverage_rows"] == 2
+    assert second["coverage_rows"] == 2
+    assert second["changed_coverage_rows"] == 3
+    assert second["graph_digest"] == first["graph_digest"]
+    assert second["materialization_digest"] != first["materialization_digest"]
 
 
 def test_radix_tree_rejects_duplicate_build_identities(tmp_path):
