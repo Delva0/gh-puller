@@ -23,19 +23,36 @@ from gh_puller.codebase.archive import (
 from gh_puller.codebase.cbm._native import NativeArchiveTransport
 from gh_puller.codebase.store import GraphRows, load_coverage, load_rows
 
+_GRAPH_TOOLS = (
+    "search_graph",
+    "search_code",
+    "query_graph",
+    "trace_path",
+    "get_graph_schema",
+    "get_code_snippet",
+    "get_architecture",
+    "check_index_coverage",
+    "index_status",
+    "detect_changes",
+    "manage_adr",
+    "ingest_traces",
+)
+
 
 def write_fake_helper(
     path: Path,
     *,
     hang_on_query: bool = False,
     indexing: bool = False,
+    tools: tuple[str, ...] = ("query_graph", "get_graph_schema", "index_status"),
 ) -> None:
-    protocol = 8 if indexing else 7
+    protocol = 9 if indexing else 8
     capabilities = [
         "archive-load",
         "tool-call",
         "graph-compare",
         "project-open",
+        "project-open-read-only",
         "project-list",
         "project-delete",
     ]
@@ -86,7 +103,7 @@ while True:
         result = {{"protocol": {protocol}, "kga_format": 5, "graph_fidelity": 2,
                   "coverage_fidelity": 1, "store_format": 1, "sdk_abi": 2,
                   "capabilities": {capabilities!r},
-                  "tools": ["query_graph", "get_graph_schema", "index_status"]}}
+                  "tools": {list(tools)!r}}}
     elif method == "load":
         Path(params["database_path"]).touch()
         result = {{"project": params["project"], "graph_digest": params["graph_digest"],
@@ -395,7 +412,7 @@ def test_client_native_query_does_not_resolve_or_start_mcp(tmp_path):
         assert result["pid"] == client.native_pid
         assert schema["node_labels"][0]["label"] == "Function"
         assert status["nodes"] == 3
-        with pytest.raises(CBMTransportError, match="requires a daemon-backed graph"):
+        with pytest.raises(CBMTransportError, match="requires a live source snapshot"):
             client.index_status(graph, verbose=True)
         assert client._daemon_backend is None
 
@@ -514,6 +531,52 @@ def test_client_queries_existing_project_without_full_helper(tmp_path, monkeypat
     ]
 
 
+def test_client_routes_every_graph_tool_through_compact_helper(tmp_path, monkeypatch):
+    helper = tmp_path / "fake-helper"
+    log = tmp_path / "requests.jsonl"
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    write_fake_helper(helper, tools=_GRAPH_TOOLS)
+    monkeypatch.setenv("NATIVE_REQUEST_LOG", str(log))
+
+    with CBMClient(
+        tmp_path / "missing-cbm",
+        native_helper=helper,
+        native_index_helper=tmp_path / "missing-index-helper",
+        cache_root=tmp_path / "cache",
+        index_backend="native",
+        timeout=5,
+    ) as client:
+        graph = client.project_graph("native-tools", source_root=tree)
+        client.search_graph(graph, label="Function")
+        client.search_code(graph, pattern="needle", mode="compact")
+        client.query_graph(graph, query="MATCH (n) RETURN n")
+        client.trace_path(graph, function_name="native-tools.main")
+        client.get_graph_schema(graph)
+        client.get_code_snippet(graph, qualified_name="native-tools.main")
+        client.get_architecture(graph, aspects=["structure"])
+        client.check_index_coverage(graph, paths=["main.py"])
+        client.index_status(graph, verbose=True)
+        client.detect_changes(graph, base_branch="HEAD", scope="files")
+        client.manage_adr(graph)
+        client.ingest_traces(
+            graph,
+            [{"caller": "native-tools.main", "callee": "native-tools.work", "count": 2}],
+        )
+
+        assert client._native_index_transport is None
+        assert client._daemon_backend is None
+
+    calls = [item for item in requests(log) if item["method"] == "call"]
+    assert [item["params"]["name"] for item in calls] == list(_GRAPH_TOOLS)
+    assert all(item["params"]["arguments"]["project"] == "native-tools" for item in calls)
+    assert calls[1]["params"]["arguments"]["pattern"] == "needle"
+    assert calls[5]["params"]["arguments"]["qualified_name"] == "native-tools.main"
+    assert calls[9]["params"]["arguments"]["format"] == "json"
+    assert calls[10]["params"]["arguments"]["mode"] == "get"
+    assert calls[11]["params"]["arguments"]["traces"][0]["count"] == 2
+
+
 def test_client_rejects_archive_handle_after_loading_another_generation(tmp_path):
     helper = tmp_path / "fake-helper"
     first_archive = tmp_path / "first.kga"
@@ -595,10 +658,22 @@ def test_real_native_index_helper_publishes_and_deletes_graph(tmp_path):
             incremental_controls=IncrementalConfig().to_dict(),
         )
         graph = client.project_graph("native-index", source_root=tree)
+        assert graph._transport.tools == frozenset(_GRAPH_TOOLS)
         queried = client.query_graph(
             graph,
             query="MATCH (n:Function) RETURN n.name",
             max_rows=10,
+        )
+        code_matches = client.search_code(graph, pattern="native_symbol")
+        snippet = client.get_code_snippet(graph, qualified_name="native_symbol")
+        status = client.index_status(graph, verbose=True)
+        coverage = client.check_index_coverage(graph, paths=["main.py"])
+        adr = client.manage_adr(graph)
+        with pytest.raises(CBMTransportError, match="writable graph handle"):
+            client.manage_adr(graph, mode="update", content="## PURPOSE\nunsafe")
+        traces = client.ingest_traces(
+            graph,
+            [{"caller": "native_symbol", "callee": "native_symbol", "count": 1}],
         )
         projects = client.list_projects(include_details=True)
         rows = load_rows(cache / "native-index.db", "native-index")
@@ -623,6 +698,12 @@ def test_real_native_index_helper_publishes_and_deletes_graph(tmp_path):
 
     assert execution == {"route": "full", "reason": "explicit_force_full"}
     assert ["native_symbol"] in queried["rows"]
+    assert code_matches["total_grep_matches"] == 1
+    assert snippet["name"] == "native_symbol"
+    assert status["git"]["root_exists"] is True
+    assert coverage["paths"][0]["freshness"] == "metadata_match"
+    assert adr["status"] == "no_adr"
+    assert traces["traces_received"] == 1
     assert ["native_symbol"] in reopened_query["rows"]
     assert any(project["name"] == "native-index" for project in projects["projects"])
     assert any(node["name"] == "native_symbol" for node in rows.nodes.values())

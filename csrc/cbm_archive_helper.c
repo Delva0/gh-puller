@@ -19,9 +19,9 @@
 #include <yyjson/yyjson.h>
 
 #ifdef GHP_NATIVE_INDEXING
-#define NATIVE_PROTOCOL_VERSION 8
+#define NATIVE_PROTOCOL_VERSION 9
 #else
-#define NATIVE_PROTOCOL_VERSION 7
+#define NATIVE_PROTOCOL_VERSION 8
 #endif
 
 enum {
@@ -136,6 +136,7 @@ static char *hello_response(uint64_t id) {
     yyjson_mut_arr_add_str(document, capabilities, "tool-call");
     yyjson_mut_arr_add_str(document, capabilities, "graph-compare");
     yyjson_mut_arr_add_str(document, capabilities, "project-open");
+    yyjson_mut_arr_add_str(document, capabilities, "project-open-read-only");
     yyjson_mut_arr_add_str(document, capabilities, "project-list");
     yyjson_mut_arr_add_str(document, capabilities, "project-delete");
 #ifdef GHP_NATIVE_INDEXING
@@ -571,7 +572,7 @@ static char *open_response(uint64_t id, helper_session_t *session, yyjson_val *p
     char error[1024];
     cbm_sdk_graph_t *graph = NULL;
     cbm_sdk_status_t status =
-        cbm_sdk_graph_open_writable(database_path, project, &graph, error, sizeof(error));
+        cbm_sdk_graph_open(database_path, project, &graph, error, sizeof(error));
     if (status != CBM_SDK_OK) {
         return error_response(id, cbm_sdk_status_code(status), error);
     }

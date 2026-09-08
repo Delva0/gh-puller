@@ -31,8 +31,8 @@ from ._daemon import CBMTransportError, ResourceMonitorLike
 if TYPE_CHECKING:
     from collections.abc import Iterator, Mapping, Sequence
 
-_ARCHIVE_PROTOCOL_VERSION = 7
-_INDEX_PROTOCOL_VERSION = 8
+_ARCHIVE_PROTOCOL_VERSION = 8
+_INDEX_PROTOCOL_VERSION = 9
 _RESPONSE_MAX_BYTES = 256 << 20
 _ARCHIVE_HELPER_ENV = "GH_PULLER_CODEBASE_CBM_HELPER"
 _INDEX_HELPER_ENV = "GH_PULLER_CODEBASE_CBM_INDEX_HELPER"
@@ -190,6 +190,7 @@ class NativeArchiveTransport:
                 "tool-call",
                 "graph-compare",
                 "project-open",
+                "project-open-read-only",
                 "project-list",
                 "project-delete",
             },
@@ -484,10 +485,10 @@ class NativeArchiveTransport:
         project: str,
         source_root: Path | None = None,
     ) -> dict[str, Any]:
-        """Bind an indexed mutable project to native graph tools.
+        """Bind an indexed project's current generation to native graph tools.
 
         Args:
-            database_path: Exact project database opened with mutation support.
+            database_path: Exact project database opened read-only.
             project: Project expected inside that database.
             source_root: Matching checkout used by tools that read source text.
         """
@@ -652,6 +653,7 @@ class NativeIndexTransport(NativeArchiveTransport):
                 {
                     "repository-index",
                     "project-open",
+                    "project-open-read-only",
                     "project-list",
                     "project-delete",
                     "granular-delta-controls",

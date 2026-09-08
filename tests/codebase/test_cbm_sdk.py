@@ -75,10 +75,18 @@ def test_client_starts_once_and_exposes_json_queries(tmp_path):
         pid = client.pid
         graph = client.daemon_graph("demo")
         search = client.search_graph(graph, label="Function", limit=4)
+        code = client.search_code(graph, pattern="needle", mode="compact")
         query = client.query_graph(graph, query="MATCH (n) RETURN n LIMIT 1")
         schema = client.get_graph_schema(graph)
         trace = client.trace_path(graph, function_name="demo.main", direction="outbound")
+        snippet = client.get_code_snippet(graph, qualified_name="demo.main")
         architecture = client.get_architecture(graph, aspects=["structure"])
+        changes = client.detect_changes(graph, base_branch="HEAD", scope="files")
+        adr = client.manage_adr(graph)
+        traces = client.ingest_traces(
+            graph,
+            [{"caller": "demo.main", "callee": "demo.work", "count": 2}],
+        )
         status = client.index_status(graph, verbose=True)
         comparison = client.compare_graphs(
             client.daemon_graph("base"),
@@ -101,10 +109,15 @@ def test_client_starts_once_and_exposes_json_queries(tmp_path):
         ]
         assert {
             search["pid"],
+            code["pid"],
             query["pid"],
             schema["pid"],
             trace["pid"],
+            snippet["pid"],
             architecture["pid"],
+            changes["pid"],
+            adr["pid"],
+            traces["pid"],
             status["pid"],
             comparison["pid"],
         } == {pid}
@@ -116,12 +129,32 @@ def test_client_starts_once_and_exposes_json_queries(tmp_path):
         }
         assert query["arguments"]["query"] == "MATCH (n) RETURN n LIMIT 1"
         assert query["arguments"]["format"] == "json"
+        assert code["arguments"] == {
+            "project": "demo",
+            "pattern": "needle",
+            "mode": "compact",
+        }
         assert schema["arguments"] == {"project": "demo"}
         assert trace["arguments"]["format"] == "json"
+        assert snippet["arguments"] == {
+            "project": "demo",
+            "qualified_name": "demo.main",
+        }
         assert architecture["arguments"] == {
             "project": "demo",
             "aspects": ["structure"],
             "format": "json",
+        }
+        assert changes["arguments"] == {
+            "project": "demo",
+            "base_branch": "HEAD",
+            "scope": "files",
+            "format": "json",
+        }
+        assert adr["arguments"] == {"project": "demo", "mode": "get"}
+        assert traces["arguments"] == {
+            "project": "demo",
+            "traces": [{"caller": "demo.main", "callee": "demo.work", "count": 2}],
         }
         assert status["arguments"] == {"project": "demo", "verbose": True}
         assert comparison["arguments"] == {

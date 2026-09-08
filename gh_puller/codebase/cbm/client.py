@@ -67,7 +67,7 @@ class ArchiveGraph(GraphTarget):
 
 @dataclass(frozen=True, slots=True)
 class NativeProjectGraph(GraphTarget):
-    """Identify a mutable project currently open in one native engine."""
+    """Identify one indexed-project generation open read-only in a native engine."""
 
     database_path: Path
     source_root: Path | None
@@ -312,14 +312,14 @@ class CBMClient:
         *,
         source_root: str | Path | None = None,
     ) -> GraphTarget:
-        """Bind an indexed project to the backend that produced it.
+        """Open an indexed project's current generation for read-only tools.
 
         Args:
             project: Exact mutable CBM project name.
             source_root: Matching checkout for native tools that inspect source.
 
         Returns:
-            A native project handle or the configured daemon graph binding.
+            A read-only native project handle or the configured daemon binding.
         """
         if self.index_backend != "native":
             if self.index_backend != self.daemon_transport:
@@ -447,8 +447,9 @@ class CBMClient:
         Args:
             name: Advertised MCP tool name.
             arguments: Tool-specific arguments. ``None`` sends an empty object.
-            target: Explicit graph binding. Archive handles select native;
-                daemon handles and omission select the configured daemon backend.
+            target: Explicit graph binding. Archive and native-project handles
+                select native; daemon handles and omission select the configured
+                daemon backend.
         """
         values = dict(arguments or {})
         if target is not None:
@@ -532,8 +533,8 @@ class CBMClient:
         """Run CBM structured, BM25, or semantic graph search.
 
         Args:
-            target: Graph and backend selected by :meth:`daemon_graph` or
-                :meth:`load_archive`.
+            target: Graph and backend selected by :meth:`daemon_graph`,
+                :meth:`project_graph`, or :meth:`load_archive`.
             **filters: Native ``search_graph`` fields such as ``query``, ``label``,
                 ``name_pattern``, ``limit``, and ``offset``.
         """
@@ -543,12 +544,34 @@ class CBMClient:
             target=target,
         )
 
+    def search_code(
+        self,
+        target: GraphTarget,
+        *,
+        pattern: str,
+        **options: object,
+    ) -> dict[str, Any]:
+        """Search source text and enrich matches with graph structure.
+
+        Args:
+            target: Graph and backend selected by :meth:`daemon_graph`,
+                :meth:`project_graph`, or :meth:`load_archive`.
+            pattern: Literal or regular-expression source pattern.
+            **options: Additional ``search_code`` fields such as ``mode``,
+                ``file_pattern``, ``path_filter``, and ``limit``.
+        """
+        return self.call_json_tool(
+            "search_code",
+            {"pattern": pattern, **options},
+            target=target,
+        )
+
     def query_graph(self, target: GraphTarget, *, query: str, **options: object) -> dict[str, Any]:
         """Run a read-only Cypher-like query against a CBM graph.
 
         Args:
-            target: Graph and backend selected by :meth:`daemon_graph` or
-                :meth:`load_archive`.
+            target: Graph and backend selected by :meth:`daemon_graph`,
+                :meth:`project_graph`, or :meth:`load_archive`.
             query: Native CBM graph query.
             **options: Additional ``query_graph`` fields such as ``graph`` and
                 ``max_rows``.
@@ -563,8 +586,8 @@ class CBMClient:
         """Return labels, relationship types, and their available properties.
 
         Args:
-            target: Graph and backend selected by :meth:`daemon_graph` or
-                :meth:`load_archive`.
+            target: Graph and backend selected by :meth:`daemon_graph`,
+                :meth:`project_graph`, or :meth:`load_archive`.
         """
         return self.call_json_tool("get_graph_schema", target=target)
 
@@ -611,8 +634,8 @@ class CBMClient:
         """Trace calls, data flow, or cross-service paths from one symbol.
 
         Args:
-            target: Graph and backend selected by :meth:`daemon_graph` or
-                :meth:`load_archive`.
+            target: Graph and backend selected by :meth:`daemon_graph`,
+                :meth:`project_graph`, or :meth:`load_archive`.
             function_name: Qualified or discoverable function name used as the
                 traversal origin.
             **options: Native ``trace_path`` fields such as ``direction``, ``depth``,
@@ -621,6 +644,28 @@ class CBMClient:
         return self.call_json_tool(
             "trace_path",
             {"function_name": function_name, **options, "format": "json"},
+            target=target,
+        )
+
+    def get_code_snippet(
+        self,
+        target: GraphTarget,
+        *,
+        qualified_name: str,
+        **options: object,
+    ) -> dict[str, Any]:
+        """Read the source belonging to one graph symbol.
+
+        Args:
+            target: Graph and backend selected by :meth:`daemon_graph`,
+                :meth:`project_graph`, or :meth:`load_archive`.
+            qualified_name: Exact symbol identity or a short name accepted by CBM.
+            **options: Additional ``get_code_snippet`` fields such as
+                ``include_neighbors``.
+        """
+        return self.call_json_tool(
+            "get_code_snippet",
+            {"qualified_name": qualified_name, **options},
             target=target,
         )
 
@@ -635,8 +680,8 @@ class CBMClient:
         """Summarize graph structure, dependencies, and architectural views.
 
         Args:
-            target: Graph and backend selected by :meth:`daemon_graph` or
-                :meth:`load_archive`.
+            target: Graph and backend selected by :meth:`daemon_graph`,
+                :meth:`project_graph`, or :meth:`load_archive`.
             path: Optional repository-relative directory scope.
             aspects: Optional CBM architecture sections. ``None`` selects the
                 compact default view.
@@ -662,8 +707,8 @@ class CBMClient:
         """Inspect CBM's best-effort coverage record for paths or scopes.
 
         Args:
-            target: Graph and backend selected by :meth:`daemon_graph` or
-                :meth:`load_archive`.
+            target: Graph and backend selected by :meth:`daemon_graph`,
+                :meth:`project_graph`, or :meth:`load_archive`.
             paths: Repository-relative files to check exactly.
             scopes: Repository-relative path prefixes to enumerate.
             scope_limit: Maximum coverage rows returned for each scope.
@@ -680,6 +725,64 @@ class CBMClient:
             target=target,
         )
 
+    def detect_changes(self, target: GraphTarget, **options: object) -> dict[str, Any]:
+        """Map source changes to graph impact.
+
+        Args:
+            target: Graph and backend selected by :meth:`daemon_graph`,
+                :meth:`project_graph`, or :meth:`load_archive`.
+            **options: ``detect_changes`` fields such as ``base_branch``,
+                ``since``, ``scope``, ``direction``, ``depth``, and ``limit``.
+        """
+        return self.call_json_tool(
+            "detect_changes",
+            {**options, "format": "json"},
+            target=target,
+        )
+
+    def manage_adr(
+        self,
+        target: GraphTarget,
+        *,
+        mode: str = "get",
+        content: str | None = None,
+        section_updates: Mapping[str, str] | None = None,
+    ) -> dict[str, Any]:
+        """Read or explicitly update a project's architecture record.
+
+        Args:
+            target: Graph and backend selected by :meth:`daemon_graph`,
+                :meth:`project_graph`, or :meth:`load_archive`.
+            mode: ADR operation; ``get`` is the read-only default. Writes require
+                a daemon graph because native graph handles are query-only.
+            content: Complete replacement document used by ``update``.
+            section_updates: Named replacement sections used by ``set_sections``.
+        """
+        arguments: dict[str, object] = {"mode": mode}
+        if content is not None:
+            arguments["content"] = content
+        if section_updates is not None:
+            arguments["section_updates"] = dict(section_updates)
+        return self.call_json_tool("manage_adr", arguments, target=target)
+
+    def ingest_traces(
+        self,
+        target: GraphTarget,
+        traces: Sequence[Mapping[str, object]],
+    ) -> dict[str, Any]:
+        """Submit runtime call observations to CBM.
+
+        Args:
+            target: Graph and backend selected by :meth:`daemon_graph`,
+                :meth:`project_graph`, or :meth:`load_archive`.
+            traces: Caller, callee, and count objects accepted by CBM.
+        """
+        return self.call_json_tool(
+            "ingest_traces",
+            {"traces": [dict(trace) for trace in traces]},
+            target=target,
+        )
+
     def index_status(
         self,
         target: GraphTarget,
@@ -689,16 +792,20 @@ class CBMClient:
         """Return graph counts, root identity, and persisted coverage status.
 
         Args:
-            target: Graph and backend selected by :meth:`daemon_graph` or
-                :meth:`load_archive`.
-            verbose: Include live Git/worktree context for daemon graphs.
-                Archive graphs contain no live worktree context.
+            target: Graph and backend selected by :meth:`daemon_graph`,
+                :meth:`project_graph`, or :meth:`load_archive`.
+            verbose: Include live Git/worktree context for daemon graphs and
+                native projects with a bound source snapshot. Archive graphs
+                contain no live worktree context.
 
         Raises:
             CBMTransportError: ``verbose`` is requested for an archive graph.
         """
-        if verbose and isinstance(target, ArchiveGraph):
-            raise CBMTransportError("verbose index status requires a daemon-backed graph")
+        if verbose and (
+            isinstance(target, ArchiveGraph)
+            or (isinstance(target, NativeProjectGraph) and target.source_root is None)
+        ):
+            raise CBMTransportError("verbose index status requires a live source snapshot")
         return self.call_json_tool(
             "index_status",
             {"verbose": verbose},
