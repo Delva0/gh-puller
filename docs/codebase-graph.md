@@ -65,7 +65,7 @@ and each delta control. `persistence=false` means that this pipeline does not as
 publish its separate team-shared graph artifact; the builder reads the atomically published
 SQLite generation from CBM's cache.
 
-Sources: [gh_puller/codebase/cbm_build.py](../gh_puller/codebase/cbm_build.py); [gh_puller/codebase/cbm_transport.py](../gh_puller/codebase/cbm_transport.py)
+Sources: [gh_puller/codebase/build.py](../gh_puller/codebase/build.py); [gh_puller/codebase/cbm/_daemon.py](../gh_puller/codebase/cbm/_daemon.py)
 
 ### Graph content and update routing are independent axes
 
@@ -93,7 +93,7 @@ manifest and in `summary.json`. Every historical graph therefore records the rou
 actually produced it instead of requiring readers to infer that route from duration or
 graph size.
 
-Sources: [gh_puller/codebase/incremental_config.py](../gh_puller/codebase/incremental_config.py); [gh_puller/codebase/cbm_transport.py](../gh_puller/codebase/cbm_transport.py); [tests/codebase/test_cbm_transport.py](../tests/codebase/test_cbm_transport.py)
+Sources: [gh_puller/codebase/cbm/plan.py](../gh_puller/codebase/cbm/plan.py); [gh_puller/codebase/cbm/_daemon.py](../gh_puller/codebase/cbm/_daemon.py); [tests/codebase/test_cbm_transport.py](../tests/codebase/test_cbm_transport.py)
 
 ### How source code becomes nodes and edges
 
@@ -142,7 +142,7 @@ Python. A commit cannot be passed directly to `search_graph`, `trace_path`, or
 `query_graph`. Supporting that behavior would require a KGA-to-CBM restoration protocol
 and a rebuild of the auxiliary query indexes; neither is part of the current interface.
 
-Sources: [DeusData/codebase-memory-mcp](https://github.com/DeusData/codebase-memory-mcp); [gh_puller/codebase/cbm_build.py](../gh_puller/codebase/cbm_build.py); [gh_puller/codebase/archive.py](../gh_puller/codebase/archive.py)
+Sources: [DeusData/codebase-memory-mcp](https://github.com/DeusData/codebase-memory-mcp); [gh_puller/codebase/build.py](../gh_puller/codebase/build.py); [gh_puller/codebase/archive.py](../gh_puller/codebase/archive.py)
 
 ## Deriving exact changes between CBM generations
 
@@ -227,7 +227,7 @@ current invocation finishes, the appended content passes verification, and CBM c
 completes. It records binary provenance, actual routes, phase durations, and resource
 observations.
 
-Sources: [gh_puller/codebase/archive.py](../gh_puller/codebase/archive.py); [gh_puller/codebase/cbm_build.py](../gh_puller/codebase/cbm_build.py); [tests/codebase/test_archive.py](../tests/codebase/test_archive.py)
+Sources: [gh_puller/codebase/archive.py](../gh_puller/codebase/archive.py); [gh_puller/codebase/build.py](../gh_puller/codebase/build.py); [tests/codebase/test_archive.py](../tests/codebase/test_archive.py)
 
 ## Reading a historical commit
 
@@ -286,7 +286,7 @@ Sources: [gh_puller/codebase/archive.py](../gh_puller/codebase/archive.py); [gh_
   correct semantic differences between full and delta CBM routes, source relationships that
   CBM did not recognize, or vector and FTS state that was not archived.
 
-Sources: [gh_puller/codebase/cbm_build.py](../gh_puller/codebase/cbm_build.py); [gh_puller/codebase/archive.py](../gh_puller/codebase/archive.py); [tests/codebase/test_build_options.py](../tests/codebase/test_build_options.py)
+Sources: [gh_puller/codebase/build.py](../gh_puller/codebase/build.py); [gh_puller/codebase/archive.py](../gh_puller/codebase/archive.py); [tests/codebase/test_build_options.py](../tests/codebase/test_build_options.py)
 
 ## Build entry point and runtime configuration
 
@@ -359,4 +359,4 @@ build_archive(
 )
 ```
 
-Sources: [gh_puller/codebase/binary.py](../gh_puller/codebase/binary.py); [gh_puller/codebase/cbm_build.py](../gh_puller/codebase/cbm_build.py); [gh_puller/codebase/incremental_config.py](../gh_puller/codebase/incremental_config.py); [tests/codebase/](../tests/codebase/)
+Sources: [gh_puller/codebase/cbm/binary.py](../gh_puller/codebase/cbm/binary.py); [gh_puller/codebase/build.py](../gh_puller/codebase/build.py); [gh_puller/codebase/cbm/plan.py](../gh_puller/codebase/cbm/plan.py); [tests/codebase/](../tests/codebase/)
