@@ -324,6 +324,10 @@ def test_real_native_helper_restores_exact_rows_and_reuses_cache(tmp_path):
             function_name="newline",
             direction="outbound",
         )
+        architecture = first.get_architecture(
+            loaded,
+            aspects=["structure", "dependencies"],
+        )
         restored = load_rows(loaded.database_path, "real-native")
     with CBMClient(native_helper=helper, cache_root=cache, timeout=30) as second:
         reused = second.load_archive(archive_path)
@@ -348,6 +352,16 @@ def test_real_native_helper_restores_exact_rows_and_reuses_cache(tmp_path):
     assert traced["callees"]["groups"] == [
         {"qn_prefix": "real-native.mod.unit", "rows": [["a!", 1]]},
     ]
+    assert architecture["total_nodes"] == 3
+    assert architecture["total_edges"] == 3
+    assert {tuple(row) for row in architecture["node_labels"]["rows"]} >= {
+        ("Function", 2),
+        ("Project", 1),
+    }
+    assert {tuple(row) for row in architecture["edge_types"]["rows"]} >= {
+        ("CALLS", 1),
+        ("CONTAINS", 2),
+    }
     assert reused.materialized is False
 
 
@@ -359,11 +373,14 @@ def test_real_native_helper_rejects_missharded_identity(tmp_path):
     archive_path = tmp_path / "archive.kga"
     write_missharded_archive(archive_path)
 
-    with CBMClient(
-        native_helper=Path(configured),
-        cache_root=tmp_path / "cache",
-        timeout=30,
-    ) as client, pytest.raises(CBMTransportError, match="invalid node row in KGA leaf"):
+    with (
+        CBMClient(
+            native_helper=Path(configured),
+            cache_root=tmp_path / "cache",
+            timeout=30,
+        ) as client,
+        pytest.raises(CBMTransportError, match="invalid node row in KGA leaf"),
+    ):
         client.load_archive(archive_path)
 
 

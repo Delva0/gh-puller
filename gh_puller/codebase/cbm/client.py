@@ -26,7 +26,7 @@ from ._native import NativeArchiveTransport, NativeHelper
 from .binary import CBMBinary, resolve_cbm_binary
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Mapping, Sequence
     from types import TracebackType
 
     from ..archive import Archive
@@ -288,11 +288,7 @@ class CBMClient:
             values["project"] = target.project
         if isinstance(target, ArchiveGraph):
             native = self._native_transport
-            if (
-                native is None
-                or native.loaded_project != target.project
-                or native.loaded_digest != target.graph_digest
-            ):
+            if native is None or native.loaded_project != target.project or native.loaded_digest != target.graph_digest:
                 raise CBMTransportError("archive graph is no longer loaded by this CBM client")
             if name not in native.tools:
                 raise CBMTransportError(f"native CBM tool is not supported for this archive graph: {name}")
@@ -415,6 +411,32 @@ class CBMClient:
             {"function_name": function_name, **options, "format": "json"},
             target=target,
         )
+
+    def get_architecture(
+        self,
+        target: GraphTarget,
+        *,
+        path: str | None = None,
+        aspects: Sequence[str] | None = None,
+        **options: object,
+    ) -> dict[str, Any]:
+        """Summarize graph structure, dependencies, and architectural views.
+
+        Args:
+            target: Graph and backend selected by :meth:`daemon_graph` or
+                :meth:`load_archive`.
+            path: Optional repository-relative directory scope.
+            aspects: Optional CBM architecture sections. ``None`` selects the
+                compact default view.
+            **options: Additional ``get_architecture`` fields supported by CBM.
+        """
+        arguments = dict(options)
+        if path is not None:
+            arguments["path"] = path
+        if aspects is not None:
+            arguments["aspects"] = list(aspects)
+        arguments["format"] = "json"
+        return self.call_json_tool("get_architecture", arguments, target=target)
 
     def close(self) -> None:
         """Finish active native and daemon processes and release their pipes."""
