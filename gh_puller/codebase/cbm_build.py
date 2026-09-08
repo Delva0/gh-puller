@@ -1,4 +1,10 @@
-"""Run the repository-wide pipeline over the single-commit build operation."""
+"""Build exact CBM graph generations into durable KGA archives.
+
+The foundational operation materializes, indexes, captures, and records one
+selected commit. The repository pipeline adds commit enumeration, shared
+process lifecycle, resume validation, progress, and command-line integration.
+Graph extraction and archive encoding remain owned by their respective modules.
+"""
 
 from __future__ import annotations
 
@@ -12,24 +18,50 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from hashlib import sha256
 from pathlib import Path
 
 from .archive import FORMAT_VERSION, GRAPH_FIDELITY_VERSION, Archive, ArchiveError
 from .binary import CBMBinaryError, resolve_cbm_binary
-from .build_plan import BuildPlan
+from .build_plan import BuildPlan, IncrementalConfig, IncrementalConfigError, add_incremental_arguments
 from .cbm_runner import CBMRunner
 from .cbm_transport import CBMTransportError
-from .commit_build import CommitTarget, build_commit
-from .errors import BuildError
-from .git_tree import TreeError
-from .incremental_config import IncrementalConfig, IncrementalConfigError, add_incremental_arguments
-from .kga_recorder import KGARecorder
+from .git_tree import TreeError, changed_paths, materialize_full
+from .graph_reader import GraphReader
+from .kga_recorder import KGACommit, KGARecorder
+
+SHA_RE = re.compile(r"^[0-9a-f]{40,64}$")
+
+
+# --- Public build contracts ---
+
+
+class BuildError(Exception):
+    """Indicate that a requested archive build cannot safely proceed."""
+
+
+@dataclass(frozen=True, slots=True)
+class CommitTarget:
+    """One Git commit selected for the next archive position."""
+
+    ordinal: int
+    sha: str
+    parents: tuple[str, ...]
+    previous_sha: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class CommitBuildResult:
+    """Execution evidence returned after one durable KGA checkpoint."""
+
+    manifest: dict
+    stage_seconds: dict[str, float]
+    index_execution: dict
+
 
 PlanSelector = BuildPlan | Callable[[CommitTarget], BuildPlan]
-SHA_RE = re.compile(r"^[0-9a-f]{40,64}$")
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,6 +84,128 @@ class BuildOptions:
     timeout: int = 3600
     cbm_transport: str = "persistent-mcp"
     allow_cbm_upgrade: bool = False
+
+
+# --- Single-commit operation ---
+
+
+def _stage(callback: Callable[[str], None] | None, name: str) -> None:
+    if callback is not None:
+        callback(name)
+
+
+def _recover_committed_pending(runner: CBMRunner, recorder: KGARecorder) -> None:
+    pending = runner.pending_commit
+    if pending is not None and recorder.latest_commit == pending:
+        runner.mark_archived(pending)
+
+
+def build_commit(
+    target: CommitTarget,
+    plan: BuildPlan,
+    recorder: KGARecorder,
+    *,
+    repo: str | Path,
+    runner: CBMRunner,
+    force_snapshot: bool = False,
+    metadata: Mapping[str, object] | None = None,
+    on_stage: Callable[[str], None] | None = None,
+) -> CommitBuildResult:
+    """Build one selected Git commit into a specified KGA.
+
+    Args:
+        target: Commit identity, archive position, and preceding selected commit.
+        plan: CBM coverage and full/delta policy for this commit only.
+        recorder: KGA transaction receiving this generation.
+        repo: Source Git repository containing ``target``.
+        runner: Reusable CBM process and build state owner.
+        force_snapshot: Disable the generation-diff optimization for this commit.
+        metadata: Additional immutable CBM provenance stored in the manifest.
+        on_stage: Optional callback receiving materialize, index, capture, and record stages.
+
+    Returns:
+        Durable manifest, stage timings, and CBM execution evidence.
+
+    Raises:
+        BuildError: The target disagrees with the archive position or an
+            interrupted commit.
+    """
+    reader = GraphReader(runner.db_path, runner.project)
+    if target.ordinal != len(recorder.commits):
+        raise BuildError(
+            f"commit ordinal {target.ordinal} does not match KGA position {len(recorder.commits)}",
+        )
+    if target.previous_sha != recorder.latest_commit:
+        raise BuildError(
+            f"commit predecessor {target.previous_sha!r} does not match KGA head {recorder.latest_commit!r}",
+        )
+    _recover_committed_pending(runner, recorder)
+    pending = runner.pending_commit
+    if pending is not None and pending != target.sha:
+        raise BuildError(f"interrupted commit {pending} must be recovered before {target.sha}")
+
+    repo_path = Path(repo).resolve()
+    timings = {}
+    started = time.monotonic()
+    _stage(on_stage, "materialize")
+    changed_files = (
+        len(changed_paths(repo_path, target.previous_sha, target.sha))
+        if target.previous_sha is not None
+        else None
+    )
+    materialize_full(repo_path, target.sha, runner.tree)
+    timings["materialize_seconds"] = time.monotonic() - started
+
+    aligned = (
+        pending is None
+        and recorder.latest_commit is not None
+        and runner.current_commit == recorder.latest_commit
+    )
+    previous = reader.pin() if aligned and not force_snapshot else None
+    runner.begin_commit(target.sha)
+    try:
+        started = time.monotonic()
+        _stage(on_stage, "cbm-index")
+        execution = runner.index(plan)
+        timings["cbm_seconds"] = time.monotonic() - started
+
+        started = time.monotonic()
+        _stage(on_stage, "graph-capture")
+        capture = reader.capture(
+            previous,
+            force_snapshot=force_snapshot,
+            unchanged=execution.get("route") == "noop",
+        )
+        timings["generation_diff_seconds"] = time.monotonic() - started
+    finally:
+        if previous is not None:
+            previous.close()
+
+    started = time.monotonic()
+    _stage(on_stage, "kga-record")
+    provenance = {
+        **plan.metadata(),
+        **dict(metadata or {}),
+        "cbm_index_execution": execution,
+        "cbm_force_full": plan.force_full,
+        "cbm_binary_sha256": runner.binary.sha256,
+    }
+    manifest = recorder.append(
+        KGACommit(target.ordinal, target.sha, target.parents, changed_files),
+        capture,
+        project=runner.project,
+        metadata=provenance,
+    )
+    runner.mark_archived(target.sha)
+    timings["merkle_seconds"] = time.monotonic() - started
+    return CommitBuildResult(
+        manifest,
+        {key: round(value, 3) for key, value in timings.items()},
+        execution,
+    )
+
+
+# --- Repository pipeline ---
 
 
 def _legacy_plan(options: BuildOptions) -> BuildPlan:
@@ -413,6 +567,9 @@ def _build_repository(options: BuildOptions, build_dir: Path, plans: PlanSelecto
             runner.close()
         progress.close()
         raise
+
+
+# --- Command-line interface ---
 
 
 def add_build_arguments(parser: argparse.ArgumentParser) -> None:

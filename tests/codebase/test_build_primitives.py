@@ -9,8 +9,8 @@ import pytest
 import gh_puller.codebase.cbm_runner as runner_module
 from gh_puller.codebase.archive import Archive
 from gh_puller.codebase.build_plan import BuildPlan
+from gh_puller.codebase.cbm_build import CommitTarget, build_commit
 from gh_puller.codebase.cbm_runner import CBMRunner
-from gh_puller.codebase.commit_build import CommitTarget, build_commit
 from gh_puller.codebase.graph_reader import GraphReader
 from gh_puller.codebase.kga_recorder import KGACommit, KGARecorder
 

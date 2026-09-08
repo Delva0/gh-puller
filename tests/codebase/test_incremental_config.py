@@ -3,8 +3,8 @@ from dataclasses import replace
 
 import pytest
 
-from gh_puller.codebase.build_plan import BuildPlan
-from gh_puller.codebase.incremental_config import (
+from gh_puller.codebase.build_plan import (
+    BuildPlan,
     IncrementalConfig,
     IncrementalConfigError,
     add_incremental_arguments,
