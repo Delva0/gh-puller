@@ -1,8 +1,8 @@
 """Expose persistent CBM query backends through one synchronous Python facade.
 
-Current-project tools use the authenticated MCP executable. Archive-backed
-``query_graph`` calls use the compact native helper after an explicit load, while
-open-ended MCP arguments keep new server fields independent of SDK releases.
+Current-project tools use the authenticated MCP executable. Tools supported by
+the compact native runtime operate on an explicitly loaded archive generation,
+while open-ended arguments keep new server fields independent of SDK releases.
 """
 
 from __future__ import annotations
@@ -65,7 +65,7 @@ def _json_object(name: str, result: dict[str, Any]) -> dict[str, Any]:
 
 
 class CBMClient:
-    """A synchronous facade over native archive queries and CBM MCP tools."""
+    """A synchronous facade over native archive and current-project CBM tools."""
 
     def __init__(
         self,
@@ -87,7 +87,7 @@ class CBMClient:
             registry: Registry root used for default manifest resolution.
             cache_root: CBM database directory. ``None`` honors ``CBM_CACHE_DIR``
                 and then uses CBM's per-user default.
-            native_helper: Helper for archive-backed queries. An explicit value
+            native_helper: Helper for archive-backed tools. An explicit value
                 selects native-only startup and defers MCP until an MCP tool is
                 requested. ``None`` preserves eager MCP startup.
             timeout: Maximum seconds for each backend request or cache lock.
@@ -170,13 +170,29 @@ class CBMClient:
         return self._mcp().list_tools()
 
     def call_tool(self, name: str, arguments: Mapping[str, object] | None = None) -> dict[str, Any]:
-        """Call any CBM tool and return its raw MCP result envelope.
+        """Call any CBM tool and return a backend-neutral result envelope.
 
         Args:
             name: Advertised MCP tool name.
             arguments: Tool-specific arguments. ``None`` sends an empty object.
         """
-        return self._mcp().call_tool(name, dict(arguments or {}))
+        values = dict(arguments or {})
+        native = self._native_transport
+        if native is not None and values.get("project") == native.loaded_project:
+            if name not in native.tools:
+                raise CBMTransportError(f"native CBM tool is not supported for the loaded archive: {name}")
+            logical = native.call_tool(name, values)
+            return {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": json.dumps(logical, ensure_ascii=False, separators=(",", ":")),
+                    },
+                ],
+                "structuredContent": logical,
+                "isError": False,
+            }
+        return self._mcp().call_tool(name, values)
 
     def call_json_tool(self, name: str, arguments: Mapping[str, object] | None = None) -> dict[str, Any]:
         """Call a tool whose logical response is a JSON object.
@@ -213,16 +229,6 @@ class CBMClient:
             **options: Additional ``query_graph`` fields such as ``graph`` and
                 ``max_rows``.
         """
-        native = self._native_transport
-        if native is not None and native.loaded_project == project:
-            unsupported = options.keys() - {"graph", "max_rows"}
-            if unsupported:
-                raise CBMTransportError(f"native query_graph does not support options: {sorted(unsupported)}")
-            graph = options.get("graph", "code")
-            max_rows = options.get("max_rows", 0)
-            if not isinstance(graph, str) or type(max_rows) is not int:
-                raise CBMTransportError("native query_graph requires string graph and integer max_rows")
-            return native.query_graph(project=project, query=query, graph=graph, max_rows=max_rows)
         return self.call_json_tool("query_graph", {"project": project, "query": query, **options, "format": "json"})
 
     def load_archive(

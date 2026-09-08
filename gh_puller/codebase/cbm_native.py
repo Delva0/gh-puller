@@ -2,7 +2,7 @@
 
 This module owns helper authentication, framed control messages, cross-process
 materialization locks, and cache identity. KGA parsing remains in the native
-helper; public query selection remains in :mod:`.cbm_sdk`.
+helper; public tool routing remains in :mod:`.cbm_sdk`.
 """
 
 from __future__ import annotations
@@ -30,7 +30,7 @@ from .cbm_transport import CBMTransportError
 if TYPE_CHECKING:
     from collections.abc import Iterator, Mapping
 
-_PROTOCOL_VERSION = 1
+_PROTOCOL_VERSION = 2
 _RESPONSE_MAX_BYTES = 256 << 20
 _HELPER_ENV = "GH_PULLER_CODEBASE_CBM_HELPER"
 _CACHE_SCHEMA = 1
@@ -199,6 +199,7 @@ class NativeArchiveTransport:
         try:
             hello = self._request("hello", {"protocol": _PROTOCOL_VERSION})
             capabilities = hello.get("capabilities")
+            tools = hello.get("tools")
             store_format = hello.get("store_format")
             if (
                 hello.get("protocol") != _PROTOCOL_VERSION
@@ -206,12 +207,16 @@ class NativeArchiveTransport:
                 or hello.get("graph_fidelity") != GRAPH_FIDELITY_VERSION
                 or not isinstance(capabilities, list)
                 or not all(isinstance(item, str) for item in capabilities)
-                or not {"archive-load", "query-graph"} <= set(capabilities)
+                or not {"archive-load", "tool-call"} <= set(capabilities)
+                or not isinstance(tools, list)
+                or not tools
+                or not all(isinstance(item, str) and item for item in tools)
                 or type(store_format) is not int
                 or store_format < 1
             ):
                 raise CBMTransportError("native CBM helper advertised an incompatible protocol")
             self.capabilities = frozenset(capabilities)
+            self.tools = frozenset(tools)
             self.store_format = store_format
         except BaseException:
             self.close()
@@ -398,10 +403,24 @@ class NativeArchiveTransport:
             graph: ``code`` or the derived ``missed`` graph.
             max_rows: Result ceiling; zero selects CBM's native default.
         """
-        return self._request(
-            "query",
+        return self.call_tool(
+            "query_graph",
             {"project": project, "query": query, "graph": graph, "max_rows": max_rows},
         )
+
+    def call_tool(self, name: str, arguments: Mapping[str, object] | None = None) -> dict[str, Any]:
+        """Call one tool advertised by the native graph runtime.
+
+        Args:
+            name: Tool name from the negotiated native registry.
+            arguments: Tool-specific JSON arguments.
+
+        Returns:
+            The tool's logical JSON object without a transport envelope.
+        """
+        if name not in self.tools:
+            raise CBMTransportError(f"native CBM tool is not supported: {name}")
+        return self._request("call", {"name": name, "arguments": dict(arguments or {})})
 
     def close(self) -> None:
         """Request clean shutdown and release process resources."""

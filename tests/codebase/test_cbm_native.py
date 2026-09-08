@@ -21,7 +21,7 @@ import sys
 import time
 
 if sys.argv[1:] == ["--version"]:
-    print("gh-puller-cbm-helper 1")
+    print("gh-puller-cbm-helper 2")
     raise SystemExit(0)
 
 def read_exact(size):
@@ -47,19 +47,26 @@ while True:
         with Path(log).open("a") as stream:
             stream.write(json.dumps(request) + "\\n")
     if method == "hello":
-        result = {{"protocol": 1, "kga_format": 5, "graph_fidelity": 2, "store_format": 1,
-                  "capabilities": ["archive-load", "query-graph"]}}
+        result = {{"protocol": 2, "kga_format": 5, "graph_fidelity": 2, "store_format": 1,
+                  "capabilities": ["archive-load", "tool-call"],
+                  "tools": ["query_graph", "get_graph_schema"]}}
     elif method == "load":
         Path(params["database_path"]).touch()
         result = {{"project": params["project"], "graph_digest": params["graph_digest"],
                   "nodes": params["node_count"], "edges": params["edge_count"],
                   "materialized": not params["reuse"]}}
-    elif method == "query":
-        if {hang_on_query!r}:
+    elif method == "call":
+        name = params["name"]
+        arguments = params["arguments"]
+        if {hang_on_query!r} and name == "query_graph":
             time.sleep(60)
-        result = {{"columns": ["backend", "project"],
-                  "rows": [["native", params["project"]]], "total": 1,
-                  "pid": os.getpid()}}
+        if name == "query_graph":
+            result = {{"columns": ["backend", "project"],
+                      "rows": [["native", arguments["project"]]], "total": 1,
+                      "pid": os.getpid()}}
+        else:
+            result = {{"node_labels": [{{"label": "Function", "count": 2}}],
+                      "edge_types": []}}
     elif method == "shutdown":
         respond({{"id": ident, "ok": True, "result": {{}}}})
         break
@@ -189,8 +196,14 @@ def test_client_native_query_does_not_resolve_or_start_mcp(tmp_path):
         assert client._transport is None
         project = client.load_archive(archive_path)["project"]
         result = client.query_graph(project=project, query="MATCH (n) RETURN n")
+        schema = client.call_json_tool("get_graph_schema", {"project": project})
         assert result["rows"] == [["native", project]]
         assert result["pid"] == client.native_pid
+        assert schema["node_labels"][0]["label"] == "Function"
+        assert client._transport is None
+
+        with pytest.raises(CBMTransportError, match="not supported for the loaded archive"):
+            client.call_json_tool("trace_path", {"project": project, "function_name": "main"})
         assert client._transport is None
 
 
@@ -226,6 +239,7 @@ def test_real_native_helper_restores_exact_rows_and_reuses_cache(tmp_path):
             query="MATCH (n:Function) RETURN n.name, n.file_path, n.docstring",
             max_rows=10,
         )
+        schema = first.call_json_tool("get_graph_schema", {"project": "real-native"})
         restored = load_rows(loaded["database_path"], "real-native")
     with CBMClient(native_helper=helper, cache_root=cache, timeout=30) as second:
         reused = second.load_archive(archive_path)
@@ -238,6 +252,7 @@ def test_real_native_helper_restores_exact_rows_and_reuses_cache(tmp_path):
         ("newline", "newline.py"),
     }
     assert any(row[2] == "native needle" for row in queried["rows"])
+    assert {item["label"] for item in schema["node_labels"]} >= {"Project", "Function"}
     assert reused["materialized"] is False
 
 

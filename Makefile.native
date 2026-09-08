@@ -1,4 +1,4 @@
-# Build the KGA-to-CBM native query helper against the transport-neutral CBM engine.
+# Build the KGA-to-CBM tool helper against the transport-neutral CBM engine.
 
 CBM_ROOT ?= ../codebase-memory-mcp
 BUILD_DIR ?= build/native

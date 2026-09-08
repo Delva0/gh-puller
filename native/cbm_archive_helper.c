@@ -1,5 +1,5 @@
 /*
- * cbm_archive_helper.c — Serve persistent native KGA load and CBM query calls.
+ * cbm_archive_helper.c — Serve persistent KGA loads and native CBM tool calls.
  *
  * Control messages are length-prefixed JSON. Graph rows never cross the
  * protocol: the helper reads KGA pages directly and keeps the resulting
@@ -7,7 +7,7 @@
  */
 #include "kga_reader.h"
 
-#include "engine/query.h"
+#include "engine/tool_runtime.h"
 #include "foundation/log.h"
 #include "foundation/profile.h"
 #include "store/store.h"
@@ -22,7 +22,7 @@
 #include <yyjson/yyjson.h>
 
 enum {
-    NATIVE_PROTOCOL_VERSION = 1,
+    NATIVE_PROTOCOL_VERSION = 2,
     KGA_FORMAT_VERSION = 5,
     KGA_FIDELITY_VERSION = 2,
     REQUEST_MAX_BYTES = 8 << 20,
@@ -125,12 +125,17 @@ static char *hello_response(uint64_t id) {
     yyjson_mut_val *result = yyjson_mut_obj(document);
     yyjson_mut_val *capabilities = yyjson_mut_arr(document);
     yyjson_mut_arr_add_str(document, capabilities, "archive-load");
-    yyjson_mut_arr_add_str(document, capabilities, "query-graph");
+    yyjson_mut_arr_add_str(document, capabilities, "tool-call");
+    yyjson_mut_val *tools = yyjson_mut_arr(document);
+    for (size_t index = 0; index < cbm_engine_tool_count(); index++) {
+        yyjson_mut_arr_add_str(document, tools, cbm_engine_tool_name(index));
+    }
     yyjson_mut_obj_add_int(document, result, "protocol", NATIVE_PROTOCOL_VERSION);
     yyjson_mut_obj_add_int(document, result, "kga_format", KGA_FORMAT_VERSION);
     yyjson_mut_obj_add_int(document, result, "graph_fidelity", KGA_FIDELITY_VERSION);
     yyjson_mut_obj_add_int(document, result, "store_format", CBM_INDEX_FORMAT_VERSION);
     yyjson_mut_obj_add_val(document, result, "capabilities", capabilities);
+    yyjson_mut_obj_add_val(document, result, "tools", tools);
     yyjson_mut_obj_add_val(document, root, "result", result);
     return document_json(document);
 }
@@ -276,80 +281,44 @@ static char *load_response(uint64_t id, helper_session_t *session, yyjson_val *p
     return document_json(document);
 }
 
-static char *query_response(uint64_t id, helper_session_t *session, yyjson_val *parameters) {
-    const char *project = NULL;
-    const char *query = NULL;
-    const char *graph_name = "code";
-    int max_rows = 0;
+static char *tool_response(uint64_t id, helper_session_t *session, yyjson_val *parameters) {
+    const char *name = NULL;
+    yyjson_val *arguments = NULL;
     if (!yyjson_is_obj(parameters) ||
-        !(project = json_string(yyjson_obj_get(parameters, "project"))) ||
-        !(query = json_string(yyjson_obj_get(parameters, "query"))) || !query[0]) {
-        return error_response(id, "invalid_request", "invalid graph query parameters");
-    }
-    yyjson_val *graph_value = yyjson_obj_get(parameters, "graph");
-    yyjson_val *max_rows_value = yyjson_obj_get(parameters, "max_rows");
-    if (graph_value && !(graph_name = json_string(graph_value))) {
-        return error_response(id, "invalid_request", "graph must be code or missed");
-    }
-    if (max_rows_value && (!json_int(max_rows_value, &max_rows) || max_rows < 0)) {
-        return error_response(id, "invalid_request", "max_rows must be nonnegative");
-    }
-    cbm_engine_graph_t graph;
-    if (strcmp(graph_name, "code") == 0) {
-        graph = CBM_ENGINE_GRAPH_CODE;
-    } else if (strcmp(graph_name, "missed") == 0) {
-        graph = CBM_ENGINE_GRAPH_MISSED;
-    } else {
-        return error_response(id, "invalid_request", "graph must be code or missed");
+        !(name = json_string(yyjson_obj_get(parameters, "name"))) || !name[0] ||
+        !(arguments = yyjson_obj_get(parameters, "arguments")) || !yyjson_is_obj(arguments)) {
+        return error_response(id, "invalid_request", "tool call requires name and arguments");
     }
     if (!session->store) {
-        return error_response(id, "no_graph", "load an archive graph before querying");
-    }
-    if (strcmp(project, session->project) != 0) {
-        return error_response(id, "project_mismatch", "query project is not the loaded graph");
+        return error_response(id, "no_graph", "load an archive graph before calling a tool");
     }
 
-    cbm_cypher_result_t query_result = {0};
-    int queried =
-        cbm_engine_query_graph(session->store, project, query, graph, max_rows, &query_result);
-    if (queried < 0) {
-        char *response = error_response(
-            id, "query_failed", query_result.error ? query_result.error : "graph query failed");
-        cbm_cypher_result_free(&query_result);
+    char *arguments_json = yyjson_val_write(arguments, YYJSON_WRITE_NOFLAG, NULL);
+    if (!arguments_json) {
+        return error_response(id, "allocation_failed", "cannot encode tool arguments");
+    }
+    cbm_engine_tool_result_t tool_result = {0};
+    cbm_engine_tool_status_t status = cbm_engine_call_tool(
+        session->store, session->project, name, arguments_json, &tool_result);
+    free(arguments_json);
+    if (status != CBM_ENGINE_TOOL_OK) {
+        char *response = error_response(id, cbm_engine_tool_status_code(status),
+                                        tool_result.error ? tool_result.error : "tool call failed");
+        cbm_engine_tool_result_free(&tool_result);
         return response;
     }
-
-    yyjson_mut_val *root = NULL;
-    yyjson_mut_doc *document = response_document(id, true, &root);
-    if (!document) {
-        cbm_cypher_result_free(&query_result);
-        return NULL;
-    }
-    yyjson_mut_val *result = yyjson_mut_obj(document);
-    yyjson_mut_val *columns = yyjson_mut_arr(document);
-    for (int column = 0; column < query_result.col_count; column++) {
-        yyjson_mut_arr_add_str(document, columns, query_result.columns[column]);
-    }
-    yyjson_mut_obj_add_val(document, result, "columns", columns);
-    yyjson_mut_val *rows = yyjson_mut_arr(document);
-    for (int row = 0; row < query_result.row_count; row++) {
-        yyjson_mut_val *values = yyjson_mut_arr(document);
-        for (int column = 0; column < query_result.col_count; column++) {
-            yyjson_mut_arr_add_str(document, values, query_result.rows[row][column]);
+    size_t result_size = strlen(tool_result.json);
+    size_t capacity = result_size + 96;
+    char *response = malloc(capacity);
+    if (response) {
+        int written = snprintf(response, capacity, "{\"id\":%llu,\"ok\":true,\"result\":%s}",
+                               (unsigned long long)id, tool_result.json);
+        if (written < 0 || (size_t)written >= capacity) {
+            free(response);
+            response = NULL;
         }
-        yyjson_mut_arr_add_val(rows, values);
     }
-    yyjson_mut_obj_add_val(document, result, "rows", rows);
-    yyjson_mut_obj_add_int(document, result, "total", query_result.row_count);
-    if (query_result.warning) {
-        yyjson_mut_obj_add_str(document, result, "warning", query_result.warning);
-    }
-    if (query_result.row_count == 0) {
-        yyjson_mut_obj_add_str(document, result, "hint", "Query returned no results.");
-    }
-    yyjson_mut_obj_add_val(document, root, "result", result);
-    char *response = document_json(document);
-    cbm_cypher_result_free(&query_result);
+    cbm_engine_tool_result_free(&tool_result);
     return response;
 }
 
@@ -376,8 +345,8 @@ static char *dispatch_request(helper_session_t *session, yyjson_val *request, bo
     if (strcmp(method, "load") == 0) {
         return load_response(id, session, parameters);
     }
-    if (strcmp(method, "query") == 0) {
-        return query_response(id, session, parameters);
+    if (strcmp(method, "call") == 0) {
+        return tool_response(id, session, parameters);
     }
     if (strcmp(method, "shutdown") == 0) {
         *shutdown = true;
