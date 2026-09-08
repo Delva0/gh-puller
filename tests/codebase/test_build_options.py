@@ -8,7 +8,7 @@ from gh_puller.codebase.build import (
     BuildError,
     BuildOptions,
     _legacy_plan,
-    _validate_resume_binary,
+    _validate_resume_engine,
     _validate_resume_fidelity,
     prepare_output_dir,
 )
@@ -69,16 +69,17 @@ def test_legacy_force_full_becomes_one_constant_commit_plan(tmp_path):
     assert plan.route == "full"
 
 
-def test_resume_pins_cbm_digest_unless_upgrade_is_explicit():
-    assert _validate_resume_binary(None, "new", False) is False
-    assert _validate_resume_binary({"cbm_binary_sha256": "same"}, "same", False) is False
-    assert _validate_resume_binary({"sha": "legacy"}, "new", True) is True
-    assert _validate_resume_binary({"cbm_binary_sha256": "old"}, "new", True) is True
+def test_resume_pins_engine_digest_and_accepts_legacy_binary_identity():
+    assert _validate_resume_engine(None, "new", False) is False
+    assert _validate_resume_engine({"cbm_engine_sha256": "same"}, "same", False) is False
+    assert _validate_resume_engine({"cbm_binary_sha256": "same"}, "same", False) is False
+    assert _validate_resume_engine({"sha": "legacy"}, "new", True) is True
+    assert _validate_resume_engine({"cbm_engine_sha256": "old"}, "new", True) is True
 
     with pytest.raises(BuildError, match="predates"):
-        _validate_resume_binary({"sha": "legacy"}, "new", False)
+        _validate_resume_engine({"sha": "legacy"}, "new", False)
     with pytest.raises(BuildError, match="differs"):
-        _validate_resume_binary({"cbm_binary_sha256": "old"}, "new", False)
+        _validate_resume_engine({"cbm_engine_sha256": "old"}, "new", False)
 
 
 def test_resume_requires_explicitly_migrated_graph_identity():

@@ -48,6 +48,7 @@ class NativeHelper:
     sha256: str
     size: int
     version: str
+    source: str
     _device: int
     _inode: int
     _mtime_ns: int
@@ -62,6 +63,16 @@ class NativeHelper:
         expected = (self._device, self._inode, self.size, self._mtime_ns)
         if identity != expected:
             raise CBMTransportError(f"native CBM helper changed after resolution: {self.path}")
+
+    def provenance(self) -> dict[str, object]:
+        """Return stable helper identity for archive and summary metadata."""
+        return {
+            "path": str(self.path),
+            "sha256": self.sha256,
+            "bytes": self.size,
+            "version": self.version,
+            "source": self.source,
+        }
 
 
 def _hash_file(path: Path) -> str:
@@ -98,6 +109,7 @@ def resolve_native_helper(
         return helper
     values = os.environ if environ is None else environ
     configured = helper if helper is not None else values.get(environment_key)
+    source = "explicit" if helper is not None else f"environment:{environment_key}"
     candidate: Path | None = None
     if configured is not None:
         raw = os.fspath(configured)
@@ -107,6 +119,7 @@ def resolve_native_helper(
         local = Path(__file__).resolve().parents[3] / "build" / "native" / local_name
         located = shutil.which(local_name, path=values.get("PATH"))
         candidate = local if local.exists() else Path(located).resolve() if located else None
+        source = "local-build" if local.exists() else "PATH"
     if candidate is None:
         raise CBMTransportError(
             f"no native CBM helper: pass its path, set {environment_key}, or build Makefile.native",
@@ -138,6 +151,7 @@ def resolve_native_helper(
         _hash_file(candidate),
         status.st_size,
         version[0],
+        source,
         status.st_dev,
         status.st_ino,
         status.st_mtime_ns,

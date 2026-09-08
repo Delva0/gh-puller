@@ -31,7 +31,8 @@ class FakeBinary:
 
 
 class FakeClient:
-    def __init__(self):
+    def __init__(self, engine):
+        self.index_engine = engine
         self.calls = []
         self.closed = False
 
@@ -64,6 +65,8 @@ class PublishingRunner:
         self.tree = root / "tree"
         self.db_path = root / "graph.db"
         self.binary = FakeBinary(root / "cbm")
+        self.engine = self.binary
+        self.transport_name = "native"
         self.current_commit = None
         self.pending_commit = None
         self.plans = []
@@ -140,9 +143,9 @@ def test_build_plan_separates_analysis_mode_from_route():
 
 
 def test_cbm_runner_reuses_client_across_commit_plans(tmp_path, monkeypatch):
-    client = FakeClient()
-    monkeypatch.setattr(runner_module, "CBMClient", lambda *_args, **_kwargs: client)
     binary = FakeBinary(tmp_path / "cbm")
+    client = FakeClient(binary)
+    monkeypatch.setattr(runner_module, "CBMClient", lambda *_args, **_kwargs: client)
     work = tmp_path / "work"
     work.mkdir()
     (work / "current-sha").write_text("untrusted-legacy-state")

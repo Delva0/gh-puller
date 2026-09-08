@@ -59,6 +59,7 @@ def write_generation(path, project, symbol):
 class PublishingClient:
     def __init__(self, cache_root):
         self.cache_root = cache_root
+        self.index_engine = PublishingEngine()
         self.calls = []
         self.closed = False
 
@@ -88,6 +89,13 @@ class PublishingClient:
 
     def close(self):
         self.closed = True
+
+
+class PublishingEngine:
+    sha256 = "engine"
+
+    def provenance(self):
+        return {"sha256": self.sha256, "source": "test"}
 
 
 def test_repository_pipeline_selects_a_plan_for_each_commit(tmp_path, monkeypatch):
@@ -149,10 +157,9 @@ def test_repository_pipeline_selects_a_plan_for_each_commit(tmp_path, monkeypatc
 
 @pytest.mark.integration
 def test_repository_pipeline_uses_native_index_sdk_end_to_end(tmp_path):
-    binary = os.environ.get("GH_PULLER_TEST_CBM_BINARY")
     helper = os.environ.get("GH_PULLER_TEST_CBM_NATIVE_INDEX_HELPER")
-    if binary is None or helper is None:
-        pytest.skip("real CBM binary and native index helper not configured")
+    if helper is None:
+        pytest.skip("real native index helper not configured")
     repo = tmp_path / "repo"
     repo.mkdir()
     git(repo, "init")
@@ -168,7 +175,8 @@ def test_repository_pipeline_uses_native_index_sdk_end_to_end(tmp_path):
     options = BuildOptions(
         repo,
         tmp_path / "build",
-        binary=Path(binary),
+        binary=tmp_path / "unused-cbm",
+        native_index_helper=helper,
         project_name=project,
         memory_limit=1 << 60,
         cbm_transport="native",
@@ -186,4 +194,5 @@ def test_repository_pipeline_uses_native_index_sdk_end_to_end(tmp_path):
     assert any(node["name"] == "second_symbol" for node in rows.nodes.values())
     assert not any(node["name"] == "first_symbol" for node in rows.nodes.values())
     assert summary["cbm_transport"] == "native"
+    assert summary["cbm_engine"]["path"] == str(Path(helper).resolve())
     assert summary["cleanup"]["project_deleted"] is True

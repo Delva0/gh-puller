@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Self
 from .client import CBMClient, CBMTransportError
 
 if TYPE_CHECKING:
+    from ._native import NativeHelper
     from .binary import CBMBinary
     from .plan import BuildPlan
 
@@ -113,19 +114,20 @@ class CBMRunner:
 
     def __init__(
         self,
-        binary: CBMBinary,
+        binary: CBMBinary | None,
         project: str,
         cache_root: str | Path,
         work_dir: str | Path,
         *,
         timeout: int = 3600,
         memory_limit: int | None = None,
-        transport: str = "persistent-mcp",
+        transport: str = "native",
+        native_index_helper: NativeHelper | str | Path | None = None,
     ):
         """Start a build-scoped CBM runner.
 
         Args:
-            binary: Authenticated executable identity fixed for this runner.
+            binary: Authenticated daemon executable; native indexing does not use it.
             project: Stable CBM project receiving every planned commit.
             cache_root: Directory containing CBM's atomically published database.
             work_dir: Runner-owned materialized Git tree and commit state.
@@ -133,6 +135,7 @@ class CBMRunner:
             memory_limit: Aggregate runner and child RSS ceiling; omission reserves
                 one GiB for the host.
             transport: Native SDK, reusable MCP, or one-process-per-call CLI index path.
+            native_index_helper: Explicit full SDK helper for the native index path.
         """
         self.binary = binary
         self.project = project
@@ -158,10 +161,12 @@ class CBMRunner:
                 cache_root=self.cache_root,
                 daemon_transport=transport if transport != "native" else "persistent-mcp",
                 index_backend=transport,
+                native_index_helper=native_index_helper,
                 timeout=timeout,
                 resource_monitor=self.monitor,
             )
             self.capabilities = self._client.capabilities()
+            self.engine = self._client.index_engine
             self.transport_name = transport
             self.startup_seconds = round(time.monotonic() - started, 3)
         except BaseException:

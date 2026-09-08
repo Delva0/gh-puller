@@ -85,6 +85,7 @@ class BuildOptions:
     binary: str | Path | None = None
     cbm_manifest: str | Path | None = None
     cbm_registry: str | Path | None = None
+    native_index_helper: str | Path | None = None
     out_dir: str | Path | None = None
     project_name: str | None = None
     mode: str = "full"
@@ -94,7 +95,7 @@ class BuildOptions:
     max_commits: int | None = None
     memory_limit: int | None = None
     timeout: int = 3600
-    cbm_transport: str = "persistent-mcp"
+    cbm_transport: str = "native"
     target_projects: tuple[str, ...] = ()
     allow_cbm_upgrade: bool = False
 
@@ -202,7 +203,8 @@ def build_commit(
         **dict(metadata or {}),
         "cbm_index_execution": execution,
         "cbm_force_full": plan.force_full,
-        "cbm_binary_sha256": runner.binary.sha256,
+        "cbm_engine_sha256": runner.engine.sha256,
+        "cbm_engine_backend": runner.transport_name,
     }
     manifest = recorder.append(
         KGACommit(target.ordinal, target.sha, target.parents, changed_files),
@@ -368,18 +370,18 @@ def _incremental_metadata(config: IncrementalConfig) -> dict:
     return BuildPlan(incremental=config).metadata()["cbm_incremental"]
 
 
-def _validate_resume_binary(last_item: dict | None, digest: str, allow_upgrade: bool) -> bool:
+def _validate_resume_engine(last_item: dict | None, digest: str, allow_upgrade: bool) -> bool:
     if last_item is None:
         return False
-    recorded = last_item.get("cbm_binary_sha256")
+    recorded = last_item.get("cbm_engine_sha256", last_item.get("cbm_binary_sha256"))
     if recorded == digest:
         return False
     if allow_upgrade:
         return True
     if recorded is None:
-        raise BuildError("archive predates CBM binary recording; resume once with --allow-cbm-upgrade")
+        raise BuildError("archive predates CBM engine recording; resume once with --allow-cbm-upgrade")
     raise BuildError(
-        "CBM binary differs from the archive: "
+        "CBM engine differs from the archive: "
         f"recorded={recorded}, requested={digest}; use --allow-cbm-upgrade to accept a semantic boundary",
     )
 
@@ -440,14 +442,6 @@ def _constant_plan_metadata(plans: PlanSelector) -> dict:
 
 
 def _build_repository(options: BuildOptions, build_dir: Path, plans: PlanSelector) -> int:
-    try:
-        cbm_binary = resolve_cbm_binary(
-            options.binary,
-            manifest=options.cbm_manifest,
-            registry=options.cbm_registry,
-        )
-    except CBMBinaryError as exc:
-        raise BuildError(str(exc)) from exc
     repo = _repository(options.repo)
     commits, source_count, source_head = _selected_commits(repo, options.max_commits)
     build_dir.mkdir(parents=True, exist_ok=True)
@@ -467,7 +461,16 @@ def _build_repository(options: BuildOptions, build_dir: Path, plans: PlanSelecto
     identity = sha256(f"gh-puller-codebase:{repo}:{build_dir}".encode()).hexdigest()[:12]
     project = options.project_name or f"cbm-archive-{_slug(repo.name)}-{identity}"
     _validate_resume_fidelity(last_item, project)
-    binary_upgrade = _validate_resume_binary(last_item, cbm_binary.sha256, options.allow_cbm_upgrade)
+    cbm_binary = None
+    if options.cbm_transport != "native":
+        try:
+            cbm_binary = resolve_cbm_binary(
+                options.binary,
+                manifest=options.cbm_manifest,
+                registry=options.cbm_registry,
+            )
+        except CBMBinaryError as exc:
+            raise BuildError(str(exc)) from exc
     cache_root = Path(os.environ.get("CBM_CACHE_DIR") or Path.home() / ".cache" / "codebase-memory-mcp")
     work_dir = Path(tempfile.gettempdir()) / f"{project}-work"
     progress = Progress(len(commits), len(archived))
@@ -485,6 +488,12 @@ def _build_repository(options: BuildOptions, build_dir: Path, plans: PlanSelecto
             timeout=options.timeout,
             memory_limit=options.memory_limit,
             transport=options.cbm_transport,
+            native_index_helper=options.native_index_helper,
+        )
+        engine_upgrade = _validate_resume_engine(
+            last_item,
+            runner.engine.sha256,
+            options.allow_cbm_upgrade,
         )
         recorder = KGARecorder(archive_path, compression_level=options.compression_level)
         resume_aligned = recorder.latest_commit is not None and runner.current_commit == recorder.latest_commit
@@ -502,10 +511,10 @@ def _build_repository(options: BuildOptions, build_dir: Path, plans: PlanSelecto
                 recorder,
                 repo=repo,
                 runner=runner,
-                force_snapshot=binary_upgrade,
+                force_snapshot=engine_upgrade,
                 on_stage=lambda stage, commit_sha=sha: progress.stage(commit_sha, stage),
             )
-            binary_upgrade = False
+            engine_upgrade = False
             timings.append(
                 {
                     "sha": sha,
@@ -527,13 +536,17 @@ def _build_repository(options: BuildOptions, build_dir: Path, plans: PlanSelecto
 
         progress.render("finalizing")
         plan_metadata = _constant_plan_metadata(plans)
+        engine_provenance = {
+            **runner.engine.provenance(),
+            "backend": options.cbm_transport,
+        }
         recorder.finalize(
             {
                 "repo": str(repo),
                 "head": commits[-1][0],
                 "selection": "root-first topo prefix",
                 **plan_metadata,
-                "cbm_binary": cbm_binary.provenance(),
+                "cbm_engine": engine_provenance,
             },
         )
         with Archive(archive_path) as archive:
@@ -560,7 +573,7 @@ def _build_repository(options: BuildOptions, build_dir: Path, plans: PlanSelecto
             "project": project,
             **plan_metadata,
             "cbm_plan_counts": plan_counts,
-            "cbm_binary": cbm_binary.provenance(),
+            "cbm_engine": engine_provenance,
             "cbm_capabilities_detected": capabilities,
             "cbm_transport": options.cbm_transport,
             "cbm_transport_startup_seconds": startup_seconds,
@@ -597,6 +610,7 @@ def add_build_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--binary")
     parser.add_argument("--cbm-manifest")
     parser.add_argument("--cbm-registry")
+    parser.add_argument("--native-index-helper")
     parser.add_argument("--build-dir", required=True)
     parser.add_argument("--out-dir")
     parser.add_argument("--project-name")
@@ -623,12 +637,12 @@ def add_build_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--cbm-transport",
         choices=("native", "cli", "persistent-mcp"),
-        default="persistent-mcp",
+        default="native",
     )
     parser.add_argument(
         "--allow-cbm-upgrade",
         action="store_true",
-        help="resume across a changed or previously unrecorded CBM binary identity",
+        help="resume across a changed or previously unrecorded CBM engine identity",
     )
     add_incremental_arguments(parser)
 
@@ -644,6 +658,7 @@ def _options_from_namespace(args: argparse.Namespace) -> BuildOptions:
         binary=args.binary,
         cbm_manifest=args.cbm_manifest,
         cbm_registry=args.cbm_registry,
+        native_index_helper=args.native_index_helper,
         out_dir=args.out_dir,
         project_name=args.project_name,
         mode=args.mode,

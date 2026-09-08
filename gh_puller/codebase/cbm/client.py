@@ -275,6 +275,13 @@ class CBMClient:
             return self._native_index().capabilities
         return self._index_daemon().capabilities()
 
+    @property
+    def index_engine(self) -> CBMBinary | NativeHelper:
+        """Return the pinned executable that implements repository indexing."""
+        if self.index_backend == "native":
+            return self._native_index().helper
+        return self.binary
+
     def index_repository(
         self,
         tree: str | Path,
