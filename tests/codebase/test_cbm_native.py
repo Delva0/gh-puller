@@ -315,6 +315,8 @@ def test_real_native_helper_restores_exact_rows_and_reuses_cache(tmp_path):
             query="MATCH (n:Function) RETURN n.name, n.file_path, n.docstring",
             max_rows=10,
         )
+        searched = first.search_graph(loaded, label="Function", fields=["ratio"], limit=10)
+        ranked = first.search_graph(loaded, query="native needle", limit=10)
         schema = first.call_json_tool("get_graph_schema", target=loaded)
         restored = load_rows(loaded.database_path, "real-native")
     with CBMClient(native_helper=helper, cache_root=cache, timeout=30) as second:
@@ -328,6 +330,13 @@ def test_real_native_helper_restores_exact_rows_and_reuses_cache(tmp_path):
         ("newline", "newline.py"),
     }
     assert any(row[2] == "native needle" for row in queried["rows"])
+    assert searched["total"] == 2
+    assert {row[0] for group in searched["groups"] for row in group["rows"]} == {
+        "a\n",
+        "a!",
+    }
+    assert ranked["search_mode"] == "bm25"
+    assert ranked["rows"][0][0] == "real-native.mod.unit.a\n"
     assert {item["label"] for item in schema["node_labels"]} >= {"Project", "Function"}
     assert reused.materialized is False
 
