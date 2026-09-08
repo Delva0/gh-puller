@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -32,7 +33,8 @@ _PROGRESS_TYPE = "github_sync_progress"
 _JOURNAL_LINES = 512
 _RECENT_TASK_SAMPLE = 2_048
 _WEEKDAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
-_OVERVIEW_WIDTHS = (12, 4, 16, 14, 9, 11, 7)
+_OVERVIEW_MIN_WIDTHS = (12, 4, 16, 14, 9, 11, 7)
+_OVERVIEW_FLEX_COLUMNS = (2, 3)
 
 type _FileVersion = tuple[int, int, int, int] | None
 type _ArchiveVersion = tuple[_FileVersion, _FileVersion]
@@ -548,6 +550,7 @@ def _maintenance_state(connection: sqlite3.Connection) -> MaintenanceState | Non
 def _render_table(
     statuses: Sequence[WriterStatus],
     now: datetime | None = None,
+    width: int | None = None,
 ) -> str:
     if not statuses:
         return "No managed GitHub writers."
@@ -565,7 +568,9 @@ def _render_table(
         )
         for status in statuses
     ]
-    return "\n".join(_overview_line(row) for row in (headers, *rows))
+    table = (headers, *rows)
+    widths = _overview_widths(table, _terminal_width() if width is None else width)
+    return "\n".join(_overview_line(row, widths) for row in table)
 
 
 def _render_detail(
@@ -622,11 +627,31 @@ def _render_detail(
     return "\n".join(lines)
 
 
-def _overview_line(values: Sequence[str]) -> str:
-    cells = (
-        f"{_fit(value, width):<{width}}"
-        for value, width in zip(values, _OVERVIEW_WIDTHS, strict=True)
-    )
+def _overview_widths(rows: Sequence[Sequence[str]], limit: int) -> tuple[int, ...]:
+    widths = list(_OVERVIEW_MIN_WIDTHS)
+    natural = tuple(max(len(row[index]) for row in rows) for index in range(len(widths)))
+    remaining = max(limit - sum(widths) - len(widths) + 1, 0)
+    while remaining:
+        expanded = False
+        for index in _OVERVIEW_FLEX_COLUMNS:
+            if widths[index] >= natural[index]:
+                continue
+            widths[index] += 1
+            remaining -= 1
+            expanded = True
+            if not remaining:
+                break
+        if not expanded:
+            break
+    return tuple(widths)
+
+
+def _terminal_width() -> int:
+    return shutil.get_terminal_size(fallback=(80, 24)).columns - 1
+
+
+def _overview_line(values: Sequence[str], widths: Sequence[int]) -> str:
+    cells = (f"{_fit(value, width):<{width}}" for value, width in zip(values, widths, strict=True))
     return " ".join(cells).rstrip()
 
 

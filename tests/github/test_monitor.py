@@ -102,7 +102,7 @@ def _status(database: Path) -> monitor.WriterStatus:
 def test_table_is_a_compact_writer_overview(tmp_path: Path) -> None:
     status = _status(tmp_path / "facts.sqlite3")
 
-    output = monitor._render_table([status], now=_EVENT_AT + timedelta(minutes=5))
+    output = monitor._render_table([status], now=_EVENT_AT + timedelta(minutes=5), width=79)
 
     lines = output.splitlines()
     assert lines[0].split() == ["ID", "ST", "REPO", "DB", "PHASE", "DONE", "UPDATED"]
@@ -114,6 +114,21 @@ def test_table_is_a_compact_writer_overview(tmp_path: Path) -> None:
     assert max(map(len, lines)) <= 79
     for omitted in ("GIT", "CYCLE", "CHECKPOINT", "QUOTA", "REQUESTS"):
         assert omitted not in lines[0]
+
+
+def test_table_uses_available_width_for_names(tmp_path: Path) -> None:
+    status = monitor.WriterStatus(
+        _writer(tmp_path / "vllm-v10.sqlite3", "vllm-project/vllm"),
+        monitor.ServiceState("inactive", "dead", 0, 0),
+        None,
+        None,
+    )
+
+    output = monitor._render_table([status], now=_EVENT_AT, width=100)
+
+    assert "vllm-project/vllm" in output
+    assert "vllm-v10.sqlite3" in output
+    assert max(map(len, output.splitlines())) <= 100
 
 
 def test_detail_combines_durable_work_and_disposable_quota(tmp_path: Path) -> None:
