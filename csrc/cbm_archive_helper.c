@@ -1,5 +1,5 @@
 /*
- * cbm_archive_helper.c — Serve persistent KGA loads and native CBM tool calls.
+ * cbm_archive_helper.c — Serve persistent KGA loads through the native CBM engine.
  *
  * Control messages are length-prefixed JSON. Graph rows never cross the
  * protocol: the helper reads KGA pages directly and keeps the resulting

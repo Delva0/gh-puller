@@ -2,6 +2,7 @@
 
 CBM_ROOT ?= ../codebase-memory-mcp
 BUILD_DIR ?= build/native
+CSRC_DIR = csrc
 TARGET = $(BUILD_DIR)/gh-puller-cbm-helper
 CBM_ENGINE = $(CBM_ROOT)/build/c/libcbm-engine.a
 CBM_MIMALLOC = $(CBM_ROOT)/build/c/prod_mimalloc.o
@@ -12,8 +13,8 @@ CFLAGS = -std=c11 -D_DEFAULT_SOURCE -D_GNU_SOURCE -O2 -Wall -Wextra -Werror \
 	-I$(CBM_ROOT)/src -I$(CBM_ROOT)/vendored \
 	-I$(CBM_ROOT)/vendored/sqlite3 -I$(CBM_ROOT)/vendored/mimalloc/include
 LDFLAGS = -lm -lstdc++ -lpthread -lz -Wl,-z,noexecstack -Wl,-z,separate-code
-SOURCES = native/cbm_archive_helper.c native/kga_reader.c
-OBJECTS = $(addprefix $(BUILD_DIR)/,$(SOURCES:.c=.o))
+SOURCES = cbm_archive_helper.c kga_reader.c
+OBJECTS = $(SOURCES:%.c=$(BUILD_DIR)/%.o)
 DEPS = $(OBJECTS:.o=.d)
 
 .PHONY: native-helper cbm-engine
@@ -24,7 +25,7 @@ native-helper: $(TARGET)
 cbm-engine:
 	$(MAKE) -C $(CBM_ROOT) -f Makefile.cbm cbm-engine build/c/prod_mimalloc.o
 
-$(BUILD_DIR)/%.o: %.c Makefile.native
+$(BUILD_DIR)/%.o: $(CSRC_DIR)/%.c Makefile.native
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
 

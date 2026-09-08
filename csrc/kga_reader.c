@@ -1,5 +1,5 @@
 /*
- * kga_reader.c — Verify KGA pages and stream graph rows into CBM.
+ * kga_reader.c — Verify KGA pages and stream exact graph rows into CBM.
  *
  * The reader opens a file identity captured by Python, bounds every positional
  * read to that immutable view, and validates frame CRC, SHA-256, and Merkle

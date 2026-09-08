@@ -4,8 +4,8 @@
  * Python owns archive index and commit selection. This boundary receives only
  * the captured file identity and Merkle roots; bulk pages stay in native code.
  */
-#ifndef GH_PULLER_NATIVE_KGA_READER_H
-#define GH_PULLER_NATIVE_KGA_READER_H
+#ifndef GH_PULLER_CSRC_KGA_READER_H
+#define GH_PULLER_CSRC_KGA_READER_H
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -38,4 +38,4 @@ typedef struct {
  */
 int ghp_kga_import_snapshot(const ghp_kga_snapshot_t *snapshot, char *error, size_t error_size);
 
-#endif /* GH_PULLER_NATIVE_KGA_READER_H */
+#endif /* GH_PULLER_CSRC_KGA_READER_H */
