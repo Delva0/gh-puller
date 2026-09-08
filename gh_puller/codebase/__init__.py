@@ -5,7 +5,7 @@ optimization and acceptance live in the persistent-digraph laboratory; this pack
 only resolves a promoted, content-addressed executable through :mod:`.binary`.
 """
 
-from .archive import Archive, ArchiveError, ArchiveWriter
+from .archive import Archive, ArchiveError, ArchiveWriter, KGARecorder
 from .binary import CBMBinary, CBMBinaryError, resolve_cbm_binary
 from .build_plan import BuildPlan, IncrementalConfig, IncrementalConfigError
 from .cbm_build import (
@@ -20,8 +20,7 @@ from .cbm_build import (
 from .cbm_runner import CBMRunner
 from .cbm_sdk import CBMClient, default_cbm_cache
 from .cbm_transport import CBMTransportError
-from .graph_reader import GraphReader
-from .kga_recorder import KGARecorder
+from .store import GraphReader
 
 __all__ = [
     "Archive",

@@ -8,8 +8,8 @@ from contextlib import ExitStack, closing
 import pytest
 
 from gh_puller.codebase import journal
-from gh_puller.codebase.generation_diff import PinnedGeneration
 from gh_puller.codebase.journal import JournalUnavailableError, available, candidate_counts, changes_after_publish
+from gh_puller.codebase.store import PinnedGeneration
 
 SCHEMA = """
 PRAGMA foreign_keys=ON;

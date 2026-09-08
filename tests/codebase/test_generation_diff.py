@@ -4,8 +4,7 @@ from contextlib import closing
 
 import pytest
 
-from gh_puller.codebase.generation_diff import PinnedGeneration
-from gh_puller.codebase.store import ExtractionError
+from gh_puller.codebase.store import ExtractionError, PinnedGeneration
 
 SCHEMA = """
 CREATE TABLE projects(name TEXT PRIMARY KEY);

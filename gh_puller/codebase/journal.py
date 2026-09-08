@@ -12,8 +12,7 @@ import sqlite3
 from contextlib import closing
 from typing import TYPE_CHECKING
 
-from .generation_diff import ChangeSet, PinnedGeneration
-from .store import ExtractionError, _edge_row, _node_row
+from .store import ChangeSet, ExtractionError, PinnedGeneration, _edge_row, _node_row
 
 if TYPE_CHECKING:
     from pathlib import Path

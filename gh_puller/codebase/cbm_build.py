@@ -23,14 +23,20 @@ from dataclasses import dataclass, field
 from hashlib import sha256
 from pathlib import Path
 
-from .archive import FORMAT_VERSION, GRAPH_FIDELITY_VERSION, Archive, ArchiveError
+from .archive import (
+    FORMAT_VERSION,
+    GRAPH_FIDELITY_VERSION,
+    Archive,
+    ArchiveError,
+    KGACommit,
+    KGARecorder,
+)
 from .binary import CBMBinaryError, resolve_cbm_binary
 from .build_plan import BuildPlan, IncrementalConfig, IncrementalConfigError, add_incremental_arguments
 from .cbm_runner import CBMRunner
 from .cbm_transport import CBMTransportError
 from .git_tree import TreeError, changed_paths, materialize_full
-from .graph_reader import GraphReader
-from .kga_recorder import KGACommit, KGARecorder
+from .store import GraphReader
 
 SHA_RE = re.compile(r"^[0-9a-f]{40,64}$")
 
