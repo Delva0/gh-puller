@@ -14,7 +14,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
-from .client import GitHubAPI, GitHubPage, GitHubResource
+from .client import GitHubAPI
 from .git_store import (
     CommitFetchSource,
     GitObjectStore,
@@ -26,6 +26,7 @@ if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
     from datetime import datetime
 
+    from .api_contract import GitHubPage, GitHubResource
     from .progress import APIProgressObserver
 
 

@@ -10,8 +10,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 from urllib.parse import parse_qs, urlencode, urlsplit
 
-from gh_puller.github.client import GitHubPage, GitHubResource
-from gh_puller.github.errors import GitHubAPIError
+from gh_puller.github.api_contract import GitHubAPIError, GitHubPage, GitHubResource
 
 _BASE = "/repos/acme/widgets"
 _T0 = datetime(2026, 8, 1, 12, tzinfo=UTC)

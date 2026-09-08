@@ -1,15 +1,428 @@
-"""Map raw GraphQL nodes to stable facts consumed by the collector.
+"""Define GitHub request documents and validated response shapes.
 
-These pure mappings neither issue requests nor choose quotas or persist data. The client
-proves pagination completeness and passes both raw nodes and mapped facts to the syncer.
+This module is the API contract between transport and collection: GraphQL documents
+select archived fields, pure mappings normalize source responses, and shared value
+objects carry validated results. It does not issue requests, choose quotas, or persist
+data.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
 from urllib.parse import quote
 
-from .errors import GitHubAPIError
+
+class GitHubAPIError(RuntimeError):
+    """Report an unrecoverable GitHub response or inconsistent data.
+
+    Args:
+        message: Operator-facing failure description.
+        status_code: HTTP status or equivalent operation status. Local validation and
+            unclassified GraphQL failures use ``None``.
+        url: Final URL of the failed HTTP request, or ``None`` for local validation.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        url: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.url = url
+
+
+@dataclass(frozen=True, slots=True)
+class GitHubPage:
+    """Carry one validated REST page and its opaque continuation URL."""
+
+    items: list[dict[str, Any]]
+    next_url: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class GitHubResource:
+    """Carry an atomic operation's stable value and exact source response."""
+
+    value: Any
+    source: str
+    raw: Any
+    cache: dict[str, Any] | None = None
+
+
+REPOSITORY_ITEM_COUNT = """
+query RepositoryItemCount($owner: String!, $repo: String!) {
+  repository(owner: $owner, name: $repo) {
+    issues(states: [OPEN, CLOSED]) { totalCount }
+    pullRequests(states: [OPEN, CLOSED, MERGED]) { totalCount }
+  }
+}
+"""
+
+PULL_REQUEST_DETAIL = """
+query PullRequestDetail($owner: String!, $repo: String!, $number: Int!) {
+  repository(owner: $owner, name: $repo) {
+    pullRequest(number: $number) {
+      id
+      fullDatabaseId
+      number
+      url
+      state
+      locked
+      title
+      body
+      authorAssociation
+      createdAt
+      updatedAt
+      closedAt
+      mergedAt
+      isDraft
+      merged
+      mergeable
+      mergeStateStatus
+      canBeRebased
+      maintainerCanModify
+      additions
+      deletions
+      changedFiles
+      baseRefName
+      baseRefOid
+      baseRepository { id name nameWithOwner url isFork owner { login avatarUrl url } }
+      headRefName
+      headRefOid
+      headRepository { id name nameWithOwner url isFork owner { login avatarUrl url } }
+      mergeCommit { oid }
+      author {
+        __typename
+        login
+        avatarUrl
+        url
+        ... on User { id databaseId name email isSiteAdmin }
+        ... on Organization { id databaseId name email }
+        ... on Bot { id databaseId }
+        ... on Mannequin { id databaseId email }
+      }
+      comments { totalCount }
+      commits { totalCount }
+    }
+  }
+}
+"""
+
+PULL_REVIEWS = """
+query PullReviews($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
+  repository(owner: $owner, name: $repo) {
+    pullRequest(number: $number) {
+      number
+      reviews(first: 100, after: $cursor) {
+        totalCount
+        nodes {
+          id
+          fullDatabaseId
+          body
+          state
+          authorAssociation
+          submittedAt
+          createdAt
+          updatedAt
+          url
+          commit { oid }
+          author {
+            __typename
+            login
+            avatarUrl
+            url
+            ... on User { id databaseId name email isSiteAdmin }
+            ... on Organization { id databaseId name email }
+            ... on Bot { id databaseId }
+            ... on Mannequin { id databaseId email }
+          }
+        }
+        pageInfo { hasNextPage endCursor }
+      }
+    }
+  }
+}
+"""
+
+PULL_COMMITS = """
+query PullCommits($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
+  repository(owner: $owner, name: $repo) {
+    pullRequest(number: $number) {
+      number
+      commits(first: 100, after: $cursor) {
+        totalCount
+        nodes {
+          id
+          url
+          commit {
+            id
+            oid
+            url
+            message
+            authoredDate
+            committedDate
+            additions
+            deletions
+            changedFilesIfAvailable
+            author { name email date user { id databaseId login avatarUrl url isSiteAdmin } }
+            committer { name email date user { id databaseId login avatarUrl url isSiteAdmin } }
+            tree { oid }
+            parents(first: 100) {
+              totalCount
+              nodes { oid }
+              pageInfo { hasNextPage endCursor }
+            }
+          }
+        }
+        pageInfo { hasNextPage endCursor }
+      }
+    }
+  }
+}
+"""
+
+_REVIEW_COMMENT_FRAGMENT = """
+fragment ReviewCommentFields on PullRequestReviewComment {
+  id
+  fullDatabaseId
+  body
+  authorAssociation
+  createdAt
+  updatedAt
+  url
+  diffHunk
+  path
+  line
+  originalLine
+  originalStartLine
+  startLine
+  outdated
+  subjectType
+  state
+  commit { oid }
+  originalCommit { oid }
+  replyTo { fullDatabaseId }
+  pullRequestReview { fullDatabaseId }
+  reactions { totalCount }
+  author {
+    __typename
+    login
+    avatarUrl
+    url
+    ... on User { id databaseId name email isSiteAdmin }
+    ... on Organization { id databaseId name email }
+    ... on Bot { id databaseId }
+    ... on Mannequin { id databaseId email }
+  }
+}
+"""
+
+PULL_REVIEW_COMMENTS = """
+query PullReviewComments($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
+  repository(owner: $owner, name: $repo) {
+    pullRequest(number: $number) {
+      number
+      reviewThreads(first: 100, after: $cursor) {
+        totalCount
+        nodes {
+          id
+          diffSide
+          isOutdated
+          isResolved
+          line
+          originalLine
+          originalStartLine
+          path
+          startDiffSide
+          startLine
+          subjectType
+          resolvedBy {
+            id
+            databaseId
+            login
+            name
+            email
+            avatarUrl
+            url
+            isSiteAdmin
+          }
+          comments(first: 100) {
+            totalCount
+            nodes { ...ReviewCommentFields }
+            pageInfo { hasNextPage endCursor }
+          }
+        }
+        pageInfo { hasNextPage endCursor }
+      }
+    }
+  }
+}
+""" + _REVIEW_COMMENT_FRAGMENT
+
+_ISSUE_REFERENCE_FRAGMENT = """
+fragment IssueReferenceFields on Issue {
+  id
+  fullDatabaseId
+  number
+  url
+  state
+  title
+  repository { id nameWithOwner url }
+}
+"""
+
+ISSUE_RELATIONS = """
+query IssueRelations($owner: String!, $repo: String!, $number: Int!) {
+  repository(owner: $owner, name: $repo) {
+    issue(number: $number) {
+      ...IssueReferenceFields
+      parent { ...IssueReferenceFields }
+      subIssues(first: 100) {
+        totalCount
+        nodes { ...IssueReferenceFields }
+        pageInfo { hasNextPage endCursor }
+      }
+      blockedBy(first: 100) {
+        totalCount
+        nodes { ...IssueReferenceFields }
+        pageInfo { hasNextPage endCursor }
+      }
+      blocking(first: 100) {
+        totalCount
+        nodes { ...IssueReferenceFields }
+        pageInfo { hasNextPage endCursor }
+      }
+    }
+  }
+}
+""" + _ISSUE_REFERENCE_FRAGMENT
+
+ISSUE_RELATION_PAGES = """
+query IssueRelationPages(
+  $id: ID!,
+  $subIssuesCursor: String,
+  $blockedByCursor: String,
+  $blockingCursor: String,
+  $includeSubIssues: Boolean!,
+  $includeBlockedBy: Boolean!,
+  $includeBlocking: Boolean!
+) {
+  node(id: $id) {
+    ... on Issue {
+      id
+      subIssues(first: 100, after: $subIssuesCursor)
+        @include(if: $includeSubIssues) {
+        totalCount
+        nodes { ...IssueReferenceFields }
+        pageInfo { hasNextPage endCursor }
+      }
+      blockedBy(first: 100, after: $blockedByCursor)
+        @include(if: $includeBlockedBy) {
+        totalCount
+        nodes { ...IssueReferenceFields }
+        pageInfo { hasNextPage endCursor }
+      }
+      blocking(first: 100, after: $blockingCursor)
+        @include(if: $includeBlocking) {
+        totalCount
+        nodes { ...IssueReferenceFields }
+        pageInfo { hasNextPage endCursor }
+      }
+    }
+  }
+}
+""" + _ISSUE_REFERENCE_FRAGMENT
+
+REVIEW_THREAD_COMMENTS = """
+query ReviewThreadComments($id: ID!, $cursor: String) {
+  node(id: $id) {
+    ... on PullRequestReviewThread {
+      id
+      comments(first: 100, after: $cursor) {
+        totalCount
+        nodes { ...ReviewCommentFields }
+        pageInfo { hasNextPage endCursor }
+      }
+    }
+  }
+}
+""" + _REVIEW_COMMENT_FRAGMENT
+
+_ISSUE_COMMENT_FRAGMENT = """
+fragment IssueCommentFields on IssueComment {
+  id
+  fullDatabaseId
+  body
+  bodyHTML
+  bodyText
+  authorAssociation
+  createdAt
+  updatedAt
+  url
+  reactions { totalCount }
+  author {
+    __typename
+    login
+    avatarUrl
+    url
+    ... on User { id databaseId name email isSiteAdmin }
+    ... on Organization { id databaseId name email }
+    ... on Bot { id databaseId }
+    ... on Mannequin { id databaseId email }
+  }
+}
+"""
+
+ISSUE_COMMENTS = """
+query IssueComments($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
+  repository(owner: $owner, name: $repo) {
+    issueOrPullRequest(number: $number) {
+      __typename
+      ... on Issue {
+        number
+        comments(first: 100, after: $cursor) {
+          totalCount
+          nodes { ...IssueCommentFields }
+          pageInfo { hasNextPage endCursor }
+        }
+      }
+      ... on PullRequest {
+        number
+        comments(first: 100, after: $cursor) {
+          totalCount
+          nodes { ...IssueCommentFields }
+          pageInfo { hasNextPage endCursor }
+        }
+      }
+    }
+  }
+}
+""" + _ISSUE_COMMENT_FRAGMENT
+
+REACTIONS = """
+query Reactions($id: ID!, $cursor: String) {
+  node(id: $id) {
+    id
+    ... on Reactable {
+      reactions(first: 100, after: $cursor) {
+        totalCount
+        nodes {
+          id
+          databaseId
+          content
+          createdAt
+          user { __typename id databaseId login avatarUrl url isSiteAdmin }
+        }
+        pageInfo { hasNextPage endCursor }
+      }
+    }
+  }
+}
+"""
 
 
 def graphql_pull(payload: dict[str, Any], number: int) -> dict[str, Any]:

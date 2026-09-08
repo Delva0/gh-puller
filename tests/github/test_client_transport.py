@@ -9,7 +9,7 @@ from gh_puller.github import (
     GitHubAPI,
     GitHubAPIError,
 )
-from gh_puller.github.client import GitHubPage
+from gh_puller.github.api_contract import GitHubPage
 
 
 @pytest.mark.asyncio

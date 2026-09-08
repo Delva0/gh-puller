@@ -9,7 +9,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from dataclasses import dataclass
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from enum import StrEnum
@@ -18,8 +17,20 @@ from urllib.parse import quote
 
 import httpx
 
-from .errors import GitHubAPIError
-from .facts import (
+from .api_contract import (
+    ISSUE_COMMENTS,
+    ISSUE_RELATION_PAGES,
+    ISSUE_RELATIONS,
+    PULL_COMMITS,
+    PULL_REQUEST_DETAIL,
+    PULL_REVIEW_COMMENTS,
+    PULL_REVIEWS,
+    REACTIONS,
+    REPOSITORY_ITEM_COUNT,
+    REVIEW_THREAD_COMMENTS,
+    GitHubAPIError,
+    GitHubPage,
+    GitHubResource,
     check_issue_reference,
     check_size,
     graphql_connection,
@@ -35,18 +46,6 @@ from .facts import (
     rest_review_comment,
 )
 from .progress import APIProgress, RateQuota
-from .queries import (
-    ISSUE_COMMENTS,
-    ISSUE_RELATION_PAGES,
-    ISSUE_RELATIONS,
-    PULL_COMMITS,
-    PULL_REQUEST_DETAIL,
-    PULL_REVIEW_COMMENTS,
-    PULL_REVIEWS,
-    REACTIONS,
-    REPOSITORY_ITEM_COUNT,
-    REVIEW_THREAD_COMMENTS,
-)
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Mapping, Sequence
@@ -80,20 +79,6 @@ class _GraphQLResponseError(GitHubAPIError):
     def __init__(self, errors: Any, url: str) -> None:
         super().__init__(f"GitHub GraphQL error for {url}: {errors!r}", url=url)
         self.errors = errors
-
-
-@dataclass(frozen=True, slots=True)
-class GitHubPage:
-    items: list[dict[str, Any]]  # Validated raw objects from one REST page.
-    next_url: str | None  # Opaque GitHub Link cursor for the next page.
-
-
-@dataclass(frozen=True, slots=True)
-class GitHubResource:
-    value: Any  # Stable operation shape consumed by the syncer.
-    source: str  # API transport that produced raw.
-    raw: Any  # Exact source-native data selected by the operation.
-    cache: dict[str, Any] | None = None  # REST validators paired with value.
 
 
 class GitHubAPI:

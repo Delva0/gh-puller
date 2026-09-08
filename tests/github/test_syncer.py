@@ -11,7 +11,7 @@ from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
-from gh_puller.github.errors import GitHubAPIError
+from gh_puller.github.api_contract import GitHubAPIError
 from gh_puller.github.observations import (
     Coverage,
     DiscoveryItemDraft,

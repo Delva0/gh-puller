@@ -11,14 +11,13 @@ import re
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Protocol
 
-from .client import GitHubResource
+from .api_contract import GitHubAPIError, GitHubResource
 from .commit_references import (
     CommitReference,
     commit_reference_payload,
     commit_reference_scope,
     observation_commit_references,
 )
-from .errors import GitHubAPIError
 from .git_store import (
     CommitFetchSource,
     GitStoreError,
