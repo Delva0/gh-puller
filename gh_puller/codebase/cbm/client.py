@@ -478,6 +478,31 @@ class CBMClient:
             target=target,
         )
 
+    def index_status(
+        self,
+        target: GraphTarget,
+        *,
+        verbose: bool = False,
+    ) -> dict[str, Any]:
+        """Return graph counts, root identity, and persisted coverage status.
+
+        Args:
+            target: Graph and backend selected by :meth:`daemon_graph` or
+                :meth:`load_archive`.
+            verbose: Include live Git/worktree context for daemon graphs.
+                Archive graphs contain no live worktree context.
+
+        Raises:
+            CBMTransportError: ``verbose`` is requested for an archive graph.
+        """
+        if verbose and isinstance(target, ArchiveGraph):
+            raise CBMTransportError("verbose index status requires a daemon-backed graph")
+        return self.call_json_tool(
+            "index_status",
+            {"verbose": verbose},
+            target=target,
+        )
+
     def close(self) -> None:
         """Finish active native and daemon processes and release their pipes."""
         if self._native_transport is not None:

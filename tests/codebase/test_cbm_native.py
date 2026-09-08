@@ -63,7 +63,7 @@ while True:
         result = {{"protocol": 5, "kga_format": 5, "graph_fidelity": 2,
                   "coverage_fidelity": 1, "store_format": 1,
                   "capabilities": ["archive-load", "tool-call"],
-                  "tools": ["query_graph", "get_graph_schema"]}}
+                  "tools": ["query_graph", "get_graph_schema", "index_status"]}}
     elif method == "load":
         Path(params["database_path"]).touch()
         result = {{"project": params["project"], "graph_digest": params["graph_digest"],
@@ -82,6 +82,13 @@ while True:
             result = {{"columns": ["backend", "project"],
                       "rows": [["native", arguments["project"]]], "total": 1,
                       "pid": os.getpid()}}
+        elif name == "index_status":
+            result = {{"project": arguments["project"], "nodes": 3, "edges": 3,
+                      "status": "ready", "parse_partial": {{"files": [], "count": 0,
+                      "truncated": False}}, "skipped": {{"files": [], "count": 0,
+                      "truncated": False}}, "not_indexed": {{"dirs": [],
+                      "dirs_count": 0, "files": [], "files_count": 0,
+                      "truncated": False}}}}
         else:
             result = {{"node_labels": [{{"label": "Function", "count": 2}}],
                       "edge_types": []}}
@@ -334,9 +341,13 @@ def test_client_native_query_does_not_resolve_or_start_mcp(tmp_path):
         graph = client.load_archive(archive_path)
         result = client.query_graph(graph, query="MATCH (n) RETURN n")
         schema = client.call_json_tool("get_graph_schema", target=graph)
+        status = client.index_status(graph)
         assert result["rows"] == [["native", graph.project]]
         assert result["pid"] == client.native_pid
         assert schema["node_labels"][0]["label"] == "Function"
+        assert status["nodes"] == 3
+        with pytest.raises(CBMTransportError, match="requires a daemon-backed graph"):
+            client.index_status(graph, verbose=True)
         assert client._daemon_backend is None
 
         with pytest.raises(CBMBinaryError, match="does not exist"):
@@ -415,6 +426,7 @@ def test_real_native_helper_restores_exact_rows_and_reuses_cache(tmp_path):
             scopes=["."],
             scope_limit=1,
         )
+        status = first.index_status(loaded)
         restored = load_rows(loaded.database_path, "real-native")
         restored_coverage = load_coverage(loaded.database_path, "real-native")
     with CBMClient(native_helper=helper, cache_root=cache, timeout=30) as second:
@@ -479,6 +491,15 @@ def test_real_native_helper_restores_exact_rows_and_reuses_cache(tmp_path):
     assert coverage["scopes"][0]["status"] == "known_gaps"
     assert coverage["scopes"][0]["total"] == 2
     assert coverage["scopes"][0]["has_more"] is True
+    assert status["project"] == "real-native"
+    assert status["nodes"] == 3
+    assert status["edges"] == 3
+    assert status["status"] == "ready"
+    assert status["parse_partial"]["files"] == [
+        {"path": "newline.py", "error_ranges": "3-4, 6-6"},
+    ]
+    assert status["not_indexed"]["dirs"] == ["vendor"]
+    assert "git" not in status
     assert reused.materialized is False
 
 
