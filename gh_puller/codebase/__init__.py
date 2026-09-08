@@ -12,6 +12,7 @@ from .cbm_build import BuildError, BuildOptions, build_archive
 from .cbm_runner import CBMRunner
 from .cbm_sdk import CBMClient, default_cbm_cache
 from .cbm_transport import CBMTransportError
+from .commit_build import CommitBuildResult, CommitTarget, build_commit
 from .graph_reader import GraphReader
 from .incremental_config import IncrementalConfig, IncrementalConfigError
 from .kga_recorder import KGARecorder
@@ -28,11 +29,14 @@ __all__ = [
     "CBMClient",
     "CBMRunner",
     "CBMTransportError",
+    "CommitBuildResult",
+    "CommitTarget",
     "GraphReader",
     "IncrementalConfig",
     "IncrementalConfigError",
     "KGARecorder",
     "build_archive",
+    "build_commit",
     "default_cbm_cache",
     "resolve_cbm_binary",
 ]

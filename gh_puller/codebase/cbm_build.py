@@ -30,6 +30,7 @@ from .archive import (
 )
 from .binary import CBMBinaryError, resolve_cbm_binary
 from .cbm_transport import CBMTransportError, make_transport
+from .errors import BuildError
 from .generation_diff import ChangeSet, PinnedGeneration
 from .git_tree import TreeError, changed_paths, materialize_full
 from .incremental_config import (
@@ -40,10 +41,6 @@ from .incremental_config import (
 from .store import ExtractionError, GraphRows, iter_edges, iter_nodes, validate_rows
 
 SHA_RE = re.compile(r"^[0-9a-f]{40,64}$")
-
-
-class BuildError(Exception):
-    pass
 
 
 @dataclass(frozen=True, slots=True)

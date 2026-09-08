@@ -140,6 +140,7 @@ class CBMRunner:
         self.work_dir = Path(work_dir)
         self.tree = self.work_dir / "tree"
         self.state_path = self.work_dir / "current-sha"
+        self.pending_path = self.work_dir / "pending-sha"
         self.db_path = self.cache_root / f"{project}.db"
         limit = memory_limit or max(1 << 30, _total_memory() - (1 << 30))
         self.monitor = ResourceMonitor(
@@ -171,6 +172,15 @@ class CBMRunner:
         """Return the last commit durably paired with the KGA by the caller."""
         try:
             value = self.state_path.read_text().strip()
+        except OSError:
+            return None
+        return value or None
+
+    @property
+    def pending_commit(self) -> str | None:
+        """Return the commit whose CBM/KGA transaction was interrupted, if any."""
+        try:
+            value = self.pending_path.read_text().strip()
         except OSError:
             return None
         return value or None
@@ -219,6 +229,18 @@ class CBMRunner:
         temporary = self.state_path.with_suffix(".tmp")
         temporary.write_text(sha)
         os.replace(temporary, self.state_path)
+        self.pending_path.unlink(missing_ok=True)
+
+    def begin_commit(self, sha: str) -> None:
+        """Durably identify the commit before asking CBM to publish it.
+
+        Args:
+            sha: Commit identity that the next KGA checkpoint must record.
+        """
+        self.work_dir.mkdir(parents=True, exist_ok=True)
+        temporary = self.pending_path.with_suffix(".tmp")
+        temporary.write_text(sha)
+        os.replace(temporary, self.pending_path)
 
     def delete_project(self) -> tuple[bool, str]:
         """Delete the runner's CBM project through the active transport."""

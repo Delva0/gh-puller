@@ -97,10 +97,9 @@ class GraphReader:
             A complete snapshot or an exact set of mutations from ``previous``.
         """
         if force_snapshot or previous is None:
-            source = "full_snapshot_anchor" if force_snapshot and previous else "full_snapshot"
+            source = "full_snapshot_anchor" if force_snapshot else "full_snapshot"
             return self.snapshot(source=source)
         if unchanged:
             return GraphCapture({}, {}, False, "noop")
         changes = previous.changes_after_publish()
         return GraphCapture(changes.nodes, changes.edges, False, "full_generation")
-

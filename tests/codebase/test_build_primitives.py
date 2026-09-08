@@ -2,6 +2,7 @@
 
 import os
 import sqlite3
+import subprocess
 
 import pytest
 
@@ -9,6 +10,7 @@ import gh_puller.codebase.cbm_runner as runner_module
 from gh_puller.codebase.archive import Archive
 from gh_puller.codebase.build_plan import BuildPlan
 from gh_puller.codebase.cbm_runner import CBMRunner
+from gh_puller.codebase.commit_build import CommitTarget, build_commit
 from gh_puller.codebase.graph_reader import GraphReader
 from gh_puller.codebase.kga_recorder import KGACommit, KGARecorder
 
@@ -53,6 +55,32 @@ class FakeTransport:
         self.closed = True
 
 
+class PublishingRunner:
+    def __init__(self, root):
+        self.project = "p"
+        self.tree = root / "tree"
+        self.db_path = root / "graph.db"
+        self.binary = FakeBinary(root / "cbm")
+        self.current_commit = None
+        self.pending_commit = None
+        self.plans = []
+
+    def begin_commit(self, sha):
+        self.pending_commit = sha
+
+    def index(self, plan):
+        symbol = (self.tree / "symbol.txt").read_text().strip()
+        replacement = self.db_path.with_suffix(".next")
+        write_store(replacement, symbol, value=ord(symbol))
+        os.replace(replacement, self.db_path)
+        self.plans.append(plan)
+        return {"route": "full" if plan.force_full else "closure_repair"}
+
+    def mark_archived(self, sha):
+        self.current_commit = sha
+        self.pending_commit = None
+
+
 def write_store(path, symbol, *, value):
     connection = sqlite3.connect(path)
     connection.executescript(SCHEMA)
@@ -68,6 +96,16 @@ def write_store(path, symbol, *, value):
     )
     connection.commit()
     connection.close()
+
+
+def git(repo, *arguments):
+    result = subprocess.run(
+        ["git", "-C", str(repo), *arguments],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return result.stdout.strip()
 
 
 def test_build_plan_separates_analysis_mode_from_route():
@@ -105,6 +143,49 @@ def test_cbm_runner_reuses_transport_across_commit_plans(tmp_path, monkeypatch):
     assert binary.checks == 3
     runner.close()
     assert transport.closed
+
+
+def test_build_commit_is_the_shared_full_and_delta_operation(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    git(repo, "init")
+    git(repo, "config", "user.email", "test@example.com")
+    git(repo, "config", "user.name", "Test")
+    (repo / "symbol.txt").write_text("a")
+    git(repo, "add", ".")
+    git(repo, "commit", "-m", "first")
+    first = git(repo, "rev-parse", "HEAD")
+    (repo / "symbol.txt").write_text("b")
+    git(repo, "commit", "-am", "second")
+    second = git(repo, "rev-parse", "HEAD")
+
+    runner = PublishingRunner(tmp_path / "runner")
+    reader = GraphReader(runner.db_path, runner.project)
+    recorder = KGARecorder(tmp_path / "archive.kga")
+    full = build_commit(
+        repo,
+        CommitTarget(0, first, (), None),
+        BuildPlan(route="full"),
+        runner,
+        reader,
+        recorder,
+    )
+    delta = build_commit(
+        repo,
+        CommitTarget(1, second, (first,), first),
+        BuildPlan(route="delta"),
+        runner,
+        reader,
+        recorder,
+    )
+    recorder.finalize()
+
+    assert full.manifest["generation_diff_source"] == "full_snapshot"
+    assert delta.manifest["generation_diff_source"] == "full_generation"
+    assert [plan.route for plan in runner.plans] == ["full", "delta"]
+    with Archive(tmp_path / "archive.kga") as archive:
+        assert set(archive.load_rows(first).nodes) == {"p", "p.a"}
+        assert set(archive.load_rows(second).nodes) == {"p", "p.b"}
 
 
 def test_graph_reader_and_recorder_preserve_full_and_diff_generations(tmp_path):
