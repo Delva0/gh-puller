@@ -1,5 +1,5 @@
 /*
- * kga_reader.h — Stream one immutable KGA graph snapshot through the CBM SDK.
+ * kga_reader.h — Stream one immutable KGA snapshot through the CBM SDK.
  *
  * Python owns archive index and commit selection. This boundary receives only
  * the captured file identity and Merkle roots; bulk pages stay in native code.
@@ -21,17 +21,32 @@ typedef struct {
 } ghp_kga_root_t;
 
 typedef struct {
+    const char *index_mode;
+    const char *recorded_at;
+    const char *recording_status;
+    int ignored_files_stored;
+    int ignored_files_total;
+    int coverage_version;
+    bool hash_records_complete;
+} ghp_kga_coverage_meta_t;
+
+typedef struct {
     const char *archive_path;
     uint64_t archive_device;
     uint64_t archive_inode;
     uint64_t captured_size;
     const char *project;
     const char *graph_digest;
+    const char *materialization_digest;
     const char *database_path;
     ghp_kga_root_t node_root;
     ghp_kga_root_t edge_root;
+    ghp_kga_root_t coverage_root;
     int node_count;
     int edge_count;
+    int coverage_count;
+    bool coverage_present;
+    ghp_kga_coverage_meta_t coverage_meta;
 } ghp_kga_snapshot_t;
 
 /* Validate every referenced frame and publish one complete SQLite generation.

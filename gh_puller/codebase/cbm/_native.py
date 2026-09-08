@@ -24,16 +24,16 @@ from hashlib import sha256
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, BinaryIO, Self
 
-from ..archive import GRAPH_FIDELITY_VERSION, Archive
+from ..archive import COVERAGE_FIDELITY_VERSION, GRAPH_FIDELITY_VERSION, Archive
 from ._daemon import CBMTransportError
 
 if TYPE_CHECKING:
     from collections.abc import Iterator, Mapping
 
-_PROTOCOL_VERSION = 4
+_PROTOCOL_VERSION = 5
 _RESPONSE_MAX_BYTES = 256 << 20
 _HELPER_ENV = "GH_PULLER_CODEBASE_CBM_HELPER"
-_CACHE_SCHEMA = 3
+_CACHE_SCHEMA = 4
 _STREAM_CLOSED = object()
 
 
@@ -182,6 +182,7 @@ class NativeArchiveTransport:
         self._closed = False
         self.loaded_project: str | None = None
         self.loaded_digest: str | None = None
+        self.loaded_materialization_digest: str | None = None
         helper_environment = dict(values)
         helper_environment.setdefault("CBM_LOG_LEVEL", "error")
         self.process = subprocess.Popen(
@@ -205,6 +206,7 @@ class NativeArchiveTransport:
                 hello.get("protocol") != _PROTOCOL_VERSION
                 or hello.get("kga_format") != 5
                 or hello.get("graph_fidelity") != GRAPH_FIDELITY_VERSION
+                or hello.get("coverage_fidelity") != COVERAGE_FIDELITY_VERSION
                 or not isinstance(capabilities, list)
                 or not all(isinstance(item, str) for item in capabilities)
                 or not {"archive-load", "tool-call"} <= set(capabilities)
@@ -331,7 +333,7 @@ class NativeArchiveTransport:
         *,
         allow_incomplete: bool = True,
     ) -> dict[str, Any]:
-        """Materialize and retain one archived commit without Python graph rows.
+        """Materialize and retain one archived commit without Python bulk rows.
 
         Args:
             archive: KGA path or an already captured reader.
@@ -348,16 +350,23 @@ class NativeArchiveTransport:
             manifest, project = reader._restorable_manifest(commit)
             status = os.fstat(reader._reader.fd)
             archive_path = reader.path.resolve(strict=True)
-            database, marker, lock = self._cache_paths(manifest["graph_digest"])
+            materialization = manifest.get("materialization_digest", manifest["graph_digest"])
+            coverage_fidelity = manifest.get("coverage_fidelity_version", 0)
+            coverage_count = manifest.get("coverage_rows", 0)
+            database, marker, lock = self._cache_paths(materialization)
             expected_marker = {
                 "schema": _CACHE_SCHEMA,
                 "helper_sha256": self.helper.sha256,
                 "store_format": self.store_format,
                 "graph_digest": manifest["graph_digest"],
+                "materialization_digest": materialization,
                 "project": project,
                 "nodes": manifest["nodes"],
                 "edges": manifest["edges"],
                 "graph_fidelity": manifest["graph_fidelity_version"],
+                "coverage_digest": manifest.get("coverage_digest"),
+                "coverage_rows": coverage_count,
+                "coverage_fidelity": coverage_fidelity,
             }
             parameters = {
                 "archive_path": str(archive_path),
@@ -366,12 +375,17 @@ class NativeArchiveTransport:
                 "captured_size": reader._reader.size,
                 "project": project,
                 "graph_digest": manifest["graph_digest"],
+                "materialization_digest": materialization,
                 "database_path": str(database),
                 "node_count": manifest["nodes"],
                 "edge_count": manifest["edges"],
                 "graph_fidelity": manifest["graph_fidelity_version"],
+                "coverage_fidelity": coverage_fidelity,
+                "coverage_count": coverage_count,
                 "node_root": manifest["node_root"],
                 "edge_root": manifest["edge_root"],
+                "coverage_root": manifest.get("coverage_root"),
+                "coverage_metadata": manifest.get("coverage_metadata"),
             }
             with _exclusive_lock(lock, self.timeout):
                 parameters["reuse"] = database.is_file() and _read_marker(marker) == expected_marker
@@ -379,9 +393,12 @@ class NativeArchiveTransport:
                 expected_result = {
                     "project": project,
                     "graph_digest": manifest["graph_digest"],
+                    "materialization_digest": materialization,
                     "nodes": manifest["nodes"],
                     "edges": manifest["edges"],
                     "graph_fidelity": manifest["graph_fidelity_version"],
+                    "coverage_rows": coverage_count,
+                    "coverage_fidelity": coverage_fidelity,
                 }
                 if (
                     any(result.get(key) != value for key, value in expected_result.items())
@@ -391,6 +408,7 @@ class NativeArchiveTransport:
                 _write_marker(marker, expected_marker)
             self.loaded_project = project
             self.loaded_digest = manifest["graph_digest"]
+            self.loaded_materialization_digest = materialization
             return {**result, "database_path": str(database)}
         finally:
             if owned:

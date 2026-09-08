@@ -11,9 +11,16 @@ from gh_puller.codebase import (
     CBMClient,
     CBMTransportError,
 )
-from gh_puller.codebase.archive import GRAPH_FIDELITY_VERSION, RadixTree, graph_digest
+from gh_puller.codebase.archive import (
+    COVERAGE_FIDELITY_VERSION,
+    GRAPH_FIDELITY_VERSION,
+    RadixTree,
+    coverage_digest,
+    graph_digest,
+    materialization_digest,
+)
 from gh_puller.codebase.cbm._native import NativeArchiveTransport
-from gh_puller.codebase.store import GraphRows, load_rows
+from gh_puller.codebase.store import GraphRows, load_coverage, load_rows
 
 
 def write_fake_helper(path: Path, *, hang_on_query: bool = False) -> None:
@@ -27,7 +34,7 @@ import sys
 import time
 
 if sys.argv[1:] == ["--version"]:
-    print("gh-puller-cbm-helper 4")
+    print("gh-puller-cbm-helper 5")
     raise SystemExit(0)
 
 def read_exact(size):
@@ -53,14 +60,18 @@ while True:
         with Path(log).open("a") as stream:
             stream.write(json.dumps(request) + "\\n")
     if method == "hello":
-        result = {{"protocol": 4, "kga_format": 5, "graph_fidelity": 2, "store_format": 1,
+        result = {{"protocol": 5, "kga_format": 5, "graph_fidelity": 2,
+                  "coverage_fidelity": 1, "store_format": 1,
                   "capabilities": ["archive-load", "tool-call"],
                   "tools": ["query_graph", "get_graph_schema"]}}
     elif method == "load":
         Path(params["database_path"]).touch()
         result = {{"project": params["project"], "graph_digest": params["graph_digest"],
+                  "materialization_digest": params["materialization_digest"],
                   "nodes": params["node_count"], "edges": params["edge_count"],
                   "graph_fidelity": params["graph_fidelity"],
+                  "coverage_rows": params["coverage_count"],
+                  "coverage_fidelity": params["coverage_fidelity"],
                   "materialized": not params["reuse"]}}
     elif method == "call":
         name = params["name"]
@@ -87,7 +98,13 @@ while True:
     path.chmod(0o755)
 
 
-def write_archive(path: Path, project: str = "native-test") -> tuple[dict, GraphRows]:
+def write_archive(
+    path: Path,
+    project: str = "native-test",
+    *,
+    with_coverage: bool = False,
+    coverage_generation: str = "original-cbm-generation",
+) -> tuple[dict, GraphRows]:
     newline = f"{project}.mod.unit.a\n"
     bang = f"{project}.mod.unit.a!"
     rows = GraphRows(
@@ -137,6 +154,37 @@ def write_archive(path: Path, project: str = "native-test") -> tuple[dict, Graph
         "graph_fidelity_version": GRAPH_FIDELITY_VERSION,
         "cbm_project": project,
     }
+    if with_coverage:
+        coverage_rows = {
+            ("newline.py", "parse_partial"): "3-4, 6-6",
+            ("vendor", "not_indexed_dir"): "excluded subtree",
+        }
+        coverage_metadata = {
+            "project": project,
+            "generation": coverage_generation,
+            "index_mode": "delta",
+            "recorded_at": "2026-09-08T00:00:00Z",
+            "recording_status": "complete",
+            "ignored_files_stored": 1,
+            "ignored_files_total": 1,
+            "coverage_version": 3,
+            "hash_records_complete": True,
+        }
+        coverage_root = RadixTree(writer, "coverage").build(coverage_rows.items())
+        coverage_identity = coverage_digest(coverage_root, coverage_metadata)
+        manifest.update(
+            {
+                "coverage_root": coverage_root.to_json(),
+                "coverage_rows": len(coverage_rows),
+                "coverage_metadata": coverage_metadata,
+                "coverage_digest": coverage_identity,
+                "materialization_digest": materialization_digest(
+                    manifest["graph_digest"],
+                    coverage_identity,
+                ),
+                "coverage_fidelity_version": COVERAGE_FIDELITY_VERSION,
+            },
+        )
     writer.commit(manifest)
     writer.finalize()
     return manifest, rows
@@ -214,9 +262,13 @@ def test_native_transport_keeps_graph_rows_out_of_python(tmp_path, monkeypatch):
     load_request = next(item for item in requests(log) if item["method"] == "load")
     assert loaded["materialized"] is True
     assert loaded["graph_digest"] == manifest["graph_digest"]
+    assert loaded["materialization_digest"] == manifest["graph_digest"]
     assert Path(loaded["database_path"]).is_file()
     assert load_request["params"]["node_root"] == manifest["node_root"]
     assert load_request["params"]["edge_root"] == manifest["edge_root"]
+    assert load_request["params"]["coverage_fidelity"] == 0
+    assert load_request["params"]["coverage_root"] is None
+    assert load_request["params"]["coverage_metadata"] is None
     assert queried["rows"] == [["native", "native-test"]]
 
 
@@ -235,6 +287,35 @@ def test_native_cache_is_reused_by_a_new_helper_process(tmp_path):
 
     loads = [item for item in requests(log) if item["method"] == "load"]
     assert [item["params"]["reuse"] for item in loads] == [False, True]
+
+
+def test_native_identity_includes_coverage_snapshot(tmp_path):
+    helper = tmp_path / "fake-helper"
+    first_archive = tmp_path / "first.kga"
+    second_archive = tmp_path / "second.kga"
+    write_fake_helper(helper)
+    first_manifest, _ = write_archive(
+        first_archive,
+        with_coverage=True,
+        coverage_generation="generation-one",
+    )
+    second_manifest, _ = write_archive(
+        second_archive,
+        with_coverage=True,
+        coverage_generation="generation-two",
+    )
+    assert first_manifest["graph_digest"] == second_manifest["graph_digest"]
+    assert first_manifest["materialization_digest"] != second_manifest["materialization_digest"]
+
+    with CBMClient(native_helper=helper, cache_root=tmp_path / "cache", timeout=5) as client:
+        first = client.load_archive(first_archive)
+        second = client.load_archive(second_archive)
+
+        assert first.database_path != second.database_path
+        assert second.coverage_rows == 2
+        assert second.coverage_fidelity == COVERAGE_FIDELITY_VERSION
+        with pytest.raises(CBMTransportError, match="no longer loaded"):
+            client.query_graph(first, query="MATCH (n) RETURN n")
 
 
 def test_client_native_query_does_not_resolve_or_start_mcp(tmp_path):
@@ -306,7 +387,7 @@ def test_real_native_helper_restores_exact_rows_and_reuses_cache(tmp_path):
         pytest.skip("real native helper not configured")
     helper = Path(configured)
     archive_path = tmp_path / "archive.kga"
-    manifest, expected = write_archive(archive_path, "real-native")
+    manifest, expected = write_archive(archive_path, "real-native", with_coverage=True)
     cache = tmp_path / "cache"
 
     with CBMClient(native_helper=helper, cache_root=cache, timeout=30) as first:
@@ -328,13 +409,37 @@ def test_real_native_helper_restores_exact_rows_and_reuses_cache(tmp_path):
             loaded,
             aspects=["structure", "dependencies"],
         )
+        coverage = first.check_index_coverage(
+            loaded,
+            paths=["newline.py", "vendor/package.c"],
+            scopes=["."],
+            scope_limit=1,
+        )
         restored = load_rows(loaded.database_path, "real-native")
+        restored_coverage = load_coverage(loaded.database_path, "real-native")
     with CBMClient(native_helper=helper, cache_root=cache, timeout=30) as second:
         reused = second.load_archive(archive_path)
 
     assert loaded.materialized is True
     assert loaded.graph_digest == manifest["graph_digest"]
+    assert loaded.materialization_digest == manifest["materialization_digest"]
+    assert loaded.coverage_rows == manifest["coverage_rows"]
+    assert loaded.coverage_fidelity == COVERAGE_FIDELITY_VERSION
     assert restored == expected
+    assert restored_coverage is not None
+    assert restored_coverage.rows == {
+        ("newline.py", "parse_partial"): "3-4, 6-6",
+        ("vendor", "not_indexed_dir"): "excluded subtree",
+    }
+    assert {
+        key: value
+        for key, value in restored_coverage.metadata.items()
+        if key != "generation"
+    } == {
+        key: value
+        for key, value in manifest["coverage_metadata"].items()
+        if key != "generation"
+    }
     assert {tuple(row[:2]) for row in queried["rows"]} == {
         ("bang", "bang.py"),
         ("newline", "newline.py"),
@@ -362,6 +467,18 @@ def test_real_native_helper_restores_exact_rows_and_reuses_cache(tmp_path):
         ("CALLS", 1),
         ("CONTAINS", 2),
     }
+    assert coverage["metadata"]["generation_matches"] is True
+    assert coverage["metadata"]["index_mode"] == "delta"
+    assert coverage["paths"][0]["status"] == "partial"
+    assert coverage["paths"][0]["freshness"] == "unavailable"
+    assert coverage["paths"][0]["coverage"][0]["ranges"] == [
+        {"start": 3, "end": 4},
+        {"start": 6, "end": 6},
+    ]
+    assert coverage["paths"][1]["status"] == "excluded"
+    assert coverage["scopes"][0]["status"] == "known_gaps"
+    assert coverage["scopes"][0]["total"] == 2
+    assert coverage["scopes"][0]["has_more"] is True
     assert reused.materialized is False
 
 

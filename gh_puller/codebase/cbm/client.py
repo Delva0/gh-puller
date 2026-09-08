@@ -55,10 +55,13 @@ class ArchiveGraph(GraphTarget):
     """
 
     graph_digest: str
+    materialization_digest: str
     database_path: Path
     nodes: int
     edges: int
     graph_fidelity: int
+    coverage_rows: int
+    coverage_fidelity: int
     materialized: bool
 
 
@@ -288,7 +291,11 @@ class CBMClient:
             values["project"] = target.project
         if isinstance(target, ArchiveGraph):
             native = self._native_transport
-            if native is None or native.loaded_project != target.project or native.loaded_digest != target.graph_digest:
+            if (
+                native is None
+                or native.loaded_project != target.project
+                or native.loaded_materialization_digest != target.materialization_digest
+            ):
                 raise CBMTransportError("archive graph is no longer loaded by this CBM client")
             if name not in native.tools:
                 raise CBMTransportError(f"native CBM tool is not supported for this archive graph: {name}")
@@ -382,10 +389,13 @@ class CBMClient:
         return ArchiveGraph(
             project=result["project"],
             graph_digest=result["graph_digest"],
+            materialization_digest=result["materialization_digest"],
             database_path=Path(result["database_path"]),
             nodes=result["nodes"],
             edges=result["edges"],
             graph_fidelity=result["graph_fidelity"],
+            coverage_rows=result["coverage_rows"],
+            coverage_fidelity=result["coverage_fidelity"],
             materialized=result["materialized"],
         )
 
@@ -437,6 +447,36 @@ class CBMClient:
             arguments["aspects"] = list(aspects)
         arguments["format"] = "json"
         return self.call_json_tool("get_architecture", arguments, target=target)
+
+    def check_index_coverage(
+        self,
+        target: GraphTarget,
+        *,
+        paths: Sequence[str] = (),
+        scopes: Sequence[str] = (),
+        scope_limit: int = 200,
+        scope_offset: int = 0,
+    ) -> dict[str, Any]:
+        """Inspect CBM's best-effort coverage record for paths or scopes.
+
+        Args:
+            target: Graph and backend selected by :meth:`daemon_graph` or
+                :meth:`load_archive`.
+            paths: Repository-relative files to check exactly.
+            scopes: Repository-relative path prefixes to enumerate.
+            scope_limit: Maximum coverage rows returned for each scope.
+            scope_offset: Starting row offset for each scope.
+        """
+        return self.call_json_tool(
+            "check_index_coverage",
+            {
+                "paths": list(paths),
+                "scopes": list(scopes),
+                "scope_limit": scope_limit,
+                "scope_offset": scope_offset,
+            },
+            target=target,
+        )
 
     def close(self) -> None:
         """Finish active native and daemon processes and release their pipes."""

@@ -1,5 +1,5 @@
 /*
- * kga_reader.c — Verify KGA pages and stream exact graph rows into CBM.
+ * kga_reader.c — Verify KGA pages and stream exact graph and coverage rows into CBM.
  *
  * The reader opens a file identity captured by Python, bounds every positional
  * read to that immutable view, and validates frame CRC, SHA-256, and Merkle
@@ -51,6 +51,7 @@ typedef struct {
 
 typedef cbm_sdk_node_t node_item_t;
 typedef cbm_sdk_edge_t edge_item_t;
+typedef cbm_sdk_coverage_row_t coverage_item_t;
 
 typedef struct {
     struct timespec started;
@@ -102,6 +103,12 @@ static bool digest_valid(const char *digest) {
         }
     }
     return true;
+}
+
+static bool coverage_meta_valid(const ghp_kga_coverage_meta_t *metadata) {
+    return metadata->index_mode && metadata->recorded_at && metadata->recording_status &&
+           metadata->ignored_files_stored >= 0 && metadata->ignored_files_total >= 0 &&
+           metadata->coverage_version >= 1;
 }
 
 static uint32_t read_u32_be(const unsigned char *bytes) {
@@ -299,7 +306,14 @@ static int compare_edges(const void *left, const void *right) {
     return 0;
 }
 
-static bool shard_matches(const char *identity, const char *shard) {
+static int compare_coverage(const void *left, const void *right) {
+    const coverage_item_t *a = left;
+    const coverage_item_t *b = right;
+    int path_comparison = strcmp(a->rel_path, b->rel_path);
+    return path_comparison != 0 ? path_comparison : strcmp(a->kind, b->kind);
+}
+
+static bool graph_shard_matches(const char *identity, const char *shard) {
     if (!identity || !shard) {
         return false;
     }
@@ -313,6 +327,18 @@ static bool shard_matches(const char *identity, const char *shard) {
     }
     size_t length = dots == 3 ? (size_t)(cursor - identity - 1) : (size_t)(cursor - identity);
     return strlen(shard) == length && memcmp(identity, shard, length) == 0;
+}
+
+static bool coverage_shard_matches(const char *rel_path, const char *shard) {
+    if (!rel_path || !shard) {
+        return false;
+    }
+    const char *slash = strchr(rel_path, '/');
+    size_t length = slash ? (size_t)(slash - rel_path) : strlen(rel_path);
+    if (length == 0) {
+        return strcmp(shard, ".") == 0;
+    }
+    return strlen(shard) == length && memcmp(rel_path, shard, length) == 0;
 }
 
 static int import_node_leaf(import_context_t *context, yyjson_val *entries, uint64_t count,
@@ -337,7 +363,7 @@ static int import_node_leaf(import_context_t *context, yyjson_val *entries, uint
             !(row->file_path = json_string(yyjson_obj_get(attributes, "file_path"))) ||
             !json_int32(yyjson_obj_get(attributes, "start_line"), &row->start_line) ||
             !json_int32(yyjson_obj_get(attributes, "end_line"), &row->end_line) ||
-            !shard_matches(row->qualified_name, shard)) {
+            !graph_shard_matches(row->qualified_name, shard)) {
             fail(context->error, context->error_size, "invalid node row in KGA leaf");
             goto cleanup;
         }
@@ -389,7 +415,7 @@ static int import_edge_leaf(import_context_t *context, yyjson_val *entries, uint
             !(row->target = json_string(yyjson_arr_get(identity, 1))) ||
             !(row->type = json_string(yyjson_arr_get(identity, 2))) ||
             !(row->local_name = json_string(yyjson_arr_get(identity, 3))) ||
-            !shard_matches(row->source, shard)) {
+            !graph_shard_matches(row->source, shard)) {
             fail(context->error, context->error_size, "invalid edge row in KGA leaf");
             goto cleanup;
         }
@@ -415,6 +441,47 @@ cleanup:
     for (size_t item = 0; item < (size_t)count; item++) {
         free((void *)items[item].properties_json);
     }
+    free(items);
+    return status;
+}
+
+static int import_coverage_leaf(import_context_t *context, yyjson_val *entries, uint64_t count,
+                                const char *shard) {
+    if (!yyjson_is_arr(entries) || yyjson_arr_size(entries) != count || count > SIZE_MAX) {
+        return fail(context->error, context->error_size, "invalid coverage leaf entries");
+    }
+    coverage_item_t *items = calloc((size_t)count, sizeof(*items));
+    if (!items && count > 0) {
+        return fail(context->error, context->error_size, "cannot allocate coverage leaf");
+    }
+    int status = -1;
+    size_t index, maximum;
+    yyjson_val *entry;
+    yyjson_arr_foreach(entries, index, maximum, entry) {
+        yyjson_val *identity = yyjson_arr_get(entry, 0);
+        coverage_item_t *row = &items[index];
+        if (!yyjson_is_arr(entry) || yyjson_arr_size(entry) != 2 || !yyjson_is_arr(identity) ||
+            yyjson_arr_size(identity) != 2 ||
+            !(row->rel_path = json_string(yyjson_arr_get(identity, 0))) ||
+            !(row->kind = json_string(yyjson_arr_get(identity, 1))) ||
+            !(row->detail = json_string(yyjson_arr_get(entry, 1))) ||
+            !coverage_shard_matches(row->rel_path, shard)) {
+            fail(context->error, context->error_size, "invalid coverage row in KGA leaf");
+            goto cleanup;
+        }
+    }
+    qsort(items, (size_t)count, sizeof(*items), compare_coverage);
+    for (size_t item = 1; item < (size_t)count; item++) {
+        if (compare_coverage(&items[item - 1], &items[item]) == 0) {
+            fail(context->error, context->error_size, "duplicate coverage identity in KGA leaf");
+            goto cleanup;
+        }
+    }
+    cbm_sdk_status_t imported = cbm_sdk_import_add_coverage(context->import, items, (size_t)count,
+                                                            context->error, context->error_size);
+    status = imported == CBM_SDK_OK ? 0 : -1;
+
+cleanup:
     free(items);
     return status;
 }
@@ -450,8 +517,15 @@ static int import_tree(import_context_t *context, const ghp_kga_root_t *referenc
             goto done;
         }
         yyjson_val *entries = yyjson_obj_get(root, "entries");
-        status = strcmp(tree, "nodes") == 0 ? import_node_leaf(context, entries, count, shard)
-                                            : import_edge_leaf(context, entries, count, shard);
+        if (strcmp(tree, "nodes") == 0) {
+            status = import_node_leaf(context, entries, count, shard);
+        } else if (strcmp(tree, "edges") == 0) {
+            status = import_edge_leaf(context, entries, count, shard);
+        } else if (strcmp(tree, "coverage") == 0) {
+            status = import_coverage_leaf(context, entries, count, shard);
+        } else {
+            fail(context->error, context->error_size, "unsupported KGA tree");
+        }
     } else if (strcmp(kind, "branch") == 0) {
         if (depth != 0 || shard) {
             fail(context->error, context->error_size, "invalid KGA branch depth");
@@ -501,12 +575,20 @@ int ghp_kga_import_snapshot(const ghp_kga_snapshot_t *snapshot, char *error, siz
         error[0] = '\0';
     }
     if (!snapshot || !snapshot->archive_path || !snapshot->project || !snapshot->database_path ||
-        !digest_valid(snapshot->graph_digest) || snapshot->captured_size < sizeof(KGA_MAGIC) ||
-        snapshot->node_count < 1 || snapshot->edge_count < 0 || !snapshot->node_root.present ||
+        !digest_valid(snapshot->graph_digest) || !digest_valid(snapshot->materialization_digest) ||
+        snapshot->captured_size < sizeof(KGA_MAGIC) || snapshot->node_count < 1 ||
+        snapshot->edge_count < 0 || !snapshot->node_root.present ||
         snapshot->node_root.count != (uint64_t)snapshot->node_count ||
         snapshot->edge_root.present != (snapshot->edge_count > 0) ||
         (snapshot->edge_root.present &&
-         snapshot->edge_root.count != (uint64_t)snapshot->edge_count)) {
+         snapshot->edge_root.count != (uint64_t)snapshot->edge_count) ||
+        snapshot->coverage_count < 0 ||
+        snapshot->coverage_root.present !=
+            (snapshot->coverage_present && snapshot->coverage_count > 0) ||
+        (snapshot->coverage_root.present &&
+         snapshot->coverage_root.count != (uint64_t)snapshot->coverage_count) ||
+        (snapshot->coverage_present && !coverage_meta_valid(&snapshot->coverage_meta)) ||
+        (!snapshot->coverage_present && snapshot->coverage_count != 0)) {
         return fail(error, error_size, "invalid KGA import snapshot");
     }
 
@@ -555,6 +637,25 @@ int ghp_kga_import_snapshot(const ghp_kga_snapshot_t *snapshot, char *error, siz
         profile_span_t edges_started = profile_start();
         result = import_tree(&context, &snapshot->edge_root, "edges", NULL, 0);
         profile_finish("edges", edges_started, snapshot->edge_count);
+    }
+    if (result == 0 && snapshot->coverage_present) {
+        cbm_sdk_coverage_meta_t metadata = {
+            .index_mode = snapshot->coverage_meta.index_mode,
+            .recorded_at = snapshot->coverage_meta.recorded_at,
+            .recording_status = snapshot->coverage_meta.recording_status,
+            .ignored_files_stored = snapshot->coverage_meta.ignored_files_stored,
+            .ignored_files_total = snapshot->coverage_meta.ignored_files_total,
+            .coverage_version = snapshot->coverage_meta.coverage_version,
+            .hash_records_complete = snapshot->coverage_meta.hash_records_complete,
+        };
+        profile_span_t coverage_started = profile_start();
+        if (cbm_sdk_import_set_coverage(import, &metadata, snapshot->coverage_count, error,
+                                        error_size) != CBM_SDK_OK ||
+            (snapshot->coverage_root.present &&
+             import_tree(&context, &snapshot->coverage_root, "coverage", NULL, 0) != 0)) {
+            result = -1;
+        }
+        profile_finish("coverage", coverage_started, snapshot->coverage_count);
     }
     if (result == 0) {
         profile_span_t finish_started = profile_start();
