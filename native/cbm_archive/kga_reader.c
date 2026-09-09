@@ -13,7 +13,9 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <pthread.h>
 #include <stdarg.h>
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -31,6 +33,7 @@ enum {
     KGA_FRAME_HEADER_SIZE = 53,
     KGA_FRAME_DIGEST_OFFSET = 21,
     KGA_MAX_TREE_DEPTH = 64,
+    KGA_IMPORT_WORKERS = 8,
 };
 
 static const unsigned char KGA_MAGIC[] = {'K', 'G', 'A', '5', '\r', '\n', 0x1a, '\n'};
@@ -47,6 +50,8 @@ typedef struct {
     cbm_sdk_import_t *import;
     char *error;
     size_t error_size;
+    pthread_mutex_t *sdk_lock;
+    atomic_int *failed;
 } import_context_t;
 
 typedef cbm_sdk_node_t node_item_t;
@@ -57,6 +62,22 @@ typedef struct {
     struct timespec started;
     bool active;
 } profile_span_t;
+
+typedef struct {
+    ghp_kga_root_t reference;
+    const char *shard;
+} tree_child_t;
+
+typedef struct {
+    import_context_t context;
+    const tree_child_t *children;
+    size_t child_count;
+    const char *tree;
+    atomic_size_t next;
+    atomic_int failed;
+    pthread_mutex_t sdk_lock;
+    char error[1024];
+} tree_import_work_t;
 
 static profile_span_t profile_start(void) {
     const char *profile = getenv("CBM_PROFILE");
@@ -390,8 +411,17 @@ static int import_node_leaf(import_context_t *context, yyjson_val *entries, uint
             goto cleanup;
         }
     }
-    cbm_sdk_status_t imported = cbm_sdk_import_add_nodes(context->import, items, (size_t)count,
-                                                         context->error, context->error_size);
+    if (context->sdk_lock) {
+        (void)pthread_mutex_lock(context->sdk_lock);
+    }
+    cbm_sdk_status_t imported =
+        context->failed && atomic_load(context->failed)
+            ? CBM_SDK_CANCELLED
+            : cbm_sdk_import_add_nodes(context->import, items, (size_t)count, context->error,
+                                       context->error_size);
+    if (context->sdk_lock) {
+        (void)pthread_mutex_unlock(context->sdk_lock);
+    }
     status = imported == CBM_SDK_OK ? 0 : -1;
 
 cleanup:
@@ -442,8 +472,17 @@ static int import_edge_leaf(import_context_t *context, yyjson_val *entries, uint
             goto cleanup;
         }
     }
-    cbm_sdk_status_t imported = cbm_sdk_import_add_edges(context->import, items, (size_t)count,
-                                                         context->error, context->error_size);
+    if (context->sdk_lock) {
+        (void)pthread_mutex_lock(context->sdk_lock);
+    }
+    cbm_sdk_status_t imported =
+        context->failed && atomic_load(context->failed)
+            ? CBM_SDK_CANCELLED
+            : cbm_sdk_import_add_edges(context->import, items, (size_t)count, context->error,
+                                       context->error_size);
+    if (context->sdk_lock) {
+        (void)pthread_mutex_unlock(context->sdk_lock);
+    }
     status = imported == CBM_SDK_OK ? 0 : -1;
 
 cleanup:
@@ -493,6 +532,79 @@ static int import_coverage_leaf(import_context_t *context, yyjson_val *entries, 
 cleanup:
     free(items);
     return status;
+}
+
+static int import_tree(import_context_t *context, const ghp_kga_root_t *reference,
+                       const char *tree, const char *shard, unsigned depth);
+
+static void *import_tree_worker(void *opaque) {
+    tree_import_work_t *work = opaque;
+    while (!atomic_load(&work->failed)) {
+        size_t index = atomic_fetch_add(&work->next, 1);
+        if (index >= work->child_count) {
+            break;
+        }
+        char error[sizeof(work->error)] = {0};
+        import_context_t context = work->context;
+        context.error = error;
+        context.error_size = sizeof(error);
+        context.sdk_lock = &work->sdk_lock;
+        context.failed = &work->failed;
+        const tree_child_t *child = &work->children[index];
+        if (import_tree(&context, &child->reference, work->tree, child->shard, 1) != 0) {
+            int expected = 0;
+            if (atomic_compare_exchange_strong(&work->failed, &expected, 1)) {
+                (void)snprintf(work->error, sizeof(work->error), "%s",
+                               error[0] ? error : "parallel KGA import failed");
+            }
+            break;
+        }
+    }
+    return NULL;
+}
+
+static int import_tree_children(import_context_t *context, const tree_child_t *children,
+                                size_t child_count, const char *tree) {
+    if (child_count < 2 || strcmp(tree, "coverage") == 0) {
+        for (size_t index = 0; index < child_count; index++) {
+            if (import_tree(context, &children[index].reference, tree, children[index].shard, 1) !=
+                0) {
+                return -1;
+            }
+        }
+        return 0;
+    }
+
+    tree_import_work_t work = {
+        .context = *context,
+        .children = children,
+        .child_count = child_count,
+        .tree = tree,
+    };
+    atomic_init(&work.next, 0);
+    atomic_init(&work.failed, 0);
+    if (pthread_mutex_init(&work.sdk_lock, NULL) != 0) {
+        return fail(context->error, context->error_size, "cannot initialize KGA import workers");
+    }
+
+    pthread_t workers[KGA_IMPORT_WORKERS - 1];
+    size_t worker_count = 0;
+    long online = sysconf(_SC_NPROCESSORS_ONLN);
+    size_t worker_limit = online > 0 && online < KGA_IMPORT_WORKERS ? (size_t)online
+                                                                  : KGA_IMPORT_WORKERS;
+    while (worker_count + 1 < worker_limit && worker_count + 1 < child_count &&
+           pthread_create(&workers[worker_count], NULL, import_tree_worker, &work) == 0) {
+        worker_count++;
+    }
+    (void)import_tree_worker(&work);
+    for (size_t index = 0; index < worker_count; index++) {
+        (void)pthread_join(workers[index], NULL);
+    }
+    (void)pthread_mutex_destroy(&work.sdk_lock);
+    if (atomic_load(&work.failed)) {
+        return fail(context->error, context->error_size, "%s", work.error);
+    }
+    return 0;
 }
 
 static int import_tree(import_context_t *context, const ghp_kga_root_t *reference, const char *tree,
@@ -545,6 +657,12 @@ static int import_tree(import_context_t *context, const ghp_kga_root_t *referenc
             fail(context->error, context->error_size, "invalid KGA branch children");
             goto done;
         }
+        size_t child_count = yyjson_arr_size(children);
+        tree_child_t *child_refs = calloc(child_count, sizeof(*child_refs));
+        if (!child_refs && child_count > 0) {
+            fail(context->error, context->error_size, "cannot allocate KGA branch references");
+            goto done;
+        }
         uint64_t total = 0;
         const char *previous_slot = NULL;
         size_t index, maximum;
@@ -557,19 +675,20 @@ static int import_tree(import_context_t *context, const ghp_kga_root_t *referenc
                 !root_from_json(yyjson_arr_get(child, 1), &child_reference) ||
                 UINT64_MAX - total < child_reference.count) {
                 fail(context->error, context->error_size, "invalid KGA branch reference");
+                free(child_refs);
                 goto done;
             }
             previous_slot = slot;
             total += child_reference.count;
-            if (import_tree(context, &child_reference, tree, slot, depth + 1) != 0) {
-                goto done;
-            }
+            child_refs[index] = (tree_child_t){.reference = child_reference, .shard = slot};
         }
         if (total != count) {
             fail(context->error, context->error_size, "KGA branch count mismatch");
+            free(child_refs);
             goto done;
         }
-        status = 0;
+        status = import_tree_children(context, child_refs, child_count, tree);
+        free(child_refs);
     } else {
         fail(context->error, context->error_size, "invalid KGA page kind");
     }
