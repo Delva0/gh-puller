@@ -766,7 +766,7 @@ async def test_pull_reviews_graphql_paginates_and_preserves_source() -> None:
 
 
 @pytest.mark.asyncio
-async def test_pull_commits_graphql_paginates_without_rest_cap() -> None:
+async def test_pull_commits_graphql_accepts_change_since_detail_observation() -> None:
     seen: list[dict[str, Any]] = []
     paths: list[str] = []
     commits = [_graphql_commit(number) for number in range(1, 252)]
@@ -824,7 +824,7 @@ async def test_pull_commits_graphql_paginates_without_rest_cap() -> None:
             "acme",
             "widgets",
             7,
-            expected=251,
+            detail_count=250,
             base="a" * 40,
             head="b" * 40,
             previous=None,
@@ -851,6 +851,60 @@ async def test_pull_commits_graphql_paginates_without_rest_cap() -> None:
         },
     ]
     assert paths == ["/seed-core", "/graphql", "/graphql", "/graphql"]
+
+
+@pytest.mark.asyncio
+async def test_pull_commits_uses_graphql_when_rest_disagrees_with_detail() -> None:
+    paths: list[str] = []
+    commits = [_graphql_commit(number) for number in range(1, 14)]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        paths.append(request.url.path)
+        if request.url.path != "/graphql":
+            return httpx.Response(
+                200,
+                json=[{"sha": f"{number:040x}"} for number in range(1, 14)],
+                request=request,
+            )
+        connection = {
+            "totalCount": len(commits),
+            "nodes": commits,
+            "pageInfo": {"hasNextPage": False, "endCursor": None},
+        }
+        return httpx.Response(
+            200,
+            json={
+                "data": {
+                    "repository": {
+                        "pullRequest": {"number": 7, "commits": connection},
+                    },
+                },
+            },
+            request=request,
+        )
+
+    client = httpx.AsyncClient(
+        base_url="https://api.github.test",
+        transport=httpx.MockTransport(handler),
+    )
+    api = GitHubAPI(client=client, graphql_url="/graphql", now=lambda: _T0)
+    try:
+        result = await api.pull_commits(
+            "acme",
+            "widgets",
+            7,
+            detail_count=12,
+            base="a" * 40,
+            head="b" * 40,
+            previous=None,
+            cache=None,
+        )
+    finally:
+        await client.aclose()
+
+    assert paths == ["/repos/acme/widgets/pulls/7/commits", "/graphql"]
+    assert result.source == "graphql"
+    assert len(result.value) == 13
 
 
 @pytest.mark.asyncio

@@ -802,8 +802,8 @@ class GitHubFactCollector:
     ) -> FactObservation:
         number = _task_number(task)
         pull = _fact_object(detail, f"pull #{number}")
-        expected = pull.get("commits")
-        if _zero(expected):
+        detail_count = pull.get("commits")
+        if _zero(detail_count):
             return await self._derived(
                 archive,
                 task,
@@ -815,7 +815,7 @@ class GitHubFactCollector:
                 detail,
                 "PullCommitCount",
             )
-        if type(expected) is not int or expected < 1:
+        if type(detail_count) is not int or detail_count < 1:
             raise IncompleteGitHubDataError(f"pull #{number} has an invalid commit count")
         base, head = _comparison_shas(pull, number)
         return await self._resource_collection(
@@ -830,7 +830,7 @@ class GitHubFactCollector:
                 self._owner,
                 self._repo,
                 number,
-                expected=expected,
+                detail_count=detail_count,
                 base=base,
                 head=head,
                 previous=previous,

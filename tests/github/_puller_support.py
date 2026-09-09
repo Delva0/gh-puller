@@ -266,13 +266,13 @@ class FakeAPI:
         repo: str,
         number: int,
         *,
-        expected: int,
+        detail_count: int,
         base: str,
         head: str,
         previous: list[dict[str, Any]] | None,
         cache: dict[str, Any] | None,
     ) -> GitHubResource:
-        if expected > 250:
+        if detail_count >= 250:
             value = await self.compare_commits(owner, repo, base, head)
             return self._resource(value)
         value, updated = await self.paginate_cached(

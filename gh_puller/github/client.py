@@ -598,7 +598,7 @@ class GitHubAPI:
         repo: str,
         number: int,
         *,
-        expected: int,
+        detail_count: int,
         base: str,
         head: str,
         previous: list[dict[str, Any]] | None,
@@ -610,7 +610,8 @@ class GitHubAPI:
             owner: Repository owner.
             repo: Repository name.
             number: Repository-local PR number.
-            expected: Commit count declared by PR details.
+            detail_count: Commit count from the earlier PR-detail observation. It
+                selects a REST strategy but does not constrain a later GraphQL snapshot.
             base: Base SHA for REST comparison fallback.
             head: Head SHA for REST comparison fallback.
             previous: Previous stable collection paired with ``cache``, or ``None`` for
@@ -620,14 +621,14 @@ class GitHubAPI:
         Returns:
             REST-compatible stable commits, fact source, raw source, and validator.
         """
-        if number < 1 or expected < 1:
-            raise ValueError("number and expected must be positive")
+        if number < 1 or detail_count < 1:
+            raise ValueError("number and detail_count must be positive")
         path = (
             f"/repos/{quote(owner, safe='')}/{quote(repo, safe='')}/pulls/{number}/commits"
         )
 
         async def rest(wait_primary: bool) -> GitHubResource:
-            if expected > 250:
+            if detail_count >= 250:
                 value = await self._compare_commits(
                     owner,
                     repo,
@@ -635,7 +636,7 @@ class GitHubAPI:
                     head,
                     primary_wait=wait_primary,
                 )
-                check_size(number, "commits", expected, value)
+                check_size(number, "commits", detail_count, value)
                 return GitHubResource(value, _Transport.REST, value)
             value, updated = await self._paginate_cached(
                 path,
@@ -643,7 +644,7 @@ class GitHubAPI:
                 cache=cache,
                 primary_wait=wait_primary,
             )
-            check_size(number, "commits", expected, value)
+            check_size(number, "commits", detail_count, value)
             return GitHubResource(value, _Transport.REST, value, updated)
 
         async def graphql(wait_primary: bool) -> GitHubResource:
@@ -659,10 +660,9 @@ class GitHubAPI:
                 rest_commit(item, self._base_url, owner, repo, number)
                 for item in raw
             ]
-            check_size(number, "commits", expected, value)
             return GitHubResource(value, _Transport.GRAPHQL, raw)
 
-        rest_cached = expected <= 250 and cache is not None
+        rest_cached = detail_count < 250 and cache is not None
         return await self._either(rest, graphql, rest_cached=rest_cached)
 
     async def pull_review_comments(

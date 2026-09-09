@@ -142,7 +142,7 @@ class GitHubAPIReader(Protocol):
         repo: str,
         number: int,
         *,
-        expected: int,
+        detail_count: int,
         base: str,
         head: str,
         previous: list[dict[str, Any]] | None,
