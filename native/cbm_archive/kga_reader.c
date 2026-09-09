@@ -33,7 +33,7 @@ enum {
     KGA_FRAME_HEADER_SIZE = 53,
     KGA_FRAME_DIGEST_OFFSET = 21,
     KGA_MAX_TREE_DEPTH = 64,
-    KGA_IMPORT_WORKERS = 8,
+    KGA_IMPORT_WORKERS = 16,
 };
 
 static const unsigned char KGA_MAGIC[] = {'K', 'G', 'A', '5', '\r', '\n', 0x1a, '\n'};
