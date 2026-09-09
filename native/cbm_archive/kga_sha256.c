@@ -107,13 +107,29 @@ static void initialize(sha256_context_t *context) {
 }
 
 static void update(sha256_context_t *context, const uint8_t *data, size_t size) {
-    for (size_t index = 0; index < size; index++) {
-        context->buffer[context->buffer_size++] = data[index];
-        if (context->buffer_size == SHA256_BLOCK_SIZE) {
-            transform(context, context->buffer);
-            context->bit_length += SHA256_BLOCK_SIZE * 8U;
-            context->buffer_size = 0;
+    if (context->buffer_size > 0) {
+        size_t available = SHA256_BLOCK_SIZE - context->buffer_size;
+        size_t copied = size < available ? size : available;
+        memcpy(context->buffer + context->buffer_size, data, copied);
+        context->buffer_size += copied;
+        data += copied;
+        size -= copied;
+        if (context->buffer_size < SHA256_BLOCK_SIZE) {
+            return;
         }
+        transform(context, context->buffer);
+        context->bit_length += SHA256_BLOCK_SIZE * 8U;
+        context->buffer_size = 0;
+    }
+    while (size >= SHA256_BLOCK_SIZE) {
+        transform(context, data);
+        context->bit_length += SHA256_BLOCK_SIZE * 8U;
+        data += SHA256_BLOCK_SIZE;
+        size -= SHA256_BLOCK_SIZE;
+    }
+    if (size > 0) {
+        memcpy(context->buffer, data, size);
+        context->buffer_size = size;
     }
 }
 
