@@ -317,6 +317,51 @@ def write_missharded_archive(path: Path) -> None:
     writer.finalize()
 
 
+def write_mismatched_import_archive(path: Path) -> None:
+    project = "invalid-import"
+    target = f"{project}.target"
+    nodes = {
+        project: {
+            "label": "Project",
+            "name": project,
+            "file_path": "",
+            "start_line": 0,
+            "end_line": 0,
+            "properties": {},
+        },
+        target: {
+            "label": "Module",
+            "name": "target",
+            "file_path": "target.py",
+            "start_line": 1,
+            "end_line": 1,
+            "properties": {},
+        },
+    }
+    edges = {
+        (project, target, "IMPORTS", "expected"): {
+            "properties": {"local_name": "different"},
+        },
+    }
+    writer = ArchiveWriter(path)
+    node_root = RadixTree(writer, "nodes").build(nodes.items())
+    edge_root = RadixTree(writer, "edges").build(edges.items())
+    writer.commit(
+        {
+            "sha": "mismatched-import",
+            "parents": [],
+            "node_root": node_root.to_json(),
+            "edge_root": edge_root.to_json(),
+            "nodes": len(nodes),
+            "edges": len(edges),
+            "graph_digest": graph_digest(node_root, edge_root),
+            "graph_fidelity_version": GRAPH_FIDELITY_VERSION,
+            "cbm_project": project,
+        },
+    )
+    writer.finalize()
+
+
 def requests(path: Path) -> list[dict]:
     return [json.loads(line) for line in path.read_text().splitlines()]
 
@@ -923,6 +968,26 @@ def test_real_native_helper_rejects_missharded_identity(tmp_path):
         ) as client,
         ArchiveLoader(Path(configured), tmp_path / "cache", 30) as loader,
         pytest.raises(CBMTransportError, match="invalid node row in KGA leaf"),
+    ):
+        loader.load(client, archive_path)
+
+
+@pytest.mark.integration
+def test_real_native_helper_rejects_mismatched_import_identity(tmp_path):
+    configured = os.environ.get("GH_PULLER_TEST_CBM_NATIVE_HELPER")
+    if configured is None:
+        pytest.skip("real native helper not configured")
+    archive_path = tmp_path / "archive.kga"
+    write_mismatched_import_archive(archive_path)
+
+    with (
+        CBMClient(
+            native_helper=Path(configured),
+            cache_root=tmp_path / "cache",
+            timeout=30,
+        ) as client,
+        ArchiveLoader(Path(configured), tmp_path / "cache", 30) as loader,
+        pytest.raises(CBMTransportError, match="invalid edge properties in KGA leaf"),
     ):
         loader.load(client, archive_path)
 

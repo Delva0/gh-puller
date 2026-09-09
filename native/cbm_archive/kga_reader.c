@@ -269,6 +269,15 @@ static bool json_int32(yyjson_val *value, int *output) {
     return true;
 }
 
+static bool edge_properties_match_identity(const edge_item_t *row, yyjson_val *properties) {
+    if (strcmp(row->type, "IMPORTS") != 0) {
+        return row->local_name[0] == '\0';
+    }
+    yyjson_val *value = yyjson_obj_get(properties, "local_name");
+    const char *stored = value ? json_string(value) : "";
+    return stored && strcmp(stored, row->local_name) == 0;
+}
+
 static bool root_from_json(yyjson_val *object, ghp_kga_root_t *reference) {
     uint64_t offset = 0;
     uint64_t count = 0;
@@ -420,7 +429,7 @@ static int import_edge_leaf(import_context_t *context, yyjson_val *entries, uint
             goto cleanup;
         }
         yyjson_val *properties = yyjson_obj_get(attributes, "properties");
-        if (!yyjson_is_obj(properties) ||
+        if (!yyjson_is_obj(properties) || !edge_properties_match_identity(row, properties) ||
             !(row->properties_json = yyjson_val_write(properties, YYJSON_WRITE_NOFLAG, NULL))) {
             fail(context->error, context->error_size, "invalid edge properties in KGA leaf");
             goto cleanup;
@@ -616,6 +625,7 @@ int ghp_kga_import_snapshot(const ghp_kga_snapshot_t *snapshot, char *error, siz
         .edge_count = snapshot->edge_count,
         .unordered_identities = true,
         .prevalidated_unique_identities = true,
+        .prevalidated_rows = true,
     };
     cbm_sdk_import_t *import = NULL;
     cbm_sdk_status_t begun = cbm_sdk_import_begin(&options, &import, error, error_size);
