@@ -254,11 +254,22 @@ async def test_archive_progress_is_recovered_without_journal(tmp_path: Path) -> 
     assert state.last_error == "GitHubAPIError: transient"
     assert state.latest is not None and state.latest[:2] == ("issue", "issue:1")
 
+    summary, error = monitor._archive_state(database, detail=False)
+
+    assert error is None
+    assert summary is not None
+    assert (summary.parents_completed, summary.parents_total) == (1, 2)
+    assert summary.observations is None
+    assert summary.current_facts is None
+    assert summary.latest is None
+    assert summary.task_rate is None
+
 
 @pytest.mark.asyncio
 async def test_detail_recovers_active_maintenance_progress_from_sqlite(tmp_path: Path) -> None:
     database = tmp_path / "facts.sqlite3"
     async with ObservationArchive(database, "acme/widgets") as archive:
+        await archive.start_cycle(_EVENT_AT - timedelta(hours=1))
         job = await archive.start_maintenance_job(
             "backfill:test",
             "backfill",
@@ -323,9 +334,14 @@ def test_watch_cache_invalidates_with_database_or_wal(
     database.write_bytes(b"database")
     calls = 0
 
-    def archive_state(path: Path) -> tuple[monitor.ArchiveState | None, str | None]:
+    def archive_state(
+        path: Path,
+        *,
+        detail: bool = True,
+    ) -> tuple[monitor.ArchiveState | None, str | None]:
         nonlocal calls
         assert path == database
+        assert detail
         calls += 1
         return None, None
 
@@ -355,9 +371,12 @@ def test_watch_renders_once_and_stops_cleanly(
         systemctl: str,
         journalctl: str,
         cache: dict[Path, monitor._ArchiveCacheEntry] | None = None,
+        *,
+        detail: bool = True,
     ) -> list[monitor.WriterStatus]:
         assert writers == [status.writer]
         assert (systemctl, journalctl) == ("systemctl", "journalctl")
+        assert detail
         caches.append(cache)
         return [status]
 

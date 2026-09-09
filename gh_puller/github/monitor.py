@@ -94,8 +94,8 @@ class ArchiveState:
     task_rate: TaskRate | None
     parents_completed: int
     parents_total: int
-    observations: int
-    current_facts: int
+    observations: int | None
+    current_facts: int | None
     requests: int
     latest: tuple[str, str, datetime] | None
     updated_at: datetime | None
@@ -144,6 +144,7 @@ class _ArchiveCacheEntry:
     """Archive state associated with an unchanged database and WAL."""
 
     version: _ArchiveVersion
+    detail: bool
     state: ArchiveState | None
     error: str | None
 
@@ -222,10 +223,16 @@ def _collect(
     systemctl: str,
     journalctl: str,
     archive_cache: dict[Path, _ArchiveCacheEntry] | None = None,
+    *,
+    detail: bool = True,
 ) -> list[WriterStatus]:
     statuses = []
     for writer in writers:
-        archive, error = _cached_archive_state(writer.database, archive_cache)
+        archive, error = _cached_archive_state(
+            writer.database,
+            archive_cache,
+            detail=detail,
+        )
         statuses.append(
             WriterStatus(
                 writer,
@@ -252,16 +259,18 @@ def _collect(
 def _cached_archive_state(
     path: Path,
     cache: dict[Path, _ArchiveCacheEntry] | None,
+    *,
+    detail: bool = True,
 ) -> tuple[ArchiveState | None, str | None]:
     if cache is None:
-        return _archive_state(path)
+        return _archive_state(path, detail=detail)
     version = _archive_version(path)
     cached = cache.get(path)
-    if cached is not None and cached.version == version:
+    if cached is not None and cached.version == version and cached.detail is detail:
         return cached.state, cached.error
-    state, error = _archive_state(path)
+    state, error = _archive_state(path, detail=detail)
     if error is None and version == _archive_version(path):
-        cache[path] = _ArchiveCacheEntry(version, state, error)
+        cache[path] = _ArchiveCacheEntry(version, detail, state, error)
     else:
         cache.pop(path, None)
     return state, error
@@ -334,7 +343,11 @@ def _latest_progress(output: str) -> ProgressState | None:
     return None
 
 
-def _archive_state(path: Path) -> tuple[ArchiveState | None, str | None]:
+def _archive_state(
+    path: Path,
+    *,
+    detail: bool = True,
+) -> tuple[ArchiveState | None, str | None]:
     if not path.is_file():
         return None, None
     connection: sqlite3.Connection | None = None
@@ -362,28 +375,18 @@ def _archive_state(path: Path) -> tuple[ArchiveState | None, str | None]:
             sum(total for _, _, total in task_counts),
         )
         parents = task_index.get("parent", (0, 0))
-        maintenance = _maintenance_state(connection)
-        latest = connection.execute(
-            """
-            SELECT family, subject_key, observed_until
-            FROM fact_observations ORDER BY id DESC LIMIT 1
-            """,
-        ).fetchone()
-        updated = connection.execute(
-            """
-            SELECT MAX(value) FROM (
-                SELECT MAX(published_at) AS value FROM fact_batches
-                UNION ALL SELECT MAX(observed_until) FROM discovery_items
-                UNION ALL SELECT MAX(completed_at) FROM sync_tasks
-                UNION ALL SELECT MAX(completed_at) FROM sync_cycles
-                UNION ALL SELECT MAX(started_at) FROM sync_cycles
-                UNION ALL SELECT MAX(requested_at) FROM maintenance_jobs
-                UNION ALL SELECT MAX(completed_at) FROM maintenance_jobs
-                UNION ALL SELECT MAX(last_attempt_from) FROM maintenance_tasks
-                UNION ALL SELECT MAX(last_attempt_until) FROM maintenance_tasks
-            )
-            """,
-        ).fetchone()
+        maintenance = _maintenance_state(connection, detail=detail)
+        latest = (
+            connection.execute(
+                """
+                SELECT family, subject_key, observed_until
+                FROM fact_observations ORDER BY id DESC LIMIT 1
+                """,
+            ).fetchone()
+            if detail
+            else None
+        )
+        updated_at = _archive_updated(connection, cycle, maintenance)
         error = (
             None
             if cycle_id is None
@@ -410,11 +413,19 @@ def _archive_state(path: Path) -> tuple[ArchiveState | None, str | None]:
                 tasks_completed=tasks[0],
                 tasks_total=tasks[1],
                 task_counts=task_counts,
-                task_rate=_recent_task_rate(connection, cycle_id),
+                task_rate=_recent_task_rate(connection, cycle_id) if detail else None,
                 parents_completed=parents[0],
                 parents_total=parents[1],
-                observations=int(connection.execute("SELECT COUNT(*) FROM fact_observations").fetchone()[0]),
-                current_facts=int(connection.execute("SELECT COUNT(*) FROM fact_heads").fetchone()[0]),
+                observations=(
+                    int(connection.execute("SELECT COUNT(*) FROM fact_observations").fetchone()[0])
+                    if detail
+                    else None
+                ),
+                current_facts=(
+                    int(connection.execute("SELECT COUNT(*) FROM fact_heads").fetchone()[0])
+                    if detail
+                    else None
+                ),
                 requests=0 if cycle is None else int(cycle["request_count"]),
                 latest=(
                     None
@@ -425,7 +436,7 @@ def _archive_state(path: Path) -> tuple[ArchiveState | None, str | None]:
                         _required_time(latest["observed_until"], "latest observation"),
                     )
                 ),
-                updated_at=None if updated is None else _time(updated[0]),
+                updated_at=updated_at,
                 last_error=(
                     maintenance.last_error
                     if maintenance is not None and maintenance.last_error is not None
@@ -482,7 +493,62 @@ def _recent_task_rate(
     return TaskRate(len(rows), observed_from, observed_until)
 
 
-def _maintenance_state(connection: sqlite3.Connection) -> MaintenanceState | None:
+def _archive_updated(
+    connection: sqlite3.Connection,
+    cycle: sqlite3.Row | None,
+    maintenance: MaintenanceState | None,
+) -> datetime | None:
+    values = []
+    if cycle is not None:
+        cycle_id = int(cycle["id"])
+        values.extend((cycle["started_at"], cycle["completed_at"]))
+        values.extend(
+            row[0]
+            for row in (
+                connection.execute(
+                    """
+                    SELECT completed_at FROM sync_tasks
+                    WHERE cycle_id = ? AND completed_at IS NOT NULL
+                    ORDER BY completed_at DESC LIMIT 1
+                    """,
+                    (cycle_id,),
+                ).fetchone(),
+                connection.execute(
+                    """
+                    SELECT MAX(observed_until) FROM discovery_items
+                    WHERE cycle_id = ?
+                    """,
+                    (cycle_id,),
+                ).fetchone(),
+            )
+            if row is not None
+        )
+    if maintenance is not None:
+        values.extend(
+            (
+                maintenance.requested_at,
+                maintenance.completed_at,
+                None if maintenance.latest is None else maintenance.latest[2],
+            ),
+        )
+    latest_batch = connection.execute(
+        "SELECT published_at FROM fact_batches ORDER BY id DESC LIMIT 1",
+    ).fetchone()
+    if latest_batch is not None:
+        values.append(latest_batch[0])
+    timestamps = [
+        value.astimezone(UTC) if isinstance(value, datetime) else _time(value)
+        for value in values
+        if value is not None
+    ]
+    return max((value for value in timestamps if value is not None), default=None)
+
+
+def _maintenance_state(
+    connection: sqlite3.Connection,
+    *,
+    detail: bool = True,
+) -> MaintenanceState | None:
     job = connection.execute(
         """
         SELECT * FROM maintenance_jobs
@@ -493,38 +559,50 @@ def _maintenance_state(connection: sqlite3.Connection) -> MaintenanceState | Non
     if job is None:
         return None
     job_id = int(job["id"])
-    outcomes = tuple(
-        (str(row["outcome"]), int(row["count"]))
-        for row in connection.execute(
+    outcomes = (
+        tuple(
+            (str(row["outcome"]), int(row["count"]))
+            for row in connection.execute(
+                """
+                SELECT outcome, COUNT(*) AS count
+                FROM maintenance_tasks
+                WHERE job_id = ? AND outcome IS NOT NULL
+                GROUP BY outcome ORDER BY outcome
+                """,
+                (job_id,),
+            )
+        )
+        if detail
+        else ()
+    )
+    latest = (
+        connection.execute(
             """
-            SELECT outcome, COUNT(*) AS count
+            SELECT kind, subject_key,
+                   COALESCE(last_attempt_until, last_attempt_from, completed_at) AS observed_at
             FROM maintenance_tasks
-            WHERE job_id = ? AND outcome IS NOT NULL
-            GROUP BY outcome ORDER BY outcome
+            WHERE job_id = ? AND COALESCE(last_attempt_until, last_attempt_from, completed_at) IS NOT NULL
+            ORDER BY observed_at DESC, id DESC
+            LIMIT 1
             """,
             (job_id,),
-        )
+        ).fetchone()
+        if detail
+        else None
     )
-    latest = connection.execute(
-        """
-        SELECT kind, subject_key,
-               COALESCE(last_attempt_until, last_attempt_from, completed_at) AS observed_at
-        FROM maintenance_tasks
-        WHERE job_id = ? AND COALESCE(last_attempt_until, last_attempt_from, completed_at) IS NOT NULL
-        ORDER BY observed_at DESC, id DESC
-        LIMIT 1
-        """,
-        (job_id,),
-    ).fetchone()
-    error = connection.execute(
-        """
-        SELECT last_error FROM maintenance_tasks
-        WHERE job_id = ? AND completed_at IS NULL AND last_error IS NOT NULL
-        ORDER BY COALESCE(last_attempt_until, last_attempt_from) DESC, id DESC
-        LIMIT 1
-        """,
-        (job_id,),
-    ).fetchone()
+    error = (
+        connection.execute(
+            """
+            SELECT last_error FROM maintenance_tasks
+            WHERE job_id = ? AND completed_at IS NULL AND last_error IS NOT NULL
+            ORDER BY COALESCE(last_attempt_until, last_attempt_from) DESC, id DESC
+            LIMIT 1
+            """,
+            (job_id,),
+        ).fetchone()
+        if detail
+        else None
+    )
     return MaintenanceState(
         job_id=job_id,
         kind=str(job["kind"]),
@@ -803,7 +881,7 @@ def _task_rate(archive: ArchiveState | None, now: datetime) -> str:
 
 
 def _facts(archive: ArchiveState | None) -> str:
-    if archive is None:
+    if archive is None or archive.current_facts is None or archive.observations is None:
         return "-"
     return f"current={archive.current_facts:,} observations={archive.observations:,}"
 
@@ -971,7 +1049,13 @@ def _watch(
     label = f" {writers[0].identity[:12]}" if selected else ""
     try:
         while True:
-            statuses = _collect(writers, systemctl, journalctl, cache)
+            statuses = _collect(
+                writers,
+                systemctl,
+                journalctl,
+                cache,
+                detail=selected,
+            )
             content = _render_detail(statuses[0]) if selected else _render_table(statuses)
             observed_at = datetime.now().astimezone()
             header = (
@@ -1009,7 +1093,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
     if args.watch:
         return _watch(writers, args.systemctl, args.journalctl, args.interval, selected)
-    statuses = _collect(writers, args.systemctl, args.journalctl)
+    statuses = _collect(
+        writers,
+        args.systemctl,
+        args.journalctl,
+        detail=selected,
+    )
     print(_render_detail(statuses[0]) if selected else _render_table(statuses))
     return 0
 
