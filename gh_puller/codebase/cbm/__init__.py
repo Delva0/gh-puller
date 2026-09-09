@@ -11,6 +11,7 @@ from .client import (
     CBMClient,
     CBMTransportError,
     GraphTarget,
+    NativeGraph,
     NativeProjectGraph,
     default_cbm_cache,
 )
@@ -27,6 +28,7 @@ __all__ = [
     "GraphTarget",
     "IncrementalConfig",
     "IncrementalConfigError",
+    "NativeGraph",
     "NativeProjectGraph",
     "default_cbm_cache",
     "resolve_cbm_binary",

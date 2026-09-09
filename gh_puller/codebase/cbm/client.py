@@ -22,7 +22,7 @@ from ._daemon import (
     _checked_index_execution,
     make_transport,
 )
-from ._native import NativeArchiveTransport, NativeHelper, NativeIndexTransport
+from ._native import NativeHelper, NativeIndexTransport, NativeTransport
 from .binary import CBMBinary, resolve_cbm_binary
 
 if TYPE_CHECKING:
@@ -48,32 +48,32 @@ class GraphTarget:
 
 
 @dataclass(frozen=True, slots=True)
-class ArchiveGraph(GraphTarget):
-    """Identify one immutable KGA generation loaded by the native backend.
-
-    A handle becomes stale when its client loads a different archive generation.
-    """
-
-    graph_digest: str
-    materialization_digest: str
-    database_path: Path
-    nodes: int
-    edges: int
-    graph_fidelity: int
-    coverage_rows: int
-    coverage_fidelity: int
-    materialized: bool
-
-
-@dataclass(frozen=True, slots=True)
-class NativeProjectGraph(GraphTarget):
-    """Identify one indexed-project generation open read-only in a native engine."""
+class NativeGraph(GraphTarget):
+    """Bind one active native engine graph as a query capability."""
 
     database_path: Path
     source_root: Path | None
     nodes: int
     edges: int
-    _transport: NativeArchiveTransport = field(repr=False, compare=False)
+    _transport: NativeTransport = field(repr=False, compare=False)
+    _binding: int = field(repr=False, compare=False)
+
+
+@dataclass(frozen=True, slots=True)
+class NativeProjectGraph(NativeGraph):
+    """Identify one indexed-project generation open read-only in a native engine."""
+
+
+@dataclass(frozen=True, slots=True)
+class ArchiveGraph(NativeGraph):
+    """Identify one immutable KGA generation loaded by the native backend."""
+
+    graph_digest: str
+    materialization_digest: str
+    graph_fidelity: int
+    coverage_rows: int
+    coverage_fidelity: int
+    materialized: bool
 
 
 def default_cbm_cache(environ: Mapping[str, str] | None = None) -> Path:
@@ -189,7 +189,7 @@ class CBMClient:
         self._backend_lock = threading.Lock()
         self._daemon_backend: CLITransport | PersistentMCPTransport | None = None
         self._index_daemon_backend: CLITransport | PersistentMCPTransport | None = None
-        self._native_transport: NativeArchiveTransport | None = None
+        self._native_transport: NativeTransport | None = None
         self._native_index_transport: NativeIndexTransport | None = None
 
     @property
@@ -240,10 +240,10 @@ class CBMClient:
                 )
         return self._index_daemon_backend
 
-    def _native(self) -> NativeArchiveTransport:
+    def _native(self) -> NativeTransport:
         with self._backend_lock:
             if self._native_transport is None:
-                self._native_transport = NativeArchiveTransport(
+                self._native_transport = NativeTransport(
                     self._native_helper,
                     self.cache_root,
                     self.timeout,
@@ -264,12 +264,11 @@ class CBMClient:
                 )
         return self._native_index_transport
 
-    def _native_project(self, database_path: Path) -> NativeArchiveTransport:
+    def _native_project(self, database_path: Path) -> NativeTransport:
         for transport in (self._native_index_transport, self._native_transport):
             if (
                 transport is not None
                 and transport.loaded_database_path == database_path
-                and transport.loaded_digest is None
             ):
                 return transport
         return self._native_index_transport or self._native()
@@ -281,7 +280,7 @@ class CBMClient:
 
     @property
     def native_pid(self) -> int:
-        """Return the persistent native archive helper process ID."""
+        """Return the persistent native query helper process ID."""
         return self._native().pid
 
     @property
@@ -332,12 +331,13 @@ class CBMClient:
         native = self._native_project(database_path)
         result = native.open_project(database_path, project, resolved_source)
         return NativeProjectGraph(
-            project,
-            database_path,
-            resolved_source,
-            result["nodes"],
-            result["edges"],
-            native,
+            project=project,
+            database_path=database_path,
+            source_root=resolved_source,
+            nodes=result["nodes"],
+            edges=result["edges"],
+            _transport=native,
+            _binding=native.binding,
         )
 
     def capabilities(self) -> frozenset[str]:
@@ -447,8 +447,8 @@ class CBMClient:
         Args:
             name: Advertised MCP tool name.
             arguments: Tool-specific arguments. ``None`` sends an empty object.
-            target: Explicit graph binding. Archive and native-project handles
-                select native; daemon handles and omission select the configured
+            target: Explicit graph binding. Native handles select their bound
+                engine session; daemon handles and omission use the configured
                 daemon backend.
         """
         values = dict(arguments or {})
@@ -457,42 +457,17 @@ class CBMClient:
             if supplied_project is not None and supplied_project != target.project:
                 raise CBMTransportError("CBM graph target disagrees with the tool project")
             values["project"] = target.project
-        if isinstance(target, ArchiveGraph):
-            native = self._native_transport
-            if (
-                native is None
-                or native.loaded_project != target.project
-                or native.loaded_materialization_digest != target.materialization_digest
-            ):
-                raise CBMTransportError("archive graph is no longer loaded by this CBM client")
-            if name not in native.tools:
-                raise CBMTransportError(f"native CBM tool is not supported for this archive graph: {name}")
-            logical = native.call_tool(name, values)
-            return {
-                "content": [
-                    {
-                        "type": "text",
-                        "text": json.dumps(logical, ensure_ascii=False, separators=(",", ":")),
-                    },
-                ],
-                "structuredContent": logical,
-                "isError": False,
-            }
-        if isinstance(target, NativeProjectGraph):
+        if isinstance(target, NativeGraph):
             native = target._transport
-            if (
-                native
-                not in {
-                    self._native_transport,
-                    self._native_index_transport,
-                }
-                or native.loaded_project != target.project
-                or native.loaded_database_path != target.database_path
-                or native.loaded_source_root != target.source_root
+            if not native.is_active_graph(
+                target._binding,
+                target.database_path,
+                target.project,
+                target.source_root,
             ):
-                raise CBMTransportError("native project graph is no longer open by this CBM client")
+                raise CBMTransportError("native graph is no longer active")
             if name not in native.tools:
-                raise CBMTransportError(f"native CBM tool is not supported for this project: {name}")
+                raise CBMTransportError(f"native CBM tool is not supported for this graph: {name}")
             logical = native.call_tool(name, values)
             return {
                 "content": [
@@ -610,14 +585,18 @@ class CBMClient:
             Immutable native graph handle containing its identity, row counts,
             cache path, and materialization status.
         """
-        result = self._native().load_archive(archive, commit, allow_incomplete=allow_incomplete)
+        native = self._native()
+        result = native.load_archive(archive, commit, allow_incomplete=allow_incomplete)
         return ArchiveGraph(
             project=result["project"],
-            graph_digest=result["graph_digest"],
-            materialization_digest=result["materialization_digest"],
             database_path=Path(result["database_path"]),
+            source_root=None,
             nodes=result["nodes"],
             edges=result["edges"],
+            _transport=native,
+            _binding=native.binding,
+            graph_digest=result["graph_digest"],
+            materialization_digest=result["materialization_digest"],
             graph_fidelity=result["graph_fidelity"],
             coverage_rows=result["coverage_rows"],
             coverage_fidelity=result["coverage_fidelity"],
@@ -795,16 +774,12 @@ class CBMClient:
             target: Graph and backend selected by :meth:`daemon_graph`,
                 :meth:`project_graph`, or :meth:`load_archive`.
             verbose: Include live Git/worktree context for daemon graphs and
-                native projects with a bound source snapshot. Archive graphs
-                contain no live worktree context.
+                native graphs with a bound source snapshot.
 
         Raises:
-            CBMTransportError: ``verbose`` is requested for an archive graph.
+            CBMTransportError: ``verbose`` is requested without a source snapshot.
         """
-        if verbose and (
-            isinstance(target, ArchiveGraph)
-            or (isinstance(target, NativeProjectGraph) and target.source_root is None)
-        ):
+        if verbose and isinstance(target, NativeGraph) and target.source_root is None:
             raise CBMTransportError("verbose index status requires a live source snapshot")
         return self.call_json_tool(
             "index_status",
@@ -823,33 +798,16 @@ class CBMClient:
         """Compare stable node and edge identities across two graph generations.
 
         Args:
-            base: Older daemon project or materialized archive generation.
+            base: Older graph generation.
             target: Newer graph from the same backend kind.
             limit: Maximum returned entries per change set.
             scan_limit: Maximum combined rows scanned per node or edge phase.
 
         Raises:
-            CBMTransportError: Archive and daemon graph kinds are mixed.
+            CBMTransportError: Native and daemon graph kinds are mixed.
         """
-        if isinstance(base, (ArchiveGraph, NativeProjectGraph)) and isinstance(
-            target,
-            (ArchiveGraph, NativeProjectGraph),
-        ):
-            project_targets = tuple(item for item in (base, target) if isinstance(item, NativeProjectGraph))
-            if any(
-                item._transport
-                not in {
-                    self._native_transport,
-                    self._native_index_transport,
-                }
-                for item in project_targets
-            ):
-                raise CBMTransportError("native project graph belongs to another CBM client")
-            native = self._native_transport
-            if native is None and project_targets:
-                native = project_targets[0]._transport
-            if native is None:
-                native = self._native()
+        if isinstance(base, NativeGraph) and isinstance(target, NativeGraph):
+            native = target._transport
             return native.compare_graphs(
                 base_database=base.database_path,
                 base_project=base.project,
@@ -858,10 +816,7 @@ class CBMClient:
                 limit=limit,
                 scan_limit=scan_limit,
             )
-        if isinstance(base, (ArchiveGraph, NativeProjectGraph)) or isinstance(
-            target,
-            (ArchiveGraph, NativeProjectGraph),
-        ):
+        if isinstance(base, NativeGraph) or isinstance(target, NativeGraph):
             raise CBMTransportError("cannot compare native and daemon graphs")
         return self.call_json_tool(
             "compare_graphs",

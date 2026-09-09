@@ -31,10 +31,10 @@ from ._daemon import CBMTransportError, ResourceMonitorLike
 if TYPE_CHECKING:
     from collections.abc import Iterator, Mapping, Sequence
 
-_ARCHIVE_PROTOCOL_VERSION = 8
+_QUERY_PROTOCOL_VERSION = 8
 _INDEX_PROTOCOL_VERSION = 9
 _RESPONSE_MAX_BYTES = 256 << 20
-_ARCHIVE_HELPER_ENV = "GH_PULLER_CODEBASE_CBM_HELPER"
+_QUERY_HELPER_ENV = "GH_PULLER_CODEBASE_CBM_HELPER"
 _INDEX_HELPER_ENV = "GH_PULLER_CODEBASE_CBM_INDEX_HELPER"
 _CACHE_SCHEMA = 4
 _STREAM_CLOSED = object()
@@ -87,7 +87,7 @@ def resolve_native_helper(
     helper: str | Path | NativeHelper | None = None,
     *,
     environ: Mapping[str, str] | None = None,
-    environment_key: str = _ARCHIVE_HELPER_ENV,
+    environment_key: str = _QUERY_HELPER_ENV,
     local_name: str = "gh-puller-cbm-helper",
 ) -> NativeHelper:
     """Resolve and authenticate one native helper.
@@ -170,8 +170,8 @@ def _read_exact(stream: BinaryIO, size: int, *, clean_eof: bool = False) -> byte
     return bytes(chunks)
 
 
-class NativeArchiveTransport:
-    """One thread-safe helper process with a content-addressed store cache."""
+class NativeTransport:
+    """Own one thread-safe native CBM helper process and its active graph binding."""
 
     def __init__(
         self,
@@ -181,12 +181,11 @@ class NativeArchiveTransport:
         environment: Mapping[str, str] | None = None,
         monitor: ResourceMonitorLike | None = None,
         *,
-        helper_environment_key: str = _ARCHIVE_HELPER_ENV,
+        helper_environment_key: str = _QUERY_HELPER_ENV,
         helper_filename: str = "gh-puller-cbm-helper",
-        protocol: int = _ARCHIVE_PROTOCOL_VERSION,
+        protocol: int = _QUERY_PROTOCOL_VERSION,
         required_capabilities: frozenset[str] = frozenset(
             {
-                "archive-load",
                 "tool-call",
                 "graph-compare",
                 "project-open",
@@ -231,8 +230,7 @@ class NativeArchiveTransport:
         self.loaded_project: str | None = None
         self.loaded_database_path: Path | None = None
         self.loaded_source_root: Path | None = None
-        self.loaded_digest: str | None = None
-        self.loaded_materialization_digest: str | None = None
+        self._binding = 0
         helper_environment = dict(values)
         helper_environment.setdefault("CBM_LOG_LEVEL", "error")
         self.process = subprocess.Popen(
@@ -257,9 +255,6 @@ class NativeArchiveTransport:
             sdk_abi = hello.get("sdk_abi")
             if (
                 hello.get("protocol") != protocol
-                or hello.get("kga_format") != 5
-                or hello.get("graph_fidelity") != GRAPH_FIDELITY_VERSION
-                or hello.get("coverage_fidelity") != COVERAGE_FIDELITY_VERSION
                 or not isinstance(capabilities, list)
                 or not all(isinstance(item, str) for item in capabilities)
                 or not required_capabilities <= set(capabilities)
@@ -276,6 +271,7 @@ class NativeArchiveTransport:
             self.tools = frozenset(tools)
             self.store_format = store_format
             self.sdk_abi = sdk_abi
+            self.hello = hello
         except BaseException:
             self.close()
             raise
@@ -284,6 +280,44 @@ class NativeArchiveTransport:
     def pid(self) -> int:
         """Return the persistent helper process ID."""
         return self.process.pid
+
+    @property
+    def binding(self) -> int:
+        """Return the generation of the graph currently active in the helper."""
+        return self._binding
+
+    def _activate_graph(
+        self,
+        database_path: Path,
+        project: str,
+        source_root: Path | None,
+    ) -> None:
+        self._binding += 1
+        self.loaded_project = project
+        self.loaded_database_path = database_path
+        self.loaded_source_root = source_root
+
+    def is_active_graph(
+        self,
+        binding: int,
+        database_path: Path,
+        project: str,
+        source_root: Path | None,
+    ) -> bool:
+        """Return whether a native graph capability still names the active binding.
+
+        Args:
+            binding: Generation captured when the graph capability was created.
+            database_path: Exact CBM store path bound by the capability.
+            project: Project identity inside the store.
+            source_root: Optional source snapshot available to source-aware tools.
+        """
+        return (
+            binding == self._binding
+            and self.loaded_database_path == database_path
+            and self.loaded_project == project
+            and self.loaded_source_root == source_root
+        )
 
     def _stdout_loop(self) -> None:
         try:
@@ -407,6 +441,13 @@ class NativeArchiveTransport:
         Returns:
             Loaded identity, row counts, materialization status, and cache path.
         """
+        if (
+            "archive-load" not in self.capabilities
+            or self.hello.get("kga_format") != 5
+            or self.hello.get("graph_fidelity") != GRAPH_FIDELITY_VERSION
+            or self.hello.get("coverage_fidelity") != COVERAGE_FIDELITY_VERSION
+        ):
+            raise CBMTransportError("native helper does not support this KGA contract")
         owned = not isinstance(archive, Archive)
         reader = Archive(archive, allow_incomplete=allow_incomplete) if owned else archive
         try:
@@ -469,11 +510,7 @@ class NativeArchiveTransport:
                 ):
                     raise CBMTransportError("native CBM helper returned the wrong loaded graph identity")
                 _write_marker(marker, expected_marker)
-            self.loaded_project = project
-            self.loaded_database_path = database
-            self.loaded_source_root = None
-            self.loaded_digest = manifest["graph_digest"]
-            self.loaded_materialization_digest = materialization
+            self._activate_graph(database, project, None)
             return {**result, "database_path": str(database)}
         finally:
             if owned:
@@ -506,11 +543,7 @@ class NativeArchiveTransport:
             or type(result.get("edges")) is not int
         ):
             raise CBMTransportError("native CBM helper opened the wrong project")
-        self.loaded_project = project
-        self.loaded_database_path = database_path
-        self.loaded_source_root = source_root
-        self.loaded_digest = None
-        self.loaded_materialization_digest = None
+        self._activate_graph(database_path, project, source_root)
         return result
 
     def list_projects(self, arguments: Mapping[str, object] | None = None) -> dict[str, Any]:
@@ -539,17 +572,16 @@ class NativeArchiveTransport:
         )
 
     def _clear_loaded(self) -> None:
+        self._binding += 1
         self.loaded_project = None
         self.loaded_database_path = None
         self.loaded_source_root = None
-        self.loaded_digest = None
-        self.loaded_materialization_digest = None
 
     def query_graph(self, *, project: str, query: str, graph: str = "code", max_rows: int = 0) -> dict[str, Any]:
         """Query the loaded immutable CBM store directly.
 
         Args:
-            project: Project identity returned by :meth:`load_archive`.
+            project: Project identity bound in the active graph.
             query: Read-only CBM Cypher-like query.
             graph: ``code`` or the derived ``missed`` graph.
             max_rows: Result ceiling; zero selects CBM's native default.
@@ -620,7 +652,7 @@ class NativeArchiveTransport:
         self.close()
 
 
-class NativeIndexTransport(NativeArchiveTransport):
+class NativeIndexTransport(NativeTransport):
     """Run repository indexing in a persistent crash-isolated native helper."""
 
     def __init__(

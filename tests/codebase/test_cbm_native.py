@@ -20,7 +20,7 @@ from gh_puller.codebase.archive import (
     graph_digest,
     materialization_digest,
 )
-from gh_puller.codebase.cbm._native import NativeArchiveTransport
+from gh_puller.codebase.cbm._native import NativeTransport
 from gh_puller.codebase.store import GraphRows, load_coverage, load_rows
 
 _GRAPH_TOOLS = (
@@ -323,7 +323,7 @@ def test_native_transport_keeps_graph_rows_out_of_python(tmp_path, monkeypatch):
     write_fake_helper(helper)
     monkeypatch.setattr(Archive, "load_rows", lambda *_args, **_kwargs: pytest.fail("loaded graph rows"))
 
-    with NativeArchiveTransport(
+    with NativeTransport(
         helper,
         tmp_path / "cache",
         5,
@@ -353,9 +353,9 @@ def test_native_cache_is_reused_by_a_new_helper_process(tmp_path):
     write_archive(archive_path)
     environment = {"NATIVE_REQUEST_LOG": str(log)}
 
-    with NativeArchiveTransport(helper, tmp_path / "cache", 5, environment) as first:
+    with NativeTransport(helper, tmp_path / "cache", 5, environment) as first:
         assert first.load_archive(archive_path)["materialized"] is True
-    with NativeArchiveTransport(helper, tmp_path / "cache", 5, environment) as second:
+    with NativeTransport(helper, tmp_path / "cache", 5, environment) as second:
         assert second.load_archive(archive_path)["materialized"] is False
 
     loads = [item for item in requests(log) if item["method"] == "load"]
@@ -387,7 +387,7 @@ def test_native_identity_includes_coverage_snapshot(tmp_path):
         assert first.database_path != second.database_path
         assert second.coverage_rows == 2
         assert second.coverage_fidelity == COVERAGE_FIDELITY_VERSION
-        with pytest.raises(CBMTransportError, match="no longer loaded"):
+        with pytest.raises(CBMTransportError, match="no longer active"):
             client.query_graph(first, query="MATCH (n) RETURN n")
 
 
@@ -418,7 +418,7 @@ def test_client_native_query_does_not_resolve_or_start_mcp(tmp_path):
 
         with pytest.raises(CBMBinaryError, match="does not exist"):
             client.query_graph(client.daemon_graph(graph.project), query="MATCH (n) RETURN n")
-        with pytest.raises(CBMTransportError, match="not supported for this archive graph"):
+        with pytest.raises(CBMTransportError, match="not supported for this graph"):
             client.call_json_tool("trace_path", {"function_name": "main"}, target=graph)
         assert client._daemon_backend is None
 
@@ -518,7 +518,7 @@ def test_client_queries_existing_project_without_full_helper(tmp_path, monkeypat
         assert projects["projects"] == [{"name": "native-build"}]
         assert deleted is True
         assert client._native_index_transport is None
-        with pytest.raises(CBMTransportError, match="no longer open"):
+        with pytest.raises(CBMTransportError, match="no longer active"):
             client.query_graph(graph, query="MATCH (n) RETURN n")
 
     assert [item["method"] for item in requests(log)] == [
@@ -603,7 +603,7 @@ def test_client_rejects_archive_handle_after_loading_another_generation(tmp_path
         }
         assert compared["limit"] == 4
         assert compared["scan_limit"] == 100
-        with pytest.raises(CBMTransportError, match="no longer loaded"):
+        with pytest.raises(CBMTransportError, match="no longer active"):
             client.query_graph(first, query="MATCH (n) RETURN n")
         with pytest.raises(CBMTransportError, match="cannot compare native and daemon"):
             client.compare_graphs(first, client.daemon_graph("second"))
@@ -614,7 +614,7 @@ def test_native_query_timeout_terminates_helper(tmp_path):
     archive_path = tmp_path / "archive.kga"
     write_fake_helper(helper, hang_on_query=True)
     write_archive(archive_path)
-    transport = NativeArchiveTransport(helper, tmp_path / "cache", 0.1)
+    transport = NativeTransport(helper, tmp_path / "cache", 0.1)
     transport.load_archive(archive_path)
 
     with pytest.raises(CBMTransportError, match="timed out"):
