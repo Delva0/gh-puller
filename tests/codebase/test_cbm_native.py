@@ -425,6 +425,8 @@ def test_client_native_query_does_not_resolve_or_start_mcp(tmp_path):
     ):
         assert "mcp" not in client._transports
         graph = loader.load(client, archive_path)
+        assert client.supports("query_graph")
+        assert not client.supports("trace_path")
         result = client.query_graph(graph, query="MATCH (n) RETURN n")
         schema = client.get_graph_schema(graph)
         status = client.index_status(graph)
@@ -441,7 +443,7 @@ def test_client_native_query_does_not_resolve_or_start_mcp(tmp_path):
                 client.project_graph(graph.project, transport="mcp"),
                 query="MATCH (n) RETURN n",
             )
-        with pytest.raises(CBMTransportError, match="tool is not supported"):
+        with pytest.raises(CBMTransportError, match="does not support trace_path"):
             client.call_json_tool("trace_path", {"function_name": "main"}, target=graph)
         assert "mcp" not in client._transports
 
@@ -466,6 +468,7 @@ def test_client_native_index_uses_full_helper_without_resolving_mcp(tmp_path, mo
 
     with CBMClient(
         tmp_path / "missing-cbm",
+        native_helper=tmp_path / "missing-query-helper",
         native_index_helper=helper,
         cache_root=tmp_path / "cache",
         timeout=5,
@@ -595,6 +598,22 @@ def test_client_routes_every_graph_tool_through_compact_helper(tmp_path, monkeyp
     assert calls[11]["params"]["arguments"]["traces"][0]["count"] == 2
 
 
+def test_native_transport_accepts_an_empty_sdk_tool_registry(tmp_path):
+    helper = tmp_path / "fake-helper"
+    write_fake_helper(helper, tools=())
+
+    with CBMClient(
+        native_helper=helper,
+        cache_root=tmp_path / "cache",
+        timeout=5,
+    ) as client:
+        graph = client.project_graph("native-empty")
+
+        assert not client.supports("query_graph")
+        with pytest.raises(CBMTransportError, match="does not support query_graph"):
+            client.query_graph(graph, query="MATCH (n) RETURN n")
+
+
 def test_client_rejects_archive_handle_after_loading_another_generation(tmp_path):
     helper = tmp_path / "fake-helper"
     first_archive = tmp_path / "first.kga"
@@ -632,7 +651,7 @@ def test_client_rejects_archive_handle_after_loading_another_generation(tmp_path
             timeout=5,
         ) as other_client:
             other = other_client.project_graph("second")
-            with pytest.raises(CBMTransportError, match="different CBM transports"):
+            with pytest.raises(CBMTransportError, match="belongs to another CBM client"):
                 client.compare_graphs(first, other)
 
 

@@ -62,55 +62,11 @@ class OpenedGraph:
 
 
 class Transport(Protocol):
-    """Implement one complete CBM client access path."""
+    """Expose route identity, capability discovery, and owned lifecycle only."""
 
     name: TransportName
 
-    @property
-    def engine(self) -> CBMBinary | NativeHelper: ...
-
-    def capabilities(self) -> frozenset[str]: ...
-
-    def open_project(self, project: str, source_root: Path | None) -> OpenedGraph: ...
-
-    def open_store(
-        self,
-        database_path: Path,
-        project: str,
-        source_root: Path | None,
-    ) -> OpenedGraph: ...
-
-    def call_tool(
-        self,
-        binding: object | None,
-        name: str,
-        arguments: Mapping[str, object],
-    ) -> dict[str, Any]: ...
-
-    def index_repository(
-        self,
-        tree: Path,
-        database_path: Path,
-        project: str,
-        mode: str,
-        *,
-        force_full: bool = False,
-        incremental_controls: Mapping[str, str | int] | None = None,
-        target_projects: Sequence[str] | None = None,
-    ) -> dict[str, Any]: ...
-
-    def list_projects(self, options: Mapping[str, object]) -> dict[str, Any]: ...
-
-    def delete_project(self, database_path: Path, project: str) -> tuple[bool, str]: ...
-
-    def compare_graphs(
-        self,
-        base: object,
-        target: object,
-        *,
-        limit: int,
-        scan_limit: int,
-    ) -> dict[str, Any]: ...
+    def supports(self, operation: str) -> bool: ...
 
     def close(self) -> None: ...
 
@@ -249,6 +205,7 @@ def index_execution_from_envelope(envelope: object) -> dict | None:
 class _ProjectBinding:
     transport: _ProjectTransport
     project: str
+    source_root: Path | None
 
 
 class _ProjectTransport:
@@ -264,19 +221,8 @@ class _ProjectTransport:
         return self._binary
 
     def open_project(self, project: str, source_root: Path | None) -> OpenedGraph:
-        if source_root is not None:
-            raise CBMTransportError("MCP and CLI graph bindings use the frontend session root")
-        binding = _ProjectBinding(self, project)
-        return OpenedGraph(project, binding)
-
-    def open_store(
-        self,
-        database_path: Path,
-        project: str,
-        source_root: Path | None,
-    ) -> OpenedGraph:
-        del database_path, project, source_root
-        raise CBMTransportError(f"{self.name} transport cannot open an explicit CBM store")
+        binding = _ProjectBinding(self, project, source_root)
+        return OpenedGraph(project, binding, source_root)
 
     def call_tool(
         self,
@@ -292,7 +238,8 @@ class _ProjectTransport:
             if supplied is not None and supplied != binding.project:
                 raise CBMTransportError("CBM graph handle disagrees with the tool project")
             values["project"] = binding.project
-        return logical_result(name, self._call_tool(name, values))
+        source_root = binding.source_root if isinstance(binding, _ProjectBinding) else None
+        return logical_result(name, self._call_tool(name, values, source_root))
 
     def index_repository(
         self,
@@ -316,6 +263,7 @@ class _ProjectTransport:
                 incremental_controls,
                 target_projects,
             ),
+            tree,
         )
         return checked_index_execution(envelope, force_full, incremental_controls)
 
@@ -345,18 +293,26 @@ class _ProjectTransport:
             or target.transport is not self
         ):
             raise CBMTransportError("graph handles belong to different CBM transports")
-        return self.call_tool(
-            None,
+        return logical_result(
             "compare_graphs",
-            {
-                "base_project": base.project,
-                "target_project": target.project,
-                "limit": limit,
-                "scan_limit": scan_limit,
-            },
+            self._call_tool(
+                "compare_graphs",
+                {
+                    "base_project": base.project,
+                    "target_project": target.project,
+                    "limit": limit,
+                    "scan_limit": scan_limit,
+                },
+                target.source_root,
+            ),
         )
 
-    def _call_tool(self, name: str, arguments: Mapping[str, object]) -> dict[str, Any]:
+    def _call_tool(
+        self,
+        name: str,
+        arguments: Mapping[str, object],
+        source_root: Path | None,
+    ) -> dict[str, Any]:
         raise NotImplementedError
 
 

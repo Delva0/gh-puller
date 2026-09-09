@@ -17,6 +17,27 @@ if sys.argv[1:] == ["--version"]:
     print("codebase-memory-mcp 0.test")
     raise SystemExit(0)
 
+if sys.argv[1:]:
+    if sys.argv[-1] == "--help":
+        print("Usage: fake CBM tool")
+        raise SystemExit(0)
+    name = sys.argv[sys.argv.index("--json") + 1]
+    arguments = json.loads(sys.argv[-1])
+    body = {
+        "tool": name,
+        "arguments": arguments,
+        "cwd": os.getcwd(),
+        "pid": os.getpid(),
+        "request_id": 0,
+    }
+    result = {
+        "content": [{"type": "text", "text": json.dumps(body)}],
+        "structuredContent": body,
+        "isError": False,
+    }
+    print(json.dumps(result), flush=True)
+    raise SystemExit(0)
+
 for line in sys.stdin:
     request = json.loads(line)
     if "id" not in request:
@@ -32,12 +53,22 @@ for line in sys.stdin:
     elif method == "tools/list":
         result = {"tools": [
             {"name": "search_graph"},
+            {"name": "search_code"},
             {"name": "query_graph"},
             {"name": "get_graph_schema"},
             {"name": "trace_path"},
+            {"name": "get_code_snippet"},
             {"name": "get_architecture"},
+            {"name": "check_index_coverage"},
+            {"name": "detect_changes"},
+            {"name": "manage_adr"},
+            {"name": "ingest_traces"},
             {"name": "index_status"},
             {"name": "compare_graphs"},
+            {"name": "legacy_json"},
+            {"name": "tree"},
+            {"name": "fail"},
+            {"name": "echo"},
         ]}
     elif method == "tools/call":
         name = request["params"]["name"]
@@ -50,6 +81,7 @@ for line in sys.stdin:
             body = {
                 "tool": name,
                 "arguments": arguments,
+                "cwd": os.getcwd(),
                 "pid": os.getpid(),
                 "request_id": request["id"],
             }
@@ -153,6 +185,8 @@ def test_mcp_route_exposes_json_queries(tmp_path):
             "limit": 3,
             "scan_limit": 50,
         }
+
+
 def test_json_call_supports_legacy_text_and_rejects_tree_output(tmp_path):
     binary = tmp_path / "fake-cbm"
     write_query_cbm(binary)
@@ -178,6 +212,29 @@ def test_client_handles_concurrent_mcp_calls(tmp_path):
 
     assert sorted(result["arguments"]["value"] for result in results) == list(range(32))
     assert len({(result["pid"], result["request_id"]) for result in results}) == 32
+
+
+def test_api_route_rebinds_project_without_leaking_transport(tmp_path):
+    binary = tmp_path / "fake-cbm"
+    source = tmp_path / "source"
+    source.mkdir()
+    write_query_cbm(binary)
+
+    with CBMClient(
+        binary,
+        transport="mcp",
+        routes={"query_graph": "cli"},
+        cache_root=tmp_path / "cache",
+        timeout=5,
+    ) as client:
+        graph = client.project_graph("demo", source_root=source)
+        searched = client.search_graph(graph, label="Function")
+        queried = client.query_graph(graph, query="MATCH (n) RETURN n")
+
+        assert searched["cwd"] == str(source)
+        assert queried["cwd"] == str(source)
+        assert searched["pid"] != queried["pid"]
+        assert set(client._transports) == {"mcp", "cli"}
 
 
 def test_client_uses_environment_cache_override(tmp_path):

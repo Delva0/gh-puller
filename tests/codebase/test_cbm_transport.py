@@ -99,6 +99,9 @@ if sys.argv[1:] == ["cli", "index_repository", "--help"]:
     print("--force-full", *delta_flags)
     raise SystemExit(0)
 
+if "--help" in sys.argv[1:]:
+    raise SystemExit(2)
+
 if len(sys.argv) > 1:
     print(json.dumps(payload(json.loads(sys.argv[-1]))), flush=True)
     raise SystemExit(0)
@@ -195,6 +198,18 @@ def test_cli_capabilities_use_cli_without_mcp_frontend(tmp_path):
         {"repository-index", "force-full-route", "granular-delta-controls"},
     )
     assert not monitor.children
+
+
+@pytest.mark.parametrize("kind", ["mcp", "cli"])
+def test_frontend_transport_discovers_missing_operations(tmp_path, kind):
+    binary = tmp_path / "fake-cbm"
+    write_fake_cbm(binary)
+    transport = make_transport(kind, binary, tmp_path / "cache", FakeMonitor())
+    try:
+        assert transport.supports("index_repository")
+        assert not transport.supports("future_sdk_operation")
+    finally:
+        transport.close()
 
 
 def test_capability_probe_requires_every_delta_control():

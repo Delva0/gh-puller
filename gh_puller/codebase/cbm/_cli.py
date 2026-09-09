@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import threading
 from typing import TYPE_CHECKING, Any
 
 from ._transport import (
@@ -43,8 +44,10 @@ class CLITransport(_ProjectTransport):
         self.timeout = timeout
         self.monitor = monitor
         self.environment = dict(environment)
+        self._help_lock = threading.Lock()
+        self._help: dict[str, str | None] = {}
 
-    def _run(self, arguments: list[str]) -> dict[str, Any]:
+    def _run(self, arguments: list[str], source_root: Path | None = None) -> dict[str, Any]:
         process = subprocess.Popen(
             [str(self._binary.path), "cli", "--json", *arguments],
             stdout=subprocess.PIPE,
@@ -56,6 +59,7 @@ class CLITransport(_ProjectTransport):
                 **self.environment,
                 "CBM_CACHE_DIR": str(self.cache_root),
             },
+            cwd=source_root,
         )
         self.monitor.add_child(process.pid)
         try:
@@ -82,44 +86,70 @@ class CLITransport(_ProjectTransport):
         if not isinstance(envelope, dict):
             raise CBMTransportError("CBM CLI returned a non-object JSON envelope")
         nested_result = envelope.get("result")
-        if envelope.get("isError") or (
-            isinstance(nested_result, dict) and nested_result.get("isError")
-        ):
+        if envelope.get("isError") or (isinstance(nested_result, dict) and nested_result.get("isError")):
             raise CBMTransportError(f"CBM CLI request failed: {stdout[-2000:]}")
         return envelope
 
-    def _call_tool(self, name: str, arguments: Mapping[str, object]) -> dict[str, Any]:
+    def _call_tool(
+        self,
+        name: str,
+        arguments: Mapping[str, object],
+        source_root: Path | None,
+    ) -> dict[str, Any]:
         return self._run(
             [name, json.dumps(arguments, separators=(",", ":"), ensure_ascii=False)],
+            source_root,
         )
+
+    def _tool_help(self, operation: str) -> str | None:
+        if (
+            not operation
+            or not operation[0].isalpha()
+            or any(not (character.isalnum() or character == "_") for character in operation)
+        ):
+            return None
+        with self._help_lock:
+            if operation in self._help:
+                return self._help[operation]
+            try:
+                result = subprocess.run(
+                    [str(self._binary.path), "cli", operation, "--help"],
+                    capture_output=True,
+                    text=True,
+                    errors="replace",
+                    timeout=min(self.timeout, 30),
+                    check=False,
+                    env={
+                        **os.environ,
+                        **self.environment,
+                        "CBM_CACHE_DIR": str(self.cache_root),
+                    },
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                help_text = None
+            else:
+                help_text = result.stdout if result.returncode == 0 else None
+            self._help[operation] = help_text
+            return help_text
+
+    def supports(self, operation: str) -> bool:
+        """Return whether this CBM binary exposes an operation through CLI."""
+        if operation == "project_graph":
+            return True
+        if operation == "open_store":
+            return False
+        return self._tool_help(operation) is not None
 
     def capabilities(self) -> frozenset[str]:
         """Inspect capabilities through CLI-generated tool help."""
-        try:
-            result = subprocess.run(
-                [str(self._binary.path), "cli", "index_repository", "--help"],
-                capture_output=True,
-                text=True,
-                errors="replace",
-                timeout=min(self.timeout, 30),
-                check=False,
-                env={
-                    **os.environ,
-                    **self.environment,
-                    "CBM_CACHE_DIR": str(self.cache_root),
-                },
-            )
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            raise CBMTransportError(f"cannot inspect CBM CLI capabilities: {exc}") from exc
-        if result.returncode:
-            raise CBMTransportError(
-                f"CBM CLI capability inspection exited {result.returncode}: {result.stderr[-2000:]}",
-            )
+        help_text = self._tool_help("index_repository")
+        if help_text is None:
+            raise CBMTransportError("CBM CLI does not expose index_repository")
         capabilities = {"repository-index"}
-        if "--force-full" in result.stdout:
+        if "--force-full" in help_text:
             capabilities.add("force-full-route")
         delta_flags = {f"--{name.replace('_', '-')}" for name in _DELTA_ARGUMENTS}
-        if all(flag in result.stdout for flag in delta_flags):
+        if all(flag in help_text for flag in delta_flags):
             capabilities.add("granular-delta-controls")
         return frozenset(capabilities)
 

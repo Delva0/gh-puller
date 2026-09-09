@@ -48,15 +48,17 @@ class _ClientMonitor:
 
 @dataclass(frozen=True, slots=True)
 class GraphHandle:
-    """Bind one CBM graph to the transport that opened it."""
+    """Identify one CBM graph independently of its access path."""
 
     project: str
-    transport: TransportName
     source_root: Path | None
     nodes: int | None
     edges: int | None
+    _owner: CBMClient = field(repr=False, compare=False)
+    _preferred: TransportName = field(repr=False, compare=False)
     _transport: Transport = field(repr=False, compare=False)
     _binding: object = field(repr=False, compare=False)
+    _store: Path | None = field(repr=False, compare=False)
 
 
 def default_cbm_cache(environ: Mapping[str, str] | None = None) -> Path:
@@ -124,10 +126,7 @@ class CBMClient:
         if timeout <= 0:
             raise ValueError("CBM timeout must be positive")
         selected_transport = parse_transport_name(transport)
-        selected_routes = {
-            operation: parse_transport_name(route)
-            for operation, route in dict(routes or {}).items()
-        }
+        selected_routes = {operation: parse_transport_name(route) for operation, route in dict(routes or {}).items()}
         overrides = dict(environment or {})
         values = {**os.environ, **overrides}
         resolved_cache = (
@@ -179,23 +178,74 @@ class CBMClient:
 
     def _select_transport(self, operation: str, transport: str | None = None) -> Transport:
         selected = (
-            parse_transport_name(transport)
-            if transport is not None
-            else self.routes.get(operation, self.transport)
+            parse_transport_name(transport) if transport is not None else self.routes.get(operation, self.transport)
         )
         return self._get_transport(selected)
 
     @staticmethod
-    def _graph(transport: Transport, opened: OpenedGraph) -> GraphHandle:
+    def _require(transport: Transport, operation: str) -> None:
+        if not transport.supports(operation):
+            raise CBMTransportError(
+                f"CBM {transport.name} transport does not support {operation}",
+            )
+
+    def _native_transport(self) -> Transport:
+        return self._get_transport("native")
+
+    def _graph(
+        self,
+        transport: Transport,
+        opened: OpenedGraph,
+        store: Path | None = None,
+    ) -> GraphHandle:
         return GraphHandle(
             opened.project,
-            transport.name,
             opened.source_root,
             opened.nodes,
             opened.edges,
+            self,
+            transport.name,
             transport,
             opened.binding,
+            store,
         )
+
+    def _target_transport(
+        self,
+        operation: str,
+        target: GraphHandle,
+        transport: str | None,
+    ) -> Transport:
+        if target._owner is not self:
+            raise CBMTransportError("graph handle belongs to another CBM client")
+        if target._store is not None:
+            if transport is not None and parse_transport_name(transport) != "native":
+                raise CBMTransportError("explicit CBM stores require the native transport")
+            self._require(target._transport, operation)
+            return target._transport
+        if transport is not None:
+            selected = self._get_transport(parse_transport_name(transport))
+        else:
+            selected = self._get_transport(self.routes.get(operation, target._preferred))
+        self._require(selected, operation)
+        return selected
+
+    def _target_binding(self, target: GraphHandle, transport: Transport) -> object:
+        if target._owner is not self:
+            raise CBMTransportError("graph handle belongs to another CBM client")
+        if transport is target._transport:
+            return target._binding
+        if target._store is not None:
+            raise CBMTransportError("explicit CBM stores require the native transport")
+        self._require(transport, "project_graph")
+        opened = transport.open_project(target.project, target.source_root)
+        if (
+            opened.project != target.project
+            or (target.nodes is not None and opened.nodes is not None and opened.nodes != target.nodes)
+            or (target.edges is not None and opened.edges is not None and opened.edges != target.edges)
+        ):
+            raise CBMTransportError("CBM transport opened a different graph")
+        return opened.binding
 
     def project_graph(
         self,
@@ -208,7 +258,7 @@ class CBMClient:
 
         Args:
             project: Exact mutable CBM project name.
-            source_root: Matching checkout for source-aware native tools.
+            source_root: Matching checkout for source-aware tools.
             transport: Explicit route overriding this API's configured selection.
 
         Returns:
@@ -216,6 +266,7 @@ class CBMClient:
         """
         resolved_source = Path(source_root).resolve() if source_root is not None else None
         route = self._select_transport("project_graph", transport)
+        self._require(route, "project_graph")
         return self._graph(route, route.open_project(project, resolved_source))
 
     def open_store(
@@ -224,39 +275,53 @@ class CBMClient:
         project: str,
         *,
         source_root: str | Path | None = None,
-        transport: str | None = None,
     ) -> GraphHandle:
-        """Open an explicit CBM store through a selected SDK route.
+        """Open an explicit CBM store through the native SDK.
 
         Args:
             database_path: Exact CBM database containing the graph.
             project: Project expected inside the store.
             source_root: Matching checkout for source-aware graph tools.
-            transport: Explicit route overriding this API's configured selection.
 
         Returns:
             A transport-neutral graph handle.
         """
         database = Path(database_path).expanduser().resolve()
         resolved_source = Path(source_root).resolve() if source_root is not None else None
-        route = self._select_transport("open_store", transport)
+        route = self._native_transport()
+        self._require(route, "open_store")
         return self._graph(
             route,
             route.open_store(database, project, resolved_source),
+            database,
         )
 
+    def supports(self, operation: str, *, transport: str | None = None) -> bool:
+        """Return whether one selected route currently exposes an operation.
+
+        Args:
+            operation: Public CBM API or tool name.
+            transport: Explicit route. ``None`` uses this operation's configured
+                route and then the client default.
+        """
+        return self._select_transport(operation, transport).supports(operation)
+
     def capabilities(self, *, transport: str | None = None) -> frozenset[str]:
-        """Return capabilities advertised by an indexing route.
+        """Return detailed features advertised by an indexing route.
 
         Args:
             transport: Explicit route overriding ``index_repository`` selection.
         """
-        return self._select_transport("index_repository", transport).capabilities()
+        route = self._select_transport("index_repository", transport)
+        self._require(route, "index_repository")
+        return route.capabilities()
 
     @property
     def index_engine(self) -> CBMBinary | NativeHelper:
         """Return the pinned executable that implements repository indexing."""
-        return self._select_transport("index_repository").engine
+        route = self._select_transport("index_repository")
+        self._require(route, "index_repository")
+        return route.engine
 
     def index_repository(
         self,
@@ -284,7 +349,7 @@ class CBMClient:
         Returns:
             Machine-readable route evidence reported by CBM.
         """
-        tree_path = Path(tree)
+        tree_path = Path(tree).resolve()
         cross_repo = mode == "cross-repo-intelligence"
         if cross_repo and not target_projects:
             raise ValueError("cross-repo-intelligence requires target projects")
@@ -294,6 +359,7 @@ class CBMClient:
             raise ValueError("target projects require cross-repo-intelligence mode")
         effective_controls = None if cross_repo else incremental_controls
         route = self._select_transport("index_repository", transport)
+        self._require(route, "index_repository")
         return route.index_repository(
             tree_path,
             _project_database(self.cache_root, project),
@@ -312,6 +378,7 @@ class CBMClient:
             transport: Explicit route overriding this API's configured selection.
         """
         route = self._select_transport("delete_project", transport)
+        self._require(route, "delete_project")
         return route.delete_project(_project_database(self.cache_root, project), project)
 
     def list_projects(self, *, transport: str | None = None, **options: object) -> dict[str, Any]:
@@ -321,7 +388,9 @@ class CBMClient:
             transport: Explicit route overriding this API's configured selection.
             **options: Native CBM pagination and detail fields.
         """
-        return self._select_transport("list_projects", transport).list_projects(options)
+        route = self._select_transport("list_projects", transport)
+        self._require(route, "list_projects")
+        return route.list_projects(options)
 
     def call_tool(
         self,
@@ -336,14 +405,17 @@ class CBMClient:
         Args:
             name: CBM SDK tool name.
             arguments: Tool-specific arguments. ``None`` sends an empty object.
-            target: Explicit graph binding. Its captured route takes precedence.
-            transport: Route used only when ``target`` is absent.
+            target: Optional graph identity and preferred route.
+            transport: Explicit route overriding both API configuration and the
+                graph's preferred route.
         """
         if target is not None:
-            if transport is not None and parse_transport_name(transport) != target.transport:
-                raise CBMTransportError("explicit transport disagrees with the graph handle")
-            return target._transport.call_tool(target._binding, name, dict(arguments or {}))
-        return self._select_transport(name, transport).call_tool(None, name, dict(arguments or {}))
+            route = self._target_transport(name, target, transport)
+            binding = self._target_binding(target, route)
+            return route.call_tool(binding, name, dict(arguments or {}))
+        route = self._select_transport(name, transport)
+        self._require(route, name)
+        return route.call_tool(None, name, dict(arguments or {}))
 
     def call_json_tool(
         self,
@@ -358,8 +430,9 @@ class CBMClient:
         Args:
             name: CBM SDK tool name.
             arguments: Tool-specific arguments. ``None`` sends an empty object.
-            target: Optional explicit graph/transport binding.
-            transport: Route used only when ``target`` is absent.
+            target: Optional graph identity and preferred route.
+            transport: Explicit route overriding both API configuration and the
+                graph's preferred route.
 
         Returns:
             The logical JSON object returned by CBM.
@@ -369,11 +442,18 @@ class CBMClient:
         """
         return self.call_tool(name, arguments, target=target, transport=transport)
 
-    def search_graph(self, target: GraphHandle, **filters: object) -> dict[str, Any]:
+    def search_graph(
+        self,
+        target: GraphHandle,
+        *,
+        transport: str | None = None,
+        **filters: object,
+    ) -> dict[str, Any]:
         """Run CBM structured, BM25, or semantic graph search.
 
         Args:
             target: Graph returned by :meth:`project_graph`.
+            transport: Explicit route overriding this API's configured selection.
             **filters: Native ``search_graph`` fields such as ``query``, ``label``,
                 ``name_pattern``, ``limit``, and ``offset``.
         """
@@ -381,6 +461,7 @@ class CBMClient:
             "search_graph",
             {**filters, "format": "json"},
             target=target,
+            transport=transport,
         )
 
     def search_code(
@@ -388,6 +469,7 @@ class CBMClient:
         target: GraphHandle,
         *,
         pattern: str,
+        transport: str | None = None,
         **options: object,
     ) -> dict[str, Any]:
         """Search source text and enrich matches with graph structure.
@@ -395,6 +477,7 @@ class CBMClient:
         Args:
             target: Graph returned by :meth:`project_graph`.
             pattern: Literal or regular-expression source pattern.
+            transport: Explicit route overriding this API's configured selection.
             **options: Additional ``search_code`` fields such as ``mode``,
                 ``file_pattern``, ``path_filter``, and ``limit``.
         """
@@ -402,14 +485,23 @@ class CBMClient:
             "search_code",
             {"pattern": pattern, **options},
             target=target,
+            transport=transport,
         )
 
-    def query_graph(self, target: GraphHandle, *, query: str, **options: object) -> dict[str, Any]:
+    def query_graph(
+        self,
+        target: GraphHandle,
+        *,
+        query: str,
+        transport: str | None = None,
+        **options: object,
+    ) -> dict[str, Any]:
         """Run a read-only Cypher-like query against a CBM graph.
 
         Args:
             target: Graph returned by :meth:`project_graph`.
             query: Native CBM graph query.
+            transport: Explicit route overriding this API's configured selection.
             **options: Additional ``query_graph`` fields such as ``graph`` and
                 ``max_rows``.
         """
@@ -417,21 +509,33 @@ class CBMClient:
             "query_graph",
             {"query": query, **options, "format": "json"},
             target=target,
+            transport=transport,
         )
 
-    def get_graph_schema(self, target: GraphHandle) -> dict[str, Any]:
+    def get_graph_schema(
+        self,
+        target: GraphHandle,
+        *,
+        transport: str | None = None,
+    ) -> dict[str, Any]:
         """Return labels, relationship types, and their available properties.
 
         Args:
             target: Graph returned by :meth:`project_graph`.
+            transport: Explicit route overriding this API's configured selection.
         """
-        return self.call_json_tool("get_graph_schema", target=target)
+        return self.call_json_tool(
+            "get_graph_schema",
+            target=target,
+            transport=transport,
+        )
 
     def trace_path(
         self,
         target: GraphHandle,
         *,
         function_name: str,
+        transport: str | None = None,
         **options: object,
     ) -> dict[str, Any]:
         """Trace calls, data flow, or cross-service paths from one symbol.
@@ -440,6 +544,7 @@ class CBMClient:
             target: Graph returned by :meth:`project_graph`.
             function_name: Qualified or discoverable function name used as the
                 traversal origin.
+            transport: Explicit route overriding this API's configured selection.
             **options: Native ``trace_path`` fields such as ``direction``, ``depth``,
                 ``mode``, ``limit``, and ``cursor``.
         """
@@ -447,6 +552,7 @@ class CBMClient:
             "trace_path",
             {"function_name": function_name, **options, "format": "json"},
             target=target,
+            transport=transport,
         )
 
     def get_code_snippet(
@@ -454,6 +560,7 @@ class CBMClient:
         target: GraphHandle,
         *,
         qualified_name: str,
+        transport: str | None = None,
         **options: object,
     ) -> dict[str, Any]:
         """Read the source belonging to one graph symbol.
@@ -461,6 +568,7 @@ class CBMClient:
         Args:
             target: Graph returned by :meth:`project_graph`.
             qualified_name: Exact symbol identity or a short name accepted by CBM.
+            transport: Explicit route overriding this API's configured selection.
             **options: Additional ``get_code_snippet`` fields such as
                 ``include_neighbors``.
         """
@@ -468,6 +576,7 @@ class CBMClient:
             "get_code_snippet",
             {"qualified_name": qualified_name, **options},
             target=target,
+            transport=transport,
         )
 
     def get_architecture(
@@ -476,6 +585,7 @@ class CBMClient:
         *,
         path: str | None = None,
         aspects: Sequence[str] | None = None,
+        transport: str | None = None,
         **options: object,
     ) -> dict[str, Any]:
         """Summarize graph structure, dependencies, and architectural views.
@@ -485,6 +595,7 @@ class CBMClient:
             path: Optional repository-relative directory scope.
             aspects: Optional CBM architecture sections. ``None`` selects the
                 compact default view.
+            transport: Explicit route overriding this API's configured selection.
             **options: Additional ``get_architecture`` fields supported by CBM.
         """
         arguments = dict(options)
@@ -493,7 +604,12 @@ class CBMClient:
         if aspects is not None:
             arguments["aspects"] = list(aspects)
         arguments["format"] = "json"
-        return self.call_json_tool("get_architecture", arguments, target=target)
+        return self.call_json_tool(
+            "get_architecture",
+            arguments,
+            target=target,
+            transport=transport,
+        )
 
     def check_index_coverage(
         self,
@@ -503,6 +619,7 @@ class CBMClient:
         scopes: Sequence[str] = (),
         scope_limit: int = 200,
         scope_offset: int = 0,
+        transport: str | None = None,
     ) -> dict[str, Any]:
         """Inspect CBM's best-effort coverage record for paths or scopes.
 
@@ -512,6 +629,7 @@ class CBMClient:
             scopes: Repository-relative path prefixes to enumerate.
             scope_limit: Maximum coverage rows returned for each scope.
             scope_offset: Starting row offset for each scope.
+            transport: Explicit route overriding this API's configured selection.
         """
         return self.call_json_tool(
             "check_index_coverage",
@@ -522,13 +640,21 @@ class CBMClient:
                 "scope_offset": scope_offset,
             },
             target=target,
+            transport=transport,
         )
 
-    def detect_changes(self, target: GraphHandle, **options: object) -> dict[str, Any]:
+    def detect_changes(
+        self,
+        target: GraphHandle,
+        *,
+        transport: str | None = None,
+        **options: object,
+    ) -> dict[str, Any]:
         """Map source changes to graph impact.
 
         Args:
             target: Graph returned by :meth:`project_graph`.
+            transport: Explicit route overriding this API's configured selection.
             **options: ``detect_changes`` fields such as ``base_branch``,
                 ``since``, ``scope``, ``direction``, ``depth``, and ``limit``.
         """
@@ -536,6 +662,7 @@ class CBMClient:
             "detect_changes",
             {**options, "format": "json"},
             target=target,
+            transport=transport,
         )
 
     def manage_adr(
@@ -545,6 +672,7 @@ class CBMClient:
         mode: str = "get",
         content: str | None = None,
         section_updates: Mapping[str, str] | None = None,
+        transport: str | None = None,
     ) -> dict[str, Any]:
         """Read or explicitly update a project's architecture record.
 
@@ -554,29 +682,39 @@ class CBMClient:
                 a writable graph handle.
             content: Complete replacement document used by ``update``.
             section_updates: Named replacement sections used by ``set_sections``.
+            transport: Explicit route overriding this API's configured selection.
         """
         arguments: dict[str, object] = {"mode": mode}
         if content is not None:
             arguments["content"] = content
         if section_updates is not None:
             arguments["section_updates"] = dict(section_updates)
-        return self.call_json_tool("manage_adr", arguments, target=target)
+        return self.call_json_tool(
+            "manage_adr",
+            arguments,
+            target=target,
+            transport=transport,
+        )
 
     def ingest_traces(
         self,
         target: GraphHandle,
         traces: Sequence[Mapping[str, object]],
+        *,
+        transport: str | None = None,
     ) -> dict[str, Any]:
         """Submit runtime call observations to CBM.
 
         Args:
             target: Graph returned by :meth:`project_graph`.
             traces: Caller, callee, and count objects accepted by CBM.
+            transport: Explicit route overriding this API's configured selection.
         """
         return self.call_json_tool(
             "ingest_traces",
             {"traces": [dict(trace) for trace in traces]},
             target=target,
+            transport=transport,
         )
 
     def index_status(
@@ -584,17 +722,20 @@ class CBMClient:
         target: GraphHandle,
         *,
         verbose: bool = False,
+        transport: str | None = None,
     ) -> dict[str, Any]:
         """Return graph counts, root identity, and persisted coverage status.
 
         Args:
             target: Graph returned by :meth:`project_graph`.
             verbose: Include live Git/worktree context when supported.
+            transport: Explicit route overriding this API's configured selection.
         """
         return self.call_json_tool(
             "index_status",
             {"verbose": verbose},
             target=target,
+            transport=transport,
         )
 
     def compare_graphs(
@@ -604,23 +745,27 @@ class CBMClient:
         *,
         limit: int = 200,
         scan_limit: int = 2_000_000,
+        transport: str | None = None,
     ) -> dict[str, Any]:
         """Compare stable node and edge identities across two graph generations.
 
         Args:
-            base: Older graph generation.
-            target: Newer graph from the same transport instance.
+            base: Older graph generation owned by this client.
+            target: Newer graph generation owned by this client.
             limit: Maximum returned entries per change set.
             scan_limit: Maximum combined rows scanned per node or edge phase.
+            transport: Explicit route overriding this API's configured selection.
 
         Raises:
-            CBMTransportError: Handles belong to different transports.
+            CBMTransportError: Handles belong to another client or cannot be
+                opened through the selected route.
         """
-        if base._transport is not target._transport:
-            raise CBMTransportError("graph handles belong to different CBM transports")
-        return target._transport.compare_graphs(
-            base._binding,
-            target._binding,
+        route = self._target_transport("compare_graphs", target, transport)
+        base_binding = self._target_binding(base, route)
+        target_binding = self._target_binding(target, route)
+        return route.compare_graphs(
+            base_binding,
+            target_binding,
             limit=limit,
             scan_limit=scan_limit,
         )

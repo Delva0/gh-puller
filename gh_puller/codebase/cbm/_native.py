@@ -37,6 +37,13 @@ _RESPONSE_MAX_BYTES = 256 << 20
 _QUERY_HELPER_ENV = "GH_PULLER_CODEBASE_CBM_HELPER"
 _INDEX_HELPER_ENV = "GH_PULLER_CODEBASE_CBM_INDEX_HELPER"
 _STREAM_CLOSED = object()
+_CAPABILITY_BY_OPERATION = {
+    "project_graph": "project-open",
+    "open_store": "project-open",
+    "list_projects": "project-list",
+    "delete_project": "project-delete",
+    "compare_graphs": "graph-compare",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -183,16 +190,7 @@ class _NativeSession:
         helper_environment_key: str = _QUERY_HELPER_ENV,
         helper_filename: str = "gh-puller-cbm-helper",
         protocol: int = _QUERY_PROTOCOL_VERSION,
-        required_capabilities: frozenset[str] = frozenset(
-            {
-                "tool-call",
-                "graph-compare",
-                "project-open",
-                "project-open-read-only",
-                "project-list",
-                "project-delete",
-            },
-        ),
+        required_capabilities: frozenset[str] = frozenset(),
     ):
         """Start the helper and negotiate the fixed native protocol.
 
@@ -258,7 +256,6 @@ class _NativeSession:
                 or not all(isinstance(item, str) for item in capabilities)
                 or not required_capabilities <= set(capabilities)
                 or not isinstance(tools, list)
-                or not tools
                 or not all(isinstance(item, str) and item for item in tools)
                 or type(store_format) is not int
                 or store_format < 1
@@ -581,17 +578,6 @@ class _NativeIndexSession(_NativeSession):
             helper_environment_key=_INDEX_HELPER_ENV,
             helper_filename="gh-puller-cbm-index-helper",
             protocol=_INDEX_PROTOCOL_VERSION,
-            required_capabilities=frozenset(
-                {
-                    "repository-index",
-                    "project-open",
-                    "project-open-read-only",
-                    "project-list",
-                    "project-delete",
-                    "granular-delta-controls",
-                    "force-full-route",
-                },
-            ),
         )
 
     def index_repository(
@@ -699,15 +685,27 @@ class NativeTransport:
         return self._index_session().capabilities
 
     @staticmethod
+    def _session_supports(session: _NativeSession, operation: str) -> bool:
+        capability = _CAPABILITY_BY_OPERATION.get(operation)
+        return capability in session.capabilities if capability is not None else operation in session.tools
+
+    def supports(self, operation: str) -> bool:
+        """Return whether the loaded SDK adapter advertises an operation."""
+        if operation == "index_repository":
+            return "repository-index" in self._index_session().capabilities
+        with self._lock:
+            index = self._index
+        if index is not None and self._session_supports(index, operation):
+            return True
+        return self._session_supports(self._query_session(), operation)
+
+    @staticmethod
     def _database_path(cache_root: Path, project: str) -> Path:
         if (
             not project
             or project.startswith(".")
             or ".." in project
-            or any(
-                not (character.isascii() and (character.isalnum() or character in "-_."))
-                for character in project
-            )
+            or any(not (character.isascii() and (character.isalnum() or character in "-_.")) for character in project)
         ):
             raise ValueError(f"invalid CBM project name: {project!r}")
         return cache_root / f"{project}.db"
@@ -717,7 +715,9 @@ class NativeTransport:
             for session in (self._index, self._query):
                 if session is not None and session.loaded_database_path == database_path:
                     return session
-            return self._index or self._query_session()
+            if self._index is not None and "project-open" in self._index.capabilities:
+                return self._index
+            return self._query_session()
 
     def open_project(self, project: str, source_root: Path | None) -> OpenedGraph:
         database_path = self._database_path(self.cache_root, project)
@@ -820,7 +820,11 @@ class NativeTransport:
         return checked_index_execution(result, force_full, incremental_controls)
 
     def list_projects(self, options: Mapping[str, object]) -> dict[str, Any]:
-        session = self._index or self._query_session()
+        session = (
+            self._index
+            if self._index is not None and "project-list" in self._index.capabilities
+            else self._query_session()
+        )
         return session.list_projects(options)
 
     def delete_project(self, database_path: Path, project: str) -> tuple[bool, str]:

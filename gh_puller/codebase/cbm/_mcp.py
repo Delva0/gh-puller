@@ -1,7 +1,8 @@
 """Implement the pooled MCP frontend transport for the CBM client.
 
 Each child process is an independent thin MCP frontend. The pool starts lazily,
-reuses idle frontends, and expands only when concurrent calls require it.
+reuses frontends bound to the same source root, and expands only when concurrent
+calls or distinct roots require it.
 """
 
 from __future__ import annotations
@@ -45,11 +46,7 @@ def capabilities_from_tools_list(result: object) -> frozenset[str]:
     if not isinstance(result, dict) or not isinstance(result.get("tools"), list):
         return frozenset()
     index_tool = next(
-        (
-            tool
-            for tool in result["tools"]
-            if isinstance(tool, dict) and tool.get("name") == "index_repository"
-        ),
+        (tool for tool in result["tools"] if isinstance(tool, dict) and tool.get("name") == "index_repository"),
         None,
     )
     if not isinstance(index_tool, dict):
@@ -76,9 +73,11 @@ class _MCPFrontend:
         timeout: float,
         monitor: ResourceMonitorLike,
         environment: Mapping[str, str],
+        source_root: Path | None,
     ):
         self.timeout = timeout
         self.monitor = monitor
+        self.source_root = source_root
         self._next_id = 0
         self._messages: queue.Queue[object] = queue.Queue()
         self._pending: dict[int, dict] = {}
@@ -98,6 +97,7 @@ class _MCPFrontend:
                 **environment,
                 "CBM_CACHE_DIR": str(cache_root),
             },
+            cwd=source_root,
         )
         if self.process.stdin is None or self.process.stdout is None or self.process.stderr is None:
             self._terminate()
@@ -312,33 +312,44 @@ class MCPTransport(_ProjectTransport):
         self._idle: list[_MCPFrontend] = []
         self._creating = 0
         self._closed = False
+        self._tools_lock = threading.Lock()
+        self._tools: tuple[dict[str, Any], ...] | None = None
 
-    def _new_frontend(self) -> _MCPFrontend:
+    def _new_frontend(self, source_root: Path | None) -> _MCPFrontend:
         return _MCPFrontend(
             self._binary.path,
             self.cache_root,
             self.timeout,
             self.monitor,
             self.environment,
+            source_root,
         )
 
-    def _acquire(self) -> _MCPFrontend:
+    def _acquire(self, source_root: Path | None) -> _MCPFrontend:
         deadline = time.monotonic() + self.timeout
         while True:
+            retired = None
             with self._condition:
                 if self._closed:
                     raise CBMTransportError("CBM MCP transport is closed")
-                if self._idle:
-                    return self._idle.pop()
+                for index in range(len(self._idle) - 1, -1, -1):
+                    if self._idle[index].source_root == source_root:
+                        return self._idle.pop(index)
                 if len(self._frontends) + self._creating < self.max_frontends:
                     self._creating += 1
                     break
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise CBMTransportError("timed out waiting for a CBM MCP frontend")
-                self._condition.wait(remaining)
+                if self._idle:
+                    retired = self._idle.pop()
+                    self._frontends.remove(retired)
+                else:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise CBMTransportError("timed out waiting for a CBM MCP frontend")
+                    self._condition.wait(remaining)
+            if retired is not None:
+                retired.close()
         try:
-            frontend = self._new_frontend()
+            frontend = self._new_frontend(source_root)
         except BaseException:
             with self._condition:
                 self._creating -= 1
@@ -364,21 +375,41 @@ class MCPTransport(_ProjectTransport):
         if close:
             frontend.close()
 
-    def _use(self, operation):
-        frontend = self._acquire()
+    def _use(self, operation, source_root: Path | None = None):
+        frontend = self._acquire(source_root)
         try:
             return operation(frontend)
         finally:
             self._release(frontend)
 
-    def _call_tool(self, name: str, arguments: Mapping[str, object]) -> dict[str, Any]:
-        return self._use(lambda frontend: frontend.call_tool(name, arguments))
+    def _call_tool(
+        self,
+        name: str,
+        arguments: Mapping[str, object],
+        source_root: Path | None,
+    ) -> dict[str, Any]:
+        return self._use(
+            lambda frontend: frontend.call_tool(name, arguments),
+            source_root,
+        )
+
+    def _tool_definitions(self) -> tuple[dict[str, Any], ...]:
+        with self._tools_lock:
+            if self._tools is None:
+                self._tools = tuple(self._use(lambda frontend: frontend.list_tools()))
+            return self._tools
+
+    def supports(self, operation: str) -> bool:
+        """Return whether the live MCP frontend advertises an operation."""
+        if operation == "project_graph":
+            return True
+        if operation == "open_store":
+            return False
+        return any(tool.get("name") == operation for tool in self._tool_definitions())
 
     def capabilities(self) -> frozenset[str]:
         """Return index capabilities advertised by one live frontend."""
-        return self._use(
-            lambda frontend: capabilities_from_tools_list({"tools": frontend.list_tools()}),
-        )
+        return capabilities_from_tools_list({"tools": list(self._tool_definitions())})
 
     @property
     def frontend_pids(self) -> frozenset[int]:

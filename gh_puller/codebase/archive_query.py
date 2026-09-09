@@ -203,17 +203,19 @@ class ArchiveLoader:
                 ):
                     raise CBMTransportError("native helper returned the wrong KGA graph identity")
                 _write_marker(marker, expected_marker)
-            opened = client.open_store(database, project, transport="native")
+            opened = client.open_store(database, project)
             if opened.nodes != result["nodes"] or opened.edges != result["edges"]:
                 raise CBMTransportError("opened CBM store has the wrong graph counts")
             return ArchiveGraph(
                 project=opened.project,
-                transport=opened.transport,
                 source_root=opened.source_root,
                 nodes=opened.nodes,
                 edges=opened.edges,
+                _owner=opened._owner,
+                _preferred=opened._preferred,
                 _transport=opened._transport,
                 _binding=opened._binding,
+                _store=database,
                 database_path=database,
                 graph_digest=result["graph_digest"],
                 materialization_digest=result["materialization_digest"],
@@ -225,6 +227,7 @@ class ArchiveLoader:
         finally:
             if owned:
                 reader.close()
+
     def close(self) -> None:
         """Close the materialization helper without affecting graph handles."""
         with self._lock:
