@@ -18,13 +18,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from .archive import (
+from ..archive import (
     COVERAGE_FIDELITY_VERSION,
     GRAPH_FIDELITY_VERSION,
     Archive,
     ArchiveError,
 )
-from .utils import (
+from ..utils import (
     NativeExecutable,
     NativeExecutableError,
     NullResourceMonitor,

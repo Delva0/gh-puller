@@ -16,6 +16,8 @@ from .build import (
 )
 from .cbm import (
     BuildPlan,
+    CBMArchiveAdapter,
+    CBMArchiveStore,
     CBMBinary,
     CBMBinaryError,
     CBMClient,
@@ -27,7 +29,6 @@ from .cbm import (
     default_cbm_cache,
     resolve_cbm_binary,
 )
-from .cbm_archive import CBMArchiveAdapter, CBMArchiveStore
 from .store import GraphReader
 
 __all__ = [

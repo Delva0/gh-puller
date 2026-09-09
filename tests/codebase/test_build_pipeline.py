@@ -11,8 +11,7 @@ import pytest
 import gh_puller.codebase.cbm.runner as runner_module
 from gh_puller.codebase.archive import Archive
 from gh_puller.codebase.build import BuildOptions, build_repository
-from gh_puller.codebase.cbm import BuildPlan, CBMClient
-from gh_puller.codebase.cbm_archive import CBMArchiveAdapter
+from gh_puller.codebase.cbm import BuildPlan, CBMArchiveAdapter, CBMClient
 
 SCHEMA = """
 CREATE TABLE projects(name TEXT PRIMARY KEY);
