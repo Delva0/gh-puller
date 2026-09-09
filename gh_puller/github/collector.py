@@ -11,7 +11,7 @@ import re
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Protocol
 
-from .api_contract import GitHubAPIError, GitHubResource
+from .client import GitHubAPIError, GitHubResource
 from .commit_references import (
     CommitReference,
     commit_reference_payload,

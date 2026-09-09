@@ -7,8 +7,7 @@ repository snapshot. Silent deletions and changes without GitHub signals are bes
 effort; once a parent item is selected, all promised collections are observed again.
 """
 
-from .api_contract import GitHubAPIError
-from .client import GitHubAPI
+from .client import GitHubAPI, GitHubAPIError
 from .git_store import GitStoreError, TransientGitStoreError
 from .maintenance import (
     REFRESH_FAMILIES,

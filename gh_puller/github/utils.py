@@ -30,7 +30,7 @@ from .git_store import (
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Awaitable, Mapping, Sequence
 
-    from .api_contract import GitHubPage, GitHubResource
+    from .client import GitHubPage, GitHubResource
 
 
 @dataclass(frozen=True, slots=True)
