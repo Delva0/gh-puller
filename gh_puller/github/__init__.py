@@ -18,11 +18,13 @@ from .maintenance import (
 )
 from .observations import (
     Coverage,
+    CurrentFactsView,
     FactObservation,
     Origin,
     iter_current_facts,
     iter_facts_as_of,
     iter_observations,
+    open_current_facts,
 )
 from .progress import ProgressObserver, RateQuota, SyncProgress
 from .syncer import (
@@ -35,6 +37,7 @@ from .syncer import (
 __all__ = [
     "REFRESH_FAMILIES",
     "Coverage",
+    "CurrentFactsView",
     "FactObservation",
     "GitHubAPI",
     "GitHubAPIError",
@@ -52,6 +55,7 @@ __all__ = [
     "iter_current_facts",
     "iter_facts_as_of",
     "iter_observations",
+    "open_current_facts",
     "refresh",
     "sync",
 ]

@@ -114,11 +114,12 @@ There is no repository-wide target timestamp or atomic run snapshot. Facts close
 become readable independently, which preserves the finest time precision available
 from the source operation.
 
-The three read views answer different questions:
+The read surfaces answer different questions:
 
 | Reader | Result |
 | --- | --- |
 | `iter_observations(..., after=N)` | Immutable publication stream after a stable integer cursor. |
+| `open_current_facts(...)` | Maintained current fact heads and their matching observation cutoff in one read transaction. |
 | `iter_current_facts(...)` | Latest actual observation for each selected fact identity. |
 | `iter_facts_as_of(..., at=T)` | Latest observation per identity with `observed_until <= T`. |
 
@@ -130,7 +131,12 @@ facts, not proof that all returned facts coexisted at one instant. Missing facts
 from datetime import UTC, datetime
 from pathlib import Path
 
-from gh_puller.github import iter_facts_as_of
+from gh_puller.github import iter_facts_as_of, open_current_facts
+
+
+async def capture_current_facts(database: Path):
+    async with open_current_facts(database) as view:
+        return view.cutoff, [fact async for fact in view]
 
 
 async def issue_state_at(database: Path, at: datetime):

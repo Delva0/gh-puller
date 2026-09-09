@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+from gh_puller.github import open_current_facts
 from gh_puller.github.observations import (
     Coverage,
     DiscoveryItemDraft,
@@ -178,6 +179,51 @@ async def test_heads_and_as_of_reads_follow_observation_time_not_publication_ord
         ("issue", {"title": "new"}),
         ("issue-relations", {"blocking": []}),
     ]
+
+
+@pytest.mark.asyncio
+async def test_current_facts_view_keeps_cutoff_and_heads_in_one_read_snapshot(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "facts.sqlite3"
+    async with ObservationArchive(database, _REPOSITORY) as archive:
+        first = await archive.publish(
+            "refresh:first",
+            "refresh",
+            _T0 + timedelta(minutes=1),
+            (_fact("issue", "issue:7", _T0, {"title": "first"}),),
+        )
+
+    view = open_current_facts(database, family="issue")
+    with pytest.raises(RuntimeError, match="not been opened"):
+        _ = view.cutoff
+    async with view:
+        assert view.cutoff == first[0].id
+        async with ObservationArchive(database, _REPOSITORY) as archive:
+            second = await archive.publish(
+                "refresh:second",
+                "refresh",
+                _T0 + timedelta(minutes=3),
+                (
+                    _fact(
+                        "issue",
+                        "issue:7",
+                        _T0 + timedelta(minutes=2),
+                        {"title": "second"},
+                    ),
+                ),
+            )
+        frozen = [fact async for fact in view]
+        assert [(fact.id, fact.payload) for fact in frozen] == [
+            (first[0].id, {"title": "first"}),
+        ]
+
+    async with open_current_facts(database) as current:
+        assert current.cutoff == second[0].id
+        facts = [fact async for fact in current]
+        assert [(fact.id, fact.payload) for fact in facts] == [
+            (second[0].id, {"title": "second"}),
+        ]
 
 
 @pytest.mark.asyncio

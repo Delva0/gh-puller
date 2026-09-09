@@ -200,6 +200,108 @@ class FactObservation:
     payload: dict[str, Any]
 
 
+class CurrentFactsView:
+    """Hold current fact heads and their cutoff in one read transaction.
+
+    The view reads the archive's maintained ``fact_heads`` relation rather than
+    reconstructing history. Later publications do not change either its cutoff or
+    yielded facts, and the view makes no claim that independently observed facts
+    coexisted on GitHub.
+
+    Args:
+        path: SQLite observation archive.
+        family: Optional exact fact-family filter.
+        subject_key: Optional exact subject filter.
+    """
+
+    def __init__(
+        self,
+        path: Path,
+        *,
+        family: str | None = None,
+        subject_key: str | None = None,
+    ) -> None:
+        self.path = Path(path)
+        self.family = family
+        self.subject_key = subject_key
+        self._reader: _Reader | None = None
+        self._db: aiosqlite.Connection | None = None
+        self._cutoff: int | None = None
+
+    async def __aenter__(self) -> Self:
+        if self._db is not None:
+            raise RuntimeError("current facts view is already open")
+        reader = _reader(self.path)
+        db = await reader.__aenter__()
+        try:
+            await db.execute("BEGIN")
+            row = await _fetchone(
+                db,
+                "SELECT COALESCE(MAX(id), 0) AS cutoff FROM fact_observations",
+            )
+        except BaseException:
+            await reader.__aexit__()
+            raise
+        self._reader = reader
+        self._db = db
+        self._cutoff = 0 if row is None else int(row["cutoff"])
+        return self
+
+    async def __aexit__(self, *_: object) -> None:
+        reader = self._reader
+        self._reader = None
+        self._db = None
+        if reader is not None:
+            await reader.__aexit__()
+
+    def __aiter__(self) -> AsyncIterator[FactObservation]:
+        return self._facts()
+
+    @property
+    def cutoff(self) -> int:
+        """Return the inclusive observation boundary captured on entry."""
+        if self._cutoff is None:
+            raise RuntimeError("current facts view has not been opened")
+        return self._cutoff
+
+    async def _facts(self) -> AsyncIterator[FactObservation]:
+        db = self._connection
+        parameters = (
+            self.family,
+            self.family,
+            self.subject_key,
+            self.subject_key,
+        )
+        async with db.execute(_CURRENT_QUERY, parameters) as cursor:
+            async for row in cursor:
+                yield _fact(row)
+
+    @property
+    def _connection(self) -> aiosqlite.Connection:
+        if self._db is None:
+            raise RuntimeError("current facts view is not open")
+        return self._db
+
+
+def open_current_facts(
+    path: Path,
+    *,
+    family: str | None = None,
+    subject_key: str | None = None,
+) -> CurrentFactsView:
+    """Prepare an atomic read of the archive's maintained current facts.
+
+    Args:
+        path: SQLite observation archive.
+        family: Optional exact fact-family filter.
+        subject_key: Optional exact subject filter.
+
+    Returns:
+        An async context manager exposing ``cutoff`` and the matching facts.
+    """
+    return CurrentFactsView(path, family=family, subject_key=subject_key)
+
+
 class ObservationArchive:
     """Store observations in a single-writer SQLite archive.
 
@@ -1717,14 +1819,14 @@ ORDER BY o.id
 
 _CURRENT_QUERY = _FACT_SELECT + """
 JOIN fact_heads AS h ON h.observation_id = o.id
-WHERE (? IS NULL OR o.family = ?)
-  AND (? IS NULL OR o.subject_key = ?)
-ORDER BY o.family, o.subject_key
+WHERE (? IS NULL OR h.family = ?)
+  AND (? IS NULL OR h.subject_key = ?)
+ORDER BY h.family, h.subject_key
 """
 
 _CURRENT_FACT_QUERY = _FACT_SELECT + """
 JOIN fact_heads AS h ON h.observation_id = o.id
-WHERE o.family = ? AND o.subject_key = ?
+WHERE h.family = ? AND h.subject_key = ?
 """
 
 _LATEST_COMPLETE_FACT_QUERY = _FACT_SELECT + """
