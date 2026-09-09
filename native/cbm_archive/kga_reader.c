@@ -287,8 +287,9 @@ static int page_read(import_context_t *context, const ghp_kga_root_t *reference,
     uint64_t compressed_size = read_u64_be(header + 9);
     uint32_t expected_crc = read_u32_be(header + 17);
     uint64_t payload_offset = reference->offset + sizeof(header);
-    if (header[0] != KGA_PAGE || raw_size == 0 || compressed_size == 0 || raw_size >= SIZE_MAX ||
-        raw_size > ULONG_MAX || compressed_size > SIZE_MAX || payload_offset > context->limit ||
+    if (header[0] != KGA_PAGE || raw_size == 0 || compressed_size == 0 ||
+        raw_size > SIZE_MAX - YYJSON_PADDING_SIZE || raw_size > ULONG_MAX ||
+        compressed_size > SIZE_MAX || payload_offset > context->limit ||
         compressed_size > context->limit - payload_offset) {
         return fail(context->error, context->error_size, "invalid page bounds at %llu",
                     (unsigned long long)reference->offset);
@@ -296,7 +297,7 @@ static int page_read(import_context_t *context, const ghp_kga_root_t *reference,
 
     measured = profile_clock(context->profile);
     unsigned char *compressed = malloc((size_t)compressed_size);
-    page->raw = malloc((size_t)raw_size + 1);
+    page->raw = malloc((size_t)raw_size + YYJSON_PADDING_SIZE);
     if (!compressed || !page->raw ||
         !read_exact(context->descriptor, payload_offset, compressed, (size_t)compressed_size)) {
         free(compressed);
@@ -324,7 +325,7 @@ static int page_read(import_context_t *context, const ghp_kga_root_t *reference,
                     (unsigned long long)reference->offset);
     }
     profile_add(context->profile, PROFILE_INFLATE, measured, 1);
-    page->raw[raw_size] = '\0';
+    memset(page->raw + raw_size, 0, YYJSON_PADDING_SIZE);
     page->raw_size = (size_t)raw_size;
 
     measured = profile_clock(context->profile);
@@ -338,7 +339,7 @@ static int page_read(import_context_t *context, const ghp_kga_root_t *reference,
     profile_add(context->profile, PROFILE_DIGEST, measured, 1);
 
     measured = profile_clock(context->profile);
-    page->document = yyjson_read_opts(page->raw, page->raw_size, YYJSON_READ_NOFLAG, NULL, NULL);
+    page->document = yyjson_read_opts(page->raw, page->raw_size, YYJSON_READ_INSITU, NULL, NULL);
     if (!page->document || !yyjson_is_obj(yyjson_doc_get_root(page->document))) {
         page_free(page);
         return fail(context->error, context->error_size, "invalid page JSON at %llu",
