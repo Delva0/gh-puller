@@ -37,14 +37,13 @@ from .observations import (
     ObservationArchive,
     TaskDraft,
 )
-from .progress import _SyncProgressTracker
-from .runtime import GitHubRuntime, archive_lock
+from .utils import GitHubRuntime, _SyncProgressTracker, archive_lock
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Sequence
 
-    from .progress import ProgressObserver
     from .syncer import GitHubSyncConfig
+    from .utils import ProgressObserver
 
 _COMMIT_TASK_SIZE = 256
 _REFERENCE_SCAN_TASK_SIZE = 256

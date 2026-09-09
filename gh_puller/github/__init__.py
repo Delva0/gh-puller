@@ -26,13 +26,13 @@ from .observations import (
     iter_observations,
     open_current_facts,
 )
-from .progress import ProgressObserver, RateQuota, SyncProgress
 from .syncer import (
     GitHubSyncConfig,
     IncompleteGitHubDataError,
     SyncResult,
     sync,
 )
+from .utils import ProgressObserver, RateQuota, SyncProgress
 
 __all__ = [
     "REFRESH_FAMILIES",

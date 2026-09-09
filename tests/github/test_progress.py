@@ -6,7 +6,7 @@ import json
 from datetime import UTC, datetime, timedelta
 from io import StringIO
 
-from gh_puller.github.progress import (
+from gh_puller.github.utils import (
     APIProgress,
     ConsoleProgress,
     RateQuota,

@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from .archive_format import ARCHIVE_SCHEMA_VERSION
-from .progress import RateQuota
+from .utils import RateQuota
 
 if TYPE_CHECKING:
     from collections.abc import Sequence

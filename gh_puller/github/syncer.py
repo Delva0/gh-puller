@@ -30,8 +30,14 @@ from .observations import (
     SyncTask,
     TaskDraft,
 )
-from .progress import ProgressObserver, _SyncProgressTracker
-from .runtime import GitHubAPIReader, GitHubRuntime, GitObjectWriter, archive_lock
+from .utils import (
+    GitHubAPIReader,
+    GitHubRuntime,
+    GitObjectWriter,
+    ProgressObserver,
+    _SyncProgressTracker,
+    archive_lock,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable

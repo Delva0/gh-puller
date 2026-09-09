@@ -20,8 +20,8 @@ from typing import TYPE_CHECKING, Any
 from dotenv import load_dotenv
 
 from .maintenance import REFRESH_FAMILIES, GitHubMaintainer, MaintenanceResult
-from .progress import ConsoleProgress
 from .syncer import GitHubSyncConfig, GitHubSyncer, SyncResult
+from .utils import ConsoleProgress
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Iterator, Sequence

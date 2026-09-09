@@ -45,12 +45,12 @@ from .api_contract import (
     rest_review,
     rest_review_comment,
 )
-from .progress import APIProgress, RateQuota
+from .utils import APIProgress, RateQuota
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Mapping, Sequence
 
-    from .progress import APIProgressObserver
+    from .utils import APIProgressObserver
 
 _LOG = logging.getLogger(__name__)
 _DEFAULT_ACCEPT = "application/vnd.github.full+json"

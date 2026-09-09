@@ -19,7 +19,7 @@ from gh_puller.github.observations import (
     Origin,
     TaskDraft,
 )
-from gh_puller.github.progress import RateQuota
+from gh_puller.github.utils import RateQuota
 
 _EVENT_AT = datetime(2026, 9, 5, 10, tzinfo=UTC)
 _LOCAL = timezone(timedelta(hours=8), "CST")

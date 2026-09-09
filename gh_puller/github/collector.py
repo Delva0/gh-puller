@@ -40,8 +40,7 @@ if TYPE_CHECKING:
     import asyncio
     from collections.abc import Awaitable, Callable, Mapping, Sequence
 
-    from .progress import _SyncProgressTracker
-    from .runtime import GitHubAPIReader, GitObjectWriter
+    from .utils import GitHubAPIReader, GitObjectWriter, _SyncProgressTracker
 
 _SHA = re.compile(r"[0-9a-f]{40,64}\Z")
 _CATALOG_ACCEPT = "application/vnd.github.raw+json"
