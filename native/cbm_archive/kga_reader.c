@@ -80,6 +80,8 @@ typedef cbm_sdk_node_t node_item_t;
 typedef cbm_sdk_edge_t edge_item_t;
 typedef cbm_sdk_coverage_row_t coverage_item_t;
 
+static const char EMPTY_PROPERTIES_JSON[] = "{}";
+
 typedef struct {
     struct timespec started;
     bool active;
@@ -394,6 +396,21 @@ static bool edge_properties_match_identity(const edge_item_t *row, yyjson_val *p
     return stored && strcmp(stored, row->local_name) == 0;
 }
 
+static const char *serialize_properties(yyjson_val *properties) {
+    if (!yyjson_is_obj(properties)) {
+        return NULL;
+    }
+    return yyjson_obj_size(properties) == 0
+               ? EMPTY_PROPERTIES_JSON
+               : yyjson_val_write(properties, YYJSON_WRITE_NOFLAG, NULL);
+}
+
+static void free_properties(const char *properties) {
+    if (properties != EMPTY_PROPERTIES_JSON) {
+        free((void *)properties);
+    }
+}
+
 static bool root_from_json(yyjson_val *object, ghp_kga_root_t *reference) {
     uint64_t offset = 0;
     uint64_t count = 0;
@@ -496,9 +513,7 @@ static int import_node_leaf(import_context_t *context, yyjson_val *entries, uint
         }
         yyjson_val *properties = yyjson_obj_get(attributes, "properties");
         uint64_t properties_started = profile_clock(context->profile);
-        row->properties_json = yyjson_is_obj(properties)
-                                   ? yyjson_val_write(properties, YYJSON_WRITE_NOFLAG, NULL)
-                                   : NULL;
+        row->properties_json = serialize_properties(properties);
         if (properties_started) {
             properties_microseconds += profile_clock(context->profile) - properties_started;
         }
@@ -538,7 +553,7 @@ static int import_node_leaf(import_context_t *context, yyjson_val *entries, uint
 cleanup:
     uint64_t release_started = profile_clock(context->profile);
     for (size_t item = 0; item < (size_t)count; item++) {
-        free((void *)items[item].properties_json);
+        free_properties(items[item].properties_json);
     }
     free(items);
     profile_add(context->profile, PROFILE_RELEASE, release_started, count);
@@ -577,7 +592,7 @@ static int import_edge_leaf(import_context_t *context, yyjson_val *entries, uint
         uint64_t properties_started = profile_clock(context->profile);
         row->properties_json =
             yyjson_is_obj(properties) && edge_properties_match_identity(row, properties)
-                ? yyjson_val_write(properties, YYJSON_WRITE_NOFLAG, NULL)
+                ? serialize_properties(properties)
                 : NULL;
         if (properties_started) {
             properties_microseconds += profile_clock(context->profile) - properties_started;
@@ -618,7 +633,7 @@ static int import_edge_leaf(import_context_t *context, yyjson_val *entries, uint
 cleanup:
     uint64_t release_started = profile_clock(context->profile);
     for (size_t item = 0; item < (size_t)count; item++) {
-        free((void *)items[item].properties_json);
+        free_properties(items[item].properties_json);
     }
     free(items);
     profile_add(context->profile, PROFILE_RELEASE, release_started, count);
