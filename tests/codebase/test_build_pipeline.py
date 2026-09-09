@@ -10,8 +10,9 @@ import pytest
 
 import gh_puller.codebase.cbm._runner as runner_module
 from gh_puller.codebase.archive import Archive
+from gh_puller.codebase.archive_query import ArchiveLoader
 from gh_puller.codebase.build import BuildOptions, build_repository
-from gh_puller.codebase.cbm import BuildPlan
+from gh_puller.codebase.cbm import BuildPlan, CBMClient
 
 SCHEMA = """
 CREATE TABLE projects(name TEXT PRIMARY KEY);
@@ -157,9 +158,10 @@ def test_repository_pipeline_selects_a_plan_for_each_commit(tmp_path, monkeypatc
 
 @pytest.mark.integration
 def test_repository_pipeline_uses_native_index_sdk_end_to_end(tmp_path):
-    helper = os.environ.get("GH_PULLER_TEST_CBM_NATIVE_INDEX_HELPER")
-    if helper is None:
-        pytest.skip("real native index helper not configured")
+    index_helper = os.environ.get("GH_PULLER_TEST_CBM_NATIVE_INDEX_HELPER")
+    query_helper = os.environ.get("GH_PULLER_TEST_CBM_NATIVE_HELPER")
+    if index_helper is None or query_helper is None:
+        pytest.skip("real native query and index helpers not configured")
     repo = tmp_path / "repo"
     repo.mkdir()
     git(repo, "init")
@@ -176,7 +178,7 @@ def test_repository_pipeline_uses_native_index_sdk_end_to_end(tmp_path):
         repo,
         tmp_path / "build",
         binary=tmp_path / "unused-cbm",
-        native_index_helper=helper,
+        native_index_helper=index_helper,
         project_name=project,
         memory_limit=1 << 60,
         cbm_transport="native",
@@ -190,9 +192,23 @@ def test_repository_pipeline_uses_native_index_sdk_end_to_end(tmp_path):
     with Archive(tmp_path / "build" / "archive.kga") as archive:
         assert archive.commit_ids() == tuple(commits)
         rows = archive.load_rows(commits[-1])
+    query_cache = tmp_path / "query-cache"
+    with (
+        CBMClient(native_helper=query_helper, cache_root=query_cache, timeout=30) as client,
+        ArchiveLoader(query_helper, query_cache, 30) as loader,
+    ):
+        graph = loader.load(client, tmp_path / "build" / "archive.kga", commits[-1])
+        queried = client.query_graph(
+            graph,
+            query="MATCH (n:Function) RETURN n.name",
+            max_rows=10,
+        )
     summary = json.loads((tmp_path / "build" / "summary.json").read_text())
     assert any(node["name"] == "second_symbol" for node in rows.nodes.values())
     assert not any(node["name"] == "first_symbol" for node in rows.nodes.values())
     assert summary["cbm_transport"] == "native"
-    assert summary["cbm_engine"]["path"] == str(Path(helper).resolve())
+    names = {row[0] for row in queried["rows"]}
+    assert "second_symbol" in names
+    assert "first_symbol" not in names
+    assert summary["cbm_engine"]["path"] == str(Path(index_helper).resolve())
     assert summary["cleanup"]["project_deleted"] is True

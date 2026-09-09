@@ -1,5 +1,5 @@
 /*
- * cbm_archive_helper.c — Serve native CBM operations through the public SDK.
+ * helper.c — Serve native CBM archive operations through the public SDK.
  *
  * Control messages are length-prefixed JSON. Bulk snapshot rows never cross the
  * protocol: the compact build reads KGA pages and keeps the resulting immutable

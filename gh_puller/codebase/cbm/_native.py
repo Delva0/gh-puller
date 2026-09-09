@@ -115,13 +115,13 @@ def resolve_native_helper(
         located = shutil.which(raw, path=values.get("PATH")) if os.sep not in raw else None
         candidate = Path(located or raw).expanduser().resolve()
     else:
-        local = Path(__file__).resolve().parents[3] / "build" / "native" / local_name
+        local = Path(__file__).resolve().parents[3] / "build" / "native" / "bin" / local_name
         located = shutil.which(local_name, path=values.get("PATH"))
         candidate = local if local.exists() else Path(located).resolve() if located else None
         source = "local-build" if local.exists() else "PATH"
     if candidate is None:
         raise CBMTransportError(
-            f"no native CBM helper: pass its path, set {environment_key}, or build Makefile.native",
+            f"no native CBM helper: pass its path, set {environment_key}, or run make native",
         )
     try:
         status = candidate.stat()
