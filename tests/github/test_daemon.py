@@ -480,6 +480,49 @@ def test_status_accepts_displayed_writer_id(tmp_path: Path) -> None:
     assert calls[1] == f"--unit {unit.name} --output=cat --lines=512 --no-pager"
 
 
+@pytest.mark.parametrize("action", ["start", "stop", "restart", "logs"])
+def test_control_actions_accept_displayed_writer_id(
+    tmp_path: Path,
+    action: str,
+) -> None:
+    environment, units, log = _environment(tmp_path)
+    database = tmp_path / "facts.sqlite3"
+    unit = _write_managed_unit(units, database)
+    identity = unit.stem.removeprefix("gh-puller-")
+
+    _run(action, identity, environment=environment)
+
+    calls = log.read_text().splitlines()
+    if action in {"start", "restart"}:
+        assert calls == [f"{action} {unit.name}", f"is-active --quiet {unit.name}"]
+    elif action == "stop":
+        assert calls == [f"stop {unit.name}"]
+    else:
+        assert calls == [f"--unit {unit.name} --output=short-full --lines=100 --follow"]
+
+
+def test_uninstall_accepts_displayed_writer_id(tmp_path: Path) -> None:
+    environment, units, log = _environment(tmp_path)
+    database = tmp_path / "facts.sqlite3"
+    unit = _write_managed_unit(units, database)
+    identity = unit.stem.removeprefix("gh-puller-")
+    rules = Path(environment["GH_PULLER_POLKIT_RULES_DIR"])
+    rules.mkdir()
+    policy = rules / f"60-{unit.stem}.rules"
+    policy.write_text("policy\n")
+
+    result = _run("uninstall", identity, environment=environment)
+
+    assert f"Uninstalled {unit.name}" in result.stdout
+    assert not unit.exists()
+    assert not policy.exists()
+    assert log.read_text().splitlines() == [
+        f"disable --now {unit.name}",
+        "daemon-reload",
+        f"reset-failed {unit.name}",
+    ]
+
+
 def test_watch_executes_one_persistent_monitor(tmp_path: Path) -> None:
     environment, units, _ = _environment(tmp_path)
     database = tmp_path / "facts.sqlite3"

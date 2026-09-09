@@ -13,13 +13,13 @@ usage() {
     cat <<'EOF'
 Usage:
   github-puller-daemon.sh install OWNER/REPO DATABASE [PULLER_OPTIONS...]
-  github-puller-daemon.sh uninstall DATABASE
-  github-puller-daemon.sh start DATABASE
-  github-puller-daemon.sh stop DATABASE
-  github-puller-daemon.sh restart DATABASE
+  github-puller-daemon.sh uninstall DATABASE|WRITER
+  github-puller-daemon.sh start DATABASE|WRITER
+  github-puller-daemon.sh stop DATABASE|WRITER
+  github-puller-daemon.sh restart DATABASE|WRITER
   github-puller-daemon.sh status [DATABASE|WRITER]
   github-puller-daemon.sh watch [-n SECONDS] [DATABASE|WRITER]
-  github-puller-daemon.sh logs DATABASE
+  github-puller-daemon.sh logs DATABASE|WRITER
   github-puller-daemon.sh render OWNER/REPO DATABASE [PULLER_OPTIONS...]
 
 install registers a disabled, inactive system-level systemd service. The service
@@ -187,6 +187,24 @@ managed_unit_paths() {
     done
 }
 
+managed_unit_paths_by_id() {
+    local identity="$1"
+    local path name suffix destination digest
+    [[ -d "$SYSTEMD_DIR" ]] || return 0
+    for path in "$SYSTEMD_DIR"/gh-puller-*.service; do
+        [[ -e "$path" ]] || continue
+        name="$(basename "$path")"
+        [[ "$name" =~ ^gh-puller-([0-9a-f]{12}|[0-9a-f]{64})\.service$ ]] || continue
+        suffix="${BASH_REMATCH[1]}"
+        destination="$(configured_value database "$path")"
+        [[ -n "$destination" ]] || continue
+        destination="$(absolute_destination "$destination")"
+        digest="$(writer_digest "$destination")"
+        [[ "$digest" == "$suffix"* && "${digest:0:12}" == "$identity" ]] || continue
+        printf '%s\n' "$path"
+    done
+}
+
 resolve_managed_unit() {
     local action="$1"
     local raw="$2"
@@ -210,6 +228,26 @@ resolve_managed_unit() {
     fi
     validate_unit_database "$canonical_path" "$destination"
     fail "no managed writer for database: $destination"
+}
+
+resolve_managed_selector() {
+    local action="$1"
+    local raw="$2"
+    local destination
+    local -a paths
+    if [[ "$raw" =~ ^[0-9a-f]{12}$ ]]; then
+        mapfile -t paths < <(managed_unit_paths_by_id "$raw")
+        if [[ ${#paths[@]} -eq 1 ]]; then
+            printf '%s\n' "${paths[0]}"
+            return
+        fi
+        if [[ ${#paths[@]} -gt 1 ]]; then
+            fail "multiple managed writers for writer ID: $raw"
+        fi
+        fail "no managed writer for writer ID: $raw"
+    fi
+    destination="$(absolute_destination "$raw")"
+    resolve_managed_unit "$action" "$raw" "$destination"
 }
 
 unit_quote() {
@@ -417,15 +455,22 @@ case "$action" in
         printf 'Logs:   %q logs %q\n' "$0" "$destination"
         ;;
     uninstall)
-        [[ $# -eq 2 ]] || fail "uninstall accepts only DATABASE"
+        [[ $# -eq 2 ]] || fail "uninstall accepts only DATABASE or WRITER"
         require_system_access
-        destination="$(absolute_destination "$2")"
-        unit="$(unit_name "$destination")"
-        unit_path="$SYSTEMD_DIR/$unit"
-        mapfile -t existing_paths < <(managed_unit_paths "$destination")
-        if [[ ${#existing_paths[@]} -eq 0 ]]; then
-            validate_unit_database "$unit_path" "$destination"
-            existing_paths=("$unit_path")
+        if [[ "$2" =~ ^[0-9a-f]{12}$ ]]; then
+            unit_path="$(resolve_managed_selector uninstall "$2")"
+            destination="$(configured_value database "$unit_path")"
+            unit="$(basename "$unit_path")"
+            mapfile -t existing_paths < <(managed_unit_paths "$destination")
+        else
+            destination="$(absolute_destination "$2")"
+            unit="$(unit_name "$destination")"
+            unit_path="$SYSTEMD_DIR/$unit"
+            mapfile -t existing_paths < <(managed_unit_paths "$destination")
+            if [[ ${#existing_paths[@]} -eq 0 ]]; then
+                validate_unit_database "$unit_path" "$destination"
+                existing_paths=("$unit_path")
+            fi
         fi
         for existing_path in "${existing_paths[@]}"; do
             existing_unit="$(basename "$existing_path")"
@@ -441,9 +486,8 @@ case "$action" in
         printf 'SQLite archives, Git object stores, .env, environments, and source files were preserved.\n'
         ;;
     start|stop|restart)
-        [[ $# -eq 2 ]] || fail "$action accepts only DATABASE"
-        destination="$(absolute_destination "$2")"
-        unit_path="$(resolve_managed_unit "$action" "$2" "$destination")"
+        [[ $# -eq 2 ]] || fail "$action accepts only DATABASE or WRITER"
+        unit_path="$(resolve_managed_selector "$action" "$2")"
         require_control_owner "$unit_path"
         unit="$(basename "$unit_path")"
         "$SYSTEMCTL" "$action" "$unit"
@@ -483,9 +527,8 @@ case "$action" in
         monitor_selection watch "$selector" --watch --interval "$interval"
         ;;
     logs)
-        [[ $# -eq 2 ]] || fail "logs accepts only DATABASE"
-        destination="$(absolute_destination "$2")"
-        unit_path="$(resolve_managed_unit logs "$2" "$destination")"
+        [[ $# -eq 2 ]] || fail "logs accepts only DATABASE or WRITER"
+        unit_path="$(resolve_managed_selector logs "$2")"
         unit="$(basename "$unit_path")"
         exec "$JOURNALCTL" --unit "$unit" --output=short-full --lines=100 --follow
         ;;
