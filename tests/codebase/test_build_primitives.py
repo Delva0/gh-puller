@@ -8,7 +8,7 @@ import pytest
 
 import gh_puller.codebase.cbm._runner as runner_module
 from gh_puller.codebase.archive import Archive, KGACommit, KGARecorder
-from gh_puller.codebase.build import CommitTarget, build_commit
+from gh_puller.codebase.build import CommitTarget, _CommitState, build_commit
 from gh_puller.codebase.cbm import BuildPlan, CBMRunner
 from gh_puller.codebase.store import GraphReader
 
@@ -62,17 +62,13 @@ class FakeClient:
 class PublishingRunner:
     def __init__(self, root):
         self.project = "p"
+        self.work_dir = root
         self.tree = root / "tree"
         self.db_path = root / "graph.db"
         self.binary = FakeBinary(root / "cbm")
         self.engine = self.binary
         self.transport_name = "native"
-        self.current_commit = None
-        self.pending_commit = None
         self.plans = []
-
-    def begin_commit(self, sha):
-        self.pending_commit = sha
 
     def index(self, plan):
         symbol = (self.tree / "symbol.txt").read_text().strip()
@@ -81,11 +77,6 @@ class PublishingRunner:
         os.replace(replacement, self.db_path)
         self.plans.append(plan)
         return {"route": "full" if plan.force_full else "closure_repair"}
-
-    def mark_archived(self, sha):
-        self.current_commit = sha
-        self.pending_commit = None
-
 
 def write_store(path, symbol, *, value):
     connection = sqlite3.connect(path)
@@ -157,11 +148,12 @@ def test_cbm_runner_reuses_client_across_commit_plans(tmp_path, monkeypatch):
         memory_limit=1 << 60,
     )
 
-    assert runner.current_commit is None
+    state = _CommitState(work)
+    assert state.current is None
     assert runner.index(BuildPlan(analysis_mode="fast"))["route"] == "closure_repair"
     assert runner.index(BuildPlan(route="full"))["route"] == "full"
-    runner.mark_archived("commit")
-    assert runner.current_commit == "commit"
+    state.finish("commit")
+    assert state.current == "commit"
     assert [call[3] for call in client.calls] == [False, True]
     runner.close()
     assert client.closed
@@ -230,7 +222,8 @@ def test_build_commit_recovers_a_cbm_generation_pending_kga_capture(tmp_path):
         repo=repo,
         runner=runner,
     )
-    runner.pending_commit = second
+    state = _CommitState(runner.work_dir)
+    state.begin(second)
     result = build_commit(
         CommitTarget(1, second, (first,), first),
         BuildPlan(route="delta"),
@@ -241,8 +234,8 @@ def test_build_commit_recovers_a_cbm_generation_pending_kga_capture(tmp_path):
     recorder.finalize()
 
     assert result.manifest["generation_diff_source"] == "full_snapshot"
-    assert runner.current_commit == second
-    assert runner.pending_commit is None
+    assert state.current == second
+    assert state.pending is None
     with Archive(tmp_path / "archive.kga") as archive:
         assert set(archive.load_rows(second).nodes) == {"p", "p.b"}
 

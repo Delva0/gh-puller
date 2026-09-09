@@ -1,42 +1,41 @@
-"""Implement private native engine backends and the immutable store cache.
+"""Implement the native SDK transport for the CBM client.
 
-This module owns helper authentication, framed control messages, native index
-requests, cross-process materialization locks, and cache identity. KGA parsing
-and CBM algorithms remain in the helpers; public routing remains in
-:mod:`.client`.
+This module owns helper authentication, framed requests, graph handles, and
+native index execution. It accepts only CBM stores and SDK-level operations;
+formats that may produce a store belong to callers outside this package.
 """
 
 from __future__ import annotations
 
-import fcntl
 import json
 import os
 import queue
 import shutil
 import struct
 import subprocess
-import tempfile
 import threading
-import time
 from collections import deque
-from contextlib import contextmanager, suppress
+from contextlib import suppress
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, BinaryIO, Self
 
-from ..archive import COVERAGE_FIDELITY_VERSION, GRAPH_FIDELITY_VERSION, Archive
-from ._daemon import CBMTransportError, ResourceMonitorLike
+from ._transport import (
+    CBMTransportError,
+    OpenedGraph,
+    ResourceMonitorLike,
+    checked_index_execution,
+)
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator, Mapping, Sequence
+    from collections.abc import Mapping, Sequence
 
 _QUERY_PROTOCOL_VERSION = 8
 _INDEX_PROTOCOL_VERSION = 9
 _RESPONSE_MAX_BYTES = 256 << 20
 _QUERY_HELPER_ENV = "GH_PULLER_CODEBASE_CBM_HELPER"
 _INDEX_HELPER_ENV = "GH_PULLER_CODEBASE_CBM_INDEX_HELPER"
-_CACHE_SCHEMA = 4
 _STREAM_CLOSED = object()
 
 
@@ -65,7 +64,7 @@ class NativeHelper:
             raise CBMTransportError(f"native CBM helper changed after resolution: {self.path}")
 
     def provenance(self) -> dict[str, object]:
-        """Return stable helper identity for archive and summary metadata."""
+        """Return stable helper identity for downstream metadata."""
         return {
             "path": str(self.path),
             "sha256": self.sha256,
@@ -170,7 +169,7 @@ def _read_exact(stream: BinaryIO, size: int, *, clean_eof: bool = False) -> byte
     return bytes(chunks)
 
 
-class NativeTransport:
+class _NativeSession:
     """Own one thread-safe native CBM helper process and its active graph binding."""
 
     def __init__(
@@ -242,7 +241,7 @@ class NativeTransport:
             env=helper_environment,
         )
         if self.monitor is not None:
-            self.monitor.child_pid = self.process.pid
+            self.monitor.add_child(self.process.pid)
         self._stdout_thread = threading.Thread(target=self._stdout_loop, daemon=True)
         self._stderr_thread = threading.Thread(target=self._stderr_loop, daemon=True)
         self._stdout_thread.start()
@@ -358,8 +357,8 @@ class NativeTransport:
                 stream.close()
         self._stdout_thread.join(timeout=2)
         self._stderr_thread.join(timeout=2)
-        if self.monitor is not None and self.monitor.child_pid == self.process.pid:
-            self.monitor.child_pid = None
+        if self.monitor is not None:
+            self.monitor.remove_child(self.process.pid)
 
     def _request(self, method: str, parameters: Mapping[str, object], *, timeout: float | None = None) -> dict:
         if self._closed:
@@ -413,108 +412,6 @@ class NativeTransport:
                     self._terminate()
                     raise CBMTransportError("memory limit exceeded while running CBM")
             return result
-
-    def _cache_paths(self, digest: str) -> tuple[Path, Path, Path]:
-        directory = self.cache_root / "archive-query-v1" / self.helper.sha256
-        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-        return (
-            directory / f"{digest}.db",
-            directory / f"{digest}.ready.json",
-            directory / f"{digest}.lock",
-        )
-
-    def load_archive(
-        self,
-        archive: str | Path | Archive,
-        commit: str | None = None,
-        *,
-        allow_incomplete: bool = True,
-    ) -> dict[str, Any]:
-        """Materialize and retain one archived commit without Python bulk rows.
-
-        Args:
-            archive: KGA path or an already captured reader.
-            commit: Exact archived commit. ``None`` selects the captured latest.
-            allow_incomplete: When opening a path, accept its final durable writer
-                checkpoint instead of requiring a final footer.
-
-        Returns:
-            Loaded identity, row counts, materialization status, and cache path.
-        """
-        if (
-            "archive-load" not in self.capabilities
-            or self.hello.get("kga_format") != 5
-            or self.hello.get("graph_fidelity") != GRAPH_FIDELITY_VERSION
-            or self.hello.get("coverage_fidelity") != COVERAGE_FIDELITY_VERSION
-        ):
-            raise CBMTransportError("native helper does not support this KGA contract")
-        owned = not isinstance(archive, Archive)
-        reader = Archive(archive, allow_incomplete=allow_incomplete) if owned else archive
-        try:
-            manifest, project = reader._restorable_manifest(commit)
-            status = os.fstat(reader._reader.fd)
-            archive_path = reader.path.resolve(strict=True)
-            materialization = manifest.get("materialization_digest", manifest["graph_digest"])
-            coverage_fidelity = manifest.get("coverage_fidelity_version", 0)
-            coverage_count = manifest.get("coverage_rows", 0)
-            database, marker, lock = self._cache_paths(materialization)
-            expected_marker = {
-                "schema": _CACHE_SCHEMA,
-                "helper_sha256": self.helper.sha256,
-                "store_format": self.store_format,
-                "graph_digest": manifest["graph_digest"],
-                "materialization_digest": materialization,
-                "project": project,
-                "nodes": manifest["nodes"],
-                "edges": manifest["edges"],
-                "graph_fidelity": manifest["graph_fidelity_version"],
-                "coverage_digest": manifest.get("coverage_digest"),
-                "coverage_rows": coverage_count,
-                "coverage_fidelity": coverage_fidelity,
-            }
-            parameters = {
-                "archive_path": str(archive_path),
-                "archive_device": status.st_dev,
-                "archive_inode": status.st_ino,
-                "captured_size": reader._reader.size,
-                "project": project,
-                "graph_digest": manifest["graph_digest"],
-                "materialization_digest": materialization,
-                "database_path": str(database),
-                "node_count": manifest["nodes"],
-                "edge_count": manifest["edges"],
-                "graph_fidelity": manifest["graph_fidelity_version"],
-                "coverage_fidelity": coverage_fidelity,
-                "coverage_count": coverage_count,
-                "node_root": manifest["node_root"],
-                "edge_root": manifest["edge_root"],
-                "coverage_root": manifest.get("coverage_root"),
-                "coverage_metadata": manifest.get("coverage_metadata"),
-            }
-            with _exclusive_lock(lock, self.timeout):
-                parameters["reuse"] = database.is_file() and _read_marker(marker) == expected_marker
-                result = self._request("load", parameters)
-                expected_result = {
-                    "project": project,
-                    "graph_digest": manifest["graph_digest"],
-                    "materialization_digest": materialization,
-                    "nodes": manifest["nodes"],
-                    "edges": manifest["edges"],
-                    "graph_fidelity": manifest["graph_fidelity_version"],
-                    "coverage_rows": coverage_count,
-                    "coverage_fidelity": coverage_fidelity,
-                }
-                if (
-                    any(result.get(key) != value for key, value in expected_result.items())
-                    or type(result.get("materialized")) is not bool
-                ):
-                    raise CBMTransportError("native CBM helper returned the wrong loaded graph identity")
-                _write_marker(marker, expected_marker)
-            self._activate_graph(database, project, None)
-            return {**result, "database_path": str(database)}
-        finally:
-            if owned:
-                reader.close()
 
     def open_project(
         self,
@@ -601,7 +498,7 @@ class NativeTransport:
         limit: int,
         scan_limit: int,
     ) -> dict[str, Any]:
-        """Compare two materialized archive generations with request-scoped handles.
+        """Compare two CBM graph stores with request-scoped handles.
 
         Args:
             base_database: Materialized database for the older generation.
@@ -631,9 +528,12 @@ class NativeTransport:
         Returns:
             The tool's logical JSON object without a transport envelope.
         """
+        values = dict(arguments or {})
         if name not in self.tools:
             raise CBMTransportError(f"native CBM tool is not supported: {name}")
-        return self._request("call", {"name": name, "arguments": dict(arguments or {})})
+        if name == "index_status" and values.get("verbose") is True and self.loaded_source_root is None:
+            raise CBMTransportError("verbose index status requires a live source snapshot")
+        return self._request("call", {"name": name, "arguments": values})
 
     def close(self) -> None:
         """Request clean shutdown and release process resources."""
@@ -652,7 +552,7 @@ class NativeTransport:
         self.close()
 
 
-class NativeIndexTransport(NativeTransport):
+class _NativeIndexSession(_NativeSession):
     """Run repository indexing in a persistent crash-isolated native helper."""
 
     def __init__(
@@ -701,9 +601,9 @@ class NativeIndexTransport(NativeTransport):
         project: str,
         mode: str,
         *,
-        force_full: bool,
-        incremental_controls: Mapping[str, str | int] | None,
-        target_projects: Sequence[str] | None,
+        force_full: bool = False,
+        incremental_controls: Mapping[str, str | int] | None = None,
+        target_projects: Sequence[str] | None = None,
     ) -> dict[str, Any]:
         """Run one typed SDK indexing request and return its logical JSON result.
 
@@ -733,41 +633,238 @@ class NativeIndexTransport(NativeTransport):
         )
 
 
-@contextmanager
-def _exclusive_lock(path: Path, timeout: float) -> Iterator[None]:
-    descriptor = os.open(path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
-    deadline = time.monotonic() + timeout
-    try:
-        while True:
-            try:
-                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                break
-            except BlockingIOError:
-                if time.monotonic() >= deadline:
-                    raise CBMTransportError(f"timed out waiting for native CBM cache lock: {path}") from None
-                time.sleep(0.05)
-        yield
-    finally:
-        with suppress(OSError):
-            fcntl.flock(descriptor, fcntl.LOCK_UN)
-        os.close(descriptor)
+@dataclass(frozen=True, slots=True)
+class _NativeBinding:
+    transport: NativeTransport
+    session: _NativeSession
+    generation: int
+    database_path: Path
+    project: str
+    source_root: Path | None
 
 
-def _read_marker(path: Path) -> object:
-    try:
-        return json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError):
-        return None
+class NativeTransport:
+    """Expose compact-query and full-index helpers as one native transport."""
 
+    name = "native"
 
-def _write_marker(path: Path, value: Mapping[str, object]) -> None:
-    descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
-    try:
-        with os.fdopen(descriptor, "w") as stream:
-            json.dump(value, stream, sort_keys=True, separators=(",", ":"))
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, path)
-    finally:
-        with suppress(FileNotFoundError):
-            os.unlink(temporary)
+    def __init__(
+        self,
+        helper: str | Path | NativeHelper | None,
+        index_helper: str | Path | NativeHelper | None,
+        cache_root: Path,
+        timeout: float,
+        environment: Mapping[str, str] | None,
+        monitor: ResourceMonitorLike | None,
+    ):
+        self._helper = helper
+        self._index_helper = index_helper
+        self.cache_root = cache_root
+        self.timeout = timeout
+        self.environment = dict(environment or {})
+        self.monitor = monitor
+        self._lock = threading.RLock()
+        self._query: _NativeSession | None = None
+        self._index: _NativeIndexSession | None = None
+
+    def _query_session(self) -> _NativeSession:
+        with self._lock:
+            if self._query is None:
+                self._query = _NativeSession(
+                    self._helper,
+                    self.cache_root,
+                    self.timeout,
+                    self.environment,
+                    self.monitor,
+                )
+            return self._query
+
+    def _index_session(self) -> _NativeIndexSession:
+        with self._lock:
+            if self._index is None:
+                self._index = _NativeIndexSession(
+                    self._index_helper,
+                    self.cache_root,
+                    self.timeout,
+                    self.environment,
+                    self.monitor,
+                )
+            return self._index
+
+    @property
+    def engine(self) -> NativeHelper:
+        return self._index_session().helper
+
+    def capabilities(self) -> frozenset[str]:
+        return self._index_session().capabilities
+
+    @staticmethod
+    def _database_path(cache_root: Path, project: str) -> Path:
+        if (
+            not project
+            or project.startswith(".")
+            or ".." in project
+            or any(
+                not (character.isascii() and (character.isalnum() or character in "-_."))
+                for character in project
+            )
+        ):
+            raise ValueError(f"invalid CBM project name: {project!r}")
+        return cache_root / f"{project}.db"
+
+    def _session_for(self, database_path: Path) -> _NativeSession:
+        with self._lock:
+            for session in (self._index, self._query):
+                if session is not None and session.loaded_database_path == database_path:
+                    return session
+            return self._index or self._query_session()
+
+    def open_project(self, project: str, source_root: Path | None) -> OpenedGraph:
+        database_path = self._database_path(self.cache_root, project)
+        return self.open_store(database_path, project, source_root)
+
+    def open_store(
+        self,
+        database_path: Path,
+        project: str,
+        source_root: Path | None,
+    ) -> OpenedGraph:
+        """Open an explicit CBM database through the native SDK.
+
+        Args:
+            database_path: Exact CBM store passed to ``cbm_sdk_graph_open``.
+            project: Project expected inside the store.
+            source_root: Matching checkout for source-aware graph tools.
+
+        Returns:
+            Opaque binding and graph counts reported by the SDK.
+        """
+        session = self._session_for(database_path)
+        result = session.open_project(database_path, project, source_root)
+        return self._opened_graph(
+            session,
+            database_path,
+            project,
+            source_root,
+            result["nodes"],
+            result["edges"],
+        )
+
+    def _opened_graph(
+        self,
+        session: _NativeSession,
+        database_path: Path,
+        project: str,
+        source_root: Path | None,
+        nodes: int,
+        edges: int,
+    ) -> OpenedGraph:
+        binding = _NativeBinding(
+            self,
+            session,
+            session.binding,
+            database_path,
+            project,
+            source_root,
+        )
+        return OpenedGraph(
+            project,
+            binding,
+            source_root,
+            nodes,
+            edges,
+        )
+
+    def call_tool(
+        self,
+        binding: object | None,
+        name: str,
+        arguments: Mapping[str, object],
+    ) -> dict[str, Any]:
+        if not isinstance(binding, _NativeBinding) or binding.transport is not self:
+            raise CBMTransportError("native CBM tools require a native graph handle")
+        if not binding.session.is_active_graph(
+            binding.generation,
+            binding.database_path,
+            binding.project,
+            binding.source_root,
+        ):
+            raise CBMTransportError("native graph is no longer active")
+        values = dict(arguments)
+        supplied = values.get("project")
+        if supplied is not None and supplied != binding.project:
+            raise CBMTransportError("CBM graph handle disagrees with the tool project")
+        values["project"] = binding.project
+        return binding.session.call_tool(name, values)
+
+    def index_repository(
+        self,
+        tree: Path,
+        database_path: Path,
+        project: str,
+        mode: str,
+        *,
+        force_full: bool = False,
+        incremental_controls: Mapping[str, str | int] | None = None,
+        target_projects: Sequence[str] | None = None,
+    ) -> dict[str, Any]:
+        result = self._index_session().index_repository(
+            tree,
+            database_path,
+            project,
+            mode,
+            force_full=force_full,
+            incremental_controls=incremental_controls,
+            target_projects=target_projects,
+        )
+        return checked_index_execution(result, force_full, incremental_controls)
+
+    def list_projects(self, options: Mapping[str, object]) -> dict[str, Any]:
+        session = self._index or self._query_session()
+        return session.list_projects(options)
+
+    def delete_project(self, database_path: Path, project: str) -> tuple[bool, str]:
+        session = self._session_for(database_path)
+        try:
+            result = session.delete_project(database_path, project)
+        except CBMTransportError as exc:
+            return False, str(exc)[-1000:]
+        return True, json.dumps(result, ensure_ascii=False)[-1000:]
+
+    def compare_graphs(
+        self,
+        base: object,
+        target: object,
+        *,
+        limit: int,
+        scan_limit: int,
+    ) -> dict[str, Any]:
+        if (
+            not isinstance(base, _NativeBinding)
+            or not isinstance(target, _NativeBinding)
+            or base.transport is not self
+            or target.transport is not self
+        ):
+            raise CBMTransportError("graph handles belong to different CBM transports")
+        return target.session.compare_graphs(
+            base_database=base.database_path,
+            base_project=base.project,
+            target_database=target.database_path,
+            target_project=target.project,
+            limit=limit,
+            scan_limit=scan_limit,
+        )
+
+    def close(self) -> None:
+        with self._lock:
+            sessions = [session for session in (self._query, self._index) if session is not None]
+            self._query = None
+            self._index = None
+        for session in sessions:
+            session.close()
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        self.close()

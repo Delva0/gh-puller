@@ -1,4 +1,4 @@
-"""Resolve immutable, provenance-bearing executables for CBM client backends.
+"""Resolve immutable, provenance-bearing executables for CBM client transports.
 
 The accepted manifest is a local deployment pointer, not a build result.  It names
 one content-addressed executable that passed the laboratory gates.  A build resolves
@@ -73,7 +73,7 @@ class CBMBinary:
             raise CBMBinaryError(f"CBM binary changed after resolution: {self.path}")
 
     def provenance(self) -> dict[str, Any]:
-        """Return stable build metadata suitable for archive and summary JSON."""
+        """Return stable executable provenance for downstream metadata."""
         result: dict[str, Any] = {
             "path": str(self.path),
             "sha256": self.sha256,

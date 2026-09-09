@@ -108,10 +108,52 @@ def _stage(callback: Callable[[str], None] | None, name: str) -> None:
         callback(name)
 
 
-def _recover_committed_pending(runner: CBMRunner, recorder: KGARecorder) -> None:
-    pending = runner.pending_commit
+class _CommitState:
+    """Coordinate CBM publication with the durable KGA checkpoint."""
+
+    def __init__(self, work_dir: Path):
+        self.work_dir = work_dir
+        self.current_path = work_dir / "current-sha"
+        self.version_path = work_dir / "state-version"
+        self.pending_path = work_dir / "pending-sha"
+
+    @property
+    def current(self) -> str | None:
+        try:
+            if self.version_path.read_text().strip() != "1":
+                return None
+            value = self.current_path.read_text().strip()
+        except OSError:
+            return None
+        return value or None
+
+    @property
+    def pending(self) -> str | None:
+        try:
+            value = self.pending_path.read_text().strip()
+        except OSError:
+            return None
+        return value or None
+
+    def begin(self, sha: str) -> None:
+        self.work_dir.mkdir(parents=True, exist_ok=True)
+        temporary = self.pending_path.with_suffix(".tmp")
+        temporary.write_text(sha)
+        os.replace(temporary, self.pending_path)
+
+    def finish(self, sha: str) -> None:
+        self.work_dir.mkdir(parents=True, exist_ok=True)
+        temporary = self.current_path.with_suffix(".tmp")
+        temporary.write_text(sha)
+        os.replace(temporary, self.current_path)
+        self.version_path.write_text("1")
+        self.pending_path.unlink(missing_ok=True)
+
+
+def _recover_committed_pending(state: _CommitState, recorder: KGARecorder) -> None:
+    pending = state.pending
     if pending is not None and recorder.latest_commit == pending:
-        runner.mark_archived(pending)
+        state.finish(pending)
 
 
 def build_commit(
@@ -153,8 +195,9 @@ def build_commit(
         raise BuildError(
             f"commit predecessor {target.previous_sha!r} does not match KGA head {recorder.latest_commit!r}",
         )
-    _recover_committed_pending(runner, recorder)
-    pending = runner.pending_commit
+    state = _CommitState(runner.work_dir)
+    _recover_committed_pending(state, recorder)
+    pending = state.pending
     if pending is not None and pending != target.sha:
         raise BuildError(f"interrupted commit {pending} must be recovered before {target.sha}")
 
@@ -173,10 +216,10 @@ def build_commit(
     aligned = (
         pending is None
         and recorder.latest_commit is not None
-        and runner.current_commit == recorder.latest_commit
+        and state.current == recorder.latest_commit
     )
     previous = reader.pin() if aligned and not force_snapshot else None
-    runner.begin_commit(target.sha)
+    state.begin(target.sha)
     try:
         started = time.monotonic()
         _stage(on_stage, "cbm-index")
@@ -204,7 +247,7 @@ def build_commit(
         "cbm_index_execution": execution,
         "cbm_force_full": plan.force_full,
         "cbm_engine_sha256": runner.engine.sha256,
-        "cbm_engine_backend": runner.transport_name,
+        "cbm_engine_transport": runner.transport_name,
     }
     manifest = recorder.append(
         KGACommit(target.ordinal, target.sha, target.parents, changed_files),
@@ -212,7 +255,7 @@ def build_commit(
         project=runner.project,
         metadata=provenance,
     )
-    runner.mark_archived(target.sha)
+    state.finish(target.sha)
     timings["merkle_seconds"] = time.monotonic() - started
     return CommitBuildResult(
         manifest,
@@ -496,7 +539,8 @@ def _build_repository(options: BuildOptions, build_dir: Path, plans: PlanSelecto
             options.allow_cbm_upgrade,
         )
         recorder = KGARecorder(archive_path, compression_level=options.compression_level)
-        resume_aligned = recorder.latest_commit is not None and runner.current_commit == recorder.latest_commit
+        state = _CommitState(work_dir)
+        resume_aligned = recorder.latest_commit is not None and state.current == recorder.latest_commit
 
         for ordinal in range(len(archived), len(commits)):
             sha, parents = commits[ordinal]
@@ -538,7 +582,7 @@ def _build_repository(options: BuildOptions, build_dir: Path, plans: PlanSelecto
         plan_metadata = _constant_plan_metadata(plans)
         engine_provenance = {
             **runner.engine.provenance(),
-            "backend": options.cbm_transport,
+            "transport": options.cbm_transport,
         }
         recorder.finalize(
             {
@@ -636,7 +680,7 @@ def add_build_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--timeout", type=int, default=3600)
     parser.add_argument(
         "--cbm-transport",
-        choices=("native", "cli", "persistent-mcp"),
+        choices=("native", "mcp", "cli"),
         default="native",
     )
     parser.add_argument(

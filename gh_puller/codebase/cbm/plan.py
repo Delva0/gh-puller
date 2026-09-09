@@ -1,8 +1,8 @@
-"""Define and validate the CBM indexing policy applied to one commit.
+"""Define and validate a CBM repository-indexing policy.
 
-The immutable policy is shared by archive build orchestration and the private
-CBM runner. Command-line parsing constructs that same policy; execution and KGA
-persistence remain outside this module.
+The immutable policy is shared by callers and the private CBM runner.
+Command-line parsing constructs the same policy; execution remains outside this
+module.
 """
 
 from __future__ import annotations
@@ -102,8 +102,7 @@ class BuildPlan:
     """Select CBM analysis coverage and routing for one commit.
 
     ``route`` controls whether CBM must rebuild from scratch. A delta request
-    leaves CBM's existing conservative full fallbacks intact; the resulting
-    published graph remains the archive source of truth.
+    leaves CBM's existing conservative full fallbacks intact.
     """
 
     analysis_mode: AnalysisMode = "full"
@@ -140,7 +139,7 @@ class BuildPlan:
         return frozenset(required)
 
     def metadata(self) -> dict:
-        """Return stable per-commit provenance for the KGA manifest."""
+        """Return stable provenance for this indexing policy."""
         metadata = {
             "cbm_analysis_mode": self.analysis_mode,
             "cbm_requested_route": self.route,

@@ -67,13 +67,12 @@ for line in sys.stdin:
     path.chmod(0o755)
 
 
-def test_client_starts_once_and_exposes_json_queries(tmp_path):
+def test_mcp_route_exposes_json_queries(tmp_path):
     binary = tmp_path / "fake-cbm"
     write_query_cbm(binary)
 
-    with CBMClient(binary, cache_root=tmp_path / "cache", timeout=5) as client:
-        pid = client.pid
-        graph = client.daemon_graph("demo")
+    with CBMClient(binary, transport="mcp", cache_root=tmp_path / "cache", timeout=5) as client:
+        graph = client.project_graph("demo")
         search = client.search_graph(graph, label="Function", limit=4)
         code = client.search_code(graph, pattern="needle", mode="compact")
         query = client.query_graph(graph, query="MATCH (n) RETURN n LIMIT 1")
@@ -89,25 +88,15 @@ def test_client_starts_once_and_exposes_json_queries(tmp_path):
         )
         status = client.index_status(graph, verbose=True)
         comparison = client.compare_graphs(
-            client.daemon_graph("base"),
+            client.project_graph("base"),
             graph,
             limit=3,
             scan_limit=50,
         )
 
-        assert client.instructions == "Query before reading source."
         assert client.binary.path == binary.resolve()
         assert client.cache_root == (tmp_path / "cache").resolve()
-        assert [tool["name"] for tool in client.list_tools()] == [
-            "search_graph",
-            "query_graph",
-            "get_graph_schema",
-            "trace_path",
-            "get_architecture",
-            "index_status",
-            "compare_graphs",
-        ]
-        assert {
+        pids = {
             search["pid"],
             code["pid"],
             query["pid"],
@@ -120,7 +109,8 @@ def test_client_starts_once_and_exposes_json_queries(tmp_path):
             traces["pid"],
             status["pid"],
             comparison["pid"],
-        } == {pid}
+        }
+        assert len(pids) == 1
         assert search["arguments"] == {
             "project": "demo",
             "label": "Function",
@@ -163,36 +153,31 @@ def test_client_starts_once_and_exposes_json_queries(tmp_path):
             "limit": 3,
             "scan_limit": 50,
         }
-
-    assert client._daemon_backend.process.returncode == 0
-
-
 def test_json_call_supports_legacy_text_and_rejects_tree_output(tmp_path):
     binary = tmp_path / "fake-cbm"
     write_query_cbm(binary)
 
-    with CBMClient(binary, cache_root=tmp_path / "cache", timeout=5) as client:
+    with CBMClient(binary, transport="mcp", cache_root=tmp_path / "cache", timeout=5) as client:
         result = client.call_json_tool("legacy_json", {"value": 42})
         assert result["arguments"] == {"value": 42}
-        assert client.call_tool("tree")["content"][0]["text"] == "root\n  child"
         with pytest.raises(CBMTransportError, match="did not return a JSON object"):
-            client.call_json_tool("tree")
+            client.call_tool("tree")
         with pytest.raises(CBMTransportError, match="expected failure"):
             client.call_tool("fail")
 
 
-def test_client_serializes_concurrent_calls_on_one_session(tmp_path):
+def test_client_handles_concurrent_mcp_calls(tmp_path):
     binary = tmp_path / "fake-cbm"
     write_query_cbm(binary)
 
     with (
-        CBMClient(binary, cache_root=tmp_path / "cache", timeout=5) as client,
+        CBMClient(binary, transport="mcp", cache_root=tmp_path / "cache", timeout=5) as client,
         ThreadPoolExecutor(max_workers=8) as pool,
     ):
         results = list(pool.map(lambda value: client.call_json_tool("echo", {"value": value}), range(32)))
 
     assert sorted(result["arguments"]["value"] for result in results) == list(range(32))
-    assert len({result["request_id"] for result in results}) == 32
+    assert len({(result["pid"], result["request_id"]) for result in results}) == 32
 
 
 def test_client_uses_environment_cache_override(tmp_path):

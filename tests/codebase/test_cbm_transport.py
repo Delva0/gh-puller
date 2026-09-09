@@ -1,36 +1,53 @@
 import os
+from concurrent.futures import ThreadPoolExecutor
+from hashlib import sha256
 from pathlib import Path
 
 import pytest
 
-from gh_puller.codebase.cbm._daemon import (
-    CBMTransportError,
-    CLITransport,
-    PersistentMCPTransport,
-    capabilities_from_tools_list,
-    make_transport,
-)
+from gh_puller.codebase.cbm._cli import CLITransport
+from gh_puller.codebase.cbm._mcp import MCPTransport, capabilities_from_tools_list
+from gh_puller.codebase.cbm._transport import CBMTransportError
+from gh_puller.codebase.cbm.binary import CBMBinary
 
 
 class FakeMonitor:
     def __init__(self):
-        self.child_pid = None
+        self.children = set()
         self.exceeded = False
         self.samples = 0
+
+    def add_child(self, pid):
+        self.children.add(pid)
+
+    def remove_child(self, pid):
+        self.children.discard(pid)
 
     def sample(self):
         self.samples += 1
 
 
+def binary_identity(path: Path) -> CBMBinary:
+    status = path.stat()
+    return CBMBinary(
+        path=path,
+        sha256=sha256(path.read_bytes()).hexdigest(),
+        size=status.st_size,
+        version="codebase-memory-mcp test",
+        source="test",
+        _device=status.st_dev,
+        _inode=status.st_ino,
+        _mtime_ns=status.st_mtime_ns,
+    )
+
+
 def write_fake_cbm(
     path: Path,
     *,
-    hang_on_tool: bool = False,
+    delay: float = 0,
     confirm_force_full: bool = True,
     confirm_incremental_controls: bool = True,
-    instructions: str | None = None,
 ) -> None:
-    delay = "time.sleep(60)" if hang_on_tool else ""
     path.write_text(
         f"""#!/usr/bin/env python3
 import json
@@ -38,17 +55,29 @@ import os
 import sys
 import time
 
+delay = {delay!r}
 confirm_force_full = {confirm_force_full!r}
 confirm_incremental_controls = {confirm_incremental_controls!r}
-instructions = {instructions!r}
+delta_flags = [
+    "--delta-closure-overflow",
+    "--delta-closure-cost-percent",
+    "--delta-dependent-scope",
+    "--delta-new-surface",
+    "--delta-reference-fanout-cap",
+    "--delta-pair-outputs",
+    "--delta-pair-refresh-budget",
+    "--delta-pair-input-missing",
+]
 
-def make_payload(arguments):
-    requested_force_full = bool(arguments.get("force_full"))
-    route = "full" if requested_force_full and confirm_force_full else "closure_repair"
+def payload(arguments):
+    if delay:
+        time.sleep(delay)
+    requested = bool(arguments.get("force_full"))
+    route = "full" if requested and confirm_force_full else "closure_repair"
     execution = {{
         "route": route,
         "pid": os.getpid(),
-        "requested_force_full": requested_force_full,
+        "requested_force_full": requested,
     }}
     if marker := os.environ.get("CBM_TEST_MARKER"):
         execution["marker"] = marker
@@ -58,24 +87,37 @@ def make_payload(arguments):
         body["incremental_controls"] = controls
     return {{
         "content": [{{"type": "text", "text": json.dumps(body)}}],
+        "structuredContent": body,
         "isError": False,
     }}
 
-if len(sys.argv) > 1:
-    print(json.dumps(make_payload(json.loads(sys.argv[-1]))), flush=True)
+if sys.argv[1:] == ["--version"]:
+    print("codebase-memory-mcp test")
     raise SystemExit(0)
 
+if sys.argv[1:] == ["cli", "index_repository", "--help"]:
+    print("--force-full", *delta_flags)
+    raise SystemExit(0)
+
+if len(sys.argv) > 1:
+    print(json.dumps(payload(json.loads(sys.argv[-1]))), flush=True)
+    raise SystemExit(0)
+
+properties = {{"force_full": {{}}}}
+properties.update({{flag[2:].replace("-", "_"): {{}} for flag in delta_flags}})
 for line in sys.stdin:
     request = json.loads(line)
     if "id" not in request:
         continue
     if request["method"] == "initialize":
         result = {{"protocolVersion": "2024-11-05", "capabilities": {{}}, "serverInfo": {{}}}}
-        if instructions is not None:
-            result["instructions"] = instructions
+    elif request["method"] == "tools/list":
+        result = {{"tools": [{{
+            "name": "index_repository",
+            "inputSchema": {{"properties": properties}},
+        }}]}}
     elif request["method"] == "tools/call":
-        {delay}
-        result = make_payload(request["params"].get("arguments", {{}}))
+        result = payload(request["params"].get("arguments", {{}}))
     else:
         result = {{}}
     print(json.dumps({{"jsonrpc": "2.0", "id": request["id"], "result": result}}), flush=True)
@@ -84,101 +126,75 @@ for line in sys.stdin:
     path.chmod(0o755)
 
 
-def test_persistent_mcp_reuses_one_process(tmp_path):
+def make_transport(kind, path, cache, monitor, **options):
+    identity = binary_identity(path)
+    if kind == "mcp":
+        return MCPTransport(identity, cache, 5, monitor, {}, **options)
+    return CLITransport(identity, cache, 5, monitor, {})
+
+
+def test_mcp_transport_reuses_an_idle_frontend(tmp_path):
     binary = tmp_path / "fake-cbm"
     write_fake_cbm(binary)
     monitor = FakeMonitor()
+    transport = make_transport("mcp", binary, tmp_path / "cache", monitor)
 
-    transport = PersistentMCPTransport(binary, tmp_path / "cache", 5, monitor)
-    process_pid = transport.process.pid
-    try:
-        first = transport.index(tmp_path / "tree", "project", "full")
-        second = transport.index(tmp_path / "tree", "project", "full")
-        queried = transport.call_tool("search_graph", {"project": "project"})
-        deleted, _ = transport.delete_project("project")
-        assert (
-            first
-            == second
-            == {
-                "route": "closure_repair",
-                "pid": process_pid,
-                "requested_force_full": False,
-            }
-        )
-        assert queried["content"]
-        assert deleted
-        assert monitor.child_pid == process_pid
-        assert monitor.samples >= 5  # initialize, two indexes, query, and delete
-    finally:
-        transport.close()
+    first = transport.index_repository(tmp_path, tmp_path / "unused.db", "project", "full")
+    second = transport.index_repository(tmp_path, tmp_path / "unused.db", "project", "full")
 
-    assert monitor.child_pid is None
-    assert transport.process.returncode == 0
-    assert all(
-        stream.closed for stream in (transport.process.stdin, transport.process.stdout, transport.process.stderr)
-    )
-    assert not transport._stdout_thread.is_alive() and not transport._stderr_thread.is_alive()
+    assert first == second
+    assert len(transport.frontend_pids) == 1
+    assert monitor.children == set(transport.frontend_pids)
     transport.close()
+    assert not monitor.children
 
 
-def test_cli_transport_remains_available_as_control(tmp_path):
+def test_mcp_transport_expands_to_multiple_frontends_for_concurrency(tmp_path):
+    binary = tmp_path / "fake-cbm"
+    write_fake_cbm(binary, delay=0.1)
+    monitor = FakeMonitor()
+    transport = make_transport(
+        "mcp",
+        binary,
+        tmp_path / "cache",
+        monitor,
+        max_frontends=4,
+    )
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        results = list(pool.map(lambda _: transport.call_tool(None, "echo", {}), range(4)))
+
+    assert len({result["index_execution"]["pid"] for result in results}) == 4
+    assert len(transport.frontend_pids) == 4
+    transport.close()
+    assert not monitor.children
+
+
+def test_cli_transport_uses_one_process_per_call(tmp_path):
     binary = tmp_path / "fake-cbm"
     write_fake_cbm(binary)
     monitor = FakeMonitor()
-    transport = CLITransport(binary, tmp_path / "cache", 5, monitor)
+    transport = make_transport("cli", binary, tmp_path / "cache", monitor)
 
-    execution = transport.index(tmp_path / "tree", "project", "full")
-    queried = transport.call_tool("search_graph", {"project": "project"})
+    first = transport.index_repository(tmp_path, tmp_path / "unused.db", "project", "full")
+    second = transport.call_tool(None, "search_graph", {"project": "project"})
 
-    assert execution["route"] == "closure_repair"
-    assert queried["content"]
-    assert execution["pid"] != os.getpid()
-    assert monitor.child_pid is None
+    assert first["pid"] != os.getpid()
+    assert second["index_execution"]["pid"] != os.getpid()
+    assert not monitor.children
     assert monitor.samples == 2
 
 
-@pytest.mark.parametrize("instructions", [None, "", "Use search_graph, then inspect exact source."])
-def test_persistent_mcp_preserves_optional_server_instructions(tmp_path, instructions):
+def test_cli_capabilities_use_cli_without_mcp_frontend(tmp_path):
     binary = tmp_path / "fake-cbm"
-    write_fake_cbm(binary, instructions=instructions)
-    transport = PersistentMCPTransport(binary, tmp_path / "cache", 5, FakeMonitor())
-    try:
-        assert transport.instructions == (instructions or "")
-        assert transport.call_tool("search_graph", {})["content"]
-    finally:
-        transport.close()
-
-
-def test_invalid_server_instructions_close_the_failed_session(tmp_path):
-    binary = tmp_path / "fake-cbm"
-    write_fake_cbm(binary, instructions=42)
+    write_fake_cbm(binary)
     monitor = FakeMonitor()
-    with pytest.raises(CBMTransportError, match="instructions must be text"):
-        PersistentMCPTransport(binary, tmp_path / "cache", 5, monitor)
-    assert monitor.child_pid is None
+    transport = make_transport("cli", binary, tmp_path / "cache", monitor)
 
-
-def test_persistent_mcp_timeout_terminates_process(tmp_path):
-    binary = tmp_path / "fake-cbm"
-    write_fake_cbm(binary, hang_on_tool=True)
-    monitor = FakeMonitor()
-    transport = PersistentMCPTransport(binary, tmp_path / "cache", 1, monitor)
-
-    with pytest.raises(CBMTransportError, match="timed out"):
-        transport.index(tmp_path / "tree", "project", "full")
-
-    assert transport.process.poll() is not None
-    assert monitor.child_pid is None
-    assert all(
-        stream.closed for stream in (transport.process.stdin, transport.process.stdout, transport.process.stderr)
+    assert transport.capabilities() == frozenset(
+        {"repository-index", "force-full-route", "granular-delta-controls"},
     )
-    assert not transport._stdout_thread.is_alive() and not transport._stderr_thread.is_alive()
-    transport.close()
-
-
-def test_transport_factory_rejects_unknown_name(tmp_path):
-    with pytest.raises(CBMTransportError, match="unknown CBM transport"):
-        make_transport("unknown", tmp_path / "cbm", tmp_path / "cache", 1, FakeMonitor())
+    assert not monitor.children
 
 
 def test_capability_probe_requires_every_delta_control():
@@ -203,136 +219,60 @@ def test_capability_probe_requires_every_delta_control():
     }
 
     assert capabilities_from_tools_list(result) == frozenset(
-        {"force-full-route", "granular-delta-controls", "persistent-mcp"},
+        {"repository-index", "force-full-route", "granular-delta-controls"},
     )
     properties.pop("delta_pair_input_missing")
     assert "granular-delta-controls" not in capabilities_from_tools_list(result)
 
 
-def test_tool_discovery_follows_every_native_cursor(monkeypatch):
-    transport = object.__new__(PersistentMCPTransport)
-    calls = []
-
-    def request(method, arguments):
-        calls.append((method, arguments))
-        if arguments:
-            return {"tools": [{"name": "index_repository", "inputSchema": {"properties": {"force_full": {}}}}]}
-        return {"tools": [{"name": "search_graph"}], "nextCursor": "next-page"}
-
-    monkeypatch.setattr(transport, "_request", request)
-    assert [tool["name"] for tool in transport.list_tools()] == ["search_graph", "index_repository"]
-    assert calls == [("tools/list", {}), ("tools/list", {"cursor": "next-page"})]
-    assert "force-full-route" in transport.capabilities()
-
-
-@pytest.mark.parametrize("transport_name", ["cli", "persistent-mcp"])
-def test_transport_passes_environment_overrides(tmp_path, transport_name):
+@pytest.mark.parametrize("kind", ["mcp", "cli"])
+def test_frontend_transports_pass_environment_overrides(tmp_path, kind):
     binary = tmp_path / "fake-cbm"
     write_fake_cbm(binary)
-    monitor = FakeMonitor()
-    transport = make_transport(
-        transport_name,
-        binary,
-        tmp_path / "cache",
-        5,
-        monitor,
-        {"CBM_TEST_MARKER": "granular-delta"},
-    )
-    try:
-        execution = transport.index(tmp_path / "tree", "project", "full")
-    finally:
-        transport.close()
-
-    assert execution["marker"] == "granular-delta"
-
-
-@pytest.mark.parametrize("transport_name", ["cli", "persistent-mcp"])
-def test_transport_passes_and_requires_force_full_confirmation(tmp_path, transport_name):
-    binary = tmp_path / "fake-cbm"
-    write_fake_cbm(binary)
-    transport = make_transport(
-        transport_name,
-        binary,
+    transport_type = MCPTransport if kind == "mcp" else CLITransport
+    transport = transport_type(
+        binary_identity(binary),
         tmp_path / "cache",
         5,
         FakeMonitor(),
+        {"CBM_TEST_MARKER": "route-marker"},
     )
     try:
-        execution = transport.index(tmp_path / "tree", "project", "full", force_full=True)
+        result = transport.index_repository(tmp_path, tmp_path / "unused.db", "project", "full")
     finally:
         transport.close()
 
-    assert execution["route"] == "full"
-    assert execution["requested_force_full"] is True
+    assert result["marker"] == "route-marker"
 
 
-@pytest.mark.parametrize("transport_name", ["cli", "persistent-mcp"])
-def test_transport_rejects_cbm_without_force_full_support(tmp_path, transport_name):
-    binary = tmp_path / "old-cbm"
+@pytest.mark.parametrize("kind", ["mcp", "cli"])
+def test_frontend_transports_require_force_full_confirmation(tmp_path, kind):
+    binary = tmp_path / "fake-cbm"
     write_fake_cbm(binary, confirm_force_full=False)
-    transport = make_transport(
-        transport_name,
-        binary,
-        tmp_path / "cache",
-        5,
-        FakeMonitor(),
-    )
+    transport = make_transport(kind, binary, tmp_path / "cache", FakeMonitor())
     try:
         with pytest.raises(CBMTransportError, match="did not confirm"):
-            transport.index(tmp_path / "tree", "project", "full", force_full=True)
+            transport.index_repository(
+                tmp_path,
+                tmp_path / "unused.db",
+                "project",
+                "full",
+                force_full=True,
+            )
     finally:
         transport.close()
 
 
-@pytest.mark.parametrize("transport_name", ["cli", "persistent-mcp"])
-def test_transport_passes_and_requires_incremental_controls_confirmation(tmp_path, transport_name):
+@pytest.mark.parametrize("kind", ["mcp", "cli"])
+def test_frontend_transports_require_delta_confirmation(tmp_path, kind):
     binary = tmp_path / "fake-cbm"
-    write_fake_cbm(binary)
-    transport = make_transport(
-        transport_name,
-        binary,
-        tmp_path / "cache",
-        5,
-        FakeMonitor(),
-    )
-    controls = {
-        "closure_overflow": "repair",
-        "closure_cost_percent": 20,
-        "dependent_scope": "symbol",
-        "new_surface": "bounded",
-        "reference_fanout_cap": 64,
-        "pair_outputs": "lazy",
-        "pair_refresh_budget": 10000,
-        "pair_input_missing": "skip",
-    }
-    try:
-        execution = transport.index(
-            tmp_path / "tree",
-            "project",
-            "full",
-            incremental_controls=controls,
-        )
-    finally:
-        transport.close()
-
-    assert execution["route"] == "closure_repair"
-
-
-@pytest.mark.parametrize("transport_name", ["cli", "persistent-mcp"])
-def test_transport_rejects_cbm_without_incremental_controls_support(tmp_path, transport_name):
-    binary = tmp_path / "old-cbm"
     write_fake_cbm(binary, confirm_incremental_controls=False)
-    transport = make_transport(
-        transport_name,
-        binary,
-        tmp_path / "cache",
-        5,
-        FakeMonitor(),
-    )
+    transport = make_transport(kind, binary, tmp_path / "cache", FakeMonitor())
     try:
         with pytest.raises(CBMTransportError, match="did not confirm"):
-            transport.index(
-                tmp_path / "tree",
+            transport.index_repository(
+                tmp_path,
+                tmp_path / "unused.db",
                 "project",
                 "full",
                 incremental_controls={"closure_overflow": "full"},

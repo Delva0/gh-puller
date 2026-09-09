@@ -6,6 +6,7 @@ import pytest
 
 from gh_puller.codebase import (
     Archive,
+    ArchiveLoader,
     ArchiveWriter,
     CBMBinaryError,
     CBMClient,
@@ -20,7 +21,6 @@ from gh_puller.codebase.archive import (
     graph_digest,
     materialization_digest,
 )
-from gh_puller.codebase.cbm._native import NativeTransport
 from gh_puller.codebase.store import GraphRows, load_coverage, load_rows
 
 _GRAPH_TOOLS = (
@@ -105,7 +105,9 @@ while True:
                   "capabilities": {capabilities!r},
                   "tools": {list(tools)!r}}}
     elif method == "load":
-        Path(params["database_path"]).touch()
+        Path(params["database_path"]).write_text(json.dumps({{
+            "nodes": params["node_count"], "edges": params["edge_count"]
+        }}))
         result = {{"project": params["project"], "graph_digest": params["graph_digest"],
                   "materialization_digest": params["materialization_digest"],
                   "nodes": params["node_count"], "edges": params["edge_count"],
@@ -142,7 +144,11 @@ while True:
                   "incremental_controls": params["incremental_controls"],
                   "index_execution": {{"route": route}}}}
     elif method == "open":
-        result = {{"project": params["project"], "nodes": 3, "edges": 2}}
+        try:
+            counts = json.loads(Path(params["database_path"]).read_text())
+        except (OSError, json.JSONDecodeError):
+            counts = {{"nodes": 3, "edges": 2}}
+        result = {{"project": params["project"], **counts}}
     elif method == "list":
         result = {{"projects": [{{"name": "native-build"}}], "total": 1, "returned": 1}}
     elif method == "delete":
@@ -323,20 +329,22 @@ def test_native_transport_keeps_graph_rows_out_of_python(tmp_path, monkeypatch):
     write_fake_helper(helper)
     monkeypatch.setattr(Archive, "load_rows", lambda *_args, **_kwargs: pytest.fail("loaded graph rows"))
 
-    with NativeTransport(
-        helper,
-        tmp_path / "cache",
-        5,
-        {"NATIVE_REQUEST_LOG": str(log)},
-    ) as transport:
-        loaded = transport.load_archive(archive_path)
-        queried = transport.query_graph(project="native-test", query="MATCH (n) RETURN n")
+    environment = {"NATIVE_REQUEST_LOG": str(log)}
+    with CBMClient(
+        native_helper=helper,
+        cache_root=tmp_path / "cache",
+        timeout=5,
+        environment=environment,
+    ) as client:
+        with ArchiveLoader(helper, tmp_path / "cache", 5, environment) as loader:
+            loaded = loader.load(client, archive_path)
+        queried = client.query_graph(loaded, query="MATCH (n) RETURN n")
 
     load_request = next(item for item in requests(log) if item["method"] == "load")
-    assert loaded["materialized"] is True
-    assert loaded["graph_digest"] == manifest["graph_digest"]
-    assert loaded["materialization_digest"] == manifest["graph_digest"]
-    assert Path(loaded["database_path"]).is_file()
+    assert loaded.materialized is True
+    assert loaded.graph_digest == manifest["graph_digest"]
+    assert loaded.materialization_digest == manifest["graph_digest"]
+    assert loaded.database_path.is_file()
     assert load_request["params"]["node_root"] == manifest["node_root"]
     assert load_request["params"]["edge_root"] == manifest["edge_root"]
     assert load_request["params"]["coverage_fidelity"] == 0
@@ -353,10 +361,16 @@ def test_native_cache_is_reused_by_a_new_helper_process(tmp_path):
     write_archive(archive_path)
     environment = {"NATIVE_REQUEST_LOG": str(log)}
 
-    with NativeTransport(helper, tmp_path / "cache", 5, environment) as first:
-        assert first.load_archive(archive_path)["materialized"] is True
-    with NativeTransport(helper, tmp_path / "cache", 5, environment) as second:
-        assert second.load_archive(archive_path)["materialized"] is False
+    with (
+        CBMClient(native_helper=helper, cache_root=tmp_path / "cache", timeout=5) as client,
+        ArchiveLoader(helper, tmp_path / "cache", 5, environment) as first,
+    ):
+        assert first.load(client, archive_path).materialized is True
+    with (
+        CBMClient(native_helper=helper, cache_root=tmp_path / "cache", timeout=5) as client,
+        ArchiveLoader(helper, tmp_path / "cache", 5, environment) as second,
+    ):
+        assert second.load(client, archive_path).materialized is False
 
     loads = [item for item in requests(log) if item["method"] == "load"]
     assert [item["params"]["reuse"] for item in loads] == [False, True]
@@ -380,9 +394,12 @@ def test_native_identity_includes_coverage_snapshot(tmp_path):
     assert first_manifest["graph_digest"] == second_manifest["graph_digest"]
     assert first_manifest["materialization_digest"] != second_manifest["materialization_digest"]
 
-    with CBMClient(native_helper=helper, cache_root=tmp_path / "cache", timeout=5) as client:
-        first = client.load_archive(first_archive)
-        second = client.load_archive(second_archive)
+    with (
+        CBMClient(native_helper=helper, cache_root=tmp_path / "cache", timeout=5) as client,
+        ArchiveLoader(helper, tmp_path / "cache", 5) as loader,
+    ):
+        first = loader.load(client, first_archive)
+        second = loader.load(client, second_archive)
 
         assert first.database_path != second.database_path
         assert second.coverage_rows == 2
@@ -397,30 +414,36 @@ def test_client_native_query_does_not_resolve_or_start_mcp(tmp_path):
     write_fake_helper(helper)
     write_archive(archive_path)
 
-    with CBMClient(
-        tmp_path / "missing-cbm",
-        native_helper=helper,
-        cache_root=tmp_path / "cache",
-        timeout=5,
-    ) as client:
-        assert client._daemon_backend is None
-        graph = client.load_archive(archive_path)
+    with (
+        CBMClient(
+            tmp_path / "missing-cbm",
+            native_helper=helper,
+            cache_root=tmp_path / "cache",
+            timeout=5,
+        ) as client,
+        ArchiveLoader(helper, tmp_path / "cache", 5) as loader,
+    ):
+        assert "mcp" not in client._transports
+        graph = loader.load(client, archive_path)
         result = client.query_graph(graph, query="MATCH (n) RETURN n")
         schema = client.get_graph_schema(graph)
         status = client.index_status(graph)
         assert result["rows"] == [["native", graph.project]]
-        assert result["pid"] == client.native_pid
+        assert result["pid"] > 0
         assert schema["node_labels"][0]["label"] == "Function"
         assert status["nodes"] == 3
         with pytest.raises(CBMTransportError, match="requires a live source snapshot"):
             client.index_status(graph, verbose=True)
-        assert client._daemon_backend is None
+        assert "mcp" not in client._transports
 
         with pytest.raises(CBMBinaryError, match="does not exist"):
-            client.query_graph(client.daemon_graph(graph.project), query="MATCH (n) RETURN n")
-        with pytest.raises(CBMTransportError, match="not supported for this graph"):
+            client.query_graph(
+                client.project_graph(graph.project, transport="mcp"),
+                query="MATCH (n) RETURN n",
+            )
+        with pytest.raises(CBMTransportError, match="tool is not supported"):
             client.call_json_tool("trace_path", {"function_name": "main"}, target=graph)
-        assert client._daemon_backend is None
+        assert "mcp" not in client._transports
 
 
 def test_client_native_index_uses_full_helper_without_resolving_mcp(tmp_path, monkeypatch):
@@ -445,7 +468,6 @@ def test_client_native_index_uses_full_helper_without_resolving_mcp(tmp_path, mo
         tmp_path / "missing-cbm",
         native_index_helper=helper,
         cache_root=tmp_path / "cache",
-        index_backend="native",
         timeout=5,
     ) as client:
         assert {"repository-index", "granular-delta-controls", "force-full-route"} <= client.capabilities()
@@ -473,8 +495,7 @@ def test_client_native_index_uses_full_helper_without_resolving_mcp(tmp_path, mo
         assert queried["rows"] == [["native", "native-build"]]
         assert projects["projects"] == [{"name": "native-build"}]
         assert deleted is True
-        assert client._daemon_backend is None
-        assert client._native_transport is None
+        assert set(client._transports) == {"native"}
 
     index_request = next(item for item in requests(log) if item["method"] == "index")
     assert index_request["params"] == {
@@ -506,7 +527,6 @@ def test_client_queries_existing_project_without_full_helper(tmp_path, monkeypat
         native_helper=helper,
         native_index_helper=tmp_path / "missing-index-helper",
         cache_root=tmp_path / "cache",
-        index_backend="native",
         timeout=5,
     ) as client:
         graph = client.project_graph("native-query", source_root=tree)
@@ -517,7 +537,7 @@ def test_client_queries_existing_project_without_full_helper(tmp_path, monkeypat
         assert queried["rows"] == [["native", "native-query"]]
         assert projects["projects"] == [{"name": "native-build"}]
         assert deleted is True
-        assert client._native_index_transport is None
+        assert set(client._transports) == {"native"}
         with pytest.raises(CBMTransportError, match="no longer active"):
             client.query_graph(graph, query="MATCH (n) RETURN n")
 
@@ -544,7 +564,6 @@ def test_client_routes_every_graph_tool_through_compact_helper(tmp_path, monkeyp
         native_helper=helper,
         native_index_helper=tmp_path / "missing-index-helper",
         cache_root=tmp_path / "cache",
-        index_backend="native",
         timeout=5,
     ) as client:
         graph = client.project_graph("native-tools", source_root=tree)
@@ -564,8 +583,7 @@ def test_client_routes_every_graph_tool_through_compact_helper(tmp_path, monkeyp
             [{"caller": "native-tools.main", "callee": "native-tools.work", "count": 2}],
         )
 
-        assert client._native_index_transport is None
-        assert client._daemon_backend is None
+        assert set(client._transports) == {"native"}
 
     calls = [item for item in requests(log) if item["method"] == "call"]
     assert [item["params"]["name"] for item in calls] == list(_GRAPH_TOOLS)
@@ -585,9 +603,12 @@ def test_client_rejects_archive_handle_after_loading_another_generation(tmp_path
     write_archive(first_archive, "first")
     write_archive(second_archive, "second")
 
-    with CBMClient(native_helper=helper, cache_root=tmp_path / "cache", timeout=5) as client:
-        first = client.load_archive(first_archive)
-        second = client.load_archive(second_archive)
+    with (
+        CBMClient(native_helper=helper, cache_root=tmp_path / "cache", timeout=5) as client,
+        ArchiveLoader(helper, tmp_path / "cache", 5) as loader,
+    ):
+        first = loader.load(client, first_archive)
+        second = loader.load(client, second_archive)
         compared = client.compare_graphs(first, second, limit=4, scan_limit=100)
 
         assert client.query_graph(second, query="MATCH (n) RETURN n")["rows"] == [
@@ -605,8 +626,14 @@ def test_client_rejects_archive_handle_after_loading_another_generation(tmp_path
         assert compared["scan_limit"] == 100
         with pytest.raises(CBMTransportError, match="no longer active"):
             client.query_graph(first, query="MATCH (n) RETURN n")
-        with pytest.raises(CBMTransportError, match="cannot compare native and daemon"):
-            client.compare_graphs(first, client.daemon_graph("second"))
+        with CBMClient(
+            native_helper=helper,
+            cache_root=tmp_path / "other-cache",
+            timeout=5,
+        ) as other_client:
+            other = other_client.project_graph("second")
+            with pytest.raises(CBMTransportError, match="different CBM transports"):
+                client.compare_graphs(first, other)
 
 
 def test_native_query_timeout_terminates_helper(tmp_path):
@@ -614,19 +641,19 @@ def test_native_query_timeout_terminates_helper(tmp_path):
     archive_path = tmp_path / "archive.kga"
     write_fake_helper(helper, hang_on_query=True)
     write_archive(archive_path)
-    transport = NativeTransport(helper, tmp_path / "cache", 0.1)
-    transport.load_archive(archive_path)
-
-    with pytest.raises(CBMTransportError, match="timed out"):
-        transport.query_graph(project="native-test", query="MATCH (n) RETURN n")
-
-    assert transport.process.poll() is not None
-    transport.close()
+    with (
+        CBMClient(native_helper=helper, cache_root=tmp_path / "cache", timeout=0.1) as client,
+        ArchiveLoader(helper, tmp_path / "cache", 0.1) as loader,
+    ):
+        loaded = loader.load(client, archive_path)
+        with pytest.raises(CBMTransportError, match="timed out"):
+            client.query_graph(loaded, query="MATCH (n) RETURN n")
+        assert loaded._binding.session.process.poll() is not None
 
 
 def test_native_project_binding_rejects_cache_path_escape(tmp_path):
     with (
-        CBMClient(index_backend="native", cache_root=tmp_path) as client,
+        CBMClient(cache_root=tmp_path) as client,
         pytest.raises(ValueError, match="invalid CBM project"),
     ):
         client.project_graph("../outside")
@@ -647,7 +674,6 @@ def test_real_native_index_helper_publishes_and_deletes_graph(tmp_path):
         tmp_path / "unused-cbm",
         native_index_helper=Path(configured),
         cache_root=cache,
-        index_backend="native",
         timeout=120,
     ) as client:
         execution = client.index_repository(
@@ -658,7 +684,6 @@ def test_real_native_index_helper_publishes_and_deletes_graph(tmp_path):
             incremental_controls=IncrementalConfig().to_dict(),
         )
         graph = client.project_graph("native-index", source_root=tree)
-        assert graph._transport.tools == frozenset(_GRAPH_TOOLS)
         queried = client.query_graph(
             graph,
             query="MATCH (n:Function) RETURN n.name",
@@ -677,14 +702,13 @@ def test_real_native_index_helper_publishes_and_deletes_graph(tmp_path):
         )
         projects = client.list_projects(include_details=True)
         rows = load_rows(cache / "native-index.db", "native-index")
-        assert client._native_transport is None
+        assert set(client._transports) == {"native"}
 
     with CBMClient(
         tmp_path / "unused-cbm",
         native_helper=Path(configured_query),
         native_index_helper=tmp_path / "missing-index-helper",
         cache_root=cache,
-        index_backend="native",
         timeout=120,
     ) as client:
         reopened = client.project_graph("native-index", source_root=tree)
@@ -694,7 +718,7 @@ def test_real_native_index_helper_publishes_and_deletes_graph(tmp_path):
             max_rows=10,
         )
         deleted, _detail = client.delete_project("native-index")
-        assert client._native_index_transport is None
+        assert set(client._transports) == {"native"}
 
     assert execution == {"route": "full", "reason": "explicit_force_full"}
     assert ["native_symbol"] in queried["rows"]
@@ -721,8 +745,11 @@ def test_real_native_helper_restores_exact_rows_and_reuses_cache(tmp_path):
     manifest, expected = write_archive(archive_path, "real-native", with_coverage=True)
     cache = tmp_path / "cache"
 
-    with CBMClient(native_helper=helper, cache_root=cache, timeout=30) as first:
-        loaded = first.load_archive(archive_path)
+    with (
+        CBMClient(native_helper=helper, cache_root=cache, timeout=30) as first,
+        ArchiveLoader(helper, cache, 30) as loader,
+    ):
+        loaded = loader.load(first, archive_path)
         queried = first.query_graph(
             loaded,
             query="MATCH (n:Function) RETURN n.name, n.file_path, n.docstring",
@@ -749,8 +776,11 @@ def test_real_native_helper_restores_exact_rows_and_reuses_cache(tmp_path):
         status = first.index_status(loaded)
         restored = load_rows(loaded.database_path, "real-native")
         restored_coverage = load_coverage(loaded.database_path, "real-native")
-    with CBMClient(native_helper=helper, cache_root=cache, timeout=30) as second:
-        reused = second.load_archive(archive_path)
+    with (
+        CBMClient(native_helper=helper, cache_root=cache, timeout=30) as second,
+        ArchiveLoader(helper, cache, 30) as loader,
+    ):
+        reused = loader.load(second, archive_path)
 
     assert loaded.materialized is True
     assert loaded.graph_digest == manifest["graph_digest"]
@@ -828,13 +858,16 @@ def test_real_native_helper_compares_archive_generations(tmp_path):
     write_archive(base_archive, project)
     write_archive(target_archive, project, extra_node="added")
 
-    with CBMClient(
-        native_helper=Path(configured),
-        cache_root=tmp_path / "cache",
-        timeout=30,
-    ) as client:
-        base = client.load_archive(base_archive)
-        target = client.load_archive(target_archive)
+    with (
+        CBMClient(
+            native_helper=Path(configured),
+            cache_root=tmp_path / "cache",
+            timeout=30,
+        ) as client,
+        ArchiveLoader(Path(configured), tmp_path / "cache", 30) as loader,
+    ):
+        base = loader.load(client, base_archive)
+        target = loader.load(client, target_archive)
         compared = client.compare_graphs(base, target, limit=10, scan_limit=100)
 
     assert base.project == target.project == project
@@ -869,9 +902,10 @@ def test_real_native_helper_rejects_missharded_identity(tmp_path):
             cache_root=tmp_path / "cache",
             timeout=30,
         ) as client,
+        ArchiveLoader(Path(configured), tmp_path / "cache", 30) as loader,
         pytest.raises(CBMTransportError, match="invalid node row in KGA leaf"),
     ):
-        client.load_archive(archive_path)
+        loader.load(client, archive_path)
 
 
 @pytest.mark.integration
@@ -916,12 +950,15 @@ def test_real_native_helper_reads_captured_prefix_while_writer_appends(tmp_path)
     assert archive_path.stat().st_size > captured_size
 
     try:
-        with CBMClient(
-            native_helper=Path(configured),
-            cache_root=tmp_path / "cache",
-            timeout=30,
-        ) as client:
-            loaded = client.load_archive(captured)
+        with (
+            CBMClient(
+                native_helper=Path(configured),
+                cache_root=tmp_path / "cache",
+                timeout=30,
+            ) as client,
+            ArchiveLoader(Path(configured), tmp_path / "cache", 30) as loader,
+        ):
+            loaded = loader.load(client, captured)
             queried = client.query_graph(loaded, query="MATCH (n:Project) RETURN n.name")
     finally:
         captured.close()

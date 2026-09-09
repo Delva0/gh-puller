@@ -1,11 +1,11 @@
 """Expose public APIs for building and querying durable code graph archives.
 
 The package owns KGA persistence and repository build orchestration. Its
-``cbm`` subpackage contains the unified client boundary while hiding daemon and
-native protocol implementations.
+``cbm`` subpackage contains the format-independent CBM client boundary.
 """
 
 from .archive import Archive, ArchiveError, ArchiveWriter, KGARecorder
+from .archive_query import ArchiveGraph, ArchiveLoader
 from .build import (
     BuildError,
     BuildOptions,
@@ -16,18 +16,15 @@ from .build import (
     build_repository,
 )
 from .cbm import (
-    ArchiveGraph,
     BuildPlan,
     CBMBinary,
     CBMBinaryError,
     CBMClient,
     CBMRunner,
     CBMTransportError,
-    GraphTarget,
+    GraphHandle,
     IncrementalConfig,
     IncrementalConfigError,
-    NativeGraph,
-    NativeProjectGraph,
     default_cbm_cache,
     resolve_cbm_binary,
 )
@@ -37,6 +34,7 @@ __all__ = [
     "Archive",
     "ArchiveError",
     "ArchiveGraph",
+    "ArchiveLoader",
     "ArchiveWriter",
     "BuildError",
     "BuildOptions",
@@ -48,13 +46,11 @@ __all__ = [
     "CBMTransportError",
     "CommitBuildResult",
     "CommitTarget",
+    "GraphHandle",
     "GraphReader",
-    "GraphTarget",
     "IncrementalConfig",
     "IncrementalConfigError",
     "KGARecorder",
-    "NativeGraph",
-    "NativeProjectGraph",
     "build_archive",
     "build_commit",
     "build_repository",

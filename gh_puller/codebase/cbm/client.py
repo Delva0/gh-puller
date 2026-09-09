@@ -1,79 +1,62 @@
-"""Implement the synchronous client exported by the CBM package facade.
+"""Implement the transport-neutral synchronous CBM client.
 
-Each API selects its native, persistent MCP, or CLI backend without exposing
-transport mechanics. Open-ended tool arguments keep new server fields
-independent of SDK releases; private sibling modules own each process protocol.
+Public operations follow CBM SDK concepts. MCP, CLI, and native transports are
+peer routes selected globally or per API, while opaque graph handles
+retain their route without exposing its process protocol.
 """
 
 from __future__ import annotations
 
-import json
 import os
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Self
 
-from ._daemon import (
+from ._transport import (
     CBMTransportError,
-    CLITransport,
-    PersistentMCPTransport,
+    OpenedGraph,
     ResourceMonitorLike,
-    _checked_index_execution,
-    make_transport,
+    Transport,
+    TransportName,
+    create_transport,
+    parse_transport_name,
 )
-from ._native import NativeHelper, NativeIndexTransport, NativeTransport
 from .binary import CBMBinary, resolve_cbm_binary
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
     from types import TracebackType
 
-    from ..archive import Archive
+    from ._native import NativeHelper
 
 
 class _ClientMonitor:
-    child_pid: int | None = None
+    """Discard process observations for clients without resource limits."""
+
     exceeded = False
+
+    def add_child(self, pid: int) -> None:
+        return
+
+    def remove_child(self, pid: int) -> None:
+        return
 
     def sample(self) -> None:
         return
 
 
 @dataclass(frozen=True, slots=True)
-class GraphTarget:
-    """Identify a project-bound target for CBM graph tools."""
+class GraphHandle:
+    """Bind one CBM graph to the transport that opened it."""
 
     project: str
-
-
-@dataclass(frozen=True, slots=True)
-class NativeGraph(GraphTarget):
-    """Bind one active native engine graph as a query capability."""
-
-    database_path: Path
+    transport: TransportName
     source_root: Path | None
-    nodes: int
-    edges: int
-    _transport: NativeTransport = field(repr=False, compare=False)
-    _binding: int = field(repr=False, compare=False)
-
-
-@dataclass(frozen=True, slots=True)
-class NativeProjectGraph(NativeGraph):
-    """Identify one indexed-project generation open read-only in a native engine."""
-
-
-@dataclass(frozen=True, slots=True)
-class ArchiveGraph(NativeGraph):
-    """Identify one immutable KGA generation loaded by the native backend."""
-
-    graph_digest: str
-    materialization_digest: str
-    graph_fidelity: int
-    coverage_rows: int
-    coverage_fidelity: int
-    materialized: bool
+    nodes: int | None
+    edges: int | None
+    _transport: Transport = field(repr=False, compare=False)
+    _binding: object = field(repr=False, compare=False)
 
 
 def default_cbm_cache(environ: Mapping[str, str] | None = None) -> Path:
@@ -99,29 +82,8 @@ def _project_database(cache_root: Path, project: str) -> Path:
     return cache_root / f"{project}.db"
 
 
-def _json_object(name: str, result: dict[str, Any]) -> dict[str, Any]:
-    structured = result.get("structuredContent")
-    if isinstance(structured, dict):
-        return structured
-    if structured is not None:
-        raise CBMTransportError(f"CBM tool {name} returned non-object structured content")
-
-    content = result.get("content")
-    if isinstance(content, list):
-        for block in content:
-            if not isinstance(block, dict) or not isinstance(block.get("text"), str):
-                continue
-            try:
-                decoded = json.loads(block["text"])
-            except json.JSONDecodeError:
-                continue
-            if isinstance(decoded, dict):
-                return decoded
-    raise CBMTransportError(f"CBM tool {name} did not return a JSON object")
-
-
 class CBMClient:
-    """Route CBM operations to native, persistent MCP, or one-shot CLI backends."""
+    """Route CBM SDK operations through interchangeable peer transports."""
 
     def __init__(
         self,
@@ -132,13 +94,13 @@ class CBMClient:
         cache_root: str | Path | None = None,
         native_helper: NativeHelper | str | Path | None = None,
         native_index_helper: NativeHelper | str | Path | None = None,
-        daemon_transport: str = "persistent-mcp",
-        index_backend: str | None = None,
+        transport: str = "native",
+        routes: Mapping[str, str] | None = None,
         timeout: float = 120,
         environment: Mapping[str, str] | None = None,
         resource_monitor: ResourceMonitorLike | None = None,
     ):
-        """Configure lazily initialized backends and their shared runtime state.
+        """Configure lazily initialized transports and their shared runtime state.
 
         Args:
             binary: Pinned binary identity, explicit executable, or command name.
@@ -147,15 +109,13 @@ class CBMClient:
             registry: Registry root used for default manifest resolution.
             cache_root: CBM database directory. ``None`` honors ``CBM_CACHE_DIR``
                 and then uses CBM's per-user default.
-            native_helper: Compact helper for archive-backed tools. ``None`` uses the
-                normal environment, local-build, and ``PATH`` resolution order.
+            native_helper: Compact helper for native graph tools. ``None`` uses
+                the normal environment, local-build, and ``PATH`` resolution order.
             native_index_helper: Full SDK helper for indexing. ``None`` uses its
                 independent environment, local-build, and ``PATH`` resolution order.
-            daemon_transport: Persistent MCP or one-process-per-call CLI backend
-                used by daemon operations.
-            index_backend: Native, persistent MCP, or CLI implementation used by
-                repository indexing. ``None`` follows ``daemon_transport``.
-            timeout: Maximum seconds for each backend request or cache lock.
+            transport: Default native, MCP, or CLI route for every operation.
+            routes: Per-API route overrides keyed by public operation or tool name.
+            timeout: Maximum seconds for each transport request or cache lock.
             environment: Environment overrides passed to CBM and used during
                 executable and cache resolution.
             resource_monitor: Optional build-owned process and memory monitor.
@@ -163,11 +123,11 @@ class CBMClient:
         """
         if timeout <= 0:
             raise ValueError("CBM timeout must be positive")
-        if daemon_transport not in {"cli", "persistent-mcp"}:
-            raise ValueError(f"unknown CBM daemon transport: {daemon_transport}")
-        selected_index_backend = daemon_transport if index_backend is None else index_backend
-        if selected_index_backend not in {"native", "cli", "persistent-mcp"}:
-            raise ValueError(f"unknown CBM index backend: {selected_index_backend}")
+        selected_transport = parse_transport_name(transport)
+        selected_routes = {
+            operation: parse_transport_name(route)
+            for operation, route in dict(routes or {}).items()
+        }
         overrides = dict(environment or {})
         values = {**os.environ, **overrides}
         resolved_cache = (
@@ -183,18 +143,15 @@ class CBMClient:
         self._binary_identity = binary if isinstance(binary, CBMBinary) else None
         self._native_helper = native_helper
         self._native_index_helper = native_index_helper
-        self.daemon_transport = daemon_transport
-        self.index_backend = selected_index_backend
+        self.transport = selected_transport
+        self.routes = selected_routes
         self._monitor = resource_monitor or _ClientMonitor()
-        self._backend_lock = threading.Lock()
-        self._daemon_backend: CLITransport | PersistentMCPTransport | None = None
-        self._index_daemon_backend: CLITransport | PersistentMCPTransport | None = None
-        self._native_transport: NativeTransport | None = None
-        self._native_index_transport: NativeIndexTransport | None = None
+        self._transport_lock = threading.Lock()
+        self._transports: dict[TransportName, Transport] = {}
 
     @property
     def binary(self) -> CBMBinary:
-        """Return the authenticated executable used by daemon operations."""
+        """Return the authenticated executable used by MCP and CLI."""
         if self._binary_identity is None:
             self._binary_identity = resolve_cbm_binary(
                 self._binary_input,
@@ -205,153 +162,101 @@ class CBMClient:
         self._binary_identity.verify_unchanged()
         return self._binary_identity
 
-    def _daemon(self) -> CLITransport | PersistentMCPTransport:
-        with self._backend_lock:
-            binary = self.binary
-            if self._daemon_backend is None:
-                self._daemon_backend = make_transport(
-                    self.daemon_transport,
-                    binary.path,
-                    self.cache_root,
-                    self.timeout,
-                    self._monitor,
-                    self._overrides,
+    def _get_transport(self, name: TransportName) -> Transport:
+        with self._transport_lock:
+            if name not in self._transports:
+                self._transports[name] = create_transport(
+                    name,
+                    resolve_binary=lambda: self.binary,
+                    cache_root=self.cache_root,
+                    timeout=self.timeout,
+                    environment=self._overrides,
+                    monitor=self._monitor,
+                    native_helper=self._native_helper,
+                    native_index_helper=self._native_index_helper,
                 )
-        return self._daemon_backend
+        return self._transports[name]
 
-    def _mcp(self) -> PersistentMCPTransport:
-        backend = self._daemon()
-        if not isinstance(backend, PersistentMCPTransport):
-            raise CBMTransportError("server metadata requires the persistent-mcp backend")
-        return backend
+    def _select_transport(self, operation: str, transport: str | None = None) -> Transport:
+        selected = (
+            parse_transport_name(transport)
+            if transport is not None
+            else self.routes.get(operation, self.transport)
+        )
+        return self._get_transport(selected)
 
-    def _index_daemon(self) -> CLITransport | PersistentMCPTransport:
-        if self.index_backend == self.daemon_transport:
-            return self._daemon()
-        with self._backend_lock:
-            if self._index_daemon_backend is None:
-                self._index_daemon_backend = make_transport(
-                    self.index_backend,
-                    self.binary.path,
-                    self.cache_root,
-                    self.timeout,
-                    self._monitor,
-                    self._overrides,
-                )
-        return self._index_daemon_backend
-
-    def _native(self) -> NativeTransport:
-        with self._backend_lock:
-            if self._native_transport is None:
-                self._native_transport = NativeTransport(
-                    self._native_helper,
-                    self.cache_root,
-                    self.timeout,
-                    self._overrides,
-                    self._monitor,
-                )
-        return self._native_transport
-
-    def _native_index(self) -> NativeIndexTransport:
-        with self._backend_lock:
-            if self._native_index_transport is None:
-                self._native_index_transport = NativeIndexTransport(
-                    self._native_index_helper,
-                    self.cache_root,
-                    self.timeout,
-                    self._overrides,
-                    self._monitor,
-                )
-        return self._native_index_transport
-
-    def _native_project(self, database_path: Path) -> NativeTransport:
-        for transport in (self._native_index_transport, self._native_transport):
-            if (
-                transport is not None
-                and transport.loaded_database_path == database_path
-            ):
-                return transport
-        return self._native_index_transport or self._native()
-
-    @property
-    def pid(self) -> int:
-        """Return the persistent MCP frontend process ID."""
-        return self._mcp().process.pid
-
-    @property
-    def native_pid(self) -> int:
-        """Return the persistent native query helper process ID."""
-        return self._native().pid
-
-    @property
-    def native_index_pid(self) -> int:
-        """Return the persistent full-SDK helper process ID."""
-        return self._native_index().pid
-
-    @property
-    def instructions(self) -> str:
-        """Return optional query guidance advertised by the CBM server."""
-        return self._mcp().instructions
-
-    def list_tools(self) -> list[dict[str, Any]]:
-        """Return all tool definitions advertised by the live CBM server."""
-        return self._mcp().list_tools()
-
-    def daemon_graph(self, project: str) -> GraphTarget:
-        """Bind a project to the configured daemon backend.
-
-        Args:
-            project: Exact mutable CBM project name.
-        """
-        return GraphTarget(project)
+    @staticmethod
+    def _graph(transport: Transport, opened: OpenedGraph) -> GraphHandle:
+        return GraphHandle(
+            opened.project,
+            transport.name,
+            opened.source_root,
+            opened.nodes,
+            opened.edges,
+            transport,
+            opened.binding,
+        )
 
     def project_graph(
         self,
         project: str,
         *,
         source_root: str | Path | None = None,
-    ) -> GraphTarget:
-        """Open an indexed project's current generation for read-only tools.
+        transport: str | None = None,
+    ) -> GraphHandle:
+        """Open or bind an indexed project's current generation.
 
         Args:
             project: Exact mutable CBM project name.
-            source_root: Matching checkout for native tools that inspect source.
+            source_root: Matching checkout for source-aware native tools.
+            transport: Explicit route overriding this API's configured selection.
 
         Returns:
-            A read-only native project handle or the configured daemon binding.
+            A transport-neutral graph handle.
         """
-        if self.index_backend != "native":
-            if self.index_backend != self.daemon_transport:
-                raise CBMTransportError(
-                    "project graph requires index_backend to match daemon_transport",
-                )
-            return self.daemon_graph(project)
-        database_path = _project_database(self.cache_root, project)
         resolved_source = Path(source_root).resolve() if source_root is not None else None
-        native = self._native_project(database_path)
-        result = native.open_project(database_path, project, resolved_source)
-        return NativeProjectGraph(
-            project=project,
-            database_path=database_path,
-            source_root=resolved_source,
-            nodes=result["nodes"],
-            edges=result["edges"],
-            _transport=native,
-            _binding=native.binding,
+        route = self._select_transport("project_graph", transport)
+        return self._graph(route, route.open_project(project, resolved_source))
+
+    def open_store(
+        self,
+        database_path: str | Path,
+        project: str,
+        *,
+        source_root: str | Path | None = None,
+        transport: str | None = None,
+    ) -> GraphHandle:
+        """Open an explicit CBM store through a selected SDK route.
+
+        Args:
+            database_path: Exact CBM database containing the graph.
+            project: Project expected inside the store.
+            source_root: Matching checkout for source-aware graph tools.
+            transport: Explicit route overriding this API's configured selection.
+
+        Returns:
+            A transport-neutral graph handle.
+        """
+        database = Path(database_path).expanduser().resolve()
+        resolved_source = Path(source_root).resolve() if source_root is not None else None
+        route = self._select_transport("open_store", transport)
+        return self._graph(
+            route,
+            route.open_store(database, project, resolved_source),
         )
 
-    def capabilities(self) -> frozenset[str]:
-        """Return capabilities advertised by the selected indexing backend."""
-        if self.index_backend == "native":
-            return self._native_index().capabilities
-        return self._index_daemon().capabilities()
+    def capabilities(self, *, transport: str | None = None) -> frozenset[str]:
+        """Return capabilities advertised by an indexing route.
+
+        Args:
+            transport: Explicit route overriding ``index_repository`` selection.
+        """
+        return self._select_transport("index_repository", transport).capabilities()
 
     @property
     def index_engine(self) -> CBMBinary | NativeHelper:
         """Return the pinned executable that implements repository indexing."""
-        if self.index_backend == "native":
-            return self._native_index().helper
-        return self.binary
+        return self._select_transport("index_repository").engine
 
     def index_repository(
         self,
@@ -362,8 +267,9 @@ class CBMClient:
         force_full: bool = False,
         incremental_controls: Mapping[str, str | int] | None = None,
         target_projects: Sequence[str] | None = None,
+        transport: str | None = None,
     ) -> dict[str, Any]:
-        """Publish one repository graph through the selected indexing backend.
+        """Publish one repository graph through the selected transport.
 
         Args:
             tree: Materialized repository tree to analyze.
@@ -373,6 +279,7 @@ class CBMClient:
             incremental_controls: Delta-policy overrides whose acknowledgement
                 must be confirmed by CBM.
             target_projects: Projects matched by cross-repository intelligence.
+            transport: Explicit route overriding this API's configured selection.
 
         Returns:
             Machine-readable route evidence reported by CBM.
@@ -386,19 +293,10 @@ class CBMClient:
         if not cross_repo and target_projects:
             raise ValueError("target projects require cross-repo-intelligence mode")
         effective_controls = None if cross_repo else incremental_controls
-        if self.index_backend == "native":
-            result = self._native_index().index_repository(
-                tree_path,
-                _project_database(self.cache_root, project),
-                project,
-                mode,
-                force_full=force_full,
-                incremental_controls=effective_controls,
-                target_projects=target_projects,
-            )
-            return _checked_index_execution(result, force_full, effective_controls)
-        return self._index_daemon().index(
+        route = self._select_transport("index_repository", transport)
+        return route.index_repository(
             tree_path,
+            _project_database(self.cache_root, project),
             project,
             mode,
             force_full=force_full,
@@ -406,110 +304,76 @@ class CBMClient:
             target_projects=target_projects,
         )
 
-    def delete_project(self, project: str) -> tuple[bool, str]:
-        """Delete one project through the backend that indexed it.
+    def delete_project(self, project: str, *, transport: str | None = None) -> tuple[bool, str]:
+        """Delete one project through a selected transport.
 
         Args:
             project: Exact CBM project name to delete.
+            transport: Explicit route overriding this API's configured selection.
         """
-        if self.index_backend == "native":
-            database_path = _project_database(self.cache_root, project)
-            try:
-                result = self._native_project(database_path).delete_project(database_path, project)
-            except CBMTransportError as exc:
-                return False, str(exc)[-1000:]
-            return True, json.dumps(result, ensure_ascii=False)[-1000:]
-        return self._index_daemon().delete_project(project)
+        route = self._select_transport("delete_project", transport)
+        return route.delete_project(_project_database(self.cache_root, project), project)
 
-    def list_projects(self, **options: object) -> dict[str, Any]:
-        """List projects through the selected indexing backend.
+    def list_projects(self, *, transport: str | None = None, **options: object) -> dict[str, Any]:
+        """List projects through a selected transport.
 
         Args:
+            transport: Explicit route overriding this API's configured selection.
             **options: Native CBM pagination and detail fields.
         """
-        if self.index_backend == "native":
-            native = self._native_index_transport or self._native()
-            return native.list_projects(options)
-        return _json_object(
-            "list_projects",
-            self._index_daemon().call_tool("list_projects", dict(options)),
-        )
+        return self._select_transport("list_projects", transport).list_projects(options)
 
     def call_tool(
         self,
         name: str,
         arguments: Mapping[str, object] | None = None,
         *,
-        target: GraphTarget | None = None,
+        target: GraphHandle | None = None,
+        transport: str | None = None,
     ) -> dict[str, Any]:
-        """Call any CBM tool and return a backend-neutral result envelope.
+        """Call any CBM tool and return its logical JSON object.
 
         Args:
-            name: Advertised MCP tool name.
+            name: CBM SDK tool name.
             arguments: Tool-specific arguments. ``None`` sends an empty object.
-            target: Explicit graph binding. Native handles select their bound
-                engine session; daemon handles and omission use the configured
-                daemon backend.
+            target: Explicit graph binding. Its captured route takes precedence.
+            transport: Route used only when ``target`` is absent.
         """
-        values = dict(arguments or {})
         if target is not None:
-            supplied_project = values.get("project")
-            if supplied_project is not None and supplied_project != target.project:
-                raise CBMTransportError("CBM graph target disagrees with the tool project")
-            values["project"] = target.project
-        if isinstance(target, NativeGraph):
-            native = target._transport
-            if not native.is_active_graph(
-                target._binding,
-                target.database_path,
-                target.project,
-                target.source_root,
-            ):
-                raise CBMTransportError("native graph is no longer active")
-            if name not in native.tools:
-                raise CBMTransportError(f"native CBM tool is not supported for this graph: {name}")
-            logical = native.call_tool(name, values)
-            return {
-                "content": [
-                    {
-                        "type": "text",
-                        "text": json.dumps(logical, ensure_ascii=False, separators=(",", ":")),
-                    },
-                ],
-                "structuredContent": logical,
-                "isError": False,
-            }
-        return self._daemon().call_tool(name, values)
+            if transport is not None and parse_transport_name(transport) != target.transport:
+                raise CBMTransportError("explicit transport disagrees with the graph handle")
+            return target._transport.call_tool(target._binding, name, dict(arguments or {}))
+        return self._select_transport(name, transport).call_tool(None, name, dict(arguments or {}))
 
     def call_json_tool(
         self,
         name: str,
         arguments: Mapping[str, object] | None = None,
         *,
-        target: GraphTarget | None = None,
+        target: GraphHandle | None = None,
+        transport: str | None = None,
     ) -> dict[str, Any]:
         """Call a tool whose logical response is a JSON object.
 
         Args:
-            name: Advertised MCP tool name.
+            name: CBM SDK tool name.
             arguments: Tool-specific arguments. ``None`` sends an empty object.
-            target: Optional explicit graph/backend binding.
+            target: Optional explicit graph/transport binding.
+            transport: Route used only when ``target`` is absent.
 
         Returns:
-            Parsed ``structuredContent``, with a text-content fallback for older
-            CBM binaries.
+            The logical JSON object returned by CBM.
 
         Raises:
-            CBMTransportError: The call fails or its response is not a JSON object.
+            CBMTransportError: The call fails or returns no logical JSON object.
         """
-        return _json_object(name, self.call_tool(name, arguments, target=target))
+        return self.call_tool(name, arguments, target=target, transport=transport)
 
-    def search_graph(self, target: GraphTarget, **filters: object) -> dict[str, Any]:
+    def search_graph(self, target: GraphHandle, **filters: object) -> dict[str, Any]:
         """Run CBM structured, BM25, or semantic graph search.
 
         Args:
-            target: Graph and backend selected by :meth:`daemon_graph`,
-                :meth:`project_graph`, or :meth:`load_archive`.
+            target: Graph returned by :meth:`project_graph`.
             **filters: Native ``search_graph`` fields such as ``query``, ``label``,
                 ``name_pattern``, ``limit``, and ``offset``.
         """
@@ -521,7 +385,7 @@ class CBMClient:
 
     def search_code(
         self,
-        target: GraphTarget,
+        target: GraphHandle,
         *,
         pattern: str,
         **options: object,
@@ -529,8 +393,7 @@ class CBMClient:
         """Search source text and enrich matches with graph structure.
 
         Args:
-            target: Graph and backend selected by :meth:`daemon_graph`,
-                :meth:`project_graph`, or :meth:`load_archive`.
+            target: Graph returned by :meth:`project_graph`.
             pattern: Literal or regular-expression source pattern.
             **options: Additional ``search_code`` fields such as ``mode``,
                 ``file_pattern``, ``path_filter``, and ``limit``.
@@ -541,12 +404,11 @@ class CBMClient:
             target=target,
         )
 
-    def query_graph(self, target: GraphTarget, *, query: str, **options: object) -> dict[str, Any]:
+    def query_graph(self, target: GraphHandle, *, query: str, **options: object) -> dict[str, Any]:
         """Run a read-only Cypher-like query against a CBM graph.
 
         Args:
-            target: Graph and backend selected by :meth:`daemon_graph`,
-                :meth:`project_graph`, or :meth:`load_archive`.
+            target: Graph returned by :meth:`project_graph`.
             query: Native CBM graph query.
             **options: Additional ``query_graph`` fields such as ``graph`` and
                 ``max_rows``.
@@ -557,55 +419,17 @@ class CBMClient:
             target=target,
         )
 
-    def get_graph_schema(self, target: GraphTarget) -> dict[str, Any]:
+    def get_graph_schema(self, target: GraphHandle) -> dict[str, Any]:
         """Return labels, relationship types, and their available properties.
 
         Args:
-            target: Graph and backend selected by :meth:`daemon_graph`,
-                :meth:`project_graph`, or :meth:`load_archive`.
+            target: Graph returned by :meth:`project_graph`.
         """
         return self.call_json_tool("get_graph_schema", target=target)
 
-    def load_archive(
-        self,
-        archive: str | Path | Archive,
-        commit: str | None = None,
-        *,
-        allow_incomplete: bool = True,
-    ) -> ArchiveGraph:
-        """Load one KGA snapshot into the native query engine.
-
-        Args:
-            archive: KGA path or an already captured :class:`Archive` reader.
-            commit: Exact archived commit. ``None`` selects the captured latest.
-            allow_incomplete: For path inputs, accept the writer's final durable
-                checkpoint while the archive is still being built.
-
-        Returns:
-            Immutable native graph handle containing its identity, row counts,
-            cache path, and materialization status.
-        """
-        native = self._native()
-        result = native.load_archive(archive, commit, allow_incomplete=allow_incomplete)
-        return ArchiveGraph(
-            project=result["project"],
-            database_path=Path(result["database_path"]),
-            source_root=None,
-            nodes=result["nodes"],
-            edges=result["edges"],
-            _transport=native,
-            _binding=native.binding,
-            graph_digest=result["graph_digest"],
-            materialization_digest=result["materialization_digest"],
-            graph_fidelity=result["graph_fidelity"],
-            coverage_rows=result["coverage_rows"],
-            coverage_fidelity=result["coverage_fidelity"],
-            materialized=result["materialized"],
-        )
-
     def trace_path(
         self,
-        target: GraphTarget,
+        target: GraphHandle,
         *,
         function_name: str,
         **options: object,
@@ -613,8 +437,7 @@ class CBMClient:
         """Trace calls, data flow, or cross-service paths from one symbol.
 
         Args:
-            target: Graph and backend selected by :meth:`daemon_graph`,
-                :meth:`project_graph`, or :meth:`load_archive`.
+            target: Graph returned by :meth:`project_graph`.
             function_name: Qualified or discoverable function name used as the
                 traversal origin.
             **options: Native ``trace_path`` fields such as ``direction``, ``depth``,
@@ -628,7 +451,7 @@ class CBMClient:
 
     def get_code_snippet(
         self,
-        target: GraphTarget,
+        target: GraphHandle,
         *,
         qualified_name: str,
         **options: object,
@@ -636,8 +459,7 @@ class CBMClient:
         """Read the source belonging to one graph symbol.
 
         Args:
-            target: Graph and backend selected by :meth:`daemon_graph`,
-                :meth:`project_graph`, or :meth:`load_archive`.
+            target: Graph returned by :meth:`project_graph`.
             qualified_name: Exact symbol identity or a short name accepted by CBM.
             **options: Additional ``get_code_snippet`` fields such as
                 ``include_neighbors``.
@@ -650,7 +472,7 @@ class CBMClient:
 
     def get_architecture(
         self,
-        target: GraphTarget,
+        target: GraphHandle,
         *,
         path: str | None = None,
         aspects: Sequence[str] | None = None,
@@ -659,8 +481,7 @@ class CBMClient:
         """Summarize graph structure, dependencies, and architectural views.
 
         Args:
-            target: Graph and backend selected by :meth:`daemon_graph`,
-                :meth:`project_graph`, or :meth:`load_archive`.
+            target: Graph returned by :meth:`project_graph`.
             path: Optional repository-relative directory scope.
             aspects: Optional CBM architecture sections. ``None`` selects the
                 compact default view.
@@ -676,7 +497,7 @@ class CBMClient:
 
     def check_index_coverage(
         self,
-        target: GraphTarget,
+        target: GraphHandle,
         *,
         paths: Sequence[str] = (),
         scopes: Sequence[str] = (),
@@ -686,8 +507,7 @@ class CBMClient:
         """Inspect CBM's best-effort coverage record for paths or scopes.
 
         Args:
-            target: Graph and backend selected by :meth:`daemon_graph`,
-                :meth:`project_graph`, or :meth:`load_archive`.
+            target: Graph returned by :meth:`project_graph`.
             paths: Repository-relative files to check exactly.
             scopes: Repository-relative path prefixes to enumerate.
             scope_limit: Maximum coverage rows returned for each scope.
@@ -704,12 +524,11 @@ class CBMClient:
             target=target,
         )
 
-    def detect_changes(self, target: GraphTarget, **options: object) -> dict[str, Any]:
+    def detect_changes(self, target: GraphHandle, **options: object) -> dict[str, Any]:
         """Map source changes to graph impact.
 
         Args:
-            target: Graph and backend selected by :meth:`daemon_graph`,
-                :meth:`project_graph`, or :meth:`load_archive`.
+            target: Graph returned by :meth:`project_graph`.
             **options: ``detect_changes`` fields such as ``base_branch``,
                 ``since``, ``scope``, ``direction``, ``depth``, and ``limit``.
         """
@@ -721,7 +540,7 @@ class CBMClient:
 
     def manage_adr(
         self,
-        target: GraphTarget,
+        target: GraphHandle,
         *,
         mode: str = "get",
         content: str | None = None,
@@ -730,10 +549,9 @@ class CBMClient:
         """Read or explicitly update a project's architecture record.
 
         Args:
-            target: Graph and backend selected by :meth:`daemon_graph`,
-                :meth:`project_graph`, or :meth:`load_archive`.
+            target: Graph returned by :meth:`project_graph`.
             mode: ADR operation; ``get`` is the read-only default. Writes require
-                a daemon graph because native graph handles are query-only.
+                a writable graph handle.
             content: Complete replacement document used by ``update``.
             section_updates: Named replacement sections used by ``set_sections``.
         """
@@ -746,14 +564,13 @@ class CBMClient:
 
     def ingest_traces(
         self,
-        target: GraphTarget,
+        target: GraphHandle,
         traces: Sequence[Mapping[str, object]],
     ) -> dict[str, Any]:
         """Submit runtime call observations to CBM.
 
         Args:
-            target: Graph and backend selected by :meth:`daemon_graph`,
-                :meth:`project_graph`, or :meth:`load_archive`.
+            target: Graph returned by :meth:`project_graph`.
             traces: Caller, callee, and count objects accepted by CBM.
         """
         return self.call_json_tool(
@@ -764,23 +581,16 @@ class CBMClient:
 
     def index_status(
         self,
-        target: GraphTarget,
+        target: GraphHandle,
         *,
         verbose: bool = False,
     ) -> dict[str, Any]:
         """Return graph counts, root identity, and persisted coverage status.
 
         Args:
-            target: Graph and backend selected by :meth:`daemon_graph`,
-                :meth:`project_graph`, or :meth:`load_archive`.
-            verbose: Include live Git/worktree context for daemon graphs and
-                native graphs with a bound source snapshot.
-
-        Raises:
-            CBMTransportError: ``verbose`` is requested without a source snapshot.
+            target: Graph returned by :meth:`project_graph`.
+            verbose: Include live Git/worktree context when supported.
         """
-        if verbose and isinstance(target, NativeGraph) and target.source_root is None:
-            raise CBMTransportError("verbose index status requires a live source snapshot")
         return self.call_json_tool(
             "index_status",
             {"verbose": verbose},
@@ -789,8 +599,8 @@ class CBMClient:
 
     def compare_graphs(
         self,
-        base: GraphTarget,
-        target: GraphTarget,
+        base: GraphHandle,
+        target: GraphHandle,
         *,
         limit: int = 200,
         scan_limit: int = 2_000_000,
@@ -799,45 +609,29 @@ class CBMClient:
 
         Args:
             base: Older graph generation.
-            target: Newer graph from the same backend kind.
+            target: Newer graph from the same transport instance.
             limit: Maximum returned entries per change set.
             scan_limit: Maximum combined rows scanned per node or edge phase.
 
         Raises:
-            CBMTransportError: Native and daemon graph kinds are mixed.
+            CBMTransportError: Handles belong to different transports.
         """
-        if isinstance(base, NativeGraph) and isinstance(target, NativeGraph):
-            native = target._transport
-            return native.compare_graphs(
-                base_database=base.database_path,
-                base_project=base.project,
-                target_database=target.database_path,
-                target_project=target.project,
-                limit=limit,
-                scan_limit=scan_limit,
-            )
-        if isinstance(base, NativeGraph) or isinstance(target, NativeGraph):
-            raise CBMTransportError("cannot compare native and daemon graphs")
-        return self.call_json_tool(
-            "compare_graphs",
-            {
-                "base_project": base.project,
-                "target_project": target.project,
-                "limit": limit,
-                "scan_limit": scan_limit,
-            },
+        if base._transport is not target._transport:
+            raise CBMTransportError("graph handles belong to different CBM transports")
+        return target._transport.compare_graphs(
+            base._binding,
+            target._binding,
+            limit=limit,
+            scan_limit=scan_limit,
         )
 
     def close(self) -> None:
-        """Finish active native and daemon processes and release their pipes."""
-        if self._native_transport is not None:
-            self._native_transport.close()
-        if self._native_index_transport is not None:
-            self._native_index_transport.close()
-        if self._index_daemon_backend is not None:
-            self._index_daemon_backend.close()
-        if self._daemon_backend is not None:
-            self._daemon_backend.close()
+        """Close only transports and child processes owned by this client."""
+        with self._transport_lock:
+            transports = tuple(self._transports.values())
+            self._transports.clear()
+        for transport in transports:
+            transport.close()
 
     def __enter__(self) -> Self:
         return self

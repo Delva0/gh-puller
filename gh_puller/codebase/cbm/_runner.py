@@ -1,13 +1,12 @@
-"""Own build-scoped filesystem state around one reusable CBM client.
+"""Own build-scoped resources around one reusable CBM client.
 
 The runner accepts per-commit build plans and exposes only the published
-database path and execution metadata. Graph extraction and KGA encoding remain
-outside this package.
+database path and execution metadata. Persistence and consumer coordination
+remain outside this package.
 """
 
 from __future__ import annotations
 
-import os
 import resource
 import shutil
 import threading
@@ -74,7 +73,8 @@ class ResourceMonitor:
         self.memory_limit = memory_limit
         self.peak_scratch = 0
         self.peak_rss = 0
-        self.child_pid: int | None = None
+        self._children: set[int] = set()
+        self._children_lock = threading.Lock()
         self.exceeded = False
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._loop, daemon=True)
@@ -85,10 +85,22 @@ class ResourceMonitor:
 
     def sample(self) -> None:
         """Capture one resource high-water sample."""
+        with self._children_lock:
+            children = tuple(self._children)
         self.peak_scratch = max(self.peak_scratch, sum(_size(path) for path in self.paths))
         own = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024
-        self.peak_rss = max(self.peak_rss, own + _rss(self.child_pid))
+        self.peak_rss = max(self.peak_rss, own + sum(_rss(pid) for pid in children))
         self.exceeded |= self.peak_rss > self.memory_limit
+
+    def add_child(self, pid: int) -> None:
+        """Include a transport child in aggregate RSS observations."""
+        with self._children_lock:
+            self._children.add(pid)
+
+    def remove_child(self, pid: int) -> None:
+        """Stop observing a transport child after its process exits."""
+        with self._children_lock:
+            self._children.discard(pid)
 
     def _loop(self) -> None:
         while not self._stop.wait(0.1):
@@ -127,14 +139,14 @@ class CBMRunner:
         """Start a build-scoped CBM runner.
 
         Args:
-            binary: Authenticated daemon executable; native indexing does not use it.
+            binary: Authenticated CBM executable; native indexing does not use it.
             project: Stable CBM project receiving every planned commit.
             cache_root: Directory containing CBM's atomically published database.
             work_dir: Runner-owned materialized Git tree and commit state.
             timeout: Maximum seconds for one CBM request.
             memory_limit: Aggregate runner and child RSS ceiling; omission reserves
                 one GiB for the host.
-            transport: Native SDK, reusable MCP, or one-process-per-call CLI index path.
+            transport: Native SDK, pooled MCP, or one-process-per-call CLI index path.
             native_index_helper: Explicit full SDK helper for the native index path.
         """
         self.binary = binary
@@ -142,9 +154,6 @@ class CBMRunner:
         self.cache_root = Path(cache_root)
         self.work_dir = Path(work_dir)
         self.tree = self.work_dir / "tree"
-        self.state_path = self.work_dir / "current-sha"
-        self.state_version_path = self.work_dir / "state-version"
-        self.pending_path = self.work_dir / "pending-sha"
         self.db_path = self.cache_root / f"{project}.db"
         limit = memory_limit or max(1 << 30, _total_memory() - (1 << 30))
         self.monitor = ResourceMonitor(
@@ -159,8 +168,7 @@ class CBMRunner:
             self._client = CBMClient(
                 binary,
                 cache_root=self.cache_root,
-                daemon_transport=transport if transport != "native" else "persistent-mcp",
-                index_backend=transport,
+                transport=transport,
                 native_index_helper=native_index_helper,
                 timeout=timeout,
                 resource_monitor=self.monitor,
@@ -175,26 +183,6 @@ class CBMRunner:
                 self._client = None
             self.monitor.stop()
             raise
-
-    @property
-    def current_commit(self) -> str | None:
-        """Return the last commit durably paired with the KGA by the caller."""
-        try:
-            if self.state_version_path.read_text().strip() != "1":
-                return None
-            value = self.state_path.read_text().strip()
-        except OSError:
-            return None
-        return value or None
-
-    @property
-    def pending_commit(self) -> str | None:
-        """Return the commit whose CBM/KGA transaction was interrupted, if any."""
-        try:
-            value = self.pending_path.read_text().strip()
-        except OSError:
-            return None
-        return value or None
 
     @property
     def resources(self) -> ResourceUsage:
@@ -215,8 +203,6 @@ class CBMRunner:
             CBMTransportError: Required CBM capabilities are absent or indexing fails.
         """
         required = set(plan.required_capabilities())
-        if self.transport_name == "persistent-mcp":
-            required.add("persistent-mcp")
         if missing := required - self.capabilities:
             raise CBMTransportError(f"CBM binary lacks required capabilities: {sorted(missing)}")
         if self._client is None:
@@ -229,30 +215,6 @@ class CBMRunner:
             incremental_controls=plan.incremental.to_dict(),
             target_projects=plan.target_projects or None,
         )
-
-    def mark_archived(self, sha: str) -> None:
-        """Record a commit only after its KGA checkpoint is durable.
-
-        Args:
-            sha: Commit identity published by the recorder.
-        """
-        self.work_dir.mkdir(parents=True, exist_ok=True)
-        temporary = self.state_path.with_suffix(".tmp")
-        temporary.write_text(sha)
-        os.replace(temporary, self.state_path)
-        self.state_version_path.write_text("1")
-        self.pending_path.unlink(missing_ok=True)
-
-    def begin_commit(self, sha: str) -> None:
-        """Durably identify the commit before asking CBM to publish it.
-
-        Args:
-            sha: Commit identity that the next KGA checkpoint must record.
-        """
-        self.work_dir.mkdir(parents=True, exist_ok=True)
-        temporary = self.pending_path.with_suffix(".tmp")
-        temporary.write_text(sha)
-        os.replace(temporary, self.pending_path)
 
     def delete_project(self) -> tuple[bool, str]:
         """Delete the runner's CBM project through its client."""
