@@ -53,6 +53,7 @@ $(ARCHIVE_OBJECT_DIR)/kga_reader.o: $(CBM_ARCHIVE_DIR)/kga_reader.c Makefile
 	@mkdir -p $(@D) $(NATIVE_LIB_DIR)
 	$(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
 
+$(ARCHIVE_OBJECT_DIR)/kga_sha256.o: CFLAGS += -O3 -funroll-loops
 $(ARCHIVE_OBJECT_DIR)/kga_sha256.o: $(CBM_ARCHIVE_DIR)/kga_sha256.c Makefile
 	@mkdir -p $(@D) $(NATIVE_LIB_DIR)
 	$(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
