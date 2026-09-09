@@ -6,7 +6,7 @@ import subprocess
 
 import pytest
 
-import gh_puller.codebase.cbm._runner as runner_module
+import gh_puller.codebase.cbm.runner as runner_module
 from gh_puller.codebase.archive import Archive, KGACommit, KGARecorder
 from gh_puller.codebase.build import CommitTarget, _CommitState, build_commit
 from gh_puller.codebase.cbm import BuildPlan, CBMRunner
@@ -78,6 +78,7 @@ class PublishingRunner:
         self.plans.append(plan)
         return {"route": "full" if plan.force_full else "closure_repair"}
 
+
 def write_store(path, symbol, *, value):
     connection = sqlite3.connect(path)
     connection.executescript(SCHEMA)
@@ -88,8 +89,7 @@ def write_store(path, symbol, *, value):
         (symbol, symbol, f'{{"value":{value}}}'),
     )
     connection.execute(
-        "INSERT INTO edges(id,project,source_id,target_id,type,properties) "
-        "VALUES (1,'p',1,2,'CONTAINS','{}')",
+        "INSERT INTO edges(id,project,source_id,target_id,type,properties) VALUES (1,'p',1,2,'CONTAINS','{}')",
     )
     connection.commit()
     connection.close()

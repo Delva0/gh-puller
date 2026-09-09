@@ -1,4 +1,4 @@
-"""Define the private contract shared by every CBM transport.
+"""Provide contracts and small utilities shared by CBM transports.
 
 The public client depends only on this module. Concrete MCP, CLI, and native
 implementations own their process protocols and expose graph bindings as opaque
@@ -15,8 +15,9 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
     from pathlib import Path
 
-    from ._native import NativeHelper
-    from .binary import CBMBinary
+    from ...utils import ResourceMonitorLike
+    from ..binary import CBMBinary
+    from .native import NativeHelper
 
 TransportName = Literal["native", "mcp", "cli"]
 TRANSPORT_NAMES = frozenset({"native", "mcp", "cli"})
@@ -36,18 +37,6 @@ _DELTA_ARGUMENTS = frozenset(
 
 class CBMTransportError(RuntimeError):
     """Report a failed or incompatible CBM transport operation."""
-
-
-class ResourceMonitorLike(Protocol):
-    """Receive process and resource observations from a transport."""
-
-    exceeded: bool
-
-    def add_child(self, pid: int) -> None: ...
-
-    def remove_child(self, pid: int) -> None: ...
-
-    def sample(self) -> None: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -344,7 +333,7 @@ def create_transport(
         A transport whose concrete implementation remains private.
     """
     if name == "native":
-        from ._native import NativeTransport
+        from .native import NativeTransport
 
         return NativeTransport(
             native_helper,
@@ -356,11 +345,11 @@ def create_transport(
         )
 
     if name == "mcp":
-        from ._mcp import MCPTransport
+        from .mcp import MCPTransport
 
         transport_type = MCPTransport
     else:
-        from ._cli import CLITransport
+        from .cli import CLITransport
 
         transport_type = CLITransport
     binary = resolve_binary()

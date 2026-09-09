@@ -8,11 +8,11 @@ from pathlib import Path
 
 import pytest
 
-import gh_puller.codebase.cbm._runner as runner_module
+import gh_puller.codebase.cbm.runner as runner_module
 from gh_puller.codebase.archive import Archive
-from gh_puller.codebase.archive_query import ArchiveLoader
 from gh_puller.codebase.build import BuildOptions, build_repository
 from gh_puller.codebase.cbm import BuildPlan, CBMClient
+from gh_puller.codebase.cbm_archive import CBMArchiveAdapter
 
 SCHEMA = """
 CREATE TABLE projects(name TEXT PRIMARY KEY);
@@ -49,8 +49,7 @@ def write_generation(path, project, symbol):
         (project, symbol, project, symbol),
     )
     connection.execute(
-        "INSERT INTO edges(id,project,source_id,target_id,type,properties) "
-        "VALUES (1,?,1,2,'CONTAINS','{}')",
+        "INSERT INTO edges(id,project,source_id,target_id,type,properties) VALUES (1,?,1,2,'CONTAINS','{}')",
         (project,),
     )
     connection.commit()
@@ -160,8 +159,9 @@ def test_repository_pipeline_selects_a_plan_for_each_commit(tmp_path, monkeypatc
 def test_repository_pipeline_uses_native_index_sdk_end_to_end(tmp_path):
     index_helper = os.environ.get("GH_PULLER_TEST_CBM_NATIVE_INDEX_HELPER")
     query_helper = os.environ.get("GH_PULLER_TEST_CBM_NATIVE_HELPER")
-    if index_helper is None or query_helper is None:
-        pytest.skip("real native query and index helpers not configured")
+    materializer = os.environ.get("GH_PULLER_TEST_KGA_MATERIALIZER")
+    if index_helper is None or query_helper is None or materializer is None:
+        pytest.skip("real native query, index, and materialization helpers not configured")
     repo = tmp_path / "repo"
     repo.mkdir()
     git(repo, "init")
@@ -184,20 +184,22 @@ def test_repository_pipeline_uses_native_index_sdk_end_to_end(tmp_path):
         cbm_transport="native",
     )
 
-    assert build_repository(
-        options,
-        lambda target: BuildPlan(route="full" if target.ordinal == 0 else "delta"),
-    ) == 0
+    assert (
+        build_repository(
+            options,
+            lambda target: BuildPlan(route="full" if target.ordinal == 0 else "delta"),
+        )
+        == 0
+    )
 
     with Archive(tmp_path / "build" / "archive.kga") as archive:
         assert archive.commit_ids() == tuple(commits)
         rows = archive.load_rows(commits[-1])
     query_cache = tmp_path / "query-cache"
-    with (
-        CBMClient(native_helper=query_helper, cache_root=query_cache, timeout=30) as client,
-        ArchiveLoader(query_helper, query_cache, 30) as loader,
-    ):
-        graph = loader.load(client, tmp_path / "build" / "archive.kga", commits[-1])
+    adapter = CBMArchiveAdapter(materializer, query_cache, 30)
+    with CBMClient(native_helper=query_helper, cache_root=query_cache, timeout=30) as client:
+        store = adapter.materialize(tmp_path / "build" / "archive.kga", commits[-1])
+        graph = client.open_store(store.database_path, store.project)
         queried = client.query_graph(
             graph,
             query="MATCH (n:Function) RETURN n.name",

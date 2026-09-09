@@ -5,7 +5,6 @@ The package owns KGA persistence and repository build orchestration. Its
 """
 
 from .archive import Archive, ArchiveError, ArchiveWriter, KGARecorder
-from .archive_query import ArchiveGraph, ArchiveLoader
 from .build import (
     BuildError,
     BuildOptions,
@@ -28,17 +27,18 @@ from .cbm import (
     default_cbm_cache,
     resolve_cbm_binary,
 )
+from .cbm_archive import CBMArchiveAdapter, CBMArchiveStore
 from .store import GraphReader
 
 __all__ = [
     "Archive",
     "ArchiveError",
-    "ArchiveGraph",
-    "ArchiveLoader",
     "ArchiveWriter",
     "BuildError",
     "BuildOptions",
     "BuildPlan",
+    "CBMArchiveAdapter",
+    "CBMArchiveStore",
     "CBMBinary",
     "CBMBinaryError",
     "CBMClient",

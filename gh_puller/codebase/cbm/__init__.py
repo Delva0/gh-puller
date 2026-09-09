@@ -1,10 +1,9 @@
-"""Expose stable CBM contracts while keeping transport mechanics private.
+"""Expose the stable CBM client, build policy, and runner contracts.
 
-The package facade is the supported integration boundary. MCP, CLI, native
-helper, and build-runner implementations remain private sibling modules.
+The package knows only CBM concepts. Native, MCP, and CLI access paths live in
+``transports``; archive formats and adapters remain outside this package.
 """
 
-from ._runner import CBMRunner
 from .binary import CBMBinary, CBMBinaryError, resolve_cbm_binary
 from .client import (
     CBMClient,
@@ -13,6 +12,7 @@ from .client import (
     default_cbm_cache,
 )
 from .plan import BuildPlan, IncrementalConfig, IncrementalConfigError
+from .runner import CBMRunner
 
 __all__ = [
     "BuildPlan",

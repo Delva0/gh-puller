@@ -6,8 +6,9 @@ import pytest
 
 from gh_puller.codebase import (
     Archive,
-    ArchiveLoader,
+    ArchiveError,
     ArchiveWriter,
+    CBMArchiveAdapter,
     CBMBinaryError,
     CBMClient,
     CBMTransportError,
@@ -46,9 +47,8 @@ def write_fake_helper(
     indexing: bool = False,
     tools: tuple[str, ...] = ("query_graph", "get_graph_schema", "index_status"),
 ) -> None:
-    protocol = 9 if indexing else 8
+    protocol = 10 if indexing else 9
     capabilities = [
-        "archive-load",
         "tool-call",
         "graph-compare",
         "project-open",
@@ -100,21 +100,9 @@ while True:
         with Path(log).open("a") as stream:
             stream.write(json.dumps(request) + "\\n")
     if method == "hello":
-        result = {{"protocol": {protocol}, "kga_format": 5, "graph_fidelity": 2,
-                  "coverage_fidelity": 1, "store_format": 1, "sdk_abi": 2,
+        result = {{"protocol": {protocol}, "store_format": 1, "sdk_abi": 3,
                   "capabilities": {capabilities!r},
                   "tools": {list(tools)!r}}}
-    elif method == "load":
-        Path(params["database_path"]).write_text(json.dumps({{
-            "nodes": params["node_count"], "edges": params["edge_count"]
-        }}))
-        result = {{"project": params["project"], "graph_digest": params["graph_digest"],
-                  "materialization_digest": params["materialization_digest"],
-                  "nodes": params["node_count"], "edges": params["edge_count"],
-                  "graph_fidelity": params["graph_fidelity"],
-                  "coverage_rows": params["coverage_count"],
-                  "coverage_fidelity": params["coverage_fidelity"],
-                  "materialized": not params["reuse"]}}
     elif method == "call":
         name = params["name"]
         arguments = params["arguments"]
@@ -161,6 +149,42 @@ while True:
                  "error": {{"code": "unsupported", "message": method}}}})
         continue
     respond({{"id": ident, "ok": True, "result": result}})
+""",
+    )
+    path.chmod(0o755)
+
+
+def write_fake_materializer(path: Path) -> None:
+    path.write_text(
+        """#!/usr/bin/env python3
+import json
+import os
+from pathlib import Path
+import sys
+
+if sys.argv[1:] == ["--version"]:
+    print("gh-puller-kga-materializer 1 kga=5 graph=2 coverage=1 store=1 sdk=3")
+    raise SystemExit(0)
+if sys.argv[1:]:
+    raise SystemExit(2)
+
+params = json.load(sys.stdin)
+if log := os.environ.get("NATIVE_REQUEST_LOG"):
+    with Path(log).open("a") as stream:
+        stream.write(json.dumps({"method": "materialize", "params": params,
+                                 "pid": os.getpid()}) + "\\n")
+if not params["reuse"]:
+    Path(params["database_path"]).write_text(json.dumps({
+        "nodes": params["node_count"], "edges": params["edge_count"]
+    }))
+print(json.dumps({"project": params["project"],
+                  "graph_digest": params["graph_digest"],
+                  "materialization_digest": params["materialization_digest"],
+                  "nodes": params["node_count"], "edges": params["edge_count"],
+                  "graph_fidelity": params["graph_fidelity"],
+                  "coverage_rows": params["coverage_count"],
+                  "coverage_fidelity": params["coverage_fidelity"],
+                  "materialized": not params["reuse"]}))
 """,
     )
     path.chmod(0o755)
@@ -366,12 +390,14 @@ def requests(path: Path) -> list[dict]:
     return [json.loads(line) for line in path.read_text().splitlines()]
 
 
-def test_native_transport_keeps_graph_rows_out_of_python(tmp_path, monkeypatch):
+def test_archive_materializer_keeps_graph_rows_out_of_python(tmp_path, monkeypatch):
     helper = tmp_path / "fake-helper"
+    materializer = tmp_path / "fake-materializer"
     log = tmp_path / "requests.jsonl"
     archive_path = tmp_path / "archive.kga"
     manifest, _ = write_archive(archive_path)
     write_fake_helper(helper)
+    write_fake_materializer(materializer)
     monkeypatch.setattr(Archive, "load_rows", lambda *_args, **_kwargs: pytest.fail("loaded graph rows"))
 
     environment = {"NATIVE_REQUEST_LOG": str(log)}
@@ -381,51 +407,50 @@ def test_native_transport_keeps_graph_rows_out_of_python(tmp_path, monkeypatch):
         timeout=5,
         environment=environment,
     ) as client:
-        with ArchiveLoader(helper, tmp_path / "cache", 5, environment) as loader:
-            loaded = loader.load(client, archive_path)
-        queried = client.query_graph(loaded, query="MATCH (n) RETURN n")
+        adapter = CBMArchiveAdapter(materializer, tmp_path / "cache", 5, environment)
+        store = adapter.materialize(archive_path)
+        request = next(item for item in requests(log) if item["method"] == "materialize")
+        assert not Path(f"/proc/{request['pid']}").exists()
+        graph = client.open_store(store.database_path, store.project)
+        queried = client.query_graph(graph, query="MATCH (n) RETURN n")
 
-    load_request = next(item for item in requests(log) if item["method"] == "load")
-    assert loaded.materialized is True
-    assert loaded.graph_digest == manifest["graph_digest"]
-    assert loaded.materialization_digest == manifest["graph_digest"]
-    assert loaded.database_path.is_file()
-    assert load_request["params"]["node_root"] == manifest["node_root"]
-    assert load_request["params"]["edge_root"] == manifest["edge_root"]
-    assert load_request["params"]["coverage_fidelity"] == 0
-    assert load_request["params"]["coverage_root"] is None
-    assert load_request["params"]["coverage_metadata"] is None
+    assert store.materialized is True
+    assert store.graph_digest == manifest["graph_digest"]
+    assert store.materialization_digest == manifest["graph_digest"]
+    assert store.database_path.is_file()
+    assert request["params"]["node_root"] == manifest["node_root"]
+    assert request["params"]["edge_root"] == manifest["edge_root"]
+    assert request["params"]["coverage_fidelity"] == 0
+    assert request["params"]["coverage_root"] is None
+    assert request["params"]["coverage_metadata"] is None
     assert queried["rows"] == [["native", "native-test"]]
 
 
-def test_native_cache_is_reused_by_a_new_helper_process(tmp_path):
-    helper = tmp_path / "fake-helper"
+def test_archive_cache_is_reused_by_a_new_materializer_process(tmp_path):
+    materializer = tmp_path / "fake-materializer"
     log = tmp_path / "requests.jsonl"
     archive_path = tmp_path / "archive.kga"
-    write_fake_helper(helper)
+    write_fake_materializer(materializer)
     write_archive(archive_path)
     environment = {"NATIVE_REQUEST_LOG": str(log)}
 
-    with (
-        CBMClient(native_helper=helper, cache_root=tmp_path / "cache", timeout=5) as client,
-        ArchiveLoader(helper, tmp_path / "cache", 5, environment) as first,
-    ):
-        assert first.load(client, archive_path).materialized is True
-    with (
-        CBMClient(native_helper=helper, cache_root=tmp_path / "cache", timeout=5) as client,
-        ArchiveLoader(helper, tmp_path / "cache", 5, environment) as second,
-    ):
-        assert second.load(client, archive_path).materialized is False
+    first = CBMArchiveAdapter(materializer, tmp_path / "cache", 5, environment)
+    second = CBMArchiveAdapter(materializer, tmp_path / "cache", 5, environment)
+    assert first.materialize(archive_path).materialized is True
+    assert second.materialize(archive_path).materialized is False
 
-    loads = [item for item in requests(log) if item["method"] == "load"]
-    assert [item["params"]["reuse"] for item in loads] == [False, True]
+    calls = [item for item in requests(log) if item["method"] == "materialize"]
+    assert [item["params"]["reuse"] for item in calls] == [False, True]
+    assert len({item["pid"] for item in calls}) == 2
 
 
 def test_native_identity_includes_coverage_snapshot(tmp_path):
     helper = tmp_path / "fake-helper"
+    materializer = tmp_path / "fake-materializer"
     first_archive = tmp_path / "first.kga"
     second_archive = tmp_path / "second.kga"
     write_fake_helper(helper)
+    write_fake_materializer(materializer)
     first_manifest, _ = write_archive(
         first_archive,
         with_coverage=True,
@@ -439,37 +464,38 @@ def test_native_identity_includes_coverage_snapshot(tmp_path):
     assert first_manifest["graph_digest"] == second_manifest["graph_digest"]
     assert first_manifest["materialization_digest"] != second_manifest["materialization_digest"]
 
-    with (
-        CBMClient(native_helper=helper, cache_root=tmp_path / "cache", timeout=5) as client,
-        ArchiveLoader(helper, tmp_path / "cache", 5) as loader,
-    ):
-        first = loader.load(client, first_archive)
-        second = loader.load(client, second_archive)
+    adapter = CBMArchiveAdapter(materializer, tmp_path / "cache", 5)
+    with CBMClient(native_helper=helper, cache_root=tmp_path / "cache", timeout=5) as client:
+        first_store = adapter.materialize(first_archive)
+        first = client.open_store(first_store.database_path, first_store.project)
+        second_store = adapter.materialize(second_archive)
+        client.open_store(second_store.database_path, second_store.project)
 
-        assert first.database_path != second.database_path
-        assert second.coverage_rows == 2
-        assert second.coverage_fidelity == COVERAGE_FIDELITY_VERSION
+        assert first_store.database_path != second_store.database_path
+        assert second_store.coverage_rows == 2
+        assert second_store.coverage_fidelity == COVERAGE_FIDELITY_VERSION
         with pytest.raises(CBMTransportError, match="no longer active"):
             client.query_graph(first, query="MATCH (n) RETURN n")
 
 
 def test_client_native_query_does_not_resolve_or_start_mcp(tmp_path):
     helper = tmp_path / "fake-helper"
+    materializer = tmp_path / "fake-materializer"
     archive_path = tmp_path / "archive.kga"
     write_fake_helper(helper)
+    write_fake_materializer(materializer)
     write_archive(archive_path)
 
-    with (
-        CBMClient(
-            tmp_path / "missing-cbm",
-            native_helper=helper,
-            cache_root=tmp_path / "cache",
-            timeout=5,
-        ) as client,
-        ArchiveLoader(helper, tmp_path / "cache", 5) as loader,
-    ):
+    adapter = CBMArchiveAdapter(materializer, tmp_path / "cache", 5)
+    with CBMClient(
+        tmp_path / "missing-cbm",
+        native_helper=helper,
+        cache_root=tmp_path / "cache",
+        timeout=5,
+    ) as client:
         assert "mcp" not in client._transports
-        graph = loader.load(client, archive_path)
+        store = adapter.materialize(archive_path)
+        graph = client.open_store(store.database_path, store.project)
         assert client.supports("query_graph")
         assert not client.supports("trace_path")
         result = client.query_graph(graph, query="MATCH (n) RETURN n")
@@ -659,31 +685,33 @@ def test_native_transport_accepts_an_empty_sdk_tool_registry(tmp_path):
             client.query_graph(graph, query="MATCH (n) RETURN n")
 
 
-def test_client_rejects_archive_handle_after_loading_another_generation(tmp_path):
+def test_client_rejects_store_handle_after_opening_another_generation(tmp_path):
     helper = tmp_path / "fake-helper"
+    materializer = tmp_path / "fake-materializer"
     first_archive = tmp_path / "first.kga"
     second_archive = tmp_path / "second.kga"
     write_fake_helper(helper)
+    write_fake_materializer(materializer)
     write_archive(first_archive, "first")
     write_archive(second_archive, "second")
 
-    with (
-        CBMClient(native_helper=helper, cache_root=tmp_path / "cache", timeout=5) as client,
-        ArchiveLoader(helper, tmp_path / "cache", 5) as loader,
-    ):
-        first = loader.load(client, first_archive)
-        second = loader.load(client, second_archive)
+    adapter = CBMArchiveAdapter(materializer, tmp_path / "cache", 5)
+    with CBMClient(native_helper=helper, cache_root=tmp_path / "cache", timeout=5) as client:
+        first_store = adapter.materialize(first_archive)
+        first = client.open_store(first_store.database_path, first_store.project)
+        second_store = adapter.materialize(second_archive)
+        second = client.open_store(second_store.database_path, second_store.project)
         compared = client.compare_graphs(first, second, limit=4, scan_limit=100)
 
         assert client.query_graph(second, query="MATCH (n) RETURN n")["rows"] == [
             ["native", "second"],
         ]
         assert compared["base"] == {
-            "database_path": str(first.database_path),
+            "database_path": str(first_store.database_path),
             "project": "first",
         }
         assert compared["target"] == {
-            "database_path": str(second.database_path),
+            "database_path": str(second_store.database_path),
             "project": "second",
         }
         assert compared["limit"] == 4
@@ -702,14 +730,15 @@ def test_client_rejects_archive_handle_after_loading_another_generation(tmp_path
 
 def test_native_query_timeout_terminates_helper(tmp_path):
     helper = tmp_path / "fake-helper"
+    materializer = tmp_path / "fake-materializer"
     archive_path = tmp_path / "archive.kga"
     write_fake_helper(helper, hang_on_query=True)
+    write_fake_materializer(materializer)
     write_archive(archive_path)
-    with (
-        CBMClient(native_helper=helper, cache_root=tmp_path / "cache", timeout=0.1) as client,
-        ArchiveLoader(helper, tmp_path / "cache", 0.1) as loader,
-    ):
-        loaded = loader.load(client, archive_path)
+    adapter = CBMArchiveAdapter(materializer, tmp_path / "cache", 5)
+    with CBMClient(native_helper=helper, cache_root=tmp_path / "cache", timeout=0.1) as client:
+        store = adapter.materialize(archive_path)
+        loaded = client.open_store(store.database_path, store.project)
         with pytest.raises(CBMTransportError, match="timed out"):
             client.query_graph(loaded, query="MATCH (n) RETURN n")
         assert loaded._binding.session.process.poll() is not None
@@ -800,57 +829,54 @@ def test_real_native_index_helper_publishes_and_deletes_graph(tmp_path):
 
 
 @pytest.mark.integration
-def test_real_native_helper_restores_exact_rows_and_reuses_cache(tmp_path):
-    configured = os.environ.get("GH_PULLER_TEST_CBM_NATIVE_HELPER")
-    if configured is None:
-        pytest.skip("real native helper not configured")
-    helper = Path(configured)
+def test_real_materializer_restores_exact_rows_and_reuses_cache(tmp_path):
+    query_configured = os.environ.get("GH_PULLER_TEST_CBM_NATIVE_HELPER")
+    materializer_configured = os.environ.get("GH_PULLER_TEST_KGA_MATERIALIZER")
+    if query_configured is None or materializer_configured is None:
+        pytest.skip("real native query helper and KGA materializer not configured")
+    helper = Path(query_configured)
+    materializer = Path(materializer_configured)
     archive_path = tmp_path / "archive.kga"
     manifest, expected = write_archive(archive_path, "real-native", with_coverage=True)
     cache = tmp_path / "cache"
+    adapter = CBMArchiveAdapter(materializer, cache, 30)
 
-    with (
-        CBMClient(native_helper=helper, cache_root=cache, timeout=30) as first,
-        ArchiveLoader(helper, cache, 30) as loader,
-    ):
-        loaded = loader.load(first, archive_path)
+    with CBMClient(native_helper=helper, cache_root=cache, timeout=30) as first:
+        store = adapter.materialize(archive_path)
+        graph = first.open_store(store.database_path, store.project)
         queried = first.query_graph(
-            loaded,
+            graph,
             query="MATCH (n:Function) RETURN n.name, n.file_path, n.docstring",
             max_rows=10,
         )
-        searched = first.search_graph(loaded, label="Function", fields=["ratio"], limit=10)
-        ranked = first.search_graph(loaded, query="native needle", limit=10)
-        schema = first.get_graph_schema(loaded)
+        searched = first.search_graph(graph, label="Function", fields=["ratio"], limit=10)
+        ranked = first.search_graph(graph, query="native needle", limit=10)
+        schema = first.get_graph_schema(graph)
         traced = first.trace_path(
-            loaded,
+            graph,
             function_name="newline",
             direction="outbound",
         )
         architecture = first.get_architecture(
-            loaded,
+            graph,
             aspects=["structure", "dependencies"],
         )
         coverage = first.check_index_coverage(
-            loaded,
+            graph,
             paths=["newline.py", "vendor/package.c"],
             scopes=["."],
             scope_limit=1,
         )
-        status = first.index_status(loaded)
-        restored = load_rows(loaded.database_path, "real-native")
-        restored_coverage = load_coverage(loaded.database_path, "real-native")
-    with (
-        CBMClient(native_helper=helper, cache_root=cache, timeout=30) as second,
-        ArchiveLoader(helper, cache, 30) as loader,
-    ):
-        reused = loader.load(second, archive_path)
+        status = first.index_status(graph)
+        restored = load_rows(store.database_path, "real-native")
+        restored_coverage = load_coverage(store.database_path, "real-native")
+    reused = adapter.materialize(archive_path)
 
-    assert loaded.materialized is True
-    assert loaded.graph_digest == manifest["graph_digest"]
-    assert loaded.materialization_digest == manifest["materialization_digest"]
-    assert loaded.coverage_rows == manifest["coverage_rows"]
-    assert loaded.coverage_fidelity == COVERAGE_FIDELITY_VERSION
+    assert store.materialized is True
+    assert store.graph_digest == manifest["graph_digest"]
+    assert store.materialization_digest == manifest["materialization_digest"]
+    assert store.coverage_rows == manifest["coverage_rows"]
+    assert store.coverage_fidelity == COVERAGE_FIDELITY_VERSION
     assert restored == expected
     assert restored_coverage is not None
     assert restored_coverage.rows == {
@@ -912,30 +938,31 @@ def test_real_native_helper_restores_exact_rows_and_reuses_cache(tmp_path):
 
 
 @pytest.mark.integration
-def test_real_native_helper_compares_archive_generations(tmp_path):
-    configured = os.environ.get("GH_PULLER_TEST_CBM_NATIVE_HELPER")
-    if configured is None:
-        pytest.skip("real native helper not configured")
+def test_real_native_client_compares_materialized_generations(tmp_path):
+    query_configured = os.environ.get("GH_PULLER_TEST_CBM_NATIVE_HELPER")
+    materializer_configured = os.environ.get("GH_PULLER_TEST_KGA_MATERIALIZER")
+    if query_configured is None or materializer_configured is None:
+        pytest.skip("real native query helper and KGA materializer not configured")
     project = "compare-native"
     base_archive = tmp_path / "base.kga"
     target_archive = tmp_path / "target.kga"
     write_archive(base_archive, project)
     write_archive(target_archive, project, extra_node="added")
+    adapter = CBMArchiveAdapter(Path(materializer_configured), tmp_path / "cache", 30)
 
-    with (
-        CBMClient(
-            native_helper=Path(configured),
-            cache_root=tmp_path / "cache",
-            timeout=30,
-        ) as client,
-        ArchiveLoader(Path(configured), tmp_path / "cache", 30) as loader,
-    ):
-        base = loader.load(client, base_archive)
-        target = loader.load(client, target_archive)
+    with CBMClient(
+        native_helper=Path(query_configured),
+        cache_root=tmp_path / "cache",
+        timeout=30,
+    ) as client:
+        base_store = adapter.materialize(base_archive)
+        base = client.open_store(base_store.database_path, base_store.project)
+        target_store = adapter.materialize(target_archive)
+        target = client.open_store(target_store.database_path, target_store.project)
         compared = client.compare_graphs(base, target, limit=10, scan_limit=100)
 
     assert base.project == target.project == project
-    assert base.database_path != target.database_path
+    assert base_store.database_path != target_store.database_path
     assert compared["base"]["project"] == project
     assert compared["target"]["project"] == project
     assert compared["nodes"]["added"]["total"] == 1
@@ -953,50 +980,37 @@ def test_real_native_helper_compares_archive_generations(tmp_path):
 
 
 @pytest.mark.integration
-def test_real_native_helper_rejects_missharded_identity(tmp_path):
-    configured = os.environ.get("GH_PULLER_TEST_CBM_NATIVE_HELPER")
+def test_real_materializer_rejects_missharded_identity(tmp_path):
+    configured = os.environ.get("GH_PULLER_TEST_KGA_MATERIALIZER")
     if configured is None:
-        pytest.skip("real native helper not configured")
+        pytest.skip("real KGA materializer not configured")
     archive_path = tmp_path / "archive.kga"
     write_missharded_archive(archive_path)
 
-    with (
-        CBMClient(
-            native_helper=Path(configured),
-            cache_root=tmp_path / "cache",
-            timeout=30,
-        ) as client,
-        ArchiveLoader(Path(configured), tmp_path / "cache", 30) as loader,
-        pytest.raises(CBMTransportError, match="invalid node row in KGA leaf"),
-    ):
-        loader.load(client, archive_path)
+    adapter = CBMArchiveAdapter(Path(configured), tmp_path / "cache", 30)
+    with pytest.raises(ArchiveError, match="invalid node row in KGA leaf"):
+        adapter.materialize(archive_path)
 
 
 @pytest.mark.integration
-def test_real_native_helper_rejects_mismatched_import_identity(tmp_path):
-    configured = os.environ.get("GH_PULLER_TEST_CBM_NATIVE_HELPER")
+def test_real_materializer_rejects_mismatched_import_identity(tmp_path):
+    configured = os.environ.get("GH_PULLER_TEST_KGA_MATERIALIZER")
     if configured is None:
-        pytest.skip("real native helper not configured")
+        pytest.skip("real KGA materializer not configured")
     archive_path = tmp_path / "archive.kga"
     write_mismatched_import_archive(archive_path)
 
-    with (
-        CBMClient(
-            native_helper=Path(configured),
-            cache_root=tmp_path / "cache",
-            timeout=30,
-        ) as client,
-        ArchiveLoader(Path(configured), tmp_path / "cache", 30) as loader,
-        pytest.raises(CBMTransportError, match="invalid edge properties in KGA leaf"),
-    ):
-        loader.load(client, archive_path)
+    adapter = CBMArchiveAdapter(Path(configured), tmp_path / "cache", 30)
+    with pytest.raises(ArchiveError, match="invalid edge properties in KGA leaf"):
+        adapter.materialize(archive_path)
 
 
 @pytest.mark.integration
-def test_real_native_helper_reads_captured_prefix_while_writer_appends(tmp_path):
-    configured = os.environ.get("GH_PULLER_TEST_CBM_NATIVE_HELPER")
-    if configured is None:
-        pytest.skip("real native helper not configured")
+def test_real_materializer_reads_captured_prefix_while_writer_appends(tmp_path):
+    query_configured = os.environ.get("GH_PULLER_TEST_CBM_NATIVE_HELPER")
+    materializer_configured = os.environ.get("GH_PULLER_TEST_KGA_MATERIALIZER")
+    if query_configured is None or materializer_configured is None:
+        pytest.skip("real native query helper and KGA materializer not configured")
     archive_path = tmp_path / "archive.kga"
     project = "live-native"
     rows = GraphRows(
@@ -1032,22 +1046,21 @@ def test_real_native_helper_reads_captured_prefix_while_writer_appends(tmp_path)
     writer.append(1, b'{"unreferenced":"new writer tail"}')
     writer._file.flush()
     assert archive_path.stat().st_size > captured_size
+    adapter = CBMArchiveAdapter(Path(materializer_configured), tmp_path / "cache", 30)
 
     try:
-        with (
-            CBMClient(
-                native_helper=Path(configured),
-                cache_root=tmp_path / "cache",
-                timeout=30,
-            ) as client,
-            ArchiveLoader(Path(configured), tmp_path / "cache", 30) as loader,
-        ):
-            loaded = loader.load(client, captured)
-            queried = client.query_graph(loaded, query="MATCH (n:Project) RETURN n.name")
+        with CBMClient(
+            native_helper=Path(query_configured),
+            cache_root=tmp_path / "cache",
+            timeout=30,
+        ) as client:
+            store = adapter.materialize(captured)
+            graph = client.open_store(store.database_path, store.project)
+            queried = client.query_graph(graph, query="MATCH (n:Project) RETURN n.name")
     finally:
         captured.close()
         writer.close_incomplete()
 
-    assert loaded.nodes == 1
-    assert loaded.edges == 0
+    assert store.nodes == 1
+    assert store.edges == 0
     assert queried["rows"] == [[project]]

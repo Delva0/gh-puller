@@ -5,10 +5,10 @@ from pathlib import Path
 
 import pytest
 
-from gh_puller.codebase.cbm._cli import CLITransport
-from gh_puller.codebase.cbm._mcp import MCPTransport, capabilities_from_tools_list
-from gh_puller.codebase.cbm._transport import CBMTransportError
 from gh_puller.codebase.cbm.binary import CBMBinary
+from gh_puller.codebase.cbm.transports.cli import CLITransport
+from gh_puller.codebase.cbm.transports.mcp import MCPTransport, capabilities_from_tools_list
+from gh_puller.codebase.cbm.transports.utils import CBMTransportError
 
 
 class FakeMonitor:

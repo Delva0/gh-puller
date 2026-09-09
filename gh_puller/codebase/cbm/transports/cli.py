@@ -12,10 +12,9 @@ import subprocess
 import threading
 from typing import TYPE_CHECKING, Any
 
-from ._transport import (
+from .utils import (
     _DELTA_ARGUMENTS,
     CBMTransportError,
-    ResourceMonitorLike,
     _ProjectTransport,
 )
 
@@ -23,7 +22,8 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
     from pathlib import Path
 
-    from .binary import CBMBinary
+    from ...utils import ResourceMonitorLike
+    from ..binary import CBMBinary
 
 
 class CLITransport(_ProjectTransport):

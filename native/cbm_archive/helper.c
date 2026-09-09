@@ -1,12 +1,9 @@
 /*
- * helper.c — Serve native CBM archive operations through the public SDK.
+ * helper.c — Serve CBM client operations through the public SDK.
  *
- * Control messages are length-prefixed JSON. Bulk snapshot rows never cross the
- * protocol: the compact build reads KGA pages and keeps the resulting immutable
- * store open, while the full build also exposes the repository pipeline.
+ * Control messages are length-prefixed JSON. The compact build exposes graph
+ * operations, while the full build also exposes the repository pipeline.
  */
-#include "kga_reader.h"
-
 #include "sdk/sdk.h"
 
 #include <limits.h>
@@ -19,42 +16,18 @@
 #include <yyjson/yyjson.h>
 
 #ifdef GHP_NATIVE_INDEXING
-#define NATIVE_PROTOCOL_VERSION 9
+#define NATIVE_PROTOCOL_VERSION 10
 #else
-#define NATIVE_PROTOCOL_VERSION 8
+#define NATIVE_PROTOCOL_VERSION 9
 #endif
 
-enum {
-    KGA_FORMAT_VERSION = 5,
-    KGA_GRAPH_FIDELITY_VERSION = 2,
-    KGA_COVERAGE_FIDELITY_VERSION = 1,
-    REQUEST_MAX_BYTES = 8 << 20,
-};
+enum { REQUEST_MAX_BYTES = 8 << 20 };
 
 typedef struct {
     cbm_sdk_graph_t *graph;
     char *database_path;
     char *source_root;
-    char *graph_digest;
-    char *materialization_digest;
-    int node_count;
-    int edge_count;
-    int coverage_count;
-    bool coverage_present;
 } helper_session_t;
-
-static bool digest_valid(const char *digest) {
-    if (!digest || strlen(digest) != GHP_KGA_SHA256_HEX_LEN) {
-        return false;
-    }
-    for (size_t index = 0; index < GHP_KGA_SHA256_HEX_LEN; index++) {
-        char byte = digest[index];
-        if (!((byte >= '0' && byte <= '9') || (byte >= 'a' && byte <= 'f'))) {
-            return false;
-        }
-    }
-    return true;
-}
 
 static const char *json_string(yyjson_val *value) {
     if (!yyjson_is_str(value)) {
@@ -132,7 +105,6 @@ static char *hello_response(uint64_t id) {
     }
     yyjson_mut_val *result = yyjson_mut_obj(document);
     yyjson_mut_val *capabilities = yyjson_mut_arr(document);
-    yyjson_mut_arr_add_str(document, capabilities, "archive-load");
     yyjson_mut_arr_add_str(document, capabilities, "tool-call");
     yyjson_mut_arr_add_str(document, capabilities, "graph-compare");
     yyjson_mut_arr_add_str(document, capabilities, "project-open");
@@ -149,9 +121,6 @@ static char *hello_response(uint64_t id) {
         yyjson_mut_arr_add_str(document, tools, cbm_sdk_graph_tool_name(index));
     }
     yyjson_mut_obj_add_int(document, result, "protocol", NATIVE_PROTOCOL_VERSION);
-    yyjson_mut_obj_add_int(document, result, "kga_format", KGA_FORMAT_VERSION);
-    yyjson_mut_obj_add_int(document, result, "graph_fidelity", KGA_GRAPH_FIDELITY_VERSION);
-    yyjson_mut_obj_add_int(document, result, "coverage_fidelity", KGA_COVERAGE_FIDELITY_VERSION);
     yyjson_mut_obj_add_int(document, result, "store_format", cbm_sdk_store_format_version());
     yyjson_mut_obj_add_int(document, result, "sdk_abi", cbm_sdk_abi_version());
     yyjson_mut_obj_add_val(document, result, "capabilities", capabilities);
@@ -160,208 +129,11 @@ static char *hello_response(uint64_t id) {
     return document_json(document);
 }
 
-static bool parse_root(yyjson_val *value, ghp_kga_root_t *root) {
-    memset(root, 0, sizeof(*root));
-    if (yyjson_is_null(value)) {
-        return true;
-    }
-    uint64_t offset = 0;
-    uint64_t count = 0;
-    const char *logical_hash = NULL;
-    if (!yyjson_is_obj(value) || !json_u64(yyjson_obj_get(value, "offset"), &offset) ||
-        !json_u64(yyjson_obj_get(value, "count"), &count) ||
-        !(logical_hash = json_string(yyjson_obj_get(value, "logical_hash"))) ||
-        !digest_valid(logical_hash)) {
-        return false;
-    }
-    root->present = true;
-    root->offset = offset;
-    root->count = count;
-    (void)snprintf(root->logical_hash, sizeof(root->logical_hash), "%s", logical_hash);
-    return true;
-}
-
-static bool parse_coverage_metadata(yyjson_val *value, const char *project,
-                                    ghp_kga_coverage_meta_t *metadata) {
-    const char *metadata_project = NULL;
-    if (!yyjson_is_obj(value) ||
-        !(metadata_project = json_string(yyjson_obj_get(value, "project"))) ||
-        strcmp(metadata_project, project) != 0 ||
-        !json_string(yyjson_obj_get(value, "generation")) ||
-        !(metadata->index_mode = json_string(yyjson_obj_get(value, "index_mode"))) ||
-        !(metadata->recorded_at = json_string(yyjson_obj_get(value, "recorded_at"))) ||
-        !(metadata->recording_status = json_string(yyjson_obj_get(value, "recording_status"))) ||
-        !json_int(yyjson_obj_get(value, "ignored_files_stored"), &metadata->ignored_files_stored) ||
-        !json_int(yyjson_obj_get(value, "ignored_files_total"), &metadata->ignored_files_total) ||
-        !json_int(yyjson_obj_get(value, "coverage_version"), &metadata->coverage_version) ||
-        !yyjson_is_bool(yyjson_obj_get(value, "hash_records_complete")) ||
-        metadata->ignored_files_stored < 0 || metadata->ignored_files_total < 0 ||
-        metadata->coverage_version < 1) {
-        return false;
-    }
-    metadata->hash_records_complete =
-        yyjson_get_bool(yyjson_obj_get(value, "hash_records_complete"));
-    return true;
-}
-
-static bool parse_snapshot(yyjson_val *parameters, ghp_kga_snapshot_t *snapshot, bool *reuse) {
-    memset(snapshot, 0, sizeof(*snapshot));
-    uint64_t device = 0;
-    uint64_t inode = 0;
-    uint64_t captured_size = 0;
-    int fidelity = 0;
-    int coverage_fidelity = 0;
-    if (!yyjson_is_obj(parameters) ||
-        !(snapshot->archive_path = json_string(yyjson_obj_get(parameters, "archive_path"))) ||
-        !json_u64(yyjson_obj_get(parameters, "archive_device"), &device) ||
-        !json_u64(yyjson_obj_get(parameters, "archive_inode"), &inode) ||
-        !json_u64(yyjson_obj_get(parameters, "captured_size"), &captured_size) ||
-        !(snapshot->project = json_string(yyjson_obj_get(parameters, "project"))) ||
-        !(snapshot->graph_digest = json_string(yyjson_obj_get(parameters, "graph_digest"))) ||
-        !digest_valid(snapshot->graph_digest) ||
-        !(snapshot->materialization_digest =
-              json_string(yyjson_obj_get(parameters, "materialization_digest"))) ||
-        !digest_valid(snapshot->materialization_digest) ||
-        !(snapshot->database_path = json_string(yyjson_obj_get(parameters, "database_path"))) ||
-        !json_int(yyjson_obj_get(parameters, "node_count"), &snapshot->node_count) ||
-        !json_int(yyjson_obj_get(parameters, "edge_count"), &snapshot->edge_count) ||
-        !json_int(yyjson_obj_get(parameters, "graph_fidelity"), &fidelity) ||
-        fidelity != KGA_GRAPH_FIDELITY_VERSION ||
-        !json_int(yyjson_obj_get(parameters, "coverage_fidelity"), &coverage_fidelity) ||
-        !json_int(yyjson_obj_get(parameters, "coverage_count"), &snapshot->coverage_count) ||
-        !parse_root(yyjson_obj_get(parameters, "node_root"), &snapshot->node_root) ||
-        !parse_root(yyjson_obj_get(parameters, "edge_root"), &snapshot->edge_root) ||
-        !parse_root(yyjson_obj_get(parameters, "coverage_root"), &snapshot->coverage_root)) {
-        return false;
-    }
-    yyjson_val *coverage_metadata = yyjson_obj_get(parameters, "coverage_metadata");
-    if (coverage_fidelity == 0) {
-        if (snapshot->coverage_count != 0 || snapshot->coverage_root.present ||
-            !yyjson_is_null(coverage_metadata) ||
-            strcmp(snapshot->materialization_digest, snapshot->graph_digest) != 0) {
-            return false;
-        }
-    } else if (coverage_fidelity == KGA_COVERAGE_FIDELITY_VERSION) {
-        snapshot->coverage_present = true;
-        if (snapshot->coverage_count < 0 ||
-            snapshot->coverage_root.present != (snapshot->coverage_count > 0) ||
-            (snapshot->coverage_root.present &&
-             snapshot->coverage_root.count != (uint64_t)snapshot->coverage_count) ||
-            !parse_coverage_metadata(coverage_metadata, snapshot->project,
-                                     &snapshot->coverage_meta)) {
-            return false;
-        }
-    } else {
-        return false;
-    }
-    yyjson_val *reuse_value = yyjson_obj_get(parameters, "reuse");
-    if (reuse_value && !yyjson_is_bool(reuse_value)) {
-        return false;
-    }
-    snapshot->archive_device = device;
-    snapshot->archive_inode = inode;
-    snapshot->captured_size = captured_size;
-    *reuse = reuse_value && yyjson_get_bool(reuse_value);
-    return true;
-}
-
 static void session_clear(helper_session_t *session) {
     cbm_sdk_graph_close(session->graph);
     free(session->database_path);
     free(session->source_root);
-    free(session->graph_digest);
-    free(session->materialization_digest);
     memset(session, 0, sizeof(*session));
-}
-
-static bool session_install(helper_session_t *session, cbm_sdk_graph_t *graph,
-                            const ghp_kga_snapshot_t *snapshot) {
-    const char *database_path = snapshot->database_path;
-    char *saved_database = strdup(database_path);
-    char *saved_graph_digest = strdup(snapshot->graph_digest);
-    char *saved_materialization_digest = strdup(snapshot->materialization_digest);
-    if (!saved_database || !saved_graph_digest || !saved_materialization_digest) {
-        free(saved_database);
-        free(saved_graph_digest);
-        free(saved_materialization_digest);
-        cbm_sdk_graph_close(graph);
-        return false;
-    }
-    session_clear(session);
-    session->graph = graph;
-    session->database_path = saved_database;
-    session->graph_digest = saved_graph_digest;
-    session->materialization_digest = saved_materialization_digest;
-    session->node_count = snapshot->node_count;
-    session->edge_count = snapshot->edge_count;
-    session->coverage_count = snapshot->coverage_count;
-    session->coverage_present = snapshot->coverage_present;
-    return true;
-}
-
-static cbm_sdk_graph_t *open_expected_graph(const ghp_kga_snapshot_t *snapshot) {
-    cbm_sdk_graph_t *graph = NULL;
-    int nodes = 0;
-    int edges = 0;
-    char error[256];
-    if (cbm_sdk_graph_open(snapshot->database_path, snapshot->project, &graph, error,
-                           sizeof(error)) != CBM_SDK_OK ||
-        cbm_sdk_graph_counts(graph, &nodes, &edges) != CBM_SDK_OK ||
-        nodes != snapshot->node_count || edges != snapshot->edge_count) {
-        cbm_sdk_graph_close(graph);
-        return NULL;
-    }
-    return graph;
-}
-
-static char *load_response(uint64_t id, helper_session_t *session, yyjson_val *parameters) {
-    ghp_kga_snapshot_t snapshot;
-    bool reuse = false;
-    if (!parse_snapshot(parameters, &snapshot, &reuse)) {
-        return error_response(id, "invalid_request", "invalid archive load parameters");
-    }
-    bool already_loaded =
-        session->graph && strcmp(cbm_sdk_graph_project(session->graph), snapshot.project) == 0 &&
-        strcmp(session->database_path, snapshot.database_path) == 0 &&
-        strcmp(session->materialization_digest, snapshot.materialization_digest) == 0;
-    bool materialized = false;
-    if (!already_loaded) {
-        cbm_sdk_graph_t *candidate = reuse ? open_expected_graph(&snapshot) : NULL;
-        if (!candidate) {
-            char error[1024];
-            if (ghp_kga_import_snapshot(&snapshot, error, sizeof(error)) != 0) {
-                return error_response(id, "archive_load_failed", error);
-            }
-            materialized = true;
-            candidate = open_expected_graph(&snapshot);
-        }
-        if (!candidate) {
-            return error_response(id, "store_open_failed", "materialized CBM store is invalid");
-        }
-        if (!session_install(session, candidate, &snapshot)) {
-            return error_response(id, "allocation_failed", "cannot retain loaded graph state");
-        }
-    }
-
-    yyjson_mut_val *root = NULL;
-    yyjson_mut_doc *document = response_document(id, true, &root);
-    if (!document) {
-        return NULL;
-    }
-    yyjson_mut_val *result = yyjson_mut_obj(document);
-    yyjson_mut_obj_add_str(document, result, "project", snapshot.project);
-    yyjson_mut_obj_add_str(document, result, "graph_digest", snapshot.graph_digest);
-    yyjson_mut_obj_add_str(document, result, "materialization_digest",
-                           snapshot.materialization_digest);
-    yyjson_mut_obj_add_int(document, result, "nodes", session->node_count);
-    yyjson_mut_obj_add_int(document, result, "edges", session->edge_count);
-    yyjson_mut_obj_add_int(document, result, "coverage_rows", session->coverage_count);
-    yyjson_mut_obj_add_int(document, result, "graph_fidelity", KGA_GRAPH_FIDELITY_VERSION);
-    yyjson_mut_obj_add_int(document, result, "coverage_fidelity",
-                           session->coverage_present ? KGA_COVERAGE_FIDELITY_VERSION : 0);
-    yyjson_mut_obj_add_bool(document, result, "materialized", materialized);
-    yyjson_mut_obj_add_val(document, root, "result", result);
-    return document_json(document);
 }
 
 static char *sdk_result_response(uint64_t id, cbm_sdk_status_t status, cbm_sdk_result_t *result) {
@@ -593,8 +365,6 @@ static char *open_response(uint64_t id, helper_session_t *session, yyjson_val *p
     session->graph = graph;
     session->database_path = saved_database;
     session->source_root = saved_source;
-    session->node_count = nodes;
-    session->edge_count = edges;
 
     yyjson_mut_val *root = NULL;
     yyjson_mut_doc *document = response_document(id, true, &root);
@@ -639,7 +409,7 @@ static char *tool_response(uint64_t id, helper_session_t *session, yyjson_val *p
         return error_response(id, "invalid_request", "tool call requires name and arguments");
     }
     if (!session->graph) {
-        return error_response(id, "no_graph", "load an archive graph before calling a tool");
+        return error_response(id, "no_graph", "open a graph before calling a tool");
     }
 
     char *arguments_json = yyjson_val_write(arguments, YYJSON_WRITE_NOFLAG, NULL);
@@ -729,9 +499,6 @@ static char *dispatch_request(helper_session_t *session, yyjson_val *request, bo
             return error_response(id, "protocol_mismatch", "unsupported native protocol");
         }
         return hello_response(id);
-    }
-    if (strcmp(method, "load") == 0) {
-        return load_response(id, session, parameters);
     }
     if (strcmp(method, "call") == 0) {
         return tool_response(id, session, parameters);

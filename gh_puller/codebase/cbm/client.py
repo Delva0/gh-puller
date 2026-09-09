@@ -13,37 +13,23 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Self
 
-from ._transport import (
+from ..utils import NullResourceMonitor
+from .binary import CBMBinary, resolve_cbm_binary
+from .transports.utils import (
     CBMTransportError,
     OpenedGraph,
-    ResourceMonitorLike,
     Transport,
     TransportName,
     create_transport,
     parse_transport_name,
 )
-from .binary import CBMBinary, resolve_cbm_binary
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
     from types import TracebackType
 
-    from ._native import NativeHelper
-
-
-class _ClientMonitor:
-    """Discard process observations for clients without resource limits."""
-
-    exceeded = False
-
-    def add_child(self, pid: int) -> None:
-        return
-
-    def remove_child(self, pid: int) -> None:
-        return
-
-    def sample(self) -> None:
-        return
+    from ..utils import ResourceMonitorLike
+    from .transports.native import NativeHelper
 
 
 @dataclass(frozen=True, slots=True)
@@ -144,7 +130,7 @@ class CBMClient:
         self._native_index_helper = native_index_helper
         self.transport = selected_transport
         self.routes = selected_routes
-        self._monitor = resource_monitor or _ClientMonitor()
+        self._monitor = resource_monitor or NullResourceMonitor()
         self._transport_lock = threading.Lock()
         self._transports: dict[TransportName, Transport] = {}
 
@@ -264,6 +250,7 @@ class CBMClient:
         Returns:
             A transport-neutral graph handle.
         """
+        _project_database(self.cache_root, project)
         resolved_source = Path(source_root).resolve() if source_root is not None else None
         route = self._select_transport("project_graph", transport)
         self._require(route, "project_graph")

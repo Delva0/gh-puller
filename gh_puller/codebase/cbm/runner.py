@@ -18,9 +18,9 @@ from typing import TYPE_CHECKING, Self
 from .client import CBMClient, CBMTransportError
 
 if TYPE_CHECKING:
-    from ._native import NativeHelper
     from .binary import CBMBinary
     from .plan import BuildPlan
+    from .transports.native import NativeHelper
 
 
 def _total_memory() -> int:

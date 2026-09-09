@@ -12,7 +12,7 @@ from gh_puller.codebase.build import (
     _validate_resume_fidelity,
     prepare_output_dir,
 )
-from gh_puller.codebase.cbm._transport import index_execution_from_envelope
+from gh_puller.codebase.cbm.transports.utils import index_execution_from_envelope
 from gh_puller.codebase.store import GraphRows
 
 

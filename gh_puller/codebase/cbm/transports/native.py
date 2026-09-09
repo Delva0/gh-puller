@@ -10,29 +10,29 @@ from __future__ import annotations
 import json
 import os
 import queue
-import shutil
 import struct
 import subprocess
 import threading
 from collections import deque
 from contextlib import suppress
 from dataclasses import dataclass
-from hashlib import sha256
-from pathlib import Path
 from typing import TYPE_CHECKING, Any, BinaryIO, Self
 
-from ._transport import (
+from ...utils import NativeExecutable, NativeExecutableError, resolve_native_executable
+from .utils import (
     CBMTransportError,
     OpenedGraph,
-    ResourceMonitorLike,
     checked_index_execution,
 )
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
+    from pathlib import Path
 
-_QUERY_PROTOCOL_VERSION = 8
-_INDEX_PROTOCOL_VERSION = 9
+    from ...utils import ResourceMonitorLike
+
+_QUERY_PROTOCOL_VERSION = 9
+_INDEX_PROTOCOL_VERSION = 10
 _RESPONSE_MAX_BYTES = 256 << 20
 _QUERY_HELPER_ENV = "GH_PULLER_CODEBASE_CBM_HELPER"
 _INDEX_HELPER_ENV = "GH_PULLER_CODEBASE_CBM_INDEX_HELPER"
@@ -46,47 +46,7 @@ _CAPABILITY_BY_OPERATION = {
 }
 
 
-@dataclass(frozen=True, slots=True)
-class NativeHelper:
-    """An executable helper pinned to the bytes inspected before startup."""
-
-    path: Path
-    sha256: str
-    size: int
-    version: str
-    source: str
-    _device: int
-    _inode: int
-    _mtime_ns: int
-
-    def verify_unchanged(self) -> None:
-        """Reject replacement of the helper before it is executed."""
-        try:
-            status = self.path.stat()
-        except OSError as exc:
-            raise CBMTransportError(f"native CBM helper disappeared: {self.path}") from exc
-        identity = (status.st_dev, status.st_ino, status.st_size, status.st_mtime_ns)
-        expected = (self._device, self._inode, self.size, self._mtime_ns)
-        if identity != expected:
-            raise CBMTransportError(f"native CBM helper changed after resolution: {self.path}")
-
-    def provenance(self) -> dict[str, object]:
-        """Return stable helper identity for downstream metadata."""
-        return {
-            "path": str(self.path),
-            "sha256": self.sha256,
-            "bytes": self.size,
-            "version": self.version,
-            "source": self.source,
-        }
-
-
-def _hash_file(path: Path) -> str:
-    digest = sha256()
-    with path.open("rb") as stream:
-        while block := stream.read(1 << 20):
-            digest.update(block)
-    return digest.hexdigest()
+NativeHelper = NativeExecutable
 
 
 def resolve_native_helper(
@@ -110,58 +70,17 @@ def resolve_native_helper(
     Raises:
         CBMTransportError: No valid helper can be resolved.
     """
-    if isinstance(helper, NativeHelper):
-        helper.verify_unchanged()
-        return helper
     values = os.environ if environ is None else environ
-    configured = helper if helper is not None else values.get(environment_key)
-    source = "explicit" if helper is not None else f"environment:{environment_key}"
-    candidate: Path | None = None
-    if configured is not None:
-        raw = os.fspath(configured)
-        located = shutil.which(raw, path=values.get("PATH")) if os.sep not in raw else None
-        candidate = Path(located or raw).expanduser().resolve()
-    else:
-        local = Path(__file__).resolve().parents[3] / "build" / "native" / "bin" / local_name
-        located = shutil.which(local_name, path=values.get("PATH"))
-        candidate = local if local.exists() else Path(located).resolve() if located else None
-        source = "local-build" if local.exists() else "PATH"
-    if candidate is None:
-        raise CBMTransportError(
-            f"no native CBM helper: pass its path, set {environment_key}, or run make native",
-        )
     try:
-        status = candidate.stat()
-    except OSError as exc:
-        raise CBMTransportError(f"native CBM helper does not exist: {candidate}") from exc
-    if not candidate.is_file() or not os.access(candidate, os.X_OK):
-        raise CBMTransportError(f"native CBM helper is not executable: {candidate}")
-    try:
-        result = subprocess.run(
-            [str(candidate), "--version"],
-            capture_output=True,
-            text=True,
-            errors="replace",
-            timeout=30,
-            check=False,
-            env=dict(values),
+        return resolve_native_executable(
+            helper,
+            environ=values,
+            environment_key=environment_key,
+            local_name=local_name,
+            version_prefix="gh-puller-cbm-helper ",
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise CBMTransportError(f"cannot execute native CBM helper {candidate}: {exc}") from exc
-    version = result.stdout.strip().splitlines()
-    if result.returncode or not version or not version[0].startswith("gh-puller-cbm-helper "):
-        detail = (result.stderr or result.stdout).strip()[-1000:]
-        raise CBMTransportError(f"invalid native CBM helper {candidate}: {detail}")
-    return NativeHelper(
-        candidate,
-        _hash_file(candidate),
-        status.st_size,
-        version[0],
-        source,
-        status.st_dev,
-        status.st_ino,
-        status.st_mtime_ns,
-    )
+    except NativeExecutableError as exc:
+        raise CBMTransportError(str(exc).replace("native executable", "native CBM helper")) from exc
 
 
 def _read_exact(stream: BinaryIO, size: int, *, clean_eof: bool = False) -> bytes | None:

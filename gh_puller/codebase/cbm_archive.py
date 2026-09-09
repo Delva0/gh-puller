@@ -1,8 +1,8 @@
-"""Adapt KGA snapshots to graph handles accepted by the pure CBM client.
+"""Materialize KGA snapshots as immutable CBM stores.
 
 This module owns archive inspection, immutable-store cache identity, and the
-KGA-specific helper request. It hands the materialized store to a pure CBM
-client; the CBM package never imports this adapter or the archive format.
+KGA-specific helper request. Opening and querying the resulting database belong
+to the pure CBM client, which never imports this adapter or the archive format.
 """
 
 from __future__ import annotations
@@ -10,45 +10,67 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import subprocess
 import tempfile
-import threading
 import time
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Self
+from typing import TYPE_CHECKING
 
-from .archive import COVERAGE_FIDELITY_VERSION, GRAPH_FIDELITY_VERSION, Archive
-from .cbm._native import NativeHelper, _NativeSession
-from .cbm._transport import CBMTransportError, ResourceMonitorLike
-from .cbm.client import CBMClient, GraphHandle
+from .archive import (
+    COVERAGE_FIDELITY_VERSION,
+    GRAPH_FIDELITY_VERSION,
+    Archive,
+    ArchiveError,
+)
+from .utils import (
+    NativeExecutable,
+    NativeExecutableError,
+    NullResourceMonitor,
+    ResourceMonitorLike,
+    resolve_native_executable,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Iterator, Mapping
 
-_CACHE_SCHEMA = 4
+_CACHE_SCHEMA = 5
+_MATERIALIZER_PROTOCOL = 1
+_MATERIALIZER_ENV = "GH_PULLER_CODEBASE_KGA_MATERIALIZER"
+_MATERIALIZER_NAME = "gh-puller-kga-materializer"
 
 
-class _ArchiveMonitor:
-    """Discard process observations for a standalone archive loader."""
-
-    exceeded = False
-
-    def add_child(self, pid: int) -> None:
-        return
-
-    def remove_child(self, pid: int) -> None:
-        return
-
-    def sample(self) -> None:
-        return
+def _materializer_contract(executable: NativeExecutable) -> int:
+    fields: dict[str, int] = {}
+    parts = executable.version.split()
+    try:
+        protocol = int(parts[1])
+        for part in parts[2:]:
+            name, value = part.split("=", 1)
+            fields[name] = int(value)
+    except (IndexError, ValueError):
+        protocol = -1
+    if (
+        protocol != _MATERIALIZER_PROTOCOL
+        or fields.get("kga") != 5
+        or fields.get("graph") != GRAPH_FIDELITY_VERSION
+        or fields.get("coverage") != COVERAGE_FIDELITY_VERSION
+        or fields.get("store", 0) < 1
+        or fields.get("sdk", 0) < 3
+    ):
+        raise ArchiveError("KGA materializer has an incompatible contract")
+    return fields["store"]
 
 
 @dataclass(frozen=True, slots=True)
-class ArchiveGraph(GraphHandle):
-    """Describe one KGA snapshot loaded as a CBM graph handle."""
+class CBMArchiveStore:
+    """Describe one KGA snapshot materialized as an immutable CBM store."""
 
     database_path: Path
+    project: str
+    nodes: int
+    edges: int
     graph_digest: str
     materialization_digest: str
     graph_fidelity: int
@@ -57,12 +79,12 @@ class ArchiveGraph(GraphHandle):
     materialized: bool
 
 
-class ArchiveLoader:
-    """Materialize KGA snapshots into stores opened by a CBM client."""
+class CBMArchiveAdapter:
+    """Materialize KGA snapshots without owning or opening CBM graphs."""
 
     def __init__(
         self,
-        helper: NativeHelper | str | Path | None,
+        materializer: NativeExecutable | str | Path | None,
         cache_root: str | Path,
         timeout: float,
         environment: Mapping[str, str] | None = None,
@@ -71,37 +93,84 @@ class ArchiveLoader:
         """Configure one KGA-to-CBM adapter.
 
         Args:
-            helper: Compact helper capable of KGA materialization and CBM queries.
+            materializer: One-shot KGA-to-CBM materializer executable.
             cache_root: Parent of engine-versioned immutable stores.
             timeout: Maximum seconds for a helper request or cache lock.
             environment: Child-process environment overrides.
             monitor: Optional process and memory observer.
         """
         if timeout <= 0:
-            raise ValueError("archive load timeout must be positive")
-        self._helper = helper
+            raise ValueError("archive materialization timeout must be positive")
         self.cache_root = Path(cache_root).expanduser().resolve()
         self.timeout = timeout
         self.environment = dict(environment or {})
-        self.monitor = monitor or _ArchiveMonitor()
-        self._lock = threading.Lock()
-        self._session: _NativeSession | None = None
+        self.monitor = monitor or NullResourceMonitor()
+        values = {**os.environ, **self.environment}
+        try:
+            self.materializer = resolve_native_executable(
+                materializer,
+                environ=values,
+                environment_key=_MATERIALIZER_ENV,
+                local_name=_MATERIALIZER_NAME,
+                version_prefix=f"{_MATERIALIZER_NAME} ",
+            )
+        except NativeExecutableError as exc:
+            raise ArchiveError(str(exc).replace("native executable", "KGA materializer")) from exc
+        self.store_format = _materializer_contract(self.materializer)
 
-    def _materializer(self) -> _NativeSession:
-        with self._lock:
-            if self._session is None:
-                self._session = _NativeSession(
-                    self._helper,
-                    self.cache_root,
-                    self.timeout,
-                    self.environment,
-                    self.monitor,
+    def _run(self, parameters: Mapping[str, object]) -> dict:
+        try:
+            self.materializer.verify_unchanged()
+        except NativeExecutableError as exc:
+            raise ArchiveError(str(exc).replace("native executable", "KGA materializer")) from exc
+        environment = {**os.environ, **self.environment}
+        environment.setdefault("CBM_LOG_LEVEL", "error")
+        try:
+            process = subprocess.Popen(
+                [str(self.materializer.path)],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                errors="replace",
+                env=environment,
+            )
+        except OSError as exc:
+            raise ArchiveError(f"cannot start KGA materializer: {exc}") from exc
+        self.monitor.add_child(process.pid)
+        try:
+            try:
+                stdout, stderr = process.communicate(
+                    json.dumps(parameters, ensure_ascii=False, separators=(",", ":")) + "\n",
+                    timeout=self.timeout,
                 )
-            return self._session
+            except subprocess.TimeoutExpired:
+                process.terminate()
+                try:
+                    process.communicate(timeout=2)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.communicate()
+                raise ArchiveError(f"KGA materialization timed out after {self.timeout:g}s") from None
+        finally:
+            self.monitor.remove_child(process.pid)
+        if process.returncode:
+            detail = (stderr or stdout).strip()[-4000:]
+            raise ArchiveError(f"KGA materialization failed: {detail}")
+        try:
+            result = json.loads(stdout)
+        except json.JSONDecodeError as exc:
+            raise ArchiveError("KGA materializer returned invalid JSON") from exc
+        if not isinstance(result, dict):
+            raise ArchiveError("KGA materializer returned a non-object result")
+        self.monitor.sample()
+        if self.monitor.exceeded:
+            raise ArchiveError("memory limit exceeded while materializing KGA")
+        return result
 
     @staticmethod
-    def _cache_paths(cache_root: Path, helper_digest: str, graph_digest: str) -> tuple[Path, Path, Path]:
-        directory = cache_root / "archive-query-v1" / helper_digest
+    def _cache_paths(cache_root: Path, materializer_digest: str, graph_digest: str) -> tuple[Path, Path, Path]:
+        directory = cache_root / "archive-cbm-v1" / materializer_digest
         directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         return (
             directory / f"{graph_digest}.db",
@@ -109,34 +178,24 @@ class ArchiveLoader:
             directory / f"{graph_digest}.lock",
         )
 
-    def load(
+    def materialize(
         self,
-        client: CBMClient,
         archive: str | Path | Archive,
         commit: str | None = None,
         *,
         allow_incomplete: bool = True,
-    ) -> ArchiveGraph:
-        """Load one archived commit without moving bulk graph rows through Python.
+    ) -> CBMArchiveStore:
+        """Materialize one archived commit without moving bulk rows through Python.
 
         Args:
-            client: Pure CBM client that owns the returned graph handle.
             archive: KGA path or an already captured reader.
             commit: Exact archived commit. ``None`` selects the captured latest.
             allow_incomplete: For path inputs, accept the writer's final durable
                 checkpoint while the archive is still being built.
 
         Returns:
-            A CBM graph handle plus immutable KGA identity and cache metadata.
+            The immutable CBM store identity and KGA materialization metadata.
         """
-        session = self._materializer()
-        if (
-            "archive-load" not in session.capabilities
-            or session.hello.get("kga_format") != 5
-            or session.hello.get("graph_fidelity") != GRAPH_FIDELITY_VERSION
-            or session.hello.get("coverage_fidelity") != COVERAGE_FIDELITY_VERSION
-        ):
-            raise CBMTransportError("native helper does not support this KGA contract")
         owned = not isinstance(archive, Archive)
         reader = Archive(archive, allow_incomplete=allow_incomplete) if owned else archive
         try:
@@ -148,13 +207,13 @@ class ArchiveLoader:
             coverage_count = manifest.get("coverage_rows", 0)
             database, marker, lock = self._cache_paths(
                 self.cache_root,
-                session.helper.sha256,
+                self.materializer.sha256,
                 materialization,
             )
             expected_marker = {
                 "schema": _CACHE_SCHEMA,
-                "helper_sha256": session.helper.sha256,
-                "store_format": session.store_format,
+                "materializer_sha256": self.materializer.sha256,
+                "store_format": self.store_format,
                 "graph_digest": manifest["graph_digest"],
                 "materialization_digest": materialization,
                 "project": project,
@@ -186,7 +245,7 @@ class ArchiveLoader:
             }
             with _exclusive_lock(lock, self.timeout):
                 parameters["reuse"] = database.is_file() and _read_marker(marker) == expected_marker
-                result = session._request("load", parameters)
+                result = self._run(parameters)
                 expected_result = {
                     "project": project,
                     "graph_digest": manifest["graph_digest"],
@@ -201,22 +260,13 @@ class ArchiveLoader:
                     any(result.get(key) != value for key, value in expected_result.items())
                     or type(result.get("materialized")) is not bool
                 ):
-                    raise CBMTransportError("native helper returned the wrong KGA graph identity")
+                    raise ArchiveError("KGA materializer returned the wrong graph identity")
                 _write_marker(marker, expected_marker)
-            opened = client.open_store(database, project)
-            if opened.nodes != result["nodes"] or opened.edges != result["edges"]:
-                raise CBMTransportError("opened CBM store has the wrong graph counts")
-            return ArchiveGraph(
-                project=opened.project,
-                source_root=opened.source_root,
-                nodes=opened.nodes,
-                edges=opened.edges,
-                _owner=opened._owner,
-                _preferred=opened._preferred,
-                _transport=opened._transport,
-                _binding=opened._binding,
-                _store=database,
+            return CBMArchiveStore(
                 database_path=database,
+                project=project,
+                nodes=result["nodes"],
+                edges=result["edges"],
                 graph_digest=result["graph_digest"],
                 materialization_digest=result["materialization_digest"],
                 graph_fidelity=result["graph_fidelity"],
@@ -227,20 +277,6 @@ class ArchiveLoader:
         finally:
             if owned:
                 reader.close()
-
-    def close(self) -> None:
-        """Close the materialization helper without affecting graph handles."""
-        with self._lock:
-            session = self._session
-            self._session = None
-        if session is not None:
-            session.close()
-
-    def __enter__(self) -> Self:
-        return self
-
-    def __exit__(self, *_args: object) -> None:
-        self.close()
 
 
 @contextmanager
@@ -254,7 +290,7 @@ def _exclusive_lock(path: Path, timeout: float) -> Iterator[None]:
                 break
             except BlockingIOError:
                 if time.monotonic() >= deadline:
-                    raise CBMTransportError(f"timed out waiting for KGA cache lock: {path}") from None
+                    raise ArchiveError(f"timed out waiting for KGA cache lock: {path}") from None
                 time.sleep(0.05)
         yield
     finally:

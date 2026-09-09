@@ -10,6 +10,7 @@ NATIVE_LIB_DIR := $(NATIVE_BUILD_DIR)/lib
 
 QUERY_TARGET := $(NATIVE_BIN_DIR)/gh-puller-cbm-helper
 INDEX_TARGET := $(NATIVE_BIN_DIR)/gh-puller-cbm-index-helper
+MATERIALIZER_TARGET := $(NATIVE_BIN_DIR)/gh-puller-kga-materializer
 CBM_SDK := $(CBM_ROOT)/build/c/libcbm-sdk.a
 CBM_SDK_FULL := $(CBM_ROOT)/build/c/libcbm-sdk-full.a
 CBM_MIMALLOC := $(CBM_ROOT)/build/c/prod_mimalloc.o
@@ -21,18 +22,19 @@ CFLAGS := -std=c11 -D_DEFAULT_SOURCE -D_GNU_SOURCE -O2 -Wall -Wextra -Werror \
 LDFLAGS := -lm -lstdc++ -lpthread -lz -Wl,-z,noexecstack -Wl,-z,separate-code
 
 ARCHIVE_OBJECT_DIR := $(NATIVE_OBJ_DIR)/cbm_archive
-ARCHIVE_COMMON_OBJECTS := \
+KGA_OBJECTS := \
 	$(ARCHIVE_OBJECT_DIR)/kga_reader.o \
 	$(ARCHIVE_OBJECT_DIR)/kga_sha256.o
-QUERY_OBJECTS := $(ARCHIVE_OBJECT_DIR)/query_helper.o $(ARCHIVE_COMMON_OBJECTS)
-INDEX_OBJECTS := $(ARCHIVE_OBJECT_DIR)/index_helper.o $(ARCHIVE_COMMON_OBJECTS)
-DEPS := $(QUERY_OBJECTS:.o=.d) $(INDEX_OBJECTS:.o=.d)
+QUERY_OBJECTS := $(ARCHIVE_OBJECT_DIR)/query_helper.o
+INDEX_OBJECTS := $(ARCHIVE_OBJECT_DIR)/index_helper.o
+MATERIALIZER_OBJECTS := $(ARCHIVE_OBJECT_DIR)/materializer.o $(KGA_OBJECTS)
+DEPS := $(QUERY_OBJECTS:.o=.d) $(INDEX_OBJECTS:.o=.d) $(MATERIALIZER_OBJECTS:.o=.d)
 
-.PHONY: native native-helper native-query-helper native-index-helper native-test cbm-sdk
+.PHONY: native native-helper native-query-helper native-index-helper native-materializer native-test cbm-sdk
 
 native: native-helper
 
-native-helper: native-query-helper native-index-helper
+native-helper: native-query-helper native-index-helper native-materializer
 
 native-query-helper: $(QUERY_TARGET)
 	$(QUERY_TARGET) --version
@@ -40,9 +42,13 @@ native-query-helper: $(QUERY_TARGET)
 native-index-helper: $(INDEX_TARGET)
 	$(INDEX_TARGET) --version
 
+native-materializer: $(MATERIALIZER_TARGET)
+	$(MATERIALIZER_TARGET) --version
+
 native-test: native-helper
 	GH_PULLER_TEST_CBM_NATIVE_HELPER=$(abspath $(QUERY_TARGET)) \
 	GH_PULLER_TEST_CBM_NATIVE_INDEX_HELPER=$(abspath $(INDEX_TARGET)) \
+	GH_PULLER_TEST_KGA_MATERIALIZER=$(abspath $(MATERIALIZER_TARGET)) \
 	uv run pytest -q tests/codebase/test_cbm_native.py tests/codebase/test_build_pipeline.py \
 		-m integration
 
@@ -66,16 +72,26 @@ $(ARCHIVE_OBJECT_DIR)/index_helper.o: $(CBM_ARCHIVE_DIR)/helper.c Makefile
 	@mkdir -p $(@D) $(NATIVE_LIB_DIR)
 	$(CC) $(CFLAGS) -DGHP_NATIVE_INDEXING -MMD -MP -c -o $@ $<
 
+$(ARCHIVE_OBJECT_DIR)/materializer.o: $(CBM_ARCHIVE_DIR)/materializer.c Makefile
+	@mkdir -p $(@D) $(NATIVE_LIB_DIR)
+	$(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
+
 $(QUERY_TARGET): $(QUERY_OBJECTS) cbm-sdk
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) -o $@ $(QUERY_OBJECTS) $(CBM_SDK) $(CBM_MIMALLOC) $(LDFLAGS)
-	@if nm $@ | grep -Eq 'tree_sitter_|cbm_mcp_server_|cbm_daemon_|cbm_pipeline_run'; then \
+	@if nm $@ | grep -Eq 'ghp_kga_|tree_sitter_|cbm_mcp_server_|cbm_daemon_|cbm_pipeline_run'; then \
 		echo "ERROR: native query helper links a forbidden CBM subsystem"; exit 1; fi
 
 $(INDEX_TARGET): $(INDEX_OBJECTS) cbm-sdk
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) -o $@ $(INDEX_OBJECTS) $(CBM_SDK_FULL) $(CBM_MIMALLOC) $(LDFLAGS)
-	@if nm $@ | grep -Eq 'cbm_mcp_server_|cbm_daemon_|cbm_cli_|cbm_watcher_'; then \
+	@if nm $@ | grep -Eq 'ghp_kga_|cbm_mcp_server_|cbm_daemon_|cbm_cli_|cbm_watcher_'; then \
 		echo "ERROR: native index helper links a frontend subsystem"; exit 1; fi
+
+$(MATERIALIZER_TARGET): $(MATERIALIZER_OBJECTS) cbm-sdk
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) -o $@ $(MATERIALIZER_OBJECTS) $(CBM_SDK) $(CBM_MIMALLOC) $(LDFLAGS)
+	@if nm $@ | grep -Eq 'tree_sitter_|cbm_mcp_server_|cbm_daemon_|cbm_pipeline_run'; then \
+		echo "ERROR: KGA materializer links a forbidden CBM subsystem"; exit 1; fi
 
 -include $(DEPS)
