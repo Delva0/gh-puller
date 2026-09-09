@@ -44,6 +44,27 @@ typedef struct {
     yyjson_doc *document;
 } kga_page_t;
 
+typedef enum {
+    PROFILE_IO,
+    PROFILE_CRC,
+    PROFILE_INFLATE,
+    PROFILE_DIGEST,
+    PROFILE_JSON,
+    PROFILE_ROWS,
+    PROFILE_PROPERTIES,
+    PROFILE_SORT,
+    PROFILE_SDK_WAIT,
+    PROFILE_SDK_IMPORT,
+    PROFILE_RELEASE,
+    PROFILE_STAGE_COUNT,
+} profile_stage_t;
+
+typedef struct {
+    bool active;
+    atomic_uint_fast64_t microseconds[PROFILE_STAGE_COUNT];
+    atomic_uint_fast64_t calls[PROFILE_STAGE_COUNT];
+} profile_metrics_t;
+
 typedef struct {
     int descriptor;
     uint64_t limit;
@@ -52,6 +73,7 @@ typedef struct {
     size_t error_size;
     pthread_mutex_t *sdk_lock;
     atomic_int *failed;
+    profile_metrics_t *profile;
 } import_context_t;
 
 typedef cbm_sdk_node_t node_item_t;
@@ -79,9 +101,69 @@ typedef struct {
     char error[1024];
 } tree_import_work_t;
 
-static profile_span_t profile_start(void) {
+static bool profile_enabled(void) {
     const char *profile = getenv("CBM_PROFILE");
-    profile_span_t span = {.active = profile && profile[0] && profile[0] != '0'};
+    return profile && profile[0] && profile[0] != '0';
+}
+
+static uint64_t profile_clock(const profile_metrics_t *metrics) {
+    if (!metrics || !metrics->active) {
+        return 0;
+    }
+    struct timespec now;
+    (void)clock_gettime(CLOCK_MONOTONIC, &now);
+    return (uint64_t)now.tv_sec * 1000000U + (uint64_t)now.tv_nsec / 1000U;
+}
+
+static void profile_record(profile_metrics_t *metrics, profile_stage_t stage, uint64_t microseconds,
+                           uint64_t calls) {
+    if (!metrics || !metrics->active) {
+        return;
+    }
+    atomic_fetch_add_explicit(&metrics->microseconds[stage], microseconds, memory_order_relaxed);
+    atomic_fetch_add_explicit(&metrics->calls[stage], calls, memory_order_relaxed);
+}
+
+static void profile_add(profile_metrics_t *metrics, profile_stage_t stage, uint64_t started,
+                        uint64_t calls) {
+    if (started) {
+        profile_record(metrics, stage, profile_clock(metrics) - started, calls);
+    }
+}
+
+static void profile_metrics_init(profile_metrics_t *metrics) {
+    memset(metrics, 0, sizeof(*metrics));
+    metrics->active = profile_enabled();
+    for (size_t stage = 0; stage < PROFILE_STAGE_COUNT; stage++) {
+        atomic_init(&metrics->microseconds[stage], 0);
+        atomic_init(&metrics->calls[stage], 0);
+    }
+}
+
+static void profile_metrics_finish(const char *tree, const profile_metrics_t *metrics) {
+    static const char *names[] = {
+        "io",   "crc",        "inflate", "digest",     "json",    "rows",
+        "properties", "sort_unique", "sdk_wait", "sdk_import", "release",
+    };
+    if (!metrics->active) {
+        return;
+    }
+    for (size_t stage = 0; stage < PROFILE_STAGE_COUNT; stage++) {
+        uint64_t microseconds =
+            atomic_load_explicit(&metrics->microseconds[stage], memory_order_relaxed);
+        uint64_t calls = atomic_load_explicit(&metrics->calls[stage], memory_order_relaxed);
+        if (calls > 0) {
+            (void)fprintf(stderr,
+                          "level=info msg=prof phase=kga_decode tree=%s sub=%s ms=%llu us=%llu "
+                          "calls=%llu\n",
+                          tree, names[stage], (unsigned long long)(microseconds / 1000U),
+                          (unsigned long long)microseconds, (unsigned long long)calls);
+        }
+    }
+}
+
+static profile_span_t profile_start(void) {
+    profile_span_t span = {.active = profile_enabled()};
     if (span.active) {
         (void)clock_gettime(CLOCK_MONOTONIC, &span.started);
     }
@@ -193,12 +275,14 @@ static void page_free(kga_page_t *page) {
 static int page_read(import_context_t *context, const ghp_kga_root_t *reference, kga_page_t *page) {
     unsigned char header[KGA_FRAME_HEADER_SIZE];
     memset(page, 0, sizeof(*page));
+    uint64_t measured = profile_clock(context->profile);
     if (!reference->present || reference->offset > context->limit ||
         context->limit - reference->offset < sizeof(header) ||
         !read_exact(context->descriptor, reference->offset, header, sizeof(header))) {
         return fail(context->error, context->error_size, "invalid page frame at %llu",
                     (unsigned long long)reference->offset);
     }
+    profile_add(context->profile, PROFILE_IO, measured, 1);
     uint64_t raw_size = read_u64_be(header + 1);
     uint64_t compressed_size = read_u64_be(header + 9);
     uint32_t expected_crc = read_u32_be(header + 17);
@@ -210,6 +294,7 @@ static int page_read(import_context_t *context, const ghp_kga_root_t *reference,
                     (unsigned long long)reference->offset);
     }
 
+    measured = profile_clock(context->profile);
     unsigned char *compressed = malloc((size_t)compressed_size);
     page->raw = malloc((size_t)raw_size + 1);
     if (!compressed || !page->raw ||
@@ -219,12 +304,16 @@ static int page_read(import_context_t *context, const ghp_kga_root_t *reference,
         return fail(context->error, context->error_size, "cannot read page at %llu",
                     (unsigned long long)reference->offset);
     }
+    profile_add(context->profile, PROFILE_IO, measured, 1);
+    measured = profile_clock(context->profile);
     if (compressed_crc32(compressed, (size_t)compressed_size) != expected_crc) {
         free(compressed);
         page_free(page);
         return fail(context->error, context->error_size, "page CRC mismatch at %llu",
                     (unsigned long long)reference->offset);
     }
+    profile_add(context->profile, PROFILE_CRC, measured, 1);
+    measured = profile_clock(context->profile);
     uLongf output_size = (uLongf)raw_size;
     int decompressed =
         uncompress((Bytef *)page->raw, &output_size, compressed, (uLong)compressed_size);
@@ -234,9 +323,11 @@ static int page_read(import_context_t *context, const ghp_kga_root_t *reference,
         return fail(context->error, context->error_size, "page decompression failed at %llu",
                     (unsigned long long)reference->offset);
     }
+    profile_add(context->profile, PROFILE_INFLATE, measured, 1);
     page->raw[raw_size] = '\0';
     page->raw_size = (size_t)raw_size;
 
+    measured = profile_clock(context->profile);
     unsigned char digest[GHP_SHA256_DIGEST_SIZE];
     ghp_sha256(page->raw, page->raw_size, digest);
     if (memcmp(digest, header + KGA_FRAME_DIGEST_OFFSET, sizeof(digest)) != 0) {
@@ -244,13 +335,16 @@ static int page_read(import_context_t *context, const ghp_kga_root_t *reference,
         return fail(context->error, context->error_size, "page digest mismatch at %llu",
                     (unsigned long long)reference->offset);
     }
+    profile_add(context->profile, PROFILE_DIGEST, measured, 1);
 
+    measured = profile_clock(context->profile);
     page->document = yyjson_read_opts(page->raw, page->raw_size, YYJSON_READ_NOFLAG, NULL, NULL);
     if (!page->document || !yyjson_is_obj(yyjson_doc_get_root(page->document))) {
         page_free(page);
         return fail(context->error, context->error_size, "invalid page JSON at %llu",
                     (unsigned long long)reference->offset);
     }
+    profile_add(context->profile, PROFILE_JSON, measured, 1);
     return 0;
 }
 
@@ -381,6 +475,8 @@ static int import_node_leaf(import_context_t *context, yyjson_val *entries, uint
         return fail(context->error, context->error_size, "cannot allocate node leaf");
     }
     int status = -1;
+    uint64_t rows_started = profile_clock(context->profile);
+    uint64_t properties_microseconds = 0;
     size_t index, maximum;
     yyjson_val *entry;
     yyjson_arr_foreach(entries, index, maximum, entry) {
@@ -398,12 +494,21 @@ static int import_node_leaf(import_context_t *context, yyjson_val *entries, uint
             goto cleanup;
         }
         yyjson_val *properties = yyjson_obj_get(attributes, "properties");
-        if (!yyjson_is_obj(properties) ||
-            !(row->properties_json = yyjson_val_write(properties, YYJSON_WRITE_NOFLAG, NULL))) {
+        uint64_t properties_started = profile_clock(context->profile);
+        row->properties_json = yyjson_is_obj(properties)
+                                   ? yyjson_val_write(properties, YYJSON_WRITE_NOFLAG, NULL)
+                                   : NULL;
+        if (properties_started) {
+            properties_microseconds += profile_clock(context->profile) - properties_started;
+        }
+        if (!row->properties_json) {
             fail(context->error, context->error_size, "invalid node properties in KGA leaf");
             goto cleanup;
         }
     }
+    profile_add(context->profile, PROFILE_ROWS, rows_started, count);
+    profile_record(context->profile, PROFILE_PROPERTIES, properties_microseconds, count);
+    uint64_t sort_started = profile_clock(context->profile);
     qsort(items, (size_t)count, sizeof(*items), compare_nodes);
     for (size_t item = 1; item < (size_t)count; item++) {
         if (compare_nodes(&items[item - 1], &items[item]) == 0) {
@@ -411,24 +516,31 @@ static int import_node_leaf(import_context_t *context, yyjson_val *entries, uint
             goto cleanup;
         }
     }
+    profile_add(context->profile, PROFILE_SORT, sort_started, 1);
+    uint64_t wait_started = profile_clock(context->profile);
     if (context->sdk_lock) {
         (void)pthread_mutex_lock(context->sdk_lock);
     }
+    profile_add(context->profile, PROFILE_SDK_WAIT, wait_started, 1);
+    uint64_t import_started = profile_clock(context->profile);
     cbm_sdk_status_t imported =
         context->failed && atomic_load(context->failed)
             ? CBM_SDK_CANCELLED
             : cbm_sdk_import_add_nodes(context->import, items, (size_t)count, context->error,
                                        context->error_size);
+    profile_add(context->profile, PROFILE_SDK_IMPORT, import_started, 1);
     if (context->sdk_lock) {
         (void)pthread_mutex_unlock(context->sdk_lock);
     }
     status = imported == CBM_SDK_OK ? 0 : -1;
 
 cleanup:
+    uint64_t release_started = profile_clock(context->profile);
     for (size_t item = 0; item < (size_t)count; item++) {
         free((void *)items[item].properties_json);
     }
     free(items);
+    profile_add(context->profile, PROFILE_RELEASE, release_started, count);
     return status;
 }
 
@@ -442,6 +554,8 @@ static int import_edge_leaf(import_context_t *context, yyjson_val *entries, uint
         return fail(context->error, context->error_size, "cannot allocate edge leaf");
     }
     int status = -1;
+    uint64_t rows_started = profile_clock(context->profile);
+    uint64_t properties_microseconds = 0;
     size_t index, maximum;
     yyjson_val *entry;
     yyjson_arr_foreach(entries, index, maximum, entry) {
@@ -459,12 +573,22 @@ static int import_edge_leaf(import_context_t *context, yyjson_val *entries, uint
             goto cleanup;
         }
         yyjson_val *properties = yyjson_obj_get(attributes, "properties");
-        if (!yyjson_is_obj(properties) || !edge_properties_match_identity(row, properties) ||
-            !(row->properties_json = yyjson_val_write(properties, YYJSON_WRITE_NOFLAG, NULL))) {
+        uint64_t properties_started = profile_clock(context->profile);
+        row->properties_json =
+            yyjson_is_obj(properties) && edge_properties_match_identity(row, properties)
+                ? yyjson_val_write(properties, YYJSON_WRITE_NOFLAG, NULL)
+                : NULL;
+        if (properties_started) {
+            properties_microseconds += profile_clock(context->profile) - properties_started;
+        }
+        if (!row->properties_json) {
             fail(context->error, context->error_size, "invalid edge properties in KGA leaf");
             goto cleanup;
         }
     }
+    profile_add(context->profile, PROFILE_ROWS, rows_started, count);
+    profile_record(context->profile, PROFILE_PROPERTIES, properties_microseconds, count);
+    uint64_t sort_started = profile_clock(context->profile);
     qsort(items, (size_t)count, sizeof(*items), compare_edges);
     for (size_t item = 1; item < (size_t)count; item++) {
         if (compare_edges(&items[item - 1], &items[item]) == 0) {
@@ -472,24 +596,31 @@ static int import_edge_leaf(import_context_t *context, yyjson_val *entries, uint
             goto cleanup;
         }
     }
+    profile_add(context->profile, PROFILE_SORT, sort_started, 1);
+    uint64_t wait_started = profile_clock(context->profile);
     if (context->sdk_lock) {
         (void)pthread_mutex_lock(context->sdk_lock);
     }
+    profile_add(context->profile, PROFILE_SDK_WAIT, wait_started, 1);
+    uint64_t import_started = profile_clock(context->profile);
     cbm_sdk_status_t imported =
         context->failed && atomic_load(context->failed)
             ? CBM_SDK_CANCELLED
             : cbm_sdk_import_add_edges(context->import, items, (size_t)count, context->error,
                                        context->error_size);
+    profile_add(context->profile, PROFILE_SDK_IMPORT, import_started, 1);
     if (context->sdk_lock) {
         (void)pthread_mutex_unlock(context->sdk_lock);
     }
     status = imported == CBM_SDK_OK ? 0 : -1;
 
 cleanup:
+    uint64_t release_started = profile_clock(context->profile);
     for (size_t item = 0; item < (size_t)count; item++) {
         free((void *)items[item].properties_json);
     }
     free(items);
+    profile_add(context->profile, PROFILE_RELEASE, release_started, count);
     return status;
 }
 
@@ -759,13 +890,21 @@ int ghp_kga_import_snapshot(const ghp_kga_snapshot_t *snapshot, char *error, siz
         .error = error,
         .error_size = error_size,
     };
+    profile_metrics_t nodes_profile;
+    profile_metrics_init(&nodes_profile);
+    context.profile = &nodes_profile;
     profile_span_t nodes_started = profile_start();
     int result = import_tree(&context, &snapshot->node_root, "nodes", NULL, 0);
     profile_finish("nodes", nodes_started, snapshot->node_count);
+    profile_metrics_finish("nodes", &nodes_profile);
     if (result == 0 && snapshot->edge_root.present) {
+        profile_metrics_t edges_profile;
+        profile_metrics_init(&edges_profile);
+        context.profile = &edges_profile;
         profile_span_t edges_started = profile_start();
         result = import_tree(&context, &snapshot->edge_root, "edges", NULL, 0);
         profile_finish("edges", edges_started, snapshot->edge_count);
+        profile_metrics_finish("edges", &edges_profile);
     }
     if (result == 0 && snapshot->coverage_present) {
         cbm_sdk_coverage_meta_t metadata = {
@@ -777,6 +916,9 @@ int ghp_kga_import_snapshot(const ghp_kga_snapshot_t *snapshot, char *error, siz
             .coverage_version = snapshot->coverage_meta.coverage_version,
             .hash_records_complete = snapshot->coverage_meta.hash_records_complete,
         };
+        profile_metrics_t coverage_profile;
+        profile_metrics_init(&coverage_profile);
+        context.profile = &coverage_profile;
         profile_span_t coverage_started = profile_start();
         if (cbm_sdk_import_set_coverage(import, &metadata, snapshot->coverage_count, error,
                                         error_size) != CBM_SDK_OK ||
@@ -785,6 +927,7 @@ int ghp_kga_import_snapshot(const ghp_kga_snapshot_t *snapshot, char *error, siz
             result = -1;
         }
         profile_finish("coverage", coverage_started, snapshot->coverage_count);
+        profile_metrics_finish("coverage", &coverage_profile);
     }
     if (result == 0) {
         profile_span_t finish_started = profile_start();
