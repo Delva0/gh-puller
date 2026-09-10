@@ -18,12 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from ..archive import (
-    COVERAGE_FIDELITY_VERSION,
-    GRAPH_FIDELITY_VERSION,
-    Archive,
-    ArchiveError,
-)
+from ..archive import Archive, ArchiveError
 from ..utils import (
     NativeExecutable,
     NativeExecutableError,
@@ -35,8 +30,8 @@ from ..utils import (
 if TYPE_CHECKING:
     from collections.abc import Iterator, Mapping
 
-_CACHE_SCHEMA = 5
-_MATERIALIZER_PROTOCOL = 1
+_CACHE_SCHEMA = "kga-cbm-cache"
+_MATERIALIZER_PROTOCOL = 2
 _MATERIALIZER_ENV = "GH_PULLER_CODEBASE_KGA_MATERIALIZER"
 _MATERIALIZER_NAME = "gh-puller-kga-materializer"
 
@@ -51,14 +46,7 @@ def _materializer_contract(executable: NativeExecutable) -> int:
             fields[name] = int(value)
     except (IndexError, ValueError):
         protocol = -1
-    if (
-        protocol != _MATERIALIZER_PROTOCOL
-        or fields.get("kga") != 5
-        or fields.get("graph") != GRAPH_FIDELITY_VERSION
-        or fields.get("coverage") != COVERAGE_FIDELITY_VERSION
-        or fields.get("store", 0) < 1
-        or fields.get("sdk", 0) < 3
-    ):
+    if protocol != _MATERIALIZER_PROTOCOL or fields.get("store", 0) < 1 or fields.get("sdk", 0) < 3:
         raise ArchiveError("KGA materializer has an incompatible contract")
     return fields["store"]
 
@@ -73,9 +61,7 @@ class CBMArchiveStore:
     edges: int
     graph_digest: str
     materialization_digest: str
-    graph_fidelity: int
     coverage_rows: int
-    coverage_fidelity: int
     materialized: bool
 
 
@@ -170,7 +156,7 @@ class CBMArchiveAdapter:
 
     @staticmethod
     def _cache_paths(cache_root: Path, materializer_digest: str, graph_digest: str) -> tuple[Path, Path, Path]:
-        directory = cache_root / "archive-cbm-v1" / materializer_digest
+        directory = cache_root / "archive-cbm" / materializer_digest
         directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         return (
             directory / f"{graph_digest}.db",
@@ -199,11 +185,11 @@ class CBMArchiveAdapter:
         owned = not isinstance(archive, Archive)
         reader = Archive(archive, allow_incomplete=allow_incomplete) if owned else archive
         try:
-            manifest, project = reader._restorable_manifest(commit)
+            manifest = reader._snapshot_manifest(commit)
+            project = manifest.get("project")
             status = os.fstat(reader._reader.fd)
             archive_path = reader.path.resolve(strict=True)
             materialization = manifest.get("materialization_digest", manifest["graph_digest"])
-            coverage_fidelity = manifest.get("coverage_fidelity_version", 0)
             coverage_count = manifest.get("coverage_rows", 0)
             database, marker, lock = self._cache_paths(
                 self.cache_root,
@@ -219,10 +205,8 @@ class CBMArchiveAdapter:
                 "project": project,
                 "nodes": manifest["nodes"],
                 "edges": manifest["edges"],
-                "graph_fidelity": manifest["graph_fidelity_version"],
                 "coverage_digest": manifest.get("coverage_digest"),
                 "coverage_rows": coverage_count,
-                "coverage_fidelity": coverage_fidelity,
             }
             parameters = {
                 "archive_path": str(archive_path),
@@ -235,8 +219,6 @@ class CBMArchiveAdapter:
                 "database_path": str(database),
                 "node_count": manifest["nodes"],
                 "edge_count": manifest["edges"],
-                "graph_fidelity": manifest["graph_fidelity_version"],
-                "coverage_fidelity": coverage_fidelity,
                 "coverage_count": coverage_count,
                 "node_root": manifest["node_root"],
                 "edge_root": manifest["edge_root"],
@@ -252,9 +234,7 @@ class CBMArchiveAdapter:
                     "materialization_digest": materialization,
                     "nodes": manifest["nodes"],
                     "edges": manifest["edges"],
-                    "graph_fidelity": manifest["graph_fidelity_version"],
                     "coverage_rows": coverage_count,
-                    "coverage_fidelity": coverage_fidelity,
                 }
                 if (
                     any(result.get(key) != value for key, value in expected_result.items())
@@ -269,9 +249,7 @@ class CBMArchiveAdapter:
                 edges=result["edges"],
                 graph_digest=result["graph_digest"],
                 materialization_digest=result["materialization_digest"],
-                graph_fidelity=result["graph_fidelity"],
                 coverage_rows=result["coverage_rows"],
-                coverage_fidelity=result["coverage_fidelity"],
                 materialized=result["materialized"],
             )
         finally:

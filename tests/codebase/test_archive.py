@@ -1,10 +1,9 @@
-import math
+from hashlib import sha256
 
 import pytest
 
 import gh_puller.codebase.archive as archive_module
 from gh_puller.codebase.archive import (
-    GRAPH_FIDELITY_VERSION,
     Archive,
     ArchiveError,
     ArchiveWriter,
@@ -206,12 +205,183 @@ def test_recorder_applies_exact_coverage_snapshots_and_deltas(tmp_path):
             ("docs", "not_indexed_dir"): "excluded subtree",
             ("src/a.py", "parse_partial"): "8-9",
         }
-        archive.verify_snapshot("c2")
+        archive.verify()
     assert first["coverage_rows"] == 2
     assert second["coverage_rows"] == 2
     assert second["changed_coverage_rows"] == 3
     assert second["graph_digest"] == first["graph_digest"]
     assert second["materialization_digest"] != first["materialization_digest"]
+
+
+def test_recorder_reuses_git_parent_root_across_physical_branch_switch(tmp_path):
+    path = tmp_path / "archive.kga"
+    recorder = KGARecorder(path)
+    left_edge = ("pkg.node", "pkg.left", "CALLS", "")
+    right_edge = ("pkg.node", "pkg.right", "CALLS", "")
+    base = recorder.append(
+        KGACommit(0, "c0", (), None),
+        GraphCapture({"pkg.node": {"value": 0}}, {}, True, "full_snapshot"),
+        project="p",
+        metadata={},
+    )
+    left = recorder.append(
+        KGACommit(1, "c1", ("c0",), 1),
+        GraphCapture(
+            {"pkg.node": {"value": 1}},
+            {left_edge: {"properties": {"branch": "left"}}},
+            False,
+            "full_generation",
+        ),
+        project="p",
+        metadata={},
+    )
+    right = recorder.append(
+        KGACommit(2, "c2", ("c0",), 1),
+        GraphCapture(
+            {"pkg.node": {"value": 2}},
+            {
+                left_edge: None,
+                right_edge: {"properties": {"branch": "right"}},
+            },
+            False,
+            "full_generation",
+        ),
+        project="p",
+        metadata={},
+    )
+    restored = recorder.append(
+        KGACommit(3, "c3", ("c1",), 0),
+        GraphCapture(
+            {"pkg.node": {"value": 1}},
+            {
+                left_edge: {"properties": {"branch": "left"}},
+                right_edge: None,
+            },
+            False,
+            "full_generation",
+        ),
+        project="p",
+        metadata={},
+    )
+    recorder.finalize()
+
+    assert base["delta_base"] is None
+    assert right["delta_base"] == "c0"
+    assert restored["delta_base"] == "c1"
+    assert restored["node_root"] == left["node_root"]
+    assert restored["edge_root"] == left["edge_root"]
+    assert restored["pages_written"] == 0
+    with Archive(path) as archive:
+        assert [archive.load_rows(commit).nodes["pkg.node"]["value"] for commit in archive.commit_ids()] == [
+            0,
+            1,
+            2,
+            1,
+        ]
+        assert [set(archive.load_rows(commit).edges) for commit in archive.commit_ids()] == [
+            set(),
+            {left_edge},
+            {right_edge},
+            {left_edge},
+        ]
+
+
+def test_merge_selects_parent_with_smallest_compressed_delta(tmp_path):
+    path = tmp_path / "archive.kga"
+    recorder = KGARecorder(path)
+    recorder.append(
+        KGACommit(0, "c0", (), None),
+        GraphCapture({"pkg.node": {"value": "base"}}, {}, True, "full_snapshot"),
+        project="p",
+        metadata={},
+    )
+    left = recorder.append(
+        KGACommit(1, "c1", ("c0",), 1),
+        GraphCapture({"pkg.node": {"value": "left"}}, {}, False, "full_generation"),
+        project="p",
+        metadata={},
+    )
+    recorder.append(
+        KGACommit(2, "c2", ("c0",), 1),
+        GraphCapture({"pkg.node": {"value": "right"}}, {}, False, "full_generation"),
+        project="p",
+        metadata={},
+    )
+    merge = recorder.append(
+        KGACommit(3, "merge", ("c2", "c1"), None),
+        GraphCapture({"pkg.node": {"value": "left"}}, {}, False, "full_generation"),
+        project="p",
+        metadata={"git_parent_changed_files": {"c2": 3, "c1": 1}},
+    )
+    recorder.finalize()
+
+    assert merge["delta_base"] == "c1"
+    assert merge["changed_files"] == 1
+    assert merge["delta_base_bytes"] == 0
+    assert merge["node_root"] == left["node_root"]
+
+
+def test_merge_compares_nonzero_precompressed_parent_plans(tmp_path):
+    path = tmp_path / "archive.kga"
+    recorder = KGARecorder(path)
+    first = "alpha.left.node"
+    second = "beta.right.node"
+    compact = "a" * 16384
+    noisy = "".join(sha256(str(index).encode()).hexdigest() for index in range(256))
+    recorder.append(
+        KGACommit(0, "c0", (), None),
+        GraphCapture({first: {"value": "base"}, second: {"value": "base"}}, {}, True, "full_snapshot"),
+        project="p",
+        metadata={},
+    )
+    recorder.append(
+        KGACommit(1, "c1", ("c0",), 1),
+        GraphCapture({first: {"value": compact}}, {}, False, "full_generation"),
+        project="p",
+        metadata={},
+    )
+    recorder.append(
+        KGACommit(2, "c2", ("c0",), 1),
+        GraphCapture(
+            {first: {"value": "base"}, second: {"value": noisy}},
+            {},
+            False,
+            "full_generation",
+        ),
+        project="p",
+        metadata={},
+    )
+    recorder.append(
+        KGACommit(3, "side", ("c0",), 2),
+        GraphCapture(
+            {first: {"value": "side-a"}, second: {"value": "side-b"}},
+            {},
+            False,
+            "full_generation",
+        ),
+        project="p",
+        metadata={},
+    )
+    merge = recorder.append(
+        KGACommit(4, "merge", ("c1", "c2"), None),
+        GraphCapture(
+            {first: {"value": compact}, second: {"value": noisy}},
+            {},
+            False,
+            "full_generation",
+        ),
+        project="p",
+        metadata={},
+    )
+    recorder.finalize()
+
+    assert merge["delta_base"] == "c2"
+    assert merge["delta_base_bytes"] > 0
+    with Archive(path) as archive:
+        assert archive.load_rows("merge").nodes == {
+            first: {"value": compact},
+            second: {"value": noisy},
+        }
 
 
 def test_radix_tree_rejects_duplicate_build_identities(tmp_path):
@@ -336,27 +506,6 @@ def test_incomplete_checkpoint_discards_partial_tail_without_scanning(tmp_path, 
     assert set(Archive(path).load_rows("c2").nodes) == {"a", "b"}
 
 
-def test_interrupted_first_extension_recovers_embedded_footer_without_scanning(tmp_path, monkeypatch):
-    path = tmp_path / "archive.kga"
-    writer = ArchiveWriter(path)
-    commit_rows(writer, "c1", [], GraphRows({"a": {"v": 1}}, {}))
-    # Model an archive finalized by the pre-checkpoint implementation.
-    legacy_end = writer.frames[-1].end
-    writer._file.truncate(legacy_end)
-    writer._file.seek(legacy_end)
-    writer.finalize()
-    durable_size = path.stat().st_size
-    with path.open("ab") as file:
-        file.write(b"partial first extension page")
-
-    monkeypatch.setattr(archive_module, "_scan_reader", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError))
-    assert len(Archive(path, allow_incomplete=True)) == 1
-    writer = ArchiveWriter(path)
-    assert path.stat().st_size == durable_size
-    assert [item["sha"] for item in writer.commits] == ["c1"]
-    writer.close_incomplete()
-
-
 def test_full_verify_accepts_embedded_checkpoints_and_prior_footer(tmp_path):
     path = tmp_path / "archive.kga"
     writer = ArchiveWriter(path)
@@ -447,6 +596,16 @@ def test_archive_writer_is_exclusive(tmp_path):
     resumed.close_incomplete()
 
 
+def test_unsupported_magic_is_rejected_without_mutating_the_file(tmp_path):
+    path = tmp_path / "archive.kga"
+    original = b"not-a-kga-archive"
+    path.write_bytes(original)
+
+    with pytest.raises(ArchiveError, match="not a supported archive"):
+        ArchiveWriter(path)
+    assert path.read_bytes() == original
+
+
 def test_reader_cache_budget_and_context_manager(tmp_path):
     path = tmp_path / "archive.kga"
     writer = ArchiveWriter(path)
@@ -480,17 +639,15 @@ def test_native_page_decoder_preserves_rows_without_standard_json(tmp_path, monk
     archive.close()
 
 
-def test_native_page_decoder_falls_back_for_nonfinite_json(tmp_path):
+def test_writer_rejects_nonfinite_json(tmp_path):
     path = tmp_path / "archive.kga"
     writer = ArchiveWriter(path)
-    commit_rows(writer, "c1", [], GraphRows({"a": {"value": math.nan}}, {}))
-    writer.finalize()
-
-    with Archive(path) as archive:
-        assert math.isnan(archive.load_rows().nodes["a"]["value"])
+    with pytest.raises(ValueError, match="Out of range float values"):
+        commit_rows(writer, "c1", [], GraphRows({"a": {"value": float("nan")}}, {}))
+    writer.close_incomplete()
 
 
-def test_snapshot_fidelity_rejects_legacy_and_dangling_graphs(tmp_path):
+def test_archive_treats_dangling_edges_as_opaque_graph_rows(tmp_path):
     path = tmp_path / "archive.kga"
     writer = ArchiveWriter(path)
     node = {
@@ -505,43 +662,21 @@ def test_snapshot_fidelity_rejects_legacy_and_dangling_graphs(tmp_path):
     edges = RadixTree(writer, "edges").build(
         {("p", "p.missing", "CONTAINS", ""): {"properties": {}}}.items(),
     )
-    common = {
+    manifest = {
+        "sha": "dangling",
+        "parents": [],
         "node_root": nodes.to_json(),
         "edge_root": edges.to_json(),
         "nodes": 1,
         "edges": 1,
         "graph_digest": graph_digest(nodes, edges),
-        "cbm_project": "p",
+        "project": "p",
     }
-    writer.commit({"sha": "legacy", "parents": [], **common})
-    writer.commit(
-        {
-            "sha": "current",
-            "parents": ["legacy"],
-            "graph_fidelity_version": GRAPH_FIDELITY_VERSION,
-            **common,
-        },
-    )
-    missing = {**node, "label": "Function", "name": "missing"}
-    nodes = RadixTree(writer, "nodes").apply(nodes, {"p.missing": missing})
-    writer.commit(
-        {
-            "sha": "closed",
-            "parents": ["current"],
-            "node_root": nodes.to_json(),
-            "edge_root": edges.to_json(),
-            "nodes": 2,
-            "edges": 1,
-            "graph_digest": graph_digest(nodes, edges),
-            "graph_fidelity_version": GRAPH_FIDELITY_VERSION,
-            "cbm_project": "p",
-        },
-    )
+    writer.commit(manifest)
     writer.finalize()
 
     with Archive(path) as archive:
-        with pytest.raises(ArchiveError, match="no verified CBM fidelity"):
-            archive.verify_snapshot("legacy")
-        with pytest.raises(ArchiveError, match="1 missing edge endpoints"):
-            archive.verify_snapshot("current")
-        archive.verify_snapshot("closed")
+        archive.verify()
+        assert archive.load_rows("dangling").edges == {
+            ("p", "p.missing", "CONTAINS", ""): {"properties": {}},
+        }

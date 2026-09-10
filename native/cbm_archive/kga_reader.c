@@ -36,7 +36,7 @@ enum {
     KGA_IMPORT_WORKERS = 16,
 };
 
-static const unsigned char KGA_MAGIC[] = {'K', 'G', 'A', '5', '\r', '\n', 0x1a, '\n'};
+static const unsigned char KGA_MAGIC[] = {'K', 'G', 'A', '\r', '\n', 0x1a, '\n'};
 
 typedef struct {
     char *raw;
@@ -208,12 +208,6 @@ static bool digest_valid(const char *digest) {
     return true;
 }
 
-static bool coverage_meta_valid(const ghp_kga_coverage_meta_t *metadata) {
-    return metadata->index_mode && metadata->recorded_at && metadata->recording_status &&
-           metadata->ignored_files_stored >= 0 && metadata->ignored_files_total >= 0 &&
-           metadata->coverage_version >= 1;
-}
-
 static uint32_t read_u32_be(const unsigned char *bytes) {
     return ((uint32_t)bytes[0] << 24U) | ((uint32_t)bytes[1] << 16U) | ((uint32_t)bytes[2] << 8U) |
            (uint32_t)bytes[3];
@@ -383,15 +377,6 @@ static bool json_int32(yyjson_val *value, int *output) {
     }
     *output = (int)number;
     return true;
-}
-
-static bool edge_properties_match_identity(const edge_item_t *row, yyjson_val *properties) {
-    if (strcmp(row->type, "IMPORTS") != 0) {
-        return row->local_name[0] == '\0';
-    }
-    yyjson_val *value = yyjson_obj_get(properties, "local_name");
-    const char *stored = value ? json_string(value) : "";
-    return stored && strcmp(stored, row->local_name) == 0;
 }
 
 static bool root_from_json(yyjson_val *object, ghp_kga_root_t *reference) {
@@ -576,9 +561,7 @@ static int import_edge_leaf(import_context_t *context, yyjson_val *entries, uint
         yyjson_val *properties = yyjson_obj_get(attributes, "properties");
         uint64_t properties_started = profile_clock(context->profile);
         row->properties_json =
-            yyjson_is_obj(properties) && edge_properties_match_identity(row, properties)
-                ? yyjson_val_write(properties, YYJSON_WRITE_NOFLAG, NULL)
-                : NULL;
+            yyjson_is_obj(properties) ? yyjson_val_write(properties, YYJSON_WRITE_NOFLAG, NULL) : NULL;
         if (properties_started) {
             properties_microseconds += profile_clock(context->profile) - properties_started;
         }
@@ -836,8 +819,9 @@ int ghp_kga_import_snapshot(const ghp_kga_snapshot_t *snapshot, char *error, siz
     }
     if (!snapshot || !snapshot->archive_path || !snapshot->project || !snapshot->database_path ||
         !digest_valid(snapshot->graph_digest) || !digest_valid(snapshot->materialization_digest) ||
-        snapshot->captured_size < sizeof(KGA_MAGIC) || snapshot->node_count < 1 ||
-        snapshot->edge_count < 0 || !snapshot->node_root.present ||
+        snapshot->captured_size < sizeof(KGA_MAGIC) || snapshot->node_count < 0 ||
+        snapshot->edge_count < 0 ||
+        snapshot->node_root.present != (snapshot->node_count > 0) ||
         snapshot->node_root.count != (uint64_t)snapshot->node_count ||
         snapshot->edge_root.present != (snapshot->edge_count > 0) ||
         (snapshot->edge_root.present &&
@@ -847,7 +831,6 @@ int ghp_kga_import_snapshot(const ghp_kga_snapshot_t *snapshot, char *error, siz
             (snapshot->coverage_present && snapshot->coverage_count > 0) ||
         (snapshot->coverage_root.present &&
          snapshot->coverage_root.count != (uint64_t)snapshot->coverage_count) ||
-        (snapshot->coverage_present && !coverage_meta_valid(&snapshot->coverage_meta)) ||
         (!snapshot->coverage_present && snapshot->coverage_count != 0)) {
         return fail(error, error_size, "invalid KGA import snapshot");
     }
@@ -876,7 +859,7 @@ int ghp_kga_import_snapshot(const ghp_kga_snapshot_t *snapshot, char *error, siz
         .edge_count = snapshot->edge_count,
         .unordered_identities = true,
         .prevalidated_unique_identities = true,
-        .prevalidated_rows = true,
+        .prevalidated_rows = false,
     };
     cbm_sdk_import_t *import = NULL;
     cbm_sdk_status_t begun = cbm_sdk_import_begin(&options, &import, error, error_size);

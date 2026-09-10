@@ -139,7 +139,7 @@ def test_cbm_runner_reuses_client_across_commit_plans(tmp_path, monkeypatch):
     monkeypatch.setattr(runner_module, "CBMClient", lambda *_args, **_kwargs: client)
     work = tmp_path / "work"
     work.mkdir()
-    (work / "current-sha").write_text("untrusted-legacy-state")
+    (work / "current-sha").write_text("unrelated-state")
     runner = CBMRunner(
         binary,
         "p",
@@ -277,5 +277,4 @@ def test_graph_reader_and_recorder_preserve_full_and_diff_generations(tmp_path):
     with Archive(archive_path) as archive:
         assert set(archive.load_rows("c1").nodes) == {"p", "p.a"}
         assert set(archive.load_rows("c2").nodes) == {"p", "p.b"}
-        archive.verify_snapshot("c1")
-        archive.verify_snapshot("c2")
+        archive.verify()

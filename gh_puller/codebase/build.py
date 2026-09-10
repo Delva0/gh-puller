@@ -23,14 +23,7 @@ from dataclasses import dataclass, field
 from hashlib import sha256
 from pathlib import Path
 
-from .archive import (
-    FORMAT_VERSION,
-    GRAPH_FIDELITY_VERSION,
-    Archive,
-    ArchiveError,
-    KGACommit,
-    KGARecorder,
-)
+from .archive import Archive, ArchiveError, KGACommit, KGARecorder
 from .cbm import (
     BuildPlan,
     CBMBinaryError,
@@ -205,11 +198,10 @@ def build_commit(
     timings = {}
     started = time.monotonic()
     _stage(on_stage, "materialize")
-    changed_files = (
-        len(changed_paths(repo_path, target.previous_sha, target.sha))
-        if target.previous_sha is not None
-        else None
-    )
+    parent_changed_files = {
+        parent: len(changed_paths(repo_path, parent, target.sha)) for parent in target.parents
+    }
+    changed_files = next(iter(parent_changed_files.values())) if len(parent_changed_files) == 1 else None
     materialize_full(repo_path, target.sha, runner.tree)
     timings["materialize_seconds"] = time.monotonic() - started
 
@@ -248,6 +240,7 @@ def build_commit(
         "cbm_force_full": plan.force_full,
         "cbm_engine_sha256": runner.engine.sha256,
         "cbm_engine_transport": runner.transport_name,
+        "git_parent_changed_files": parent_changed_files,
     }
     manifest = recorder.append(
         KGACommit(target.ordinal, target.sha, target.parents, changed_files),
@@ -267,7 +260,7 @@ def build_commit(
 # --- Repository pipeline ---
 
 
-def _legacy_plan(options: BuildOptions) -> BuildPlan:
+def _constant_plan(options: BuildOptions) -> BuildPlan:
     try:
         return BuildPlan(
             analysis_mode=options.mode,
@@ -283,12 +276,12 @@ def build_archive(options: BuildOptions) -> int:
     """Build all selected repository commits with one constant plan.
 
     Args:
-        options: Repository, destination, CBM identity, and legacy constant plan.
+        options: Repository, destination, CBM identity, and constant build plan.
 
     Returns:
         Zero after the final archive and summary pass verification.
     """
-    return build_repository(options, _legacy_plan(options))
+    return build_repository(options, _constant_plan(options))
 
 
 def build_repository(options: BuildOptions, plans: PlanSelector) -> int:
@@ -409,32 +402,26 @@ def prepare_output_dir(build_dir: str | Path, out_dir: str | Path | None) -> Pat
     return destination
 
 
-def _incremental_metadata(config: IncrementalConfig) -> dict:
-    return BuildPlan(incremental=config).metadata()["cbm_incremental"]
-
-
 def _validate_resume_engine(last_item: dict | None, digest: str, allow_upgrade: bool) -> bool:
     if last_item is None:
         return False
-    recorded = last_item.get("cbm_engine_sha256", last_item.get("cbm_binary_sha256"))
+    recorded = last_item.get("cbm_engine_sha256")
+    if recorded is None:
+        raise BuildError("archive does not record its CBM engine; use a new build directory")
     if recorded == digest:
         return False
     if allow_upgrade:
         return True
-    if recorded is None:
-        raise BuildError("archive predates CBM engine recording; resume once with --allow-cbm-upgrade")
     raise BuildError(
         "CBM engine differs from the archive: "
         f"recorded={recorded}, requested={digest}; use --allow-cbm-upgrade to accept a semantic boundary",
     )
 
 
-def _validate_resume_fidelity(last_item: dict | None, project: str) -> None:
+def _validate_resume_project(last_item: dict | None, project: str) -> None:
     if last_item is None:
         return
-    if last_item.get("graph_fidelity_version") != GRAPH_FIDELITY_VERSION:
-        raise BuildError("archive has not passed the one-time graph fidelity migration")
-    recorded = last_item.get("cbm_project")
+    recorded = last_item.get("project")
     if recorded != project:
         raise BuildError(
             f"CBM project differs from the archive: recorded={recorded!r}, requested={project!r}",
@@ -497,13 +484,12 @@ def _build_repository(options: BuildOptions, build_dir: Path, plans: PlanSelecto
     if archive_complete and len(archived) == len(commits):
         with Archive(archive_path) as archive:
             archive.verify()
-            archive.verify_snapshot()
         print(json.dumps({"archive": str(archive_path), "commits": len(archived), "verified": True}))
         return 0
 
     identity = sha256(f"gh-puller-codebase:{repo}:{build_dir}".encode()).hexdigest()[:12]
     project = options.project_name or f"cbm-archive-{_slug(repo.name)}-{identity}"
-    _validate_resume_fidelity(last_item, project)
+    _validate_resume_project(last_item, project)
     cbm_binary = None
     if options.cbm_transport != "native":
         try:
@@ -595,7 +581,6 @@ def _build_repository(options: BuildOptions, build_dir: Path, plans: PlanSelecto
         )
         with Archive(archive_path) as archive:
             archive.verify_index()
-            archive.verify_snapshot()
             archive_count = len(archive)
         progress.render("cleanup")
         cleanup_ok, cleanup_detail = runner.delete_project()
@@ -606,8 +591,7 @@ def _build_repository(options: BuildOptions, build_dir: Path, plans: PlanSelecto
         runner.close()
         runner = None
         summary = {
-            "archive_format_version": FORMAT_VERSION,
-            "format": "merkle-module-shards-v1",
+            "format": "kga",
             "repo": str(repo),
             "head": commits[-1][0],
             "source_head": source_head,
@@ -686,7 +670,7 @@ def add_build_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--allow-cbm-upgrade",
         action="store_true",
-        help="resume across a changed or previously unrecorded CBM engine identity",
+        help="resume after explicitly accepting a changed CBM engine identity",
     )
     add_incremental_arguments(parser)
 
@@ -719,7 +703,7 @@ def _options_from_namespace(args: argparse.Namespace) -> BuildOptions:
 
 
 def build(args: argparse.Namespace) -> int:
-    """Run the legacy namespace entry point through the repository pipeline.
+    """Run a parsed namespace through the repository pipeline.
 
     Args:
         args: Namespace populated by :func:`add_build_arguments`.

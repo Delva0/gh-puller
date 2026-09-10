@@ -7,11 +7,8 @@ import pytest
 from gh_puller.codebase.store import (
     CoverageSnapshot,
     ExtractionError,
-    GraphRows,
     load_coverage,
     load_rows,
-    validate_coverage,
-    validate_rows,
 )
 
 SCHEMA = """
@@ -62,7 +59,6 @@ def test_load_rows_preserves_full_names_and_opaque_strings(tmp_path):
     assert rows.edges == {
         ("p", "p.a", "CONTAINS", ""): {"properties": {"qualified_name": "p.a"}},
     }
-    validate_rows(rows, "p")
 
 
 def test_load_rows_rejects_ambiguous_property_json(tmp_path):
@@ -73,16 +69,8 @@ def test_load_rows_rejects_ambiguous_property_json(tmp_path):
         load_rows(path, "p")
 
 
-@pytest.mark.parametrize(
-    ("column", "message"),
-    [
-        ("file_path", "invalid file path"),
-        ("start_line", "invalid source lines"),
-        ("end_line", "invalid source lines"),
-        ("properties", "unsupported type NoneType"),
-    ],
-)
-def test_load_rows_rejects_null_fields_instead_of_filling(tmp_path, column, message):
+@pytest.mark.parametrize("column", ["file_path", "start_line", "end_line"])
+def test_load_rows_does_not_apply_cbm_row_validation(tmp_path, column):
     path = tmp_path / "graph.db"
     write_store(path, "{}")
     with sqlite3.connect(path) as connection, connection:
@@ -90,36 +78,26 @@ def test_load_rows_rejects_null_fields_instead_of_filling(tmp_path, column, mess
             f"UPDATE nodes SET {column}=NULL WHERE qualified_name='p.a'",  # noqa: S608 - fixed columns.
         )
 
-    with pytest.raises(ExtractionError, match=message):
+    assert load_rows(path, "p").nodes["p.a"][column] is None
+
+
+def test_load_rows_requires_properties_to_be_json_objects(tmp_path):
+    path = tmp_path / "graph.db"
+    write_store(path, "{}")
+    with sqlite3.connect(path) as connection, connection:
+        connection.execute("UPDATE nodes SET properties=NULL WHERE qualified_name='p.a'")
+
+    with pytest.raises(ExtractionError, match="unsupported type NoneType"):
         load_rows(path, "p")
 
 
-def test_load_rows_rejects_invalid_stored_edge_endpoints(tmp_path):
+def test_load_rows_does_not_prevalidate_stored_edge_endpoints(tmp_path):
     path = tmp_path / "graph.db"
     write_store(path, "{}")
     with sqlite3.connect(path) as connection, connection:
         connection.execute("DELETE FROM nodes WHERE qualified_name='p.a'")
 
-    with pytest.raises(ExtractionError, match="1 invalid edge endpoints"):
-        load_rows(path, "p")
-
-
-def test_validate_rows_rejects_edge_identity_drift():
-    node = {
-        "label": "Project",
-        "name": "p",
-        "file_path": "",
-        "start_line": 0,
-        "end_line": 0,
-        "properties": {},
-    }
-    rows = GraphRows(
-        {"p": node},
-        {("p", "p", "IMPORTS", "recorded"): {"properties": {"local_name": "actual"}}},
-    )
-
-    with pytest.raises(ExtractionError, match="inconsistent identity"):
-        validate_rows(rows, "p")
+    assert load_rows(path, "p").edges == {}
 
 
 def test_load_coverage_preserves_rows_and_generation_metadata(tmp_path):
@@ -161,4 +139,3 @@ def test_load_coverage_preserves_rows_and_generation_metadata(tmp_path):
             "hash_records_complete": True,
         },
     )
-    validate_coverage(coverage, "p")

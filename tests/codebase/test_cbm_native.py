@@ -14,14 +14,7 @@ from gh_puller.codebase import (
     CBMTransportError,
     IncrementalConfig,
 )
-from gh_puller.codebase.archive import (
-    COVERAGE_FIDELITY_VERSION,
-    GRAPH_FIDELITY_VERSION,
-    RadixTree,
-    coverage_digest,
-    graph_digest,
-    materialization_digest,
-)
+from gh_puller.codebase.archive import RadixTree, coverage_digest, graph_digest, materialization_digest
 from gh_puller.codebase.store import GraphRows, load_coverage, load_rows
 
 _GRAPH_TOOLS = (
@@ -163,7 +156,7 @@ from pathlib import Path
 import sys
 
 if sys.argv[1:] == ["--version"]:
-    print("gh-puller-kga-materializer 1 kga=5 graph=2 coverage=1 store=1 sdk=3")
+    print("gh-puller-kga-materializer 2 store=1 sdk=3")
     raise SystemExit(0)
 if sys.argv[1:]:
     raise SystemExit(2)
@@ -181,9 +174,7 @@ print(json.dumps({"project": params["project"],
                   "graph_digest": params["graph_digest"],
                   "materialization_digest": params["materialization_digest"],
                   "nodes": params["node_count"], "edges": params["edge_count"],
-                  "graph_fidelity": params["graph_fidelity"],
                   "coverage_rows": params["coverage_count"],
-                  "coverage_fidelity": params["coverage_fidelity"],
                   "materialized": not params["reuse"]}))
 """,
     )
@@ -254,8 +245,7 @@ def write_archive(
         "nodes": len(rows.nodes),
         "edges": len(rows.edges),
         "graph_digest": graph_digest(node_root, edge_root),
-        "graph_fidelity_version": GRAPH_FIDELITY_VERSION,
-        "cbm_project": project,
+        "project": project,
     }
     if with_coverage:
         coverage_rows = {
@@ -285,7 +275,6 @@ def write_archive(
                     manifest["graph_digest"],
                     coverage_identity,
                 ),
-                "coverage_fidelity_version": COVERAGE_FIDELITY_VERSION,
             },
         )
     writer.commit(manifest)
@@ -334,8 +323,7 @@ def write_missharded_archive(path: Path) -> None:
             "nodes": 1,
             "edges": 0,
             "graph_digest": graph_digest(node_root, None),
-            "graph_fidelity_version": GRAPH_FIDELITY_VERSION,
-            "cbm_project": "__project__",
+            "project": "__project__",
         },
     )
     writer.finalize()
@@ -379,8 +367,37 @@ def write_mismatched_import_archive(path: Path) -> None:
             "nodes": len(nodes),
             "edges": len(edges),
             "graph_digest": graph_digest(node_root, edge_root),
-            "graph_fidelity_version": GRAPH_FIDELITY_VERSION,
-            "cbm_project": project,
+            "project": project,
+        },
+    )
+    writer.finalize()
+
+
+def write_dangling_archive(path: Path) -> None:
+    project = "dangling-native"
+    node = {
+        "label": "Project",
+        "name": project,
+        "file_path": "",
+        "start_line": 0,
+        "end_line": 0,
+        "properties": {},
+    }
+    writer = ArchiveWriter(path)
+    node_root = RadixTree(writer, "nodes").build({project: node}.items())
+    edge_root = RadixTree(writer, "edges").build(
+        {(project, f"{project}.missing", "CONTAINS", ""): {"properties": {}}}.items(),
+    )
+    writer.commit(
+        {
+            "sha": "dangling",
+            "parents": [],
+            "node_root": node_root.to_json(),
+            "edge_root": edge_root.to_json(),
+            "nodes": 1,
+            "edges": 1,
+            "graph_digest": graph_digest(node_root, edge_root),
+            "project": project,
         },
     )
     writer.finalize()
@@ -420,7 +437,6 @@ def test_archive_materializer_keeps_graph_rows_out_of_python(tmp_path, monkeypat
     assert store.database_path.is_file()
     assert request["params"]["node_root"] == manifest["node_root"]
     assert request["params"]["edge_root"] == manifest["edge_root"]
-    assert request["params"]["coverage_fidelity"] == 0
     assert request["params"]["coverage_root"] is None
     assert request["params"]["coverage_metadata"] is None
     assert queried["rows"] == [["native", "native-test"]]
@@ -473,7 +489,6 @@ def test_native_identity_includes_coverage_snapshot(tmp_path):
 
         assert first_store.database_path != second_store.database_path
         assert second_store.coverage_rows == 2
-        assert second_store.coverage_fidelity == COVERAGE_FIDELITY_VERSION
         with pytest.raises(CBMTransportError, match="no longer active"):
             client.query_graph(first, query="MATCH (n) RETURN n")
 
@@ -876,7 +891,6 @@ def test_real_materializer_restores_exact_rows_and_reuses_cache(tmp_path):
     assert store.graph_digest == manifest["graph_digest"]
     assert store.materialization_digest == manifest["materialization_digest"]
     assert store.coverage_rows == manifest["coverage_rows"]
-    assert store.coverage_fidelity == COVERAGE_FIDELITY_VERSION
     assert restored == expected
     assert restored_coverage is not None
     assert restored_coverage.rows == {
@@ -1001,7 +1015,22 @@ def test_real_materializer_rejects_mismatched_import_identity(tmp_path):
     write_mismatched_import_archive(archive_path)
 
     adapter = CBMArchiveAdapter(Path(configured), tmp_path / "cache", 30)
-    with pytest.raises(ArchiveError, match="invalid edge properties in KGA leaf"):
+    with pytest.raises(ArchiveError, match="edge 1 is invalid"):
+        adapter.materialize(archive_path)
+
+
+@pytest.mark.integration
+def test_real_materializer_leaves_endpoint_validation_to_cbm(tmp_path):
+    configured = os.environ.get("GH_PULLER_TEST_KGA_MATERIALIZER")
+    if configured is None:
+        pytest.skip("real KGA materializer not configured")
+    archive_path = tmp_path / "archive.kga"
+    write_dangling_archive(archive_path)
+
+    with Archive(archive_path) as archive:
+        archive.verify()
+    adapter = CBMArchiveAdapter(Path(configured), tmp_path / "cache", 30)
+    with pytest.raises(ArchiveError, match="edge 1 has a missing endpoint"):
         adapter.materialize(archive_path)
 
 
@@ -1037,8 +1066,7 @@ def test_real_materializer_reads_captured_prefix_while_writer_appends(tmp_path):
             "nodes": 1,
             "edges": 0,
             "graph_digest": graph_digest(node_root, None),
-            "graph_fidelity_version": GRAPH_FIDELITY_VERSION,
-            "cbm_project": project,
+            "project": project,
         },
     )
     captured = Archive(archive_path, allow_incomplete=True)

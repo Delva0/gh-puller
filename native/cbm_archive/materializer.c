@@ -20,10 +20,7 @@
 #include <yyjson/yyjson.h>
 
 enum {
-    MATERIALIZER_PROTOCOL_VERSION = 1,
-    KGA_FORMAT_VERSION = 5,
-    KGA_GRAPH_FIDELITY_VERSION = 2,
-    KGA_COVERAGE_FIDELITY_VERSION = 1,
+    MATERIALIZER_PROTOCOL_VERSION = 2,
     REQUEST_MAX_BYTES = 8 << 20,
 };
 
@@ -97,22 +94,15 @@ static bool parse_root(yyjson_val *value, ghp_kga_root_t *root) {
     return true;
 }
 
-static bool parse_coverage_metadata(yyjson_val *value, const char *project,
-                                    ghp_kga_coverage_meta_t *metadata) {
-    const char *metadata_project = NULL;
+static bool parse_coverage_metadata(yyjson_val *value, ghp_kga_coverage_meta_t *metadata) {
     if (!yyjson_is_obj(value) ||
-        !(metadata_project = json_string(yyjson_obj_get(value, "project"))) ||
-        strcmp(metadata_project, project) != 0 ||
-        !json_string(yyjson_obj_get(value, "generation")) ||
         !(metadata->index_mode = json_string(yyjson_obj_get(value, "index_mode"))) ||
         !(metadata->recorded_at = json_string(yyjson_obj_get(value, "recorded_at"))) ||
         !(metadata->recording_status = json_string(yyjson_obj_get(value, "recording_status"))) ||
         !json_int(yyjson_obj_get(value, "ignored_files_stored"), &metadata->ignored_files_stored) ||
         !json_int(yyjson_obj_get(value, "ignored_files_total"), &metadata->ignored_files_total) ||
         !json_int(yyjson_obj_get(value, "coverage_version"), &metadata->coverage_version) ||
-        !yyjson_is_bool(yyjson_obj_get(value, "hash_records_complete")) ||
-        metadata->ignored_files_stored < 0 || metadata->ignored_files_total < 0 ||
-        metadata->coverage_version < 1) {
+        !yyjson_is_bool(yyjson_obj_get(value, "hash_records_complete"))) {
         return false;
     }
     metadata->hash_records_complete =
@@ -125,8 +115,6 @@ static bool parse_snapshot(yyjson_val *parameters, ghp_kga_snapshot_t *snapshot,
     uint64_t device = 0;
     uint64_t inode = 0;
     uint64_t captured_size = 0;
-    int fidelity = 0;
-    int coverage_fidelity = 0;
     if (!yyjson_is_obj(parameters) ||
         !(snapshot->archive_path = json_string(yyjson_obj_get(parameters, "archive_path"))) ||
         !json_u64(yyjson_obj_get(parameters, "archive_device"), &device) ||
@@ -141,9 +129,6 @@ static bool parse_snapshot(yyjson_val *parameters, ghp_kga_snapshot_t *snapshot,
         !(snapshot->database_path = json_string(yyjson_obj_get(parameters, "database_path"))) ||
         !json_int(yyjson_obj_get(parameters, "node_count"), &snapshot->node_count) ||
         !json_int(yyjson_obj_get(parameters, "edge_count"), &snapshot->edge_count) ||
-        !json_int(yyjson_obj_get(parameters, "graph_fidelity"), &fidelity) ||
-        fidelity != KGA_GRAPH_FIDELITY_VERSION ||
-        !json_int(yyjson_obj_get(parameters, "coverage_fidelity"), &coverage_fidelity) ||
         !json_int(yyjson_obj_get(parameters, "coverage_count"), &snapshot->coverage_count) ||
         !parse_root(yyjson_obj_get(parameters, "node_root"), &snapshot->node_root) ||
         !parse_root(yyjson_obj_get(parameters, "edge_root"), &snapshot->edge_root) ||
@@ -151,24 +136,20 @@ static bool parse_snapshot(yyjson_val *parameters, ghp_kga_snapshot_t *snapshot,
         return false;
     }
     yyjson_val *coverage_metadata = yyjson_obj_get(parameters, "coverage_metadata");
-    if (coverage_fidelity == 0) {
+    if (yyjson_is_null(coverage_metadata)) {
         if (snapshot->coverage_count != 0 || snapshot->coverage_root.present ||
-            !yyjson_is_null(coverage_metadata) ||
             strcmp(snapshot->materialization_digest, snapshot->graph_digest) != 0) {
             return false;
         }
-    } else if (coverage_fidelity == KGA_COVERAGE_FIDELITY_VERSION) {
+    } else {
         snapshot->coverage_present = true;
         if (snapshot->coverage_count < 0 ||
             snapshot->coverage_root.present != (snapshot->coverage_count > 0) ||
             (snapshot->coverage_root.present &&
              snapshot->coverage_root.count != (uint64_t)snapshot->coverage_count) ||
-            !parse_coverage_metadata(coverage_metadata, snapshot->project,
-                                     &snapshot->coverage_meta)) {
+            !parse_coverage_metadata(coverage_metadata, &snapshot->coverage_meta)) {
             return false;
         }
-    } else {
-        return false;
     }
     yyjson_val *reuse_value = yyjson_obj_get(parameters, "reuse");
     if (reuse_value && !yyjson_is_bool(reuse_value)) {
@@ -231,9 +212,6 @@ static int materialize(yyjson_val *parameters) {
     yyjson_mut_obj_add_int(document, result, "nodes", snapshot.node_count);
     yyjson_mut_obj_add_int(document, result, "edges", snapshot.edge_count);
     yyjson_mut_obj_add_int(document, result, "coverage_rows", snapshot.coverage_count);
-    yyjson_mut_obj_add_int(document, result, "graph_fidelity", KGA_GRAPH_FIDELITY_VERSION);
-    yyjson_mut_obj_add_int(document, result, "coverage_fidelity",
-                           snapshot.coverage_present ? KGA_COVERAGE_FIDELITY_VERSION : 0);
     yyjson_mut_obj_add_bool(document, result, "materialized", materialized);
     char *json = yyjson_mut_write(document, YYJSON_WRITE_NOFLAG, NULL);
     yyjson_mut_doc_free(document);
@@ -248,9 +226,8 @@ static int materialize(yyjson_val *parameters) {
 
 int main(int argc, char **argv) {
     if (argc == 2 && strcmp(argv[1], "--version") == 0) {
-        (void)printf("gh-puller-kga-materializer %d kga=%d graph=%d coverage=%d store=%d sdk=%d\n",
-                     MATERIALIZER_PROTOCOL_VERSION, KGA_FORMAT_VERSION, KGA_GRAPH_FIDELITY_VERSION,
-                     KGA_COVERAGE_FIDELITY_VERSION, cbm_sdk_store_format_version(),
+        (void)printf("gh-puller-kga-materializer %d store=%d sdk=%d\n",
+                     MATERIALIZER_PROTOCOL_VERSION, cbm_sdk_store_format_version(),
                      cbm_sdk_abi_version());
         return 0;
     }
