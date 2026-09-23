@@ -4,12 +4,13 @@ import asyncio
 import json
 import os
 import socket
+import tempfile
 from pathlib import Path
 from urllib.parse import urlsplit
 
 from .. import envs
 from ..utils import _log as _utils_log
-from .events import EventBus, _put_event, is_compact_event, set_active_bus, truncate
+from .events import DELTA_TYPES, EventBus, _put_event, set_active_bus, truncate
 
 
 def _file_stem(session: str) -> str:
@@ -34,20 +35,20 @@ def _log(msg: str) -> None:
 class FileSink:
     """Write one flat JSONL log per session.
 
-    Compact logs omit only model deltas, so replayed request state is identical to the
-    raw stream. Events before ``session/start`` are ignored.
+    Live logs retain every event. After flushing ``session/end``, atomically replace
+    the log with a copy omitting only model deltas, without changing retained bytes
+    or sequence numbers. Existing readers can finish the complete stream through
+    their open handles. Incomplete sessions and failed compactions retain the full
+    log. Events outside ``session/start`` through ``session/end`` are ignored.
     """
 
-    def __init__(self, root: str, *, raw: bool = False):
+    def __init__(self, root: str):
         self.root = Path(root)
-        self.raw = raw
         self._files: dict[str, Path] = {}
         self.root.mkdir(parents=True, exist_ok=True)
 
     async def consume(self, evt: dict) -> None:
-        """Append one event line to the session file; non-stream only unless raw."""
-        if not self.raw and not is_compact_event(evt["type"]):
-            return
+        """Flush one full event, then compact a completed session off the event loop."""
         session = evt.get("session", "")
         if evt["type"] == "session/start":
             self._open(session)
@@ -57,6 +58,31 @@ class FileSink:
         with open(path, "a", encoding="utf-8") as f:  # noqa: ASYNC230 - Ordered append is synchronous.
             f.write(json.dumps(evt, ensure_ascii=False) + "\n")
             f.flush()
+        if evt["type"] == "session/end":
+            self._files.pop(session)
+            try:
+                await asyncio.to_thread(self._compact, path)
+            except (OSError, ValueError, TypeError) as exc:
+                _log(f"FileSink.compact failed {path}: {exc}; complete source log retained")
+
+    @staticmethod
+    def _compact(path: Path) -> None:
+        temporary = None
+        try:
+            with path.open("rb") as source, tempfile.NamedTemporaryFile(
+                mode="wb", dir=path.parent, prefix=f".{path.name}.", suffix=".tmp", delete=False,
+            ) as target:
+                temporary = Path(target.name)
+                os.chmod(temporary, path.stat().st_mode)
+                for line in source:
+                    if json.loads(line).get("type") not in DELTA_TYPES:
+                        target.write(line)
+                target.flush()
+                os.fsync(target.fileno())
+            os.replace(temporary, path)
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
 
     def _open(self, session: str) -> None:
         """Register the session file (created on session/start)."""
@@ -445,7 +471,6 @@ def _default_otel_urls() -> list[str]:
 _cfg = {
     # FileSink is always on; file_dir redirects its output for isolation and embedding.
     "file_dir": envs.AGENT_MONITOR_DIR,
-    "raw": envs.AGENT_MONITOR_FILE_RAW,
     "ws_urls": _split_urls(envs.AGENT_MONITOR_WEBUI_URL),
     "otel_urls": _default_otel_urls(),
 }
@@ -454,7 +479,7 @@ _file_sinks: list[FileSink] = []
 _ws_sinks: list[WsSink] = []
 
 
-def configure(*, file_dir=None, ws_urls=None, otel_urls=None, raw=None) -> None:
+def configure(*, file_dir=None, ws_urls=None, otel_urls=None) -> None:
     """Reconfigure monitoring (tests/embedding); defaults re-read env constants, effective on the next publish.
 
     Closes the old bus (cancels sink tasks); the new config rebuilds lazily — idempotent.
@@ -466,12 +491,9 @@ def configure(*, file_dir=None, ws_urls=None, otel_urls=None, raw=None) -> None:
             empty deploys none (one sink instance per URL).
         otel_urls: URL list or comma-separated string; None re-reads the whole
             _OTEL_BACKENDS table; empty disables OTel sinks.
-        raw: True writes model deltas; None re-reads AGENT_MONITOR_FILE_RAW;
-            False writes the compact replay-equivalent stream.
     """
     shutdown()
     _cfg["file_dir"] = envs.AGENT_MONITOR_DIR if file_dir is None else file_dir
-    _cfg["raw"] = envs.AGENT_MONITOR_FILE_RAW if raw is None else bool(raw)
     _cfg["ws_urls"] = _split_urls(envs.AGENT_MONITOR_WEBUI_URL if ws_urls is None else ws_urls)
     _cfg["otel_urls"] = _default_otel_urls() if otel_urls is None else _split_urls(otel_urls)
 
@@ -511,9 +533,9 @@ def ensure_bus() -> EventBus:
     global _bus, _file_sinks, _ws_sinks
     if _bus is None:
         b = EventBus()
-        fs = FileSink(_cfg["file_dir"], raw=_cfg["raw"])
+        fs = FileSink(_cfg["file_dir"])
         _file_sinks.append(fs)
-        b.add(fs.consume, lossless=_cfg["raw"])
+        b.add(fs.consume, lossless=True)
         for url in _cfg["ws_urls"]:
             if not _url_reachable(url):
                 _log(f"ws sink 未启用: 端口不可达 {url}")

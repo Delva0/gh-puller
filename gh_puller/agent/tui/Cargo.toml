@@ -1,0 +1,24 @@
+[package]
+name = "agent-tui"
+version = "0.1.0"
+edition = "2024"
+description = "Read-only canonical Agent event observer"
+license = "MIT"
+
+[dependencies]
+ratatui = { version = "=0.30.2", default-features = false, features = ["crossterm"] }
+crossterm = "=0.29.0"
+serde = { version = "1", features = ["derive", "rc"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+tiktoken-rs = "0.9"
+pulldown-cmark = "0.13"
+unicode-width = "0.2"
+unicode-segmentation = "1"
+base64 = "0.22"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

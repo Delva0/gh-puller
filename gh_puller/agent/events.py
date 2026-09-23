@@ -827,7 +827,7 @@ class EventBus:
         Args:
             consume: Coroutine function accepting one event envelope.
             lossless: Retain model deltas even when this consumer falls behind.
-                Intended for explicitly requested raw recording.
+                Required by file consumers that compact only after session end.
         """
         queue: asyncio.Queue[dict] = asyncio.Queue()
         self._sinks.append((queue, lossless))

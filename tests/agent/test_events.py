@@ -13,7 +13,7 @@ from opentelemetry.trace import StatusCode
 from gh_puller import agent
 from gh_puller.agent import sinks
 from gh_puller.agent.events import EventBus, EventRecorder, fold_state, set_active_bus, text_message
-from gh_puller.agent.sinks import FileSink, OtelSink
+from gh_puller.agent.sinks import OtelSink
 from tests.agent._support import (
     capture as _capture,
 )
@@ -191,33 +191,6 @@ async def test_base_agent_records_config_without_inferring_context(tmp_path) -> 
         "agent": "bare", "config": config,
     }
     assert not any(event["type"].startswith("context/") for event in events)
-
-
-@pytest.mark.asyncio
-async def test_file_sink_compact_and_raw_have_identical_state(tmp_path) -> None:
-    compact = FileSink(str(tmp_path / "compact"))
-    raw = FileSink(str(tmp_path / "raw"), raw=True)
-    events = [
-        _event("session/start", 0, label="x"),
-        _event("agent/set", 1, agent="x", config={"model": "m"}),
-        _event("context/append/user", 2, items=[text_message("user", "q")]),
-        _event("model/request", 3, requestId="r1"),
-        _event("model/delta/text", 4, requestId="r1", index=0, text="a"),
-        _event("context/append/assistant", 5, items=[text_message("assistant", "a")]),
-        _event("session/end", 6, outcome="completed", durationMs=1),
-    ]
-    for event in events:
-        await compact.consume(event)
-        await raw.consume(event)
-    compact_events = [json.loads(line) for line in (tmp_path / "compact" / "s.jsonl")
-                      .read_text(encoding="utf-8").splitlines()]
-    raw_events = [json.loads(line) for line in (tmp_path / "raw" / "s.jsonl")
-                  .read_text(encoding="utf-8").splitlines()]
-    assert [event["type"] for event in compact_events] == [
-        "session/start", "agent/set", "context/append/user", "model/request",
-        "context/append/assistant", "session/end",
-    ]
-    assert fold_state(compact_events) == fold_state(raw_events)
 
 
 @pytest.mark.asyncio

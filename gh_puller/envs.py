@@ -31,8 +31,6 @@ CHAT_TOKEN_LIMIT_ESTIMATE = int(os.environ.get("DEEPWIKI_CHAT_TOKEN_LIMIT", "750
 
 # The file sink and monitor hub share this flat directory of session JSONL files.
 AGENT_MONITOR_DIR = _path("AGENT_MONITOR_DIR", "~/.gh-puller/generator-sessions")
-# Compact logs omit model deltas; raw logs retain the complete event sequence.
-AGENT_MONITOR_FILE_RAW = os.environ.get("AGENT_MONITOR_FILE_RAW", "0") == "1"
 AGENT_MONITOR_WEBUI_URL = os.environ.get("AGENT_MONITOR_WEBUI_URL", "ws://localhost:8765/ws")
 # Zero disables heartbeats; the monitor lease should remain several times longer.
 AGENT_MONITOR_HEARTBEAT_SECS = int(os.environ.get("AGENT_MONITOR_HEARTBEAT_SECS", "30"))

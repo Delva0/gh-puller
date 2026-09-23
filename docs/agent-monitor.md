@@ -147,7 +147,7 @@ Sources: [gh_puller/agent/](../gh_puller/agent/); [tests/agent/](../tests/agent/
 ```mermaid
 flowchart TD
     Adapter[Agent adapter] --> Bus[Canonical event bus]
-    Bus --> File[Compact JSONL]
+    Bus --> File[Live JSONL → compact at session end]
     Bus --> Live[Live WebSocket]
     File --> Hub[Local sidecar]
     Live --> Hub
@@ -157,8 +157,18 @@ flowchart TD
     Fold --> Events[Event list]
 ```
 
-JSONL is the durable source. Compact files omit only `model/delta/*`; all state-changing
-and terminal facts remain. The sidecar indexes files, maintains leases, and forwards
+JSONL is the durable source. File consumers use lossless queues and flush every event,
+including all three canonical model delta types. After flushing `session/end`, the sink
+streams retained lines into a same-directory temporary file and atomically replaces the
+log. Only `DELTA_TYPES` are removed; retained bytes, order and sequence numbers stay intact.
+Open readers can finish the full stream through their existing handles. New readers see
+compact history. Sessions without an end event remain complete live logs; compaction
+failures are reported and preserve the source. There is no storage mode setting.
+
+The [Rust terminal observer](../gh_puller/agent/tui/README.md) tails one file and reconstructs
+the canonical context without backend-specific inference.
+
+The sidecar indexes files, maintains leases, and forwards
 events without interpreting Item semantics. The browser folds `Item[]` directly and
 uses the same Item renderer for committed Context and live delta projections.
 
