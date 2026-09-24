@@ -65,6 +65,7 @@ pub struct Card {
     pub text: String,
     pub arguments: String,
     pub result: Option<String>,
+    pub recorded_result: Option<Arc<str>>,
     pub tokens: usize,
     pub provisional: bool,
     pub status: String,
@@ -92,6 +93,7 @@ impl Card {
             text: String::new(),
             arguments: String::new(),
             result: None,
+            recorded_result: None,
             tokens: 0,
             provisional: false,
             status: String::new(),
@@ -116,13 +118,50 @@ impl Card {
             } else {
                 &self.arguments
             };
-            format!(
-                "```json\n{args}\n```\n\n{}",
-                self.result.as_deref().unwrap_or("No result in context")
-            )
+            let results = self
+                .result_versions()
+                .into_iter()
+                .map(|(label, text)| {
+                    let body = if serde_json::from_str::<Value>(text).is_ok() {
+                        format!("```json\n{text}\n```")
+                    } else {
+                        text.to_string()
+                    };
+                    if label.is_empty() {
+                        body
+                    } else {
+                        format!("### {label}\n\n{body}")
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            format!("```json\n{args}\n```\n\n{results}")
         } else {
             self.text.clone()
         }
+    }
+    fn result_versions(&self) -> Vec<(&str, &str)> {
+        let Some(current) = self.result.as_deref() else {
+            return vec![("", "No result in context")];
+        };
+        if let Some(recorded) = self.recorded_result.as_deref().filter(|r| *r != current) {
+            vec![("Recorded result", recorded), ("Current context", current)]
+        } else {
+            vec![("", current)]
+        }
+    }
+    pub fn result_text(&self) -> String {
+        self.result_versions()
+            .into_iter()
+            .map(|(label, text)| {
+                if label.is_empty() {
+                    text.to_string()
+                } else {
+                    format!("{label}\n{text}")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n")
     }
 }
 
@@ -159,7 +198,26 @@ pub struct Model {
     current_request: String,
     pending: HashMap<String, Vec<String>>,
     current_group: Vec<String>,
+    recorded_results: HashMap<String, Arc<str>>,
     origin: Option<f64>,
+}
+
+pub fn duration(ms: f64) -> String {
+    let seconds = ms.max(0.0) / 1000.0;
+    if seconds < 59.995 {
+        return format!("{seconds:.2}s");
+    }
+    let seconds = seconds.round() as u64;
+    if seconds < 3600 {
+        format!("{}m {:02}s", seconds / 60, seconds % 60)
+    } else {
+        format!(
+            "{}h {:02}m {:02}s",
+            seconds / 3600,
+            seconds / 60 % 60,
+            seconds % 60
+        )
+    }
 }
 
 pub fn pretty(v: &Value) -> String {
@@ -244,6 +302,7 @@ impl Model {
             current_request: String::new(),
             pending: HashMap::new(),
             current_group: vec![],
+            recorded_results: HashMap::new(),
             origin: None,
         }
     }
@@ -314,6 +373,12 @@ impl Model {
             "function_call_output" => {
                 c.call_id = call_id.into();
                 c.result = Some(pretty(&item["output"]));
+                c.recorded_result = Some(
+                    self.recorded_results
+                        .entry(call_id.into())
+                        .or_insert_with(|| Arc::from(c.result.as_deref().unwrap()))
+                        .clone(),
+                );
                 c.result_source = stats::raw(&item["output"]);
                 if c.status.is_empty() {
                     c.status = "Result received".into();
@@ -368,6 +433,12 @@ impl Model {
     }
     fn append(&mut self, items: &[Value]) {
         for item in items {
+            if item["type"] == "function_call_output" {
+                self.recorded_results.insert(
+                    item["call_id"].as_str().unwrap_or("").into(),
+                    Arc::from(pretty(&item["output"])),
+                );
+            }
             let reuse = self.staged(item);
             let id = self.project(item, reuse, self.current_group.clone());
             if let Some(pending) = self.pending.get_mut(&self.current_request) {
@@ -601,7 +672,7 @@ impl Model {
                         .as_f64()
                         .or_else(|| c.started.map(|s| (at - s).max(0.0)));
                     c.status = if d.get("error").is_some() {
-                        format!("Failed · {}", pretty(&d["error"]))
+                        "Failed".into()
                     } else {
                         "Completed".into()
                     };
@@ -636,7 +707,10 @@ impl Model {
                     },
                     reason => reason,
                 };
-                self.summary.status = format!("{status} · {:.2}s", at / 1000.0);
+                self.summary.status = format!(
+                    "{status} · session {}",
+                    duration(d["durationMs"].as_f64().unwrap_or(at))
+                );
                 for id in self.current_group.clone() {
                     if self.cards.get(&id).is_some_and(|c| c.duration_ms.is_none()) {
                         self.finish(&id, at, "Stopped");

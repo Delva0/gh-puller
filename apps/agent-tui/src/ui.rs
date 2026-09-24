@@ -1,7 +1,8 @@
 //! Virtualized cards, persistent reading anchors, and terminal-local interaction.
 use crate::{
     document::{self, Document, Job},
-    model::{Card, Change, Kind, Summary},
+    hyperlinks,
+    model::{Card, Change, Kind, Summary, duration},
     stats::number,
 };
 use base64::Engine;
@@ -356,13 +357,13 @@ mod tests {
         };
         assert_eq!(
             row(&terminal, 23).trim(),
-            format!("Completed · 2.33s  {}", app.summary.footer)
+            format!("Completed · session 2.33s  {}", app.summary.footer)
         );
         assert!(!row(&terminal, 22).contains("Completed"));
         app.notice = "A long notification ".repeat(10);
         terminal.draw(|f| app.render(f)).unwrap();
         let footer = row(&terminal, 23);
-        assert!(footer.trim().starts_with("Completed · 2.33s"));
+        assert!(footer.trim().starts_with("Completed · session 2.33s"));
         assert!(footer.trim().ends_with(&app.summary.footer));
     }
 
@@ -376,6 +377,124 @@ mod tests {
         assert_eq!(heights.total(), 300_005);
         assert_eq!(heights.locate(10), 1);
         assert_eq!(heights.locate(11), 2);
+    }
+
+    #[test]
+    fn expanded_cards_end_on_the_last_content_row() {
+        let (mut model, mut app) = fixture();
+        apply(
+            &mut model,
+            "context/set",
+            json!({"items":[
+                {"type":"message","role":"assistant","content":[{"type":"output_text","text":"One line."}]},
+                {"type":"function_call","call_id":"next","name":"read","arguments":"{}"}
+            ]}),
+        );
+        app.apply(model.change());
+        layout(&mut app);
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| app.render(f)).unwrap();
+        assert_eq!(app.heights.values, vec![2, 1]);
+        assert_eq!(
+            app.hits.iter().map(|h| h.y).collect::<Vec<_>>(),
+            vec![2, 3, 4]
+        );
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(0, 3)].symbol(), "╰");
+        assert_eq!(buffer[(2, 3)].symbol(), "O");
+        assert_eq!(buffer[(2, 4)].symbol(), "▸");
+    }
+
+    #[test]
+    fn tool_headers_show_only_failure_status_without_error_payloads() {
+        let (mut model, mut app) = fixture();
+        apply(
+            &mut model,
+            "tool/start",
+            json!({"callId":"c", "name":"read", "arguments":{}}),
+        );
+        app.apply(model.change());
+        assert!(
+            !app.title(&app.cards["tool:c"])
+                .to_string()
+                .contains("Running")
+        );
+        apply(
+            &mut model,
+            "tool/end",
+            json!({"callId":"c", "result":"done"}),
+        );
+        app.apply(model.change());
+        assert!(
+            !app.title(&app.cards["tool:c"])
+                .to_string()
+                .contains("Completed")
+        );
+        apply(
+            &mut model,
+            "tool/end",
+            json!({"callId":"c", "error":{"message":"long error"}}),
+        );
+        app.apply(model.change());
+        let title = app.title(&app.cards["tool:c"]).to_string();
+        assert!(title.ends_with(" · Failed"));
+        assert!(!title.contains("long error"));
+    }
+
+    #[test]
+    fn link_hit_targets_follow_unicode_wrapping_tables_and_horizontal_scroll() {
+        let (mut model, mut app) = fixture();
+        let source = "中 [**#16712**](https://example.com/16712) and [second](https://example.com/second).\n\n| PR | Note |\n|---|---|\n| [#16713](https://example.com/16713) | A wide table cell |";
+        apply(
+            &mut model,
+            "context/set",
+            json!({"items":[
+                {"type":"message","role":"assistant","content":[{"type":"output_text","text":source}]}
+            ]}),
+        );
+        app.apply(model.change());
+        let mut urls = HashSet::new();
+        for width in [75, 14] {
+            app.width = width;
+            layout(&mut app);
+            for horizontal in [0, 4] {
+                app.horizontal = horizontal;
+                let mut terminal = Terminal::new(TestBackend::new(width as u16 + 5, 30)).unwrap();
+                terminal.draw(|f| app.render(f)).unwrap();
+                let links = app.hyperlinks();
+                let url_at = |x, y| {
+                    links
+                        .iter()
+                        .find(|link| link.y == y && link.start <= x && x < link.end)
+                        .map(|link| link.url.as_str())
+                };
+                for hit in app.hits.iter().filter(|h| !h.title) {
+                    let mut column = 0;
+                    let doc = &app.docs[&hit.id];
+                    assert!(!doc.plain.contains("https://"));
+                    for (byte, g) in hit.text.grapheme_indices(true) {
+                        if column >= horizontal && column + g.width() <= horizontal + width {
+                            let expected = doc
+                                .links
+                                .iter()
+                                .find(|l| l.start <= hit.start + byte && hit.start + byte < l.end)
+                                .map(|l| l.url.as_str());
+                            let actual = url_at((column - horizontal + 2) as u16, hit.y);
+                            assert_eq!(actual, expected);
+                            if let Some(url) = actual {
+                                urls.insert(url.to_string());
+                            }
+                        }
+                        column += g.width();
+                    }
+                    assert!(url_at(0, hit.y).is_none());
+                    assert!(url_at(width as u16 + 2, hit.y).is_none());
+                }
+            }
+        }
+        assert_eq!(urls.len(), 3);
+        key(&mut app, KeyCode::Char('m'));
+        assert!(app.hyperlinks().is_empty());
     }
 }
 impl Heights {
@@ -500,7 +619,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("link", "Open link in card"),
     ("quit", "Quit"),
 ];
-const HELP: &str = "j/k ↑/↓        Scroll (pauses follow)\nPgUp/PgDn      Page up / down\nHome/End       Top / follow bottom\nTab/Shift-Tab  Next / previous card\nEnter/Space    Expand / collapse card\ne / E          Expand / collapse all\nh/l ←/→        Scroll horizontally\n/              Search text and tool names\nn / N          Next / previous match\n] / [          Next / previous turn\n} / {          Next / previous step\n!              Next error\nc / y          Copy selection or card / latest answer\ns              Token statistics\nt              Change theme\n: or Ctrl-P    Command palette\nm              Menu\no              Open first link in card\n? / F1         Help\nEsc            Close panel / clear selection\nq / Ctrl-C     Quit\n\nClick a title to toggle a card. Drag to select text.\nRight-click to copy. Scroll with the wheel or scrollbar.\nCopy uses OSC 52 with tmux passthrough.";
+const HELP: &str = "j/k ↑/↓        Scroll (pauses follow)\nPgUp/PgDn      Page up / down\nHome/End       Top / follow bottom\nTab/Shift-Tab  Next / previous card\nEnter/Space    Expand / collapse card\ne / E          Expand / collapse all\nh/l ←/→        Scroll horizontally\n/              Search text and tool names\nn / N          Next / previous match\n] / [          Next / previous turn\n} / {          Next / previous step\n!              Next error\nc / y          Copy selection or card / latest answer\ns              Token statistics\nt              Change theme\n: or Ctrl-P    Command palette\nm              Menu\no              Open first link in card\nCtrl+click     Open link under pointer\n? / F1         Help\nEsc            Close panel / clear selection\nq / Ctrl-C     Quit\n\nClick a title to toggle a card. Drag to select text.\nRight-click to copy. Scroll with the wheel or scrollbar.\nCopy uses OSC 52 with tmux passthrough.";
 
 impl App {
     pub fn new(path: String) -> Self {
@@ -558,9 +677,9 @@ impl App {
             .get(id)
             .filter(|d| d.width == self.width && d.expanded == open)
         {
-            return 2 + d.rows.len();
+            return 1 + d.rows.len();
         }
-        3
+        2
     }
     fn anchor(&self) -> Option<(String, usize, Option<usize>)> {
         if self.order.is_empty() {
@@ -759,7 +878,7 @@ impl App {
     fn title(&self, c: &Card) -> Line<'static> {
         let duration = c
             .duration_ms
-            .map(|n| format!(" · {:.2}s", n / 1000.0))
+            .map(|n| format!(" · {}", duration(n)))
             .unwrap_or_default();
         if c.kind.heading() {
             return Line::styled(
@@ -806,7 +925,7 @@ impl App {
                     number(c.tokens),
                     if c.provisional { " · Pending" } else { "" },
                     time,
-                    if c.status.is_empty() {
+                    if c.status.is_empty() || (c.kind == Kind::Tool && c.status != "Failed") {
                         String::new()
                     } else {
                         format!(" · {}", document::safe(&c.status).replace('\n', " "))
@@ -923,7 +1042,7 @@ impl App {
                             text: String::new(),
                             title: true,
                         });
-                    } else if row < height - 1 {
+                    } else {
                         if let Some(doc) =
                             self.docs.get(&id).filter(|d| d.expanded == self.open(&id))
                         {
@@ -1196,6 +1315,7 @@ impl App {
                         &c.text,
                         &c.arguments,
                         c.result.as_deref().unwrap_or(""),
+                        c.recorded_result.as_deref().unwrap_or(""),
                     ]
                     .iter()
                     .any(|s| s.to_lowercase().contains(&query))
@@ -1253,12 +1373,7 @@ impl App {
             self.focus.as_ref().and_then(|id| self.cards.get(id))
         }?;
         Some(if card.kind == Kind::Tool {
-            format!(
-                "{}\n{}\n{}",
-                card.name,
-                card.arguments,
-                card.result.as_deref().unwrap_or("")
-            )
+            format!("{}\n{}\n{}", card.name, card.arguments, card.result_text())
         } else {
             card.text.clone()
         })
@@ -1290,35 +1405,65 @@ impl App {
         let text = c.body(true);
         let url = pulldown_cmark::Parser::new(&text).find_map(|e| match e {
             pulldown_cmark::Event::Start(pulldown_cmark::Tag::Link { dest_url, .. })
-                if dest_url.starts_with("https://") || dest_url.starts_with("http://") =>
+                if document::web_link(&dest_url) =>
             {
                 Some(dest_url.into_string())
             }
             _ => None,
         });
         if let Some(url) = url {
-            let result = std::process::Command::new(if cfg!(target_os = "macos") {
-                "open"
-            } else {
-                "xdg-open"
-            })
-            .arg(&url)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn();
-            self.notice = match result {
-                Ok(mut child) => {
-                    std::thread::spawn(move || {
-                        let _ = child.wait();
-                    });
-                    format!("Opening {url}")
-                }
-                Err(e) => format!("Could not open link: {e}"),
-            };
+            self.open_link(&url);
         } else {
             self.notice = "No link in this card".into();
         }
+    }
+    fn open_link(&mut self, url: &str) {
+        let result = std::process::Command::new(if cfg!(target_os = "macos") {
+            "open"
+        } else {
+            "xdg-open"
+        })
+        .arg(url)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+        self.notice = match result {
+            Ok(mut child) => {
+                std::thread::spawn(move || {
+                    let _ = child.wait();
+                });
+                "Opening link".into()
+            }
+            Err(e) => format!("Could not open link: {e}"),
+        };
+    }
+    pub fn hyperlinks(&self) -> Vec<hyperlinks::Link> {
+        if self.panel.is_some() {
+            return vec![];
+        }
+        let mut links = vec![];
+        for hit in self.hits.iter().filter(|h| !h.title) {
+            let Some(doc) = self.docs.get(&hit.id) else {
+                continue;
+            };
+            let first = doc.links.partition_point(|link| link.end <= hit.start);
+            for link in doc.links[first..].iter().take_while(|l| l.start < hit.end) {
+                let start = doc.plain[hit.start..link.start.max(hit.start)].width();
+                let end = doc.plain[hit.start..link.end.min(hit.end)].width();
+                let start = start.saturating_sub(self.horizontal).min(self.width);
+                let end = end.saturating_sub(self.horizontal).min(self.width);
+                if start < end {
+                    links.push(hyperlinks::Link {
+                        y: hit.y,
+                        start: start as u16 + 2,
+                        end: end as u16 + 2,
+                        url: link.url.clone(),
+                    });
+                }
+            }
+        }
+        links
     }
     fn command(&mut self, command: &str) {
         match command {

@@ -1,6 +1,6 @@
 use agent_tui::{
     document::{self, Job},
-    model::{Event, Kind, Model},
+    model::{Event, Kind, Model, duration},
 };
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -185,10 +185,10 @@ fn terminal_status_reports_one_outcome_or_specific_failure_reason() {
     ] {
         let mut m = Model::new();
         apply(&mut m, "session/end", data, 2330.0);
-        assert_eq!(m.summary.status, format!("{expected} · 2.33s"));
+        assert_eq!(m.summary.status, format!("{expected} · session 2.33s"));
         apply(&mut m, "turn/start", json!({}), 3000.0);
         assert_eq!(m.summary.last_ms, 2330.0);
-        assert_eq!(m.summary.status, format!("{expected} · 2.33s"));
+        assert_eq!(m.summary.status, format!("{expected} · session 2.33s"));
     }
 }
 
@@ -198,7 +198,7 @@ fn tables_unicode_links_and_code_survive_layout_and_resize() {
     apply(
         &mut m,
         "context/append/assistant",
-        json!({"items":[message("assistant", "# 你好\n\n| 名称 | 值 |\n|---|---|\n| 测试 | `42` |\n\n[文档](https://example.com)\n\n```rust\nlet long_line = 123456789;\n```")]}),
+        json!({"items":[message("assistant", "# 你好\n\nA paragraph that wraps at the narrow width.\n\n| 名称 | 值 |\n|---|---|\n| 测试 | `42` |\n\n[文档](https://example.com)\n\n```rust\nlet long_line = 123456789;\n```")]}),
         0.0,
     );
     m.change();
@@ -215,7 +215,74 @@ fn tables_unicode_links_and_code_survive_layout_and_resize() {
     });
     assert_eq!(wide.plain, narrow.plain);
     assert!(wide.plain.contains("│ 测试 │ 42"));
-    assert!(wide.plain.contains("https://example.com"));
+    assert!(!wide.plain.contains("https://example.com"));
+    assert_eq!(wide.links[0].url, "https://example.com");
+    assert_eq!(&wide.plain[wide.links[0].start..wide.links[0].end], "文档");
     assert!(narrow.rows.iter().any(|r| r.line.width() > 10));
     assert!(narrow.rows.len() > wide.rows.len());
+}
+
+#[test]
+fn prior_results_survive_context_summaries_without_changing_the_fold_or_counts() {
+    let mut m = Model::new();
+    let call = json!({"type":"function_call", "call_id":"c", "name":"read", "arguments":"{}"});
+    let payload = "full content ".repeat(2000);
+    let original =
+        json!({"type":"function_call_output", "call_id":"c", "output":{"content":payload}});
+    let summary = json!({"type":"function_call_output", "call_id":"c", "output":"Short summary."});
+    apply(
+        &mut m,
+        "context/append",
+        json!({"items":[call.clone(), original]}),
+        0.0,
+    );
+    apply(
+        &mut m,
+        "tool/end",
+        json!({"callId":"c", "result":"activity only"}),
+        1.0,
+    );
+    apply(
+        &mut m,
+        "context/set",
+        json!({"items":[call.clone(), summary.clone()]}),
+        2.0,
+    );
+    m.change();
+    assert_eq!(m.context, vec![call.clone(), summary]);
+    let card = &m.cards["tool:c"];
+    assert_eq!(card.result.as_deref(), Some("Short summary."));
+    assert!(card.recorded_result.as_deref().unwrap().contains(&payload));
+    assert!(card.result_text().contains(&payload));
+    assert!(card.tokens < 20);
+    let doc = document::prepare(Job {
+        card: Arc::new(card.clone()),
+        width: 40,
+        expanded: true,
+    });
+    assert!(doc.plain.contains(&payload));
+    assert!(doc.plain.contains("Recorded result"));
+    assert!(doc.plain.contains("Current context\nShort summary."));
+    assert!(!doc.plain.contains("activity only"));
+    assert!(doc.rows.iter().all(|r| r.line.width() <= 40));
+    apply(&mut m, "context/set", json!({"items":[call]}), 3.0);
+    assert!(!m.cards["tool:c"].body(true).contains(&payload));
+}
+
+#[test]
+fn session_duration_is_labeled_and_keeps_idle_time_in_the_recorded_lifetime() {
+    assert_eq!(duration(1680.0), "1.68s");
+    assert_eq!(duration(60000.0), "1m 00s");
+    assert_eq!(duration(3599999.0), "1h 00m 00s");
+    assert_eq!(duration(22240850.0), "6h 10m 41s");
+    let mut m = Model::new();
+    apply(&mut m, "turn/start", json!({}), 0.0);
+    apply(&mut m, "turn/end", json!({}), 2000.0);
+    apply(
+        &mut m,
+        "session/end",
+        json!({"outcome":"completed", "durationMs":22240850}),
+        22242000.0,
+    );
+    assert_eq!(m.summary.status, "Completed · session 6h 10m 41s");
 }

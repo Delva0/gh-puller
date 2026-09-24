@@ -1,5 +1,5 @@
 //! Markdown preparation and wrapping run outside the terminal input thread.
-use crate::model::Card;
+use crate::model::{Card, Kind};
 use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 use ratatui::{
     style::{Color, Modifier, Style},
@@ -21,6 +21,12 @@ pub struct Row {
     pub start: usize,
     pub end: usize,
 }
+#[derive(Clone, Debug)]
+pub struct Link {
+    pub start: usize,
+    pub end: usize,
+    pub url: String,
+}
 pub struct Document {
     pub id: String,
     pub revision: u64,
@@ -28,6 +34,7 @@ pub struct Document {
     pub expanded: bool,
     pub rows: Vec<Row>,
     pub plain: String,
+    pub links: Vec<Link>,
 }
 pub struct Job {
     pub card: Arc<Card>,
@@ -38,7 +45,55 @@ pub struct Job {
 #[derive(Default)]
 struct SourceLine {
     spans: Vec<Span<'static>>,
+    links: Vec<Link>,
+    len: usize,
     nowrap: bool,
+}
+impl SourceLine {
+    fn push(&mut self, span: Span<'static>, url: Option<&str>) {
+        let start = self.len;
+        self.len += span.content.len();
+        if let Some(url) = url.filter(|url| web_link(url)) {
+            if let Some(link) = self
+                .links
+                .last_mut()
+                .filter(|l| l.end == start && l.url == url)
+            {
+                link.end = self.len;
+            } else {
+                self.links.push(Link {
+                    start,
+                    end: self.len,
+                    url: url.into(),
+                });
+            }
+        }
+        self.spans.push(span);
+    }
+    fn append(&mut self, line: &Self) {
+        self.links.extend(line.links.iter().map(|link| Link {
+            start: self.len + link.start,
+            end: self.len + link.end,
+            url: link.url.clone(),
+        }));
+        self.len += line.len;
+        self.spans.extend(line.spans.iter().cloned());
+    }
+    fn width(&self) -> usize {
+        self.spans.iter().map(Span::width).sum()
+    }
+    fn styled(text: String, style: Style, nowrap: bool) -> Self {
+        let mut line = Self {
+            nowrap,
+            ..Self::default()
+        };
+        line.push(Span::styled(text, style), None);
+        line
+    }
+}
+pub fn web_link(url: &str) -> bool {
+    (url.starts_with("https://") || url.starts_with("http://"))
+        && !url.chars().any(char::is_control)
 }
 pub fn safe(text: &str) -> String {
     text.chars()
@@ -53,10 +108,10 @@ fn markdown(source: &str) -> Vec<SourceLine> {
     let mut styles = vec![Style::default()];
     let mut code = false;
     let mut list_depth: usize = 0;
-    let mut links = vec![];
-    let mut table: Vec<Vec<String>> = vec![];
-    let mut row: Vec<String> = vec![];
-    let mut cell: Option<String> = None;
+    let mut links: Vec<String> = vec![];
+    let mut table: Vec<Vec<SourceLine>> = vec![];
+    let mut row: Vec<SourceLine> = vec![];
+    let mut cell: Option<SourceLine> = None;
     let push = |line: &mut SourceLine, lines: &mut Vec<SourceLine>| {
         lines.push(std::mem::take(line));
     };
@@ -72,7 +127,7 @@ fn markdown(source: &str) -> Vec<SourceLine> {
                 table.clear();
             }
             Event::Start(Tag::TableHead | Tag::TableRow) => row.clear(),
-            Event::Start(Tag::TableCell) => cell = Some(String::new()),
+            Event::Start(Tag::TableCell) => cell = Some(SourceLine::default()),
             Event::End(TagEnd::TableCell) => row.push(cell.take().unwrap_or_default()),
             Event::End(TagEnd::TableHead | TagEnd::TableRow) => {
                 table.push(std::mem::take(&mut row))
@@ -84,48 +139,45 @@ fn markdown(source: &str) -> Vec<SourceLine> {
                         table
                             .iter()
                             .filter_map(|r| r.get(i))
-                            .map(|s| s.width())
+                            .map(SourceLine::width)
                             .max()
                             .unwrap_or(0)
                     })
                     .collect();
                 for (index, cells) in table.iter().enumerate() {
-                    let mut t = String::from("│");
+                    let mut t = SourceLine::styled("│".into(), Style::default(), true);
                     for (i, w) in widths.iter().enumerate() {
-                        let c = cells.get(i).map(String::as_str).unwrap_or("");
-                        t.push_str(&format!(
-                            " {c}{} │",
-                            " ".repeat(w.saturating_sub(c.width()))
-                        ));
+                        t.push(Span::raw(" "), None);
+                        let width = if let Some(c) = cells.get(i) {
+                            t.append(c);
+                            c.width()
+                        } else {
+                            0
+                        };
+                        t.push(
+                            Span::raw(format!("{} │", " ".repeat(w.saturating_sub(width)))),
+                            None,
+                        );
                     }
-                    lines.push(SourceLine {
-                        spans: vec![Span::styled(
-                            t,
-                            if index == 0 {
-                                Style::default()
-                                    .fg(Color::Cyan)
-                                    .add_modifier(Modifier::BOLD)
-                            } else {
-                                Style::default()
-                            },
-                        )],
-                        nowrap: true,
-                    });
                     if index == 0 {
-                        lines.push(SourceLine {
-                            spans: vec![Span::styled(
-                                format!(
-                                    "├{}┤",
-                                    widths
-                                        .iter()
-                                        .map(|w| "─".repeat(w + 2))
-                                        .collect::<Vec<_>>()
-                                        .join("┼")
-                                ),
-                                Style::default().fg(Color::DarkGray),
-                            )],
-                            nowrap: true,
-                        });
+                        for span in &mut t.spans {
+                            span.style = span.style.fg(Color::Cyan).add_modifier(Modifier::BOLD);
+                        }
+                    }
+                    lines.push(t);
+                    if index == 0 {
+                        lines.push(SourceLine::styled(
+                            format!(
+                                "├{}┤",
+                                widths
+                                    .iter()
+                                    .map(|w| "─".repeat(w + 2))
+                                    .collect::<Vec<_>>()
+                                    .join("┼")
+                            ),
+                            Style::default().fg(Color::DarkGray),
+                            true,
+                        ));
                     }
                 }
             }
@@ -187,12 +239,7 @@ fn markdown(source: &str) -> Vec<SourceLine> {
                 );
             }
             Event::End(TagEnd::Link) => {
-                if let Some(url) = links.pop() {
-                    line.spans.push(Span::styled(
-                        format!(" ({})", safe(&url)),
-                        Style::default().fg(Color::LightBlue),
-                    ));
-                }
+                links.pop();
                 styles.pop();
             }
             Event::Start(Tag::Image { dest_url, .. }) => {
@@ -201,10 +248,13 @@ fn markdown(source: &str) -> Vec<SourceLine> {
                 } else {
                     &dest_url
                 };
-                line.spans.push(Span::styled(
-                    format!("[image: {}] ", safe(url)),
-                    Style::default().fg(Color::Magenta),
-                ));
+                cell.as_mut().unwrap_or(&mut line).push(
+                    Span::styled(
+                        format!("[image: {}] ", safe(url)),
+                        Style::default().fg(Color::Magenta),
+                    ),
+                    links.last().map(String::as_str),
+                );
             }
             Event::Start(Tag::List(_)) => list_depth += 1,
             Event::End(TagEnd::List(_)) => list_depth = list_depth.saturating_sub(1),
@@ -212,23 +262,27 @@ fn markdown(source: &str) -> Vec<SourceLine> {
                 if !line.spans.is_empty() {
                     push(&mut line, &mut lines);
                 }
-                line.spans.push(Span::raw(format!(
-                    "{}• ",
-                    "  ".repeat(list_depth.saturating_sub(1))
-                )));
+                line.push(
+                    Span::raw(format!("{}• ", "  ".repeat(list_depth.saturating_sub(1)))),
+                    None,
+                );
             }
             Event::End(TagEnd::Item | TagEnd::Paragraph | TagEnd::BlockQuote(_)) => {
                 if !line.spans.is_empty() {
                     push(&mut line, &mut lines);
                 }
             }
-            Event::Start(Tag::BlockQuote(_)) => line
-                .spans
-                .push(Span::styled("│ ", Style::default().fg(Color::DarkGray))),
+            Event::Start(Tag::BlockQuote(_)) => line.push(
+                Span::styled("│ ", Style::default().fg(Color::DarkGray)),
+                None,
+            ),
             Event::Text(text) | Event::Html(text) | Event::InlineHtml(text) => {
                 let text = safe(&text);
                 if let Some(cell) = cell.as_mut() {
-                    cell.push_str(&text.replace('\n', " "));
+                    cell.push(
+                        Span::styled(text.replace('\n', " "), *styles.last().unwrap()),
+                        links.last().map(String::as_str),
+                    );
                     continue;
                 }
                 for (i, s) in text.split('\n').enumerate() {
@@ -237,36 +291,37 @@ fn markdown(source: &str) -> Vec<SourceLine> {
                     }
                     line.nowrap = code;
                     if !s.is_empty() {
-                        line.spans
-                            .push(Span::styled(s.to_string(), *styles.last().unwrap()));
+                        line.push(
+                            Span::styled(s.to_string(), *styles.last().unwrap()),
+                            links.last().map(String::as_str),
+                        );
                     }
                 }
             }
             Event::Code(text) => {
-                if let Some(cell) = cell.as_mut() {
-                    cell.push_str(&safe(&text));
-                } else {
-                    line.spans.push(Span::styled(
+                cell.as_mut().unwrap_or(&mut line).push(
+                    Span::styled(
                         safe(&text),
-                        Style::default().fg(Color::Yellow),
-                    ));
-                }
+                        styles.last().copied().unwrap_or_default().fg(Color::Yellow),
+                    ),
+                    links.last().map(String::as_str),
+                );
             }
-            Event::SoftBreak => line.spans.push(Span::raw(" ")),
+            Event::SoftBreak => cell
+                .as_mut()
+                .unwrap_or(&mut line)
+                .push(Span::raw(" "), links.last().map(String::as_str)),
             Event::HardBreak => push(&mut line, &mut lines),
             Event::Rule => {
                 push(&mut line, &mut lines);
-                lines.push(SourceLine {
-                    spans: vec![Span::styled(
-                        "────────────────",
-                        Style::default().fg(Color::DarkGray),
-                    )],
-                    nowrap: false,
-                });
+                lines.push(SourceLine::styled(
+                    "────────────────".into(),
+                    Style::default().fg(Color::DarkGray),
+                    false,
+                ));
             }
             Event::TaskListMarker(done) => {
-                line.spans
-                    .push(Span::raw(if done { "[✓] " } else { "[ ] " }))
+                line.push(Span::raw(if done { "[✓] " } else { "[ ] " }), None)
             }
             _ => (),
         }
@@ -283,7 +338,9 @@ pub fn prepare(job: Job) -> Document {
     let lines = markdown(&source);
     let mut rows = vec![];
     let mut plain = String::new();
+    let mut links = vec![];
     for line in lines {
+        let base = plain.len();
         let mut spans = vec![];
         let mut cells = 0;
         let mut start = plain.len();
@@ -292,7 +349,7 @@ pub fn prepare(job: Job) -> Document {
             let mut piece = String::new();
             for g in span.content.graphemes(true) {
                 let n = g.width();
-                if !line.nowrap && cells > 0 && cells + n > width {
+                if (!line.nowrap || job.card.kind == Kind::Tool) && cells > 0 && cells + n > width {
                     if !piece.is_empty() {
                         spans.push(Span::styled(std::mem::take(&mut piece), style));
                     }
@@ -317,6 +374,11 @@ pub fn prepare(job: Job) -> Document {
             start,
             end: plain.len(),
         });
+        links.extend(line.links.into_iter().map(|link| Link {
+            start: base + link.start,
+            end: base + link.end,
+            url: link.url,
+        }));
         plain.push('\n');
     }
     Document {
@@ -326,6 +388,7 @@ pub fn prepare(job: Job) -> Document {
         expanded: job.expanded,
         rows,
         plain,
+        links,
     }
 }
 

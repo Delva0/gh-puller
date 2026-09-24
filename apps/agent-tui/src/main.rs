@@ -1,5 +1,6 @@
 //! The CLI supports observation and deterministic offline replay without a model call.
 use agent_tui::{
+    hyperlinks,
     model::{Event as AgentEvent, Model},
     reader,
     ui::App,
@@ -86,6 +87,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let (updates, stop) = reader::spawn(&file);
     let mut app = App::new(file.display().to_string());
+    let mut links = hyperlinks::Writer::default();
     let mut terminal = ratatui::init();
     execute!(io::stdout(), EnableMouseCapture)?;
     let original_hook = std::panic::take_hook();
@@ -118,7 +120,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             app.poll_layout();
             if app.dirty && last_frame.elapsed() >= Duration::from_micros(16667) {
-                terminal.draw(|f| app.render(f))?;
+                let frame = terminal.draw(|f| app.render(f))?;
+                links.write(frame.buffer, &app.hyperlinks(), &mut io::stdout())?;
                 last_frame = Instant::now();
                 if let Some(start) = first_input.take() {
                     if let Some(trace) = trace.as_mut() {

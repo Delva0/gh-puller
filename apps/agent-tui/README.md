@@ -46,24 +46,33 @@ Malformed complete records stop reconstruction at the valid prefix and display t
 | Detailed token statistics | `s` |
 | Commands / temporary menu / help | `:` or Ctrl-P / `m` / `?` |
 | Cycle dark themes | `t` |
+| Open a link by its label | Ctrl+left click (terminal link handling) |
 | Open focused card's first HTTP(S) Markdown link | `o` |
 | Close popup / clear selection | Esc |
 | Exit | `q`, Ctrl-C |
 
 Copy uses OSC 52, with tmux passthrough when `TMUX` is set. Delivery to the desktop
 clipboard depends on terminal permissions; tmux may need `set -g allow-passthrough on`.
-Links remain visible as URLs and open only on an explicit `o` command, using `xdg-open`
-on Linux or `open` on macOS. The observer never executes tool calls or writes the input log.
+Markdown links show their labels. OSC 8 carries their targets for the terminal's native
+link handling, including Ctrl+click. The `o` shortcut opens the first link in the focused
+card using `xdg-open` on Linux or `open` on macOS. The observer never executes tool calls
+or writes the input log.
 
 Thought, system and tool cards start collapsed, answers and user cards expanded. Every
 collapsed card occupies one line with no border. Expanding a tool shows its formatted
-arguments and **context result**. Tool activity controls execution status and duration,
-never the context result. User/system/thought/answer cards do not acquire timestamps or stream spans.
+arguments and **context result**, with long tool output wrapped instead of clipped.
+When a context update changes a result, the card also retains the output from its original
+context append under **Recorded result**. Both versions are searchable and copyable;
+counts and folded state still follow current context. Activity never replaces context results.
+Tool headers show `Failed` on errors and omit successful completion labels and error payloads.
+Expanded cards end on their last content row. User/system/thought/answer cards do not
+acquire timestamps or stream spans.
 Scrolling up pauses automatic following; End clears the new-event indicator. User-expanded
 cards stay expanded. Top chrome contains only session title and path; panels are temporary.
 
 The footer combines status and statistics on one line, for example
-`Completed · 2.33s  1/2 40/349 —/s`. The numbers are
+`Completed · session 2.33s  1/2 40/349 —/s`. Session duration is the recorded lifetime,
+including idle time, using hours and minutes for longer sessions. The numbers are
 `turn/steps-in-turn input/output speed/s`. Input is frozen at the first
 request in the turn. Output includes reasoning and is corrected by `usage.output`.
 Speed covers first nonempty delta through model completion for each request, excluding
