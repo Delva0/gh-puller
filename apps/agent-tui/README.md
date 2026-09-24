@@ -4,13 +4,17 @@ Read-only Rust + Ratatui observer for one canonical Agent JSONL file. It require
 credentials, model calls, WebSocket service, or Python runtime. Each agent gets a separate
 terminal or tmux window. The existing Graphub `tui` entry point is unchanged.
 
+This application owns its Cargo build, dependencies and terminal interface. The canonical
+event contract, adapters and FileSink remain in `gh_puller/agent/`; JSONL is their boundary
+with this observer. The sibling `apps/agent-monitor/` provides the Web interface.
+
 ## Build and run
 
 From the gh-puller repository, with a Rust toolchain and a native C linker installed:
 
 ```bash
-cargo build --release --locked --manifest-path gh_puller/agent/tui/Cargo.toml
-cargo install --locked --path gh_puller/agent/tui
+cargo build --release --locked --manifest-path apps/agent-tui/Cargo.toml
+cargo install --locked --path apps/agent-tui
 agent-tui /path/to/monitor/session.jsonl
 ```
 
@@ -102,19 +106,19 @@ coordinates. Idle sessions do not redraw the body. All event clocks come from th
 ## Verify and reproduce
 
 ```bash
-cargo test --locked --manifest-path gh_puller/agent/tui/Cargo.toml
-cargo clippy --locked --all-targets --manifest-path gh_puller/agent/tui/Cargo.toml -- -D warnings
+cargo test --locked --manifest-path apps/agent-tui/Cargo.toml
+cargo clippy --locked --all-targets --manifest-path apps/agent-tui/Cargo.toml -- -D warnings
 uv run --frozen pytest tests/agent -q
 ```
 
 Offline tools require an explicit new output directory and preserve prior runs:
 
 ```bash
-uv run --frozen python gh_puller/agent/tui/tools/verify_adapters.py \
-  --binary gh_puller/agent/tui/target/release/agent-tui --output /tmp/agent-tui-parity-new
-uv run --frozen python gh_puller/agent/tui/tools/benchmark.py \
-  --binary gh_puller/agent/tui/target/release/agent-tui --output /tmp/agent-tui-benchmark-new
-uv run --frozen python gh_puller/agent/tui/tools/demo.py > /tmp/agent-tui-demo.jsonl
+uv run --frozen python apps/agent-tui/tools/verify_adapters.py \
+  --binary apps/agent-tui/target/release/agent-tui --output /tmp/agent-tui-parity-new
+uv run --frozen python apps/agent-tui/tools/benchmark.py \
+  --binary apps/agent-tui/target/release/agent-tui --output /tmp/agent-tui-benchmark-new
+uv run --frozen python apps/agent-tui/tools/demo.py > /tmp/agent-tui-demo.jsonl
 agent-tui /tmp/agent-tui-demo.jsonl
 ```
 

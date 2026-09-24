@@ -51,7 +51,7 @@ def main():
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=False)
     plugin = Capture(args.output)
-    repository = Path(__file__).resolve().parents[4]
+    repository = Path(__file__).resolve().parents[3]
     result = pytest.main([str(repository / "tests/agent/adapters"), "-q"], plugins=[plugin])
     if result:
         raise SystemExit(result)

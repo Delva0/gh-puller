@@ -165,7 +165,7 @@ Open readers can finish the full stream through their existing handles. New read
 compact history. Sessions without an end event remain complete live logs; compaction
 failures are reported and preserve the source. There is no storage mode setting.
 
-The [Rust terminal observer](../gh_puller/agent/tui/README.md) tails one file and reconstructs
+The [Rust terminal observer](../apps/agent-tui/README.md) tails one file and reconstructs
 the canonical context without backend-specific inference.
 
 The sidecar indexes files, maintains leases, and forwards

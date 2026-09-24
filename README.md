@@ -84,6 +84,7 @@ uv run -m gh_puller.codebase build \
 | 构建可恢复、可随机读取的逐 commit 代码图 | [`gh_puller.codebase`][codebase-package]：CBM 图化与 Merkle 历史压缩；详见[代码图文档][codebase-graph] |
 | 生成代码 Wiki、Code Map 并进行问答 | [DeepWiki WebUI]：FastAPI + Next.js 的 DeepWiki 兼容应用 |
 | 记录并查看 Agent Context、模型与工具活动 | [Agent monitor]：JSONL / WebSocket 查看器；语义契约见[事件模型][agent-events] |
+| 在终端浏览 Agent Context 与实时输出 | [Agent TUI]：独立 Rust 应用，读取单个 canonical JSONL 文件 |
 | 通过 MCP 暴露代码图谱工具 | [gh-puller MCP]：对 `codebase-memory-mcp` CLI 的 MCP 服务封装 |
 | 按版本向 vllm-kb 提供代码图谱 | [vllm-kb adapter]：校验快照并路由到内部 MCP 索引 |
 | 评测兼容 `POST /ask` 的问答服务 | [benchmark]：一套题库对一个 endpoint 的 REST 评测框架 |
@@ -93,6 +94,8 @@ uv run -m gh_puller.codebase build \
 根 Python 包使用 `uv.lock`；各 Python 应用拥有独立锁文件，Web 应用与共享
 `@gh-puller/ui` 使用根 `pnpm-lock.yaml`。进入子项目时，请采用其 README 中的
 `uv --directory ...` 或 `pnpm --dir ...` 命令。
+
+Rust 终端应用 `apps/agent-tui` 使用独立的 `Cargo.toml` 和 `Cargo.lock`，通过 Cargo 构建和安装。
 
 发布包默认只安装 GitHub 归档依赖；Agent、评测和代码图入口分别对应 `agent`、
 `benchmark`、`codebase` extras。仓库的默认 `dev` 组会安装这三组依赖；本地 DSH SDK
@@ -115,6 +118,7 @@ uvx ruff check
 [github-cli-test]: tests/github/test_cli.py
 [deepwiki webui]: apps/deepwiki-webui/README.md
 [agent monitor]: apps/agent-monitor/README.md
+[agent tui]: apps/agent-tui/README.md
 [agent-events]: docs/agent-monitor.md
 [gh-puller mcp]: apps/gh-puller-mcp/README.md
 [vllm-kb adapter]: apps/vllm-kb-adapter/README.md
