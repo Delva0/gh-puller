@@ -209,18 +209,35 @@ fn tables_unicode_links_and_code_survive_layout_and_resize() {
         card: card.clone(),
         width: 80,
         expanded: true,
+        wrap: true,
+        query: String::new(),
     });
     let narrow = document::prepare(Job {
+        card: card.clone(),
+        width: 10,
+        expanded: true,
+        wrap: true,
+        query: String::new(),
+    });
+    let unwrapped = document::prepare(Job {
         card,
         width: 10,
         expanded: true,
+        wrap: false,
+        query: "LONG_LINE".into(),
     });
     assert_eq!(wide.plain, narrow.plain);
+    assert_eq!(wide.plain, unwrapped.plain);
+    assert_eq!(wide.links[0].start, unwrapped.links[0].start);
+    assert_eq!(wide.links[0].end, unwrapped.links[0].end);
+    assert!(unwrapped.rows.iter().any(|r| r.line.width() > 10));
+    let (start, end) = unwrapped.matches[0];
+    assert_eq!(&unwrapped.plain[start..end], "long_line");
     assert!(wide.plain.contains("│ 测试 │ 42"));
     assert!(!wide.plain.contains("https://example.com"));
     assert_eq!(wide.links[0].url, "https://example.com");
     assert_eq!(&wide.plain[wide.links[0].start..wide.links[0].end], "文档");
-    assert!(narrow.rows.iter().any(|r| r.line.width() > 10));
+    assert!(narrow.rows.iter().all(|r| r.line.width() <= 10));
     assert!(narrow.rows.len() > wide.rows.len());
 }
 
@@ -261,6 +278,8 @@ fn prior_results_survive_context_summaries_without_changing_the_fold_or_counts()
         card: Arc::new(card.clone()),
         width: 40,
         expanded: true,
+        wrap: true,
+        query: String::new(),
     });
     assert!(doc.plain.contains(&payload));
     assert!(doc.plain.contains("Recorded result"));
@@ -384,6 +403,8 @@ fn all_message_roles_preserve_soft_newlines_and_literal_backslashes() {
             card: Arc::new(m.cards[&m.order[0]].clone()),
             width: 80,
             expanded: true,
+            wrap: true,
+            query: String::new(),
         });
         assert!(
             doc.plain
@@ -422,6 +443,8 @@ fn tool_definitions_render_description_newlines_without_changing_context_or_coun
         card: Arc::new(card.clone()),
         width: 80,
         expanded: true,
+        wrap: true,
+        query: String::new(),
     });
     assert!(
         doc.plain
@@ -502,6 +525,8 @@ fn output_phase_times_survive_response_context_commit_and_replacement() {
         .clone();
     assert_eq!(m.cards[&thought].duration_ms, Some(200.0));
     assert_eq!(m.cards[&answer].duration_ms, Some(300.0));
+    assert_eq!(m.cards[&thought].request_duration_ms, Some(600.0));
+    assert_eq!(m.cards[&answer].request_duration_ms, Some(600.0));
     assert!(!m.cards[&thought].provisional);
     assert!(!m.cards[&answer].provisional);
     apply(&mut m, "context/set", json!({"items":output}), 700.0);
@@ -514,6 +539,75 @@ fn output_phase_times_survive_response_context_commit_and_replacement() {
     assert_eq!(m.cards[&thought].duration_ms, Some(200.0));
     assert_eq!(m.cards[&answer].duration_ms, Some(300.0));
     assert_eq!(m.context, output.as_array().unwrap().clone());
+}
+
+#[test]
+fn compact_output_retains_request_duration_after_commit_and_replacement() {
+    let mut m = Model::new();
+    let output = json!([
+        {"type":"reasoning","content":[{"type":"reasoning_text","text":"Thinking"}]},
+        message("assistant", "Answer")
+    ]);
+    apply(&mut m, "model/request", json!({"requestId":"r"}), 20_000.0);
+    apply(
+        &mut m,
+        "model/response",
+        json!({"requestId":"r","output":output}),
+        21_560.0,
+    );
+    apply(
+        &mut m,
+        "context/append/assistant",
+        json!({"items":output}),
+        21_561.0,
+    );
+    let ids = m.order.clone();
+    apply(&mut m, "context/set", json!({"items":output}), 30_000.0);
+    apply(
+        &mut m,
+        "session/end",
+        json!({"outcome":"completed"}),
+        22_000_000.0,
+    );
+    assert_eq!(m.order, ids);
+    for c in m
+        .cards
+        .values()
+        .filter(|c| matches!(c.kind, Kind::Think | Kind::Answer))
+    {
+        assert_eq!(c.duration_ms, None);
+        assert_eq!(c.request_duration_ms, Some(1560.0));
+        assert!(!c.provisional);
+    }
+    for (start, end) in [
+        (None, Some(20.0)),
+        (Some(10.0), None),
+        (Some(20.0), Some(10.0)),
+    ] {
+        let mut m = Model::new();
+        for (kind, data, elapsed_ms) in [
+            ("model/request", json!({"requestId":"r"}), start),
+            (
+                "model/response",
+                json!({"requestId":"r","output":output}),
+                end,
+            ),
+        ] {
+            m.apply(Event {
+                kind: kind.into(),
+                data,
+                elapsed_ms,
+                ts: Some(10_000.0),
+                seq: None,
+            });
+        }
+        assert!(
+            m.cards
+                .values()
+                .filter(|c| matches!(c.kind, Kind::Think | Kind::Answer))
+                .all(|c| c.request_duration_ms.is_none())
+        );
+    }
 }
 
 #[test]

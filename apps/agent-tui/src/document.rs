@@ -1,5 +1,5 @@
 //! Markdown preparation and wrapping run outside the terminal input thread.
-use crate::model::{Card, Kind};
+use crate::model::Card;
 use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 use ratatui::{
     style::{Color, Modifier, Style},
@@ -32,6 +32,9 @@ pub struct Document {
     pub revision: u64,
     pub width: usize,
     pub expanded: bool,
+    pub wrap: bool,
+    pub query: String,
+    pub matches: Vec<(usize, usize)>,
     pub rows: Vec<Row>,
     pub plain: String,
     pub links: Vec<Link>,
@@ -40,6 +43,8 @@ pub struct Job {
     pub card: Arc<Card>,
     pub width: usize,
     pub expanded: bool,
+    pub wrap: bool,
+    pub query: String,
 }
 
 #[derive(Default)]
@@ -47,7 +52,6 @@ struct SourceLine {
     spans: Vec<Span<'static>>,
     links: Vec<Link>,
     len: usize,
-    nowrap: bool,
 }
 impl SourceLine {
     fn push(&mut self, span: Span<'static>, url: Option<&str>) {
@@ -82,11 +86,8 @@ impl SourceLine {
     fn width(&self) -> usize {
         self.spans.iter().map(Span::width).sum()
     }
-    fn styled(text: String, style: Style, nowrap: bool) -> Self {
-        let mut line = Self {
-            nowrap,
-            ..Self::default()
-        };
+    fn styled(text: String, style: Style) -> Self {
+        let mut line = Self::default();
         line.push(Span::styled(text, style), None);
         line
     }
@@ -106,7 +107,6 @@ fn markdown(source: &str) -> Vec<SourceLine> {
     let mut lines = vec![];
     let mut line = SourceLine::default();
     let mut styles = vec![Style::default()];
-    let mut code = false;
     let mut list_depth: usize = 0;
     let mut links: Vec<String> = vec![];
     let mut table: Vec<Vec<SourceLine>> = vec![];
@@ -145,7 +145,7 @@ fn markdown(source: &str) -> Vec<SourceLine> {
                     })
                     .collect();
                 for (index, cells) in table.iter().enumerate() {
-                    let mut t = SourceLine::styled("│".into(), Style::default(), true);
+                    let mut t = SourceLine::styled("│".into(), Style::default());
                     for (i, w) in widths.iter().enumerate() {
                         t.push(Span::raw(" "), None);
                         let width = if let Some(c) = cells.get(i) {
@@ -176,7 +176,6 @@ fn markdown(source: &str) -> Vec<SourceLine> {
                                     .join("┼")
                             ),
                             Style::default().fg(Color::DarkGray),
-                            true,
                         ));
                     }
                 }
@@ -185,14 +184,12 @@ fn markdown(source: &str) -> Vec<SourceLine> {
                 if !line.spans.is_empty() {
                     push(&mut line, &mut lines);
                 }
-                code = true;
                 styles.push(Style::default().fg(Color::Rgb(171, 202, 226)));
             }
             Event::End(TagEnd::CodeBlock) => {
                 if !line.spans.is_empty() {
                     push(&mut line, &mut lines);
                 }
-                code = false;
                 styles.pop();
             }
             Event::Start(Tag::Heading { .. }) => {
@@ -289,7 +286,6 @@ fn markdown(source: &str) -> Vec<SourceLine> {
                     if i > 0 {
                         push(&mut line, &mut lines);
                     }
-                    line.nowrap = code;
                     if !s.is_empty() {
                         line.push(
                             Span::styled(s.to_string(), *styles.last().unwrap()),
@@ -318,7 +314,6 @@ fn markdown(source: &str) -> Vec<SourceLine> {
                 lines.push(SourceLine::styled(
                     "────────────────".into(),
                     Style::default().fg(Color::DarkGray),
-                    false,
                 ));
             }
             Event::TaskListMarker(done) => {
@@ -350,7 +345,7 @@ pub fn prepare(job: Job) -> Document {
             let mut piece = String::new();
             for g in span.content.graphemes(true) {
                 let n = g.width();
-                if (!line.nowrap || job.card.kind == Kind::Tool) && cells > 0 && cells + n > width {
+                if job.wrap && cells > 0 && cells + n > width {
                     if !piece.is_empty() {
                         spans.push(Span::styled(std::mem::take(&mut piece), style));
                     }
@@ -387,10 +382,43 @@ pub fn prepare(job: Job) -> Document {
         revision: job.card.revision,
         width,
         expanded: job.expanded,
+        wrap: job.wrap,
+        matches: match_ranges(&plain, &job.query),
+        query: job.query,
         rows,
         plain,
         links,
     }
+}
+
+/// Return original UTF-8 byte ranges even when lowercasing changes byte length.
+pub fn match_ranges(text: &str, query: &str) -> Vec<(usize, usize)> {
+    if query.is_empty() {
+        return vec![];
+    }
+    let query: String = query.chars().flat_map(char::to_lowercase).collect();
+    if text.is_ascii() {
+        return text
+            .to_ascii_lowercase()
+            .match_indices(&query)
+            .map(|(start, matched)| (start, start + matched.len()))
+            .collect();
+    }
+    let mut lower = String::new();
+    let mut offsets = vec![];
+    for (byte, c) in text.char_indices() {
+        offsets.push((lower.len(), byte));
+        lower.extend(c.to_lowercase());
+    }
+    offsets.push((lower.len(), text.len()));
+    lower
+        .match_indices(&query)
+        .map(|(start, matched)| {
+            let first = offsets.partition_point(|(folded, _)| *folded <= start) - 1;
+            let last = offsets.partition_point(|(folded, _)| *folded < start + matched.len());
+            (offsets[first].1, offsets[last].1)
+        })
+        .collect()
 }
 
 pub fn spawn() -> (Sender<Job>, Receiver<Document>) {
@@ -432,4 +460,27 @@ pub fn clip(line: &Line<'static>, left: usize, width: usize) -> Line<'static> {
         }
     }
     Line::from(spans)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::match_ranges;
+
+    #[test]
+    fn case_insensitive_search_keeps_original_unicode_byte_boundaries() {
+        for (text, query, expected) in [
+            ("FOO foo", "Foo", vec!["FOO", "foo"]),
+            ("你好世界，你好", "你好", vec!["你好", "你好"]),
+            ("İstanbul iSTANBUL", "i", vec!["İ", "i"]),
+            ("你好 CAFÉ café", "Café", vec!["CAFÉ", "café"]),
+            ("ΟΣ", "ΟΣ", vec!["ΟΣ"]),
+            ("你好", "", vec![]),
+        ] {
+            let actual: Vec<_> = match_ranges(text, query)
+                .into_iter()
+                .map(|(start, end)| &text[start..end])
+                .collect();
+            assert_eq!(actual, expected);
+        }
+    }
 }

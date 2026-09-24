@@ -34,10 +34,11 @@ Malformed complete records stop reconstruction at the valid prefix and display t
 | Top / bottom and follow | Home / End |
 | Next / previous card | Tab / Shift-Tab |
 | Toggle card | Enter, Space, click title |
-| Collapse all | `1` (or `E`) |
+| Collapse all | `1` |
 | Expand only user and assistant answer | `2` |
-| Expand all | `3` (or `e`) |
-| Browse wide code or tables | `h/l`, left/right |
+| Expand all | `3` |
+| Toggle line wrapping | `w`, or `wrap` in the command palette |
+| Browse long lines with wrapping off | `h/l`, left/right |
 | Select text | Drag over body; selection survives valid updates and resize |
 | Copy selection or full focused card | `c`, right click |
 | Copy latest assistant answer | `y` |
@@ -50,7 +51,7 @@ Malformed complete records stop reconstruction at the valid prefix and display t
 | Cycle dark themes | `t` |
 | Open a link by its label | Ctrl+left click (terminal link handling) |
 | Open focused card's first HTTP(S) Markdown link | `o` |
-| Close popup / clear selection | Esc |
+| Close popup / clear selection and search | Esc |
 | Exit | `q`, Ctrl-C |
 
 Copy uses OSC 52, with tmux passthrough when `TMUX` is set. Delivery to the desktop
@@ -67,27 +68,33 @@ reveal cards individually; the view reads **Custom** when the result differs fro
 presets. Returning to a matching preset restores its name. New cards follow the active
 preset, or the last preset while Custom; existing choices survive matching context updates.
 
-Every collapsed card occupies one line with no border. Expanding a tool shows its formatted
+Every collapsed card occupies one line with no border and a dimmer title. Expanding a tool shows its formatted
 arguments and **context result**, with long tool output wrapped instead of clipped.
 When a context update changes a result, the card also retains the output from its original
 context append under **Recorded result**. Both versions are searchable and copyable;
 counts and folded state still follow current context. Activity never replaces context results.
 Tool headers show `Failed` on errors and omit successful completion labels and error payloads.
 Expanded cards end on their last content row. Focus uses a subtle card background; selected
-text has a stronger background. Turn and step separators use dim text on the page background.
+text has a stronger background. Search matches use an amber background, including tool names
+and matches across Markdown formatting or wrapped rows. Selection takes priority over search
+highlighting. Turn and step separators use dim text on the page background.
 All card bodies share Markdown rendering and preserve soft newlines; literal `\n` text is
 not decoded a second time. Canonical `tool_defs` parts show tool names and descriptions as
 text, preserving description newlines, with input schemas in JSON code blocks. Other fields
-remain visible as structured data. Links, code and tables retain their formatting.
+remain visible as structured data. Links, code and tables retain their formatting. Wrapping
+is on by default and applies to all content, including code and tables. `w` toggles wrapping
+without changing text, selection or link targets; the command palette shows its current state.
 
-Every card header includes tokens and time. Tool time covers execution. Think and answer
+Every card header includes tokens and any recorded time. Tool time covers execution. Think and answer
 time sums observed output phases within the request: each phase starts at its first nonempty
 delta and ends at the next output part, response, error or turn end. Interleaved parts accumulate
 their own intervals. First-output waits and tool execution are excluded from these output
 times. These are adapter receipt intervals, not server generation measurements. A context
-commit or matching replacement retains the timing. User/system content has no recorded execution
-duration; its time is `—`. Output cards without deltas, including compact history, also show `—`.
-An unfinished output phase with no recorded boundary remains unknown after session close.
+commit or matching replacement retains the timing. When phase timing is unavailable, including
+compact history, think and answer cards show `request 1.56s`, measured from `model/request` to
+`model/response` or `model/error` using `elapsedMs`. This is the total request duration shared
+by its output cards, so it must not be summed across cards. Untimed cards, including user/system
+content, omit the time field. An unfinished output phase with no recorded boundary remains unknown.
 Scrolling up pauses automatic following; End clears the new-event indicator. User-expanded
 cards stay expanded. Top chrome contains only session title and path; panels are temporary.
 

@@ -73,6 +73,8 @@ mod tests {
                 card: app.cards[&id].clone(),
                 width: app.width,
                 expanded: app.open(&id),
+                wrap: app.wrap,
+                query: app.search.clone(),
             });
             app.docs.insert(id.clone(), doc);
             let i = app.positions[&id];
@@ -99,9 +101,9 @@ mod tests {
         assert!(app.open(&ids[1]));
         assert_eq!(app.focus.as_ref(), Some(&ids[1]));
         assert_eq!(app.copy_text(true).as_deref(), Some("answer"));
-        key(&mut app, KeyCode::Char('E'));
+        key(&mut app, KeyCode::Char('1'));
         assert!(!app.open(&ids[0]));
-        key(&mut app, KeyCode::Char('e'));
+        key(&mut app, KeyCode::Char('3'));
         assert!(app.open(&ids[1]));
     }
 
@@ -598,6 +600,186 @@ mod tests {
         key(&mut app, KeyCode::Char('m'));
         assert!(app.hyperlinks().is_empty());
     }
+
+    #[test]
+    fn search_highlights_formatted_text_wrapped_rows_and_names_below_selection() {
+        let (mut model, mut app) = fixture();
+        apply(
+            &mut model,
+            "context/set",
+            json!({"items":[
+                {"type":"message","role":"assistant","content":[{"type":"output_text",
+                    "text":"01234567 [**Fo**o](https://example.com)\nNext foo."}]},
+                {"type":"function_call","call_id":"c","name":"FoO","arguments":"{}"}
+            ]}),
+        );
+        app.apply(model.change());
+        let id = app.order[0].clone();
+        for width in [75, 10] {
+            app.search = "foo".into();
+            app.width = width;
+            layout(&mut app);
+            let mut terminal = Terminal::new(TestBackend::new(width as u16 + 5, 24)).unwrap();
+            terminal.draw(|f| app.render(f)).unwrap();
+            let count = |terminal: &Terminal<TestBackend>, color| {
+                terminal
+                    .backend()
+                    .buffer()
+                    .content
+                    .iter()
+                    .filter(|c| c.bg == color)
+                    .count()
+            };
+            assert_eq!(count(&terminal, Color::Rgb(96, 76, 32)), 9);
+            app.selection = Some(Selection {
+                start: Point {
+                    id: id.clone(),
+                    byte: 9,
+                },
+                end: Point {
+                    id: id.clone(),
+                    byte: 11,
+                },
+            });
+            terminal.draw(|f| app.render(f)).unwrap();
+            assert_eq!(app.selected_text().as_deref(), Some("Fo"));
+            assert_eq!(count(&terminal, Color::Rgb(75, 91, 126)), 2);
+            assert_eq!(count(&terminal, Color::Rgb(96, 76, 32)), 7);
+            key(&mut app, KeyCode::Esc);
+            terminal.draw(|f| app.render(f)).unwrap();
+            assert_eq!(count(&terminal, Color::Rgb(96, 76, 32)), 0);
+            assert_eq!(count(&terminal, Color::Rgb(75, 91, 126)), 0);
+        }
+    }
+
+    #[test]
+    fn search_reveals_matches_deep_in_a_card_and_in_unwrapped_lines() {
+        for wrap in [true, false] {
+            let (mut model, mut app) = fixture();
+            let text = format!(
+                "{}{}NEEDLE end",
+                "Earlier line\n".repeat(40),
+                "prefix ".repeat(40)
+            );
+            apply(
+                &mut model,
+                "context/set",
+                json!({"items":[
+                    {"type":"message","role":"assistant","content":[{"type":"output_text","text":text}]}
+                ]}),
+            );
+            app.apply(model.change());
+            app.wrap = wrap;
+            layout(&mut app);
+            app.input = "needle".into();
+            app.search();
+            let mut terminal = Terminal::new(TestBackend::new(80, 13)).unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            loop {
+                app.poll_layout();
+                terminal.draw(|f| app.render(f)).unwrap();
+                if app.search_result.is_none()
+                    && app.reveal_match.is_none()
+                    && app.requested.is_empty()
+                {
+                    break;
+                }
+                assert!(std::time::Instant::now() < deadline);
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            assert_eq!(app.matches.len(), 1);
+            assert!(app.scroll > 30);
+            assert_eq!(app.horizontal > 0, !wrap);
+            assert_eq!(
+                terminal
+                    .backend()
+                    .buffer()
+                    .content
+                    .iter()
+                    .filter(|c| c.bg == Color::Rgb(96, 76, 32))
+                    .count(),
+                6
+            );
+        }
+    }
+
+    #[test]
+    fn wrapping_preserves_text_selection_and_the_visible_character_anchor() {
+        let (mut model, mut app) = fixture();
+        let text = format!(
+            "{}\nSecond line\nThird line\nLast line",
+            "prefix ".repeat(60)
+        );
+        apply(
+            &mut model,
+            "context/set",
+            json!({"items":[
+                {"type":"message","role":"assistant","content":[{"type":"output_text","text":text}]}
+            ]}),
+        );
+        app.apply(model.change());
+        let id = app.order[0].clone();
+        app.width = 20;
+        app.viewport = 3;
+        layout(&mut app);
+        app.scroll = 6;
+        app.selection = Some(Selection {
+            start: Point {
+                id: id.clone(),
+                byte: 112,
+            },
+            end: Point {
+                id: id.clone(),
+                byte: 130,
+            },
+        });
+        let selected = app.selected_text();
+        let plain = app.docs[&id].plain.clone();
+        for wrap in [false, true] {
+            let anchor = app.anchor();
+            let byte = anchor.as_ref().unwrap().2;
+            key(&mut app, KeyCode::Char('w'));
+            layout(&mut app);
+            app.restore(anchor);
+            assert_eq!(app.wrap, wrap);
+            assert_eq!(app.anchor().unwrap().2, byte);
+            assert_eq!(app.selected_text(), selected);
+            assert_eq!(app.docs[&id].plain, plain);
+        }
+    }
+
+    #[test]
+    fn headers_dim_when_collapsed_and_omit_unknown_durations() {
+        let (_, mut app) = fixture();
+        let id = app.order[0].clone();
+        let card = app.cards[&id].clone();
+        let expanded = app.title(&card);
+        assert!(expanded.to_string().ends_with(" tokens"));
+        key(&mut app, KeyCode::Char('1'));
+        let collapsed = app.title(&card);
+        if let (Some(Color::Rgb(r, g, b)), Some(Color::Rgb(rd, gd, bd))) =
+            (expanded.spans[0].style.fg, collapsed.spans[0].style.fg)
+        {
+            assert!(rd < r && gd < g && bd < b);
+        } else {
+            panic!("Role titles must use the theme's RGB colors");
+        }
+        assert!(
+            !collapsed.spans[0]
+                .style
+                .add_modifier
+                .contains(Modifier::BOLD)
+        );
+        let mut output = (*app.cards[&app.order[2]]).clone();
+        output.request_duration_ms = Some(1560.0);
+        assert!(app.title(&output).to_string().ends_with(" · request 1.56s"));
+        output.duration_ms = Some(200.0);
+        assert!(app.title(&output).to_string().ends_with(" · 0.20s"));
+        for legacy in ['e', 'E'] {
+            key(&mut app, KeyCode::Char(legacy));
+            assert_eq!(app.view(), Some(Preset::Collapsed));
+        }
+    }
 }
 impl Heights {
     fn sum(&self, mut end: usize) -> usize {
@@ -706,11 +888,12 @@ pub struct App {
     view_mismatches: [usize; 3],
     heights: Heights,
     docs: HashMap<String, Document>,
-    requested: HashSet<(String, u64, usize, bool)>,
+    requested: HashSet<String>,
     jobs: Sender<Job>,
     completed: Receiver<Document>,
     pub scroll: usize,
     pub horizontal: usize,
+    wrap: bool,
     pub focus: Option<String>,
     pub follow: bool,
     pub unseen: usize,
@@ -725,6 +908,7 @@ pub struct App {
     matches: Vec<String>,
     match_index: usize,
     search_result: Option<Receiver<Vec<String>>>,
+    reveal_match: Option<String>,
     panel_scroll: u16,
     menu_index: usize,
     theme: usize,
@@ -737,6 +921,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("collapse", "1 · Collapse all cards"),
     ("conversation", "2 · Expand only user and assistant answer"),
     ("expand", "3 · Expand all cards"),
+    ("wrap", "w · Toggle line wrapping"),
     ("copy", "Copy selection or card"),
     ("answer", "Copy latest answer"),
     ("follow", "Go to bottom"),
@@ -749,7 +934,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("link", "Open link in card"),
     ("quit", "Quit"),
 ];
-const HELP: &str = "j/k ↑/↓        Scroll (pauses follow)\nPgUp/PgDn      Page up / down\nHome/End       Top / follow bottom\nTab/Shift-Tab  Next / previous card\nEnter/Space    Expand / collapse card\n1              Collapse all cards\n2              Expand user and assistant answer\n3              Expand all cards\ne / E          Expand / collapse all (aliases)\nh/l ←/→        Scroll horizontally\n/              Search text and tool names\nn / N          Next / previous match\n] / [          Next / previous turn\n} / {          Next / previous step\n!              Next error\nc / y          Copy selection or card / latest answer\ns              Token statistics\nt              Change theme\n: or Ctrl-P    Command palette\nm              Menu\no              Open first link in card\nCtrl+click     Open link under pointer\n? / F1         Help\nEsc            Close panel / clear selection\nq / Ctrl-C     Quit\n\nManual toggles show Custom when no preset matches.\nNew cards follow the last preset in Custom.\nClick a title to toggle a card. Drag to select text.\nRight-click to copy. Scroll with the wheel or scrollbar.\nCopy uses OSC 52 with tmux passthrough.";
+const HELP: &str = "j/k ↑/↓        Scroll (pauses follow)\nPgUp/PgDn      Page up / down\nHome/End       Top / follow bottom\nTab/Shift-Tab  Next / previous card\nEnter/Space    Expand / collapse card\n1              Collapse all cards\n2              Expand user and assistant answer\n3              Expand all cards\nw              Toggle line wrapping\nh/l ←/→        Scroll horizontally\n/              Search text and tool names\nn / N          Next / previous match\n] / [          Next / previous turn\n} / {          Next / previous step\n!              Next error\nc / y          Copy selection or card / latest answer\ns              Token statistics\nt              Change theme\n: or Ctrl-P    Command palette\nm              Menu\no              Open first link in card\nCtrl+click     Open link under pointer\n? / F1         Help\nEsc            Close panel / clear selection and search\nq / Ctrl-C     Quit\n\nManual toggles show Custom when no preset matches.\nNew cards follow the last preset in Custom.\nClick a title to toggle a card. Drag to select text.\nRight-click to copy. Scroll with the wheel or scrollbar.\nCopy uses OSC 52 with tmux passthrough.";
 
 impl App {
     pub fn new(path: String) -> Self {
@@ -770,6 +955,7 @@ impl App {
             completed,
             scroll: 0,
             horizontal: 0,
+            wrap: true,
             focus: None,
             follow: true,
             unseen: 0,
@@ -784,6 +970,7 @@ impl App {
             matches: vec![],
             match_index: 0,
             search_result: None,
+            reveal_match: None,
             panel_scroll: 0,
             menu_index: 0,
             theme: 0,
@@ -843,7 +1030,7 @@ impl App {
         if let Some(d) = self
             .docs
             .get(id)
-            .filter(|d| d.width == self.width && d.expanded == open)
+            .filter(|d| d.width == self.width && d.expanded == open && d.wrap == self.wrap)
         {
             return 1 + d.rows.len();
         }
@@ -856,9 +1043,20 @@ impl App {
         let i = self.heights.locate(self.scroll);
         let id = self.order[i].clone();
         let row = self.scroll.saturating_sub(self.heights.sum(i));
-        let byte = row
-            .checked_sub(1)
-            .and_then(|r| self.docs.get(&id)?.rows.get(r).map(|r| r.start));
+        let byte = row.checked_sub(1).and_then(|r| {
+            let doc = self.docs.get(&id)?;
+            let row = doc.rows.get(r)?;
+            let mut column = 0;
+            let mut byte = row.start;
+            for g in doc.plain[row.start..row.end].graphemes(true) {
+                if column + g.width() > self.horizontal {
+                    break;
+                }
+                column += g.width();
+                byte += g.len();
+            }
+            Some(byte)
+        });
         Some((id, row, byte))
     }
     fn restore(&mut self, anchor: Option<(String, usize, Option<usize>)>) {
@@ -869,12 +1067,21 @@ impl App {
         {
             let offset = byte
                 .and_then(|byte| {
-                    self.docs
-                        .get(&id)?
+                    let doc = self.docs.get(&id)?;
+                    let row = doc
                         .rows
                         .iter()
-                        .position(|r| r.start <= byte && byte < r.end)
-                        .map(|r| r + 1)
+                        .position(|r| r.start <= byte && byte < r.end)?;
+                    if doc.wrap == self.wrap {
+                        self.horizontal = if doc.wrap {
+                            0
+                        } else {
+                            doc.plain
+                                .get(doc.rows[row].start..byte)
+                                .map_or(0, str::width)
+                        };
+                    }
+                    Some(row + 1)
                 })
                 .unwrap_or(offset);
             self.scroll =
@@ -983,14 +1190,15 @@ impl App {
             let Ok(doc) = self.completed.try_recv() else {
                 break;
             };
-            self.requested
-                .remove(&(doc.id.clone(), doc.revision, doc.width, doc.expanded));
+            self.requested.remove(&doc.id);
             if self
                 .cards
                 .get(&doc.id)
                 .is_none_or(|c| c.revision != doc.revision)
                 || doc.width != self.width
                 || doc.expanded != self.open(&doc.id)
+                || doc.wrap != self.wrap
+                || doc.query != self.search
             {
                 self.dirty = true;
                 continue;
@@ -1019,6 +1227,7 @@ impl App {
             self.restore(anchor);
             self.dirty = true;
         }
+        self.reveal_search_match();
     }
     fn request(&mut self, id: &str) {
         let c = &self.cards[id];
@@ -1027,20 +1236,25 @@ impl App {
             return;
         }
         if self.docs.get(id).is_some_and(|d| {
-            d.width == self.width && d.revision == c.revision && d.expanded == expanded
+            d.width == self.width
+                && d.revision == c.revision
+                && d.expanded == expanded
+                && d.wrap == self.wrap
+                && d.query == self.search
         }) {
             return;
         }
         // At most one outstanding layout per card; a newer revision follows completion.
-        if self.requested.iter().any(|(key, _, _, _)| key == id) {
+        if self.requested.contains(id) {
             return;
         }
-        self.requested
-            .insert((id.into(), c.revision, self.width, expanded));
+        self.requested.insert(id.into());
         let _ = self.jobs.send(Job {
             card: c.clone(),
             width: self.width,
             expanded,
+            wrap: self.wrap,
+            query: self.search.clone(),
         });
     }
     fn background(&self) -> Color {
@@ -1069,9 +1283,13 @@ impl App {
         }
     }
     fn title(&self, c: &Card) -> Line<'static> {
-        let duration = c
+        let time = c
             .duration_ms
             .map(|n| format!(" · {}", duration(n)))
+            .or_else(|| {
+                c.request_duration_ms
+                    .map(|n| format!(" · request {}", duration(n)))
+            })
             .unwrap_or_default();
         if c.kind.heading() {
             return Line::styled(
@@ -1079,7 +1297,7 @@ impl App {
                     "─ {} {}{}{}",
                     c.kind.label(),
                     c.name,
-                    duration,
+                    time,
                     if c.status.is_empty() {
                         String::new()
                     } else {
@@ -1089,12 +1307,12 @@ impl App {
                 Style::default().fg(Color::Rgb(83, 94, 112)),
             );
         }
-        let symbol = if self.open(&c.id) { "▾" } else { "▸" };
-        let time = if duration.is_empty() {
-            " · —".into()
-        } else {
-            duration
-        };
+        let open = self.open(&c.id);
+        let symbol = if open { "▾" } else { "▸" };
+        let mut role = Self::color(c.kind);
+        if !open && let Color::Rgb(r, g, b) = role {
+            role = Color::Rgb(r / 4 * 3, g / 4 * 3, b / 4 * 3);
+        }
         Line::from(vec![
             Span::styled(
                 document::safe(&format!(
@@ -1106,23 +1324,29 @@ impl App {
                         format!(" {}", c.name)
                     }
                 )),
-                Style::default()
-                    .fg(Self::color(c.kind))
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(role).add_modifier(if open {
+                    Modifier::BOLD
+                } else {
+                    Modifier::empty()
+                }),
             ),
             Span::styled(
                 format!(
                     " · {} tokens{}{}{}",
                     number(c.tokens),
-                    if c.provisional { " · Pending" } else { "" },
                     time,
+                    if c.provisional { " · Pending" } else { "" },
                     if c.status.is_empty() || (c.kind == Kind::Tool && c.status != "Failed") {
                         String::new()
                     } else {
                         format!(" · {}", document::safe(&c.status).replace('\n', " "))
                     }
                 ),
-                Style::default().fg(Color::Gray),
+                Style::default().fg(if open {
+                    Color::Gray
+                } else {
+                    Color::Rgb(105, 115, 130)
+                }),
             ),
         ])
     }
@@ -1214,8 +1438,23 @@ impl App {
                         );
                     }
                     if row == 0 {
+                        let title = self.title(&card);
+                        let prefix = format!("▸ {} ", card.kind.label()).len();
+                        let matches: Vec<_> =
+                            document::match_ranges(&document::safe(&card.name), &self.search)
+                                .into_iter()
+                                .map(|(start, end)| (start + prefix, end + prefix))
+                                .collect();
+                        let title = self.highlight(
+                            &title,
+                            0,
+                            &matches,
+                            None,
+                            0,
+                            area.width.saturating_sub(4) as usize,
+                        );
                         frame.render_widget(
-                            Paragraph::new(self.title(&card)),
+                            Paragraph::new(title),
                             Rect::new(2, y, area.width - 4, 1),
                         );
                         self.hits.push(Hit {
@@ -1231,18 +1470,19 @@ impl App {
                             self.docs.get(&id).filter(|d| d.expanded == self.open(&id))
                         {
                             if let Some(r) = doc.rows.get(row - 1) {
-                                let mut line = document::clip(&r.line, self.horizontal, self.width);
-                                if let Some((start, end)) =
-                                    self.selection_range(&id, doc.plain.len())
-                                {
-                                    line = self.highlight(
-                                        line,
-                                        &doc.plain[r.start..r.end],
-                                        r.start,
-                                        start,
-                                        end,
-                                    );
-                                }
+                                let matches = if doc.query == self.search {
+                                    doc.matches.as_slice()
+                                } else {
+                                    &[]
+                                };
+                                let line = self.highlight(
+                                    &r.line,
+                                    r.start,
+                                    matches,
+                                    self.selection_range(&id, doc.plain.len()),
+                                    self.horizontal,
+                                    self.width,
+                                );
                                 frame.render_widget(
                                     Paragraph::new(line),
                                     Rect::new(2, y, area.width - 5, 1),
@@ -1314,31 +1554,48 @@ impl App {
     }
     fn highlight(
         &self,
-        line: Line<'static>,
-        source: &str,
+        line: &Line<'static>,
         base: usize,
-        start: usize,
-        end: usize,
+        matches: &[(usize, usize)],
+        selection: Option<(usize, usize)>,
+        left: usize,
+        width: usize,
     ) -> Line<'static> {
         let mut byte = base;
         let mut x = 0;
-        for g in source.graphemes(true) {
-            if x >= self.horizontal {
-                break;
-            }
-            x += g.width();
-            byte += g.len();
-        }
         let mut spans = vec![];
-        for span in line.spans {
+        let mut matched = matches.partition_point(|(_, end)| *end <= byte);
+        'line: for span in &line.spans {
             for g in span.content.graphemes(true) {
-                let style = if byte < end && byte + g.len() > start {
+                let next = x + g.width();
+                if x >= left + width {
+                    break 'line;
+                }
+                while matched < matches.len() && matches[matched].1 <= byte {
+                    matched += 1;
+                }
+                let selected =
+                    selection.is_some_and(|(start, end)| byte < end && byte + g.len() > start);
+                let found = matches
+                    .get(matched)
+                    .is_some_and(|(start, end)| byte < *end && byte + g.len() > *start);
+                let style = if selected {
                     span.style.bg(Color::Rgb(75, 91, 126)).fg(Color::White)
+                } else if found {
+                    span.style.bg(Color::Rgb(96, 76, 32)).fg(Color::White)
                 } else {
                     span.style
                 };
-                spans.push(Span::styled(g.to_string(), style));
+                if next > left {
+                    let text = if x >= left && next <= left + width {
+                        g.to_string()
+                    } else {
+                        " ".repeat(next.min(left + width) - x.max(left))
+                    };
+                    spans.push(Span::styled(text, style));
+                }
                 byte += g.len();
+                x = next;
             }
         }
         Line::from(spans)
@@ -1387,9 +1644,10 @@ impl App {
             Panel::Commands | Panel::Menu => (
                 "Commands · ↑↓ to select · Enter to run",
                 format!(
-                    ":{}    View: {}\n\n{}",
+                    ":{}    View: {} · Wrap: {}\n\n{}",
                     self.input,
                     self.view_label(),
+                    if self.wrap { "On" } else { "Off" },
                     COMMANDS
                         .iter()
                         .filter(|(name, label)| name.contains(&self.input)
@@ -1462,6 +1720,7 @@ impl App {
         self.dirty = true;
     }
     fn scroll_by(&mut self, delta: isize) {
+        self.reveal_match = None;
         self.follow = false;
         self.notice.clear();
         self.scroll = self
@@ -1470,6 +1729,7 @@ impl App {
             .min(self.heights.total().saturating_sub(self.viewport));
     }
     fn jump(&mut self, id: String) {
+        self.reveal_match = None;
         if let Some(i) = self.positions.get(&id) {
             self.scroll = self
                 .heights
@@ -1503,7 +1763,14 @@ impl App {
         }
     }
     fn search(&mut self) {
-        self.search = self.input.to_lowercase();
+        self.search = self.input.clone();
+        self.reveal_match = None;
+        if self.search.is_empty() {
+            self.matches.clear();
+            self.search_result = None;
+            self.notice.clear();
+            return;
+        }
         self.match_index = 0;
         let cards: Vec<_> = self.order.iter().map(|id| self.cards[id].clone()).collect();
         let query = self.search.clone();
@@ -1514,15 +1781,17 @@ impl App {
             let matches = cards
                 .iter()
                 .filter(|c| {
-                    [
-                        &c.name,
-                        &c.text,
-                        &c.arguments,
-                        c.result.as_deref().unwrap_or(""),
-                        c.recorded_result.as_deref().unwrap_or(""),
-                    ]
-                    .iter()
-                    .any(|s| s.to_lowercase().contains(&query))
+                    !c.kind.heading()
+                        && (!document::match_ranges(&document::safe(&c.name), &query).is_empty()
+                            || !document::prepare(Job {
+                                card: (*c).clone(),
+                                width: 120,
+                                expanded: true,
+                                wrap: false,
+                                query: query.clone(),
+                            })
+                            .matches
+                            .is_empty())
                 })
                 .map(|c| c.id.clone())
                 .collect();
@@ -1541,8 +1810,43 @@ impl App {
         let id = self.matches[self.match_index].clone();
         if self.cards.contains_key(&id) {
             self.set_open(&id, true);
-            self.jump(id);
+            self.jump(id.clone());
+            self.reveal_match = Some(id);
+            self.reveal_search_match();
         }
+    }
+    fn reveal_search_match(&mut self) {
+        let Some(id) = self.reveal_match.as_ref() else {
+            return;
+        };
+        let Some(doc) = self.docs.get(id).filter(|d| {
+            d.query == self.search
+                && d.wrap == self.wrap
+                && d.width == self.width
+                && d.expanded
+                && d.revision == self.cards[id].revision
+        }) else {
+            return;
+        };
+        if document::match_ranges(&document::safe(&self.cards[id].name), &self.search).is_empty()
+            && let Some((start, _)) = doc.matches.first()
+            && let Some(row) = doc
+                .rows
+                .iter()
+                .position(|r| r.start <= *start && *start < r.end)
+        {
+            self.scroll = (self.heights.sum(self.positions[id]) + row + 1)
+                .min(self.heights.total().saturating_sub(self.viewport));
+            self.horizontal = if self.wrap {
+                0
+            } else {
+                doc.plain[doc.rows[row].start..*start]
+                    .width()
+                    .saturating_sub(8)
+            };
+        }
+        self.reveal_match = None;
+        self.dirty = true;
     }
     pub fn selected_text(&self) -> Option<String> {
         self.selection.as_ref()?;
@@ -1672,9 +1976,17 @@ impl App {
             "expand" => self.set_view(Preset::Expanded),
             "collapse" => self.set_view(Preset::Collapsed),
             "conversation" => self.set_view(Preset::Conversation),
+            "wrap" => {
+                self.wrap = !self.wrap;
+                if self.anchor().is_none_or(|(_, _, byte)| byte.is_none()) {
+                    self.horizontal = 0;
+                }
+                self.notice = format!("Wrap: {}", if self.wrap { "On" } else { "Off" });
+            }
             "copy" => self.copy(false),
             "answer" => self.copy(true),
             "follow" => {
+                self.reveal_match = None;
                 self.scroll = self.heights.total().saturating_sub(self.viewport);
                 self.follow = !self.summary.ended;
                 self.unseen = 0;
@@ -1782,6 +2094,7 @@ impl App {
                     KeyCode::PageUp => self.scroll_by(-(self.viewport as isize)),
                     KeyCode::PageDown => self.scroll_by(self.viewport as isize),
                     KeyCode::Home => {
+                        self.reveal_match = None;
                         self.scroll = 0;
                         self.follow = false;
                     }
@@ -1797,9 +2110,10 @@ impl App {
                             self.toggle(&id);
                         }
                     }
-                    KeyCode::Char('1' | 'E') => self.command("collapse"),
+                    KeyCode::Char('1') => self.command("collapse"),
                     KeyCode::Char('2') => self.command("conversation"),
-                    KeyCode::Char('3' | 'e') => self.command("expand"),
+                    KeyCode::Char('3') => self.command("expand"),
+                    KeyCode::Char('w') => self.command("wrap"),
                     KeyCode::Char('c') => self.copy(false),
                     KeyCode::Char('y') => self.copy(true),
                     KeyCode::Char('o') => self.link(),
@@ -1831,6 +2145,10 @@ impl App {
                     KeyCode::Char('!') => self.command("error"),
                     KeyCode::Esc => {
                         self.selection = None;
+                        self.search.clear();
+                        self.matches.clear();
+                        self.search_result = None;
+                        self.reveal_match = None;
                         self.notice.clear();
                     }
                     _ => (),

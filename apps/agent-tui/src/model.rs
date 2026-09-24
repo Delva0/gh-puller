@@ -70,6 +70,7 @@ pub struct Card {
     pub provisional: bool,
     pub status: String,
     pub duration_ms: Option<f64>,
+    pub request_duration_ms: Option<f64>,
     pub group: Vec<String>,
     pub revision: u64,
     pub call_id: String,
@@ -100,6 +101,7 @@ impl Card {
             provisional: false,
             status: String::new(),
             duration_ms: None,
+            request_duration_ms: None,
             group: vec![],
             revision: 0,
             call_id: String::new(),
@@ -207,6 +209,7 @@ pub struct Model {
     timed_turns: usize,
     active_ms: f64,
     active_output: HashMap<String, (String, Option<f64>)>,
+    request_started: HashMap<String, f64>,
 }
 
 pub fn duration(ms: f64) -> String {
@@ -361,6 +364,7 @@ impl Model {
             timed_turns: 0,
             active_ms: 0.0,
             active_output: HashMap::new(),
+            request_started: HashMap::new(),
         }
     }
     fn key(&mut self) -> String {
@@ -560,6 +564,7 @@ impl Model {
                 c.status = old.status.clone();
                 c.started = old.started;
                 c.duration_ms = old.duration_ms;
+                c.request_duration_ms = old.request_duration_ms;
                 c.output_seen = old.output_seen;
                 if !self.cards.contains_key(&c.id) {
                     self.cards.insert(c.id.clone(), c);
@@ -646,6 +651,10 @@ impl Model {
             ),
             "model/request" => {
                 self.current_request = d["requestId"].as_str().unwrap_or("").into();
+                if let Some(at) = event.elapsed_ms {
+                    self.request_started
+                        .insert(self.current_request.clone(), at);
+                }
                 self.current_group.retain(|id| !id.starts_with("request:"));
                 self.group(
                     format!("request:{}", self.current_request),
@@ -722,6 +731,12 @@ impl Model {
             }
             "model/response" => {
                 let request = d["requestId"].as_str().unwrap_or("").to_string();
+                let request_duration = self
+                    .request_started
+                    .remove(&request)
+                    .zip(event.elapsed_ms)
+                    .filter(|(start, end)| end >= start)
+                    .map(|(start, end)| end - start);
                 self.advance_output(&request, event.elapsed_ms);
                 self.finish(
                     &format!("request:{request}"),
@@ -744,6 +759,9 @@ impl Model {
                         let mut c = self.cards[&id].clone();
                         c.provisional = true;
                         c.request = request.clone();
+                        if matches!(c.kind, Kind::Think | Kind::Answer) {
+                            c.request_duration_ms = request_duration;
+                        }
                         self.put(c);
                         retained.insert(id.clone());
                         self.pending.entry(request.clone()).or_default().push(id);
@@ -801,6 +819,20 @@ impl Model {
                         .unwrap_or(&self.current_request)
                         .to_string();
                     self.advance_output(&request, event.elapsed_ms);
+                    let elapsed = self
+                        .request_started
+                        .remove(&request)
+                        .zip(event.elapsed_ms)
+                        .filter(|(start, end)| end >= start)
+                        .map(|(start, end)| end - start);
+                    for id in self.pending.get(&request).cloned().unwrap_or_default() {
+                        if let Some(mut c) = self.cards.get(&id).cloned()
+                            && matches!(c.kind, Kind::Think | Kind::Answer)
+                        {
+                            c.request_duration_ms = elapsed;
+                            self.put(c);
+                        }
+                    }
                 }
                 let id = self.key();
                 let mut c = Card::new(id, Kind::Error);
