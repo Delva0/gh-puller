@@ -299,6 +299,55 @@ fn duration_uses_seconds_minutes_and_hours() {
 }
 
 #[test]
+fn running_duration_advances_within_turns_without_synthesizing_events_or_usage() {
+    let mut m = Model::new();
+    assert!(!m.tick(1000.0));
+    apply(&mut m, "session/start", json!({}), 0.0);
+    assert_eq!(m.summary.status, "Running");
+    apply(&mut m, "turn/start", json!({}), 100.0);
+    assert_eq!(m.summary.status, "Running · 0.00s");
+    apply(&mut m, "model/request", json!({"requestId":"r"}), 200.0);
+    let state = m.folded();
+    let footer = m.stats.footer();
+    let events = m.summary.events;
+    assert!(m.tick(1100.0));
+    assert_eq!(m.summary.status, "Running · 1.00s");
+    assert_eq!(m.cards["turn:1"].duration_ms, Some(1000.0));
+    assert_eq!(m.folded(), state);
+    assert_eq!(m.stats.footer(), footer);
+    assert_eq!(m.summary.events, events);
+    assert_eq!(m.summary.last_ms, 200.0);
+    apply(
+        &mut m,
+        "model/delta/text",
+        json!({"requestId":"r", "text":"Visible now"}),
+        1300.0,
+    );
+    assert_eq!(m.summary.status, "Running · 1.20s");
+    assert!(m.cards.values().any(|c| c.text == "Visible now"));
+    assert!(!m.summary.ended);
+    apply(&mut m, "turn/end", json!({}), 1600.0);
+    assert_eq!(m.summary.status, "Running · 1.50s");
+    assert!(!m.tick(300_000.0));
+    assert_eq!(m.summary.status, "Running · 1.50s");
+    apply(&mut m, "turn/start", json!({}), 601_600.0);
+    assert_eq!(m.summary.status, "Running · 1.50s");
+    assert!(m.tick(604_100.0));
+    assert_eq!(m.summary.status, "Running · 4.00s");
+    assert_eq!(m.cards["turn:2"].duration_ms, Some(2500.0));
+    apply(&mut m, "turn/end", json!({}), 604_600.0);
+    apply(
+        &mut m,
+        "session/end",
+        json!({"outcome":"completed"}),
+        22_000_000.0,
+    );
+    assert_eq!(m.summary.status, "Completed · 4.50s");
+    assert!(!m.tick(99_000_000.0));
+    assert_eq!(m.summary.status, "Completed · 4.50s");
+}
+
+#[test]
 fn session_duration_sums_turns_across_idle_time_and_context_replacement() {
     let mut m = Model::new();
     apply(&mut m, "session/start", json!({}), 0.0);

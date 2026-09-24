@@ -22,8 +22,9 @@ The locked build was verified with Rust 1.98.1 on Linux. Cargo installs into
 `~/.cargo/bin`; include that directory in `PATH`. A missing file is awaited. The observer
 opens the file once and retains its handle until `session/end`, including across the
 FileSink's atomic compaction. Partial JSON lines and split UTF-8 are buffered. At session
-end it stops reading and freezes event clocks while keeping the browser open. An EOF
-without an end event is labeled **End not recorded**, including when watching a historical file.
+end it stops reading and freezes event clocks while keeping the browser open. An open
+session is **Running** until its end event is received. An empty file waits for a session;
+opening a file does not determine the session state.
 Malformed complete records stop reconstruction at the valid prefix and display the error.
 
 ## Interaction
@@ -95,13 +96,17 @@ compact history, think and answer cards show `request 1.56s`, measured from `mod
 `model/response` or `model/error` using `elapsedMs`. This is the total request duration shared
 by its output cards, so it must not be summed across cards. Untimed cards, including user/system
 content, omit the time field. An unfinished output phase with no recorded boundary remains unknown.
-Scrolling up pauses automatic following; End clears the new-event indicator. User-expanded
+Scrolling up pauses automatic following; incoming events still update the cards. End returns
+to the bottom and resumes following an open session. User-expanded
 cards stay expanded. Top chrome contains only session title and path; panels are temporary.
 
 The footer combines status and statistics on one line, for example
-`Completed · 2.31s  1/2 40/349 —/s`. Duration sums the session's `turn/start`–`turn/end`
-intervals using `elapsedMs`, including model and tool waits. It excludes idle time before,
-between and after turns. Missing or incomplete turn timing displays `—`; the observer
+`Running · 1.24s  1/2 40/349 —/s` or `Completed · 2.31s  1/2 40/349 —/s`. Duration sums
+completed turns plus the current open turn, including model and tool waits. The open turn
+heading also updates during execution. Between events, the reader advances the display clock
+every 100 ms, anchored to recorded `elapsedMs` and `ts` when available, then using a local
+monotonic clock. Recorded boundaries calibrate and freeze the durations. Time before,
+between and after turns is excluded. Missing or incomplete final turn timing displays `—`; the observer
 does not substitute the session's recorded lifetime. Longer durations use hours and minutes,
 such as `6h 10m 41s`. The numbers are
 `turn/steps-in-turn input/output speed/s`. Input is frozen at the first

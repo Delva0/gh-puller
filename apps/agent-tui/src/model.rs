@@ -395,6 +395,50 @@ impl Model {
             self.put(c);
         }
     }
+    fn elapsed(&self, at: Option<f64>) -> Option<f64> {
+        if self.stats.turn == 0 {
+            None
+        } else if self.timed_turns == self.stats.turn {
+            Some(self.active_ms)
+        } else if !self.summary.ended && self.timed_turns + 1 == self.stats.turn {
+            self.turn_started_ms
+                .zip(at)
+                .filter(|(start, end)| end >= start)
+                .map(|(start, end)| self.active_ms + end - start)
+        } else {
+            None
+        }
+    }
+    fn running_time(&mut self, at: Option<f64>) -> bool {
+        let status = match self.elapsed(at) {
+            Some(ms) => format!("Running · {}", duration(ms)),
+            None => "Running".into(),
+        };
+        let mut changed = self.summary.status != status;
+        self.summary.status = status;
+        if let Some((start, end)) = self
+            .turn_started_ms
+            .zip(at)
+            .filter(|(start, end)| end >= start)
+            && let Some(mut card) = self
+                .cards
+                .get(&format!("turn:{}", self.stats.turn))
+                .cloned()
+            && card.duration_ms != Some(end - start)
+        {
+            card.duration_ms = Some(end - start);
+            self.put(card);
+            changed = true;
+        }
+        changed
+    }
+    /// Advance display time within an open turn without synthesizing events or usage.
+    pub fn tick(&mut self, at: f64) -> bool {
+        if self.summary.ended || self.turn_started_ms.is_none() {
+            return false;
+        }
+        self.running_time(Some(at))
+    }
     fn advance_output(&mut self, request: &str, at: Option<f64>) {
         let Some((id, previous)) = self.active_output.remove(request) else {
             return;
@@ -596,7 +640,6 @@ impl Model {
         });
         self.summary.events += 1;
         self.summary.last_ms = at;
-        self.summary.status = "End not recorded".into();
         self.stats.apply(kind, d, at);
         match kind {
             "session/start" => {
@@ -864,11 +907,10 @@ impl Model {
                     reason => reason,
                 };
                 // Session lifetime can include hours spent waiting between completed turns.
-                let elapsed = if self.stats.turn > 0 && self.timed_turns == self.stats.turn {
-                    duration(self.active_ms)
-                } else {
-                    "—".into()
-                };
+                let elapsed = self
+                    .elapsed(None)
+                    .map(duration)
+                    .unwrap_or_else(|| "—".into());
                 self.summary.status = format!("{status} · {elapsed}");
                 for id in self.current_group.clone() {
                     if self.cards.get(&id).is_some_and(|c| c.duration_ms.is_none()) {
@@ -887,6 +929,9 @@ impl Model {
                     self.agent["config"][facet] = d[facet].clone();
                 }
             }
+        }
+        if !self.summary.ended {
+            self.running_time(event.elapsed_ms);
         }
     }
 

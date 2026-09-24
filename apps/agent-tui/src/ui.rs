@@ -279,10 +279,11 @@ mod tests {
         app.apply(model.change());
         assert_eq!(app.scroll, scroll);
         assert_eq!(app.focus, focus);
-        assert_eq!(app.unseen, 1);
+        assert!(!app.follow);
+        assert_eq!(app.summary.status, "Running");
+        assert!(app.cards.values().any(|c| c.text == "new text"));
         key(&mut app, KeyCode::End);
         assert!(app.follow);
-        assert_eq!(app.unseen, 0);
         apply(&mut model, "session/end", json!({"outcome":"completed"}));
         app.apply(model.change());
         assert!(!app.follow);
@@ -896,7 +897,6 @@ pub struct App {
     wrap: bool,
     pub focus: Option<String>,
     pub follow: bool,
-    pub unseen: usize,
     width: usize,
     viewport: usize,
     selection: Option<Selection>,
@@ -958,7 +958,6 @@ impl App {
             wrap: true,
             focus: None,
             follow: true,
-            unseen: 0,
             width: 80,
             viewport: 24,
             selection: None,
@@ -1093,7 +1092,6 @@ impl App {
     }
     pub fn apply(&mut self, change: Change) {
         let anchor = self.anchor();
-        let old_events = self.summary.events;
         for c in change.cards {
             if c.kind != Kind::Request {
                 if self.positions.contains_key(&c.id)
@@ -1152,9 +1150,6 @@ impl App {
         }
         self.settle_view();
         self.summary = change.summary;
-        if !self.follow {
-            self.unseen += self.summary.events.saturating_sub(old_events);
-        }
         self.restore(anchor);
         if self.summary.ended {
             self.follow = false;
@@ -1530,8 +1525,6 @@ impl App {
         let mut status = self.summary.status.clone();
         if !self.notice.is_empty() {
             status.push_str(&format!(" · {}", self.notice));
-        } else if self.unseen > 0 {
-            status.push_str(&format!(" · ↑ {} new events · End to follow", self.unseen));
         }
         let stats = format!("  {}", self.summary.footer);
         let status_width = (area.width as usize).saturating_sub(stats.width() + 1);
@@ -1989,7 +1982,6 @@ impl App {
                 self.reveal_match = None;
                 self.scroll = self.heights.total().saturating_sub(self.viewport);
                 self.follow = !self.summary.ended;
-                self.unseen = 0;
                 self.notice.clear();
             }
             "stats" => self.panel = Some(Panel::Stats),
