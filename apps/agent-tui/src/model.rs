@@ -373,12 +373,7 @@ impl Model {
             "function_call_output" => {
                 c.call_id = call_id.into();
                 c.result = Some(pretty(&item["output"]));
-                c.recorded_result = Some(
-                    self.recorded_results
-                        .entry(call_id.into())
-                        .or_insert_with(|| Arc::from(c.result.as_deref().unwrap()))
-                        .clone(),
-                );
+                c.recorded_result = self.recorded_results.get(call_id).cloned();
                 c.result_source = stats::raw(&item["output"]);
                 if c.status.is_empty() {
                     c.status = "Result received".into();
@@ -461,6 +456,11 @@ impl Model {
         self.pending.clear();
         let mut ordered = HashSet::new();
         for item in items {
+            if item["type"] == "function_call_output" {
+                self.recorded_results
+                    .entry(item["call_id"].as_str().unwrap_or("").into())
+                    .or_insert_with(|| Arc::from(pretty(&item["output"])));
+            }
             let ident = identity(item);
             let reuse = ids.get_mut(&ident).and_then(VecDeque::pop_front);
             let old = reuse.as_ref().and_then(|id| previous.get(id));

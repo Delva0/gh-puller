@@ -286,3 +286,31 @@ fn session_duration_is_labeled_and_keeps_idle_time_in_the_recorded_lifetime() {
     );
     assert_eq!(m.summary.status, "Completed · session 6h 10m 41s");
 }
+
+#[test]
+fn retained_results_come_from_context_facts_including_initial_snapshots() {
+    let mut m = Model::new();
+    let output = |text| json!({"type":"function_call_output", "call_id":"c", "output":text});
+    apply(
+        &mut m,
+        "model/response",
+        json!({"requestId":"r", "output":[output("provisional output")]}),
+        0.0,
+    );
+    apply(
+        &mut m,
+        "context/set",
+        json!({"items":[output("recorded output")]}),
+        1.0,
+    );
+    apply(
+        &mut m,
+        "context/set",
+        json!({"items":[output("summary")]}),
+        2.0,
+    );
+    let card = &m.cards["tool:c"];
+    assert_eq!(card.result.as_deref(), Some("summary"));
+    assert_eq!(card.recorded_result.as_deref(), Some("recorded output"));
+    assert!(!card.body(true).contains("provisional output"));
+}
