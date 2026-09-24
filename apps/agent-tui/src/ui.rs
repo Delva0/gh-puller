@@ -207,7 +207,7 @@ mod tests {
         app.handle(Event::Mouse(MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
             column: 8,
-            row: 5,
+            row: 7,
             modifiers: KeyModifiers::NONE,
         }));
         assert!(app.panel.is_none());
@@ -249,6 +249,11 @@ mod tests {
         }));
         assert_eq!(app.selected_text().as_deref(), Some("你好"));
         assert_eq!(app.copy_text(false).as_deref(), Some("你好"));
+        terminal.draw(|f| app.render(f)).unwrap();
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(2, y)].bg, Color::Rgb(75, 91, 126));
+        assert_eq!(buffer[(10, y)].bg, app.focus_background());
+        assert_eq!(buffer[(78, y)].symbol(), " ");
         app.width = 10;
         layout(&mut app);
         assert_eq!(app.selected_text().as_deref(), Some("你好"));
@@ -281,6 +286,95 @@ mod tests {
         assert!(!app.follow);
         key(&mut app, KeyCode::End);
         assert!(!app.follow);
+    }
+
+    #[test]
+    fn presets_track_custom_toggles_new_cards_and_context_replacements() {
+        let (mut model, mut app) = fixture();
+        let ids = app.order.clone();
+        assert_eq!(app.view(), Some(Preset::Conversation));
+        key(&mut app, KeyCode::Char('1'));
+        assert_eq!(app.view(), Some(Preset::Collapsed));
+        apply(&mut model, "turn/start", json!({}));
+        apply(
+            &mut model,
+            "context/append/system",
+            json!({"items":[
+                {"type":"message","role":"system","content":[{"type":"input_text","text":"Instructions"}]}
+            ]}),
+        );
+        app.apply(model.change());
+        let system = app.order.last().unwrap().clone();
+        assert!(!app.open(&system));
+        assert_eq!(app.view(), Some(Preset::Collapsed));
+        app.focus = Some(ids[0].clone());
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(app.view(), None);
+        assert_eq!(app.view_label(), "Custom");
+        app.toggle(&ids[2]);
+        assert_eq!(app.view(), Some(Preset::Conversation));
+        app.toggle(&system);
+        assert_eq!(app.view(), None);
+        app.toggle(&system);
+        assert_eq!(app.view(), Some(Preset::Conversation));
+
+        key(&mut app, KeyCode::Char('3'));
+        apply(
+            &mut model,
+            "context/append/tool",
+            json!({"items":[
+                {"type":"function_call_output","call_id":"new","output":"Result"}
+            ]}),
+        );
+        app.apply(model.change());
+        assert!(app.open("tool:new"));
+        assert_eq!(app.view(), Some(Preset::Expanded));
+        key(&mut app, KeyCode::Char('2'));
+        assert!(!app.open(&system));
+        assert!(!app.open(&ids[1]));
+        assert!(app.open(&ids[0]) && app.open(&ids[2]));
+        app.toggle("tool:new");
+        let items = model.context.clone();
+        apply(&mut model, "context/set", json!({"items":items}));
+        app.apply(model.change());
+        assert_eq!(app.view(), None);
+        assert!(app.open("tool:new"));
+        let items: Vec<_> = model
+            .context
+            .iter()
+            .filter(|i| i["call_id"] != "new")
+            .cloned()
+            .collect();
+        apply(&mut model, "context/set", json!({"items":items}));
+        app.apply(model.change());
+        assert_eq!(app.view(), Some(Preset::Conversation));
+        assert_eq!(app.notice, "View: Conversation");
+    }
+
+    #[test]
+    fn custom_views_preserve_overrides_and_search_updates_the_view() {
+        let (mut model, mut app) = fixture();
+        let ids = app.order.clone();
+        app.toggle(&ids[0]);
+        assert_eq!(app.view(), None);
+        apply(
+            &mut model,
+            "context/append",
+            json!({"items":[
+                {"type":"message","role":"user","content":[{"type":"input_text","text":"Another question"}]},
+                {"type":"reasoning","content":[{"type":"reasoning_text","text":"Another thought"}]}
+            ]}),
+        );
+        app.apply(model.change());
+        assert!(!app.open(&ids[0]));
+        assert!(app.open(&app.order[3]));
+        assert!(!app.open(&app.order[4]));
+        assert_eq!(app.view(), None);
+        app.matches = vec![ids[0].clone()];
+        app.next_match(true);
+        assert!(app.open(&ids[0]));
+        assert_eq!(app.view(), Some(Preset::Conversation));
+        assert_eq!(app.focus.as_ref(), Some(&ids[0]));
     }
 
     #[test]
@@ -576,6 +670,31 @@ enum Panel {
     Menu,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Preset {
+    Collapsed,
+    Conversation,
+    Expanded,
+}
+const PRESETS: [Preset; 3] = [Preset::Collapsed, Preset::Conversation, Preset::Expanded];
+impl Preset {
+    fn opens(self, kind: Kind) -> bool {
+        !kind.heading()
+            && match self {
+                Self::Collapsed => false,
+                Self::Conversation => kind.default_open(),
+                Self::Expanded => true,
+            }
+    }
+    fn label(self) -> &'static str {
+        match self {
+            Self::Collapsed => "Collapsed",
+            Self::Conversation => "Conversation",
+            Self::Expanded => "Expanded",
+        }
+    }
+}
+
 pub struct App {
     pub summary: Summary,
     pub path: String,
@@ -583,6 +702,8 @@ pub struct App {
     pub cards: HashMap<String, Arc<Card>>,
     positions: HashMap<String, usize>,
     expanded: HashMap<String, bool>,
+    preset: Preset,
+    view_mismatches: [usize; 3],
     heights: Heights,
     docs: HashMap<String, Document>,
     requested: HashSet<(String, u64, usize, bool)>,
@@ -613,8 +734,9 @@ pub struct App {
 }
 
 const COMMANDS: &[(&str, &str)] = &[
-    ("expand", "Expand all cards"),
-    ("collapse", "Collapse all cards"),
+    ("collapse", "1 · Collapse all cards"),
+    ("conversation", "2 · Expand only user and assistant answer"),
+    ("expand", "3 · Expand all cards"),
     ("copy", "Copy selection or card"),
     ("answer", "Copy latest answer"),
     ("follow", "Go to bottom"),
@@ -627,7 +749,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("link", "Open link in card"),
     ("quit", "Quit"),
 ];
-const HELP: &str = "j/k ↑/↓        Scroll (pauses follow)\nPgUp/PgDn      Page up / down\nHome/End       Top / follow bottom\nTab/Shift-Tab  Next / previous card\nEnter/Space    Expand / collapse card\ne / E          Expand / collapse all\nh/l ←/→        Scroll horizontally\n/              Search text and tool names\nn / N          Next / previous match\n] / [          Next / previous turn\n} / {          Next / previous step\n!              Next error\nc / y          Copy selection or card / latest answer\ns              Token statistics\nt              Change theme\n: or Ctrl-P    Command palette\nm              Menu\no              Open first link in card\nCtrl+click     Open link under pointer\n? / F1         Help\nEsc            Close panel / clear selection\nq / Ctrl-C     Quit\n\nClick a title to toggle a card. Drag to select text.\nRight-click to copy. Scroll with the wheel or scrollbar.\nCopy uses OSC 52 with tmux passthrough.";
+const HELP: &str = "j/k ↑/↓        Scroll (pauses follow)\nPgUp/PgDn      Page up / down\nHome/End       Top / follow bottom\nTab/Shift-Tab  Next / previous card\nEnter/Space    Expand / collapse card\n1              Collapse all cards\n2              Expand user and assistant answer\n3              Expand all cards\ne / E          Expand / collapse all (aliases)\nh/l ←/→        Scroll horizontally\n/              Search text and tool names\nn / N          Next / previous match\n] / [          Next / previous turn\n} / {          Next / previous step\n!              Next error\nc / y          Copy selection or card / latest answer\ns              Token statistics\nt              Change theme\n: or Ctrl-P    Command palette\nm              Menu\no              Open first link in card\nCtrl+click     Open link under pointer\n? / F1         Help\nEsc            Close panel / clear selection\nq / Ctrl-C     Quit\n\nManual toggles show Custom when no preset matches.\nNew cards follow the last preset in Custom.\nClick a title to toggle a card. Drag to select text.\nRight-click to copy. Scroll with the wheel or scrollbar.\nCopy uses OSC 52 with tmux passthrough.";
 
 impl App {
     pub fn new(path: String) -> Self {
@@ -639,6 +761,8 @@ impl App {
             cards: HashMap::new(),
             positions: HashMap::new(),
             expanded: HashMap::new(),
+            preset: Preset::Conversation,
+            view_mismatches: [0; 3],
             heights: Heights::default(),
             docs: HashMap::new(),
             requested: HashSet::new(),
@@ -672,7 +796,43 @@ impl App {
         self.expanded
             .get(id)
             .copied()
-            .unwrap_or_else(|| self.cards[id].kind.default_open())
+            .unwrap_or_else(|| self.preset.opens(self.cards[id].kind))
+    }
+    fn view(&self) -> Option<Preset> {
+        if self.view_mismatches[self.preset as usize] == 0 {
+            Some(self.preset)
+        } else {
+            PRESETS
+                .into_iter()
+                .find(|preset| self.view_mismatches[*preset as usize] == 0)
+        }
+    }
+    fn view_label(&self) -> &'static str {
+        self.view().map(Preset::label).unwrap_or("Custom")
+    }
+    fn count_view(&mut self, kind: Kind, open: bool, add: bool) {
+        if kind.heading() {
+            return;
+        }
+        for preset in PRESETS {
+            if preset.opens(kind) != open {
+                let count = &mut self.view_mismatches[preset as usize];
+                if add {
+                    *count += 1;
+                } else {
+                    *count -= 1;
+                }
+            }
+        }
+    }
+    fn settle_view(&mut self) {
+        if let Some(preset) = self.view() {
+            self.preset = preset;
+            self.expanded.clear();
+        }
+        if self.notice.starts_with("View: ") {
+            self.notice = format!("View: {}", self.view_label());
+        }
     }
     fn height(&self, id: &str) -> usize {
         let c = &self.cards[id];
@@ -729,6 +889,19 @@ impl App {
         let old_events = self.summary.events;
         for c in change.cards {
             if c.kind != Kind::Request {
+                if self.positions.contains_key(&c.id)
+                    && let Some(old) = self.cards.get(&c.id)
+                    && old.kind != c.kind
+                {
+                    let kind = old.kind;
+                    self.count_view(kind, self.open(&c.id), false);
+                    let open = self
+                        .expanded
+                        .get(&c.id)
+                        .copied()
+                        .unwrap_or_else(|| self.preset.opens(c.kind));
+                    self.count_view(c.kind, open, true);
+                }
                 self.cards.insert(c.id.clone(), c);
             }
         }
@@ -743,9 +916,12 @@ impl App {
             self.expanded.retain(|id, _| live.contains(id));
             self.positions.clear();
             self.heights = Heights::default();
-            for (i, id) in self.order.iter().enumerate() {
+            self.view_mismatches = [0; 3];
+            for i in 0..self.order.len() {
+                let id = self.order[i].clone();
                 self.positions.insert(id.clone(), i);
-                self.heights.push(self.height(id));
+                self.heights.push(self.height(&id));
+                self.count_view(self.cards[&id].kind, self.open(&id), true);
             }
             if self.focus.as_ref().is_some_and(|id| !live.contains(id)) {
                 self.focus = self.order.first().cloned();
@@ -762,10 +938,12 @@ impl App {
                 if !self.positions.contains_key(&id) && self.cards.contains_key(&id) {
                     self.positions.insert(id.clone(), self.order.len());
                     self.heights.push(self.height(&id));
+                    self.count_view(self.cards[&id].kind, self.open(&id), true);
                     self.order.push(id);
                 }
             }
         }
+        self.settle_view();
         self.summary = change.summary;
         if !self.follow {
             self.unseen += self.summary.events.saturating_sub(old_events);
@@ -872,6 +1050,13 @@ impl App {
             Color::Rgb(0, 0, 0),
         ][self.theme]
     }
+    fn focus_background(&self) -> Color {
+        [
+            Color::Rgb(31, 36, 46),
+            Color::Rgb(43, 39, 54),
+            Color::Rgb(24, 28, 34),
+        ][self.theme]
+    }
     fn color(kind: Kind) -> Color {
         match kind {
             Kind::User => Color::Rgb(229, 192, 123),
@@ -891,7 +1076,7 @@ impl App {
         if c.kind.heading() {
             return Line::styled(
                 document::safe(&format!(
-                    " {} {}{}{}",
+                    "─ {} {}{}{}",
                     c.kind.label(),
                     c.name,
                     duration,
@@ -901,16 +1086,14 @@ impl App {
                         format!(" · {}", c.status)
                     }
                 )),
-                Style::default()
-                    .fg(Self::color(c.kind))
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(Color::Rgb(83, 94, 112)),
             );
         }
         let symbol = if self.open(&c.id) { "▾" } else { "▸" };
-        let time = if c.kind == Kind::Tool {
-            duration
+        let time = if duration.is_empty() {
+            " · —".into()
         } else {
-            String::new()
+            duration
         };
         Line::from(vec![
             Span::styled(
@@ -998,8 +1181,7 @@ impl App {
                     let y = 2 + (absolute - self.scroll) as u16;
                     if card.kind.heading() {
                         frame.render_widget(
-                            Paragraph::new(self.title(&card))
-                                .style(Style::default().bg(Color::Rgb(31, 36, 46))),
+                            Paragraph::new(self.title(&card)),
                             Rect::new(1, y, area.width - 2, 1),
                         );
                         self.hits.push(Hit {
@@ -1012,6 +1194,12 @@ impl App {
                         });
                         continue;
                     }
+                    if focused {
+                        frame.render_widget(
+                            Block::default().style(Style::default().bg(self.focus_background())),
+                            Rect::new(0, y, area.width - 1, 1),
+                        );
+                    }
                     if self.open(&id) {
                         frame.render_widget(
                             Paragraph::new(if row == 0 {
@@ -1023,18 +1211,6 @@ impl App {
                             })
                             .style(Style::default().fg(Self::color(card.kind))),
                             Rect::new(0, y, 1, 1),
-                        );
-                    }
-                    if self.open(&id) || focused {
-                        frame.render_widget(
-                            Paragraph::new(if focused { "┃" } else { "│" }).style(
-                                Style::default().fg(if focused {
-                                    Color::Gray
-                                } else {
-                                    Color::Rgb(48, 55, 67)
-                                }),
-                            ),
-                            Rect::new(area.width - 2, y, 1, 1),
                         );
                     }
                     if row == 0 {
@@ -1211,15 +1387,16 @@ impl App {
             Panel::Commands | Panel::Menu => (
                 "Commands · ↑↓ to select · Enter to run",
                 format!(
-                    ":{}\n\n{}",
+                    ":{}    View: {}\n\n{}",
                     self.input,
+                    self.view_label(),
                     COMMANDS
                         .iter()
                         .filter(|(name, label)| name.contains(&self.input)
                             || label.contains(&self.input))
                         .enumerate()
                         .map(|(i, (name, label))| format!(
-                            "{} {name:<12} {label}",
+                            "{} {name:<14} {label}",
                             if i == self.menu_index { "›" } else { " " }
                         ))
                         .collect::<Vec<_>>()
@@ -1248,22 +1425,41 @@ impl App {
         }
         let anchor = self.anchor();
         let open = !self.open(id);
-        self.expanded.insert(id.into(), open);
-        if let Some(i) = self.positions.get(id).copied() {
-            self.heights.set(i, self.height(id));
-        }
+        self.set_open(id, open);
+        self.notice = format!("View: {}", self.view_label());
         self.restore(anchor);
         self.dirty = true;
     }
-    fn all(&mut self, expanded: bool) {
-        let anchor = self.anchor();
-        for id in &self.order {
-            self.expanded.insert(id.clone(), expanded);
+    fn set_open(&mut self, id: &str, open: bool) {
+        let kind = self.cards[id].kind;
+        if kind.heading() || self.open(id) == open {
+            return;
         }
-        for (i, id) in self.order.iter().enumerate() {
+        self.count_view(kind, self.open(id), false);
+        if open == self.preset.opens(kind) {
+            self.expanded.remove(id);
+        } else {
+            self.expanded.insert(id.into(), open);
+        }
+        self.count_view(kind, open, true);
+        self.settle_view();
+        if let Some(i) = self.positions.get(id).copied() {
             self.heights.set(i, self.height(id));
         }
+    }
+    fn set_view(&mut self, preset: Preset) {
+        let anchor = self.anchor();
+        self.preset = preset;
+        self.expanded.clear();
+        self.view_mismatches = [0; 3];
+        for i in 0..self.order.len() {
+            let id = self.order[i].clone();
+            self.count_view(self.cards[&id].kind, self.open(&id), true);
+            self.heights.set(i, self.height(&id));
+        }
+        self.notice = format!("View: {}", self.view_label());
         self.restore(anchor);
+        self.dirty = true;
     }
     fn scroll_by(&mut self, delta: isize) {
         self.follow = false;
@@ -1344,9 +1540,7 @@ impl App {
         };
         let id = self.matches[self.match_index].clone();
         if self.cards.contains_key(&id) {
-            self.expanded.insert(id.clone(), true);
-            let i = self.positions[&id];
-            self.heights.set(i, self.height(&id));
+            self.set_open(&id, true);
             self.jump(id);
         }
     }
@@ -1475,8 +1669,9 @@ impl App {
     }
     fn command(&mut self, command: &str) {
         match command {
-            "expand" => self.all(true),
-            "collapse" => self.all(false),
+            "expand" => self.set_view(Preset::Expanded),
+            "collapse" => self.set_view(Preset::Collapsed),
+            "conversation" => self.set_view(Preset::Conversation),
             "copy" => self.copy(false),
             "answer" => self.copy(true),
             "follow" => {
@@ -1602,8 +1797,9 @@ impl App {
                             self.toggle(&id);
                         }
                     }
-                    KeyCode::Char('e') => self.command("expand"),
-                    KeyCode::Char('E') => self.command("collapse"),
+                    KeyCode::Char('1' | 'E') => self.command("collapse"),
+                    KeyCode::Char('2') => self.command("conversation"),
+                    KeyCode::Char('3' | 'e') => self.command("expand"),
                     KeyCode::Char('c') => self.copy(false),
                     KeyCode::Char('y') => self.copy(true),
                     KeyCode::Char('o') => self.link(),

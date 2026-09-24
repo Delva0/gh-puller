@@ -34,7 +34,9 @@ Malformed complete records stop reconstruction at the valid prefix and display t
 | Top / bottom and follow | Home / End |
 | Next / previous card | Tab / Shift-Tab |
 | Toggle card | Enter, Space, click title |
-| Expand / collapse all | `e` / `E` |
+| Collapse all | `1` (or `E`) |
+| Expand only user and assistant answer | `2` |
+| Expand all | `3` (or `e`) |
 | Browse wide code or tables | `h/l`, left/right |
 | Select text | Drag over body; selection survives valid updates and resize |
 | Copy selection or full focused card | `c`, right click |
@@ -58,15 +60,34 @@ link handling, including Ctrl+click. The `o` shortcut opens the first link in th
 card using `xdg-open` on Linux or `open` on macOS. The observer never executes tool calls
 or writes the input log.
 
-Thought, system and tool cards start collapsed, answers and user cards expanded. Every
-collapsed card occupies one line with no border. Expanding a tool shows its formatted
+The default **Conversation** view expands only user and assistant answer cards. `1`, `2`
+and `3` select **Collapsed**, **Conversation** and **Expanded**. The command palette offers
+`collapse`, `conversation` and `expand` and shows the current view. Manual toggles and search
+reveal cards individually; the view reads **Custom** when the result differs from all three
+presets. Returning to a matching preset restores its name. New cards follow the active
+preset, or the last preset while Custom; existing choices survive matching context updates.
+
+Every collapsed card occupies one line with no border. Expanding a tool shows its formatted
 arguments and **context result**, with long tool output wrapped instead of clipped.
 When a context update changes a result, the card also retains the output from its original
 context append under **Recorded result**. Both versions are searchable and copyable;
 counts and folded state still follow current context. Activity never replaces context results.
 Tool headers show `Failed` on errors and omit successful completion labels and error payloads.
-Expanded cards end on their last content row. User/system/thought/answer cards do not
-acquire timestamps or stream spans.
+Expanded cards end on their last content row. Focus uses a subtle card background; selected
+text has a stronger background. Turn and step separators use dim text on the page background.
+All card bodies share Markdown rendering and preserve soft newlines; literal `\n` text is
+not decoded a second time. Canonical `tool_defs` parts show tool names and descriptions as
+text, preserving description newlines, with input schemas in JSON code blocks. Other fields
+remain visible as structured data. Links, code and tables retain their formatting.
+
+Every card header includes tokens and time. Tool time covers execution. Think and answer
+time sums observed output phases within the request: each phase starts at its first nonempty
+delta and ends at the next output part, response, error or turn end. Interleaved parts accumulate
+their own intervals. First-output waits and tool execution are excluded from these output
+times. These are adapter receipt intervals, not server generation measurements. A context
+commit or matching replacement retains the timing. User/system content has no recorded execution
+duration; its time is `—`. Output cards without deltas, including compact history, also show `—`.
+An unfinished output phase with no recorded boundary remains unknown after session close.
 Scrolling up pauses automatic following; End clears the new-event indicator. User-expanded
 cards stay expanded. Top chrome contains only session title and path; panels are temporary.
 
@@ -82,7 +103,7 @@ Speed covers first nonempty delta through model completion for each request, exc
 tool waits and first-output waits. Compact history has no deltas, so its speed is `—`.
 Values at or above 1000 use two decimal places with `K`, including millions.
 
-`s` explains the local `o200k_base` counts, per-Item framing estimate, 1024-token image
+`s` explains card timing, the local `o200k_base` counts, per-Item framing estimate, 1024-token image
 placeholder, input-usage calibration, and known/unknown usage counters. Context composition,
 latest request, current turn, session totals and cache reads are separate. Local counts are
 estimates of model-visible content, not provider billing. Images display metadata only;

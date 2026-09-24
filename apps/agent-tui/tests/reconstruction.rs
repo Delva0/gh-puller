@@ -367,3 +367,304 @@ fn retained_results_come_from_context_facts_including_initial_snapshots() {
     assert_eq!(card.recorded_result.as_deref(), Some("recorded output"));
     assert!(!card.body(true).contains("provisional output"));
 }
+
+#[test]
+fn all_message_roles_preserve_soft_newlines_and_literal_backslashes() {
+    let text = "First line\nSecond [line](https://example.com)\nLiteral \\n stays literal.\n\n```text\ncode line 1\ncode line 2\n```";
+    let mut documents = vec![];
+    for role in ["system", "user", "assistant"] {
+        let mut m = Model::new();
+        apply(
+            &mut m,
+            "context/append",
+            json!({"items":[message(role, text)]}),
+            0.0,
+        );
+        let doc = document::prepare(Job {
+            card: Arc::new(m.cards[&m.order[0]].clone()),
+            width: 80,
+            expanded: true,
+        });
+        assert!(
+            doc.plain
+                .starts_with("First line\nSecond line\nLiteral \\n stays literal.\n")
+        );
+        assert!(doc.plain.contains("code line 1\ncode line 2\n"));
+        assert_eq!(&doc.plain[doc.links[0].start..doc.links[0].end], "line");
+        documents.push(doc.plain);
+    }
+    assert_eq!(documents[0], documents[1]);
+    assert_eq!(documents[1], documents[2]);
+}
+
+#[test]
+fn tool_definitions_render_description_newlines_without_changing_context_or_counts() {
+    let mut m = Model::new();
+    let part = json!({"type":"tool_defs", "tools":[{
+        "name":"read_file", "description":"Read a file.\nKeep its line endings.",
+        "inputSchema":{"type":"object", "properties":{"path":{"type":"string"}}},
+        "extra":"Preserve unknown fields"
+    }, {"name":"<opaque>"}], "source":"Declared tools"});
+    let item = json!({"type":"message", "role":"system", "content":[part.clone()]});
+    apply(
+        &mut m,
+        "context/append/system",
+        json!({"items":[item.clone()]}),
+        0.0,
+    );
+    m.change();
+    let card = &m.cards[&m.order[0]];
+    assert_eq!(
+        card.tokens,
+        agent_tui::stats::count(&agent_tui::model::pretty(&part))
+    );
+    let doc = document::prepare(Job {
+        card: Arc::new(card.clone()),
+        width: 80,
+        expanded: true,
+    });
+    assert!(
+        doc.plain
+            .contains("read_file\nRead a file.\nKeep its line endings.\n")
+    );
+    assert!(!doc.plain.contains("file.\\nKeep"));
+    assert!(doc.plain.contains("Input schema\n"));
+    assert!(doc.plain.contains("\"type\": \"string\""));
+    assert!(doc.plain.contains("Preserve unknown fields"));
+    assert!(doc.plain.contains("Declared tools"));
+    assert!(doc.plain.contains("<opaque>"));
+    assert_eq!(m.context, vec![item]);
+}
+
+#[test]
+fn output_phase_times_survive_response_context_commit_and_replacement() {
+    let mut m = Model::new();
+    apply(&mut m, "model/request", json!({"requestId":"r"}), 0.0);
+    apply(
+        &mut m,
+        "model/delta/reasoning",
+        json!({"requestId":"r","text":""}),
+        20.0,
+    );
+    apply(
+        &mut m,
+        "model/delta/reasoning",
+        json!({"requestId":"r","text":"Think"}),
+        100.0,
+    );
+    apply(
+        &mut m,
+        "model/delta/reasoning",
+        json!({"requestId":"r","text":"ing"}),
+        180.0,
+    );
+    apply(
+        &mut m,
+        "model/delta/text",
+        json!({"requestId":"r","text":"An"}),
+        300.0,
+    );
+    apply(
+        &mut m,
+        "model/delta/text",
+        json!({"requestId":"r","text":"swer"}),
+        400.0,
+    );
+    let output = json!([
+        {"type":"reasoning","content":[{"type":"reasoning_text","text":"Thinking"}]},
+        message("assistant", "Answer")
+    ]);
+    apply(
+        &mut m,
+        "model/response",
+        json!({"requestId":"r","output":output}),
+        600.0,
+    );
+    apply(
+        &mut m,
+        "context/append/assistant",
+        json!({"items":output}),
+        601.0,
+    );
+    let thought = m
+        .cards
+        .values()
+        .find(|c| c.kind == Kind::Think)
+        .unwrap()
+        .id
+        .clone();
+    let answer = m
+        .cards
+        .values()
+        .find(|c| c.kind == Kind::Answer)
+        .unwrap()
+        .id
+        .clone();
+    assert_eq!(m.cards[&thought].duration_ms, Some(200.0));
+    assert_eq!(m.cards[&answer].duration_ms, Some(300.0));
+    assert!(!m.cards[&thought].provisional);
+    assert!(!m.cards[&answer].provisional);
+    apply(&mut m, "context/set", json!({"items":output}), 700.0);
+    apply(
+        &mut m,
+        "session/end",
+        json!({"outcome":"completed"}),
+        22_000_000.0,
+    );
+    assert_eq!(m.cards[&thought].duration_ms, Some(200.0));
+    assert_eq!(m.cards[&answer].duration_ms, Some(300.0));
+    assert_eq!(m.context, output.as_array().unwrap().clone());
+}
+
+#[test]
+fn interleaved_parts_accumulate_per_request_and_tool_execution_stays_separate() {
+    let mut m = Model::new();
+    apply(&mut m, "model/request", json!({"requestId":"a"}), 0.0);
+    apply(
+        &mut m,
+        "model/delta/reasoning",
+        json!({"requestId":"a","text":"Reason"}),
+        100.0,
+    );
+    apply(&mut m, "model/request", json!({"requestId":"b"}), 110.0);
+    apply(
+        &mut m,
+        "model/delta/text",
+        json!({"requestId":"b","text":"Other"}),
+        120.0,
+    );
+    apply(
+        &mut m,
+        "model/delta/text",
+        json!({"requestId":"a","text":"Answer"}),
+        200.0,
+    );
+    apply(
+        &mut m,
+        "model/response",
+        json!({"requestId":"b","output":[message("assistant", "Other")]}),
+        300.0,
+    );
+    apply(
+        &mut m,
+        "model/delta/tool-call",
+        json!({"requestId":"a","callId":"c","name":"read","argumentsDelta":"{}"}),
+        350.0,
+    );
+    apply(
+        &mut m,
+        "model/delta/reasoning",
+        json!({"requestId":"a","text":" more"}),
+        400.0,
+    );
+    apply(
+        &mut m,
+        "model/response",
+        json!({"requestId":"a","output":[
+            {"type":"reasoning","content":[{"type":"reasoning_text","text":"Reason more"}]},
+            message("assistant", "Answer"),
+            {"type":"function_call","call_id":"c","name":"read","arguments":"{}"}
+        ]}),
+        500.0,
+    );
+    apply(
+        &mut m,
+        "tool/start",
+        json!({"callId":"c","name":"read"}),
+        800.0,
+    );
+    apply(&mut m, "tool/end", json!({"callId":"c"}), 850.0);
+    let part = |kind, request| {
+        m.cards
+            .values()
+            .find(|c| c.kind == kind && c.request == request)
+            .unwrap()
+    };
+    assert_eq!(part(Kind::Think, "a").duration_ms, Some(200.0));
+    assert_eq!(part(Kind::Answer, "a").duration_ms, Some(150.0));
+    assert_eq!(part(Kind::Answer, "b").duration_ms, Some(180.0));
+    assert_eq!(m.cards["tool:c"].duration_ms, Some(50.0));
+}
+
+#[test]
+fn output_timing_stops_on_error_and_missing_timing_stays_unknown() {
+    let mut m = Model::new();
+    apply(&mut m, "model/request", json!({"requestId":"r"}), 0.0);
+    apply(
+        &mut m,
+        "model/delta/text",
+        json!({"requestId":"r","text":"Partial"}),
+        100.0,
+    );
+    apply(
+        &mut m,
+        "model/error",
+        json!({"requestId":"r","error":{"message":"Cancelled"}}),
+        300.0,
+    );
+    apply(
+        &mut m,
+        "session/end",
+        json!({"outcome":"failed"}),
+        22_000_000.0,
+    );
+    assert_eq!(
+        m.cards
+            .values()
+            .find(|c| c.kind == Kind::Answer)
+            .unwrap()
+            .duration_ms,
+        Some(200.0)
+    );
+
+    for missing in ["deltas", "clock", "end"] {
+        let mut m = Model::new();
+        apply(&mut m, "model/request", json!({"requestId":"r"}), 0.0);
+        if missing != "deltas" {
+            apply(
+                &mut m,
+                "model/delta/text",
+                json!({"requestId":"r","text":"A"}),
+                100.0,
+            );
+            if missing == "clock" {
+                m.apply(Event {
+                    kind: "model/delta/text".into(),
+                    data: json!({"requestId":"r","text":"B"}),
+                    elapsed_ms: None,
+                    ts: Some(100.0),
+                    seq: None,
+                });
+                apply(
+                    &mut m,
+                    "model/delta/text",
+                    json!({"requestId":"r","text":"C"}),
+                    200.0,
+                );
+            }
+        }
+        if missing != "end" {
+            apply(
+                &mut m,
+                "model/response",
+                json!({"requestId":"r","output":[message("assistant", "Answer")]}),
+                300.0,
+            );
+        }
+        apply(
+            &mut m,
+            "session/end",
+            json!({"outcome":"completed"}),
+            22_000_000.0,
+        );
+        assert_eq!(
+            m.cards
+                .values()
+                .find(|c| c.kind == Kind::Answer)
+                .unwrap()
+                .duration_ms,
+            None,
+            "{missing}"
+        );
+    }
+}

@@ -307,10 +307,11 @@ fn markdown(source: &str) -> Vec<SourceLine> {
                     links.last().map(String::as_str),
                 );
             }
-            Event::SoftBreak => cell
+            Event::SoftBreak if cell.is_some() => cell
                 .as_mut()
-                .unwrap_or(&mut line)
+                .unwrap()
                 .push(Span::raw(" "), links.last().map(String::as_str)),
+            Event::SoftBreak => push(&mut line, &mut lines),
             Event::HardBreak => push(&mut line, &mut lines),
             Event::Rule => {
                 push(&mut line, &mut lines);

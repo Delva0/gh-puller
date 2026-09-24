@@ -36,7 +36,7 @@ pub enum Kind {
 }
 impl Kind {
     pub fn default_open(self) -> bool {
-        matches!(self, Self::User | Self::Answer | Self::Error | Self::Notice)
+        matches!(self, Self::User | Self::Answer)
     }
     pub fn heading(self) -> bool {
         matches!(self, Self::Turn | Self::Step | Self::Request)
@@ -83,6 +83,8 @@ pub struct Card {
     pub images: usize,
     #[serde(skip)]
     pub started: Option<f64>,
+    #[serde(skip)]
+    output_seen: bool,
 }
 impl Card {
     fn new(id: String, kind: Kind) -> Self {
@@ -106,6 +108,7 @@ impl Card {
             result_source: String::new(),
             images: 0,
             started: None,
+            output_seen: false,
         }
     }
     pub fn body(&self, expanded: bool) -> String {
@@ -203,6 +206,7 @@ pub struct Model {
     turn_started_ms: Option<f64>,
     timed_turns: usize,
     active_ms: f64,
+    active_output: HashMap<String, (String, Option<f64>)>,
 }
 
 pub fn duration(ms: f64) -> String {
@@ -232,6 +236,52 @@ pub fn pretty(v: &Value) -> String {
     } else {
         serde_json::to_string_pretty(v).unwrap()
     }
+}
+
+fn tool_definitions(part: &Value) -> String {
+    let tools = match part.get("tools") {
+        Some(Value::Array(tools)) => tools.as_slice(),
+        None => &[],
+        _ => return pretty(part),
+    };
+    let code = |value: &Value| {
+        format!(
+            "```json\n{}\n```",
+            serde_json::to_string_pretty(value).unwrap()
+        )
+    };
+    let mut sections = vec!["## Tools".to_string()];
+    if tools.is_empty() {
+        sections.push("No tools".into());
+    }
+    for tool in tools {
+        let Some(fields) = tool.as_object() else {
+            sections.push(code(tool));
+            continue;
+        };
+        let mut rest = fields.clone();
+        if let Some(name) = tool["name"].as_str() {
+            sections.push(format!("### {name}"));
+            rest.remove("name");
+        }
+        if let Some(description) = tool["description"].as_str() {
+            sections.push(description.into());
+            rest.remove("description");
+        }
+        if let Some(schema) = rest.remove("inputSchema") {
+            sections.push(format!("#### Input schema\n\n{}", code(&schema)));
+        }
+        if !rest.is_empty() {
+            sections.push(code(&Value::Object(rest)));
+        }
+    }
+    let mut rest = part.as_object().unwrap().clone();
+    rest.remove("type");
+    rest.remove("tools");
+    if !rest.is_empty() {
+        sections.push(code(&Value::Object(rest)));
+    }
+    sections.join("\n\n")
 }
 
 fn image_meta(p: &Value) -> String {
@@ -310,6 +360,7 @@ impl Model {
             turn_started_ms: None,
             timed_turns: 0,
             active_ms: 0.0,
+            active_output: HashMap::new(),
         }
     }
     fn key(&mut self) -> String {
@@ -338,6 +389,26 @@ impl Model {
             c.duration_ms = c.started.map(|s| (at - s).max(0.0));
             c.status = status.into();
             self.put(c);
+        }
+    }
+    fn advance_output(&mut self, request: &str, at: Option<f64>) {
+        let Some((id, previous)) = self.active_output.remove(request) else {
+            return;
+        };
+        if let Some(c) = self.cards.get_mut(&id) {
+            c.duration_ms = c
+                .duration_ms
+                .zip(previous.zip(at))
+                .filter(|(_, (start, end))| end >= start)
+                .map(|(total, (start, end))| total + end - start);
+            self.revision += 1;
+            c.revision = self.revision;
+            self.dirty.insert(id);
+        }
+    }
+    fn stop_output(&mut self, at: Option<f64>) {
+        for request in self.active_output.keys().cloned().collect::<Vec<_>>() {
+            self.advance_output(&request, at);
         }
     }
     fn project(&mut self, item: &Value, reuse: Option<String>, group: Vec<String>) -> String {
@@ -400,7 +471,11 @@ impl Model {
                                 .map(String::from)
                                 .unwrap_or_else(|| pretty(p));
                             source.push(t.clone());
-                            text.push(t);
+                            text.push(if p["type"] == "tool_defs" {
+                                tool_definitions(p)
+                            } else {
+                                t
+                            });
                         }
                     }
                 } else if item_type == "reasoning" {
@@ -485,6 +560,7 @@ impl Model {
                 c.status = old.status.clone();
                 c.started = old.started;
                 c.duration_ms = old.duration_ms;
+                c.output_seen = old.output_seen;
                 if !self.cards.contains_key(&c.id) {
                     self.cards.insert(c.id.clone(), c);
                 }
@@ -554,6 +630,7 @@ impl Model {
                 );
             }
             "turn/end" => {
+                self.stop_output(event.elapsed_ms);
                 if let Some((start, end)) = self.turn_started_ms.take().zip(event.elapsed_ms)
                     && end >= start
                 {
@@ -582,7 +659,10 @@ impl Model {
                 );
             }
             "model/delta/text" | "model/delta/reasoning" | "model/delta/tool-call" => {
-                let request = d["requestId"].as_str().unwrap_or(&self.current_request);
+                let request = d["requestId"]
+                    .as_str()
+                    .unwrap_or(&self.current_request)
+                    .to_string();
                 let index = d["index"].as_u64().unwrap_or(0);
                 let card_kind = match kind {
                     "model/delta/text" => Kind::Answer,
@@ -595,9 +675,19 @@ impl Model {
                 } else {
                     format!("stream:{request}:{kind}:{index}")
                 };
+                let has_output = if card_kind == Kind::Tool {
+                    ["argumentsDelta", "name"]
+                        .iter()
+                        .any(|field| d[field].as_str().is_some_and(|s| !s.is_empty()))
+                } else {
+                    d["text"].as_str().is_some_and(|s| !s.is_empty())
+                };
+                if has_output {
+                    self.advance_output(&request, event.elapsed_ms);
+                }
                 if !self.cards.contains_key(&id) {
                     self.pending
-                        .entry(request.into())
+                        .entry(request.clone())
                         .or_default()
                         .push(id.clone());
                 }
@@ -605,9 +695,9 @@ impl Model {
                     .cards
                     .get(&id)
                     .cloned()
-                    .unwrap_or_else(|| Card::new(id, card_kind));
+                    .unwrap_or_else(|| Card::new(id.clone(), card_kind));
                 c.provisional = true;
-                c.request = request.into();
+                c.request = request.clone();
                 c.group = self.current_group.clone();
                 c.call_id = call.into();
                 if card_kind == Kind::Tool {
@@ -618,6 +708,13 @@ impl Model {
                         .push_str(d["argumentsDelta"].as_str().unwrap_or(""));
                     c.token_source.clone_from(&c.arguments);
                 } else {
+                    if has_output {
+                        if !c.output_seen {
+                            c.output_seen = true;
+                            c.duration_ms = event.elapsed_ms.map(|_| 0.0);
+                        }
+                        self.active_output.insert(request, (id, event.elapsed_ms));
+                    }
                     c.text.push_str(d["text"].as_str().unwrap_or(""));
                     c.token_source.clone_from(&c.text);
                 }
@@ -625,6 +722,7 @@ impl Model {
             }
             "model/response" => {
                 let request = d["requestId"].as_str().unwrap_or("").to_string();
+                self.advance_output(&request, event.elapsed_ms);
                 self.finish(
                     &format!("request:{request}"),
                     at,
@@ -695,6 +793,15 @@ impl Model {
                 self.put(c);
             }
             "session/error" | "model/error" => {
+                if kind == "session/error" {
+                    self.stop_output(event.elapsed_ms);
+                } else {
+                    let request = d["requestId"]
+                        .as_str()
+                        .unwrap_or(&self.current_request)
+                        .to_string();
+                    self.advance_output(&request, event.elapsed_ms);
+                }
                 let id = self.key();
                 let mut c = Card::new(id, Kind::Error);
                 c.text = pretty(&d["error"]);
@@ -709,6 +816,8 @@ impl Model {
                 }
             }
             "session/end" => {
+                // A late close cannot establish the end of an unfinished output phase.
+                self.stop_output(None);
                 self.summary.ended = true;
                 let status = match d["reasonCode"].as_str().unwrap_or("") {
                     "cancelled" => "Cancelled",
