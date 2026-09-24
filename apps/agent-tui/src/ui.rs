@@ -105,6 +105,93 @@ mod tests {
     }
 
     #[test]
+    fn collapsed_cards_use_one_unframed_row_and_tools_expand_in_place() {
+        let (mut model, mut app) = fixture();
+        apply(
+            &mut model,
+            "context/append",
+            json!({"items":[
+                {"type":"message","role":"system","content":[{"type":"input_text","text":"System instructions"}]},
+                {"type":"function_call","call_id":"read","name":"read_file","arguments":"{\"path\":\"file.rs\"}"},
+                {"type":"function_call_output","call_id":"read","output":"File contents"}
+            ]}),
+        );
+        app.apply(model.change());
+        let tool = "tool:read";
+        assert!(!app.open(tool));
+        app.command("collapse");
+        for id in app.order.clone() {
+            assert_eq!(app.height(&id), 1);
+            assert!(app.cards[&id].body(false).is_empty());
+            app.request(&id);
+        }
+        assert!(app.requested.is_empty());
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| app.render(f)).unwrap();
+        assert_eq!(app.heights.total(), app.order.len());
+        for (i, id) in app.order.iter().enumerate() {
+            assert_eq!(app.hits[i].id, *id);
+            assert_eq!(app.hits[i].y, i as u16 + 2);
+            assert!(app.hits[i].title);
+            assert_eq!(terminal.backend().buffer()[(0, i as u16 + 2)].symbol(), " ");
+        }
+        app.focus = Some(tool.into());
+        key(&mut app, KeyCode::Enter);
+        layout(&mut app);
+        terminal.draw(|f| app.render(f)).unwrap();
+        assert!(app.docs[tool].plain.contains("file.rs"));
+        assert!(app.docs[tool].plain.contains("File contents"));
+        assert!(app.hits.iter().any(|h| h.id == tool && !h.title));
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(app.height(tool), 1);
+        assert_eq!(app.focus.as_deref(), Some(tool));
+    }
+
+    #[test]
+    fn request_headings_stay_hidden_across_updates_and_context_replacement() {
+        let (mut model, mut app) = fixture();
+        apply(&mut model, "turn/start", json!({}));
+        apply(&mut model, "step/start", json!({}));
+        apply(&mut model, "model/request", json!({"requestId":"r1"}));
+        apply(
+            &mut model,
+            "context/append/assistant",
+            json!({"items":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"First step"}]}]}),
+        );
+        app.apply(model.change());
+        app.focus = Some("step:1:1".into());
+        apply(&mut model, "step/start", json!({}));
+        apply(&mut model, "model/request", json!({"requestId":"r2"}));
+        apply(
+            &mut model,
+            "context/append/assistant",
+            json!({"items":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Second step"}]}]}),
+        );
+        app.apply(model.change());
+        assert!(model.cards.values().any(|c| c.kind == Kind::Request));
+        assert!(!app.cards.values().any(|c| c.kind == Kind::Request));
+        key(&mut app, KeyCode::Char('}'));
+        assert_eq!(app.focus.as_deref(), Some("step:1:2"));
+        let items = model.context.clone();
+        apply(&mut model, "context/set", json!({"items":items}));
+        app.apply(model.change());
+        assert!(!app.cards.values().any(|c| c.kind == Kind::Request));
+        assert!(app.order.iter().all(|id| app.cards.contains_key(id)));
+        key(&mut app, KeyCode::Char('{'));
+        assert_eq!(app.focus.as_deref(), Some("step:1:1"));
+        assert!(
+            app.title(&app.cards["turn:1"])
+                .to_string()
+                .contains("turn 1")
+        );
+        assert!(
+            app.title(&app.cards["step:1:1"])
+                .to_string()
+                .contains("step 1")
+        );
+    }
+
+    #[test]
     fn command_menu_and_async_search_are_usable() {
         let (_, mut app) = fixture();
         key(&mut app, KeyCode::Char(':'));
@@ -113,6 +200,17 @@ mod tests {
         }
         key(&mut app, KeyCode::Enter);
         assert!(app.order.iter().all(|id| !app.open(id)));
+        key(&mut app, KeyCode::Char('m'));
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| app.render(f)).unwrap();
+        app.handle(Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 8,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        }));
+        assert!(app.panel.is_none());
+        assert!(app.order.iter().all(|id| app.open(id)));
         key(&mut app, KeyCode::Char('/'));
         for c in "answer".chars() {
             key(&mut app, KeyCode::Char(c));
@@ -230,7 +328,42 @@ mod tests {
         let footer: String = (0..80)
             .map(|x| terminal.backend().buffer()[(x, 23)].symbol())
             .collect();
-        assert_eq!(footer.trim(), app.summary.footer);
+        assert_eq!(
+            footer.trim(),
+            format!("{}  {}", app.summary.status, app.summary.footer)
+        );
+        assert_eq!(app.viewport, 21);
+    }
+
+    #[test]
+    fn completion_and_statistics_share_one_footer_row_with_room_for_notices() {
+        let (mut model, mut app) = fixture();
+        model.apply(AgentEvent {
+            kind: "session/end".into(),
+            data: json!({"outcome":"completed","reasonCode":"completed"}),
+            elapsed_ms: Some(2330.0),
+            ts: None,
+            seq: None,
+        });
+        app.apply(model.change());
+        key(&mut app, KeyCode::End);
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| app.render(f)).unwrap();
+        let row = |terminal: &Terminal<TestBackend>, y| -> String {
+            (0..80)
+                .map(|x| terminal.backend().buffer()[(x, y)].symbol())
+                .collect()
+        };
+        assert_eq!(
+            row(&terminal, 23).trim(),
+            format!("Completed · 2.33s  {}", app.summary.footer)
+        );
+        assert!(!row(&terminal, 22).contains("Completed"));
+        app.notice = "A long notification ".repeat(10);
+        terminal.draw(|f| app.render(f)).unwrap();
+        let footer = row(&terminal, 23);
+        assert!(footer.trim().starts_with("Completed · 2.33s"));
+        assert!(footer.trim().ends_with(&app.summary.footer));
     }
 
     #[test]
@@ -353,21 +486,21 @@ pub struct App {
 }
 
 const COMMANDS: &[(&str, &str)] = &[
-    ("expand", "全部展开"),
-    ("collapse", "全部折叠"),
-    ("copy", "复制选区或整块"),
-    ("answer", "复制最新回答"),
-    ("follow", "回到底部"),
-    ("stats", "详细统计"),
-    ("theme", "切换主题"),
-    ("help", "快捷键"),
-    ("error", "下一个错误"),
-    ("turn", "下一轮"),
-    ("step", "下一步/请求"),
-    ("link", "打开当前块链接"),
-    ("quit", "退出"),
+    ("expand", "Expand all cards"),
+    ("collapse", "Collapse all cards"),
+    ("copy", "Copy selection or card"),
+    ("answer", "Copy latest answer"),
+    ("follow", "Go to bottom"),
+    ("stats", "Token statistics"),
+    ("theme", "Change theme"),
+    ("help", "Keyboard shortcuts"),
+    ("error", "Next error"),
+    ("turn", "Next turn"),
+    ("step", "Next step"),
+    ("link", "Open link in card"),
+    ("quit", "Quit"),
 ];
-const HELP: &str = "j/k ↑/↓       滚动（上翻暂停自动跟随）\nPgUp/PgDn      翻页\nHome/End       顶部 / 跟随底部\nTab/Shift-Tab  下一块 / 上一块\nEnter/Space    展开 / 折叠当前块\ne / E          全部展开 / 全部折叠\nh/l ←/→        横向浏览代码及宽表格\n/              搜索正文或工具名\nn / N          下一个 / 上一个匹配\n] / [          下一轮 / 上一轮\n} / {          下一步或请求 / 上一步或请求\n!              下一个错误块\nc / y          复制选区或当前整块 / 最新回答\ns              详细统计\nt              切换暗色主题\n: 或 Ctrl-P    命令面板\nm              临时菜单\no              打开当前块的第一个 HTTP(S) 链接\n? / F1         帮助\nEsc            关闭面板 / 清除选区\nq / Ctrl-C     退出\n\n鼠标：标题单击折叠；正文拖动选字；右键复制；\n滚轮滚动；右侧滚动条可拖动。\n复制使用 OSC 52；支持 tmux passthrough。\n所有时间来自事件，缺失轮/步边界时保持中性。";
+const HELP: &str = "j/k ↑/↓        Scroll (pauses follow)\nPgUp/PgDn      Page up / down\nHome/End       Top / follow bottom\nTab/Shift-Tab  Next / previous card\nEnter/Space    Expand / collapse card\ne / E          Expand / collapse all\nh/l ←/→        Scroll horizontally\n/              Search text and tool names\nn / N          Next / previous match\n] / [          Next / previous turn\n} / {          Next / previous step\n!              Next error\nc / y          Copy selection or card / latest answer\ns              Token statistics\nt              Change theme\n: or Ctrl-P    Command palette\nm              Menu\no              Open first link in card\n? / F1         Help\nEsc            Close panel / clear selection\nq / Ctrl-C     Quit\n\nClick a title to toggle a card. Drag to select text.\nRight-click to copy. Scroll with the wheel or scrollbar.\nCopy uses OSC 52 with tmux passthrough.";
 
 impl App {
     pub fn new(path: String) -> Self {
@@ -416,12 +549,9 @@ impl App {
     }
     fn height(&self, id: &str) -> usize {
         let c = &self.cards[id];
-        if c.kind.heading() {
-            return 1;
-        }
         let open = self.open(id);
-        if !open && c.kind != Kind::Tool {
-            return 2;
+        if c.kind.heading() || !open {
+            return 1;
         }
         if let Some(d) = self
             .docs
@@ -430,7 +560,7 @@ impl App {
         {
             return 2 + d.rows.len();
         }
-        if c.kind == Kind::Tool && !open { 6 } else { 3 }
+        3
     }
     fn anchor(&self) -> Option<(String, usize, Option<usize>)> {
         if self.order.is_empty() {
@@ -471,10 +601,15 @@ impl App {
         let anchor = self.anchor();
         let old_events = self.summary.events;
         for c in change.cards {
-            self.cards.insert(c.id.clone(), c);
+            if c.kind != Kind::Request {
+                self.cards.insert(c.id.clone(), c);
+            }
         }
         if let Some(order) = change.reset {
-            self.order = order;
+            self.order = order
+                .into_iter()
+                .filter(|id| self.cards.contains_key(id))
+                .collect();
             let live: HashSet<_> = self.order.iter().cloned().collect();
             self.cards.retain(|id, _| live.contains(id));
             self.docs.retain(|id, _| live.contains(id));
@@ -530,7 +665,11 @@ impl App {
                 .collect();
             self.match_index = self.matches.len().saturating_sub(1);
             self.next_match(true);
-            self.notice = format!("搜索「{}」 · {} 个匹配块", self.search, self.matches.len());
+            self.notice = format!(
+                "\"{}\" · {} matching cards",
+                self.search,
+                self.matches.len()
+            );
             self.dirty = true;
         }
         let anchor = self.anchor();
@@ -579,7 +718,7 @@ impl App {
     fn request(&mut self, id: &str) {
         let c = &self.cards[id];
         let expanded = self.open(id);
-        if c.kind.heading() || (!expanded && c.kind != Kind::Tool) {
+        if c.kind.heading() || !expanded {
             return;
         }
         if self.docs.get(id).is_some_and(|d| {
@@ -625,11 +764,15 @@ impl App {
         if c.kind.heading() {
             return Line::styled(
                 document::safe(&format!(
-                    " {} {}{} {}",
+                    " {} {}{}{}",
                     c.kind.label(),
                     c.name,
                     duration,
-                    c.status
+                    if c.status.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" · {}", c.status)
+                    }
                 )),
                 Style::default()
                     .fg(Self::color(c.kind))
@@ -644,7 +787,15 @@ impl App {
         };
         Line::from(vec![
             Span::styled(
-                document::safe(&format!("{symbol} {} {}", c.kind.label(), c.name)),
+                document::safe(&format!(
+                    "{symbol} {}{}",
+                    c.kind.label(),
+                    if c.name.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" {}", c.name)
+                    }
+                )),
                 Style::default()
                     .fg(Self::color(c.kind))
                     .add_modifier(Modifier::BOLD),
@@ -653,7 +804,7 @@ impl App {
                 format!(
                     " · {} tokens{}{}{}",
                     number(c.tokens),
-                    if c.provisional { " · 暂存" } else { "" },
+                    if c.provisional { " · Pending" } else { "" },
                     time,
                     if c.status.is_empty() {
                         String::new()
@@ -668,7 +819,7 @@ impl App {
     pub fn render(&mut self, frame: &mut Frame) {
         let area = frame.area();
         let width = area.width.saturating_sub(5).max(1) as usize;
-        self.viewport = area.height.saturating_sub(4).max(1) as usize;
+        self.viewport = area.height.saturating_sub(3).max(1) as usize;
         if width != self.width {
             self.width = width;
             self.dirty = true;
@@ -678,7 +829,7 @@ impl App {
             Block::default().style(Style::default().bg(bg).fg(Color::Rgb(217, 222, 232))),
             area,
         );
-        if area.height < 5 || area.width < 12 {
+        if area.height < 4 || area.width < 12 {
             return;
         }
         frame.render_widget(
@@ -734,28 +885,31 @@ impl App {
                         });
                         continue;
                     }
-                    let edge = Style::default().fg(Self::color(card.kind));
-                    frame.render_widget(
-                        Paragraph::new(if row == 0 {
-                            "╭"
-                        } else if row == height - 1 {
-                            "╰"
-                        } else {
-                            "│"
-                        })
-                        .style(edge),
-                        Rect::new(0, y, 1, 1),
-                    );
-                    frame.render_widget(
-                        Paragraph::new(if focused { "┃" } else { "│" }).style(Style::default().fg(
-                            if focused {
-                                Color::Gray
+                    if self.open(&id) {
+                        frame.render_widget(
+                            Paragraph::new(if row == 0 {
+                                "╭"
+                            } else if row == height - 1 {
+                                "╰"
                             } else {
-                                Color::Rgb(48, 55, 67)
-                            },
-                        )),
-                        Rect::new(area.width - 2, y, 1, 1),
-                    );
+                                "│"
+                            })
+                            .style(Style::default().fg(Self::color(card.kind))),
+                            Rect::new(0, y, 1, 1),
+                        );
+                    }
+                    if self.open(&id) || focused {
+                        frame.render_widget(
+                            Paragraph::new(if focused { "┃" } else { "│" }).style(
+                                Style::default().fg(if focused {
+                                    Color::Gray
+                                } else {
+                                    Color::Rgb(48, 55, 67)
+                                }),
+                            ),
+                            Rect::new(area.width - 2, y, 1, 1),
+                        );
+                    }
                     if row == 0 {
                         frame.render_widget(
                             Paragraph::new(self.title(&card)),
@@ -801,7 +955,7 @@ impl App {
                             }
                         } else if row == 1 {
                             frame.render_widget(
-                                Paragraph::new("排版中…")
+                                Paragraph::new("Loading…")
                                     .style(Style::default().fg(Color::DarkGray)),
                                 Rect::new(2, y, area.width - 5, 1),
                             );
@@ -830,20 +984,23 @@ impl App {
                 Rect::new(area.width - 1, 2 + y as u16, 1, 1),
             );
         }
-        let status = if !self.notice.is_empty() {
-            self.notice.clone()
+        let mut status = self.summary.status.clone();
+        if !self.notice.is_empty() {
+            status.push_str(&format!(" · {}", self.notice));
         } else if self.unseen > 0 {
-            format!("↑ 已暂停跟随 · {} 条新事件 · End 回到底部", self.unseen)
-        } else {
-            self.summary.status.clone()
-        };
-        frame.render_widget(
-            Paragraph::new(format!(" {}", document::safe(&status)))
-                .style(Style::default().fg(Color::DarkGray)),
-            Rect::new(0, area.height - 2, area.width, 1),
+            status.push_str(&format!(" · ↑ {} new events · End to follow", self.unseen));
+        }
+        let stats = format!("  {}", self.summary.footer);
+        let status_width = (area.width as usize).saturating_sub(stats.width() + 1);
+        let mut footer = document::clip(
+            &Line::styled(document::safe(&status), Style::default().fg(Color::Gray)),
+            0,
+            status_width,
         );
+        footer.spans.insert(0, Span::raw(" "));
+        footer.spans.push(Span::raw(stats));
         frame.render_widget(
-            Paragraph::new(format!(" {}", self.summary.footer))
+            Paragraph::new(footer)
                 .style(Style::default().fg(Color::White).bg(Color::Rgb(38, 44, 55))),
             Rect::new(0, area.height - 1, area.width, 1),
         );
@@ -912,17 +1069,20 @@ impl App {
             height,
         );
         let (title, body) = match self.panel.as_ref().unwrap() {
-            Panel::Help => ("快捷键 · Esc 关闭", HELP.to_string()),
-            Panel::Stats => ("统计 · ↑↓ 滚动 · Esc 关闭", self.summary.details.clone()),
+            Panel::Help => ("Shortcuts · Esc to close", HELP.to_string()),
+            Panel::Stats => (
+                "Tokens · ↑↓ to scroll · Esc to close",
+                self.summary.details.clone(),
+            ),
             Panel::Search => (
-                "搜索 · Enter 跳转",
+                "Search · Enter to find",
                 format!(
-                    "/{}\n\n正文、思考、参数、结果及工具名；n/N 跳转匹配。",
+                    "/{}\n\nSearch text, reasoning, arguments, results and tool names.\nUse n/N to move between matches.",
                     self.input
                 ),
             ),
             Panel::Commands | Panel::Menu => (
-                "命令 · ↑↓ 选择 · Enter 执行",
+                "Commands · ↑↓ to select · Enter to run",
                 format!(
                     ":{}\n\n{}",
                     self.input,
@@ -1026,7 +1186,7 @@ impl App {
         let query = self.search.clone();
         let (tx, rx) = std::sync::mpsc::channel();
         self.search_result = Some(rx);
-        self.notice = format!("搜索「{}」…", self.search);
+        self.notice = format!("Searching \"{}\"…", self.search);
         std::thread::spawn(move || {
             let matches = cards
                 .iter()
@@ -1118,8 +1278,8 @@ impl App {
                 .write_all(sequence.as_bytes())
                 .and_then(|_| io::stdout().flush())
             {
-                Ok(()) => self.notice = format!("已发送 OSC 52 · {} bytes", text.len()),
-                Err(e) => self.notice = format!("复制失败：{e}"),
+                Ok(()) => self.notice = format!("Sent to clipboard · {} bytes", text.len()),
+                Err(e) => self.notice = format!("Copy failed: {e}"),
             }
         }
     }
@@ -1152,12 +1312,12 @@ impl App {
                     std::thread::spawn(move || {
                         let _ = child.wait();
                     });
-                    format!("打开 {url}")
+                    format!("Opening {url}")
                 }
-                Err(e) => format!("无法打开链接：{e}"),
+                Err(e) => format!("Could not open link: {e}"),
             };
         } else {
-            self.notice = "当前块没有 HTTP(S) Markdown 链接".into();
+            self.notice = "No link in this card".into();
         }
     }
     fn command(&mut self, command: &str) {
@@ -1176,13 +1336,13 @@ impl App {
             "help" => self.panel = Some(Panel::Help),
             "theme" => self.theme = (self.theme + 1) % 3,
             "error" => self.navigate(true, |c| {
-                c.kind == Kind::Error || c.status.starts_with("失败")
+                c.kind == Kind::Error || c.status.starts_with("Failed")
             }),
             "turn" => self.navigate(true, |c| c.kind == Kind::Turn),
-            "step" => self.navigate(true, |c| matches!(c.kind, Kind::Step | Kind::Request)),
+            "step" => self.navigate(true, |c| c.kind == Kind::Step),
             "link" => self.link(),
             "quit" => self.quit = true,
-            _ => self.notice = format!("未知命令：{command}"),
+            _ => self.notice = format!("Unknown command: {command}"),
         }
     }
     fn chosen_command(&self, index: usize) -> Option<&'static str> {
@@ -1318,9 +1478,7 @@ impl App {
                     KeyCode::Char(']') => self.command("turn"),
                     KeyCode::Char('[') => self.navigate(false, |c| c.kind == Kind::Turn),
                     KeyCode::Char('}') => self.command("step"),
-                    KeyCode::Char('{') => {
-                        self.navigate(false, |c| matches!(c.kind, Kind::Step | Kind::Request))
-                    }
+                    KeyCode::Char('{') => self.navigate(false, |c| c.kind == Kind::Step),
                     KeyCode::Char('!') => self.command("error"),
                     KeyCode::Esc => {
                         self.selection = None;
@@ -1336,8 +1494,8 @@ impl App {
                     if matches!(self.panel, Some(Panel::Commands | Panel::Menu))
                         && m.kind == MouseEventKind::Down(MouseButton::Left)
                     {
-                        let panel_height = self.viewport.min(32);
-                        let top = (self.viewport + 4 - panel_height) / 2;
+                        let panel_height = self.viewport.saturating_sub(1).min(32);
+                        let top = (self.viewport + 3 - panel_height) / 2;
                         if let Some(index) = (m.row as usize).checked_sub(top + 3)
                             && let Some(cmd) = self.chosen_command(index)
                         {

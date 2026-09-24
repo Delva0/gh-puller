@@ -202,7 +202,7 @@ fn markdown(source: &str) -> Vec<SourceLine> {
                     &dest_url
                 };
                 line.spans.push(Span::styled(
-                    format!("[图片: {}] ", safe(url)),
+                    format!("[image: {}] ", safe(url)),
                     Style::default().fg(Color::Magenta),
                 ));
             }

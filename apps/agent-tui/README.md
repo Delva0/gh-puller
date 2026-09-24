@@ -23,7 +23,7 @@ The locked build was verified with Rust 1.98.1 on Linux. Cargo installs into
 opens the file once and retains its handle until `session/end`, including across the
 FileSink's atomic compaction. Partial JSON lines and split UTF-8 are buffered. At session
 end it stops reading and freezes event clocks while keeping the browser open. An EOF
-without an end event is labeled **尚未确认结束**, including when watching a historical file.
+without an end event is labeled **End not recorded**, including when watching a historical file.
 Malformed complete records stop reconstruction at the valid prefix and display the error.
 
 ## Interaction
@@ -41,7 +41,7 @@ Malformed complete records stop reconstruction at the valid prefix and display t
 | Copy latest assistant answer | `y` |
 | Search body and tool names | `/`, then `n/N` |
 | Next / previous turn | `]` / `[` |
-| Next / previous step or request | `}` / `{` |
+| Next / previous step | `}` / `{` |
 | Next error | `!` |
 | Detailed token statistics | `s` |
 | Commands / temporary menu / help | `:` or Ctrl-P / `m` / `?` |
@@ -55,14 +55,16 @@ clipboard depends on terminal permissions; tmux may need `set -g allow-passthrou
 Links remain visible as URLs and open only on an explicit `o` command, using `xdg-open`
 on Linux or `open` on macOS. The observer never executes tool calls or writes the input log.
 
-Thought and system cards start collapsed, answers and user cards expanded. A collapsed
-tool card shows up to four formatted argument lines; expansion shows all arguments and
-the **context result**. Tool activity controls execution status and duration, never the
-context result. User/system/thought/answer cards do not acquire timestamps or stream spans.
+Thought, system and tool cards start collapsed, answers and user cards expanded. Every
+collapsed card occupies one line with no border. Expanding a tool shows its formatted
+arguments and **context result**. Tool activity controls execution status and duration,
+never the context result. User/system/thought/answer cards do not acquire timestamps or stream spans.
 Scrolling up pauses automatic following; End clears the new-event indicator. User-expanded
 cards stay expanded. Top chrome contains only session title and path; panels are temporary.
 
-The footer is strictly `轮/本轮步数 输入/输出 速度/s`. Its input is frozen at the first
+The footer combines status and statistics on one line, for example
+`Completed · 2.33s  1/2 40/349 —/s`. The numbers are
+`turn/steps-in-turn input/output speed/s`. Input is frozen at the first
 request in the turn. Output includes reasoning and is corrected by `usage.output`.
 Speed covers first nonempty delta through model completion for each request, excluding
 tool waits and first-output waits. Compact history has no deltas, so its speed is `—`.
@@ -88,8 +90,8 @@ flowchart LR
 Only `context/append` and the four canonical role append events extend Context;
 `context/set` replaces it. `agent/set` and single-segment agent facets follow Python
 `fold_state()`. Backend configuration and v5 metadata never invent turn/step markers.
-Unmarked content remains ungrouped current context; requests can be shown as neutral
-request headings without incrementing step or turn counts.
+Unmarked content remains ungrouped current context. Model requests contribute to statistics
+without adding visible headings. Only recorded `turn` and `step` events create headings.
 
 Deltas are provisional cards, responses reconcile them, and Context commits reuse their
 identities. Tools pair on `call_id`. Context replacement uses Item IDs, call IDs and exact
@@ -99,7 +101,7 @@ is displayed without inventing hidden text.
 
 The reader and tokenizer cannot block terminal input. Changes are batched through a bounded
 channel; card heights use an incremental prefix index. Only visible expanded cards request
-Markdown layout. Folded thought/system contents are not parsed. Layout results are cached
+Markdown layout. Collapsed card contents are not parsed. Layout results are cached
 by card revision, width and expansion; selection uses text byte offsets rather than screen
 coordinates. Idle sessions do not redraw the body. All event clocks come from the log.
 

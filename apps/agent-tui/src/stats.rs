@@ -327,7 +327,7 @@ impl Stats {
             )
         };
         let mut text = format!(
-            "当前上下文 ≈{} tokens\n本轮首次请求快照 {} tokens（冻结）\n\n最近请求 {}\n{}\n\n本轮 {}\n会话 {}\n\n上下文构成（本地计数）\n",
+            "Current context ≈{} tokens\nTurn input {} tokens (frozen at first request)\n\nLatest request {}\n{}\n\nTurn {}\nSession {}\n\nContext composition (local counts)\n",
             number(context),
             number(self.turn_input),
             self.current,
@@ -343,7 +343,7 @@ impl Stats {
         for (kind, n) in &self.composition {
             text.push_str(&format!("  {kind}: {}\n", number(*n)));
         }
-        text.push_str("\n估算：o200k_base encode_ordinary；每个 Item 加 4 framing tokens；\n图片每张占位 1024。API input 校准后续上下文增量；本轮输入不回改。\n输出包含 reasoning，usage.output 到达后替代流式估算。\n速度按首个非空 delta 至响应计时，排除工具等待及首段前等待。\ncompact 无 delta 时速度为 —。未知 usage 不计为已知零。\n卡片 token 为本地内容计数，不代表模型计费。\n");
+        text.push_str("\nEstimates use o200k_base encode_ordinary, plus 4 framing tokens\nper Item and 1024 tokens per image. API input usage calibrates\nsubsequent context estimates; turn input stays frozen.\nOutput includes reasoning. Usage replaces stream estimates.\nSpeed covers the first nonempty delta through response, excluding\ntool waits and first-output waits. Without deltas, speed is —.\nUnknown usage is not counted as zero. Card counts estimate\ncontent size, not provider billing.\n");
         text
     }
 }

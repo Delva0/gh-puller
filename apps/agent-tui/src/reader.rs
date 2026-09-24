@@ -95,7 +95,7 @@ pub fn spawn(path: &Path) -> (Receiver<Change>, Arc<AtomicBool>) {
                     }
                     Ok(None) => break,
                     Err(e) => {
-                        model.summary.status = format!("读取停止 · {e} · 上下文仅覆盖有效前缀");
+                        model.summary.status = format!("Read stopped: {e}");
                         let _ = tx.send(model.change());
                         return;
                     }
@@ -110,7 +110,7 @@ pub fn spawn(path: &Path) -> (Receiver<Change>, Arc<AtomicBool>) {
             }
             if changed || !sent {
                 if partial && !model.summary.ended {
-                    model.summary.status = "等待完整 JSONL 行 · 尚未确认结束".into();
+                    model.summary.status = "Waiting for complete line · End not recorded".into();
                 }
                 if tx.send(model.change()).is_err() {
                     return;

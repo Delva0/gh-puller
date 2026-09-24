@@ -160,6 +160,39 @@ fn no_backend_metadata_invents_boundaries_and_error_does_not_commit_output() {
 }
 
 #[test]
+fn terminal_status_reports_one_outcome_or_specific_failure_reason() {
+    for (data, expected) in [
+        (
+            json!({"outcome":"completed","reasonCode":"completed"}),
+            "Completed",
+        ),
+        (json!({"outcome":"failed","reasonCode":"error"}), "Failed"),
+        (
+            json!({"outcome":"failed","reasonCode":"cancelled"}),
+            "Cancelled",
+        ),
+        (
+            json!({"outcome":"failed","reasonCode":"timeout"}),
+            "Timed out",
+        ),
+        (
+            json!({"outcome":"failed","reasonCode":"budget_exhausted"}),
+            "Budget exhausted",
+        ),
+        (json!({"outcome":"completed"}), "Completed"),
+        (json!({"outcome":"failed"}), "Failed"),
+        (json!({}), "Ended"),
+    ] {
+        let mut m = Model::new();
+        apply(&mut m, "session/end", data, 2330.0);
+        assert_eq!(m.summary.status, format!("{expected} · 2.33s"));
+        apply(&mut m, "turn/start", json!({}), 3000.0);
+        assert_eq!(m.summary.last_ms, 2330.0);
+        assert_eq!(m.summary.status, format!("{expected} · 2.33s"));
+    }
+}
+
+#[test]
 fn tables_unicode_links_and_code_survive_layout_and_resize() {
     let mut m = Model::new();
     apply(

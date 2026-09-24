@@ -7,35 +7,49 @@ import json
 
 
 def message(role, text):
-    return {"type": "message", "role": role, "content": [{"type": "input_text", "text": text}]}
+    content_type = "output_text" if role == "assistant" else "input_text"
+    return {"type": "message", "role": role, "content": [{"type": content_type, "text": text}]}
 
 
 def main():
     thought = {
         "type": "reasoning",
-        "content": [{"type": "reasoning_text", "text": "先核对事件契约，再检查日志结束时的原子替换。"}],
+        "content": [{
+            "type": "reasoning_text",
+            "text": "Check which events compaction removes and whether it preserves context event order.",
+        }],
     }
     call = {
         "type": "function_call",
         "call_id": "read-1",
         "name": "read_file",
-        "arguments": '{"path":"gh_puller/agent/events.py"}',
+        "arguments": '{"path":"gh_puller/agent/sinks.py"}',
     }
     answer = message(
         "assistant",
-        "## 上下文已重建\n\n日志在结束后完成压缩，当前视图保留完整上下文。\n\n"
-        "| 检查项 | 结果 |\n|---|---|\n| context/set | 整体替换 |\n| 工具调用和结果 | 按 call_id 配对 |\n"
-        "| 原始 seq | 保留 |\n\n```rust\nassert_eq!(live_context, compact_context);\n```\n\n"
-        "[Ratatui 文档](https://ratatui.rs/) · 支持中文选区、宽表格和代码横向滚动。",
+        "## FileSink compaction\n\nCompleted logs reconstruct the same context. Compaction removes only "
+        "model deltas; context events keep their original content and order.\n\n"
+        "| Check | Result |\n|---|---|\n| Context events | Preserved |\n| Original seq | Preserved |\n"
+        "| Open readers | Can finish reading the original file |\n\n"
+        "```python\nassert fold_state(full_log) == fold_state(compact_log)\n```\n\n"
+        "The replacement uses [os.replace](https://docs.python.org/3/library/os.html#os.replace) "
+        "after the temporary file is complete.",
     )
     events = [
-        (0, "session/start", {"label": "Agent · Context observer"}),
-        (0, "context/append/system", {"items": [message("system", "You are a helpful coding agent.")]}),
+        (0, "session/start", {"label": "FileSink compaction"}),
+        (0, "context/append/system", {"items": [message(
+            "system", "Check code against the event contract and report any data loss.",
+        )]}),
         (10, "turn/start", {}),
-        (10, "context/append/user", {"items": [message("user", "请检查 FileSink 压缩后是否仍能重建相同的上下文。")]}),
+        (10, "context/append/user", {"items": [message(
+            "user", "Does FileSink compaction preserve the context? "
+            "Check event ordering and readers with an open file handle.",
+        )]}),
         (20, "step/start", {}),
         (20, "model/request", {"requestId": "r1", "model": "offline-fixture"}),
-        (100, "model/delta/reasoning", {"requestId": "r1", "index": 0, "text": "先核对事件契约"}),
+        (100, "model/delta/reasoning", {
+            "requestId": "r1", "index": 0, "text": "Check which events compaction removes",
+        }),
         (
             400,
             "model/response",
@@ -45,7 +59,7 @@ def main():
         (
             410,
             "tool/start",
-            {"callId": "read-1", "name": "read_file", "arguments": {"path": "gh_puller/agent/events.py"}},
+            {"callId": "read-1", "name": "read_file", "arguments": {"path": "gh_puller/agent/sinks.py"}},
         ),
         (730, "tool/end", {"callId": "read-1", "result": "Read 300 lines"}),
         (
@@ -56,8 +70,9 @@ def main():
                     {
                         "type": "function_call_output",
                         "call_id": "read-1",
-                        "output": "context/set replaces Item[]. context/append/* appends Item[]. "
-                        "Activity never changes the fold.",
+                        "output": "FileSink writes and flushes every event. After session/end, _compact copies "
+                        "all non-delta records to a temporary file, then calls os.replace. "
+                        "Context records retain their original bytes and sequence numbers.",
                     },
                 ],
             },
@@ -65,7 +80,7 @@ def main():
         (740, "step/end", {}),
         (750, "step/start", {}),
         (750, "model/request", {"requestId": "r2", "model": "offline-fixture"}),
-        (900, "model/delta/text", {"requestId": "r2", "index": 0, "text": "## 上下文已重建"}),
+        (900, "model/delta/text", {"requestId": "r2", "index": 0, "text": "## FileSink compaction"}),
         (
             2300,
             "model/response",

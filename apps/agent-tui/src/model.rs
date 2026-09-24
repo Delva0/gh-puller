@@ -48,11 +48,11 @@ impl Kind {
             Self::Think => "assistant think",
             Self::Answer => "assistant answer",
             Self::Tool => "tool",
-            Self::Turn => "轮",
-            Self::Step => "步",
-            Self::Request => "模型请求",
-            Self::Notice => "上下文",
-            Self::Error => "错误",
+            Self::Turn => "turn",
+            Self::Step => "step",
+            Self::Request => "request",
+            Self::Notice => "context",
+            Self::Error => "error",
         }
     }
 }
@@ -107,28 +107,21 @@ impl Card {
         }
     }
     pub fn body(&self, expanded: bool) -> String {
+        if !expanded {
+            return String::new();
+        }
         if self.kind == Kind::Tool {
             let args = if self.arguments.is_empty() {
-                "（参数未记录）"
+                "Arguments not recorded"
             } else {
                 &self.arguments
             };
-            if expanded {
-                format!(
-                    "```json\n{args}\n```\n\n{}",
-                    self.result.as_deref().unwrap_or("（上下文尚无工具结果）")
-                )
-            } else {
-                let mut lines: Vec<_> = args.lines().take(4).collect();
-                if args.lines().count() > 4 {
-                    lines.push("…");
-                }
-                format!("```json\n{}\n```", lines.join("\n"))
-            }
-        } else if expanded {
-            self.text.clone()
+            format!(
+                "```json\n{args}\n```\n\n{}",
+                self.result.as_deref().unwrap_or("No result in context")
+            )
         } else {
-            String::new()
+            self.text.clone()
         }
     }
 }
@@ -196,7 +189,7 @@ fn image_meta(p: &Value) -> String {
         url.into()
     };
     format!(
-        "[图片] {source} · detail={} · size={}×{}",
+        "[image] {source} · detail={} · size={}×{}",
         p.get("detail")
             .or_else(|| v.get("detail"))
             .and_then(Value::as_str)
@@ -243,7 +236,7 @@ impl Model {
             stats: Stats::new(),
             summary: Summary {
                 title: "Agent".into(),
-                status: "等待文件 · 尚未确认结束".into(),
+                status: "Waiting for file".into(),
                 ..Summary::default()
             },
             sequence: 0,
@@ -323,7 +316,7 @@ impl Model {
                 c.result = Some(pretty(&item["output"]));
                 c.result_source = stats::raw(&item["output"]);
                 if c.status.is_empty() {
-                    c.status = "上下文结果".into();
+                    c.status = "Result received".into();
                 }
             }
             _ => {
@@ -445,7 +438,7 @@ impl Model {
         });
         self.summary.events += 1;
         self.summary.last_ms = at;
-        self.summary.status = "等待后续事件 · 尚未确认结束".into();
+        self.summary.status = "End not recorded".into();
         self.stats.apply(kind, d, at);
         match kind {
             "session/start" => {
@@ -598,7 +591,7 @@ impl Model {
                 if kind == "tool/start" {
                     c.started = Some(at);
                     c.name = d["name"].as_str().unwrap_or("").into();
-                    c.status = "执行中".into();
+                    c.status = "Running".into();
                     if c.arguments.is_empty() {
                         c.arguments = pretty(d.get("arguments").unwrap_or(&Value::Null));
                         c.token_source = stats::raw(&d["arguments"]);
@@ -608,9 +601,9 @@ impl Model {
                         .as_f64()
                         .or_else(|| c.started.map(|s| (at - s).max(0.0)));
                     c.status = if d.get("error").is_some() {
-                        format!("失败 · {}", pretty(&d["error"]))
+                        format!("Failed · {}", pretty(&d["error"]))
                     } else {
-                        "完成".into()
+                        "Completed".into()
                     };
                 }
                 self.put(c);
@@ -625,21 +618,28 @@ impl Model {
                     self.finish(
                         &format!("request:{}", d["requestId"].as_str().unwrap_or("")),
                         at,
-                        "失败",
+                        "Failed",
                     );
                 }
             }
             "session/end" => {
                 self.summary.ended = true;
-                self.summary.status = format!(
-                    "会话结束 · {} · {} · {:.2}s",
-                    d["outcome"].as_str().unwrap_or(""),
-                    d["reasonCode"].as_str().unwrap_or(""),
-                    at / 1000.0
-                );
+                let status = match d["reasonCode"].as_str().unwrap_or("") {
+                    "cancelled" => "Cancelled",
+                    "timeout" => "Timed out",
+                    "budget_exhausted" => "Budget exhausted",
+                    "error" => "Failed",
+                    "" | "completed" => match d["outcome"].as_str() {
+                        Some("completed") => "Completed",
+                        Some("failed") => "Failed",
+                        _ => "Ended",
+                    },
+                    reason => reason,
+                };
+                self.summary.status = format!("{status} · {:.2}s", at / 1000.0);
                 for id in self.current_group.clone() {
                     if self.cards.get(&id).is_some_and(|c| c.duration_ms.is_none()) {
-                        self.finish(&id, at, "会话终止");
+                        self.finish(&id, at, "Stopped");
                     }
                 }
             }
