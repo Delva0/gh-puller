@@ -339,10 +339,18 @@ mod tests {
     #[test]
     fn completion_and_statistics_share_one_footer_row_with_room_for_notices() {
         let (mut model, mut app) = fixture();
+        apply(&mut model, "turn/start", json!({}));
+        model.apply(AgentEvent {
+            kind: "turn/end".into(),
+            data: json!({}),
+            elapsed_ms: Some(2330.0),
+            ts: None,
+            seq: None,
+        });
         model.apply(AgentEvent {
             kind: "session/end".into(),
-            data: json!({"outcome":"completed","reasonCode":"completed"}),
-            elapsed_ms: Some(2330.0),
+            data: json!({"outcome":"completed","reasonCode":"completed","durationMs":60000}),
+            elapsed_ms: Some(60000.0),
             ts: None,
             seq: None,
         });
@@ -357,13 +365,13 @@ mod tests {
         };
         assert_eq!(
             row(&terminal, 23).trim(),
-            format!("Completed · session 2.33s  {}", app.summary.footer)
+            format!("Completed · 2.33s  {}", app.summary.footer)
         );
         assert!(!row(&terminal, 22).contains("Completed"));
         app.notice = "A long notification ".repeat(10);
         terminal.draw(|f| app.render(f)).unwrap();
         let footer = row(&terminal, 23);
-        assert!(footer.trim().starts_with("Completed · session 2.33s"));
+        assert!(footer.trim().starts_with("Completed · 2.33s"));
         assert!(footer.trim().ends_with(&app.summary.footer));
     }
 

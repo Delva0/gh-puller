@@ -71,8 +71,11 @@ Scrolling up pauses automatic following; End clears the new-event indicator. Use
 cards stay expanded. Top chrome contains only session title and path; panels are temporary.
 
 The footer combines status and statistics on one line, for example
-`Completed · session 2.33s  1/2 40/349 —/s`. Session duration is the recorded lifetime,
-including idle time, using hours and minutes for longer sessions. The numbers are
+`Completed · 2.31s  1/2 40/349 —/s`. Duration sums the session's `turn/start`–`turn/end`
+intervals using `elapsedMs`, including model and tool waits. It excludes idle time before,
+between and after turns. Missing or incomplete turn timing displays `—`; the observer
+does not substitute the session's recorded lifetime. Longer durations use hours and minutes,
+such as `6h 10m 41s`. The numbers are
 `turn/steps-in-turn input/output speed/s`. Input is frozen at the first
 request in the turn. Output includes reasoning and is corrected by `usage.output`.
 Speed covers first nonempty delta through model completion for each request, excluding

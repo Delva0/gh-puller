@@ -184,11 +184,13 @@ fn terminal_status_reports_one_outcome_or_specific_failure_reason() {
         (json!({}), "Ended"),
     ] {
         let mut m = Model::new();
+        apply(&mut m, "turn/start", json!({}), 0.0);
+        apply(&mut m, "turn/end", json!({}), 2000.0);
         apply(&mut m, "session/end", data, 2330.0);
-        assert_eq!(m.summary.status, format!("{expected} · session 2.33s"));
+        assert_eq!(m.summary.status, format!("{expected} · 2.00s"));
         apply(&mut m, "turn/start", json!({}), 3000.0);
         assert_eq!(m.summary.last_ms, 2330.0);
-        assert_eq!(m.summary.status, format!("{expected} · session 2.33s"));
+        assert_eq!(m.summary.status, format!("{expected} · 2.00s"));
     }
 }
 
@@ -270,21 +272,72 @@ fn prior_results_survive_context_summaries_without_changing_the_fold_or_counts()
 }
 
 #[test]
-fn session_duration_is_labeled_and_keeps_idle_time_in_the_recorded_lifetime() {
+fn duration_uses_seconds_minutes_and_hours() {
     assert_eq!(duration(1680.0), "1.68s");
     assert_eq!(duration(60000.0), "1m 00s");
     assert_eq!(duration(3599999.0), "1h 00m 00s");
     assert_eq!(duration(22240850.0), "6h 10m 41s");
+}
+
+#[test]
+fn session_duration_sums_turns_across_idle_time_and_context_replacement() {
     let mut m = Model::new();
-    apply(&mut m, "turn/start", json!({}), 0.0);
-    apply(&mut m, "turn/end", json!({}), 2000.0);
+    apply(&mut m, "session/start", json!({}), 0.0);
+    apply(&mut m, "turn/start", json!({}), 69.58106404636055);
+    apply(&mut m, "turn/end", json!({}), 109898.22950900998);
+    apply(&mut m, "context/set", json!({"items":[]}), 200000.0);
+    assert!(m.cards.is_empty());
+    apply(&mut m, "turn/start", json!({}), 428642.53456296865);
+    apply(&mut m, "turn/end", json!({}), 463174.2166070035);
     apply(
         &mut m,
         "session/end",
-        json!({"outcome":"completed", "durationMs":22240850}),
-        22242000.0,
+        json!({"outcome":"completed", "durationMs":22240848}),
+        22240850.407439053,
     );
-    assert_eq!(m.summary.status, "Completed · session 6h 10m 41s");
+    assert_eq!(m.summary.status, "Completed · 2m 24s");
+    assert_eq!(m.stats.turn, 2);
+    assert!(m.context.is_empty());
+}
+
+#[test]
+fn session_duration_remains_unknown_without_complete_monotonic_turn_timings() {
+    for boundaries in [
+        vec![],
+        vec![("turn/end", Some(2000.0))],
+        vec![("turn/start", Some(0.0))],
+        vec![("turn/start", None), ("turn/end", Some(2000.0))],
+        vec![("turn/start", Some(0.0)), ("turn/end", None)],
+        vec![("turn/start", Some(2000.0)), ("turn/end", Some(0.0))],
+        vec![
+            ("turn/start", Some(0.0)),
+            ("turn/end", Some(2000.0)),
+            ("turn/start", Some(3000.0)),
+        ],
+        vec![
+            ("turn/start", Some(0.0)),
+            ("turn/start", Some(1000.0)),
+            ("turn/end", Some(2000.0)),
+        ],
+    ] {
+        let mut m = Model::new();
+        for (i, (kind, elapsed_ms)) in boundaries.iter().enumerate() {
+            m.apply(Event {
+                kind: (*kind).into(),
+                data: json!({}),
+                elapsed_ms: *elapsed_ms,
+                ts: Some(100.0 + i as f64),
+                seq: Some(i as u64),
+            });
+        }
+        apply(
+            &mut m,
+            "session/end",
+            json!({"outcome":"completed", "durationMs":22240850}),
+            22240850.0,
+        );
+        assert_eq!(m.summary.status, "Completed · —", "{boundaries:?}");
+    }
 }
 
 #[test]

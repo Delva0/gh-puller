@@ -344,7 +344,7 @@ impl Stats {
             text.push_str(&format!("  {kind}: {}\n", number(*n)));
         }
         text.push_str("\nEstimates use o200k_base encode_ordinary, plus 4 framing tokens\nper Item and 1024 tokens per image. API input usage calibrates\nsubsequent context estimates; turn input stays frozen.\nOutput includes reasoning. Usage replaces stream estimates.\nSpeed covers the first nonempty delta through response, excluding\ntool waits and first-output waits. Without deltas, speed is —.\nUnknown usage is not counted as zero. Card counts estimate\ncontent size, not provider billing.\n");
-        text.push_str("Tool card counts follow current context; earlier recorded\nresults may also be shown. Session duration includes idle time.\n");
+        text.push_str("Tool card counts follow current context; earlier recorded\nresults may also be shown. Session time sums turn/start to\nturn/end intervals using elapsedMs, including model and tool\nwaits. Idle time outside turns is excluded. Missing or incomplete\nturn timing is —.\n");
         text
     }
 }

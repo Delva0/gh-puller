@@ -200,6 +200,9 @@ pub struct Model {
     current_group: Vec<String>,
     recorded_results: HashMap<String, Arc<str>>,
     origin: Option<f64>,
+    turn_started_ms: Option<f64>,
+    timed_turns: usize,
+    active_ms: f64,
 }
 
 pub fn duration(ms: f64) -> String {
@@ -304,6 +307,9 @@ impl Model {
             current_group: vec![],
             recorded_results: HashMap::new(),
             origin: None,
+            turn_started_ms: None,
+            timed_turns: 0,
+            active_ms: 0.0,
         }
     }
     fn key(&mut self) -> String {
@@ -529,6 +535,7 @@ impl Model {
                 self.append(d["items"].as_array().map(Vec::as_slice).unwrap_or_default())
             }
             "turn/start" => {
+                self.turn_started_ms = event.elapsed_ms;
                 self.current_group.clear();
                 self.group(
                     format!("turn:{}", self.stats.turn),
@@ -546,7 +553,15 @@ impl Model {
                     at,
                 );
             }
-            "turn/end" => self.finish(&format!("turn:{}", self.stats.turn), at, ""),
+            "turn/end" => {
+                if let Some((start, end)) = self.turn_started_ms.take().zip(event.elapsed_ms)
+                    && end >= start
+                {
+                    self.active_ms += end - start;
+                    self.timed_turns += 1;
+                }
+                self.finish(&format!("turn:{}", self.stats.turn), at, "");
+            }
             "step/end" => self.finish(
                 &format!("step:{}:{}", self.stats.turn, self.stats.step),
                 at,
@@ -707,10 +722,13 @@ impl Model {
                     },
                     reason => reason,
                 };
-                self.summary.status = format!(
-                    "{status} · session {}",
-                    duration(d["durationMs"].as_f64().unwrap_or(at))
-                );
+                // Session lifetime can include hours spent waiting between completed turns.
+                let elapsed = if self.stats.turn > 0 && self.timed_turns == self.stats.turn {
+                    duration(self.active_ms)
+                } else {
+                    "—".into()
+                };
+                self.summary.status = format!("{status} · {elapsed}");
                 for id in self.current_group.clone() {
                     if self.cards.get(&id).is_some_and(|c| c.duration_ms.is_none()) {
                         self.finish(&id, at, "Stopped");
