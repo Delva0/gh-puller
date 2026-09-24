@@ -1,9 +1,11 @@
 //! The CLI supports observation and deterministic offline replay without a model call.
 use agent_tui::{
+    cli::Observation,
     hyperlinks,
     model::{Event as AgentEvent, Model},
-    reader,
+    session::Sessions,
     ui::App,
+    workspace::Workspace,
 };
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture},
@@ -16,7 +18,6 @@ use std::{
     fs::File,
     io::{self, BufRead, BufReader, Write},
     path::PathBuf,
-    sync::atomic::Ordering,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -28,6 +29,51 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     if first == "--help" || first == "-h" {
         help();
+        return Ok(());
+    }
+    if first == "--workspace-snapshot" {
+        let output = args.next().ok_or("missing snapshot output path")?;
+        let files: Vec<_> = args.collect();
+        if files.is_empty() {
+            return Err("missing snapshot input files".into());
+        }
+        let mut app = Workspace::new();
+        for file in files {
+            let mut model = Model::new();
+            for line in BufReader::new(File::open(&file)?).lines() {
+                model.apply(serde_json::from_str(&line?)?);
+            }
+            let id = app.add_file(PathBuf::from(file));
+            app.apply(id, model.change());
+            app.views[id].follow = false;
+            app.views[id].scroll = 0;
+        }
+        let mut terminal = Terminal::new(TestBackend::new(160, 54))?;
+        terminal.draw(|f| app.render(f))?;
+        for id in 1..app.views.len().min(4) {
+            if id == 3 {
+                app.command("focus-left", None);
+            }
+            app.command(if id == 1 { "split-right" } else { "split-down" }, None);
+            app.show_file(id);
+            terminal.draw(|f| app.render(f))?;
+        }
+        for _ in 0..200 {
+            app.poll_layout();
+            terminal.draw(|f| app.render(f))?;
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let cells: Vec<_> = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| json!({"text":c.symbol(), "fg":color(c.fg), "bg":color(c.bg)}))
+            .collect();
+        std::fs::write(
+            output,
+            serde_json::to_vec(&json!({"width":160,"height":54,"cells":cells}))?,
+        )?;
         return Ok(());
     }
     if first == "--fold" || first == "--inspect" || first == "--prefixes" || first == "--snapshot" {
@@ -78,15 +124,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )?;
         return Ok(());
     }
-    let file = PathBuf::from(first);
-    let trace_path = args.next();
-    let mut trace = if trace_path.as_deref() == Some("--trace-input") {
-        Some(File::create(args.next().ok_or("missing trace path")?)?)
-    } else {
-        None
-    };
-    let (updates, stop) = reader::spawn(&file);
-    let mut app = App::new(file.display().to_string());
+    let options = Observation::parse(std::iter::once(first).chain(args))?;
+    let mut trace = options.trace.map(File::create).transpose()?;
+    let mut sessions = Sessions::new(options.sources);
+    let mut app = Workspace::new();
     let mut links = hyperlinks::Writer::default();
     let mut terminal = ratatui::init();
     execute!(io::stdout(), EnableMouseCapture)?;
@@ -112,12 +153,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 input_count += 1;
                 app.handle(event);
             }
-            for _ in 0..2 {
-                let Ok(change) = updates.try_recv() else {
-                    break;
-                };
-                app.apply(change);
-            }
+            sessions.poll(&mut app);
             app.poll_layout();
             if app.dirty && last_frame.elapsed() >= Duration::from_micros(16667) {
                 let frame = terminal.draw(|f| app.render(f))?;
@@ -128,7 +164,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         writeln!(
                             trace,
                             "{}",
-                            json!({"input_to_frame_ms": start.elapsed().as_secs_f64()*1000.0, "frame_unix_ns": SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64, "events": app.summary.events, "inputs":input_count})
+                            json!({"input_to_frame_ms": start.elapsed().as_secs_f64()*1000.0, "frame_monotonic_ns": monotonic_ns(), "frame_unix_ns": SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64, "events": app.event_counts().iter().sum::<usize>(), "files": app.event_counts(), "visible_files": app.visible_files(), "inputs":input_count})
                         )?;
                         trace.flush()?;
                     }
@@ -145,11 +181,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Ok(())
     })();
-    stop.store(true, Ordering::Relaxed);
+    drop(sessions);
     let _ = execute!(io::stdout(), DisableMouseCapture);
     ratatui::restore();
     result?;
     Ok(())
+}
+
+// A shared monotonic clock makes PTY measurements immune to wall-clock corrections.
+#[cfg(unix)]
+fn monotonic_ns() -> Option<u64> {
+    let at = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
+    Some(at.tv_sec as u64 * 1_000_000_000 + at.tv_nsec as u64)
+}
+#[cfg(not(unix))]
+fn monotonic_ns() -> Option<u64> {
+    None
 }
 
 fn color(color: ratatui::style::Color) -> String {
@@ -169,6 +216,6 @@ fn color(color: ratatui::style::Color) -> String {
 }
 fn help() {
     println!(
-        "agent-tui <events.jsonl>\n\nRead-only observer. Missing files are awaited; session/end freezes observation.\n? help · / search · : commands · s stats · End follow · q quit\n\nOffline: --fold FILE | --prefixes FILE | --inspect FILE\nSnapshot: --snapshot FILE cells.json (120×42 Ratatui TestBackend)\nMeasurement: agent-tui FILE --trace-input trace.jsonl"
+        "agent-tui FILE [FILE ...] [--watch DIR ...]\nagent-tui --watch DIR\n\nRead-only multi-file observer. Ctrl-W: h/j/k/l focus, n/p tabs, v/s split, H/J/K/L move, c close, z maximize, f sessions, r resize. Esc cancels.\n Missing sources are awaited; --watch scans recursively each second without directory symlinks. Each session/end freezes only that file. Quitting never stops agents.\n? help · / search · : commands · s stats · End follow · q quit\n\nOffline: --fold FILE | --prefixes FILE | --inspect FILE\nSnapshot: --snapshot FILE cells.json (120×42 Ratatui TestBackend)\nWorkspace snapshot: --workspace-snapshot cells.json FILE... (160×54, up to four panes)\nMeasurement: agent-tui FILE --trace-input trace.jsonl"
     );
 }

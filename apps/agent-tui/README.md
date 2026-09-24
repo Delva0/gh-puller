@@ -1,8 +1,9 @@
 # Agent TUI
 
-Read-only Rust + Ratatui observer for one canonical Agent JSONL file. It requires no
-credentials, model calls, WebSocket service, or Python runtime. Each agent gets a separate
-terminal or tmux window. The existing Graphub `tui` entry point is unchanged.
+Read-only Rust + Ratatui observer for canonical Agent JSONL files. One process monitors
+multiple files in a dockable workspace. It requires no credentials, model calls, WebSocket
+service, or Python runtime. It never starts or stops agents. The existing Graphub `tui`
+entry point is unchanged.
 
 This application owns its Cargo build, dependencies and terminal interface. The canonical
 event contract, adapters and FileSink remain in `gh_puller/agent/`; JSONL is their boundary
@@ -16,6 +17,9 @@ From the gh-puller repository, with a Rust toolchain and a native C linker insta
 cargo build --release --locked --manifest-path apps/agent-tui/Cargo.toml
 cargo install --locked --path apps/agent-tui
 agent-tui /path/to/monitor/session.jsonl
+agent-tui first.jsonl second.jsonl
+agent-tui --watch ./sessions
+agent-tui first.jsonl --watch ./sessions --watch ./other-sessions
 ```
 
 The locked build was verified with Rust 1.98.1 on Linux. Cargo installs into
@@ -27,7 +31,63 @@ session is **Running** until its end event is received. An empty file waits for 
 opening a file does not determine the session state.
 Malformed complete records stop reconstruction at the valid prefix and display the error.
 
-## Interaction
+Sources are fixed by the startup command. `--watch` scans existing and new `.jsonl` files
+recursively every second in a background worker, without following directory symlinks.
+Missing files and directories are awaited. Overlapping sources and file symlinks are
+coalesced by normalized path; each file has one reader and one persistent reading view.
+A file error stops only that reader and remains visible in its footer and the session list.
+
+Every launch starts with one pane and multiple tabs. Layout is not saved. Newly discovered
+files join the current pane as background tabs without changing the active file. Closing a
+tab hides its view while monitoring continues. `Ctrl-W f` lists every monitored file,
+including hidden ones; type to filter and press Enter to open or move that file here.
+After all tabs close, the session list stays open and monitoring continues. Sources cannot
+be added from inside the workspace.
+
+![Four independent session panes](assets/workspace.png)
+
+## Workspace
+
+Press `Ctrl-W`, release it, then press one key below. The temporary hint shows the choices;
+Esc cancels the prefix. These keys also work while a file popup is open.
+
+| Following key | Action |
+|---|---|
+| `h/j/k/l` or arrows | Focus the pane to the left / below / above / right |
+| `n/p` | Next / previous tab in this pane |
+| `v/s` | Split left-right / top-bottom; the new pane shows the session list |
+| `H/J/K/L` or Shift+arrow | Move the current tab in that direction; create a split if needed |
+| `c` | Close the current tab; keep consuming that file |
+| `z` | Maximize / restore the focused pane |
+| `f` | List monitored sessions, including hidden tabs |
+| `r` | Resize mode: arrows move a divider; Enter or Esc finishes |
+
+Drag a tab along a tab bar to reorder it, or onto another tab bar to move that one tab.
+Drop in the center of another pane to merge the entire source tab group. Drop at a pane's
+left, right, top or bottom edge to split. The outlined preview shows the destination;
+Esc cancels a drag. Drag a divider to resize it. Click to focus a pane. The wheel acts on
+the pane under the pointer without moving keyboard focus. Text selection, scrollbars and
+tabs capture their own drags so crossing a pane boundary cannot manipulate another file.
+
+Each file retains its fold choices, search, scroll, selection and follow state as it moves
+or hides. Every visible pane has its own file footer; statistics are never combined.
+If any pane would be smaller than 32 columns or 8 rows, only the focused pane is displayed
+until there is room again. This does not modify the split tree or its ratios. `Ctrl-W`
+directional focus still works in this temporary view and while maximized.
+
+All workspace actions appear in `:` / Ctrl-P / `m`, including tab reordering, merging,
+individual divider adjustments, and all four split directions. Commands are labeled
+**File** or **Workspace**. File commands keep the file selected when the palette opened,
+even if focus subsequently changes. Workspace layout commands keep their opening pane.
+Theme (`t`), help, and quit are global. `q`, `quit`, and Ctrl-C exit the entire observer;
+agents keep running. Inside search, the session filter, or the palette, `q` is text.
+Ctrl-P and Ctrl-C remain available in those inputs.
+
+## File interaction
+
+These actions affect the active file in the focused pane. In particular, `1/2/3` never
+change another file, `y` copies this file’s latest answer, and Tab / Shift-Tab navigate
+cards, not tabs.
 
 | Action | Key / mouse |
 |---|---|
@@ -98,7 +158,7 @@ by its output cards, so it must not be summed across cards. Untimed cards, inclu
 content, omit the time field. An unfinished output phase with no recorded boundary remains unknown.
 Scrolling up pauses automatic following; incoming events still update the cards. End returns
 to the bottom and resumes following an open session. User-expanded
-cards stay expanded. Top chrome contains only session title and path; panels are temporary.
+cards stay expanded. Each pane shows its tab bar, session title and path; file popups stay inside their pane.
 
 The footer combines status and statistics on one line, for example
 `Running · 1.24s  1/2 40/349 —/s` or `Completed · 2.31s  1/2 40/349 —/s`. Duration sums
@@ -125,11 +185,14 @@ embedded base64 is neither rendered nor counted as text.
 
 ```mermaid
 flowchart LR
-  File[Held append-only file handle] --> Worker[Decode complete lines / fold / token counts]
-  Worker --> Changes[Bounded incremental card updates]
-  Changes --> UI[Input thread / visible rows / 60 FPS cap]
-  UI --> Layout[Background Markdown / tables / wrapping / search]
-  Layout --> UI
+  Sources[Startup files + background directory discovery] --> Sessions[One held file handle and model worker per file]
+  Sessions --> Changes[Bounded incremental card updates per file]
+  Changes --> Workspace[Input first / rotate readers / 4 ms update budget]
+  Workspace --> Views[Persistent file views / hidden tabs keep updating]
+  Views --> Layout[Visible Markdown layout on background workers]
+  Layout --> Workspace
+  Workspace --> Tiling[ratatui-hypertile 0.4.1 core / tree + focus + ratios]
+  Tiling --> Frame[Clipped pane areas / per-file footers / 60 FPS cap]
 ```
 
 Only `context/append` and the four canonical role append events extend Context;
@@ -145,8 +208,13 @@ Activity without a Context fact stays visibly provisional. Opaque/unknown typed 
 is displayed without inventing hidden text.
 
 The reader and tokenizer cannot block terminal input. Changes are batched through a bounded
-channel; card heights use an incremental prefix index. Only visible expanded cards request
-Markdown layout. Collapsed card contents are not parsed. Layout results are cached
+channel. Sends are cancellable even when a queue is full. The UI services input first,
+then consumes at most one batch per file per pass with a 4 ms pass budget, rotating the
+starting file across passes. Card heights use an incremental prefix index. Only visible
+expanded cards request Markdown layout. Hidden tabs do not render or enqueue body layout jobs. Clean visible panes reuse
+their last rendered cells; focus changes and workspace overlays do not re-render their cards.
+The cache is invalidated by file updates, reading actions, geometry or theme changes.
+Collapsed card contents are not parsed. Layout results are cached
 by card revision, width and expansion; selection uses text byte offsets rather than screen
 coordinates. Idle sessions do not redraw the body. All event clocks come from the log.
 
@@ -165,6 +233,8 @@ uv run --frozen python apps/agent-tui/tools/verify_adapters.py \
   --binary apps/agent-tui/target/release/agent-tui --output /tmp/agent-tui-parity-new
 uv run --frozen python apps/agent-tui/tools/benchmark.py \
   --binary apps/agent-tui/target/release/agent-tui --output /tmp/agent-tui-benchmark-new
+uv run --frozen python apps/agent-tui/tools/workspace_benchmark.py \
+  --binary apps/agent-tui/target/release/agent-tui --output /tmp/agent-tui-workspace-new
 uv run --frozen python apps/agent-tui/tools/demo.py > /tmp/agent-tui-demo.jsonl
 agent-tui /tmp/agent-tui-demo.jsonl
 ```
@@ -179,10 +249,24 @@ terminal emulator's display/compositor. `all_single_input_frames` must be true f
 pairing to be valid. The benchmark is synthetic, not a bound on arbitrary giant records.
 
 `--fold FILE`, `--prefixes FILE`, and `--inspect FILE` provide deterministic JSON output.
-`--snapshot FILE cells.json` captures a 120×42 Ratatui TestBackend frame. `tools/screenshot.py`
-converts its real cells to PNG with Pillow and optional CJK fonts; it does not generate a
+`--snapshot FILE cells.json` captures the original 120×42 single-file TestBackend view.
+`--workspace-snapshot cells.json FILE...` renders a 160×54 workspace with up to four panes;
+extra files remain background tabs. `tools/screenshot.py` converts its real cells to PNG with Pillow and optional CJK fonts; it does not generate a
 mockup. Runtime logs, benchmark fixtures, traces and build output stay outside Git.
 
 Rendering uses [Ratatui](https://ratatui.rs/tutorials/counter-app/basic-app/),
 [pulldown-cmark](https://github.com/pulldown-cmark/pulldown-cmark), and the bundled
 [tiktoken-rs](https://github.com/zurawiki/tiktoken-rs) `o200k_base` vocabulary.
+
+The workspace benchmark measures one process with one file, eight files with one visible,
+and eight files with four visible. Every file has 100,000 historical records and receives
+200 appended records/s for 10 seconds. It records CPU, peak sampled RSS, all per-file event
+counts, actual visible file IDs, and 100 input-to-flush samples on `CLOCK_MONOTONIC`.
+Each sample retains its send and frame timestamps. It rejects invalid timestamp
+pairing and checks that every hidden file catches up. [Measured results](docs/workspace-performance.md)
+include the previous single-file release baseline on the same machine.
+
+The tiling tree, rectangles, directional focus and ratios are owned by the pinned
+[ratatui-hypertile 0.4.1 core](https://docs.rs/ratatui-hypertile/0.4.1/ratatui_hypertile/).
+The application owns tabs, docking previews, selectors, modal routing and mouse capture;
+it does not use the extras runtime or its layout/content modes.

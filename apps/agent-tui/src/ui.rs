@@ -781,6 +781,148 @@ mod tests {
             assert_eq!(app.view(), Some(Preset::Collapsed));
         }
     }
+    #[test]
+    fn area_resize_retains_the_reading_byte_even_when_zoom_temporarily_fits_the_card() {
+        let (mut model, mut app) = fixture();
+        apply(
+            &mut model,
+            "context/set",
+            json!({"items":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Long readable words. ".repeat(100)}]}]}),
+        );
+        app.apply(model.change());
+        let mut terminal = Terminal::new(TestBackend::new(160, 60)).unwrap();
+        let small = Rect::new(51, 9, 40, 18);
+        let large = Rect::new(0, 0, 160, 60);
+        let draw = |app: &mut App, terminal: &mut Terminal<TestBackend>, rect| {
+            terminal.draw(|f| app.render_area(f, rect)).unwrap();
+            layout(app);
+            terminal.draw(|f| app.render_area(f, rect)).unwrap();
+        };
+        draw(&mut app, &mut terminal, small);
+        app.scroll_by(15);
+        draw(&mut app, &mut terminal, small);
+        let byte = app.anchor().unwrap().2.unwrap();
+        draw(&mut app, &mut terminal, large);
+        assert_eq!(app.scroll, 0);
+        draw(&mut app, &mut terminal, small);
+        let current = app.anchor().unwrap().2.unwrap();
+        assert!(current <= byte && byte - current < app.width);
+        app.command("wrap");
+        draw(&mut app, &mut terminal, small);
+        let left = app.horizontal;
+        key(&mut app, KeyCode::Right);
+        draw(&mut app, &mut terminal, small);
+        assert_eq!(app.horizontal, left + 8);
+        assert!(
+            app.hyperlinks()
+                .iter()
+                .all(|l| l.start >= small.x && l.end <= small.right())
+        );
+    }
+
+    #[test]
+    fn hidden_tab_updates_do_not_request_or_build_documents() {
+        use crate::workspace::Workspace;
+        let mut ws = Workspace::new();
+        ws.add_file("visible.jsonl".into());
+        ws.add_file("hidden.jsonl".into());
+        let (mut model, _) = fixture();
+        apply(
+            &mut model,
+            "context/append/user",
+            json!({"items":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hidden body"}]}]}),
+        );
+        ws.apply(1, model.change());
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        for _ in 0..5 {
+            ws.poll_layout();
+            terminal.draw(|f| ws.render(f)).unwrap();
+        }
+        assert!(ws.views[1].requested.is_empty());
+        assert!(ws.views[1].docs.is_empty());
+        assert_eq!(ws.views[1].renders, 0);
+        assert!(
+            ws.views[1]
+                .cards
+                .values()
+                .any(|card| card.text == "hidden body")
+        );
+    }
+
+    #[test]
+    fn every_file_command_and_reading_shortcut_leaves_the_other_file_untouched() {
+        use crate::workspace::Workspace;
+        let mut ws = Workspace::new();
+        for id in 0..2 {
+            ws.add_file(format!("{id}.jsonl").into());
+            ws.views[id] = fixture().1;
+        }
+        let state = |a: &App| {
+            format!(
+                "{:?} {:?} {} {} {} {} {} {:?} {} {} {:?} {:?}",
+                a.expanded,
+                a.preset,
+                a.wrap,
+                a.scroll,
+                a.horizontal,
+                a.follow,
+                a.search,
+                a.matches,
+                a.notice,
+                a.input,
+                a.focus,
+                a.panel
+            )
+        };
+        let before = state(&ws.views[1]);
+        for (command, _) in COMMANDS
+            .iter()
+            .filter(|(name, _)| !matches!(*name, "theme" | "quit" | "help"))
+        {
+            ws.command(command, Some(0));
+            assert_eq!(state(&ws.views[1]), before, "{command}");
+            ws.views[0].close_panel();
+        }
+        for code in [
+            KeyCode::Char('1'),
+            KeyCode::Char('2'),
+            KeyCode::Char('3'),
+            KeyCode::Char('w'),
+            KeyCode::Char('y'),
+            KeyCode::Char('c'),
+            KeyCode::Char('o'),
+            KeyCode::Char('s'),
+            KeyCode::Char('n'),
+            KeyCode::Char('N'),
+            KeyCode::Char(']'),
+            KeyCode::Char('['),
+            KeyCode::Char('}'),
+            KeyCode::Char('{'),
+            KeyCode::Char('!'),
+            KeyCode::Tab,
+            KeyCode::BackTab,
+            KeyCode::Enter,
+            KeyCode::Char(' '),
+            KeyCode::Home,
+            KeyCode::End,
+            KeyCode::Up,
+            KeyCode::Down,
+            KeyCode::Left,
+            KeyCode::Right,
+            KeyCode::PageUp,
+            KeyCode::PageDown,
+        ] {
+            ws.handle(Event::Key(KeyEvent::new(code, KeyModifiers::NONE)));
+            assert_eq!(state(&ws.views[1]), before, "{code:?}");
+            ws.views[0].close_panel();
+        }
+        for code in [KeyCode::Char('/'), KeyCode::Char('a'), KeyCode::Enter] {
+            ws.handle(Event::Key(KeyEvent::new(code, KeyModifiers::NONE)));
+        }
+        assert_eq!(ws.views[0].search, "a");
+        assert_eq!(state(&ws.views[1]), before);
+        assert_eq!(ws.views[0].copy_text(true).as_deref(), Some("answer"));
+    }
 }
 impl Heights {
     fn sum(&self, mut end: usize) -> usize {
@@ -844,7 +986,7 @@ struct Hit {
     title: bool,
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 enum Panel {
     Help,
     Stats,
@@ -899,6 +1041,7 @@ pub struct App {
     pub follow: bool,
     width: usize,
     viewport: usize,
+    resize_anchor: Option<(String, usize, Option<usize>)>,
     selection: Option<Selection>,
     hits: Vec<Hit>,
     drag_scrollbar: bool,
@@ -911,13 +1054,16 @@ pub struct App {
     reveal_match: Option<String>,
     panel_scroll: u16,
     menu_index: usize,
-    theme: usize,
+    pub(crate) theme: usize,
+    area: Rect,
+    #[cfg(test)]
+    pub(crate) renders: usize,
     pub notice: String,
     pub quit: bool,
     pub dirty: bool,
 }
 
-const COMMANDS: &[(&str, &str)] = &[
+pub(crate) const COMMANDS: &[(&str, &str)] = &[
     ("collapse", "1 · Collapse all cards"),
     ("conversation", "2 · Expand only user and assistant answer"),
     ("expand", "3 · Expand all cards"),
@@ -934,7 +1080,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("link", "Open link in card"),
     ("quit", "Quit"),
 ];
-const HELP: &str = "j/k ↑/↓        Scroll (pauses follow)\nPgUp/PgDn      Page up / down\nHome/End       Top / follow bottom\nTab/Shift-Tab  Next / previous card\nEnter/Space    Expand / collapse card\n1              Collapse all cards\n2              Expand user and assistant answer\n3              Expand all cards\nw              Toggle line wrapping\nh/l ←/→        Scroll horizontally\n/              Search text and tool names\nn / N          Next / previous match\n] / [          Next / previous turn\n} / {          Next / previous step\n!              Next error\nc / y          Copy selection or card / latest answer\ns              Token statistics\nt              Change theme\n: or Ctrl-P    Command palette\nm              Menu\no              Open first link in card\nCtrl+click     Open link under pointer\n? / F1         Help\nEsc            Close panel / clear selection and search\nq / Ctrl-C     Quit\n\nManual toggles show Custom when no preset matches.\nNew cards follow the last preset in Custom.\nClick a title to toggle a card. Drag to select text.\nRight-click to copy. Scroll with the wheel or scrollbar.\nCopy uses OSC 52 with tmux passthrough.";
+pub(crate) const HELP: &str = "j/k ↑/↓        Scroll (pauses follow)\nPgUp/PgDn      Page up / down\nHome/End       Top / follow bottom\nTab/Shift-Tab  Next / previous card\nEnter/Space    Expand / collapse card\n1              Collapse all cards\n2              Expand user and assistant answer\n3              Expand all cards\nw              Toggle line wrapping\nh/l ←/→        Scroll horizontally\n/              Search text and tool names\nn / N          Next / previous match\n] / [          Next / previous turn\n} / {          Next / previous step\n!              Next error\nc / y          Copy selection or card / latest answer\ns              Token statistics\nt              Change theme\n: or Ctrl-P    Command palette\nm              Menu\no              Open first link in card\nCtrl+click     Open link under pointer\n? / F1         Help\nEsc            Close panel / clear selection and search\nq / Ctrl-C     Quit\n\nManual toggles show Custom when no preset matches.\nNew cards follow the last preset in Custom.\nClick a title to toggle a card. Drag to select text.\nRight-click to copy. Scroll with the wheel or scrollbar.\nCopy uses OSC 52 with tmux passthrough.";
 
 impl App {
     pub fn new(path: String) -> Self {
@@ -960,6 +1106,7 @@ impl App {
             follow: true,
             width: 80,
             viewport: 24,
+            resize_anchor: None,
             selection: None,
             hits: vec![],
             drag_scrollbar: false,
@@ -973,6 +1120,9 @@ impl App {
             panel_scroll: 0,
             menu_index: 0,
             theme: 0,
+            area: Rect::new(0, 0, 85, 27),
+            #[cfg(test)]
+            renders: 0,
             notice: String::new(),
             quit: false,
             dirty: true,
@@ -992,6 +1142,13 @@ impl App {
                 .into_iter()
                 .find(|preset| self.view_mismatches[*preset as usize] == 0)
         }
+    }
+    pub(crate) fn view_settings(&self) -> String {
+        format!(
+            "View: {} · Wrap: {}",
+            self.view_label(),
+            if self.wrap { "On" } else { "Off" }
+        )
     }
     fn view_label(&self) -> &'static str {
         self.view().map(Preset::label).unwrap_or("Custom")
@@ -1091,7 +1248,7 @@ impl App {
             .min(self.heights.total().saturating_sub(self.viewport));
     }
     pub fn apply(&mut self, change: Change) {
-        let anchor = self.anchor();
+        let anchor = self.resize_anchor.clone().or_else(|| self.anchor());
         for c in change.cards {
             if c.kind != Kind::Request {
                 if self.positions.contains_key(&c.id)
@@ -1116,6 +1273,13 @@ impl App {
                 .filter(|id| self.cards.contains_key(id))
                 .collect();
             let live: HashSet<_> = self.order.iter().cloned().collect();
+            if self
+                .resize_anchor
+                .as_ref()
+                .is_some_and(|(id, _, _)| !live.contains(id))
+            {
+                self.resize_anchor = None;
+            }
             self.cards.retain(|id, _| live.contains(id));
             self.docs.retain(|id, _| live.contains(id));
             self.expanded.retain(|id, _| live.contains(id));
@@ -1179,7 +1343,7 @@ impl App {
             );
             self.dirty = true;
         }
-        let anchor = self.anchor();
+        let anchor = self.resize_anchor.clone().or_else(|| self.anchor());
         let mut changed = false;
         for _ in 0..64 {
             let Ok(doc) = self.completed.try_recv() else {
@@ -1346,19 +1510,34 @@ impl App {
         ])
     }
     pub fn render(&mut self, frame: &mut Frame) {
-        let area = frame.area();
+        self.render_area(frame, frame.area());
+    }
+    pub fn render_area(&mut self, frame: &mut Frame, area: Rect) {
+        #[cfg(test)]
+        {
+            self.renders += 1;
+        }
+        self.area = area;
+        self.hits.clear();
+        let anchor = self.resize_anchor.clone().or_else(|| self.anchor());
         let width = area.width.saturating_sub(5).max(1) as usize;
-        self.viewport = area.height.saturating_sub(3).max(1) as usize;
-        if width != self.width {
+        let viewport = area.height.saturating_sub(3).max(1) as usize;
+        if width != self.width || viewport != self.viewport {
+            if !self.follow {
+                self.resize_anchor = anchor.clone();
+            }
             self.width = width;
+            self.viewport = viewport;
             self.dirty = true;
         }
+        self.restore(anchor);
         let bg = self.background();
         frame.render_widget(
             Block::default().style(Style::default().bg(bg).fg(Color::Rgb(217, 222, 232))),
             area,
         );
         if area.height < 4 || area.width < 12 {
+            self.dirty = false;
             return;
         }
         frame.render_widget(
@@ -1374,12 +1553,12 @@ impl App {
                     Style::default().fg(Color::DarkGray),
                 ),
             ])),
-            Rect::new(0, 0, area.width, 1),
+            Rect::new(area.x, area.y, area.width, 1),
         );
         frame.render_widget(
             Paragraph::new("─".repeat(area.width as usize))
                 .style(Style::default().fg(Color::Rgb(48, 55, 67))),
-            Rect::new(0, 1, area.width, 1),
+            Rect::new(area.x, area.y + 1, area.width, 1),
         );
         self.hits.clear();
         if !self.order.is_empty() {
@@ -1401,7 +1580,7 @@ impl App {
                     if card.kind.heading() {
                         frame.render_widget(
                             Paragraph::new(self.title(&card)),
-                            Rect::new(1, y, area.width - 2, 1),
+                            Rect::new(area.x + 1, area.y + y, area.width - 2, 1),
                         );
                         self.hits.push(Hit {
                             y,
@@ -1416,7 +1595,7 @@ impl App {
                     if focused {
                         frame.render_widget(
                             Block::default().style(Style::default().bg(self.focus_background())),
-                            Rect::new(0, y, area.width - 1, 1),
+                            Rect::new(area.x, area.y + y, area.width - 1, 1),
                         );
                     }
                     if self.open(&id) {
@@ -1429,7 +1608,7 @@ impl App {
                                 "│"
                             })
                             .style(Style::default().fg(Self::color(card.kind))),
-                            Rect::new(0, y, 1, 1),
+                            Rect::new(area.x, area.y + y, 1, 1),
                         );
                     }
                     if row == 0 {
@@ -1450,7 +1629,7 @@ impl App {
                         );
                         frame.render_widget(
                             Paragraph::new(title),
-                            Rect::new(2, y, area.width - 4, 1),
+                            Rect::new(area.x + 2, area.y + y, area.width - 4, 1),
                         );
                         self.hits.push(Hit {
                             y,
@@ -1480,7 +1659,7 @@ impl App {
                                 );
                                 frame.render_widget(
                                     Paragraph::new(line),
-                                    Rect::new(2, y, area.width - 5, 1),
+                                    Rect::new(area.x + 2, area.y + y, area.width - 5, 1),
                                 );
                                 self.hits.push(Hit {
                                     y,
@@ -1495,7 +1674,7 @@ impl App {
                             frame.render_widget(
                                 Paragraph::new("Loading…")
                                     .style(Style::default().fg(Color::DarkGray)),
-                                Rect::new(2, y, area.width - 5, 1),
+                                Rect::new(area.x + 2, area.y + y, area.width - 5, 1),
                             );
                         }
                     }
@@ -1519,7 +1698,7 @@ impl App {
                     "│"
                 })
                 .style(Style::default().fg(Color::Rgb(84, 96, 114))),
-                Rect::new(area.width - 1, 2 + y as u16, 1, 1),
+                Rect::new(area.right() - 1, area.y + 2 + y as u16, 1, 1),
             );
         }
         let mut status = self.summary.status.clone();
@@ -1538,7 +1717,7 @@ impl App {
         frame.render_widget(
             Paragraph::new(footer)
                 .style(Style::default().fg(Color::White).bg(Color::Rgb(38, 44, 55))),
-            Rect::new(0, area.height - 1, area.width, 1),
+            Rect::new(area.x, area.bottom() - 1, area.width, 1),
         );
         if self.panel.is_some() {
             self.render_panel(frame);
@@ -1612,12 +1791,12 @@ impl App {
         ))
     }
     fn render_panel(&self, f: &mut Frame) {
-        let a = f.area();
+        let a = self.area;
         let width = a.width.saturating_sub(6).min(94);
         let height = a.height.saturating_sub(4).min(32);
         let rect = Rect::new(
-            (a.width - width) / 2,
-            (a.height - height) / 2,
+            a.x + (a.width - width) / 2,
+            a.y + (a.height - height) / 2,
             width,
             height,
         );
@@ -1674,7 +1853,7 @@ impl App {
         if self.cards[id].kind.heading() {
             return;
         }
-        let anchor = self.anchor();
+        let anchor = self.resize_anchor.clone().or_else(|| self.anchor());
         let open = !self.open(id);
         self.set_open(id, open);
         self.notice = format!("View: {}", self.view_label());
@@ -1699,7 +1878,7 @@ impl App {
         }
     }
     fn set_view(&mut self, preset: Preset) {
-        let anchor = self.anchor();
+        let anchor = self.resize_anchor.clone().or_else(|| self.anchor());
         self.preset = preset;
         self.expanded.clear();
         self.view_mismatches = [0; 3];
@@ -1713,6 +1892,7 @@ impl App {
         self.dirty = true;
     }
     fn scroll_by(&mut self, delta: isize) {
+        self.resize_anchor = None;
         self.reveal_match = None;
         self.follow = false;
         self.notice.clear();
@@ -1722,6 +1902,7 @@ impl App {
             .min(self.heights.total().saturating_sub(self.viewport));
     }
     fn jump(&mut self, id: String) {
+        self.resize_anchor = None;
         self.reveal_match = None;
         if let Some(i) = self.positions.get(&id) {
             self.scroll = self
@@ -1954,9 +2135,9 @@ impl App {
                 let end = end.saturating_sub(self.horizontal).min(self.width);
                 if start < end {
                     links.push(hyperlinks::Link {
-                        y: hit.y,
-                        start: start as u16 + 2,
-                        end: end as u16 + 2,
+                        y: self.area.y + hit.y,
+                        start: self.area.x + start as u16 + 2,
+                        end: self.area.x + end as u16 + 2,
                         url: link.url.clone(),
                     });
                 }
@@ -1964,7 +2145,8 @@ impl App {
         }
         links
     }
-    fn command(&mut self, command: &str) {
+    pub fn command(&mut self, command: &str) {
+        self.dirty = true;
         match command {
             "expand" => self.set_view(Preset::Expanded),
             "collapse" => self.set_view(Preset::Collapsed),
@@ -1979,6 +2161,7 @@ impl App {
             "copy" => self.copy(false),
             "answer" => self.copy(true),
             "follow" => {
+                self.resize_anchor = None;
                 self.reveal_match = None;
                 self.scroll = self.heights.total().saturating_sub(self.viewport);
                 self.follow = !self.summary.ended;
@@ -2020,6 +2203,33 @@ impl App {
             id: hit.id.clone(),
             byte: byte.min(hit.end),
         })
+    }
+    pub fn has_panel(&self) -> bool {
+        self.panel.is_some()
+    }
+    pub fn input_active(&self) -> bool {
+        matches!(
+            self.panel,
+            Some(Panel::Search | Panel::Commands | Panel::Menu)
+        )
+    }
+    pub fn close_panel(&mut self) {
+        self.panel = None;
+        self.dirty = true;
+    }
+    /// The workspace captures drags, then clips and translates to this view's coordinates.
+    pub fn handle_at(&mut self, mut event: Event) {
+        if let Event::Mouse(m) = &mut event {
+            m.column = m
+                .column
+                .saturating_sub(self.area.x)
+                .min(self.area.width.saturating_sub(1));
+            m.row = m
+                .row
+                .saturating_sub(self.area.y)
+                .min(self.area.height.saturating_sub(1));
+        }
+        self.handle(event);
     }
     pub fn handle(&mut self, event: Event) {
         self.dirty = true;
@@ -2086,15 +2296,20 @@ impl App {
                     KeyCode::PageUp => self.scroll_by(-(self.viewport as isize)),
                     KeyCode::PageDown => self.scroll_by(self.viewport as isize),
                     KeyCode::Home => {
+                        self.resize_anchor = None;
                         self.reveal_match = None;
                         self.scroll = 0;
                         self.follow = false;
                     }
                     KeyCode::End => self.command("follow"),
                     KeyCode::Left | KeyCode::Char('h') => {
+                        self.resize_anchor = None;
                         self.horizontal = self.horizontal.saturating_sub(8)
                     }
-                    KeyCode::Right | KeyCode::Char('l') => self.horizontal += 8,
+                    KeyCode::Right | KeyCode::Char('l') => {
+                        self.resize_anchor = None;
+                        self.horizontal += 8;
+                    }
                     KeyCode::Tab => self.navigate(true, |c| !c.kind.heading()),
                     KeyCode::BackTab => self.navigate(false, |c| !c.kind.heading()),
                     KeyCode::Enter | KeyCode::Char(' ') => {
@@ -2180,6 +2395,7 @@ impl App {
                         self.copy(false);
                     }
                     MouseEventKind::Down(MouseButton::Left) => {
+                        self.resize_anchor = None;
                         if m.column as usize >= self.width + 4 {
                             self.drag_scrollbar = true;
                             self.follow = false;

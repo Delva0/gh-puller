@@ -123,7 +123,7 @@ pub fn spawn(path: &Path) -> (Receiver<Change>, Arc<AtomicBool>) {
                     Ok(None) => break,
                     Err(e) => {
                         model.summary.status = format!("Read stopped: {e}");
-                        let _ = tx.send(model.change());
+                        let _ = crate::sources::send(&tx, model.change(), &stopping);
                         return;
                     }
                 }
@@ -144,7 +144,7 @@ pub fn spawn(path: &Path) -> (Receiver<Change>, Arc<AtomicBool>) {
                 ticked = Instant::now();
             }
             if changed || !sent {
-                if tx.send(model.change()).is_err() {
+                if !crate::sources::send(&tx, model.change(), &stopping) {
                     return;
                 }
                 sent = true;
@@ -236,6 +236,21 @@ mod tests {
         assert_eq!(ended.summary.status, "Completed · 0.70s");
         assert!(rx.recv_timeout(Duration::from_millis(220)).is_err());
         stop.store(true, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn a_full_reader_queue_does_not_prevent_shutdown() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        std::fs::write(&path, "{\"type\":\"unknown\"}\n".repeat(10000)).unwrap();
+        let (_rx, stop) = spawn(&path);
+        std::thread::sleep(Duration::from_millis(150));
+        stop.store(true, Ordering::Relaxed);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Arc::strong_count(&stop) > 1 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(Arc::strong_count(&stop), 1);
     }
 
     #[test]

@@ -10,6 +10,8 @@ dependencies = [
  "crossterm",
  "pulldown-cmark",
  "ratatui",
+ "ratatui-hypertile",
+ "rustix",
  "serde",
  "serde_json",
  "tempfile",
@@ -657,6 +659,15 @@ dependencies = [
  "crossterm",
  "instability",
  "ratatui-core",
+]
+
+[[package]]
+name = "ratatui-hypertile"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "80c78d226fbdf5c14991d498f3fcce7081689a47a72b8bf095fbc6dc251e7298"
+dependencies = [
+ "ratatui",
 ]
 
 [[package]]
