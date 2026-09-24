@@ -23,8 +23,10 @@ def session_path(session: str, *, directory: str | Path | None = None) -> Path:
 
     Args:
         session: Observation identity; its final slash-separated component names the file.
-        directory: Explicit sink root, or the currently configured root when omitted.
+        directory: Explicit sink root; omission uses the configured file path or root.
     """
+    if directory is None and _cfg["file_path"] is not None:
+        return Path(_cfg["file_path"])
     return Path(_cfg["file_dir"] if directory is None else directory) / f"{_file_stem(session)}.jsonl"
 
 
@@ -33,22 +35,40 @@ def _log(msg: str) -> None:
 
 
 class FileSink:
-    """Write one flat JSONL log per session.
+    """Write one JSONL log per session, optionally at an explicit file path.
 
-    Live logs retain every event. After flushing ``session/end``, atomically replace
-    the log with a copy omitting only model deltas, without changing retained bytes
-    or sequence numbers. Existing readers can finish the complete stream through
-    their open handles. Incomplete sessions and failed compactions retain the full
-    log. Events outside ``session/start`` through ``session/end`` are ignored.
+    Live logs retain every event. Unless ``save_delta`` is enabled, flushing
+    ``session/end`` atomically replaces the log with a copy omitting only model
+    deltas, without changing retained bytes or sequence numbers. Existing readers
+    can finish the complete stream through their open handles. Incomplete sessions
+    and failed compactions retain the full log. Events outside ``session/start``
+    through ``session/end`` are ignored.
     """
 
-    def __init__(self, root: str):
-        self.root = Path(root)
+    def __init__(self, root: str | Path | None = None, *, file_path: str | Path | None = None,
+                 save_delta: bool = False):
+        """Choose per-session filenames or one caller-owned session file.
+
+        Args:
+            root: Directory for session-derived filenames; omission uses AGENT_MONITOR_DIR.
+                Mutually exclusive with file_path.
+            file_path: Exact destination for a single session; parent directories are created.
+                The caller owns path uniqueness across sink instances.
+            save_delta: Retain model deltas after session end instead of compacting the log.
+        """
+        if root is not None and file_path is not None:
+            raise ValueError("root and file_path are mutually exclusive")
+        self.file_path = Path(file_path) if file_path is not None else None
+        self.root = self.file_path.parent if self.file_path is not None else Path(
+            envs.AGENT_MONITOR_DIR if root is None else root,
+        )
+        self.save_delta = save_delta
+        self._session: str | None = None
         self._files: dict[str, Path] = {}
         self.root.mkdir(parents=True, exist_ok=True)
 
     async def consume(self, evt: dict) -> None:
-        """Flush one full event, then compact a completed session off the event loop."""
+        """Flush one full event, optionally compacting a completed session off the event loop."""
         session = evt.get("session", "")
         if evt["type"] == "session/start":
             self._open(session)
@@ -60,10 +80,11 @@ class FileSink:
             f.flush()
         if evt["type"] == "session/end":
             self._files.pop(session)
-            try:
-                await asyncio.to_thread(self._compact, path)
-            except (OSError, ValueError, TypeError) as exc:
-                _log(f"FileSink.compact failed {path}: {exc}; complete source log retained")
+            if not self.save_delta:
+                try:
+                    await asyncio.to_thread(self._compact, path)
+                except (OSError, ValueError, TypeError) as exc:
+                    _log(f"FileSink.compact failed {path}: {exc}; complete source log retained")
 
     @staticmethod
     def _compact(path: Path) -> None:
@@ -86,7 +107,11 @@ class FileSink:
 
     def _open(self, session: str) -> None:
         """Register the session file (created on session/start)."""
-        self._files[session] = session_path(session, directory=self.root)
+        if self.file_path is not None:
+            if self._session is not None and self._session != session:
+                raise ValueError("file_path accepts one session; configure a distinct path for another session")
+            self._session = session
+        self._files[session] = self.file_path or session_path(session, directory=self.root)
 
     async def touch(self, session: str) -> None:
         """Keep-warm primitive: refresh file mtime only (no writes); silent no-op on failure."""
@@ -469,8 +494,10 @@ def _default_otel_urls() -> list[str]:
 
 
 _cfg = {
-    # FileSink is always on; file_dir redirects its output for isolation and embedding.
+    # FileSink is always on; an explicit path embeds a session in its owner's run directory.
     "file_dir": envs.AGENT_MONITOR_DIR,
+    "file_path": None,
+    "save_delta": False,
     "ws_urls": _split_urls(envs.AGENT_MONITOR_WEBUI_URL),
     "otel_urls": _default_otel_urls(),
 }
@@ -479,21 +506,29 @@ _file_sinks: list[FileSink] = []
 _ws_sinks: list[WsSink] = []
 
 
-def configure(*, file_dir=None, ws_urls=None, otel_urls=None) -> None:
+def configure(*, file_dir=None, file_path: str | Path | None = None, save_delta: bool = False,
+              ws_urls=None, otel_urls=None) -> None:
     """Reconfigure monitoring (tests/embedding); defaults re-read env constants, effective on the next publish.
 
     Closes the old bus (cancels sink tasks); the new config rebuilds lazily — idempotent.
 
     Args:
         file_dir: Directory for the always-on file sink (cannot be disabled); tests/embedding
-            redirect here instead of the real monitor dir.
+            redirect here instead of the real monitor dir. Mutually exclusive with file_path.
+        file_path: Exact destination for one session; omission uses per-session files in
+            file_dir or AGENT_MONITOR_DIR. Reconfigure with a distinct path for another session.
+        save_delta: Retain model deltas after session end; live and unfinished logs always retain them.
         ws_urls: URL list or comma-separated string; None re-reads the env constant;
             empty deploys none (one sink instance per URL).
         otel_urls: URL list or comma-separated string; None re-reads the whole
             _OTEL_BACKENDS table; empty disables OTel sinks.
     """
+    if file_dir is not None and file_path is not None:
+        raise ValueError("file_dir and file_path are mutually exclusive")
     shutdown()
     _cfg["file_dir"] = envs.AGENT_MONITOR_DIR if file_dir is None else file_dir
+    _cfg["file_path"] = file_path
+    _cfg["save_delta"] = save_delta
     _cfg["ws_urls"] = _split_urls(envs.AGENT_MONITOR_WEBUI_URL if ws_urls is None else ws_urls)
     _cfg["otel_urls"] = _default_otel_urls() if otel_urls is None else _split_urls(otel_urls)
 
@@ -533,7 +568,8 @@ def ensure_bus() -> EventBus:
     global _bus, _file_sinks, _ws_sinks
     if _bus is None:
         b = EventBus()
-        fs = FileSink(_cfg["file_dir"])
+        fs = FileSink(None if _cfg["file_path"] is not None else _cfg["file_dir"],
+                      file_path=_cfg["file_path"], save_delta=_cfg["save_delta"])
         _file_sinks.append(fs)
         b.add(fs.consume, lossless=True)
         for url in _cfg["ws_urls"]:

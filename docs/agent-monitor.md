@@ -147,7 +147,7 @@ Sources: [gh_puller/agent/](../gh_puller/agent/); [tests/agent/](../tests/agent/
 ```mermaid
 flowchart TD
     Adapter[Agent adapter] --> Bus[Canonical event bus]
-    Bus --> File[Live JSONL → compact at session end]
+    Bus --> File[Live JSONL → optional compaction at session end]
     Bus --> Live[Live WebSocket]
     File --> Hub[Local sidecar]
     Live --> Hub
@@ -158,12 +158,23 @@ flowchart TD
 ```
 
 JSONL is the durable source. File consumers use lossless queues and flush every event,
-including all three canonical model delta types. After flushing `session/end`, the sink
-streams retained lines into a same-directory temporary file and atomically replaces the
-log. Only `DELTA_TYPES` are removed; retained bytes, order and sequence numbers stay intact.
+including all three canonical model delta types. With the default `save_delta=False`,
+after flushing `session/end` the sink streams retained lines into a same-directory temporary
+file and atomically replaces the log. Only `DELTA_TYPES` are removed; retained bytes, order
+and sequence numbers stay intact.
 Open readers can finish the full stream through their existing handles. New readers see
 compact history. Sessions without an end event remain complete live logs; compaction
-failures are reported and preserve the source. There is no storage mode setting.
+failures are reported and preserve the source. `save_delta=True` retains all events after
+session end, including failed and cancelled sessions, without replacing the file.
+
+Use `configure(file_path="runs/example/events.jsonl", save_delta=True)` to place one
+session's log at an exact path. Parent directories are created automatically;
+`session_path(session)` returns that configured path. An explicit file accepts one session
+per configuration: choose a distinct path and reconfigure after flushing before starting
+another session. The caller owns path uniqueness across processes and sink instances.
+`file_dir` remains available for a directory of session-derived filenames and is mutually
+exclusive with `file_path`. Omitting both uses `AGENT_MONITOR_DIR`. Calling `configure()`
+resets the custom path and restores default delta compaction.
 
 The [Rust terminal observer](../apps/agent-tui/README.md) tails one file and reconstructs
 the canonical context without backend-specific inference.
