@@ -19,6 +19,37 @@ fn message(role: &str, text: &str) -> Value {
 }
 
 #[test]
+fn title_keeps_first_user_prompt_across_queries_and_context_replacements() {
+    for initial in ["context/set", "context/append/user"] {
+        let mut m = Model::new();
+        apply(&mut m, "session/start", json!({"label":"run-123"}), 0.0);
+        assert!(m.summary.title.is_empty());
+        apply(
+            &mut m,
+            initial,
+            json!({"items":[message("system", "Instructions"), message("user", "  第一个问题\n\t请检查代码  ")]}),
+            1.0,
+        );
+        assert_eq!(m.summary.title, "第一个问题 请检查代码");
+        for (kind, data) in [
+            (
+                "context/append/user",
+                json!({"items":[message("user", "Next question")]}),
+            ),
+            ("context/set", json!({"items":[]})),
+            (
+                "context/set",
+                json!({"items":[message("user", "Replaced context")]}),
+            ),
+            ("session/start", json!({"label":"Another label"})),
+        ] {
+            apply(&mut m, kind, data, 2.0);
+            assert_eq!(m.summary.title, "第一个问题 请检查代码");
+        }
+    }
+}
+
+#[test]
 fn response_then_context_commit_reuses_stream_cards() {
     let mut m = Model::new();
     apply(&mut m, "model/request", json!({"requestId":"r"}), 0.0);

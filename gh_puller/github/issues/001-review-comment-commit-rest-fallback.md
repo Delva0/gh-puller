@@ -1,6 +1,7 @@
 # Missing REST enrichment for GraphQL review-comment commit IDs
 
-Status: recorded only, 2026-09-17. No collector or archive changes made.
+Status: closed without implementation, 2026-09-17. No automatic REST fallback or
+bulk refresh is required.
 
 ## Reproduced case
 
@@ -50,20 +51,32 @@ returned at the earlier capture time.
   Missing IDs may also leave gaps in commit-reference extraction and Git
   object collection.
 
-## Follow-up scope
+## Resolution
 
-Consider targeted REST enrichment for review comments with missing commit IDs,
-joined by the original comment ID. Preserve the native GraphQL response and the
-REST provenance separately; do not overwrite raw observations or infer the
-reviewed version from a PR head, merge commit or timestamp.
+A read-only archive scan found 42,865 review comments with at least one null
+GraphQL commit field across 6,648 PRs. Limited refreshes then tested 24 PRs
+spanning old and recent numbers and all three null patterns: `commit` only,
+`originalCommit` only, and both fields. REST supplied the missing scalar IDs,
+but every SHA recovered only from REST was unavailable from the managed store,
+the PR ref, the known fork branch, and upstream branches and tags.
 
-Existing affected archives need an explicit backfill strategy, including
-derived commit references and Git objects where applicable. A present SHA does
-not itself guarantee that the referenced Git object remains retrievable.
+A control sample selected 46 SHAs returned directly by GraphQL across 30 PRs.
+Forty-five Git objects were available. The remaining object stayed unavailable
+after a targeted refresh even though GraphQL still returned its SHA. This is a
+strong correlation, not an availability invariant: API identity and Git object
+availability remain separate observations.
 
-Deterministic regression cases should cover GraphQL-null/REST-present fields,
-both sources returning null, conflicting non-null values, failed enrichment,
-and unchanged review-thread/reply identities. No LLM is needed.
+The REST-only SHA is therefore a historical identifier, not recoverable code.
+No current L0 consumer requires that identifier without its Git object, while
+the archived `diff_hunk` already preserves the available review context.
+Automatically rereading REST would add one comment-list request for each
+affected PR and trigger unproductive Git acquisition attempts.
+
+The collector will continue deriving `pull-review-comments` from complete
+GraphQL review threads. Non-null GraphQL commit IDs still produce structured
+commit references and Git-object checks. Null IDs remain faithfully archived;
+they do not trigger REST enrichment or a historical backfill. This keeps REST
+traffic and collection policy minimal.
 
 ## Read-only reproduction
 

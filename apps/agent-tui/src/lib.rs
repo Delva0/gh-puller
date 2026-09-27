@@ -3,6 +3,7 @@ pub mod cli;
 pub mod document;
 pub mod hyperlinks;
 pub mod model;
+pub mod observer;
 pub mod reader;
 pub mod session;
 pub mod sources;

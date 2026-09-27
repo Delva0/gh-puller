@@ -126,14 +126,14 @@ const WORKSPACE_COMMANDS: &[(&str, &str)] = &[
     ("move-right", "Ctrl-W L · Move tab right"),
     ("close-tab", "Ctrl-W c · Hide current tab"),
     ("maximize", "Ctrl-W z · Maximize / restore pane"),
-    ("sessions", "Ctrl-W f · Open monitored session here"),
+    ("open", "Ctrl-W o · Open a monitored file here"),
     ("resize", "Ctrl-W r · Resize with arrows; Enter / Esc ends"),
     ("resize-left", "Move vertical divider left"),
     ("resize-right", "Move vertical divider right"),
     ("resize-up", "Move horizontal divider up"),
     ("resize-down", "Move horizontal divider down"),
 ];
-const WORKSPACE_HELP: &str = "Workspace · one observer; agents keep running\nCtrl-W, then (Esc cancels):\nh/j/k/l or arrows    Focus a pane\nn/p                 Next / previous tab\nv/s                 Split left-right / top-bottom\nH/J/K/L or Shift+arrow  Move tab; split if needed\nc                   Close tab (keep monitoring)\nz                   Maximize / restore\nf                   Sessions (Enter opens/moves here)\nr                   Resize; arrows, Enter/Esc to finish\n\nDrag a tab onto a tab bar to move or reorder it.\nDrop in a pane center to merge the source tab group.\nDrop at an edge to split. Esc cancels the preview.\nDrag dividers to resize. Click to focus; wheel follows pointer.\nEach file has one view, including hidden tabs.\nNew files open in background. Layout is not saved.\nSmall terminals temporarily show only the focused pane.\n\nFile · shortcuts below affect the current file only.\nPalette File commands keep the file selected at opening.\nTheme (t), help, and quit (q/Ctrl-C) affect the workspace.\nq remains text in search, session filter and palette.\n";
+const WORKSPACE_HELP: &str = "Workspace · one observer; agents keep running\nCtrl-W, then (Esc cancels):\nh/j/k/l or arrows    Focus a pane\nn/p                 Next / previous tab\nv/s                 Split left-right / top-bottom\nH/J/K/L or Shift+arrow  Move tab; split if needed\nc                   Close tab (keep monitoring)\nz                   Maximize / restore\no                   Open a monitored file here\nr                   Resize; arrows, Enter/Esc to finish\n\nDrag a tab onto a tab bar to move or reorder it.\nDrop in a pane center to merge the source tab group.\nDrop at an edge to split. Esc cancels the preview.\nDrag dividers to resize. Click to focus; wheel follows pointer.\nEach file has one view, including hidden tabs.\nNew files open in background. Layout is not saved.\nSmall terminals temporarily show only the focused pane.\n\nFile · shortcuts below affect the current file only.\nPalette File commands keep the file selected at opening.\nTheme (t), help, and quit (q/Ctrl-C) affect the workspace.\nq remains text in search, session filter and palette.\n";
 
 pub struct Workspace {
     pub views: Vec<App>,
@@ -437,7 +437,7 @@ impl Workspace {
                 self.zoomed = !self.zoomed;
                 self.compute();
             }
-            "sessions" => {
+            "open" => {
                 let pane = self.focused();
                 let g = self.groups.get_mut(&pane).unwrap();
                 g.selecting = true;
@@ -577,7 +577,7 @@ impl Workspace {
             KeyCode::Char('s') => "split-down",
             KeyCode::Char('c') => "close-tab",
             KeyCode::Char('z') => "maximize",
-            KeyCode::Char('f') => "sessions",
+            KeyCode::Char('o') => "open",
             KeyCode::Char('r') => "resize",
             KeyCode::Char('q') => "quit",
             _ => return,
@@ -921,17 +921,19 @@ impl Workspace {
                 }) {
                     let file = hit.file;
                     let g = self.groups.get_mut(&pane).unwrap();
-                    g.active = Some(file);
-                    g.selecting = false;
-                    self.capture = Some(Capture::Tab {
-                        file,
-                        source: pane,
-                        origin: (mouse.column, mouse.row),
-                        target: None,
-                        moved: false,
-                    });
-                } else {
-                    self.groups.get_mut(&pane).unwrap().selecting = true;
+                    if g.active == Some(file) && mouse.column == hit.rect.x {
+                        g.selecting = !g.selecting;
+                    } else {
+                        g.active = Some(file);
+                        g.selecting = false;
+                        self.capture = Some(Capture::Tab {
+                            file,
+                            source: pane,
+                            origin: (mouse.column, mouse.row),
+                            target: None,
+                            moved: false,
+                        });
+                    }
                 }
             } else if matches!(
                 mouse.kind,
@@ -1030,11 +1032,11 @@ impl Workspace {
                 break;
             }
             let file = g.tabs[index];
-            let active = g.active == Some(file) && !g.selecting;
+            let active = g.active == Some(file);
             let width = (label.width() as u16 + 3).min(rect.right() - x);
             let hit = Rect::new(x, rect.y, width, 1);
             frame.render_widget(
-                Paragraph::new(format!("{} {label} ", if active { "▸" } else { " " })).style(
+                Paragraph::new(format!("{} {label} ", if active { "▾" } else { " " })).style(
                     if active {
                         style
                             .fg(if focused { Color::Cyan } else { Color::White })
@@ -1056,7 +1058,7 @@ impl Workspace {
         }
         if g.tabs.is_empty() {
             frame.render_widget(
-                Paragraph::new(" Sessions · Ctrl-W f").style(style.fg(Color::Cyan)),
+                Paragraph::new(" Sessions · Ctrl-W o").style(style.fg(Color::Cyan)),
                 Rect::new(rect.x, rect.y, rect.width, 1),
             );
         }
@@ -1191,11 +1193,11 @@ impl Workspace {
         self.cached.clone_from(frame.buffer_mut());
         self.cached_views = rendered;
         let hint = if self.prefix {
-            " Ctrl-W: h/j/k/l focus · n/p tabs · v/s split · H/J/K/L move · c close · z zoom · f sessions · r resize · Esc cancel"
+            " Ctrl-W: o open · c close · h/j/k/l focus · n/p tabs · v/s split · H/J/K/L move · z zoom · r resize · Esc cancel"
         } else if self.resizing {
             " Resize: arrows move dividers · Enter / Esc ends"
         } else if self.zoomed {
-            " Maximized · Ctrl-W z restores · Ctrl-W f sessions · : commands · ? help"
+            " Maximized · Ctrl-W z restores · Ctrl-W o open · : commands · ? help"
         } else if self.small && self.groups.len() > 1 {
             " Focused pane only: terminal is small · layout restores on resize · Ctrl-W h/j/k/l focus"
         } else {
@@ -1398,7 +1400,7 @@ mod tests {
         prefix(&mut ws, KeyCode::Char('c'));
         assert!(!ws.groups.values().any(|g| g.tabs.contains(&1)));
         assert_eq!(ws.views[1].notice, "View: Expanded");
-        prefix(&mut ws, KeyCode::Char('f'));
+        prefix(&mut ws, KeyCode::Char('o'));
         for c in "run-1".chars() {
             key(&mut ws, KeyCode::Char(c));
         }
@@ -1425,7 +1427,7 @@ mod tests {
         key(&mut ws, KeyCode::Esc);
         key(&mut ws, KeyCode::Char('t'));
         assert!(ws.views.iter().all(|v| v.theme == 1));
-        prefix(&mut ws, KeyCode::Char('f'));
+        prefix(&mut ws, KeyCode::Char('o'));
         key(&mut ws, KeyCode::Char('q'));
         assert!(!ws.quit);
         key(&mut ws, KeyCode::Esc);

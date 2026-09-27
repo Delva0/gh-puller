@@ -128,21 +128,21 @@ def test_mcp_route_exposes_json_queries(tmp_path):
 
         assert client.binary.path == binary.resolve()
         assert client.cache_root == (tmp_path / "cache").resolve()
-        pids = {
-            search["pid"],
-            code["pid"],
-            query["pid"],
-            schema["pid"],
-            trace["pid"],
-            snippet["pid"],
-            architecture["pid"],
-            changes["pid"],
-            adr["pid"],
-            traces["pid"],
-            status["pid"],
-            comparison["pid"],
-        }
-        assert len(pids) == 1
+        results = (
+            search,
+            code,
+            query,
+            schema,
+            trace,
+            snippet,
+            architecture,
+            changes,
+            adr,
+            traces,
+            status,
+            comparison,
+        )
+        assert len({result["pid"] for result in results}) == len(results)
         assert search["arguments"] == {
             "project": "demo",
             "label": "Function",

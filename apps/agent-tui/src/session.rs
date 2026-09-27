@@ -20,9 +20,12 @@ pub struct FileSession {
     stop: Arc<AtomicBool>,
 }
 impl FileSession {
-    fn new(path: PathBuf) -> Self {
+    pub fn new(path: PathBuf) -> Self {
         let (updates, stop) = reader::spawn(&path);
         Self { updates, stop }
+    }
+    pub fn poll(&self) -> Option<Change> {
+        self.updates.try_recv().ok()
     }
 }
 impl Drop for FileSession {
@@ -63,7 +66,7 @@ impl Sessions {
             let id = self.next;
             self.next = (self.next + 1) % self.files.len();
             // One batch per file per pass. Start the next pass after the last serviced file.
-            if let Ok(change) = self.files[id].updates.try_recv() {
+            if let Some(change) = self.files[id].poll() {
                 workspace.apply(id, change);
             }
             if start.elapsed() >= Duration::from_millis(4) {

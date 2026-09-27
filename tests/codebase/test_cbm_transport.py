@@ -129,14 +129,14 @@ for line in sys.stdin:
     path.chmod(0o755)
 
 
-def make_transport(kind, path, cache, monitor, **options):
+def make_transport(kind, path, cache, monitor):
     identity = binary_identity(path)
     if kind == "mcp":
-        return MCPTransport(identity, cache, 5, monitor, {}, **options)
+        return MCPTransport(identity, cache, 5, monitor, {})
     return CLITransport(identity, cache, 5, monitor, {})
 
 
-def test_mcp_transport_reuses_an_idle_frontend(tmp_path):
+def test_mcp_transport_uses_one_frontend_per_call(tmp_path):
     binary = tmp_path / "fake-cbm"
     write_fake_cbm(binary)
     monitor = FakeMonitor()
@@ -145,30 +145,23 @@ def test_mcp_transport_reuses_an_idle_frontend(tmp_path):
     first = transport.index_repository(tmp_path, tmp_path / "unused.db", "project", "full")
     second = transport.index_repository(tmp_path, tmp_path / "unused.db", "project", "full")
 
-    assert first == second
-    assert len(transport.frontend_pids) == 1
-    assert monitor.children == set(transport.frontend_pids)
+    assert first["pid"] != second["pid"]
+    assert not monitor.children
     transport.close()
     assert not monitor.children
 
 
-def test_mcp_transport_expands_to_multiple_frontends_for_concurrency(tmp_path):
+def test_mcp_transport_uses_independent_frontends_for_concurrency(tmp_path):
     binary = tmp_path / "fake-cbm"
     write_fake_cbm(binary, delay=0.1)
     monitor = FakeMonitor()
-    transport = make_transport(
-        "mcp",
-        binary,
-        tmp_path / "cache",
-        monitor,
-        max_frontends=4,
-    )
+    transport = make_transport("mcp", binary, tmp_path / "cache", monitor)
 
     with ThreadPoolExecutor(max_workers=4) as pool:
         results = list(pool.map(lambda _: transport.call_tool(None, "echo", {}), range(4)))
 
     assert len({result["index_execution"]["pid"] for result in results}) == 4
-    assert len(transport.frontend_pids) == 4
+    assert not monitor.children
     transport.close()
     assert not monitor.children
 

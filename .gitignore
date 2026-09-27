@@ -16,6 +16,7 @@ wheels/
 # Local Experiment
 playground/
 archive/
+issues/
 
 # Runtime artifacts
 archives/

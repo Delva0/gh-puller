@@ -1,9 +1,9 @@
 # Agent TUI
 
-Read-only Rust + Ratatui observer for canonical Agent JSONL files. One process monitors
-multiple files in a dockable workspace. It requires no credentials, model calls, WebSocket
-service, or Python runtime. It never starts or stops agents. The existing Graphub `tui`
-entry point is unchanged.
+Read-only Rust + Ratatui observer for canonical Agent JSONL files. A single file opens
+directly; multiple files use a dockable workspace. It requires no credentials, model calls,
+WebSocket service, or Python runtime. It never starts or stops agents. The existing Graphub
+`tui` entry point is unchanged.
 
 This application owns its Cargo build, dependencies and terminal interface. The canonical
 event contract, adapters and FileSink remain in `gh_puller/agent/`; JSONL is their boundary
@@ -37,9 +37,12 @@ Missing files and directories are awaited. Overlapping sources and file symlinks
 coalesced by normalized path; each file has one reader and one persistent reading view.
 A file error stops only that reader and remains visible in its footer and the session list.
 
-Every launch starts with one pane and multiple tabs. Layout is not saved. Newly discovered
-files join the current pane as background tabs without changing the active file. Closing a
-tab hides its view while monitoring continues. `Ctrl-W f` lists every monitored file,
+One explicit file without `--watch` opens the file view across the whole terminal, without
+tabs, docking, or workspace commands. File shortcuts, search, copying and help still work.
+Multiple files or any `--watch` source start the workspace with one pane and multiple tabs.
+This startup choice remains fixed when tabs close or files appear. Layout is not saved.
+Newly discovered files join the current pane as background tabs without changing the active
+file. Closing a tab hides its view while monitoring continues. `Ctrl-W o` lists every monitored file,
 including hidden ones; type to filter and press Enter to open or move that file here.
 After all tabs close, the session list stays open and monitoring continues. Sources cannot
 be added from inside the workspace.
@@ -59,9 +62,11 @@ Esc cancels the prefix. These keys also work while a file popup is open.
 | `H/J/K/L` or Shift+arrow | Move the current tab in that direction; create a split if needed |
 | `c` | Close the current tab; keep consuming that file |
 | `z` | Maximize / restore the focused pane |
-| `f` | List monitored sessions, including hidden tabs |
+| `o` | Open a monitored file, including a closed tab |
 | `r` | Resize mode: arrows move a divider; Enter or Esc finishes |
 
+Click the active tab's `▾` to open or close the monitored session list. Click a tab title
+to select it; blank tab-bar space only focuses the pane.
 Drag a tab along a tab bar to reorder it, or onto another tab bar to move that one tab.
 Drop in the center of another pane to merge the entire source tab group. Drop at a pane's
 left, right, top or bottom edge to split. The outlined preview shows the destination;
@@ -71,6 +76,9 @@ tabs capture their own drags so crossing a pane boundary cannot manipulate anoth
 
 Each file retains its fold choices, search, scroll, selection and follow state as it moves
 or hides. Every visible pane has its own file footer; statistics are never combined.
+The white heading shows the first user prompt on one line, truncated to the pane width.
+It remains unchanged by later queries or context replacements; an empty session waits
+for its first query. A gray file path follows, keeping its trailing components when truncated.
 If any pane would be smaller than 32 columns or 8 rows, only the focused pane is displayed
 until there is room again. This does not modify the split tree or its ratios. `Ctrl-W`
 directional focus still works in this temporary view and while maximized.

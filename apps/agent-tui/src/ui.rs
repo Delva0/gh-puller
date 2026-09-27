@@ -1540,20 +1540,42 @@ impl App {
             self.dirty = false;
             return;
         }
+        let mut title = Line::raw(format!(
+            " {}",
+            if self.summary.title.is_empty() {
+                "Waiting for first query".into()
+            } else {
+                document::safe(&self.summary.title)
+            }
+        ));
+        let mut path = Line::raw(document::safe(&self.path).replace('\n', " "));
+        let width = area.width as usize;
+        let title_width = width - path.width().min(width / 2) - 1;
+        if title.width() > title_width {
+            title = document::clip(&title, 0, title_width.saturating_sub(1));
+            title.spans.push(Span::raw("…"));
+        }
+        let path_x = title.width() + 1;
+        let path_width = width - path_x;
+        if path.width() > path_width {
+            path = document::clip(
+                &path,
+                path.width() - path_width + 1,
+                path_width.saturating_sub(1),
+            );
+            path.spans.insert(0, Span::raw("…"));
+        }
         frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled(
-                    format!(" {} ", document::safe(&self.summary.title)),
-                    Style::default()
-                        .fg(Color::White)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    document::safe(&self.path),
-                    Style::default().fg(Color::DarkGray),
-                ),
-            ])),
+            Paragraph::new(title).style(
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Rect::new(area.x, area.y, area.width, 1),
+        );
+        frame.render_widget(
+            Paragraph::new(path).style(Style::default().fg(Color::DarkGray)),
+            Rect::new(area.x + path_x as u16, area.y, path_width as u16, 1),
         );
         frame.render_widget(
             Paragraph::new("─".repeat(area.width as usize))
@@ -2239,6 +2261,13 @@ impl App {
                     self.quit = true;
                     return;
                 }
+                if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('p') {
+                    self.panel = Some(Panel::Commands);
+                    self.input.clear();
+                    self.panel_scroll = 0;
+                    self.menu_index = 0;
+                    return;
+                }
                 if self.panel.is_some() {
                     match key.code {
                         KeyCode::Esc => self.panel = None,
@@ -2332,10 +2361,6 @@ impl App {
                         self.input.clear();
                     }
                     KeyCode::Char(':') => {
-                        self.panel = Some(Panel::Commands);
-                        self.input.clear();
-                    }
-                    KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         self.panel = Some(Panel::Commands);
                         self.input.clear();
                     }

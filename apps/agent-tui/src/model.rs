@@ -349,7 +349,6 @@ impl Model {
             identities: vec![],
             stats: Stats::new(),
             summary: Summary {
-                title: "Agent".into(),
                 status: "Waiting for file".into(),
                 ..Summary::default()
             },
@@ -536,6 +535,12 @@ impl Model {
                 c.token_source = source.join("\n\n");
             }
         }
+        if kind == Kind::User && self.summary.title.is_empty() {
+            self.summary.title = c.text.split_whitespace().collect::<Vec<_>>().join(" ");
+            if self.summary.title.is_empty() {
+                self.summary.title = "Untitled query".into();
+            }
+        }
         self.put(c);
         id
     }
@@ -642,11 +647,6 @@ impl Model {
         self.summary.last_ms = at;
         self.stats.apply(kind, d, at);
         match kind {
-            "session/start" => {
-                if let Some(label) = d["label"].as_str() {
-                    self.summary.title = label.into();
-                }
-            }
             "agent/set" => self.agent = json!({"agent": d["agent"], "config": d["config"]}),
             "context/set" => {
                 self.replace(d["items"].as_array().map(Vec::as_slice).unwrap_or_default())

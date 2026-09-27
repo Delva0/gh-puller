@@ -63,8 +63,8 @@ gives CBM a self-consistent repository snapshot. The Git changeset currently con
 per-parent changed-file provenance; it is not part of the indexing request sent to CBM.
 
 The default transport starts one persistent native index helper and sends every commit to it
-in sequence. MCP provides another persistent frontend, while `cli` starts one process per
-call. All routes receive the same indexing arguments: the source-tree path, project,
+in sequence. MCP and `cli` each start one daemon-backed client process per call. All routes
+receive the same indexing arguments: the source-tree path, project,
 graph-content mode, `force_full`, and each delta control. The builder reads CBM's atomically
 published SQLite generation from its cache.
 
@@ -76,7 +76,7 @@ Sources: [gh_puller/codebase/build.py](../gh_puller/codebase/build.py); [gh_pull
 | --- | --- | --- |
 | Graph content | `mode` | Controls file filtering and whether derived content such as similarity and semantic data participates in the graph |
 | Update route | `force_full` and delta controls | Selects full, no-op, closure-repair, or conservative fallback behavior for the current generation |
-| Process lifetime | `cbm_transport` | Selects a persistent native helper, pooled MCP frontend, or one-shot CLI process without changing the intended graph semantics |
+| Process lifetime | `cbm_transport` | Selects a persistent native helper or a one-shot daemon-backed MCP/CLI client without changing the intended graph semantics |
 
 The default `--mode full` therefore does not mean "force a full build for every commit."
 Only `--force-full` asks CBM to bypass no-op and delta routing. The builder checks

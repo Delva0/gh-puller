@@ -29,8 +29,7 @@ log = partial(_utils_log, prefix="deepwiki")
 
 
 def resolve_generator(generator: str | None = None,
-                      generator_config: dict | None = None,
-                      get_env=None) -> tuple[str, dict]:
+                      generator_config: dict | None = None) -> tuple[str, dict]:
     """Resolve a generator selection without interpreting its configuration.
 
     Args:
@@ -38,7 +37,6 @@ def resolve_generator(generator: str | None = None,
             default.
         generator_config: Configuration to copy with keys, paths, and defaults
             unchanged.
-        get_env: Reserved compatibility hook; ignored.
 
     Returns:
         The resolved adapter identifier and copied configuration.
@@ -84,8 +82,7 @@ def repo_key_of(repo_type: str, owner: str, repo: str) -> str:
 
 
 def generator_digest(generator: str | None = None,
-                     generator_config: dict | None = None,
-                     get_env=None) -> str:
+                     generator_config: dict | None = None) -> str:
     """Build the stable short digest used to isolate selection state.
 
     Args:
@@ -93,12 +90,11 @@ def generator_digest(generator: str | None = None,
             defaults.
         generator_config: Credential-free selection configuration; see the module
             contract.
-        get_env: Reserved compatibility hook forwarded to selection resolution.
 
     Returns:
         An eight-character hexadecimal fingerprint.
     """
-    generator_id, resolved = resolve_generator(generator, generator_config, get_env)
+    generator_id, resolved = resolve_generator(generator, generator_config)
     return _generator_digest_of(generator_id, resolved)
 
 

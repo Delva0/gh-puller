@@ -4,6 +4,8 @@
 `/gh-puller/graph` 单端点，并只暴露 `search_graph`、
 `search_code`、`trace_path`、`query_graph`、`get_architecture`、`detect_changes`。
 
+本目录是独立 Python 项目，使用自身的 `pyproject.toml` 和 `uv.lock`；以下命令均从本目录运行。
+
 本文件是该组件对接契约、生产快照布局和运维步骤的维护入口。`archive/` 只保留原始材料，
 不作为当前配置依据；生产约定变化时更新本文件。
 
@@ -104,6 +106,79 @@ find /home/xxx/snapshots-vllm \
 版本，且对应的内层源码目录必须存在；无关目录也会使注册表构建失败。vLLM 与 vLLM Ascend
 各自选择版本，不推断两者的配套关系。
 
+## 本机拉取与一次性更新
+
+在 Linux 主机安装 Git、uv 和 `codebase-memory-mcp` 后，运行本项目的
+[更新脚本](scripts/update-vllm-snapshots.sh)：
+
+```bash
+./scripts/update-vllm-snapshots.sh --dry-run
+./scripts/update-vllm-snapshots.sh
+```
+
+脚本按自身位置定位本项目并使用其独立环境，项目目录可以单独复制部署。它直接调用本机
+CBM CLI，复用 adapter 的预构建和绑定审计，无需先启动 HTTP 服务。
+每次通过 `git ls-remote --tags` 读取两个远端仓库的完整版本列表，处理所有能按 PEP 440
+归一化的版本 tag（包括 RC），忽略非版本 tag。本地没有的版本逐一拉取并预构建；已有版本
+则比较 commit，变化时更新并重建。README 上面的生产目录清单不参与版本筛选；即使本地已有
+最高版本，仍会补上远端列表中其他缺失版本，也不会漏掉两次运行之间新增的多个 tag。
+默认在当前用户家目录创建上面的两种布局，源码使用 `--depth=1` 的独立 Git checkout，
+不安装 vLLM 或下载模型。完成后输出
+`update complete: built=... skipped=... removed=...` 并退出，以后更新仍执行同一条命令。
+
+两个仓库可以独立指定起始版本，包含起始版本本身。例如只保留并构建 vLLM `0.30.0` 及以后、
+Ascend `0.26.0rc1` 及以后的版本：
+
+```bash
+./scripts/update-vllm-snapshots.sh \
+  --vllm-from-version 0.30.0 \
+  --vllm-ascend-from-version 0.26.0rc1
+```
+
+指定下限时，脚本先通过 CBM `delete_project` 删除该仓库更旧的索引，再清理对应的缓存残留和
+源码版本目录，包括源码已不存在的旧索引。仅处理本脚本的 `vllm-kb-<repo>-<version>` 索引及
+上述固定布局中的版本目录。版本按 PEP 440 比较，因此正式版下限会排除同版本的 RC。
+某个仓库不传下限时，仍处理其完整版本列表，也不清理其旧版本。参数不保存，后续更新需要继续
+带上相同下限；省略后会重新补齐远端列表中的缺失版本。下限筛选结果为空时会报错，清理不会开始。
+可先在命令末尾加 `--dry-run` 查看将要删除、保留和拉取的版本。
+
+tag 不随分支的新 commit 自动前进，但维护者可以强制重打；脚本比较 annotated tag 解引用
+后的 commit，只有 tag 注解变化而源码 commit 相同时无需重建。
+每个外层版本目录中的 `.vllm-kb-build.json` 仅在构建和绑定审计成功后写入，记录 tag、commit、
+源码路径、缓存路径、构建模式和 CBM 版本。只有源码 commit 和成功记录均匹配、实际缓存目录中的
+`<index-name>.db` 文件存在、且 CBM `list_projects` 返回正确源码绑定时，才跳过构建。
+DB 或成功记录缺失、tag 指向新 commit、构建配置变化都会触发重建；构建失败可重跑。
+保留范围内的远端 tag 消失会报错；遇到本地修改、非 Git 快照或错误的索引路径绑定也会停止，
+需要先处理冲突再运行。快照根目录和缓存目录的文件锁阻止脚本重复并发执行。
+
+源码与索引分别占用空间：CBM 默认写入 `~/.cache/codebase-memory-mcp/`，也读取
+`CBM_CACHE_DIR` 或脚本的 `--cache-dir`。运行中的 gh-puller-mcp 必须使用相同用户和缓存目录。
+脚本在拉取和构建前检查两个源码根目录及实际缓存盘，默认各要求至少 10 GiB 可用空间、
+系统至少 10 GiB 可用内存，并逐个构建。等待 CBM 时每秒复查资源，磁盘或可用内存降到
+2 GiB 以下便终止当前 CLI 请求、报错退出，保留未完成状态供下次重试；若显式配置更低的启动
+门槛，运行中沿用较低值。这是采样保护，不能替代操作系统级内存或磁盘配额。
+默认向 CBM 传递 `CBM_MEM_BUDGET_MB=4096` 和 `CBM_WORKERS=2`。这些设置只对继承该环境
+的进程生效；已有共享 daemon 启动的 worker 可能沿用 daemon 的配置。预算也不是 RSS 硬上限，
+因此仍需检查系统余量，不能据此认定大仓只占用 4 GiB。需要固定 worker 配置时，应在启动
+CBM 服务前设置这些环境变量，或使用独立的 `--cache-dir` 并让后续查询服务指向同一目录。
+指定起始版本可以回收更旧快照及索引的空间；保留范围内的新增版本仍需预留磁盘空间。
+
+资源门槛及路径可以按主机调整，例如：
+
+```bash
+./scripts/update-vllm-snapshots.sh \
+  --vllm-root "$HOME/snapshots-vllm" \
+  --vllm-ascend-root "$HOME/snapshots-vllm-ascend" \
+  --cache-dir "$HOME/.cache/codebase-memory-mcp" \
+  --min-free-disk-gib 20 --min-available-memory-gib 12 \
+  --cbm-memory-mb 4096 --workers 2
+```
+
+`--dry-run` 列出版本范围内的处理计划、范围外的清理计划及缺失、commit 变化的版本数量，
+不创建或删除文件，不调用 CBM；实际索引状态及绑定在正式运行时检查。
+成功新增版本后，重新启动 adapter，使启动时注册表加载新版本；更新期间应暂停向这些快照发起查询，
+因为源码 checkout 与图索引不是一起原子切换的。脚本没有轮询或定时任务，已有 CBM 服务由其自身管理。
+
 ## 版本与 qn 路由契约
 
 所有公开工具都接受可选 `version`。显式版本必须命中快照，可带前导 `v`；省略或传空值时，
@@ -141,11 +216,11 @@ trace_path.function_name starts with selected snapshot.index_name + "."
 
 ## 部署
 
-以下命令均从 gh-puller 仓库根目录运行。先以默认 `all` 工具档位启动 gh-puller-mcp；
-`prebuild` 需要 `list_projects` 和 `index_repository`：
+gh-puller-mcp 是单独部署的上游服务，需要启用默认 `all` 工具档位；
+`prebuild` 需要 `list_projects` 和 `index_repository`。若两个项目目录相邻，可在另一个终端启动上游：
 
 ```bash
-uv --directory apps/gh-puller-mcp run python -m gh_puller_mcp \
+uv --directory ../gh-puller-mcp run python -m gh_puller_mcp \
   --http --host 127.0.0.1 --port 8788 --path /mcp
 ```
 
@@ -157,20 +232,20 @@ curl -fsS http://127.0.0.1:8788/mcp \
   -H 'Accept: application/json' \
   -H 'Content-Type: application/json' \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' \
-  | uv --directory apps/vllm-kb-adapter run python -m json.tool
+  | uv run python -m json.tool
 ```
 
 发布时优先构建全部 vLLM 与 vLLM Ascend 快照；已正确绑定的索引会跳过：
 
 ```bash
-uv --directory apps/vllm-kb-adapter run vllm-kb-adapter prebuild
+uv run vllm-kb-adapter prebuild
 ```
 
 随后启动适配层。若预构建仍有缺失，启动审计会保留这些版本供在线兜底；已存在但路径错绑的
 索引仍会阻止启动：
 
 ```bash
-uv --directory apps/vllm-kb-adapter run vllm-kb-adapter serve \
+uv run vllm-kb-adapter serve \
   --host 0.0.0.0 --port 8787
 ```
 
@@ -181,13 +256,13 @@ curl -fsS http://127.0.0.1:8787/gh-puller/graph \
   -H 'Accept: application/json' \
   -H 'Content-Type: application/json' \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' \
-  | uv --directory apps/vllm-kb-adapter run python -m json.tool
+  | uv run python -m json.tool
 ```
 
 若 gh-puller-mcp 地址或快照根目录不同，公共选项需放在子命令之前：
 
 ```bash
-uv --directory apps/vllm-kb-adapter run vllm-kb-adapter \
+uv run vllm-kb-adapter \
   --upstream-url http://127.0.0.1:8788/mcp \
   --vllm-root /srv/snapshots-vllm \
   --vllm-ascend-root /srv/snapshots-vllm-ascend \
@@ -281,9 +356,10 @@ vllm-kb 配置指向适配层，而不是内部 gh-puller-mcp：
 ## 验证
 
 ```bash
-uv --directory apps/vllm-kb-adapter run ruff check .
-uv --directory apps/vllm-kb-adapter run pytest -q
-uv --directory apps/gh-puller-mcp run pytest -q tests/test_backend.py
+uv run ruff check .
+uv run pytest -q
 ```
+
+修改上游传输层时，在 gh-puller-mcp 项目目录另行运行 `uv run pytest -q tests/test_backend.py`。
 
 [vllm-kb-checklist]: https://github.com/Mitchellax/vllm-kb/blob/main/docs/gh-puller-integration-checklist.md

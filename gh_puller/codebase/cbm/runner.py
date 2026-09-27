@@ -146,7 +146,7 @@ class CBMRunner:
             timeout: Maximum seconds for one CBM request.
             memory_limit: Aggregate runner and child RSS ceiling; omission reserves
                 one GiB for the host.
-            transport: Native SDK, pooled MCP, or one-process-per-call CLI index path.
+            transport: Native SDK or one-process-per-call MCP/CLI index path.
             native_index_helper: Explicit full SDK helper for the native index path.
         """
         self.binary = binary

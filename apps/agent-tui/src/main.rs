@@ -3,7 +3,7 @@ use agent_tui::{
     cli::Observation,
     hyperlinks,
     model::{Event as AgentEvent, Model},
-    session::Sessions,
+    observer::Observer,
     ui::App,
     workspace::Workspace,
 };
@@ -126,8 +126,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let options = Observation::parse(std::iter::once(first).chain(args))?;
     let mut trace = options.trace.map(File::create).transpose()?;
-    let mut sessions = Sessions::new(options.sources);
-    let mut app = Workspace::new();
+    let mut app = Observer::new(options.sources)?;
     let mut links = hyperlinks::Writer::default();
     let mut terminal = ratatui::init();
     execute!(io::stdout(), EnableMouseCapture)?;
@@ -141,7 +140,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut last_frame = Instant::now() - Duration::from_secs(1);
         let mut first_input: Option<Instant> = None;
         let mut input_count = 0;
-        while !app.quit {
+        while !app.quit() {
             // Service input before draining worker results; neither parser can hold this thread.
             for _ in 0..64 {
                 if !event::poll(Duration::ZERO)? {
@@ -153,9 +152,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 input_count += 1;
                 app.handle(event);
             }
-            sessions.poll(&mut app);
-            app.poll_layout();
-            if app.dirty && last_frame.elapsed() >= Duration::from_micros(16667) {
+            app.poll();
+            if app.dirty() && last_frame.elapsed() >= Duration::from_micros(16667) {
                 let frame = terminal.draw(|f| app.render(f))?;
                 links.write(frame.buffer, &app.hyperlinks(), &mut io::stdout())?;
                 last_frame = Instant::now();
@@ -171,7 +169,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     input_count = 0;
                 }
             }
-            let wait = if app.dirty {
+            let wait = if app.dirty() {
                 Duration::from_millis(2)
             } else {
                 Duration::from_millis(8)
@@ -181,7 +179,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Ok(())
     })();
-    drop(sessions);
+    drop(app);
     let _ = execute!(io::stdout(), DisableMouseCapture);
     ratatui::restore();
     result?;
@@ -216,6 +214,6 @@ fn color(color: ratatui::style::Color) -> String {
 }
 fn help() {
     println!(
-        "agent-tui FILE [FILE ...] [--watch DIR ...]\nagent-tui --watch DIR\n\nRead-only multi-file observer. Ctrl-W: h/j/k/l focus, n/p tabs, v/s split, H/J/K/L move, c close, z maximize, f sessions, r resize. Esc cancels.\n Missing sources are awaited; --watch scans recursively each second without directory symlinks. Each session/end freezes only that file. Quitting never stops agents.\n? help · / search · : commands · s stats · End follow · q quit\n\nOffline: --fold FILE | --prefixes FILE | --inspect FILE\nSnapshot: --snapshot FILE cells.json (120×42 Ratatui TestBackend)\nWorkspace snapshot: --workspace-snapshot cells.json FILE... (160×54, up to four panes)\nMeasurement: agent-tui FILE --trace-input trace.jsonl"
+        "agent-tui FILE [FILE ...] [--watch DIR ...]\nagent-tui --watch DIR\n\nRead-only observer. One FILE opens directly; multiple files or --watch enable the workspace.\nWorkspace Ctrl-W: h/j/k/l focus, n/p tabs, v/s split, H/J/K/L move, c close, z maximize, o open, r resize. Esc cancels.\n Missing sources are awaited; --watch scans recursively each second without directory symlinks. Each session/end freezes only that file. Quitting never stops agents.\n? help · / search · : commands · s stats · End follow · q quit\n\nOffline: --fold FILE | --prefixes FILE | --inspect FILE\nSnapshot: --snapshot FILE cells.json (120×42 Ratatui TestBackend)\nWorkspace snapshot: --workspace-snapshot cells.json FILE... (160×54, up to four panes)\nMeasurement: agent-tui FILE --trace-input trace.jsonl"
     );
 }

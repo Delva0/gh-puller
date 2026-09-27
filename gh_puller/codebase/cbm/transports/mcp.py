@@ -1,8 +1,7 @@
-"""Implement the pooled MCP frontend transport for the CBM client.
+"""Implement the one-process-per-call MCP transport for the CBM client.
 
-Each child process is an independent thin MCP frontend. The pool starts lazily,
-reuses frontends bound to the same source root, and expands only when concurrent
-calls or distinct roots require it.
+Each operation uses an independent thin MCP frontend connected to CBM's shared
+daemon. Frontend process lifetime remains request-scoped like the CLI transport.
 """
 
 from __future__ import annotations
@@ -31,7 +30,6 @@ if TYPE_CHECKING:
     from ..binary import CBMBinary
 
 _STREAM_CLOSED = object()
-_MAX_FRONTENDS = 8
 
 
 def capabilities_from_tools_list(result: object) -> frozenset[str]:
@@ -77,7 +75,6 @@ class _MCPFrontend:
     ):
         self.timeout = timeout
         self.monitor = monitor
-        self.source_root = source_root
         self._next_id = 0
         self._messages: queue.Queue[object] = queue.Queue()
         self._pending: dict[int, dict] = {}
@@ -124,10 +121,6 @@ class _MCPFrontend:
         except BaseException:
             self._terminate()
             raise
-
-    @property
-    def closed(self) -> bool:
-        return self._closed
 
     def _stderr_text(self) -> str:
         return "".join(self._stderr_tail)[-4000:]
@@ -285,7 +278,7 @@ class _MCPFrontend:
 
 
 class MCPTransport(_ProjectTransport):
-    """Pool MCP frontends behind one transport contract."""
+    """Launch an independent initialized MCP frontend for every operation."""
 
     name = "mcp"
 
@@ -296,22 +289,12 @@ class MCPTransport(_ProjectTransport):
         timeout: float,
         monitor: ResourceMonitorLike,
         environment: Mapping[str, str],
-        *,
-        max_frontends: int = _MAX_FRONTENDS,
     ):
         super().__init__(binary)
-        if max_frontends < 1:
-            raise ValueError("max_frontends must be positive")
         self.cache_root = cache_root
         self.timeout = timeout
         self.monitor = monitor
         self.environment = dict(environment)
-        self.max_frontends = max_frontends
-        self._condition = threading.Condition()
-        self._frontends: set[_MCPFrontend] = set()
-        self._idle: list[_MCPFrontend] = []
-        self._creating = 0
-        self._closed = False
         self._tools_lock = threading.Lock()
         self._tools: tuple[dict[str, Any], ...] | None = None
 
@@ -325,62 +308,12 @@ class MCPTransport(_ProjectTransport):
             source_root,
         )
 
-    def _acquire(self, source_root: Path | None) -> _MCPFrontend:
-        deadline = time.monotonic() + self.timeout
-        while True:
-            retired = None
-            with self._condition:
-                if self._closed:
-                    raise CBMTransportError("CBM MCP transport is closed")
-                for index in range(len(self._idle) - 1, -1, -1):
-                    if self._idle[index].source_root == source_root:
-                        return self._idle.pop(index)
-                if len(self._frontends) + self._creating < self.max_frontends:
-                    self._creating += 1
-                    break
-                if self._idle:
-                    retired = self._idle.pop()
-                    self._frontends.remove(retired)
-                else:
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        raise CBMTransportError("timed out waiting for a CBM MCP frontend")
-                    self._condition.wait(remaining)
-            if retired is not None:
-                retired.close()
-        try:
-            frontend = self._new_frontend(source_root)
-        except BaseException:
-            with self._condition:
-                self._creating -= 1
-                self._condition.notify()
-            raise
-        with self._condition:
-            self._creating -= 1
-            if self._closed:
-                frontend.close()
-                raise CBMTransportError("CBM MCP transport is closed")
-            self._frontends.add(frontend)
-            return frontend
-
-    def _release(self, frontend: _MCPFrontend) -> None:
-        with self._condition:
-            if self._closed or frontend.closed:
-                self._frontends.discard(frontend)
-                close = not frontend.closed
-            else:
-                self._idle.append(frontend)
-                close = False
-            self._condition.notify()
-        if close:
-            frontend.close()
-
     def _use(self, operation, source_root: Path | None = None):
-        frontend = self._acquire(source_root)
+        frontend = self._new_frontend(source_root)
         try:
             return operation(frontend)
         finally:
-            self._release(frontend)
+            frontend.close()
 
     def _call_tool(
         self,
@@ -411,21 +344,5 @@ class MCPTransport(_ProjectTransport):
         """Return index capabilities advertised by one live frontend."""
         return capabilities_from_tools_list({"tools": list(self._tool_definitions())})
 
-    @property
-    def frontend_pids(self) -> frozenset[int]:
-        """Return frontend process IDs for diagnostics and tests."""
-        with self._condition:
-            return frozenset(frontend.process.pid for frontend in self._frontends)
-
     def close(self) -> None:
-        """Close every frontend owned by this transport."""
-        with self._condition:
-            if self._closed:
-                return
-            self._closed = True
-            frontends = tuple(self._frontends)
-            self._frontends.clear()
-            self._idle.clear()
-            self._condition.notify_all()
-        for frontend in frontends:
-            frontend.close()
+        """Release no resources because every frontend is request-scoped."""

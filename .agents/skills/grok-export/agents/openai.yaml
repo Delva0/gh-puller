@@ -1,0 +1,4 @@
+interface:
+  display_name: "Grok Export"
+  short_description: "Export complete Grok agent context to one Markdown file"
+  default_prompt: "Use $grok-export to archive this Grok share in one Markdown file with every exposed message, thinking step, tool call, result, and metadata field."
