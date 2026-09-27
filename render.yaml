@@ -1,0 +1,22 @@
+# yaml-language-server: $schema=https://render.com/schema/render.yaml.json
+services:
+  - type: web
+    name: agent-chat
+    runtime: docker
+    plan: free
+    region: singapore
+    repo: https://github.com/Delva0/gh-puller
+    branch: agent-chat
+    dockerfilePath: ./apps/agent-chat/Dockerfile
+    dockerContext: .
+    healthCheckPath: /api/health
+    autoDeployTrigger: "off"
+    numInstances: 1
+    maxShutdownDelaySeconds: 30
+    envVars:
+      - key: CHAT_ACCESS_PASSWORD
+        sync: false
+      - key: CHAT_SECURE_COOKIE
+        value: "true"
+      - key: PORT
+        value: "10000"

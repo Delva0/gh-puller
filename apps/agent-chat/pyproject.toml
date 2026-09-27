@@ -1,0 +1,33 @@
+[project]
+name = "gh-puller-agent-chat"
+version = "0.1.0"
+description = "Private browser conversations with gh-puller search agents"
+requires-python = ">=3.13"
+dependencies = ["fastapi>=0.139.0", "uvicorn>=0.51.0", "gh-puller[search]"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["agent_chat*"]
+
+[tool.uv.sources]
+gh-puller = { path = "../..", editable = true }
+
+[[tool.uv.index]]
+url = "https://pypi.org/simple"
+default = true
+
+[dependency-groups]
+dev = ["pytest>=9.1.1", "pytest-asyncio>=1.4.0", "ruff>=0.15"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+extend = "../../pyproject.toml"
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "S106", "S108", "INP001", "D100", "D104"]
