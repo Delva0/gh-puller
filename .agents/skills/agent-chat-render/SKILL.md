@@ -61,4 +61,5 @@ uv run --no-project python .agents/skills/agent-chat-render/scripts/check_deploy
 详细用法、凭据来源和费用边界见 [持续交付](references/delivery.md#真实公网验收)。
 
 修改技能时运行 `skill-creator` 的 `quick_validate.py`，并实测有变化的辅助脚本。
-验收记录维护在主仓 `apps/agent-chat/VERIFICATION.md`；不要把该技能写成不断追加的逐次运行日志。
+逐次验收证据保存在应用已忽略的 `verification/`；交付结果在回复或提交说明中报告。
+技能只保留可复用经验，不维护逐次运行日志。

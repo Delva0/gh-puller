@@ -94,7 +94,7 @@ uv run --project apps/agent-chat --frozen python \
 
 验收出口：逐项阅读答案、工具结果与失败记录，保存实际请求参数、源码 SHA 和数据来源。
 脚本 exit 0 不表示每次工具调用都成功；工具失败次数和最终问题是否解决分别记录。
-更新 `apps/agent-chat/VERIFICATION.md`，附公网 URL、部署提交、测试结果及剩余限制。
+交付时报告公网 URL、部署提交、测试结果及剩余限制，证据留在已忽略的 `verification/`。
 文档提交可以单独推送；它不会自动证明线上已运行该文档提交。
 
 参考：[Render 部署与回滚](https://render.com/docs/deploys)、[应用说明](../../../../apps/agent-chat/README.md)。

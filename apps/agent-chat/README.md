@@ -151,7 +151,7 @@ npm test
 测试报告与截图保存在 `web/playwright-report/` 和 `web/test-results/`，不会提交。
 
 公网验收必须另行在真实 HTTPS 服务上执行 GitHub、GitCode、Web 的真实查询，并检查刷新、停止、事件导出和内存。
-自动模拟测试通过不代表公网验收完成。实际交付状态记录于 [VERIFICATION.md](VERIFICATION.md)。
+自动模拟测试通过不代表公网验收完成。
 
 真实浏览器验收脚本是 `web/scripts/live-acceptance.mjs`。在进程环境中提供 `CHAT_TEST_URL`、
 `CHAT_ACCESS_PASSWORD`、`OPENAI_API_KEY`、`GH_TOKEN`、`GITCODE_TOKEN`、`BRAVE_SEARCH_API_KEY`，

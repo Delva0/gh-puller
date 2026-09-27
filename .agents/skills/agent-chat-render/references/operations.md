@@ -72,5 +72,4 @@
 运维结论引用具体部署、UTC 时间窗、事件文件与行号或平台指标。
 验证中断、日志接口不可用、未知费用和未验证的冷启动条件都保留为限制，不将模拟结果写成公网结果。
 
-参考：[免费服务限制](https://render.com/docs/free)、[Render 部署](https://render.com/docs/deploys)、
-[应用验证记录](../../../../apps/agent-chat/VERIFICATION.md)。
+参考：[免费服务限制](https://render.com/docs/free)、[Render 部署](https://render.com/docs/deploys)。
