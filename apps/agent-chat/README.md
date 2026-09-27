@@ -29,8 +29,9 @@ Python 依赖锁在 `uv.lock`，前端依赖锁在 `web/package-lock.json`。本
 
 ## 使用与数据生命周期
 
-- 新会话默认 GitHub / DSL，第一条问题生成简短标题。第一次提交后 agent 和工具配置固定，模型配置和密钥仍可更新。
-- GitHub 支持 DSL、REST、GraphQL、Split；GitCode 支持 DSL、REST；Web 提供搜索和下载。
+- 新会话默认 GitHub / REST，切换到 GitCode 也默认 REST；第一条问题生成简短标题。
+  第一次提交后 agent 和工具配置固定，模型配置和密钥仍可更新。
+- GitHub 支持 REST、DSL、GraphQL、Split；GitCode 支持 REST、DSL；Web 提供搜索和下载。
   PTC A/B 需要服务端 Node；Code 需要显式配置 Docker 容器连接，免费部署中显示为不可用。
 - 设置默认沿用实验的模型地址与 `deepseek-v4.1-flash`，最大步数 32、工具并发 8。
   Brave 需要密钥，也可选择 Auto / DuckDuckGo。模型供应商须支持所选 thinking / reasoning 参数。
@@ -102,6 +103,7 @@ Dockerfile 是 `apps/agent-chat/Dockerfile`，健康检查 `/api/health`，自�
 
 当前公网地址：[循迹 Agent Chat](https://agent-chat-pdl4.onrender.com)。
 服务管理页：[Render Dashboard](https://dashboard.render.com/web/srv-dasjnn8473hc738kgnk0)。
+可复用的部署、持续交付和运维流程见 [agent-chat-render 技能](../../.agents/skills/agent-chat-render/SKILL.md)。
 
 1. 将验证过的应用提交推送到 `agent-chat` 分支。
 2. 在 Render 的 **My Workspace → New → Blueprint** 连接 `Delva0/gh-puller`，选择 `agent-chat` 分支和根目录 `render.yaml`。

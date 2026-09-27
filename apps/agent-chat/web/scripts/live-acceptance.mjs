@@ -50,6 +50,7 @@ try {
     if (agent !== 'github') await page.locator('.new-chat').click();
     await page.getByLabel('选择 agent').selectOption(agent);
     await page.getByRole('button', { name: '打开设置' }).click();
+    if (agent !== 'web') await expect(page.getByLabel('查询后端')).toHaveValue('rest');
     await page.getByLabel('模型 API Key').fill(key);
     if (process.env.OPENAI_BASE_URL) await page.getByLabel('模型地址').fill(process.env.OPENAI_BASE_URL);
     if (process.env.CHAT_TEST_MODEL) await page.getByLabel('模型名', { exact: true }).fill(process.env.CHAT_TEST_MODEL);
@@ -71,7 +72,8 @@ try {
     const toolStarts = record.events.filter(event => event.type === 'tool/start');
     const toolEnds = record.events.filter(event => event.type === 'tool/end');
     assert.equal(end.type, 'query/end');
-    const summary = { agent, prompt, status: end.data.status, error: end.data.error, duration_ms: end.data.duration_ms,
+    const summary = { agent, backend: record.session.settings.backend, prompt,
+      status: end.data.status, error: end.data.error, duration_ms: end.data.duration_ms,
       models: record.events.filter(event => event.type === 'model/request').length,
       tools: toolStarts.map(event => event.data.name),
       failures: toolEnds.filter(event => 'error' in event.data).length, answer: end.data.answer };

@@ -29,7 +29,7 @@ class PublicSettings(BaseModel):
 
     base_url: str = Field(default=DEFAULT_BASE_URL, max_length=2048)
     model: str = Field(default="deepseek-v4.1-flash", min_length=1, max_length=200)
-    backend: str = "dsl"
+    backend: str = "rest"
     ptc: Literal["off", "A", "B"] = "off"
     max_steps: int = Field(default=32, ge=1, le=128)
     concurrency: int = Field(default=8, ge=1, le=16)
@@ -107,9 +107,9 @@ def catalog(server: ServerSettings):
     code = bool(server.code_container and shutil.which("docker"))
     return [
         {"id": "github", "name": "GitHub", "available": True, "reason": "",
-         "backends": ["dsl", "rest", "graphql", "split"], "ptc": node, "web": True},
+         "backends": ["rest", "dsl", "graphql", "split"], "ptc": node, "web": True},
         {"id": "gitcode", "name": "GitCode", "available": True, "reason": "",
-         "backends": ["dsl", "rest"], "ptc": node, "web": True},
+         "backends": ["rest", "dsl"], "ptc": node, "web": True},
         {"id": "code", "name": "Code", "available": code,
          "reason": "" if code else "当前服务未配置 Docker 容器连接",
          "backends": [], "ptc": False, "web": False},

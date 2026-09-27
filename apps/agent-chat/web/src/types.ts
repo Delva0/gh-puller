@@ -16,7 +16,7 @@ export type Settings = z.infer<typeof settingsSchema>;
 export type Credentials = { api_key: string; github_token: string; gitcode_token: string; brave_api_key: string };
 export const emptyCredentials: Credentials = { api_key: '', github_token: '', gitcode_token: '', brave_api_key: '' };
 export const fallbackSettings: Settings = {
-  base_url: '', model: 'deepseek-v4.1-flash', backend: 'dsl', ptc: 'off', max_steps: 32,
+  base_url: '', model: 'deepseek-v4.1-flash', backend: 'rest', ptc: 'off', max_steps: 32,
   concurrency: 8, reasoning_effort: 'high', thinking: true, max_tokens: 8192,
   web_search_backend: 'brave', web_search_concurrency: 1, web_search_interval: 2, multimodal: true,
 };
@@ -42,8 +42,7 @@ export interface Capability {
 export interface Catalog { agents: Capability[]; defaults: Settings; revision: string; idle_minutes: number }
 
 export function settingsFor(agent: Agent, settings: Settings): Settings {
-  return { ...settings, backend: agent === 'web' || agent === 'code' ? '' :
-    ['dsl', 'rest'].includes(settings.backend) ? settings.backend : 'dsl',
+  return { ...settings, backend: agent === 'web' || agent === 'code' ? '' : 'rest',
   ptc: agent === 'web' || agent === 'code' ? 'off' : settings.ptc };
 }
 

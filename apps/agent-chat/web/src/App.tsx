@@ -76,7 +76,7 @@ export default function App() {
 
   function newChat(settings = preferences) {
     const chat: Conversation = { id: crypto.randomUUID(), title: '新会话', created: new Date().toISOString(),
-      agent: 'github', settings: { ...settingsFor('github', settings), backend: 'dsl' }, events: [], readonly: false };
+      agent: 'github', settings: settingsFor('github', settings), events: [], readonly: false };
     commit([...chatsRef.current, chat]); setActiveId(chat.id); setDraft(''); setNotice('');
     follow.current = true; setAtBottom(true);
     if (window.innerWidth <= 760) setSidebar(false);

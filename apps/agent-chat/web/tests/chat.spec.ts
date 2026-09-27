@@ -15,7 +15,7 @@ async function configure(page: Page) {
   await page.getByLabel('模型地址').fill('https://model.example/v1');
   await page.getByLabel('模型名', { exact: true }).fill('fixture-model');
   await page.getByLabel('模型 API Key').fill(secret);
-  await page.getByLabel('查询后端').selectOption('rest');
+  await expect(page.getByLabel('查询后端')).toHaveValue('rest');
   await page.getByLabel('搜索服务').selectOption('duckduckgo');
   await page.getByRole('button', { name: '保存设置' }).click();
 }
@@ -100,8 +100,9 @@ test('credentials, streaming, traces, history management and refresh', async ({ 
   await page.getByRole('button', { name: '新建会话' }).click();
   await expect(page.getByLabel('选择 agent')).toHaveValue('github');
   await page.getByRole('button', { name: '打开设置' }).click();
-  await expect(page.getByLabel('查询后端')).toHaveValue('dsl');
-  await page.getByRole('button', { name: '关闭', exact: true }).click();
+  await expect(page.getByLabel('查询后端')).toHaveValue('rest');
+  await page.getByLabel('查询后端').selectOption('dsl');
+  await page.getByRole('button', { name: '保存设置' }).click();
   await page.getByLabel('选择 agent').selectOption('gitcode');
   await configure(page);
   await send(page, 'GitCode evidence');

@@ -74,6 +74,7 @@ async def test_ownership_and_capabilities(harness):
     assert not code["available"] and code["reason"]
     assert (await client.post("/api/sessions", json={"agent": "code"})).status_code == 422
     assert catalog["defaults"]["max_steps"] == 32 and catalog["defaults"]["concurrency"] == 8
+    assert catalog["defaults"]["backend"] == "rest"
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="https://chat.test") as other:
         await login(other)
         assert (await other.get("/api/sessions")).json() == []
