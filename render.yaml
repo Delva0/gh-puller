@@ -12,7 +12,6 @@ services:
     healthCheckPath: /api/health
     autoDeployTrigger: "off"
     numInstances: 1
-    maxShutdownDelaySeconds: 30
     envVars:
       - key: CHAT_ACCESS_PASSWORD
         sync: false

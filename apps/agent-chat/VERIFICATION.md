@@ -8,13 +8,14 @@
 | 主仓相关回归测试 | 26 项通过：search、tool_storage、events、OpenAI adapter |
 | Ruff | 应用与后端测试通过 |
 | 前端 TypeScript / Vite | 通过 |
-| Render Blueprint | 通过 Render 官方 JSON Schema 验证 |
+| Render Blueprint | 官方 JSON Schema 通过；已移除 Free 不支持的 maxShutdownDelaySeconds，平台验收待继续 |
 | 本地真实模型与工具接入 | GitHub、GitCode、Web 均通过，见下表 |
 | 浏览器 E2E / 视觉检查 | 4 组通过；桌面 1440×1000、手机 390×844 截图已检查 |
 | 512 MB 生产镜像 | 通过真实浏览器验收；0.1 CPU，峰值约 135 MiB，无 OOM，健康检查无超时 |
 | HTTPS 公网真实模型与工具 E2E | 待完成，尚无已验收公网地址 |
 
 后端外部传输使用固定响应；浏览器测试同样不会调用真实模型。公网验收结果单独记录，不能由模拟测试替代。
+JSON Schema 检查不覆盖套餐限制：首次 Dashboard 校验拒绝了 `maxShutdownDelaySeconds`，现使用平台默认关闭行为。
 
 ## 本地真实接入
 
