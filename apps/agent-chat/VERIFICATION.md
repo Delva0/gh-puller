@@ -8,11 +8,12 @@
 | 主仓相关回归测试 | 26 项通过：search、tool_storage、events、OpenAI adapter |
 | Ruff | 应用与后端测试通过 |
 | 前端 TypeScript / Vite | 通过 |
-| Render Blueprint | 官方 JSON Schema 通过；已移除 Free 不支持的 maxShutdownDelaySeconds，平台验收待继续 |
+| Render Blueprint | 官方 JSON Schema 与平台创建通过；Free 不支持的 maxShutdownDelaySeconds 已移除 |
 | 本地真实模型与工具接入 | GitHub、GitCode、Web 均通过，见下表 |
 | 浏览器 E2E / 视觉检查 | 4 组通过；桌面 1440×1000、手机 390×844 截图已检查 |
 | 512 MB 生产镜像 | 通过真实浏览器验收；0.1 CPU，峰值约 135 MiB，无 OOM，健康检查无超时 |
-| HTTPS 公网真实模型与工具 E2E | 待完成，尚无已验收公网地址 |
+| HTTPS 公网上线 | 已上线，登录页和健康检查均返回 200，版本 94e42e3 |
+| HTTPS 公网真实模型与工具 E2E | 待完成，需要部署时设置的网站访问口令 |
 
 后端外部传输使用固定响应；浏览器测试同样不会调用真实模型。公网验收结果单独记录，不能由模拟测试替代。
 JSON Schema 检查不覆盖套餐限制：首次 Dashboard 校验拒绝了 `maxShutdownDelaySeconds`，现使用平台默认关闭行为。
@@ -77,4 +78,18 @@ Playwright Chromium 覆盖登录、Code 禁用、密钥配置、Enter / Shift+En
 `container-browser-03/` 增加健康检查后发现旧源码 wheel 被缓存、首次初始化期间 3 次超时。
 修复镜像源码包重建后，以上最终验收重新完成全流程。
 
-以上地址是本机 HTTP，Render HTTPS 公网部署、平台冷启动和公网资源指标仍未验收。
+以上容器验收使用本机 HTTP。Render 公网状态见下节。
+
+## 公网部署
+
+地址：https://agent-chat-pdl4.onrender.com 。服务 `srv-dasjnn8473hc738kgnk0` 位于已确认的 My Workspace，
+Singapore / Free，单实例，部署分支 `agent-chat`，自动部署关闭。
+首次部署 `dep-dasjno0473hc738kgpqg` 于 2026-09-27 15:55:15 UTC 完成，平台状态为 `live`。
+部署提交为 `94e42e39762e188868f23692f4c8c49adbfc3241`，与公网 `/api/health` 返回的 revision 一致。
+
+2026-09-28（北京时间）经 HTTPS 验证：首页与健康检查均返回 200，证书校验通过；
+Playwright 打开公网登录页并确认访问口令输入框。记录和截图保存在本机 `verification/render-public/`。
+Render 指标在 15:56–16:05 UTC 的空闲内存约 69–70 MiB，限制为 512 MiB；这不是查询负载下的内存结果。
+
+公网登录、GitHub / GitCode / Web 真实查询、刷新续问、停止、事件导出以及查询期间的资源指标仍未完成。
+继续验收需要部署时设置的 `CHAT_ACCESS_PASSWORD`；本机尚未提供该口令。当前上线检查不能替代上述验收。
