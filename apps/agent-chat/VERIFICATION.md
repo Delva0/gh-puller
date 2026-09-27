@@ -12,8 +12,9 @@
 | 本地真实模型与工具接入 | GitHub、GitCode、Web 均通过，见下表 |
 | 浏览器 E2E / 视觉检查 | 4 组通过；桌面 1440×1000、手机 390×844 截图已检查 |
 | 512 MB 生产镜像 | 通过真实浏览器验收；0.1 CPU，峰值约 135 MiB，无 OOM，健康检查无超时 |
-| HTTPS 公网上线 | 已上线，登录页和健康检查均返回 200，版本 94e42e3 |
-| HTTPS 公网真实模型与工具 E2E | DSL 版本已完成；REST 默认配置待上线复验 |
+| HTTPS 公网上线 | 已上线，登录与健康检查通过，版本 b546d18 |
+| HTTPS 公网真实模型与工具 E2E | REST 默认配置已完成；三类查询无工具错误，刷新续问、停止和导出通过 |
+| Render 复用技能 | 结构校验、Ruff、引用路径检查通过；版本检查和真实浏览器包装器已实测 |
 
 后端外部传输使用固定响应；浏览器测试同样不会调用真实模型。公网验收结果单独记录，不能由模拟测试替代。
 JSON Schema 检查不覆盖套餐限制：首次 Dashboard 校验拒绝了 `maxShutdownDelaySeconds`，现使用平台默认关闭行为。
@@ -115,3 +116,37 @@ GitCode 的默认分支和描述在首次仓库查询已返回；随后追加核
 采样不能证明瞬时峰值或重型并发查询的内存上限。
 平台日志 API 本次返回 503（上游 Loki 502），未完成额外的服务器日志审查；失败响应保存在 `render-logs-unavailable.json`。
 上述工具轨迹来自应用 SSE / `events.json`，内存指标来自 Render 带外 API。
+
+### REST 默认配置公网复验
+
+部署 `dep-daskdq8u01pc73cbnnrg` 于 2026-09-27 16:41:37 UTC 成为 `live`，
+提交 `b546d185f9a5084ae3b33509233870c08227facf` 与 HTTPS 健康检查、浏览器读取的 revision 一致。
+GitHub / GitCode 新会话默认 REST；浏览器脚本直接断言默认值，没有代替用户切换查询后端。
+既有 DSL 会话不改写；服务重启后丢失上下文的历史只读。
+
+16:42:09–16:42:43 UTC，通过 `.agents/skills/agent-chat-render/scripts/run_live_browser.py`
+在真实 HTTPS 页面完成登录、三类查询、工具展开、刷新续问、停止、事件下载与序号去重。
+模型及调用参数与首次公网验收相同，仅 GitHub / GitCode 的查询后端改为 REST；Web 使用 Brave。
+Cookie 属性、刷新后密钥框为空、导出不含提供的凭据均通过。
+
+| 查询 | 耗时 | 模型请求 | 工具调用 | 工具错误 |
+| --- | --- | --- | --- | --- |
+| GitHub：`psf/requests` 默认分支和描述 | 3.977 秒 | 2 | 1 | 0 |
+| GitCode：`openharmony/docs` 默认分支和描述 | 5.799 秒 | 2 | 1 | 0 |
+| Web：搜索并读取 Python asyncio 官方文档 | 8.096 秒 | 3 | 2 | 0 |
+
+证据目录为 `verification/render-public/live-02-rest/`，`report.json` 记录实际 backend、问题、耗时与回答。
+人工核对：`github-events.json:230` / `:467` 返回 `main` 和仓库描述；
+`gitcode-events.json:295` / `:749` 返回 `master` 和“暂无描述”，缺少的 `html_url` 在投影遗漏中明确说明；
+`web-events.json:441` / `:1181` 中 HTTP 200 的官方正文支持最终用途说明。
+这组小型查询无工具错误，不表示所有 REST 调用已覆盖，也不证明 DSL 问题已经修复。
+
+`render-metrics.json` 覆盖 16:41:30–16:42:44 UTC，分辨率 30 秒；新实例 `xc25n` 的内存采样最大为
+90,337,280 字节（约 86.2 MiB），限制 512 MiB。切换前旧实例 `bjkv7` 的采样不归入此查询负载。
+采样点有限，未测瞬时峰值、重型并发容量或强制休眠后的冷启动。
+平台日志接口此次恢复：`render-error-logs.json` 在 16:41:37–16:42:44 UTC 返回空的应用 error 日志，
+仅代表该过滤条件与时间窗；首次验收的 503 记录仍保留，不据此宣称所有平台日志均已审计。
+
+默认值修改后的本地检查仍为后端 29 项、Playwright 4 组通过，Ruff、TypeScript 和 Vite 构建通过。
+技能健康检查已验证正确 SHA 返回 200，错误 SHA 会在读取凭据和调用模型前阻止验收。
+技能及验证记录提交可领先于线上应用提交；纯说明修改没有再次触发部署。
