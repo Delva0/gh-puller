@@ -20,6 +20,17 @@ agent = [
     "opentelemetry-sdk>=1.44.0",
     "websockets>=16.1",
 ]
+search = [
+    "gh-puller[agent]",
+    "beautifulsoup4>=4.12",
+    "ddgs==9.16.0",
+    "graphql-core>=3.2.12,<3.3",
+    "jsonschema>=4.26.0",
+    "markdownify>=1.2.0",
+    "mcp==1.30.0",
+    "pillow>=11",
+    "pypdf>=6",
+]
 benchmark = [
     "claude-agent-sdk>=0.2.142",
     "fastapi>=0.139.0",
@@ -42,6 +53,9 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 include = ["gh_puller*"]
 
+[tool.setuptools.package-data]
+"gh_puller.tools" = ["*.mjs", "*.graphql", "*.LICENSE", "github_schema.meta.json", "gitcode_api_catalog.json"]
+
 [[tool.uv.index]]
 url = "https://pypi.org/simple"
 
@@ -51,7 +65,7 @@ deepseek-harness-runtime-bin = { path = "../deepseek-harness/python/sdk-runtime"
 
 [dependency-groups]
 dev = [
-    "gh-puller[agent,benchmark,codebase]",
+    "gh-puller[agent,benchmark,codebase,search]",
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
 ]
