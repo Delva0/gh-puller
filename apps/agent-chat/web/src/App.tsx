@@ -11,7 +11,7 @@ import { useValidation } from './useValidation';
 import { availabilityHint } from './ui-model';
 import { fork, selectBranch, versions } from './branches';
 import { deleteChat, exportEvents, download, exportHistory, importHistory, loadHistory, loadSettings, saveChat, saveSettings } from './db';
-import { emptyCredentials, emptyPreferences, eventSchema, isRunning, publicData, settingsFor,
+import { artifactSchema, emptyCredentials, emptyPreferences, eventSchema, isRunning, publicData, settingsFor,
   type Agent, type Catalog, type ChatEvent, type Conversation, type Credentials, type ModelSettings,
   type Preferences, type SessionView, type Settings } from './types';
 
@@ -161,13 +161,15 @@ export default function App() {
     let timer: ReturnType<typeof setTimeout> | undefined;
     let checkingStatus = false;
     let queue: ChatEvent[] = [];
+    let attachments: Record<string, string> = {};
     const source = new EventSource(`/api/sessions/${serverId}/events?after=${active.events.at(-1)?.seq ?? 0}`);
     setConnection('connecting');
     const flush = () => {
       if (timer) clearTimeout(timer);
       timer = undefined;
-      if (!queue.length) return;
+      if (!queue.length && !Object.keys(attachments).length) return;
       const batch = queue; queue = [];
+      const artifacts = attachments; attachments = {};
       update(id, chat => {
         if (chat.server_id !== serverId || chat.branch_id !== branchId) return chat;
         const after = chat.events.at(-1)?.seq ?? 0;
@@ -176,6 +178,7 @@ export default function App() {
         const first = entries.find(e => e.type === 'query/start');
         const last = entries.filter(e => e.type === 'query/start' || e.type === 'query/end').at(-1);
         return { ...chat, events: [...chat.events, ...entries], live: last ? last.type === 'query/start' : chat.live,
+          artifacts: Object.keys(artifacts).length ? { ...chat.artifacts, ...artifacts } : chat.artifacts,
           title: !chat.renamed && !chat.events.length && first ? String(first.data.prompt).replace(/\s+/g, ' ').slice(0, 36) : chat.title };
       });
       for (const event of batch) if (event.type === 'query/start' && pending.current.get(id)?.request_id === event.query_id) {
@@ -183,6 +186,13 @@ export default function App() {
       }
     };
     source.onopen = () => { if (!disposed) setConnection('ready'); };
+    source.addEventListener('artifact', message => {
+      try {
+        const artifact = artifactSchema.parse(JSON.parse((message as MessageEvent).data));
+        attachments[artifact.sha256] = artifact.content;
+        timer ??= setTimeout(flush, 70);
+      } catch { setNotice('收到无法识别的事件，请导出记录并重连。'); }
+    });
     source.onmessage = message => {
       try {
         const event = eventSchema.parse(JSON.parse(message.data));
@@ -277,7 +287,7 @@ export default function App() {
       body.server_id ??= reuse?.id;
       pending.current.set(chat.id, body);
       if (!body.server_id) {
-        const payload = { agent: chat.agent, events: chat.events, source_session: chat.server_id ?? chat.source_id };
+        const payload = { agent: chat.agent, events: chat.events, artifacts: chat.artifacts, source_session: chat.server_id ?? chat.source_id };
         let session: SessionView;
         try { session = await api<SessionView>('/sessions', 'POST', payload); }
         catch (error) {
@@ -346,7 +356,7 @@ export default function App() {
   async function importFile(file?: File) {
     if (!file) return;
     try {
-      if (file.size > 32 * 1024 * 1024) throw new Error('导入文件不能超过 32 MB');
+      if (file.size > 128 * 1024 * 1024) throw new Error('导入文件不能超过 128 MB');
       const imported = importHistory(JSON.parse(await file.text()));
       commit([...chatsRef.current, ...imported]);
       if (imported.length) setActiveId(imported[0].id);

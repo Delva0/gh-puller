@@ -183,7 +183,9 @@ class WebTools(ToolProvider):
 
     def remember_resource(self, resource):
         self.resources[resource["ref"]] = resource
-        self.storage.event("web/resource_saved", resource=resource)
+        if self.storage.observer:
+            path = self.storage.write(resource["ref"] + ".resource.json", resource)
+            self.storage.event("web/resource_saved", ref=resource["ref"], path=path)
 
     def search_deadline(self, kind, until):
         """Observe wall-clock deadlines so pacing survives a different process clock."""
@@ -195,22 +197,25 @@ class WebTools(ToolProvider):
         self.storage.event(kind, backend=self.search_backend, until=until)
 
     def load_events(self, events):
-        resources, deadlines = {}, {}
         for event in events:
             kind, data = event["type"], event["data"]
             if kind == "web/cleared":
-                resources.clear()
+                self.resources.clear()
             elif kind == "web/resource_saved":
-                resource = data["resource"]
+                resource = (json.loads(self.storage.read(data["path"])) if "path" in data
+                            else dict(data["resource"]))
                 if not self.storage.path(resource["body_file"]).is_file():
                     raise ValueError("Observed web resource file is missing")
-                resources[resource["ref"]] = resource
+                self.resources[resource["ref"]] = resource
+                if "path" not in data:
+                    path = self.storage.write(self.storage.allocate("web-resource") + ".resource.json", resource)
+                    data = {"ref": resource["ref"], "path": path}
             elif kind in {"web/search_scheduled", "web/search_limited"} and data["backend"] == self.search_backend:
-                deadlines[kind] = data["until"]
-        for resource in resources.values():
-            self.remember_resource(dict(resource))
-        for kind, until in deadlines.items():
-            self.search_deadline(kind, until)
+                self.search_deadline(kind, data["until"])
+                continue
+            else:
+                continue
+            self.storage.event(kind, **data)
 
     async def _job(self, call_id, kind, arguments, limit, action):
         operation = self.storage.allocate(kind)

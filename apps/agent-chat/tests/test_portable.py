@@ -1,6 +1,8 @@
 """Exercise resumed native contexts, branch prefixes, evidence safety and model discovery."""
 
 import asyncio
+import base64
+import hashlib
 import json
 from pathlib import Path
 
@@ -36,9 +38,11 @@ async def test_own_event_stream_restores_native_memory_and_evidence(harness, kin
     before = app.state.manager.sessions[original]
     messages = before.agent.messages[1:]
     files = {p.name: p.read_bytes() for p in before.storage.root.iterdir() if p.is_file()}
+    bundle = (await client.get(f"/api/sessions/{original}/export")).json()
     old_root = before.root
     await app.state.manager.delete(before)
-    response = await client.post("/api/sessions", json={"agent": kind, "events": events})
+    response = await client.post("/api/sessions", json={"agent": kind, "events": events,
+                                                     "artifacts": bundle["artifacts"]})
     assert response.status_code == 201, response.text
     assert not response.json()["recovery_warning"]
     resumed = response.json()["id"]
@@ -159,14 +163,15 @@ async def test_tool_owned_restore_rejects_external_files_before_inference(harnes
     await login(client)
     source = await create(client)
     events = await query_export(app, client, source, question("evidence", tool_result_preview_chars=1))
+    artifacts = (await client.get(f"/api/sessions/{source}/export")).json()["artifacts"]
     secret = tmp_path / "outside-private-data"
     secret.write_text("must-never-be-read")
     data = next(event["data"] for event in events if event["type"] == kind)
     if kind == "github/response_saved":
-        data["metadata"]["body_file"] = str(secret)
+        data["path"] = str(secret)
     else:
         data["artifact"] = str(secret)
-    response = await client.post("/api/sessions", json={"agent": "github", "events": events})
+    response = await client.post("/api/sessions", json={"agent": "github", "events": events, "artifacts": artifacts})
     assert response.status_code == 201
     identifier = response.json()["id"]
     calls = len(factory.calls)
@@ -191,6 +196,56 @@ async def test_clone_cannot_copy_another_browser_credentials(harness):
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="https://chat.test") as other:
         await login(other)
         assert (await other.post("/api/sessions", json={"agent": "web", "source_session": source})).status_code == 404
+
+
+@pytest.mark.parametrize("invalid", ["missing", "changed", "oversize", "path"])
+async def test_artifact_import_is_bounded_and_does_not_replace_source_on_failure(harness, invalid):
+    app, client, _, settings = harness
+    await login(client)
+    source = await create(client)
+    body = b"independent immutable artifact"
+    digest = hashlib.sha256(body).hexdigest()
+    records = [{"seq": 1, "type": "artifact/saved", "at": "2026-09-28", "query_id": None,
+                "data": {"path": "evidence.body", "sha256": digest, "size": len(body), "complete": True}}]
+    artifacts = {digest: base64.b64encode(body).decode()}
+    if invalid == "missing":
+        artifacts.clear()
+    elif invalid == "changed":
+        artifacts[digest] = base64.b64encode(b"replaced content").decode()
+    elif invalid == "oversize":
+        settings.storage_bytes = 4
+    else:
+        artifacts = {"../../outside": artifacts[digest]}
+    response = await client.post("/api/sessions", json={
+        "agent": "web", "source_session": source, "events": records, "artifacts": artifacts,
+    })
+    assert response.status_code == 422
+    assert list(app.state.manager.sessions) == [source]
+    assert len(await asyncio.to_thread(lambda: list(Path(settings.temp_root).iterdir()))) == 1
+
+
+async def test_attachment_budget_is_separate_from_event_log_and_deduplicated(harness):
+    app, client, _, settings = harness
+    await login(client)
+    settings.event_bytes = 4096
+    body = b"file body" * 2048
+    digest = hashlib.sha256(body).hexdigest()
+    identity = {"at": "2026-09-28", "query_id": None}
+    events = [{**identity, "seq": 1, "type": "agent/set", "data": {"agent": "search-web", "config": {}}},
+              {**identity, "seq": 2, "type": "artifact/saved", "data": {
+                  "path": "evidence.body", "sha256": digest, "size": len(body), "complete": True}}]
+    response = await client.post("/api/sessions", json={
+        "agent": "web", "events": events, "artifacts": {digest: base64.b64encode(body).decode()},
+    })
+    assert response.status_code == 201, response.text
+    session = app.state.manager.sessions[response.json()["id"]]
+    assert session.log_size < settings.event_bytes < len(body)
+    session.storage.load_events(events)
+    assert session.storage.used == len(body)
+    assert (session.storage.root / "evidence.body").stat().st_ino == (
+        session.storage.root / ".attachments" / digest).stat().st_ino
+    await app.state.manager.delete(session)
+    assert not session.root.exists()
 
 
 async def test_models_endpoint_auth_discovery_and_failure_redaction(tmp_path):

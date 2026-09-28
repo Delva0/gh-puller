@@ -204,7 +204,6 @@ class GitHubAPI(APIReads):
 
     def name_resource(self, key, resource):
         self.resource_names[tuple(key)] = resource
-        self.event("resource_named", key=list(key), resource=resource)
 
     def cooldown(self, resource, until):
         self.cooldowns[resource] = max(self.cooldowns.get(resource, 0), until)
@@ -216,9 +215,7 @@ class GitHubAPI(APIReads):
             data = event["data"]
             if data.get("tool") != self.scope:
                 continue
-            if event["type"] == "github/resource_named":
-                self.name_resource(data["key"], data["resource"])
-            elif event["type"] == "github/rate_limited":
+            if event["type"] == "github/rate_limited":
                 self.cooldown(data["resource"], data["until"])
 
     def _failure(self, exc):

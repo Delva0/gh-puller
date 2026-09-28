@@ -1,4 +1,4 @@
-"""Define the common Agent lifecycle and caller-visible failure contract."""
+"""Share Agent lifecycle, Context replay and the caller-visible failure contract."""
 
 import contextlib
 import copy
@@ -130,7 +130,7 @@ class BaseAgent:
         raise NotImplementedError
 
     def load_events(self, events):
-        """Replay shared Context while retaining the target's system instructions.
+        """Replay shared Context through the adapter's native-context hook.
 
         Args:
             events: Ordered event dictionaries, optionally ending mid-turn. Only Context
@@ -140,9 +140,7 @@ class BaseAgent:
             NotImplementedError: The adapter cannot apply Context to its native client.
         """
         recorder = self._require_event_recorder()
-        items = [item for item in recorder.context() if item.get("role") == "system"]
-        items.extend(item for item in fold_state(events)["context"] if item.get("role") != "system")
-        items = copy.deepcopy(items)
+        items = copy.deepcopy(fold_state(events)["context"])
         self._load_context(items)
         recorder.set_context(items)
 
@@ -150,17 +148,7 @@ class BaseAgent:
         """Apply canonical items to native memory before publishing the restored Context.
 
         Args:
-            items: Complete target Context, including its current system instructions.
+            items: Folded source Context. Adapters may replace items in place to
+                reflect their actual native Context, including their system/tool policy.
         """
         raise NotImplementedError("This agent cannot apply Context to its native client")
-
-    @staticmethod
-    def own_events(events, identity):
-        """Select the latest Agent's private observations, excluding earlier identities.
-
-        Args:
-            events: Ordered event prefix.
-            identity: Exact target Agent identity; foreign histories yield no private events.
-        """
-        start = max((i for i, event in enumerate(events) if event["type"] == "agent/set"), default=-1)
-        return events[start + 1:] if start >= 0 and events[start]["data"]["agent"] == identity else []

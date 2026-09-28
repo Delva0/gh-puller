@@ -317,6 +317,22 @@ class CommonAgent(BaseAgent):
         self.storage.event("context/cleared", query=self.context.query)
 
     @classmethod
+    def own_events(cls, events):
+        """Select private facts from the latest execution session and identity.
+
+        Args:
+            events: Ordered event prefix. Re-observing the same identity/configuration
+                does not start a new instance; ``session/start`` does.
+        """
+        start, identity = 0, None
+        for index, event in enumerate(events):
+            if event["type"] == "session/start":
+                start, identity = index + 1, None
+            elif event["type"] == "agent/set" and event["data"]["agent"] != identity:
+                start, identity = index + 1, event["data"]["agent"]
+        return events[start:] if identity == "search-" + cls.name else []
+
+    @classmethod
     def validate_events(cls, events, *, max_bytes=64 * 1024 * 1024):
         """Bound file observations before allocation; tools validate their references on load.
 
@@ -324,9 +340,9 @@ class CommonAgent(BaseAgent):
             events: An ordered prefix of canonical and Agent-owned events.
             max_bytes: Maximum total decoded evidence size accepted by the caller.
         """
-        ToolStorage.event_files(cls.own_events(events, "search-" + cls.name), max_bytes=max_bytes)
+        ToolStorage.event_files(cls.own_events(events), max_bytes=max_bytes)
 
-    def load_events(self, events, *, max_bytes=64 * 1024 * 1024):
+    def load_events(self, events, *, resolve_artifact=None, max_bytes=64 * 1024 * 1024):
         """Restore own memory or a foreign Agent's Context in a fresh session.
 
         Args:
@@ -334,9 +350,11 @@ class CommonAgent(BaseAgent):
                 foreign events contribute only context. Connections and in-flight work
                 are not process snapshots; the target keeps its current configuration.
             max_bytes: Maximum total decoded evidence size accepted by the caller.
+            resolve_artifact: Caller-owned reader of content-addressed evidence. Omission
+                resolves only artifacts already available in this ToolStorage.
         """
-        own = self.own_events(events, self.agent)
-        self.storage.load_events(own, max_bytes=max_bytes)
+        own = self.own_events(events)
+        self.storage.load_events(own, resolve_artifact=resolve_artifact, max_bytes=max_bytes)
         self.storage.reserve_context_ids(fold_state(events)["context"])
         self.tool_registry.load_events(own)
         self.early_answers.load_events(own)
@@ -368,20 +386,40 @@ class CommonAgent(BaseAgent):
                                   if m["role"] == "assistant" and not m.get("tool_calls")), "")
         self.completed_steps.clear()
 
+    def update_config(self, changes):
+        """Apply between-turn model controls and observe their effective values.
+
+        Args:
+            changes: Public native configuration values. Construction-time tool options
+                require a new Agent; credentials use ``set_credentials`` separately.
+        """
+        recorder = self._require_event_recorder()
+        config = self.normalize_runtime({**self.config, **copy.deepcopy(changes)})
+        config["model"] = model_id(config["model"])
+        if "reasoning_effort" in config["parameters"]:
+            config["parameters"]["reasoning_effort"] = reasoning_effort(config["parameters"]["reasoning_effort"])
+        changed = {key: value for key, value in config.items() if value != self.config.get(key)}
+        if changed.keys() - {"model", "base_url", "parameters", "environment", "max_steps"}:
+            raise ValueError("Tool or Agent configuration changed; construct a new Agent")
+        self.config.update(changed)
+        for key, value in changed.items():
+            recorder.set_agent_facet(key, value)
+        if "environment" in changed:
+            self.messages[0] = {"role": "system", "content": self.instructions()}
+            self.context.synchronize(self.messages)
+
     def set_model(self, model: str) -> None:
         """Change the model between turns, preserving context and request parameters."""
         model = model_id(model)
         previous = self.config["model"]
-        self.config["model"] = model
-        self._require_event_recorder().set_agent_facet("model", model)
+        self.update_config({"model": model})
         self.storage.event("model/changed", previous=previous, model=model, parameters=self.config["parameters"])
 
     def set_reasoning_effort(self, effort: str) -> None:
         """Change effort between turns without altering the prompt or retained context."""
         effort = reasoning_effort(effort)
         previous = self.config["parameters"].get("reasoning_effort")
-        self.config["parameters"] = {**self.config["parameters"], "reasoning_effort": effort}
-        self._require_event_recorder().set_agent_facet("parameters", self.config["parameters"])
+        self.update_config({"parameters": {**self.config["parameters"], "reasoning_effort": effort}})
         self.storage.event("model/reasoning_effort_changed", previous=previous, reasoning_effort=effort,
                        parameters=self.config["parameters"])
 

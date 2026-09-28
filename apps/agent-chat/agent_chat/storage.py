@@ -1,6 +1,9 @@
 """Retain only bounded, scrubbed tool files in a session-owned temporary directory."""
 
+import base64
+import hashlib
 import json
+import re
 from contextlib import contextmanager
 from threading import RLock
 
@@ -37,8 +40,31 @@ class PrivateStorage(ToolStorage):
             value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
         ).encode()
         data = self.scrub_bytes(data)
+        digest = hashlib.sha256(data).hexdigest()
+        if digest in self.artifacts:
+            self.path(name).hardlink_to(self.path(self.artifacts[digest]))
+            self.describe(name, **metadata)
+            return name
         self.reserve(len(data))
         return super().write(name, data, **metadata)
+
+    def import_artifacts(self, artifacts):
+        for digest, encoded in artifacts.items():
+            if not re.fullmatch(r"[0-9a-f]{64}", digest) or len(encoded) > (self.limit + 2) // 3 * 4:
+                raise ValueError("Invalid artifact attachment")
+            data = base64.b64decode(encoded, validate=True)
+            if hashlib.sha256(data).hexdigest() != digest or self.scrub_bytes(data) != data:
+                raise ValueError("Artifact attachment does not match its reference")
+            if digest not in self.artifacts:
+                self.write(".attachments/" + digest, data)
+
+    def copy_artifacts(self, source):
+        for digest in source.artifacts:
+            if digest not in self.artifacts:
+                self.write(".attachments/" + digest, source.read_artifact(digest))
+
+    def attachment(self, digest):
+        return base64.b64encode(self.read_artifact(digest)).decode()
 
     @contextmanager
     def binary(self, name, **metadata):

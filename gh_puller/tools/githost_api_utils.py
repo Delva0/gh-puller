@@ -139,26 +139,26 @@ class APIReads:
 
     def remember_response(self, metadata):
         self.responses[metadata["result_id"]] = metadata
-        self.event("response_saved", metadata=metadata)
+        if self.storage.observer:
+            path = self.storage.write(metadata["result_id"] + ".response.json", metadata)
+            self.event("response_saved", result_id=metadata["result_id"], path=path)
 
     def load_events(self, events):
-        """Replay saved-response identities and query-local cache links, never pending requests."""
-        archive = {}
+        """Replay immutable evidence identities; request caches rebuild on demand."""
+        self._reads = ReadCache()
         for event in events:
             kind, data = event["type"], event["data"]
             if kind == f"{self.provider}/cleared":
                 self.responses.clear()
-                if data.get("tool") == self.scope:
-                    self._reads = ReadCache()
-            elif kind == f"{self.provider}/response_saved" and "metadata" in data:
-                metadata = deepcopy(data["metadata"])
+            elif kind == f"{self.provider}/response_saved":
+                metadata = (json.loads(self.storage.read(data["path"])) if "path" in data
+                            else deepcopy(data["metadata"]))
                 if not self.storage.path(metadata["body_file"]).is_file():
                     raise ValueError("Observed API response file is missing")
-                archive[metadata["result_id"]] = self.responses[metadata["result_id"]] = metadata
-            elif kind == f"{self.provider}/query_started" and data.get("tool") == self.scope:
-                self._reads = ReadCache()
-            elif kind == f"{self.provider}/read_cached" and data.get("tool") == self.scope:
-                self._reads.responses[data["identity"]] = archive[data["result_id"]]
+                self.responses[metadata["result_id"]] = metadata
+                if "path" not in data:
+                    path = self.storage.write(self.storage.allocate(self.provider) + ".response.json", metadata)
+                    data = {"tool": data.get("tool", self.scope), "result_id": metadata["result_id"], "path": path}
             else:
                 continue
             self.storage.event(kind, **data)
@@ -187,7 +187,6 @@ class APIReads:
 
     def begin_query(self) -> None:
         self._reads = ReadCache()
-        self.event("query_started")
 
     @contextmanager
     def read_scope(self):
@@ -260,7 +259,6 @@ class APIReads:
             metadata = await asyncio.shield(flight.task)
             if reuse and self._cacheable(metadata):
                 cache.responses[identity] = metadata
-                self.event("read_cached", identity=identity, result_id=metadata["result_id"])
             if shared:
                 self.storage.event(
                     f"{self.provider}/request_shared", operation=operation, source_result_id=metadata["result_id"],

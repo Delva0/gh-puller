@@ -1,10 +1,11 @@
 """Store files needed by tools, independently of observation and experiment archives.
 
-Callers own the directory lifetime. File storage and operation identifiers work
-without an observer; optional observation receives diagnostic events.
+Callers own directory lifetime and artifact transport. Events contain content-addressed
+references, never file bodies; recovery resolves them through a caller-provided reader.
 """
 
 import base64
+import hashlib
 import json
 import re
 import threading
@@ -27,6 +28,7 @@ class ToolStorage:
         self.sequence = 0
         self.lock = threading.RLock()
         self.observer = observer
+        self.artifacts: dict[str, str] = {}
 
     def allocate(self, kind: str) -> str:
         """Allocate a unique operation identifier.
@@ -107,61 +109,89 @@ class ToolStorage:
             metadata: Additional observation details.
         """
         path = self.path(name)
+        body = self.read(name)
+        digest = hashlib.sha256(body).hexdigest()
+        self.artifacts[digest] = name
         self.event("artifact/saved", path=path.relative_to(self.root).as_posix(),
-                   size=path.stat().st_size, complete=complete,
-                   **({"content": base64.b64encode(self.read(name)).decode()} if self.observer else {}), **metadata)
+                   size=len(body), complete=complete, sha256=digest, **metadata)
+
+    def read_artifact(self, digest: str) -> bytes:
+        """Resolve an immutable artifact already owned by this storage.
+
+        Args:
+            digest: SHA-256 content address observed by ``artifact/saved``.
+        """
+        if digest not in self.artifacts:
+            raise ValueError("Observed artifact is unavailable; supply its attachment or a resolver")
+        body = self.read(self.artifacts[digest])
+        if hashlib.sha256(body).hexdigest() != digest:
+            raise ValueError("Observed artifact content changed")
+        return body
 
     @staticmethod
     def event_files(events, *, max_bytes=64 * 1024 * 1024):
-        """Decode bounded evidence without accessing the filesystem.
+        """Validate bounded artifact references without reading external resources.
 
         Args:
             events: Ordered tool observations. Older path-only observations are ignored.
-            max_bytes: Maximum total decoded evidence size.
+            max_bytes: Maximum total referenced evidence size.
         """
         files, size = {}, 0
         for event in events:
             data = event["data"]
-            if event["type"] != "artifact/saved" or "content" not in data:
+            if event["type"] != "artifact/saved" or not {"sha256", "content"}.intersection(data):
                 continue
             name = data["path"]
             path = PurePosixPath(name)
             if (not path.parts or len(name) > 256 or path.is_absolute() or ".." in path.parts
                     or "\\" in name or path.as_posix() != name):
                 raise ValueError("Invalid observed file path")
-            body = base64.b64decode(data["content"], validate=True)
-            if name in files and files[name] != body:
+            if "content" in data:
+                if len(data["content"]) > (max_bytes + 2) // 3 * 4:
+                    raise ValueError("Observed files exceed the storage limit")
+                body = base64.b64decode(data["content"], validate=True)
+                data = {**data, "sha256": hashlib.sha256(body).hexdigest(), "size": len(body)}
+            if (not re.fullmatch(r"[0-9a-f]{64}", data["sha256"])
+                    or type(data["size"]) is not int or data["size"] < 0):
+                raise ValueError("Invalid observed artifact reference")
+            if name in files and any(files[name][key] != data[key] for key in ("sha256", "size")):
                 raise ValueError("Observed immutable file changed")
-            size += len(body) if name not in files else 0
+            size += data["size"] if name not in files else 0
             if size > max_bytes:
                 raise ValueError("Observed files exceed the storage limit")
-            files[name] = body
+            files[name] = data
         return files
 
-    def load_events(self, events, *, max_bytes=64 * 1024 * 1024):
+    def load_events(self, events, *, resolve_artifact=None, max_bytes=64 * 1024 * 1024):
         """Restore tool evidence into fresh storage and publish the restored files.
 
         Args:
             events: Ordered observations from the owning Agent.
-            max_bytes: Maximum total decoded evidence size.
+            resolve_artifact: Reader mapping SHA-256 addresses to bytes, without implicit
+                filesystem or network access. Omission uses this storage's own artifacts.
+            max_bytes: Maximum total referenced evidence size.
         """
         files = self.event_files(events, max_bytes=max_bytes)
-        metadata = {event["data"]["path"]: {key: value for key, value in event["data"].items()
-                                           if key not in {"path", "content", "size"}}
-                    for event in events if event["type"] == "artifact/saved" and "content" in event["data"]}
+        resolve_artifact = resolve_artifact or self.read_artifact
         for event in events:
             if event["type"] == "artifact/allocated":
                 sequence = event["data"]["sequence"]
                 if type(sequence) is not int or sequence < 0:
                     raise ValueError("Invalid tool operation sequence")
                 self.sequence = max(self.sequence, sequence)
-        for name, body in files.items():
+        for name, data in files.items():
+            body = (base64.b64decode(data["content"], validate=True) if "content" in data
+                    else resolve_artifact(data["sha256"]))
+            if len(body) != data["size"] or hashlib.sha256(body).hexdigest() != data["sha256"]:
+                raise ValueError("Observed artifact does not match its reference")
+            metadata = {key: value for key, value in data.items()
+                        if key not in {"path", "content", "size", "sha256"}}
             if self.path(name).exists():
                 if self.read(name) != body:
                     raise ValueError("Observed file conflicts with current tool storage")
-                self.describe(name, **metadata[name])
+                self.describe(name, **metadata)
             else:
-                self.write(name, body, **metadata[name])
+                self.write(name, body, **metadata)
         self.event("artifact/allocated", sequence=self.sequence)
 
     def reserve_context_ids(self, items):

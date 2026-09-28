@@ -37,6 +37,7 @@ class Login(BaseModel):
 class CreateSession(BaseModel):
     agent: AgentKind = next(iter(AGENTS))
     events: list[HistoryEvent] = Field(default_factory=list, max_length=100000)
+    artifacts: dict[str, str] = Field(default_factory=dict, max_length=100000)
     source_session: str | None = None
 
 
@@ -81,13 +82,15 @@ def create_app(settings: ServerSettings | None = None, *, agent_factory=build_ag
             if request.headers.get("content-type", "").split(";")[0] != "application/json":
                 return JSONResponse({"detail": "请求必须使用 JSON"}, status_code=415)
             body = bytearray()
+            limit = (settings.event_bytes + (settings.storage_bytes + 2) // 3 * 4 + 128 * 1024
+                     if request.url.path == "/api/sessions" else 128 * 1024)
             async for chunk in request.stream():
-                limit = settings.event_bytes if request.url.path == "/api/sessions" else 128 * 1024
                 if len(body) + len(chunk) > limit:
                     return JSONResponse({"detail": "请求过大"}, status_code=413)
                 body.extend(chunk)
             # Starlette's cached request replays this bounded body to downstream handlers.
             request._body = bytes(body)
+            del body
         response = await call_next(request)
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["Referrer-Policy"] = "no-referrer"
@@ -204,6 +207,12 @@ def create_app(settings: ServerSettings | None = None, *, agent_factory=build_ag
             session.scrubber.add(session.credentials.values())
         try:
             degraded = load_history(session, body.events)
+            session.storage.import_artifacts(body.artifacts)
+            if source:
+                session.storage.copy_artifacts(source.storage)
+            for digest in {event.data["sha256"] for event in body.events
+                           if event.type == "artifact/saved" and "sha256" in event.data}:
+                session.storage.read_artifact(digest)
         except Exception as exc:  # Invalid imported state must release all partially restored resources.
             await manager.delete(session)
             raise HTTPException(422, "会话恢复数据无效或超过保留上限") from exc
@@ -249,6 +258,7 @@ def create_app(settings: ServerSettings | None = None, *, agent_factory=build_ag
 
         async def subscribe():
             nonlocal cursor
+            sent_artifacts = set()
             while not await request.is_disconnected():
                 if session.closed:
                     yield "event: expired\ndata: {}\n\n"
@@ -256,6 +266,11 @@ def create_app(settings: ServerSettings | None = None, *, agent_factory=build_ag
                 session.changed.clear()
                 batch = session.replay(cursor)
                 for event in batch:
+                    if (event["type"] == "artifact/saved" and (digest := event["data"].get("sha256"))
+                            and digest not in sent_artifacts):
+                        attachment = {"sha256": digest, "content": session.storage.attachment(digest)}
+                        yield f"event: artifact\ndata: {json.dumps(attachment)}\n\n"
+                        sent_artifacts.add(digest)
                     cursor = event["seq"]
                     yield f"id: {cursor}\ndata: {json.dumps(event, ensure_ascii=False)}\n\n"
                 if cursor < len(session.offsets):
@@ -277,7 +292,7 @@ def create_app(settings: ServerSettings | None = None, *, agent_factory=build_ag
         snapshot = len(session.offsets)
 
         async def download():
-            yield json.dumps({"version": 2, "session": session.view()}, ensure_ascii=False)[:-1] + ',"events":['
+            yield json.dumps({"version": 3, "session": session.view()}, ensure_ascii=False)[:-1] + ',"events":['
             cursor = 0
             while cursor < snapshot:
                 for event in session.replay(cursor, min(200, snapshot - cursor)):
@@ -285,10 +300,13 @@ def create_app(settings: ServerSettings | None = None, *, agent_factory=build_ag
                     cursor += 1
                 if session.closed:
                     break
-            yield "]}"
+            yield '],"artifacts":{'
+            for index, digest in enumerate(list(session.storage.artifacts)):
+                yield ("," if index else "") + json.dumps(digest) + ":" + json.dumps(session.storage.attachment(digest))
+            yield "}}"
 
         return StreamingResponse(download(), media_type="application/json",
-                                 headers={"Content-Disposition": 'attachment; filename="events.json"'})
+                                 headers={"Content-Disposition": f'attachment; filename="events_{session.id}.json"'})
 
     if settings.static_dir.is_dir():
         app.mount("/assets", StaticFiles(directory=settings.static_dir / "assets"), name="assets")

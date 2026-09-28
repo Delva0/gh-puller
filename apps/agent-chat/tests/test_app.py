@@ -1,12 +1,15 @@
 """Verify authentication, replay, isolation, idempotency, cancellation and cleanup."""
 
 import asyncio
+import base64
+import hashlib
 import json
 import threading
 import time
 
 import httpx
 import pytest
+from gh_puller.agent.events import fold_state
 
 from agent_chat.app import COOKIE
 from agent_chat.config import Question
@@ -111,15 +114,24 @@ async def test_real_agents_replay_export_and_secret_free_files(harness, kind, ba
     assert {event["type"] for event in events} >= {"tool/start", "tool/end", "model/response", "query/end"}
     data = (await client.get(f"/api/sessions/{session_id}/export")).json()
     assert data["events"] == events
+    assert data["version"] == 3 and data["artifacts"]
+    assert f"events_{session_id}.json" in (await client.get(
+        f"/api/sessions/{session_id}/export")).headers["content-disposition"]
+    for digest, content in data["artifacts"].items():
+        decoded = base64.b64decode(content)
+        assert hashlib.sha256(decoded).hexdigest() == digest
+        assert b"fixture-model-secret-value" not in decoded
+    assert all("content" not in e["data"] for e in events if e["type"] == "artifact/saved")
     assert "fixture-model-secret-value" not in json.dumps(data)
     files = [path for path in session.root.rglob("*") if path.is_file()]
     assert all(b"fixture-model-secret-value" not in path.read_bytes() for path in files)
     assert not any(path.name in {"manifest.json", "source.tar", "timeline.jsonl"} for path in session.root.rglob("*"))
     after = events[3]["seq"]
     response = await client.get(f"/api/sessions/{session_id}/events?after=1", headers={"Last-Event-ID": str(after)})
-    replay = [json.loads(line[6:]) for line in response.text.splitlines()
-              if line.startswith("data: {") and line != "data: {}"]
+    packets = [json.loads(line[6:]) for line in response.text.splitlines() if line.startswith("data: {")]
+    replay = [packet for packet in packets if "seq" in packet]
     assert replay == events[after:]
+    assert {packet["sha256"]: packet["content"] for packet in packets if "sha256" in packet} == data["artifacts"]
     assert "event: idle" in response.text
     assert (await client.get(f"/api/sessions/{session_id}/events?after=999999")).status_code == 409
 
@@ -142,6 +154,29 @@ async def test_duplicate_submission_and_busy_session(harness):
     assert "已有上下文" in session.replay(0, 10000)[-1]["data"]["answer"]
     assert len(factory.agents) == 1
     assert (await client.post(url, json=question(request_id="request-0003", concurrency=3))).status_code == 409
+
+
+async def test_reused_instance_observes_changed_model_and_request_controls(harness):
+    app, client, factory, _ = harness
+    await login(client)
+    identifier = await create(client)
+    url = f"/api/sessions/{identifier}/questions"
+    await client.post(url, json=question())
+    session = await finished(app, identifier)
+    body = question("next model", request_id="request-0002")
+    body["settings"].update(model="next-model", reasoning_effort="provider-custom", thinking=True)
+    await client.post(url, json=body)
+    await finished(app, identifier)
+    assert len(factory.agents) == 1 and factory.calls[2]["model"] == "next-model"
+    assert factory.calls[2]["reasoning_effort"] == "provider-custom"
+    events = session.replay(0, 10000)
+    assert fold_state(events)["agent"]["config"] == session.agent.config
+    assert len([event for event in events if event["type"] == "session/start"]) == 1
+    unchanged = len(events)
+    body["request_id"] = "request-0003"
+    await client.post(url, json=body)
+    await finished(app, identifier)
+    assert not any(e["type"].startswith("agent/set/") for e in session.replay(unchanged, 10000))
 
 
 @pytest.mark.parametrize("variant", ["A", "B"])

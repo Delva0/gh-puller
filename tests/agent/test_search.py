@@ -76,7 +76,8 @@ async def test_search_loop_uses_runtime_storage_and_canonical_events(
         assert await agent.result("Find evidence") == "Answer from evidence"
         assert len(reads) == 1
         files = [p for p in work.rglob("*") if p.is_file()]
-        assert files and all(p.suffix in {".body", ".md"} or p.name.endswith("-tool-result.json") for p in files)
+        assert files and all(p.suffix in {".body", ".md"} or p.name.endswith(
+            ("-tool-result.json", ".response.json", ".resource.json")) for p in files)
         assert await agent.result("Summarize the same evidence") == "Answer from evidence"
         assert len(reads) == 1 and len(requests) == 3
     await sinks.flush()
@@ -138,7 +139,8 @@ async def test_offload_retrieval_without_experiment_files(tmp_path):
         assert await agent.result("Read") == "Answer"
         assert await agent.result("Retrieve") == "Answer"
     assert len(reads) == 1 and len(requests) == 4
-    assert all(p.suffix == ".body" or p.name.endswith("-tool-result.json") for p in tmp_path.iterdir())
+    assert all(p.suffix == ".body" or p.name.endswith(
+        ("-tool-result.json", ".response.json")) for p in tmp_path.iterdir())
 
 
 def test_observation_package_does_not_import_concrete_agents_or_tools():
@@ -193,6 +195,12 @@ async def test_event_prefixes_restore_own_memory_and_foreign_context_only(tmp_pa
                          github_transport=httpx.MockTransport(lambda _: httpx.Response(200, json={"name": "evidence"})))
     async with source.session(session="original"):
         await source.result("Read original evidence")
+        before = copy.deepcopy(source.config), len(events)
+        with pytest.raises(ValueError, match="construct a new Agent"):
+            source.update_config({"model": "rejected", "concurrency": 100})
+        assert (source.config, len(events)) == before
+        source.update_config({"model": "different-model"})
+        source._require_event_recorder().set_agent(source.agent, source.config)
         await source.early_answers.early_answer("early", "An observed partial answer")
         final_prefix = len(events)
         source.clear_context()
@@ -201,7 +209,7 @@ async def test_event_prefixes_restore_own_memory_and_foreign_context_only(tmp_pa
     saved_at = next(i for i, e in enumerate(events) if e["type"] == "tool_result/saved")
     cleared_at = next(i for i, e in enumerate(events) if e["type"] == "tool_result/cleared")
     response_at = next(i for i, e in enumerate(events) if e["type"] == "github/response_saved")
-    response_id = events[response_at]["data"]["metadata"]["result_id"]
+    response_id = events[response_at]["data"]["result_id"]
     response_clear = next(i for i, e in enumerate(events) if e["type"] == "github/cleared")
     early_at = next(i for i, e in enumerate(events) if e["type"] == "agent/set/early_answers")
     early_clear = next(i for i, e in enumerate(events)
@@ -211,7 +219,7 @@ async def test_event_prefixes_restore_own_memory_and_foreign_context_only(tmp_pa
         options = {"web_search_backend": "duckduckgo", "web_search_interval": 7}
         resumed = target({**config, "agent_options": options}, ToolStorage(tmp_path / f"target-{end}"), api_key="test")
         async with resumed.session(session=f"resumed-{end}"):
-            resumed.load_events(events[:end])
+            resumed.load_events(events[:end], resolve_artifact=source.storage.read_artifact)
             assert resumed.web_tools.search_interval == 7
             assert len([m for m in resumed.messages if m["role"] == "system"]) == 1
             def conversation(items):
@@ -248,7 +256,7 @@ async def test_synchronous_provider_artifacts_join_the_same_event_stream(tmp_pat
     await sinks.flush()
     restored = WebAgent(config, ToolStorage(tmp_path / "restored"), api_key="test")
     async with restored.session(session="restored"):
-        restored.load_events(list(events))
+        restored.load_events(list(events), resolve_artifact=source.storage.read_artifact)
         assert restored.web_tools.resources == {"worker": {"ref": "worker", "body_file": "worker.body"}}
         assert restored.storage.read("worker.body") == b"worker evidence"
 
@@ -286,13 +294,14 @@ async def test_own_image_context_survives_repeated_reconstruction(tmp_path):
         target = WebAgent(config, ToolStorage(tmp_path / name), api_key="test",
                           model_transport=httpx.MockTransport(model))
         async with target.session(session=name):
-            target.load_events(history)
+            target.load_events(history, resolve_artifact=source.storage.read_artifact)
             assert target.messages[1:] == messages
             if generation == 1:
                 await target.result("Continue")
                 assert requests[-1]["messages"][1:-1] == messages
         await sinks.flush()
         history = [e for e in events if e["session"] == name]
+        source = target
     assert len(downloads) == 1
 
 

@@ -429,6 +429,12 @@ test('model popup, branch edits, regeneration, agent switching and portable hist
   const saved = await captureDownload(page, '导出事件');
   expect(saved.events.some((event: { type: string }) => event.type.startsWith('context/append'))).toBe(true);
   expect(saved.events.some((event: { type: string }) => event.type === 'artifact/saved')).toBe(true);
+  const artifacts = saved.events.filter((event: { type: string }) => event.type === 'artifact/saved');
+  expect(Object.keys(saved.artifacts).length).toBeGreaterThan(0);
+  for (const event of artifacts) {
+    expect(event.data.content).toBeUndefined();
+    expect(saved.artifacts[event.data.sha256]).toBeDefined();
+  }
   expect(saved.events.some((event: { type: string }) => event.type === 'context/checkpoint')).toBe(false);
   expect(saved.events.slice(0, before.events.length)).toEqual(before.events);
   await page.reload();

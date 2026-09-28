@@ -28,9 +28,12 @@ export const eventSchema = z.object({
   source_seq: z.number().optional(), elapsed_ms: z.number().optional(),
 });
 export type ChatEvent = z.infer<typeof eventSchema>;
+export const artifactSchema = z.object({ sha256: z.string().regex(/^[0-9a-f]{64}$/), content: z.string() });
+export const artifactsSchema = z.record(artifactSchema.shape.sha256, z.string());
 export interface Conversation {
   id: string; server_id?: string; source_id?: string; title: string; created: string; agent: Agent;
   settings: Settings; events: ChatEvent[]; readonly: boolean; renamed?: boolean;
+  artifacts?: Record<string, string>;
   branches?: Branch[]; branch_id?: string; live?: boolean;
   rebuild_acknowledged?: boolean;
 }

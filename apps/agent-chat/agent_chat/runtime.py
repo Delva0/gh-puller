@@ -274,7 +274,7 @@ class SessionManager:
                                 session.agent = session.context = None
                             raise
                 else:
-                    session.agent.config.update(config)
+                    session.agent.update_config(config)
                     session.agent.set_credentials(session.credentials)
                 answer = await session.agent.result(prompt)
         except asyncio.CancelledError:

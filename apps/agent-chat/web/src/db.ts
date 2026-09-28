@@ -1,9 +1,10 @@
 import { z } from 'zod';
-import { agentSchema, emptyPreferences, eventSchema, preferencesSchema, settingsSchema, publicData,
+import { agentSchema, artifactsSchema, emptyPreferences, eventSchema, preferencesSchema, settingsSchema, publicData,
   type Catalog, type Conversation, type Preferences } from './types';
 
 let connection: Promise<IDBDatabase> | undefined;
 const savedEvents = new Map<string, Conversation['events']>();
+const savedArtifacts = new Map<string, Set<string>>();
 const writes = new Map<string, Promise<void>>();
 function serialize(id: string, operation: () => Promise<void>) {
   const next = (writes.get(id) ?? Promise.resolve()).catch(() => {}).then(operation);
@@ -12,11 +13,13 @@ function serialize(id: string, operation: () => Promise<void>) {
 }
 function database() {
   if (!connection) connection = new Promise<IDBDatabase>((resolve, reject) => {
-    const request = indexedDB.open('trace-agent-chat', 1);
+    const request = indexedDB.open('trace-agent-chat', 2);
     request.onupgradeneeded = () => {
-      request.result.createObjectStore('chats', { keyPath: 'id' });
-      request.result.createObjectStore('events', { keyPath: ['chat_id', 'seq'] });
-      request.result.createObjectStore('preferences');
+      const db = request.result;
+      if (!db.objectStoreNames.contains('chats')) db.createObjectStore('chats', { keyPath: 'id' });
+      if (!db.objectStoreNames.contains('events')) db.createObjectStore('events', { keyPath: ['chat_id', 'seq'] });
+      if (!db.objectStoreNames.contains('preferences')) db.createObjectStore('preferences');
+      if (!db.objectStoreNames.contains('artifacts')) db.createObjectStore('artifacts', { keyPath: ['chat_id', 'sha256'] });
     };
     request.onsuccess = () => resolve(request.result);
     request.onerror = () => reject(request.error);
@@ -37,10 +40,16 @@ function result<T>(request: IDBRequest<T>) {
 }
 export async function loadHistory(): Promise<Conversation[]> {
   const db = await database();
-  const tx = db.transaction(['chats', 'events']);
-  const [chats, events] = await Promise.all([
+  const tx = db.transaction(['chats', 'events', 'artifacts']);
+  const [chats, events, artifacts] = await Promise.all([
     result(tx.objectStore('chats').getAll()), result(tx.objectStore('events').getAll()),
+    result(tx.objectStore('artifacts').getAll()),
   ]);
+  const attachments = new Map<string, Record<string, string>>();
+  for (const { chat_id, sha256, content } of artifacts) {
+    if (!attachments.has(chat_id)) attachments.set(chat_id, {});
+    attachments.get(chat_id)![sha256] = content;
+  }
   const grouped = new Map<string, Conversation['events']>();
   for (const { chat_id, ...event } of events) {
     if (!grouped.has(chat_id)) grouped.set(chat_id, []);
@@ -49,29 +58,38 @@ export async function loadHistory(): Promise<Conversation[]> {
   return chats.map(chat => {
     const entries = (grouped.get(chat.id) ?? []).sort((a, b) => a.seq - b.seq);
     savedEvents.set(chat.id, entries);
-    return { ...chat, settings: settingsSchema.parse(chat.settings), events: entries, readonly: false, live: false };
+    const bodies = attachments.get(chat.id) ?? {};
+    savedArtifacts.set(chat.id, new Set(Object.keys(bodies)));
+    return { ...chat, settings: settingsSchema.parse(chat.settings), events: entries, artifacts: bodies, readonly: false, live: false };
   });
 }
 export function saveChat(chat: Conversation) { return serialize(chat.id, async () => {
-  const { events, ...metadata } = chat;
+  const { events, artifacts = {}, ...metadata } = chat;
   const db = await database();
-  const tx = db.transaction(['chats', 'events'], 'readwrite');
+  const tx = db.transaction(['chats', 'events', 'artifacts'], 'readwrite');
   tx.objectStore('chats').put(publicData(metadata));
   const before = savedEvents.get(chat.id) ?? [];
   let common = 0;
   while (common < events.length && common < before.length && events[common] === before[common]) common++;
   if (common < before.length) tx.objectStore('events').delete(IDBKeyRange.bound([chat.id, common + 1], [chat.id, Number.MAX_SAFE_INTEGER]));
   for (const event of events.slice(common)) tx.objectStore('events').put({ chat_id: chat.id, ...publicData(event) });
+  const known = savedArtifacts.get(chat.id) ?? new Set<string>();
+  for (const [sha256, content] of Object.entries(artifacts)) if (!known.has(sha256)) {
+    tx.objectStore('artifacts').put({ chat_id: chat.id, sha256, content });
+  }
   await complete(tx);
   savedEvents.set(chat.id, events);
+  savedArtifacts.set(chat.id, new Set([...known, ...Object.keys(artifacts)]));
 }); }
 export function deleteChat(id: string) { return serialize(id, async () => {
   const db = await database();
-  const tx = db.transaction(['chats', 'events'], 'readwrite');
+  const tx = db.transaction(['chats', 'events', 'artifacts'], 'readwrite');
   tx.objectStore('chats').delete(id);
   tx.objectStore('events').delete(IDBKeyRange.bound([id, 0], [id, Number.MAX_SAFE_INTEGER]));
+  tx.objectStore('artifacts').delete(IDBKeyRange.bound([id, ''], [id, '\uffff']));
   await complete(tx);
   savedEvents.delete(id);
+  savedArtifacts.delete(id);
 }); }
 export async function saveSettings(settings: Preferences) {
   const db = await database();
@@ -94,18 +112,19 @@ export async function loadSettings(catalog: Catalog): Promise<Preferences | unde
 const exportChat = z.object({
   title: z.string().min(1).max(100), created: z.string(), agent: agentSchema,
   settings: settingsSchema, events: z.array(eventSchema).max(100000), renamed: z.boolean().optional(),
+  artifacts: artifactsSchema.optional(),
   branch_id: z.string().optional(), branches: z.array(z.object({ id: z.string(), agent: agentSchema,
     settings: settingsSchema, events: z.array(eventSchema).max(100000) })).max(200).optional(),
 });
-const historySchema = z.object({ version: z.union([z.literal(1), z.literal(2)]), conversations: z.array(exportChat).max(200) });
+const historySchema = z.object({ version: z.union([z.literal(1), z.literal(2), z.literal(3)]), conversations: z.array(exportChat).max(200) });
 export function exportHistory(chats: Conversation[]) {
-  return historySchema.parse(publicData({ version: 2, conversations: chats }));
+  return historySchema.parse(publicData({ version: 3, conversations: chats }));
 }
 export function importHistory(value: unknown): Conversation[] {
   if (value && typeof value === 'object' && 'session' in value && 'events' in value) {
-    const item = value as { session: object; events: unknown; branches?: unknown; branch_id?: string };
-    value = { version: 2, conversations: [{ created: new Date().toISOString(), ...item.session,
-      events: item.events, branches: item.branches, branch_id: item.branch_id }] };
+    const item = value as { session: object; events: unknown; artifacts?: unknown; branches?: unknown; branch_id?: string };
+    value = { version: 3, conversations: [{ created: new Date().toISOString(), ...item.session,
+      events: item.events, artifacts: item.artifacts, branches: item.branches, branch_id: item.branch_id }] };
   }
   return historySchema.parse(publicData(value)).conversations.map(chat => {
     if ([chat.events, ...(chat.branches ?? []).map(branch => branch.events)].some(events => events.some((event, index) => event.seq !== index + 1))) {
@@ -115,8 +134,8 @@ export function importHistory(value: unknown): Conversation[] {
   });
 }
 export function exportEvents(chat: Conversation) {
-  return publicData({ version: 2, session: { id: chat.id, title: chat.title, created: chat.created, agent: chat.agent, settings: chat.settings },
-    events: chat.events, branches: chat.branches, branch_id: chat.branch_id });
+  return publicData({ version: 3, session: { id: chat.id, title: chat.title, created: chat.created, agent: chat.agent, settings: chat.settings },
+    events: chat.events, artifacts: chat.artifacts, branches: chat.branches, branch_id: chat.branch_id });
 }
 export function download(name: string, value: unknown) {
   const url = URL.createObjectURL(new Blob([JSON.stringify(value, null, 2)], { type: 'application/json' }));

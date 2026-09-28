@@ -9,6 +9,7 @@ import pytest
 
 from gh_puller.agent.base import BaseAgent
 from gh_puller.agent.events import new_event, text_message
+from gh_puller.agents import GitHubAgent, WebAgent
 from gh_puller.tools.registry import ToolProvider, ToolRegistry, tool
 from gh_puller.tools.storage import ToolStorage
 from gh_puller.tools.tool_bash import DockerBashTools
@@ -45,7 +46,7 @@ async def test_base_replays_only_context_and_preserves_arbitrary_items():
     target = Adapter({})
     async with target.session():
         target.load_events(events)
-        assert target.native == [text_message("system", "target instructions"), unknown,
+        assert target.native == [text_message("system", "foreign instructions"), unknown,
                                  text_message("user", "continue")]
         assert target.native == target._require_event_recorder().context()
         target.native[1]["value"]["nested"].clear()
@@ -75,9 +76,23 @@ def test_registry_delegates_once_to_an_independent_provider():
     assert library.restored == [events]
 
 
+def test_private_replay_uses_execution_boundaries_not_config_observations():
+    start = new_event("session/start", label="same")
+    identity = new_event("agent/set", agent="search-github", config={"model": "a"})
+    fact = new_event("github/cleared", tool="github_rest")
+    changed = new_event("agent/set", agent="search-github", config={"model": "b"})
+    events = [start, identity, fact, changed]
+    assert GitHubAgent.own_events(events) == [fact, changed]
+    assert not WebAgent.own_events(events)
+    assert not GitHubAgent.own_events([*events, start, identity])
+    foreign = new_event("agent/set", agent="search-web", config={})
+    assert not GitHubAgent.own_events([*events, foreign, identity])
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(("provider", "method"), [(GitHubRESTTool, "github_rest"), (GitCodeTool, "gitcode_api")])
-async def test_api_tools_restore_evidence_cache_and_rate_limits_independently(tmp_path, provider, method):
+@pytest.mark.parametrize("legacy", [False, True])
+async def test_api_tools_restore_evidence_and_rate_limits_with_cold_caches(tmp_path, provider, method, legacy):
     reads = []
 
     def source(request):
@@ -95,33 +110,45 @@ async def test_api_tools_restore_evidence_cache_and_rate_limits_independently(tm
             original.api.cooldown("all", until)
         else:
             original.api.cooldown_until(until)
+        if legacy:
+            for event in events:
+                if event["type"].endswith("/response_saved"):
+                    event["data"] = {"tool": original.api.scope, "metadata": copy.deepcopy(
+                        original.responses[result["result_id"]])}
         before = copy.deepcopy(events)
         original_events = events
         for generation in range(2):
             restored_storage, replayed = observed_storage(tmp_path / f"restored-{generation}")
-            restored_storage.load_events(events)
+            restored_storage.load_events(events, resolve_artifact=storage.read_artifact)
             restored = provider(client, restored_storage, token="")
             restored.api.reuse_reads = True
             restored.load_events(events)
             saved = (await getattr(restored, method)("saved", [{"result_id": result["result_id"]}]))["results"][0]
             assert saved["data"]["id"] == 42
-            cached = (await getattr(restored, method)("cached", [{"path": "/repos/o/r"}]))["results"][0]
-            assert cached["result_id"] == result["result_id"] and len(reads) == 1
+            assert not restored.api._reads.responses and len(reads) == 1
             if provider is GitHubRESTTool:
                 assert restored.api.cooldowns["all"] == until
-                assert restored.api.resource_names[("/repos/o/r", "lexical")] == "core"
+                assert not restored.api.resource_names
             else:
                 assert restored.api.cooldown == until
             events = list(replayed)
+            assert all("metadata" not in e["data"] for e in events if e["type"].endswith("/response_saved"))
         restored.begin_query()
         blocked = (await getattr(restored, method)("fresh", [{"path": "/repos/o/r"}]))["results"][0]
         assert "error" in blocked and len(reads) == 1
+        if provider is GitHubRESTTool:
+            restored.api.cooldowns.clear()
+        else:
+            restored.api.cooldown = 0
+        fresh = (await getattr(restored, method)("new-read", [{"path": "/repos/o/r"}]))["results"][0]
+        assert fresh["result_id"] != result["result_id"] and len(reads) == 2
+        assert not any(e["type"].endswith(("/read_cached", "/query_started", "/resource_named")) for e in events)
         assert before[0] == {"type": "artifact/allocated", "data": {"sequence": 1}}
         start = len(original_events)
         original.clear_context()
         for end in range(start + 1, len(original_events) + 1):
             cleared_storage = ToolStorage(tmp_path / f"clear-{end}")
-            cleared_storage.load_events(original_events[:end])
+            cleared_storage.load_events(original_events[:end], resolve_artifact=storage.read_artifact)
             cleared = provider(client, cleared_storage, token="")
             cleared.load_events(original_events[:end])
             assert not cleared.responses and not cleared.api._reads.responses
@@ -142,7 +169,7 @@ async def test_offload_restores_retention_and_attachments_without_reexecuting(tm
                 policy=OffloadPolicy(num_user_query=1, preview_chars=1))
     source.prepare_messages([message, image])
     target_storage = ToolStorage(tmp_path / "target")
-    target_storage.load_events(events)
+    target_storage.load_events(events, resolve_artifact=storage.read_artifact)
     target = ToolResultStore(target_storage)
     target.load_events(events)
     messages = copy.deepcopy([message, image])
@@ -160,9 +187,9 @@ async def test_offload_restores_retention_and_attachments_without_reexecuting(tm
     source.bind(ToolOutput(later["content"], images=images, observations=parts), later, later_image,
                 name="retrieve", tool_query=next(iter(source.begin_tool_batch(1))),
                 policy=OffloadPolicy(num_user_query=1, preview_chars=1))
-    storage = ToolStorage(tmp_path / "duplicate-image")
-    storage.load_events(events)
-    target = ToolResultStore(storage)
+    duplicate = ToolStorage(tmp_path / "duplicate-image")
+    duplicate.load_events(events, resolve_artifact=storage.read_artifact)
+    target = ToolResultStore(duplicate)
     target.load_events(events)
     messages = copy.deepcopy([message, image, later, later_image])
     target.bind_messages(messages, images={"read": messages[1], "later": messages[3]})

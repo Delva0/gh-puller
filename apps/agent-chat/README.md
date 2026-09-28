@@ -133,21 +133,34 @@ Brave 测试会消耗一次搜索请求（按钮悬停提示）。所有 API Key
 
 唯一的恢复来源是主包 Agent 的事件流。应用转发、保存和传递事件，不读取或改写 Agent 内部字段，
 也不在提问结束后生成额外检查点。`BaseAgent.load_events()` 折叠 `context/*`，由具体 Agent
-将 Context 转为自己的原生表示；系统提示、工具及当前配置由目标 Agent 提供。
+将 Context 转为自己的原生表示。BaseAgent 不决定系统提示、工具或私有状态策略；
+搜索 Agent 的 CommonAgent 保留目标的系统提示、工具和当前配置。
+`agent/set` 仅观测身份与配置，不代表构造实例；搜索 Agent 按 `session/start` 区分执行实例，
+同一身份再次发布完整配置不会丢失前面的私有事件。实例内模型控制通过 `update_config()` 更新并发布
+相应的 `agent/set/<facet>`；没有改变的值不重复发布。应用不直接修改 Agent 的配置字典。
 `CommonAgent` 在加载自身事件流时，还调用已安装工具的 `load_events()`。每个工具解释自己的事件：
 
 | 组件 | 恢复依据 |
 | --- | --- |
-| ToolStorage | `artifact/allocated`、`artifact/saved`：操作编号和文件内容 |
-| GitHub/GitCode API 工具 | `github/*`、`gitcode/*`：响应索引、查询缓存、资源类别及限流期限 |
+| ToolStorage | `artifact/allocated`、`artifact/saved`：操作编号、文件路径、大小和 SHA-256 引用 |
+| GitHub/GitCode API 工具 | `github/*`、`gitcode/*`：不可变响应的索引引用与限流期限 |
 | Web 工具 | `web/resource_saved`、`web/cleared`、搜索调度及限流事件 |
 | 工具结果 offload | `tool_result/*`：完整结果引用、保留年龄与是否已被模型看到；正文仍来自 Context |
 | 提前回答 | 已有的 `agent/set/early_answers` |
 | 容器 Shell 工具 | 已有的 `sandbox/task_request`、`sandbox/task_observed`、`sandbox/shell_state` |
 
 工具可以独立回放，不依赖搜索 Agent 对其内部字段的了解，也没有统一对象快照。
-跨 Agent 只加载 Context，不带入私有状态；切回时不会复活旧 Agent 的缓存。
+跨 Agent 只加载 Context，不带入私有状态；切回时不会复活旧 Agent 的私有内存。
+查询缓存、在途请求和学习到的资源分类缓存不回放，按需重建。已返回的 `result_id`／资源引用属于
+不可变证据的身份，需要保留，不能用一次新网络请求替代。
 未携带的图片与文件用文本占位。新增工具按需实现自己的恢复方法，无状态工具无需实现。
+
+新增恢复事件使用简短信号或引用，不内嵌文件正文、图片或大块响应元数据。
+ToolStorage 的 `resolve_artifact(sha256)` 由调用者提供；不会根据导入事件任意读取宿主文件或联网。
+浏览器在独立 IndexedDB store 中按内容哈希保存附件，SSE 的附件消息与普通事件分开；同一文件只存一份。
+`events_<session_id>.json` 导出仍是一个文件，其 `events` 为时间线、`artifacts` 为附件，导入时校验哈希和大小。
+服务端恢复到新物理会话时重新发布已恢复的事实，使新事件流可以独立回放；附件按哈希复用。
+原始事件前缀和历史分支保持原样。仅拷贝 `events` 数组时，调用者须另行提供引用的附件。
 
 恢复到事件前缀指恢复当时记录的数据，不是恢复 Python 执行栈或重新执行已经发生的外部操作。
 连接与协程重新建立；中断且未提交输出的工具调用在继续提问时标为未观测到结果。
@@ -155,7 +168,8 @@ Code 可以恢复同一容器的已记录任务引用，但容器文件与进程
 模型与平台密钥不进入事件流。导入时验证序号、Context、文件路径和大小；工具加载时验证自己持有的
 文件引用，只访问会话专属目录。恢复失败会关闭半恢复的 Agent，阻止后续问题误用它。
 旧版展示记录、应用检查点和统一状态快照只用于迁移上下文，不迁移旧私有状态。事件与工具文件仍受保留上限约束。
-历史／事件导入文件上限为 32 MiB；设置导入上限为 1 MiB。
+历史／事件导入文件上限为 128 MiB；服务端分别限制事件字节数和解码后的工具附件大小。
+设置导入上限为 1 MiB。
 
 ## 镜像
 

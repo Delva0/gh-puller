@@ -12,7 +12,9 @@ Custom events are retained during compaction; only their owning adapter interpre
 The canonical namespaces remain reserved so a misspelled Context operation is rejected.
 
 Configuration and effect remain separate facts. Credential-shaped Agent configuration
-fields are redacted before reaching any sink.
+fields are redacted before reaching any sink. ``agent/set`` observes identity/configuration;
+it neither constructs an Agent nor opens an execution session. Re-observing the same
+identity does not discard its memory. ``session/start`` marks a new execution lifetime.
 
 ``usage`` contains recognized token counters; an absent counter is unknown, while
 an explicit zero remains zero. ``rawUsage`` preserves the adapter-supplied counter
