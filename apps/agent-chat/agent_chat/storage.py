@@ -29,6 +29,9 @@ class PrivateStorage(ToolStorage):
             data = data.replace(secret.encode(), b"[redacted]")
         return data
 
+    def read(self, name):
+        return self.scrub_bytes(super().read(name))
+
     def write(self, name, value, **metadata):
         data = value if isinstance(value, bytes) else (
             value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)

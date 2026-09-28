@@ -124,15 +124,20 @@ def tool_definitions(*providers) -> list[dict]:
 
 
 def tool_configuration(*providers, shared=()):
-    """Discover real tool names and configuration dependencies without constructing providers.
+    """Discover registered identities and installed names without constructing providers.
 
     Args:
         providers: Provider classes or instances with the same aliases used by ToolRegistry.
         shared: Configuration keys applied to all outputs by the enclosing agent.
+
+    Returns:
+        Registered function names as identities, with call_name retaining the installed
+        alias. Backends sharing a call alias remain distinct configuration targets.
     """
-    return [{"id": spec.name, "configuration": list(dict.fromkeys((*spec.configuration, *shared)))}
+    return [{"id": registered, "call_name": spec.name,
+             "configuration": list(dict.fromkeys((*spec.configuration, *shared)))}
             for entry in providers
-            for _, spec in installed_specs(*(entry if isinstance(entry, tuple) else (entry, None)))]
+            for registered, spec in installed_specs(*(entry if isinstance(entry, tuple) else (entry, None)))]
 
 
 def typescript_type(schema: dict) -> str:

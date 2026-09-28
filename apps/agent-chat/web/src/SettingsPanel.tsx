@@ -8,7 +8,7 @@ import { availabilityHint, credentialTestHint, fieldDescription, fieldValue, num
 import type { Availability } from './availability';
 import { api } from './api';
 import { emptyCredentials, emptyPreferences, preferencesSchema, settingsFor, type Catalog, type ConfigField,
-  type ConfigValues, type Credentials, type Preferences } from './types';
+  type ConfigValues, type Credentials, type Preferences, type ToolDefinition } from './types';
 import type { ModelDiscovery } from './useModels';
 import type { ConfigurationValidation } from './useValidation';
 
@@ -56,9 +56,9 @@ function ConfigInput({ field, value, onChange, onDraft, consumers }: {
       catch { setInvalid(true); onDraft('Invalid JSON'); }
     }} onBlur={() => { setText(format(effective)); setInvalid(false); onDraft(''); }} />;
   }
-  return <label className={`config-field ${field.type === 'boolean' && !field.choices.length ? 'switch-field' : ''}`}>
+  return <div className={`config-field ${field.type === 'boolean' && !field.choices.length ? 'switch-field' : ''}`}>
     <span className="config-label"><span title={description || undefined}>{label}</span>{consumers}</span>{control}
-  </label>;
+  </div>;
 }
 
 function AvailabilityDot({ status }: { status: Availability }) {
@@ -68,26 +68,58 @@ function AvailabilityDot({ status }: { status: Availability }) {
     aria-label={t(status.pending ? '待校验' : status.available ? '可用' : '不可用')} title={availabilityHint(status, language)} />;
 }
 
-export function SettingsPanel({ preferences, credentials, catalog, onChange, onClose, configured, discovery, validation, onDraft }: {
+function SharedTools({ tools, onSelect }: { tools: ToolDefinition[]; onSelect: (id: string) => void }) {
+  const t = useText();
+  const [open, setOpen] = useState(false);
+  const [above, setAbove] = useState(false);
+  const root = useRef<HTMLSpanElement>(null);
+  useEffect(() => {
+    if (!open) return;
+    const close = (event: PointerEvent) => { if (!root.current?.contains(event.target as Node)) setOpen(false); };
+    document.addEventListener('pointerdown', close);
+    return () => document.removeEventListener('pointerdown', close);
+  }, [open]);
+  if (tools.length < 2) return null;
+  return <span className="config-consumers" ref={root} onBlur={event => {
+    if (!event.currentTarget.contains(event.relatedTarget as Node)) setOpen(false);
+  }} onKeyDown={event => { if (event.key === 'Escape' && open) { event.preventDefault(); event.stopPropagation(); setOpen(false); } }}>
+    <button type="button" aria-expanded={open} title={t('使用此配置的工具')} onClick={event => {
+      event.preventDefault();
+      const bottom = root.current!.closest('.settings-page')!.getBoundingClientRect().bottom;
+      setAbove(root.current!.getBoundingClientRect().bottom + Math.min(tools.length * 36, 180) + 12 > bottom);
+      setOpen(!open);
+    }}>{tools.length} {t('个工具')}</button>
+    {open && <span className={`consumer-list ${above ? 'above' : ''}`} role="group" aria-label={t('使用此配置的工具')}>
+      {tools.map(tool => <button key={tool.id} type="button" onClick={event => {
+        event.preventDefault(); onSelect(tool.id); setOpen(false);
+      }}>{tool.id}</button>)}
+    </span>}
+  </span>;
+}
+
+export function SettingsPanel({ preferences, credentials, catalog, onChange, onClose, configured, discovery, validation, onDraft, currentAgent }: {
   preferences: Preferences; credentials: Credentials; catalog: Catalog;
   onChange: (preferences: Preferences, credentials: Credentials) => void; onClose: () => void; configured: Set<string>;
   discovery: ModelDiscovery;
   validation: ConfigurationValidation; onDraft: (key: string, reason: string) => void;
+  currentAgent: string;
 }) {
   const t = useText();
   const language = useContext(LanguageContext);
   const [tab, setTab] = useState('model');
   const [notice, setNotice] = useState('');
   const [keyStatus, setKeyStatus] = useState<Record<string, string>>({});
-  const [selectedTool, setSelectedTool] = useState('');
+  const [selectedAgent, setSelectedAgent] = useState(currentAgent);
+  const [toolId, setToolId] = useState('');
   const tested = useRef<Record<string, string>>({});
   const file = useRef<HTMLInputElement>(null);
   const tools = validation.tools;
+  const capability = catalog.agents.find(agent => agent.id === selectedAgent) ?? catalog.agents[0];
+  const selectedTool = tools.find(tool => tool.id === toolId) ?? tools[0];
   const credentialSpecs = Object.assign({}, ...catalog.agents.map(agent => agent.credentials)) as Catalog['agents'][number]['credentials'];
   const toolFields = [...new Map(catalog.agents.flatMap(item => item.fields).filter(field => field.tool).map(field => [field.key, field])).values()];
-  const visibleKeys = [...new Set(tools.filter(tool => !selectedTool || tool.id === selectedTool).flatMap(tool => tool.configuration))]
+  const visibleKeys = (selectedTool?.configuration ?? [])
     .filter(key => credentialSpecs[key] ? validation.fields[key]?.active !== false : toolFields.some(field => field.key === key));
-  useEffect(() => { if (selectedTool && !tools.some(tool => tool.id === selectedTool)) setSelectedTool(''); }, [tools, selectedTool]);
   async function testKey(key: string, value: string, force = false) {
     if (key !== 'api_key' && !credentialSpecs[key]?.testable) return;
     if (!value.trim() && !(key === 'api_key' && configured.has(key))) return;
@@ -104,11 +136,15 @@ export function SettingsPanel({ preferences, credentials, catalog, onChange, onC
       if (tested.current[key] === signature) setKeyStatus(status => ({ ...status, [key]: error instanceof Error ? error.message : '操作失败，请重试' }));
     } finally { validation.refresh(); }
   }
-  const consumers = (key: string) => <span className="config-consumers" aria-label={t('使用此配置的工具')}>
-    {tools.filter(tool => tool.configuration.includes(key)).map(tool => <button type="button" key={tool.id}
-      title={`${t('筛选工具配置')}: ${tool.id}`} className={tool.id === selectedTool ? 'selected' : ''}
-      onClick={event => { event.preventDefault(); setSelectedTool(selectedTool === tool.id ? '' : tool.id); }}>{tool.id}</button>)}</span>;
-  const keyField = (key: string, label: string, links?: ReactNode) => <label key={key}>
+  const consumers = (key: string) => <SharedTools key={`${selectedTool?.id}:${key}`}
+    tools={tools.filter(tool => tool.configuration.includes(key))} onSelect={setToolId} />;
+  const toolTiles = (items: ToolDefinition[], navigate = false) => <div className="tool-index" aria-label={t('工具')}>
+    {items.map(tool => <button key={tool.id} type="button" className="tool-node" data-tool={tool.id} aria-label={tool.id}
+      aria-pressed={navigate ? undefined : selectedTool?.id === tool.id} title={availabilityHint(validation.tool(tool.id), language)}
+      onClick={() => { setToolId(tool.id); if (navigate) setTab('tools'); }}>
+      <AvailabilityDot status={validation.tool(tool.id)} /><span>{tool.id}</span></button>)}
+  </div>;
+  const keyField = (key: string, label: string, links?: ReactNode) => <div className="credential-field" key={key}>
     <span className="config-label"><span>{label}</span>{links}</span><PasswordInput autoComplete="off" name={key} aria-label={label}
     value={credentials[key] ?? ''} onChange={e => {
       delete tested.current[key];
@@ -120,7 +156,7 @@ export function SettingsPanel({ preferences, credentials, catalog, onChange, onC
       disabled={key === 'api_key' ? discovery.status === 'loading' : keyStatus[key] === 'loading'}
       onMouseDown={event => event.preventDefault()} onClick={() => void testKey(key, credentials[key] ?? '', true)}>
       {(key === 'api_key' ? discovery.status === 'loading' : keyStatus[key] === 'loading') ? <LoaderCircle size={16} className="spin" /> : <Unplug size={16} />}</button>} />
-    {keyStatus[key] && keyStatus[key] !== 'loading' && <small role="status">{t(keyStatus[key])}</small>}</label>;
+    {keyStatus[key] && keyStatus[key] !== 'loading' && <small role="status">{t(keyStatus[key])}</small>}</div>;
   async function importConfig(selected?: File) {
     if (!selected) return;
     try {
@@ -136,7 +172,7 @@ export function SettingsPanel({ preferences, credentials, catalog, onChange, onC
   return <Modal title={t('设置')} wide onClose={onClose}>
     <div className="settings-layout"><nav className="settings-tabs" role="tablist" aria-label={t('设置')}>
       {[['model', t('模型'), '输入即保存。密钥仅保留在当前页面和活跃会话内存。'], ['agent', 'Agent', '每个 agent 分别保存自己的配置。'],
-        ['tools', t('工具'), '使用此工具的 agent 共用这些配置；已开始的会话保留原配置。']].map(([id, label, tip]) =>
+        ['tools', t('工具'), '共享配置由使用它的工具共同引用；修改在下次提问时生效。']].map(([id, label, tip]) =>
         <button key={id} type="button" role="tab" aria-selected={tab === id} aria-controls={`settings-${id}`}
           title={t(tip)} id={`settings-tab-${id}`} onClick={() => setTab(id)}>{label}</button>)}
     </nav><div className="settings-page" key={tab} role="tabpanel" id={`settings-${tab}`} aria-labelledby={`settings-tab-${tab}`}>
@@ -151,22 +187,24 @@ export function SettingsPanel({ preferences, credentials, catalog, onChange, onC
           onChange={e => onChange({ ...preferences, language: e.target.value as Preferences['language'] }, credentials)}>
           <option value="zh">简体中文</option><option value="en">English</option></select>
       </section></>}
-      {tab === 'agent' && catalog.agents.map(capability => <section className="settings-section" key={capability.id}>
+      {tab === 'agent' && <>
+        <div className="tool-index agent-index" aria-label="Agent">
+          {catalog.agents.map(agent => <button key={agent.id} type="button" className="tool-node" data-agent={agent.id}
+            aria-label={agent.name} aria-pressed={capability.id === agent.id} onClick={() => setSelectedAgent(agent.id)}>
+            <AvailabilityDot status={validation.agent(agent.id)} /><span>{agent.name}</span></button>)}
+        </div>
+        <section className="agent-config" key={capability.id}>
         <div className="settings-section-title"><AvailabilityDot status={validation.agent(capability.id)} /><h3>{capability.name}</h3></div>
         {capability.fields.filter(field => !field.tool).map(field => <ConfigInput key={field.key} field={field}
           onDraft={reason => onDraft(`agent:${capability.id}:${field.key}`, reason)}
           value={settingsFor(capability.id, preferences, catalog).options[field.key]} onChange={next => onChange({ ...preferences,
             agents: { ...preferences.agents, [capability.id]: { ...preferences.agents[capability.id], [field.key]: next } } }, credentials)} />)}
-      </section>)}
+        </section>
+        <section className="settings-section agent-tools"><h3>{t('所需工具')}</h3>{toolTiles(validation.agentTools(capability.id), true)}</section>
+      </>}
       {tab === 'tools' && <>
-        <div className="tool-index" aria-label={t('工具')}>
-          {tools.map(tool => <button key={tool.id} type="button" className="tool-node" data-tool={tool.id} aria-label={tool.id}
-            aria-pressed={selectedTool === tool.id} title={availabilityHint(validation.tool(tool.id), language)}
-            onClick={() => setSelectedTool(selectedTool === tool.id ? '' : tool.id)}>
-            <AvailabilityDot status={validation.tool(tool.id)} /><span>{tool.id}</span></button>)}
-        </div>
-        <div className="shared-config-heading"><h3>{t('共享配置')}</h3>
-          <button type="button" className="text-button" onClick={() => setSelectedTool('')} disabled={!selectedTool}>{t('全部配置')}</button></div>
+        {toolTiles(tools)}
+        <div className="settings-section-title"><AvailabilityDot status={validation.tool(selectedTool?.id ?? '')} /><h3>{selectedTool?.id}</h3></div>
         {visibleKeys.map(key => <section className="shared-config" data-config={key} key={key}>
           {credentialSpecs[key] ? keyField(key, uiLabel(key, language), consumers(key)) : <ConfigInput
             field={toolFields.find(field => field.key === key)!}

@@ -22,6 +22,7 @@ from ..tools.tool_offload import OffloadPolicy, ToolOutput, ToolResultStore
 from ..tools.tool_ptc import PTCTool
 from ..tools.tool_web import WebTools
 from .context import ContextMirror
+from .history import Checkpoint, read_events, restore, snapshot
 from .options import model_id, reasoning_effort
 
 
@@ -88,6 +89,8 @@ class CommonAgent(BaseAgent):
         self.on_early_answer = on_early_answer
         self.tool_definitions = []
         self.tool_results = ToolResultStore(storage)
+        self._history = Checkpoint(messages=[])
+        self._history_files = set()
         self.messages: list[dict] = []
         self.completed_steps: set[tuple[int, int]] = set()
         self.web_tools = self.web_client = None
@@ -292,6 +295,35 @@ class CommonAgent(BaseAgent):
         self.clear_resources()
         self.context.synchronize(self.messages, force=True)
         self.storage.event("context/cleared", query=self.context.query)
+
+    @classmethod
+    def validate_events(cls, events, *, max_bytes=64 * 1024 * 1024):
+        """Check recoverable observations before allocating an execution instance.
+
+        Args:
+            events: Ordered event dictionaries containing checkpoints or older observations.
+            max_bytes: Maximum total decoded evidence size accepted by the caller.
+
+        Returns:
+            Whether any observations lack a native checkpoint.
+        """
+        return read_events(events, max_bytes)[2]
+
+    def load_events(self, events, *, max_bytes=64 * 1024 * 1024):
+        """Restore recorded native context after entering a fresh agent session.
+
+        Args:
+            events: Ordered event dictionaries; existing context is replaced.
+            max_bytes: Maximum total decoded evidence size accepted by the caller.
+
+        Returns:
+            Whether any observations lack a native checkpoint.
+        """
+        return restore(self, events, max_bytes)
+
+    def export_context(self):
+        """Capture recorded context and newly created evidence for a checkpoint event."""
+        return snapshot(self)
 
     def set_model(self, model: str) -> None:
         """Change the model between turns, preserving context and request parameters."""

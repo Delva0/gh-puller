@@ -21,7 +21,7 @@ from gh_puller.agent.events import EventBus
 from gh_puller.agents import AGENTS
 
 from .config import Question, ServerSettings, resolve_settings, validate_capabilities
-from .portable import Checkpoint, restore, snapshot
+from .portable import restore, snapshot
 from .security import PublicTransport, SecretFilter
 from .storage import PrivateStorage
 
@@ -78,8 +78,7 @@ class Session:
     closed: bool = False
     limited: bool = False
     log_size: int = 0
-    portable: Checkpoint = field(default_factory=lambda: Checkpoint(messages=[]))
-    portable_files: set = field(default_factory=set)
+    history: list = field(default_factory=list)
     credential_base_url: str = ""
 
     def __post_init__(self):
@@ -283,7 +282,6 @@ class SessionManager:
             try:
                 if state := snapshot(session):
                     session.emit("context/checkpoint", state)
-                    session.portable_files.update(state["files"])
             except Exception as exc:  # Preserve the answer even if portable evidence exceeds retention limits.
                 error = (error + "; " if error else "") + "Context checkpoint unavailable: " + str(exc)
             session.finish(status, error, answer)

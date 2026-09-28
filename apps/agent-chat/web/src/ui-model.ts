@@ -12,10 +12,10 @@ const fields: Record<string, { label: [string, string]; description?: [string, s
   web_search_concurrency: { label: ['搜索并发', 'Search concurrency'], min: 1, max: 16 },
   web_search_interval: { label: ['搜索间隔（秒）', 'Search interval (seconds)'], min: 0, max: 300, step: 0.1,
     description: ['相邻搜索请求之间的最小等待时间。', 'Minimum time between search requests.'] },
-  tool_result_num_user_query: { label: ['结果保留提问数', 'Result retention (questions)'], min: 1, max: 1000 },
-  tool_result_num_tool_query: { label: ['结果保留调用数', 'Result retention (calls)'], min: 1, max: 10000 },
-  tool_result_preview_lines: { label: ['结果预览行数', 'Result preview lines'], min: 1, max: 1000 },
-  tool_result_preview_chars: { label: ['结果预览字符数', 'Result preview characters'], min: 1, max: 100000 },
+  tool_result_num_user_query: { label: ['工具结果保留提问数', 'Tool result retention (questions)'], min: 1, max: 1000 },
+  tool_result_num_tool_query: { label: ['工具结果保留调用数', 'Tool result retention (calls)'], min: 1, max: 10000 },
+  tool_result_preview_lines: { label: ['工具结果预览行数', 'Tool result preview lines'], min: 1, max: 1000 },
+  tool_result_preview_chars: { label: ['工具结果预览字符数', 'Tool result preview characters'], min: 1, max: 100000 },
 };
 const labels: Record<string, [string, string]> = {
   github: ['GitHub', 'GitHub'], gitcode: ['GitCode', 'GitCode'], web: ['网页', 'Web'], tool_results: ['工具结果', 'Tool results'],

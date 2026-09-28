@@ -40,6 +40,8 @@ export default function App() {
   const [removing, setRemoving] = useState<string[]>([]);
   const [search, setSearch] = useState('');
   const [showSettings, setShowSettings] = useState(false);
+  const [rebuild, setRebuild] = useState<{ chatId: string; prompt: string; query?: string; retry: boolean } | null>(null);
+  const [rememberRebuild, setRememberRebuild] = useState(false);
   const [draft, setDraft] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const pending = useRef(new Map<string, Pending>());
@@ -239,7 +241,7 @@ export default function App() {
     catch (error) { setLoginError(errorMessage(error)); }
     finally { setChecking(false); }
   }
-  async function send(prompt = draft, query?: string, retry = false) {
+  async function send(prompt = draft, query?: string, retry = false, confirmed = false) {
     let chat = chatsRef.current.find(item => item.id === activeId);
     if (!catalog || chat && isRunning(chat) || submitting) return;
     let body = retry && chat ? pending.current.get(chat.id) : undefined;
@@ -249,6 +251,9 @@ export default function App() {
     }
     if (!body && !configured.has('api_key')) {
       setNotice('请先在设置中输入模型 API Key。'); setShowSettings(true); return;
+    }
+    if (chat && (chat.events.length || chat.server_id || chat.source_id) && !body?.server_id && !confirmed && !chat.rebuild_acknowledged) {
+      setRebuild({ chatId: chat.id, prompt, query, retry }); setRememberRebuild(false); return;
     }
     if (!chat) {
       chat = { id: crypto.randomUUID(), title: t('新会话'), created: new Date().toISOString(), agent: selectedAgent,
@@ -472,10 +477,21 @@ export default function App() {
       </form><p className="composer-caption"><span>{t('Enter 发送 · Shift + Enter 换行')}</span><span>{t('以来源为依据，保留自己的判断')}</span></p>
     </div></main>
     {showSettings && catalog && <SettingsPanel preferences={preferences} credentials={credentials} catalog={catalog}
-      configured={configured} discovery={discovery} validation={validation}
+      configured={configured} discovery={discovery} validation={validation} currentAgent={selectedAgent}
       onDraft={(key, reason) => setConfigDrafts(value => {
         const next = { ...value }; if (reason) next[key] = reason; else delete next[key]; return next;
       })} onClose={() => { setShowSettings(false); setConfigDrafts({}); }} onChange={changePreferences} />}
+    {rebuild && <Modal title={t('继续会话')} onClose={() => setRebuild(null)}>
+      <p className="rebuild-note">{t('将重新构造 Agent，并根据事件流恢复已观测的上下文。当前会话 Agent 内存状态可能丢失')}</p>
+      <label className="remember-choice"><input type="checkbox" checked={rememberRebuild}
+        onChange={event => setRememberRebuild(event.target.checked)} />{t('本会话不再提示')}</label>
+      <footer className="modal-actions"><button type="button" className="secondary" onClick={() => setRebuild(null)}>{t('取消')}</button>
+        <button type="button" className="primary" onClick={() => {
+          if (rememberRebuild) update(rebuild.chatId, chat => ({ ...chat, rebuild_acknowledged: true }));
+          const request = rebuild; setRebuild(null);
+          if (activeId === request.chatId) void send(request.prompt, request.query, request.retry, true);
+        }}>{t('重建并继续')}</button></footer>
+    </Modal>}
     {rename && <Modal title={t('重命名会话')} onClose={() => setRename(null)}><form onSubmit={renameChat}>
       <label>{t('会话标题')}<input autoFocus required maxLength={100} value={renameText} onChange={e => setRenameText(e.target.value)} /></label>
       <footer className="modal-actions"><button type="button" className="secondary" onClick={() => setRename(null)}>{t('取消')}</button><button className="primary" type="submit"><Check size={16} />{t('保存标题')}</button></footer>

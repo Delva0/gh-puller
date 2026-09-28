@@ -59,15 +59,18 @@ def test_shared_tools_defaults_and_operator_only_bindings():
 
 
 @pytest.mark.parametrize("backend", ["rest", "graphql", "dsl", "split"])
-def test_tool_discovery_uses_runtime_aliases_and_shared_configuration(backend):
+def test_tool_discovery_preserves_registered_identity_under_runtime_aliases(backend):
     options = {**GitHubAgent.defaults, "backend": backend}
     tools = {item["id"]: item["configuration"] for item in GitHubAgent.configuration_tools(options)}
-    assert "web" not in tools and "tool_results" not in tools
-    assert "github_token" in tools["github"]
-    assert "tool_result_preview_chars" in tools["github"]
-    assert ("github_graphql" in tools) == (backend == "split")
+    name = "github_" + ("rest" if backend == "split" else backend)
+    assert not {"github", "web", "tool_results"} & tools.keys()
+    assert "github_token" in tools[name]
+    assert "tool_result_preview_chars" in tools[name]
+    assert ("github_graphql" in tools) == (backend in {"split", "graphql"})
+    installed = next(item for item in GitHubAgent.configuration_tools(options) if item["id"] == name)
+    assert installed["call_name"] == "github"
     if backend == "split":
-        assert tools["github"] == tools["github_graphql"]
+        assert tools["github_rest"] == tools["github_graphql"]
     ptc = {item["id"]: item["configuration"]
            for item in GitHubAgent.configuration_tools({**options, "ptc": "A"})}
     assert {"github_token", "brave_api_key"} <= set(ptc["run_code"])

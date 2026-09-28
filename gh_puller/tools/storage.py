@@ -68,6 +68,14 @@ class ToolStorage:
         self.describe(name, **metadata)
         return path.relative_to(self.root).as_posix()
 
+    def read(self, name: str) -> bytes:
+        """Read runtime evidence through caller-owned storage policy.
+
+        Args:
+            name: Relative path confined to this storage directory.
+        """
+        return self.path(name).read_bytes()
+
     @contextmanager
     def binary(self, name: str, **metadata):
         """Create a streamed file, retaining partial bytes on failure or cancellation.

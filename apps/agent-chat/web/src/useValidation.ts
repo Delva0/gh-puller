@@ -48,6 +48,7 @@ export function useValidation(catalog: Catalog | null, preferences: Preferences,
       key.startsWith('tool:') && fields.has(key.slice(5))).map(([key, value]) => [key.split(':').at(-1)!, value]));
     return state(report?.agents[id], errors);
   }
-  return { tools, fields: report?.fields ?? {}, agent, tool, refresh: () => setEpoch(value => value + 1) };
+  const agentTools = (id: string) => report?.agents[id]?.tools ?? catalog?.agents.find(agent => agent.id === id)?.tools ?? [];
+  return { tools, fields: report?.fields ?? {}, agent, tool, agentTools, refresh: () => setEpoch(value => value + 1) };
 }
 export type ConfigurationValidation = ReturnType<typeof useValidation>;

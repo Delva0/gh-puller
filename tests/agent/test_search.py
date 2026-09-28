@@ -153,3 +153,41 @@ from gh_puller.agent.events import fold_state
 assert fold_state([]) == {"agent": None, "context": []}
 """
     subprocess.run([sys.executable, "-I", "-c", source], check=True, capture_output=True, text=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("target", [GitHubAgent, GitCodeAgent, WebAgent])
+async def test_package_event_recovery_keeps_evidence_and_uses_target_configuration(tmp_path, target):
+    count = 0
+
+    def model(request):
+        nonlocal count
+        count += 1
+        if count == 1:
+            return completion(call("github", {"requests": [{"path": "/repos/o/r"}]}))
+        return completion({"content": "Evidence found"})
+
+    config = {"model": "test", "base_url": "https://model.example", "agent_options": {
+        "web_search_backend": "duckduckgo", "tool_result_preview_chars": 1,
+    }}
+    source = GitHubAgent(config, ToolStorage(tmp_path / "source"), api_key="test",
+                         model_transport=httpx.MockTransport(model),
+                         github_transport=httpx.MockTransport(lambda _: httpx.Response(200, json={"name": "evidence"})))
+    async with source.session(session="original"):
+        await source.result("Read original evidence")
+        messages = source.messages[1:]
+        checkpoint = source.export_context()
+    events = [{"seq": 1, "type": "context/checkpoint", "data": checkpoint}]
+    options = {"web_search_backend": "duckduckgo", "web_search_interval": 7}
+    resumed = target({**config, "agent_options": options}, ToolStorage(tmp_path / "target"), api_key="test")
+    async with resumed.session(session="resumed"):
+        assert not resumed.load_events(events)
+        assert resumed.messages[1:] == messages
+        assert resumed.web_tools.search_interval == 7
+        assert set(resumed.tool_registry.registered_names.values()) == {
+            tool["id"] for tool in target.configuration_tools(resumed.options)}
+        result = await resumed.tool_results.get_tool_result("again", list(checkpoint["saved"]))
+        assert "evidence" in result.content
+        assert not any(item.get("error") for item in json.loads(result.content)["results"])
+        assert not resumed.export_context()["files"]
+    assert source.storage.root != resumed.storage.root

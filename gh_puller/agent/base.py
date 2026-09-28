@@ -127,3 +127,16 @@ class BaseAgent:
             prompt: User text for the next session turn.
         """
         raise NotImplementedError
+
+    def load_events(self, events, **options):
+        """Restore observed context using the adapter's own representation.
+
+        Args:
+            events: Ordered event dictionaries. Restoration covers recorded observations,
+                not unobserved process memory; the target keeps its current configuration.
+            options: Adapter-specific recovery options, such as evidence size limits.
+
+        Raises:
+            NotImplementedError: The adapter does not provide event-stream recovery.
+        """
+        raise NotImplementedError("This agent does not implement event-stream recovery")

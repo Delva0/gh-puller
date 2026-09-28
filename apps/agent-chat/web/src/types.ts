@@ -32,6 +32,7 @@ export interface Conversation {
   id: string; server_id?: string; source_id?: string; title: string; created: string; agent: Agent;
   settings: Settings; events: ChatEvent[]; readonly: boolean; renamed?: boolean;
   branches?: Branch[]; branch_id?: string; live?: boolean;
+  rebuild_acknowledged?: boolean;
 }
 export interface Branch { id: string; events: ChatEvent[]; agent: Agent; settings: Settings }
 export interface SessionView {
@@ -46,11 +47,11 @@ export interface ConfigField {
   choices: { value: ConfigValues[string]; reason: string }[]; tool: string | null;
   effective_default?: ConfigValues[string];
 }
-export interface ToolDefinition { id: string; configuration: string[] }
+export interface ToolDefinition { id: string; call_name: string; configuration: string[] }
 export interface FieldValidation { valid: boolean; reason: string; active?: boolean; pending?: boolean }
 export interface ValidationState { valid: boolean; issues: Record<string, FieldValidation> }
 export interface ValidationReport {
-  agents: Record<string, ValidationState & { fields: Record<string, FieldValidation> }>;
+  agents: Record<string, ValidationState & { fields: Record<string, FieldValidation>; tools: (ToolDefinition & ValidationState)[] }>;
   tools: (ToolDefinition & ValidationState)[];
   fields: Record<string, FieldValidation>;
 }

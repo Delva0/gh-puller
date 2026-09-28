@@ -13,11 +13,15 @@ async function choose(page: Page, label: string, value: string) {
   await page.getByRole('combobox', { name: label, exact: true }).click();
   await page.getByRole('option', { name: new RegExp('^' + value + '$', 'i') }).click();
 }
+async function selectTool(page: Page, id: string) {
+  await page.getByRole('tab', { name: '工具', exact: true }).click();
+  await page.locator(`#settings-tools .tool-node[data-tool=${id}]`).click();
+}
 async function configure(page: Page) {
   await page.getByRole('button', { name: '打开设置' }).click();
   await page.getByLabel('模型地址').fill('https://model.example/v1');
   await page.getByLabel('模型 API Key').fill(secret);
-  await page.getByRole('tab', { name: '工具', exact: true }).click();
+  await selectTool(page, 'web_search');
   await page.locator('[name="web_search_backend"]').selectOption('"duckduckgo"');
   await page.getByRole('button', { name: '关闭', exact: true }).click();
   await expect(page.getByRole('dialog')).not.toBeVisible();
@@ -28,6 +32,13 @@ async function send(page: Page, prompt: string) {
   await page.getByLabel('输入问题').fill(prompt);
   await expect(page.getByRole('button', { name: '发送问题', exact: true })).toBeEnabled();
   await page.getByLabel('输入问题').press('Enter');
+  const confirmation = page.getByRole('dialog', { name: '继续会话', exact: true });
+  await expect.poll(async () => await confirmation.isVisible() || await page.getByRole('button', { name: '停止生成' }).isVisible()).toBe(true);
+  if (await confirmation.isVisible()) {
+    await confirmation.getByLabel('本会话不再提示').check();
+    await confirmation.getByRole('button', { name: '重建并继续', exact: true }).click();
+    await expect(confirmation).not.toBeVisible();
+  }
 }
 async function downloaded(item: Download) {
   return JSON.parse(await readFile((await item.path())!, 'utf8'));
@@ -258,18 +269,20 @@ test('configuration discovery, fixed panels, ranges, keys, import/export and lan
   await page.getByRole('tab', { name: 'Agent', exact: true }).click();
   expect((await page.getByRole('dialog').boundingBox())!.height).toBe(bounds!.height);
   await expect(page.locator('[name=backend]').first()).toHaveValue('"rest"');
-  await page.locator('[name=ptc]').nth(0).selectOption('"A"');
-  await page.locator('[name=ptc]').nth(1).selectOption('"B"');
+  await page.locator('[name=ptc]').selectOption('"A"');
   await page.locator('[name=concurrency]').first().fill('128');
   await expect(page.locator('[name=concurrency]').first()).toHaveAttribute('aria-invalid', 'true');
   await page.locator('[name=concurrency]').first().blur();
   await expect(page.locator('[name=concurrency]').first()).toHaveValue('8');
   await page.locator('[name=concurrency]').first().fill('16');
+  await page.locator('[data-agent=gitcode]').click();
+  await page.locator('[name=ptc]').selectOption('"B"');
+  await page.locator('[data-agent=fixture_research]').click();
   await page.locator('[name=strategy]').selectOption('"deep"');
   await page.locator('[name=candidate_count]').fill('1234');
   await page.locator('[name=follow_links]').uncheck();
   await page.screenshot({ path: info.outputPath('desktop-settings-agent.png'), fullPage: true, animations: 'disabled' });
-  await page.getByRole('tab', { name: '工具', exact: true }).click();
+  await selectTool(page, 'web_search');
   expect((await page.getByRole('dialog').boundingBox())!.height).toBe(bounds!.height);
   await expect(page.locator('[name=brave_api_key]')).toHaveCount(0);
   await page.locator('[name=web_search_backend]').selectOption('"brave"');
@@ -308,7 +321,8 @@ test('configuration discovery, fixed panels, ranges, keys, import/export and lan
   await expect(page.getByLabel('模型 API Key')).toHaveValue('');
   await page.getByRole('tab', { name: 'Agent', exact: true }).click();
   await expect(page.locator('[name=strategy]')).toHaveValue('"deep"');
-  await expect(page.locator('[name=ptc]').nth(1)).toHaveValue('"B"');
+  await page.locator('[data-agent=gitcode]').click();
+  await expect(page.locator('[name=ptc]')).toHaveValue('"B"');
   await page.getByRole('tab', { name: '模型', exact: true }).click();
   await page.getByLabel('语言').selectOption('en');
   await expect(page.getByRole('dialog', { name: 'Settings' })).toBeVisible();
@@ -344,7 +358,7 @@ test('legacy flat preferences migrate without rewriting archived settings', asyn
   await page.getByRole('tab', { name: 'Agent', exact: true }).click();
   await expect(page.locator('[name=backend]').first()).toHaveValue('"rest"');
   await expect(page.locator('[name=ptc]').first()).toHaveValue('false');
-  await page.getByRole('tab', { name: '工具', exact: true }).click();
+  await selectTool(page, 'web_search');
   await expect(page.locator('[name=web_search_concurrency]')).toHaveValue('3');
   await page.getByRole('button', { name: '关闭', exact: true }).click();
   await expect(page.getByRole('dialog')).not.toBeVisible();
@@ -453,9 +467,16 @@ test('mobile settings scroll independently and compact pickers fit the viewport'
   await page.getByRole('button', { name: '测试连接 GitHub API Key', exact: true }).click();
   await expect(page.getByRole('tabpanel')).toContainText('连接成功');
   await page.locator('[name=tool_result_preview_chars]').scrollIntoViewIfNeeded();
+  await page.locator('[data-config=tool_result_preview_chars] .config-consumers > button').click();
+  const sharedPopup = await page.locator('.consumer-list').boundingBox();
+  expect(sharedPopup!.x).toBeGreaterThanOrEqual(0);
+  expect(sharedPopup!.x + sharedPopup!.width).toBeLessThanOrEqual(390);
   expect((await page.getByRole('dialog').boundingBox())!.height).toBe(bounds!.height);
   expect(await page.getByRole('dialog').evaluate(element => element.scrollTop)).toBe(0);
   await page.screenshot({ path: info.outputPath('mobile-settings.png'), fullPage: true, animations: 'disabled' });
+  await page.locator('[data-config=tool_result_preview_chars] .config-consumers > button').press('Escape');
+  await expect(page.locator('.consumer-list')).toHaveCount(0);
+  await expect(page.getByRole('dialog')).toBeVisible();
   await page.getByRole('button', { name: '关闭', exact: true }).click();
   await expect(page.getByRole('dialog')).not.toBeVisible();
   await page.getByRole('button', { name: '折叠侧栏' }).click();
@@ -483,10 +504,11 @@ test('required tool credentials control agent availability, including retained s
   await expect(agent.locator('.config-field small')).toHaveCount(0);
   await page.getByRole('tab', { name: '工具', exact: true }).click();
   const web = page.locator('.tool-node[data-tool=web_search]');
-  await expect(page.locator('.tool-node[data-tool=github]')).toBeVisible();
+  await expect(page.locator('.tool-node[data-tool=github_rest]')).toBeVisible();
   await expect(page.locator('.tool-node[data-tool=web], .tool-node[data-tool=tool_results]')).toHaveCount(0);
   await expect(web.getByRole('img', { name: '不可用', exact: true })).toBeVisible();
   await expect(page.locator('.tool-node[data-tool=web_fetch]').getByRole('img', { name: '可用', exact: true })).toBeVisible();
+  await web.click();
   await page.locator('[name=web_search_backend]').selectOption('"auto"');
   await expect(web.getByRole('img', { name: '可用', exact: true })).toBeVisible();
   await page.locator('[name=web_search_backend]').selectOption('"brave"');
@@ -525,39 +547,98 @@ test('required tool credentials control agent availability, including retained s
   expect(await browserRecords(page)).not.toContain('fixture-brave-secret');
 });
 
-test('shared configuration links real tools without duplicate fields and validates drafts', async ({ page }, info) => {
+test('native tool identities, agent tiles and shared field navigation follow package choices', async ({ page }, info) => {
   await login(page); await configure(page);
   await page.getByRole('button', { name: '打开设置' }).click();
   await page.getByRole('tab', { name: 'Agent', exact: true }).click();
-  await page.locator('[name=backend]').first().selectOption('"split"');
-  await page.getByRole('tab', { name: '工具', exact: true }).click();
-  const github = page.locator('.tool-node[data-tool=github]');
-  await expect(github.getByRole('img', { name: '可用', exact: true })).toBeVisible();
-  await expect(page.locator('.tool-node[data-tool=github_graphql]')).toBeVisible();
+  await expect(page.locator('.agent-index [aria-pressed=true]')).toHaveCount(1);
+  await expect(page.locator('.agent-config')).toHaveCount(1);
+  await expect(page.locator('.agent-tools [data-tool=github_rest]')).toBeVisible();
+  await page.locator('[name=backend]').selectOption('"dsl"');
+  await expect(page.locator('.agent-tools [data-tool=github_dsl]')).toBeVisible();
+  await expect(page.locator('.agent-tools [data-tool=github_rest]')).toHaveCount(0);
+  await page.locator('.agent-tools [data-tool=github_dsl]').click();
+  await expect(page.getByRole('tab', { name: '工具', exact: true })).toHaveAttribute('aria-selected', 'true');
+  await expect(page.locator('#settings-tools [data-tool=github_dsl]')).toHaveAttribute('aria-pressed', 'true');
+  await expect(page.locator('[data-tool=github]')).toHaveCount(0);
+  await expect(page.getByRole('button', { name: '全部配置', exact: true })).toHaveCount(0);
+  await page.getByRole('tab', { name: 'Agent', exact: true }).click();
+  await page.locator('[name=backend]').selectOption('"split"');
+  await expect(page.locator('.agent-tools [data-tool=github_rest]')).toBeVisible();
+  await expect(page.locator('.agent-tools [data-tool=github_graphql]')).toBeVisible();
+  await page.screenshot({ path: info.outputPath('agent-tools.png'), fullPage: true, animations: 'disabled' });
+  await selectTool(page, 'github_rest');
+  const github = page.locator('#settings-tools [data-tool=github_rest]');
+  await github.click();
+  await expect(github).toHaveAttribute('aria-pressed', 'true');
+  await expect(page.locator('#settings-tools [aria-pressed=true]')).toHaveCount(1);
   await expect(page.locator('[name=github_token]')).toHaveCount(1);
   const shared = page.locator('[data-config=github_token]');
-  await expect(shared.locator('.config-consumers')).toContainText('github');
-  await expect(shared.locator('.config-consumers')).toContainText('github_graphql');
-  await github.click();
-  await expect(page.locator('[name=github_token]')).toBeVisible();
-  await expect(page.locator('[name=web_search_backend]')).toHaveCount(0);
+  await expect(shared.locator('.config-consumers')).toHaveText('2 个工具');
+  await page.locator('[name=github_token]').fill('shared-github-token');
+  await shared.getByRole('button', { name: '2 个工具', exact: true }).click();
+  await expect(shared.getByRole('group')).toContainText('github_rest');
+  await expect(shared.getByRole('group')).toContainText('github_graphql');
   await page.screenshot({ path: info.outputPath('shared-tool-config-dark.png'), fullPage: true, animations: 'disabled' });
-  await page.getByRole('button', { name: '全部配置', exact: true }).click();
-  const search = page.locator('.tool-node[data-tool=web_search]');
-  await search.click();
+  await shared.getByRole('button', { name: 'github_graphql', exact: true }).click();
+  await expect(page.locator('#settings-tools [data-tool=github_graphql]')).toHaveAttribute('aria-pressed', 'true');
+  await expect(page.locator('[name=github_token]')).toHaveValue('shared-github-token');
+  await expect(page.getByLabel('工具结果保留提问数', { exact: true })).toBeVisible();
+  await selectTool(page, 'web_search');
   await expect(page.locator('[name=github_token]')).toHaveCount(0);
   await page.locator('[name=web_search_concurrency]').fill('0');
-  await expect(search.getByRole('img', { name: '不可用', exact: true })).toBeVisible();
+  await expect(page.locator('#settings-tools [data-tool=web_search]').getByRole('img', { name: '不可用', exact: true })).toBeVisible();
   await page.locator('[name=web_search_concurrency]').blur();
   await expect(page.locator('[name=web_search_concurrency]')).toHaveValue('1');
-  await expect(search.getByRole('img', { name: '可用', exact: true })).toBeVisible();
-  await page.getByRole('button', { name: '全部配置', exact: true }).click();
+  await expect(page.locator('#settings-tools [data-tool=web_search]').getByRole('img', { name: '可用', exact: true })).toBeVisible();
   await page.getByRole('button', { name: '关闭', exact: true }).click();
   await expect(page.getByRole('dialog')).not.toBeVisible();
+  await expect(page.getByLabel('选择 agent')).toHaveText('GitHub');
   await page.getByRole('button', { name: '切换为浅色主题' }).click();
   await page.getByRole('button', { name: '打开设置' }).click();
-  await page.getByRole('tab', { name: '工具', exact: true }).click();
+  await selectTool(page, 'github_graphql');
   await page.screenshot({ path: info.outputPath('shared-tool-config-light.png'), fullPage: true, animations: 'disabled' });
+});
+
+test('rebuild is a neutral confirmation before changes, cancellation retains the live instance', async ({ page }, info) => {
+  await login(page); await configure(page); await send(page, 'original evidence');
+  await expect(page.locator('.execution > summary')).toContainText('已完成');
+  const original = (await (await page.request.get('/api/sessions')).json())[0].id;
+  await page.getByRole('button', { name: '打开设置' }).click();
+  await selectTool(page, 'web_search');
+  await page.locator('[name=web_search_interval]').fill('7');
+  await page.getByRole('button', { name: '关闭', exact: true }).click();
+  await expect(page.getByRole('dialog')).not.toBeVisible();
+  await page.getByLabel('输入问题').fill('use updated tools');
+  await page.getByLabel('输入问题').press('Enter');
+  const dialog = page.getByRole('dialog', { name: '继续会话', exact: true });
+  await expect(dialog).toContainText('将重新构造 Agent，并根据事件流恢复已观测的上下文。当前会话 Agent 内存状态可能丢失');
+  await expect(dialog.locator('.danger, [role=alert]')).toHaveCount(0);
+  await page.screenshot({ path: info.outputPath('rebuild-notice.png'), fullPage: true, animations: 'disabled' });
+  await dialog.getByRole('button', { name: '取消', exact: true }).click();
+  await expect(dialog).not.toBeVisible();
+  await expect(page.getByLabel('输入问题')).toHaveValue('use updated tools');
+  expect((await (await page.request.get('/api/sessions')).json()).map((session: { id: string }) => session.id)).toEqual([original]);
+  await expect(page.locator('.execution > summary')).toHaveCount(1);
+  await page.getByLabel('输入问题').press('Enter');
+  await dialog.getByLabel('本会话不再提示').check();
+  await dialog.getByRole('button', { name: '重建并继续', exact: true }).click();
+  await expect(dialog).not.toBeVisible();
+  await expect(page.locator('.execution > summary')).toHaveCount(2);
+  await expect(page.locator('.execution > summary').last()).toContainText('已完成');
+  const exported = await captureDownload(page, '导出事件');
+  const starts = exported.events.filter((event: { type: string }) => event.type === 'query/start');
+  expect(starts.map((event: { data: { settings: { options: { web_search_interval: number } } } }) => event.data.settings.options.web_search_interval)).toEqual([2, 7]);
+  expect((await page.request.get(`/api/sessions/${original}`)).status()).toBe(404);
+  await page.reload();
+  await page.getByLabel('输入问题').fill('remember this conversation');
+  await expect(page.getByRole('button', { name: '发送问题', exact: true })).toBeEnabled();
+  await page.getByLabel('输入问题').press('Enter');
+  await expect(page.locator('.execution > summary')).toHaveCount(3);
+  await expect(page.locator('.execution > summary').last()).toContainText('已完成');
+  await expect(dialog).not.toBeVisible();
+  const history = await captureDownload(page, '导出历史');
+  expect(JSON.stringify(history)).not.toContain('rebuild_acknowledged');
 });
 
 test('models without reasoning do not render empty thought cards', async ({ page }) => {
@@ -584,7 +665,7 @@ test('API keys test once on paste or blur, never while typing', async ({ page },
   const bounds = await page.getByRole('dialog').boundingBox();
   expect(bounds!.height).toBe(820);
   for (const key of ['api_key', 'github_token', 'gitcode_token', 'brave_api_key']) {
-    if (key === 'github_token') await page.getByRole('tab', { name: '工具', exact: true }).click();
+    if (key !== 'api_key') await selectTool(page, { github_token: 'github_rest', gitcode_token: 'gitcode_api', brave_api_key: 'web_search' }[key]!);
     const input = page.locator(`[name=${key}]`);
     await input.focus();
     await input.pressSequentially('typed-test-key', { delay: 5 });

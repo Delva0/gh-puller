@@ -56,7 +56,7 @@ def validate_configuration(body, manager, owner, checks):
         overrides = {key: body.tools[key] for key in config.owners if key in body.tools}
         overrides.update(body.agents.get(name, {}))
         report = config.validate(overrides, credentials, resources(manager.settings), checked)
-        reports[name] = {key: report[key] for key in ("valid", "issues", "fields")}
+        reports[name] = report
         for key in (*config.owners, *config.credentials):
             fields[key] = report["fields"][key]
         for item in report["tools"]:
