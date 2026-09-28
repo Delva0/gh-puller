@@ -27,7 +27,7 @@ const english: Record<string, string> = {
   '今天，想探究什么？': 'What are you curious about?', '从一个问题开始，沿着证据找到答案。': 'Start with a question. Follow the evidence.',
   '回到底部': 'Jump to bottom', '关闭提示': 'Dismiss notice', '输入问题': 'Message', '提出问题，一起循迹…': 'Ask a question. Follow the trail…',
   '选择 agent': 'Choose agent', '模型名': 'Model name', '思考强度': 'Reasoning effort', '关闭思考': 'Off',
-  '不可用': 'Unavailable', '停止生成': 'Stop generating', '发送问题': 'Send message',
+  '可用': 'Available', '不可用': 'Unavailable', '停止生成': 'Stop generating', '发送问题': 'Send message',
   'Enter 发送 · Shift + Enter 换行': 'Enter to send · Shift + Enter for a new line',
   '以来源为依据，保留自己的判断': 'Follow sources. Keep your own judgment.',
   '访问口令': 'Access passphrase', '输入私人访问口令': 'Enter your private passphrase',

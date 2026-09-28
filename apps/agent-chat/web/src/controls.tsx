@@ -2,10 +2,18 @@ import { useEffect, useId, useRef, useState, type CSSProperties, type InputHTMLA
 import { Check, ChevronDown, Eye, EyeOff, RefreshCw } from 'lucide-react';
 import { useText } from './i18n';
 
-export function PasswordInput({ actions, ...props }: InputHTMLAttributes<HTMLInputElement> & { actions?: ReactNode }) {
+export function PasswordInput({ actions, onCommit, ...props }: InputHTMLAttributes<HTMLInputElement> & {
+  actions?: ReactNode; onCommit?: (value: string) => void;
+}) {
   const t = useText();
   const [visible, setVisible] = useState(false);
-  return <span className="password-control"><input {...props} type={visible ? 'text' : 'password'} />
+  return <span className="password-control"><input {...props} type={visible ? 'text' : 'password'}
+    onBlur={event => { props.onBlur?.(event); onCommit?.(event.currentTarget.value); }}
+    onPaste={event => {
+      props.onPaste?.(event);
+      const input = event.currentTarget;
+      requestAnimationFrame(() => onCommit?.(input.value));
+    }} />
     <span className="password-actions">{actions}<button type="button" className="icon-button"
       aria-label={t(visible ? '隐藏密码' : '显示密码')} title={t(visible ? '隐藏密码' : '显示密码')}
       onClick={() => setVisible(!visible)}>{visible ? <EyeOff size={16} /> : <Eye size={16} />}</button></span></span>;

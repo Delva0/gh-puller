@@ -97,10 +97,14 @@ async def test_real_agents_replay_export_and_secret_free_files(harness, kind, ba
     app, client, factory, _ = harness
     await login(client)
     session_id = await create(client, kind)
+    assert (await client.get(f"/api/sessions/{session_id}")).json()["configured_credentials"] == []
     response = await client.post(f"/api/sessions/{session_id}/questions",
                                  json=question("secret evidence", backend=backend))
     assert response.status_code == 202
     session = await finished(app, session_id)
+    view = (await client.get(f"/api/sessions/{session_id}")).json()
+    assert view["configured_credentials"] == ["api_key"]
+    assert "fixture-model-secret-value" not in json.dumps(view)
     events = session.replay(0, 10000)
     assert events[-1]["data"]["status"] == "completed"
     assert len(factory.calls) == 2

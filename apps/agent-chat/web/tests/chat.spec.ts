@@ -34,7 +34,10 @@ async function downloaded(item: Download) {
 async function captureDownload(page: Page, name: string) {
   const pending = page.waitForEvent('download');
   await page.getByRole('button', { name, exact: true }).click();
-  return downloaded(await pending);
+  const file = await pending;
+  const contents = await downloaded(file);
+  if (name === '导出事件') expect(file.suggestedFilename()).toBe(`events_${contents.session.id}.json`);
+  return contents;
 }
 async function browserRecords(page: Page) {
   return page.evaluate(async () => {
@@ -63,6 +66,7 @@ test('credentials, streaming, traces, history management and refresh', async ({ 
   const errors: string[] = [];
   page.on('pageerror', error => errors.push(error.message));
   await login(page);
+  await expect(page.locator('.chat-row')).toHaveCount(0);
   await page.getByLabel('选择 agent').click();
   await expect(page.getByRole('option', { name: /^Code/ })).toBeDisabled();
   await page.keyboard.press('Escape');
@@ -109,6 +113,11 @@ test('credentials, streaming, traces, history management and refresh', async ({ 
   await page.getByRole('button', { name: '清空搜索' }).click();
 
   await page.getByRole('button', { name: '新建会话' }).click();
+  await expect(page.locator('.chat-row')).toHaveCount(1);
+  await expect(page.locator('.chat-row.active')).toHaveCount(0);
+  await expect(page.locator('.welcome')).toBeVisible();
+  await page.getByRole('button', { name: '新建会话' }).click();
+  await expect(page.locator('.chat-row')).toHaveCount(1);
   await expect(page.getByLabel('选择 agent')).toHaveText('GitHub');
   await page.getByRole('button', { name: '打开设置' }).click();
   await page.getByRole('tab', { name: 'Agent', exact: true }).click();
@@ -196,7 +205,7 @@ test('mobile drawer, long histories, code, tables and inert HTML', async ({ page
     ],
   }));
   await page.getByLabel('导入历史文件').setInputFiles({ name: 'long-history.json', mimeType: 'application/json', buffer: Buffer.from(JSON.stringify({ version: 1, conversations })) });
-  await expect(page.locator('.chat-open')).toHaveCount(43);
+  await expect(page.locator('.chat-open')).toHaveCount(42);
   await page.screenshot({ path: info.outputPath('mobile-drawer.png'), fullPage: true, animations: 'disabled' });
   await page.getByRole('button', { name: '折叠侧栏' }).click();
   await page.locator('.conversation-scroll').evaluate(element => { element.scrollTop = 0; });
@@ -454,4 +463,95 @@ test('mobile settings scroll independently and compact pickers fit the viewport'
   expect(popup!.x).toBeGreaterThanOrEqual(0);
   expect(popup!.x + popup!.width).toBeLessThanOrEqual(390);
   await page.screenshot({ path: info.outputPath('mobile-models.png'), fullPage: true, animations: 'disabled' });
+});
+
+test('required tool credentials control agent availability, including retained session keys', async ({ page }, info) => {
+  await login(page);
+  await page.getByLabel('选择 agent').click();
+  for (const name of ['GitHub', 'GitCode', 'Web', 'Code']) await expect(page.getByRole('option', { name: new RegExp('^' + name + '\\b') })).toBeDisabled();
+  await expect(page.getByRole('option', { name: /^Web\b/ })).toContainText('Brave API Key');
+  await page.keyboard.press('Escape');
+  await page.getByRole('button', { name: '打开设置' }).click();
+  await page.getByLabel('模型地址').fill('https://model.example/v1');
+  await page.getByLabel('模型 API Key').fill(secret);
+  await page.getByRole('tab', { name: 'Agent', exact: true }).click();
+  const agent = page.locator('section').filter({ has: page.getByRole('heading', { name: 'GitHub', exact: true }) });
+  await expect(agent.getByRole('img', { name: '不可用', exact: true })).toHaveAttribute('title', /Brave API Key/);
+  await expect(agent.locator('.config-field').first().locator('span')).toHaveAttribute('title', '此 Agent 向各工具提供的并发预算。');
+  await expect(agent.locator('.config-field small')).toHaveCount(0);
+  await page.getByRole('tab', { name: '工具', exact: true }).click();
+  const web = page.locator('section').filter({ has: page.getByRole('heading', { name: 'web', exact: true }) });
+  await expect(page.getByRole('heading', { name: 'github', exact: true })).toBeVisible();
+  await expect(web.getByRole('img', { name: '不可用', exact: true })).toBeVisible();
+  await page.locator('[name=web_search_backend]').selectOption('"auto"');
+  await expect(web.getByRole('img', { name: '可用', exact: true })).toBeVisible();
+  await page.locator('[name=web_search_backend]').selectOption('"brave"');
+  await page.locator('[name=brave_api_key]').fill('fixture-brave-secret');
+  await expect(web.getByRole('img', { name: '可用', exact: true })).toBeVisible();
+  await page.locator('[name=web_search_backend]').focus();
+  await expect(web).toContainText('连接成功');
+  await expect(page.locator('[name=web_search_backend]')).toHaveCSS('outline-style', 'none');
+  await page.screenshot({ path: info.outputPath('settings-tool-availability.png'), fullPage: true, animations: 'disabled' });
+  await page.getByRole('button', { name: '关闭', exact: true }).click();
+  await expect(page.getByRole('dialog')).not.toBeVisible();
+  await choose(page, '模型名', 'fixture-model');
+  await send(page, 'retain required credentials');
+  await expect(page.locator('.execution > summary')).toContainText('已完成');
+  const queryFont = await page.locator('.user-message > div').evaluate(e => getComputedStyle(e).fontSize);
+  await expect(page.locator('.markdown')).toHaveCSS('font-size', queryFont);
+  await page.reload();
+  await page.getByLabel('选择 agent').click();
+  await expect(page.getByRole('option', { name: 'Web', exact: true })).toBeEnabled();
+  await page.keyboard.press('Escape');
+  await send(page, 'continue with retained keys');
+  await expect(page.locator('.execution > summary')).toHaveCount(2);
+  await expect(page.locator('.execution > summary').last()).toContainText('已完成');
+  await page.getByRole('button', { name: '新建会话' }).click();
+  await expect(page.locator('.chat-row.active')).toHaveCount(0);
+  await expect(page.locator('.chat-row')).toHaveCount(1);
+  await page.getByLabel('选择 agent').click();
+  await expect(page.getByRole('option', { name: /^Web\b/ })).toBeDisabled();
+  await page.keyboard.press('Escape');
+  expect(await browserRecords(page)).not.toContain('fixture-brave-secret');
+});
+
+test('API keys test once on paste or blur, never while typing', async ({ page }, info) => {
+  const calls: string[] = [];
+  page.on('request', request => {
+    if (request.url().endsWith('/api/models')) calls.push('api_key');
+    if (request.url().endsWith('/api/credentials/test')) calls.push(request.postDataJSON().name);
+  });
+  await login(page);
+  await page.getByRole('button', { name: '打开设置' }).click();
+  await page.getByLabel('模型地址').fill('https://model.example/v1');
+  await expect(page.getByRole('heading', { name: '语言', exact: true })).toHaveJSProperty('tagName', 'H3');
+  const bounds = await page.getByRole('dialog').boundingBox();
+  expect(bounds!.height).toBe(820);
+  for (const key of ['api_key', 'github_token', 'gitcode_token', 'brave_api_key']) {
+    if (key === 'github_token') await page.getByRole('tab', { name: '工具', exact: true }).click();
+    const input = page.locator(`[name=${key}]`);
+    await input.focus();
+    await input.pressSequentially('typed-test-key', { delay: 5 });
+    await page.waitForTimeout(750);
+    expect(calls.filter(name => name === key)).toHaveLength(0);
+    await input.blur();
+    await expect.poll(() => calls.filter(name => name === key).length).toBe(1);
+    await expect(page.getByRole('tabpanel')).toContainText('连接成功');
+    await input.focus(); await input.blur();
+    expect(calls.filter(name => name === key)).toHaveLength(1);
+    await input.fill('');
+    await page.evaluate(() => navigator.clipboard.writeText('pasted-test-key'));
+    await input.press('Control+V');
+    await expect(input).toHaveValue('pasted-test-key');
+    await expect.poll(() => calls.filter(name => name === key).length).toBe(2);
+    await input.blur();
+    await expect(page.getByRole('tabpanel')).toContainText('连接成功');
+    expect(calls.filter(name => name === key)).toHaveLength(2);
+  }
+  await page.getByRole('button', { name: '关闭', exact: true }).click();
+  await expect(page.getByRole('dialog')).not.toBeVisible();
+  await page.getByRole('button', { name: '切换为浅色主题' }).click();
+  await page.getByLabel('输入问题').fill('多行草稿\n'.repeat(30));
+  await expect(page.getByLabel('输入问题')).toHaveCSS('scrollbar-width', 'thin');
+  await page.screenshot({ path: info.outputPath('light-composer-scroll.png'), fullPage: true, animations: 'disabled' });
 });

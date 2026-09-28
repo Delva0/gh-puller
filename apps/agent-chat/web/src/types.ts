@@ -38,6 +38,7 @@ export interface SessionView {
   id: string; agent: Agent; title: string; created: string; running: boolean;
   query_id: string | null; seq: number; settings: Settings | null;
   has_credentials: boolean; readonly: boolean;
+  configured_credentials: string[];
   recovery_warning?: boolean;
 }
 export interface ConfigField {
@@ -45,7 +46,7 @@ export interface ConfigField {
   choices: { value: ConfigValues[string]; reason: string }[]; tool: string | null;
   effective_default?: ConfigValues[string];
 }
-export interface ToolConfig { id: string; credentials: string[] }
+export interface ToolConfig { id: string; credentials: string[]; credential_requirements: Record<string, ConfigValues> }
 export interface Capability {
   id: Agent; name: string; available: boolean; reason: string;
   defaults: ConfigValues; fields: ConfigField[]; tools: ToolConfig[];

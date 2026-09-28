@@ -25,6 +25,8 @@ def test_added_fields_and_inherited_metadata_need_no_application_schema(monkeypa
     assert fields["follow_links"]["type"] == "boolean"
     assert fields["strategy"]["choices"] == [{"value": value, "reason": ""} for value in ("fast", "deep")]
     assert "max_steps" not in fields
+    web = next(tool for tool in catalog["tools"] if tool["id"] == "web")
+    assert web["credential_requirements"] == {"brave_api_key": {"web_search_backend": "brave"}}
     assert ResearchAgent.defaults["strategy"] == "fast"
     native = config.resolve({"candidate_count": 100000, "strategy": "deep"}, {})
     subject = ResearchAgent({"model": "arbitrary", "base_url": "https://example.org", **native},

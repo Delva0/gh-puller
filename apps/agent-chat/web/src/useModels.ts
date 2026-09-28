@@ -9,12 +9,12 @@ export function useModels(baseUrl: string, key: string, sessionId?: string, enab
   const [status, setStatus] = useState<'idle' | 'loading' | 'success' | 'error'>('idle');
   const [error, setError] = useState('');
   const generation = useRef(0);
-  const refresh = useCallback(async () => {
+  const refresh = useCallback(async (apiKey = key) => {
     const attempt = ++generation.current;
-    if (!enabled || !key && !sessionId) { setStatus('idle'); return; }
+    if (!enabled || !apiKey && !sessionId) { setStatus('idle'); return; }
     setStatus('loading'); setError('');
     try {
-      const result = await api<{ models: string[] }>('/models', 'POST', { base_url: baseUrl, api_key: key, session_id: sessionId });
+      const result = await api<{ models: string[] }>('/models', 'POST', { base_url: baseUrl, api_key: apiKey, session_id: sessionId });
       if (attempt !== generation.current) return;
       setModels(result.models); setStatus('success');
       localStorage.setItem('trace-models', JSON.stringify({ [baseUrl]: result.models }));
@@ -25,10 +25,16 @@ export function useModels(baseUrl: string, key: string, sessionId?: string, enab
   }, [baseUrl, key, sessionId, enabled]);
   useEffect(() => {
     generation.current++;
-    setModels(cached(baseUrl)); setStatus('idle'); setError('');
-    const timer = setTimeout(() => void refresh(), 650);
-    return () => { clearTimeout(timer); generation.current++; };
-  }, [baseUrl, refresh]);
+    setStatus('idle'); setError('');
+    return () => { generation.current++; };
+  }, [baseUrl, key, sessionId, enabled]);
+  useEffect(() => { setModels(cached(baseUrl)); }, [baseUrl]);
+  useEffect(() => {
+    // Reconnect with server-held credentials. Typed keys are tested only on paste or blur.
+    if (enabled && sessionId && !key) void refresh();
+    // Credential edits must not schedule network requests.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [baseUrl, sessionId, enabled]);
   return { models, status, error, refresh };
 }
 export type ModelDiscovery = ReturnType<typeof useModels>;

@@ -115,7 +115,7 @@ export function importHistory(value: unknown): Conversation[] {
   });
 }
 export function exportEvents(chat: Conversation) {
-  return publicData({ version: 2, session: { title: chat.title, created: chat.created, agent: chat.agent, settings: chat.settings },
+  return publicData({ version: 2, session: { id: chat.id, title: chat.title, created: chat.created, agent: chat.agent, settings: chat.settings },
     events: chat.events, branches: chat.branches, branch_id: chat.branch_id });
 }
 export function download(name: string, value: unknown) {

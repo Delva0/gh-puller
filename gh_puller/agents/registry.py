@@ -58,7 +58,10 @@ class AgentConfiguration:
         return {"id": self.agent.name, "name": self.agent.__name__.removesuffix("Agent"),
                 "available": not missing, "reason": "Requires: " + ", ".join(missing) if missing else "",
                 "defaults": self.public_defaults(), "fields": fields,
-                "tools": [{"id": tool.name, "credentials": list(tool.credentials)} for tool in self.agent.tool_configs]}
+                "tools": [{"id": tool.name, "credentials": list(tool.credentials),
+                           "credential_requirements": {key: spec.required_when for key, spec in tool.credentials.items()
+                                                       if spec.required_when}}
+                          for tool in self.agent.tool_configs]}
 
     def resolve(self, values, resources):
         """Validate public overrides and inject only declared operator resource bindings.

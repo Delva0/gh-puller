@@ -1,5 +1,6 @@
 import type { Catalog, ConfigField, ConfigValues, Preferences } from './types';
 import type { Language } from './i18n';
+import type { Availability } from './availability';
 
 // Presentation policy belongs here; availability and actual defaults come from the package catalog.
 const fields: Record<string, { label: [string, string]; description?: [string, string]; min?: number; max?: number; step?: number }> = {
@@ -34,6 +35,10 @@ const readable = (key: string) => key.split('_').map(word => word.length <= 3 ? 
 export const uiLabel = (key: string, language: Language) => (fields[key]?.label ?? labels[key])?.[language === 'zh' ? 0 : 1] ?? readable(key);
 export const fieldDescription = (field: ConfigField, language: Language) => fields[field.key]?.description?.[language === 'zh' ? 0 : 1] ?? field.description;
 export const toolLabel = (key: string, language: Language) => tools[key]?.[language === 'zh' ? 0 : 1] ?? readable(key);
+export function availabilityHint(status: Availability, language: Language) {
+  return [status.reason, status.missing.length ? `${language === 'zh' ? '请配置' : 'Configure'}: ${status.missing.map(key => uiLabel(key, language)).join(', ')}` : '']
+    .filter(Boolean).join(' · ') || (language === 'zh' ? '可用' : 'Available');
+}
 export const fieldValue = (field: ConfigField, value: ConfigValues[string]) => value ?? field.effective_default ?? field.default;
 export function numericPolicy(field: ConfigField) {
   const rule = fields[field.key];

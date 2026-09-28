@@ -7,6 +7,8 @@ import { SettingsPanel } from './SettingsPanel';
 import { CompactSelect, PasswordInput } from './controls';
 import { LanguageContext, translator } from './i18n';
 import { useModels } from './useModels';
+import { agentAvailability } from './availability';
+import { availabilityHint } from './ui-model';
 import { fork, selectBranch, versions } from './branches';
 import { deleteChat, exportEvents, download, exportHistory, importHistory, loadHistory, loadSettings, saveChat, saveSettings } from './db';
 import { emptyCredentials, emptyPreferences, eventSchema, isRunning, publicData, settingsFor,
@@ -30,7 +32,7 @@ export default function App() {
   const [theme, setTheme] = useState(() => localStorage.getItem('trace-theme') === 'light' ? 'light' : 'dark');
   const [credentials, setCredentials] = useState<Credentials>(emptyCredentials);
   const keysRef = useRef(credentials);
-  const [remembered, setRemembered] = useState<Record<string, boolean>>({});
+  const [remembered, setRemembered] = useState<Record<string, string[]>>({});
   const [notice, setNotice] = useState('');
   const [sidebar, setSidebar] = useState(() => window.innerWidth > 760);
   const [resizing, setResizing] = useState(false);
@@ -55,12 +57,17 @@ export default function App() {
   const searchInput = useRef<HTMLInputElement>(null);
   const fileInput = useRef<HTMLInputElement>(null);
   const active = chats.find(chat => chat.id === activeId);
-  const capability = catalog?.agents.find(item => item.id === active?.agent);
+  const selectedAgent = active?.agent ?? preferences.agent ?? catalog?.default_agent ?? '';
+  const capability = catalog?.agents.find(item => item.id === selectedAgent);
+  const composerSettings = active?.settings ?? (catalog ? settingsFor(selectedAgent, preferences, catalog) : undefined);
   const turns = useMemo(() => turnsFrom(active?.events ?? []), [active?.events]);
   const running = active ? isRunning(active) : false;
   const credentialSource = active?.server_id ?? active?.source_id;
+  const configured = new Set([...Object.keys(credentials).filter(key => credentials[key].trim()),
+    ...(credentialSource ? remembered[credentialSource] ?? [] : [])]);
+  const available = catalog && capability ? agentAvailability(capability, preferences, catalog, configured) : undefined;
   const discovery = useModels(preferences.connection.base_url ?? catalog?.defaults.base_url ?? '', credentials.api_key ?? '',
-    credentialSource && remembered[credentialSource] ? credentialSource : undefined, authenticated);
+    credentialSource && remembered[credentialSource]?.includes('api_key') ? credentialSource : undefined, authenticated);
   useEffect(() => {
     document.documentElement.lang = preferences.language === 'en' ? 'en' : 'zh-CN';
     localStorage.setItem('trace-language', preferences.language);
@@ -94,12 +101,8 @@ export default function App() {
     }
   }
 
-  function newChat(settings = preferences, directory = catalog) {
-    if (!directory) return;
-    const agent = directory.agents.find(item => item.id === settings.agent && item.available)?.id ?? directory.default_agent;
-    const chat: Conversation = { id: crypto.randomUUID(), title: t('新会话'), created: new Date().toISOString(),
-      agent, settings: settingsFor(agent, settings, directory), events: [], readonly: false, branch_id: crypto.randomUUID() };
-    commit([...chatsRef.current, chat]); setActiveId(chat.id); setDraft(''); setNotice('');
+  function newChat() {
+    setActiveId(''); setDraft(''); setNotice(''); setConnection('ready');
     follow.current = true; setAtBottom(true);
     if (window.innerWidth <= 760) setSidebar(false);
     setTimeout(() => input.current?.focus(), 0);
@@ -112,14 +115,14 @@ export default function App() {
     setCatalog(info);
     const config = await loadSettings(info).catch(() => undefined) ?? emptyPreferences;
     setPreferences(config);
-    setRemembered(Object.fromEntries(sessions.map(session => [session.id, session.has_credentials])));
+    setRemembered(Object.fromEntries(sessions.map(session => [session.id, session.configured_credentials])));
     commit(chatsRef.current.map(chat => {
       const session = sessions.find(item => item.id === chat.server_id);
       return { ...chat, readonly: false, live: session?.running ?? false, server_id: session?.id,
         settings: session?.running ? chat.settings : settingsFor(chat.agent, config, info) };
     }));
     setAuthenticated(true); setLoginError(''); setConnection('ready');
-    if (!chatsRef.current.length) newChat(config, info);
+    if (!chatsRef.current.length) newChat();
     setStreamEpoch(n => n + 1);
   }
 
@@ -188,7 +191,7 @@ export default function App() {
       flush(); source.close(); setConnection('ready');
       void api<SessionView>(`/sessions/${serverId}`).then(session => {
         if (!disposed) {
-          setRemembered(value => ({ ...value, [serverId]: session.has_credentials }));
+          setRemembered(value => ({ ...value, [serverId]: session.configured_credentials }));
           update(id, chat => chat.server_id === serverId && chat.branch_id === branchId ? { ...chat, live: session.running } : chat);
         }
       }).catch(() => {});
@@ -236,11 +239,19 @@ export default function App() {
   }
   async function send(prompt = draft, query?: string, retry = false) {
     let chat = chatsRef.current.find(item => item.id === activeId);
-    if (!chat || isRunning(chat) || submitting) return;
-    let body = retry ? pending.current.get(chat.id) : undefined;
+    if (!catalog || chat && isRunning(chat) || submitting) return;
+    let body = retry && chat ? pending.current.get(chat.id) : undefined;
     if (!body && !prompt.trim()) return;
-    if (!body && !credentials.api_key && !((chat.server_id ?? chat.source_id) && remembered[(chat.server_id ?? chat.source_id)!])) {
+    if (!body && !available?.available) {
+      setNotice(available ? availabilityHint(available, preferences.language) : '不可用'); setShowSettings(true); return;
+    }
+    if (!body && !configured.has('api_key')) {
       setNotice('请先在设置中输入模型 API Key。'); setShowSettings(true); return;
+    }
+    if (!chat) {
+      chat = { id: crypto.randomUUID(), title: t('新会话'), created: new Date().toISOString(), agent: selectedAgent,
+        settings: settingsFor(selectedAgent, preferences, catalog), events: [], readonly: false, branch_id: crypto.randomUUID() };
+      commit([...chatsRef.current, chat]); setActiveId(chat.id); setSearch('');
     }
     if (query && !retry) { chat = fork(chat, query); update(chat.id, () => chat!); }
     body ??= { request_id: crypto.randomUUID(), prompt: prompt.trim(), settings: chat.settings, credentials: { ...credentials } };
@@ -256,13 +267,16 @@ export default function App() {
           session = await api<SessionView>('/sessions', 'POST', { ...payload, source_session: undefined });
         }
         body.server_id = session.id;
+        setRemembered(value => ({ ...value, [session.id]: session.configured_credentials }));
         update(chat.id, item => ({ ...item, server_id: session.id, source_id: undefined }));
         if (session.recovery_warning) setNotice('旧记录缺少原生检查点，已恢复可用对话；缺失的工具附件需重新获取。');
       }
       const { server_id: serverId, ...question } = body;
       await api(`/sessions/${serverId}/questions`, 'POST', question);
       pending.current.delete(chat.id); setDraft('');
-      setRemembered(value => ({ ...value, [serverId!]: true }));
+      setRemembered(value => ({ ...value, [serverId!]: [...new Set([
+        ...(value[serverId!] ?? []), ...Object.keys(body.credentials).filter(key => body.credentials[key].trim()),
+      ])] }));
       update(chat.id, item => ({ ...item, live: true }));
       follow.current = true; setAtBottom(true); setStreamEpoch(n => n + 1);
     } catch (error) {
@@ -278,10 +292,12 @@ export default function App() {
     catch (error) { setNotice(errorMessage(error)); }
   }
   function changeAgent(agent: Agent) {
-    if (!active || running || !catalog) return;
+    if (running || !catalog) return;
+    const target = catalog.agents.find(item => item.id === agent);
+    if (!target || !agentAvailability(target, preferences, catalog, configured).available) return;
     const next = { ...preferences, agent };
     changePreferences(next);
-    update(active.id, chat => ({ ...chat, agent, settings: settingsFor(agent, next, catalog) }));
+    if (active) update(active.id, chat => ({ ...chat, agent, settings: settingsFor(agent, next, catalog) }));
   }
   async function renameChat(event: React.FormEvent) {
     event.preventDefault(); if (!rename || !renameText.trim()) return;
@@ -351,8 +367,8 @@ export default function App() {
     </form>{loginError && <div className="login-error" role="alert"><CircleAlert size={16} />{t(loginError)}</div>}
   </div><span className="login-corner">{t('循迹 / TRACE THE EVIDENCE')}</span></main></LanguageContext.Provider>;
 
-  const modelOptions = [...new Set([active?.settings.model ?? catalog?.defaults.model ?? '', ...discovery.models])].filter(Boolean).map(value => ({ value, label: value }));
-  const effort = active?.settings.thinking ? active.settings.reasoning_effort : 'off';
+  const modelOptions = [...new Set([composerSettings?.model ?? '', ...discovery.models])].filter(Boolean).map(value => ({ value, label: value }));
+  const effort = composerSettings?.thinking ? composerSettings.reasoning_effort : 'off';
   const efforts = [{ value: 'off', label: t('关闭思考') }, ...['low', 'high', 'max'].map(value => ({ value, label: value[0].toUpperCase() + value.slice(1) }))];
   if (effort && !efforts.some(item => item.value === effort)) efforts.push({ value: effort, label: effort });
   return <LanguageContext.Provider value={preferences.language}><div className={`app ${sidebar ? '' : 'sidebar-hidden'} ${resizing ? 'resizing' : ''}`} style={{ '--sidebar-width': `${preferences.sidebar_width}px` } as CSSProperties}>
@@ -391,7 +407,8 @@ export default function App() {
       <span className="header-name">{capability?.name ?? active?.agent ?? '循迹'}<ChevronDown size={14} /></span>
       <span className="header-divider">/</span><span className="header-title">{active?.title ?? '循迹'}</span></div>
       <div className="header-right"><span className="status-pill"><i />{t('私人会话')}</span>
-        {Boolean(active?.events.length) && <button className="icon-button" aria-label={t('导出事件')} title={t('导出 events.json')} onClick={() => download('events.json', exportEvents(active!))}><Download size={18} /></button>}
+        {Boolean(active?.events.length) && <button className="icon-button" aria-label={t('导出事件')} title={t('导出事件')}
+          onClick={() => download(`events_${active!.id}.json`, exportEvents(active!))}><Download size={18} /></button>}
         <button className="icon-button theme-toggle" aria-label={t(theme === 'dark' ? '切换为浅色主题' : '切换为深色主题')}
           onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')}>{theme === 'dark' ? <Sun size={18} /> : <Moon size={18} />}</button></div>
     </header>
@@ -435,21 +452,25 @@ export default function App() {
             if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) { e.preventDefault(); if (!running) void send(); }
           }} />
         <div className="composer-tools"><CompactSelect label={t('选择 agent')} disabled={running || submitting}
-          value={active?.agent ?? catalog?.default_agent ?? ''} onChange={changeAgent}
-          options={catalog?.agents.map(item => ({ value: item.id, label: item.name, disabled: !item.available, reason: item.reason })) ?? []} />
-          <div className="composer-right"><CompactSelect className="model-select" label={t('模型名')} value={active?.settings.model ?? ''}
+          value={selectedAgent} onChange={changeAgent}
+          options={catalog?.agents.map(item => {
+            const status = agentAvailability(item, preferences, catalog, configured);
+            return { value: item.id, label: item.name, disabled: !status.available, reason: availabilityHint(status, preferences.language) };
+          }) ?? []} />
+          <div className="composer-right"><CompactSelect className="model-select" label={t('模型名')} value={composerSettings?.model ?? ''}
             options={modelOptions} onChange={model => changeModel({ model })} disabled={running || submitting} searchable
             onRefresh={() => void discovery.refresh()} status={discovery.status === 'loading' ? t('检测模型中…') : discovery.status === 'error' ? t(discovery.error) :
               discovery.status === 'idle' && !discovery.models.length ? t('请配置模型连接以获取列表') : undefined} />
           <CompactSelect className="effort-select" label={t('思考强度')} value={effort ?? 'high'} options={efforts} disabled={running || submitting}
             onChange={value => changeModel(value === 'off' ? { thinking: false } : { thinking: true, reasoning_effort: value })} />
           {running ? <button type="button" className="send-button stop" aria-label={t('停止生成')} onClick={() => void stop()}><Square size={15} fill="currentColor" /></button> :
-            <button className="send-button" aria-label={t('发送问题')} type="submit" disabled={!draft.trim() || submitting || !catalog}>
+            <button className="send-button" aria-label={t('发送问题')} type="submit" disabled={!draft.trim() || submitting || !available?.available}
+              title={available && !available.available ? availabilityHint(available, preferences.language) : undefined}>
               {submitting ? <LoaderCircle size={19} className="spin" /> : <ArrowUp size={21} />}</button>}</div></div>
       </form><p className="composer-caption"><span>{t('Enter 发送 · Shift + Enter 换行')}</span><span>{t('以来源为依据，保留自己的判断')}</span></p>
     </div></main>
     {showSettings && catalog && <SettingsPanel preferences={preferences} credentials={credentials} catalog={catalog}
-      remembered={Boolean(credentialSource && remembered[credentialSource])} discovery={discovery} onClose={() => setShowSettings(false)} onChange={changePreferences} />}
+      configured={configured} discovery={discovery} onClose={() => setShowSettings(false)} onChange={changePreferences} />}
     {rename && <Modal title={t('重命名会话')} onClose={() => setRename(null)}><form onSubmit={renameChat}>
       <label>{t('会话标题')}<input autoFocus required maxLength={100} value={renameText} onChange={e => setRenameText(e.target.value)} /></label>
       <footer className="modal-actions"><button type="button" className="secondary" onClick={() => setRename(null)}>{t('取消')}</button><button className="primary" type="submit"><Check size={16} />{t('保存标题')}</button></footer>

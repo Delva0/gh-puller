@@ -98,7 +98,9 @@ class Session:
         return {"id": self.id, "agent": self.kind, "title": self.title, "created": self.created,
                 "running": self.running, "query_id": self.query_id, "seq": len(self.offsets),
                 "settings": self.public.model_dump() if self.public else None,
-                "has_credentials": bool(self.credentials.get("api_key")), "readonly": self.closed or self.limited}
+                "has_credentials": bool(self.credentials.get("api_key")),
+                "configured_credentials": sorted(key for key, value in self.credentials.items() if value),
+                "readonly": self.closed or self.limited}
 
     def emit(self, kind, data, **extra):
         if self.closed:
