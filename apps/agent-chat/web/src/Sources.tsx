@@ -22,23 +22,30 @@ export function SourceBadge({ tool, selected, onClick }: { tool: TraceTool; sele
   </button>;
 }
 
-export function SourcePanel({ tool, onClose }: { tool: TraceTool; onClose: () => void }) {
+export function SourcePanel({ tool, onClose }: { tool?: TraceTool; onClose: () => void }) {
   const t = useText();
   const ref = useRef<HTMLElement>(null);
-  const sources = useMemo(() => toolSources(tool), [tool.name, tool.result, tool.error]);
+  const open = Boolean(tool);
+  const nextSources = useMemo(() => tool ? toolSources(tool) : null, [tool?.name, tool?.result, tool?.error]);
+  // Preserve the last selection so closing can animate the same content as opening.
+  const [sources, setSources] = useState(nextSources ?? []);
+  if (nextSources && nextSources !== sources) setSources(nextSources);
   useEffect(() => {
+    if (!open) return;
     const previous = document.activeElement as HTMLElement | null;
-    ref.current?.focus();
+    ref.current?.focus({ preventScroll: true });
     return () => { if (previous?.isConnected) previous.focus({ preventScroll: true }); };
-  }, []);
+  }, [open]);
   useEffect(() => {
+    if (!open) return;
     const escape = (event: KeyboardEvent) => {
       if (event.key === 'Escape' && !event.defaultPrevented && !document.querySelector('dialog[open]')) { event.preventDefault(); onClose(); }
     };
     document.addEventListener('keydown', escape);
     return () => document.removeEventListener('keydown', escape);
-  }, [onClose]);
-  return <aside ref={ref} id="source-panel" className="source-panel" tabIndex={-1} aria-label={t('来源')}>
+  }, [open, onClose]);
+  return <aside ref={ref} id="source-panel" className={`source-panel side-panel ${open ? 'open' : ''}`} inert={!open}
+    tabIndex={-1} aria-hidden={!open} aria-label={t('来源')}>
     <header><h2>{t('来源')} <span>{sources.length}</span></h2>
       <button type="button" className="icon-button" aria-label={t('关闭来源面板')} onClick={onClose}><X size={20} /></button></header>
     <div className="source-list">{sources.map(source => <a className="source-card" key={source.url} href={source.url}

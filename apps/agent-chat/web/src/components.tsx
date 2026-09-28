@@ -15,14 +15,21 @@ export function Mark({ small = false, animated = false }: { small?: boolean; ani
     if (!animated) return;
     const svg = ref.current!;
     const motion = matchMedia('(prefers-reduced-motion: reduce)');
-    let frame = 0, start = 0;
+    let frame = 0, start: number | undefined;
     const draw = (phase: number) => {
-      const angle = Math.sin(phase) * .18;
-      const points = [[8, 29], [19, 7], [32, 17], [21, 33], [22, 17]].map(([x, y], index) => {
-        const offset = index * 1.3;
-        const dx = x - 20 + 1.8 * (Math.sin(phase + offset) - Math.sin(offset));
-        const dy = y - 20 + 1.5 * (Math.cos(phase + offset) - Math.cos(offset));
-        return [20 + dx * Math.cos(angle) - dy * Math.sin(angle), 20 + dx * Math.sin(angle) + dy * Math.cos(angle)];
+      const anchors = [[8, 29], [19, 7], [32, 17], [21, 33], [22, 17]];
+      const drift = anchors.map((_, index) => {
+        const offset = index * 1.7;
+        return [
+          1.2 * (Math.sin(phase + offset) - Math.sin(offset)) + .55 * (Math.sin(phase * 3 - offset) + Math.sin(offset)),
+          1.05 * (Math.sin(phase * 2 + offset * .8) - Math.sin(offset * .8)) + .45 * (Math.sin(phase * 3 + offset * 1.4) - Math.sin(offset * 1.4)),
+        ];
+      });
+      // Keep the silhouette centered while each vertex follows its own closed, irregular path.
+      const center = [0, 1].map(axis => drift.slice(0, 4).reduce((sum, point) => sum + point[axis], 0) / 4);
+      const points = anchors.map(([x, y], index) => {
+        const scale = index === 4 ? .5 : 1;
+        return [x + (drift[index][0] - center[0]) * scale, y + (drift[index][1] - center[1]) * scale];
       });
       svg.children[0].setAttribute('d', `M${points.slice(0, 4).map(point => point.join(' ')).join('L')}Z`);
       svg.children[1].setAttribute('d', `M${points[0]}L${points[4]}L${points[2]}M${points[1]}L${points[4]}L${points[3]}`);
@@ -30,11 +37,11 @@ export function Mark({ small = false, animated = false }: { small?: boolean; ani
       svg.children[2].setAttribute('cy', String(points[4][1]));
     };
     const tick = (time: number) => {
-      start ||= time;
-      draw((time - start) % 4000 / 4000 * Math.PI * 2);
+      start ??= time;
+      draw((time - start) % 16000 / 16000 * Math.PI * 2);
       frame = requestAnimationFrame(tick);
     };
-    const reset = () => { cancelAnimationFrame(frame); start = 0; draw(0); if (!motion.matches) frame = requestAnimationFrame(tick); };
+    const reset = () => { cancelAnimationFrame(frame); start = undefined; draw(0); if (!motion.matches) frame = requestAnimationFrame(tick); };
     reset(); motion.addEventListener('change', reset);
     return () => { cancelAnimationFrame(frame); motion.removeEventListener('change', reset); draw(0); };
   }, [animated]);

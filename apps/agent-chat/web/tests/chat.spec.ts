@@ -52,6 +52,7 @@ test('interim answers remain during subsequent reasoning and sources open a pers
   await expect(panel.locator('.source-card').first()).toHaveAttribute('href', 'https://github.com/o/r');
   await expect(panel).toContainText('可核对的仓库说明。');
   await expect(badge).toHaveAttribute('aria-expanded', 'true');
+  await expect(panel).toHaveCSS('transform', 'none');
   const main = await page.locator('.main-panel').boundingBox(), bounds = await panel.boundingBox();
   expect(bounds!.x).toBeGreaterThanOrEqual(main!.x + main!.width - 1);
   await page.screenshot({ path: info.outputPath('sources-desktop-dark.png'), fullPage: true, animations: 'disabled' });

@@ -1,4 +1,4 @@
-# 循迹 · Agent Chat
+# Agent Chat · 开发与维护助手
 
 独立的 React / TypeScript / Vite 页面与 FastAPI 服务，直接使用主仓 `gh-puller[search]`。
 前端组件和样式位于本目录，不依赖 `ui/`、实验 TUI 或研究归档。
@@ -44,7 +44,7 @@ Python 依赖锁在 `uv.lock`，前端依赖锁在 `web/package-lock.json`。本
   Agent 与工具标题显示可用性圆点，说明通过悬停查看。缺少主包声明的必填凭据时，依赖工具的 Agent 在输入框中禁用；
   判断同时计入当前页面和该会话仍保留在服务端的凭据。选用无需密钥的搜索后端后，相应要求自动解除。
   模型默认发送工具返回的图片，若请求被拒绝，在未输出内容时以 `<image>` 占位重试一次。
-- 右上角切换深浅主题。空会话图形以四秒为周期游动，系统减少动态效果时保持静止。
+- 右上角切换深浅主题。左右侧栏使用相同的开合过渡。空会话图形以十六秒为周期平滑游动，系统减少动态效果时保持静止。
   思考与工具按实际事件顺序展示，可展开查看。中途回答保留到下一段回答开始输出。
   网页与 GitHub / GitCode 工具显示本次结果中可识别的来源；点击来源数量打开右侧列表，查看标题、摘要并打开原始链接。
 - 同一浏览器的历史、事件与非敏感设置保存在 IndexedDB。搜索、重命名、删除与 JSON 导入导出均可在侧栏操作。
@@ -216,7 +216,7 @@ Dockerfile 专属 ignore 文件仅允许主包、应用代码与构建元数据�
 付费附加服务或自动升级。源码仓库为 `Delva0/gh-puller`，部署分支 `agent-chat`；构建上下文是主仓根目录，
 Dockerfile 是 `apps/agent-chat/Dockerfile`，健康检查 `/api/health`，自动部署关闭。
 
-当前公网地址：[循迹 Agent Chat](https://agent-chat-pdl4.onrender.com)。
+当前公网地址：[Agent Chat](https://agent-chat-pdl4.onrender.com)。
 服务管理页：[Render Dashboard](https://dashboard.render.com/web/srv-dasjnn8473hc738kgnk0)。
 可复用的部署、持续交付和运维流程见 [agent-chat-render 技能](../../.agents/skills/agent-chat-render/SKILL.md)。
 

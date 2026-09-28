@@ -80,6 +80,7 @@ export default function App() {
     credentialSource && remembered[credentialSource]?.includes('api_key') ? credentialSource : undefined, authenticated);
   useEffect(() => {
     document.documentElement.lang = preferences.language === 'en' ? 'en' : 'zh-CN';
+    document.title = `Agent Chat · ${translator(preferences.language)('开发与维护助手')}`;
     localStorage.setItem('trace-language', preferences.language);
   }, [preferences.language]);
   useEffect(() => {
@@ -398,25 +399,25 @@ export default function App() {
   }
 
   if (!authenticated) return <LanguageContext.Provider value={preferences.language}><main className="login-page"><div className="login-card">
-    <div className="login-brand"><Mark /><span>{t('循迹')}</span></div><div className="eyebrow">AGENT CHAT</div>
-    <h1>{t('从问题出发，')}<br /><span>{t('循证而答。')}</span></h1>
-    <p className="login-description">{t('你的私人研究空间。连接代码、社区与网络，')}<br />{t('让每一个回答有迹可循。')}</p>
+    <div className="login-brand"><Mark /><span>Agent Chat</span></div><div className="eyebrow">{t('开发与维护助手')}</div>
+    <h1>{t('项目里的事，')}<br /><span>{t('一起推进。')}</span></h1>
+    <p className="login-description">{t('理解代码、排查问题、跟进变更，')}<br />{t('让开发和维护更顺手。')}</p>
     <form onSubmit={login}><label>{t('访问口令')}<PasswordInput aria-label={t('访问口令')} autoComplete="current-password" required
       value={password} onChange={e => setPassword(e.target.value)} placeholder={t('输入私人访问口令')} /></label>
       <button className="primary" disabled={Boolean(checking)} type="submit">{checking ? <><LoaderCircle size={17} className="spin" />{t(checking)}</> : <>{t('进入工作空间')}<ArrowUp size={17} /></>}</button>
     </form>{loginError && <div className="login-error" role="alert"><CircleAlert size={16} />{t(loginError)}</div>}
     {historyError && <div className="turn-notice" role="status"><CircleAlert size={16} />{t(historyError)}</div>}
-  </div><span className="login-corner">{t('循迹 / TRACE THE EVIDENCE')}</span></main></LanguageContext.Provider>;
+  </div><span className="login-corner">AGENT CHAT / BUILD · FIX · IMPROVE</span></main></LanguageContext.Provider>;
 
   const modelOptions = [...new Set([composerSettings?.model ?? '', ...discovery.models])].filter(Boolean).map(value => ({ value, label: value }));
   const effort = composerSettings?.thinking ? composerSettings.reasoning_effort : 'off';
   const efforts = [{ value: 'off', label: t('关闭思考') }, ...['low', 'high', 'max'].map(value => ({ value, label: value[0].toUpperCase() + value.slice(1) }))];
   if (effort && !efforts.some(item => item.value === effort)) efforts.push({ value: effort, label: effort });
   return <LanguageContext.Provider value={preferences.language}><div className={`app ${sidebar ? '' : 'sidebar-hidden'} ${resizing ? 'resizing' : ''} ${sourceTool ? 'sources-open' : ''}`} style={{ '--sidebar-width': `${preferences.sidebar_width}px` } as CSSProperties}>
-    <button className={`sidebar-scrim ${sidebar ? 'open' : ''}`} aria-label={t('关闭侧栏')} aria-hidden={!sidebar}
+    <button className={`sidebar-scrim panel-scrim ${sidebar ? 'open' : ''}`} aria-label={t('关闭侧栏')} aria-hidden={!sidebar}
       tabIndex={sidebar ? 0 : -1} onClick={() => setSidebar(false)} />
-    <aside className={`sidebar ${sidebar ? 'open' : ''}`} inert={!sidebar}>
-      <div className="sidebar-brand"><button className="brand-button" onClick={() => newChat()}><Mark small /><strong>{t('循迹')}</strong><span>Agent Chat</span></button>
+    <aside className={`sidebar side-panel ${sidebar ? 'open' : ''}`} inert={!sidebar}>
+      <div className="sidebar-brand"><button className="brand-button" onClick={() => newChat()}><Mark small /><span className="brand-wordmark"><strong>Agent Chat</strong><small>{t('开发与维护助手')}</small></span></button>
         <button className="icon-button" aria-label={t('折叠侧栏')} onClick={() => setSidebar(false)}><PanelLeftClose size={19} /></button></div>
       <button className="new-chat" onClick={() => newChat()}><MessageSquarePlus size={19} />{t('新建会话')}<span>＋</span></button>
       <div className="history-search"><Search size={16} /><input ref={searchInput} aria-label={t('搜索历史')} placeholder={t('搜索历史')} value={search} onChange={e => setSearch(e.target.value)} />
@@ -445,8 +446,8 @@ export default function App() {
     </aside>
     <main className="main-panel"><header className="main-header"><div className="header-left">
       {!sidebar && <button className="icon-button" aria-label={t('打开侧栏')} onClick={() => setSidebar(true)}><Menu size={21} /></button>}
-      <span className="header-name">{capability?.name ?? active?.agent ?? '循迹'}<ChevronDown size={14} /></span>
-      <span className="header-divider">/</span><span className="header-title">{active?.title ?? '循迹'}</span></div>
+      <span className="header-name">{capability?.name ?? active?.agent ?? 'Agent Chat'}<ChevronDown size={14} /></span>
+      <span className="header-divider">/</span><span className="header-title">{active?.title ?? t('新会话')}</span></div>
       <div className="header-right"><span className="status-pill"><i />{t('私人会话')}</span>
         {Boolean(active?.events.length) && <button className="icon-button" aria-label={t('导出事件')} title={t('导出事件')}
           onClick={() => download(`events_${active!.id}.json`, exportEvents(active!))}><Download size={18} /></button>}
@@ -470,8 +471,8 @@ export default function App() {
       lastScrollTop.current = element.scrollTop;
       setAtBottom(bottom);
     }}><div className="conversation">
-      {!turns.length ? <div className="welcome"><div className="welcome-mark"><Mark animated /></div><div className="eyebrow">A LITTLE CURIOSITY GOES A LONG WAY</div>
-        <h1>{t('今天，想探究什么？')}</h1><p>{t('从一个问题开始，沿着证据找到答案。')}</p>
+      {!turns.length ? <div className="welcome"><div className="welcome-mark"><Mark animated /></div><div className="eyebrow">GOOD CODE IS A WORK IN PROGRESS</div>
+        <h1>{t('今天，想解决什么？')}</h1><p>{t('读懂代码、排查问题，也聊聊下一步怎么改。')}</p>
       </div> : turns.map((turn, index) => {
         const variants = versions(active!, index);
         const selected = variants.findIndex(branch => branch.events.some(event => event.type === 'query/start' && event.query_id === turn.id));
@@ -489,7 +490,7 @@ export default function App() {
       {(notice || historyError) && <div className="notice" role="status"><CircleAlert size={15} /><span>{t(notice || historyError)}</span><button className="icon-button" aria-label={t('关闭提示')} onClick={() => { if (notice) setNotice(''); else setHistoryError(''); }}><X size={15} /></button></div>}
       {active && pending.current.has(active.id) && !submitting && <div className="notice"><span>{t('提交状态未确认，可安全重试同一条问题。')}</span><button className="secondary" onClick={() => void send('', undefined, true)}>{t('重试提交')}</button></div>}
       <form className="composer" onSubmit={e => { e.preventDefault(); void send(); }}>
-        <textarea ref={input} aria-label={t('输入问题')} placeholder={t('提出问题，一起循迹…')} rows={2}
+        <textarea ref={input} aria-label={t('输入问题')} placeholder={t('贴上代码、报错或仓库链接，说说你想做什么…')} rows={2}
           disabled={submitting} maxLength={16000} value={draft} onChange={e => setDraft(e.target.value)} onKeyDown={e => {
             if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) { e.preventDefault(); if (!running) void send(); }
           }} />
@@ -509,10 +510,11 @@ export default function App() {
             <button className="send-button" aria-label={t('发送问题')} type="submit" disabled={!draft.trim() || submitting || !available?.available}
               title={available && !available.available ? availabilityHint(available, preferences.language) : undefined}>
               {submitting ? <LoaderCircle size={19} className="spin" /> : <ArrowUp size={21} />}</button>}</div></div>
-      </form><p className="composer-caption"><span>{t('Enter 发送 · Shift + Enter 换行')}</span><span>{t('以来源为依据，保留自己的判断')}</span></p>
+      </form><p className="composer-caption"><span>{t('Enter 发送 · Shift + Enter 换行')}</span><span>{t('每次改动，都多一点把握。')}</span></p>
     </div></main>
-    {sourceTool && <><button className="source-scrim" aria-label={t('关闭来源面板')} tabIndex={-1} onClick={() => setSources(null)} />
-      <SourcePanel key={`${sources!.turnId}:${sources!.callId}`} tool={sourceTool} onClose={() => setSources(null)} /></>}
+    <button className={`source-scrim panel-scrim ${sourceTool ? 'open' : ''}`} aria-label={t('关闭来源面板')}
+      aria-hidden={!sourceTool} tabIndex={-1} onClick={() => setSources(null)} />
+    <SourcePanel tool={sourceTool} onClose={() => setSources(null)} />
     {showSettings && catalog && <SettingsPanel preferences={preferences} credentials={credentials} catalog={catalog}
       configured={configured} discovery={discovery} validation={validation} currentAgent={selectedAgent}
       onDraft={(key, reason) => setConfigDrafts(value => {
