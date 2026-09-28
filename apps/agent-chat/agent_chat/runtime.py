@@ -18,7 +18,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from fastapi import HTTPException
-from gh_puller.agent.events import EventBus, is_event_type
+from gh_puller.agent.events import EventBus, EventRecorder, is_event_type
 from gh_puller.agents import AGENTS
 
 from .config import Question, ServerSettings, resolve_settings, validate_capabilities
@@ -85,6 +85,7 @@ class Session:
         self.log.touch(mode=0o600)
         self.storage = PrivateStorage(self.root / "tools", self.scrubber, self.server.storage_bytes)
         self.scrubber.add([self.server.password])
+        self.recorder = EventRecorder(self.id)
 
     @property
     def running(self):
@@ -102,13 +103,16 @@ class Session:
         if self.closed:
             return
         event = {"seq": len(self.offsets) + 1, "type": kind, "at": now(), "query_id": self.query_id,
+                 "session": self.id, "ts": time.time(),
+                 "elapsedMs": (time.monotonic() - self.recorder.started_at) * 1000,
                  "data": self.scrubber.clean(data), **extra}
         self.write_event(event)
 
     def write_event(self, event):
         kind = event["type"]
         encoded = (json.dumps(event, ensure_ascii=False) + "\n").encode()
-        if kind != "query/end" and self.log_size + len(encoded) > self.server.event_bytes:
+        if (kind not in {"query/end", "session/end", "turn/end", "step/end"}
+                and self.log_size + len(encoded) > self.server.event_bytes):
             if self.limited:
                 return
             self.limited = True
@@ -130,7 +134,8 @@ class Session:
                 return
         elif kind in {"model/response", "model/error"}:
             self.flush_fragments(data["requestId"])
-        self.emit(kind, data, source_seq=event["seq"], elapsed_ms=event["elapsedMs"])
+        self.emit(kind, data, source_seq=event["seq"], elapsed_ms=event["elapsedMs"],
+                  ts=event["ts"], elapsedMs=event["elapsedMs"])
 
     def flush_fragments(self, request_id=None):
         for key in list(self.scrubber.pending):
@@ -241,6 +246,8 @@ class SessionManager:
         if len(session.requests) == 1:
             session.title = session.scrubber.text(" ".join(question.prompt.split()))[:36] or "新会话"
         try:
+            if not session.recorder.started:
+                session.recorder.start()
             session.emit("query/start", {"prompt": question.prompt, "settings": public.model_dump(),
                                          "agent": session.kind, "source_revision": self.settings.revision,
                                          "data_boundary": AGENTS[session.kind].data_boundary})
@@ -258,7 +265,7 @@ class SessionManager:
                 await AGENTS[session.kind].prepare(config, self.preparations)
                 if session.agent is None:
                     session.agent = self.factory(session.kind, config, session.credentials, session.storage)
-                    session.context = session.agent.session(session=session.id)
+                    session.context = session.agent.session(recorder=session.recorder)
                     try:
                         await session.context.__aenter__()
                     except BaseException:
@@ -297,18 +304,33 @@ class SessionManager:
 
     async def delete(self, session):
         await self.stop(session)
+        ok = False
+        try:
+            if session.context:
+                await session.context.__aexit__(None, None, None)
+            ok = True
+        finally:
+            try:
+                if session.recorder.started:
+                    session.recorder.finish(ok)
+            finally:
+                session.closed = True
+                session.changed.set()
+                self.sessions.pop(session.id, None)
+                session.agent = session.context = session.task = None
+                session.credentials.clear()
+                session.scrubber.secrets.clear()
+                session.scrubber.pending.clear()
+                session.directory.cleanup()
+
+    async def rebuild(self, session, kind):
         try:
             if session.context:
                 await session.context.__aexit__(None, None, None)
         finally:
-            session.closed = True
-            session.changed.set()
-            self.sessions.pop(session.id, None)
-            session.agent = session.context = session.task = None
-            session.credentials.clear()
-            session.scrubber.secrets.clear()
-            session.scrubber.pending.clear()
-            session.directory.cleanup()
+            session.agent = session.context = None
+            session.kind, session.public = kind, None
+            session.history = session.replay(0, len(session.offsets))
 
     async def expire(self):
         for session in list(self.sessions.values()):

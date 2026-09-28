@@ -200,6 +200,10 @@ def create_app(settings: ServerSettings | None = None, *, agent_factory=build_ag
         source = manager.get(owner, body.source_session) if body.source_session else None
         if source and source.running:
             raise HTTPException(409, "请先停止当前查询")
+        records = [event.model_dump(exclude_none=True) | {"query_id": event.query_id} for event in body.events]
+        if source and records and records == source.replay(0, len(source.offsets)):
+            await manager.rebuild(source, body.agent)
+            return {**source.view(), "recovery_warning": False}
         session = manager.create(owner, body.agent, replacing=source)
         if source:
             session.credentials = source.credentials.copy()
@@ -218,7 +222,7 @@ def create_app(settings: ServerSettings | None = None, *, agent_factory=build_ag
             raise HTTPException(422, "会话恢复数据无效或超过保留上限") from exc
         if source:
             await manager.delete(source)
-        return {**session.view(), "recovery_warning": degraded}
+        return {**session.view(), "recovery_warning": degraded, "events": session.history}
 
     @app.get("/api/sessions/{session_id}")
     async def get_session(session_id: str, owner: Owner):

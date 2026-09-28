@@ -375,12 +375,13 @@ class SandboxBashTool(ToolProvider):
         connection = None
         for event in events:
             kind, data = event["type"], event["data"]
-            if kind == "sandbox/connected":
+            kind = kind.replace("sandbox/", "tool/bash/", 1)
+            if kind == "tool/bash/connected":
                 connection = data["connection"]
             elif connection == self.sandbox.identity:
-                if kind == "sandbox/task_request":
+                if kind == "tool/bash/task_request":
                     self.calls[data["call_id"]] = data["task_id"]
-                elif kind == "sandbox/task_observed":
+                elif kind == "tool/bash/task_observed":
                     result = copy.deepcopy(data["result"])
                     self.observed[result["task_id"]] = result
                 else:
@@ -408,7 +409,7 @@ class SandboxBashTool(ToolProvider):
             raise ToolInputError("wait and timeout must be finite") from exc
         operation = self.storage.allocate("sandbox-bash")
         self.storage.event("io/queued", operation=operation, call_id=call_id, kind_name="sandbox-bash", arguments=args)
-        self.storage.event("sandbox/task_request", call_id=call_id, task_id=task_id, action=action)
+        self.storage.event("tool/bash/task_request", call_id=call_id, task_id=task_id, action=action)
         self.storage.record(f"{operation}.request.json", args)
         try:
             async with self.limit:
@@ -425,7 +426,7 @@ class SandboxBashTool(ToolProvider):
             # result of a task that continues after the client exits.
             self.observed[task_id] = result
             self.storage.record(f"{operation}.result.json", result)
-            self.storage.event("sandbox/task_observed", call_id=call_id, result=result)
+            self.storage.event("tool/bash/task_observed", call_id=call_id, result=result)
             self.storage.event("io/end", operation=operation, call_id=call_id,
                            status="failed" if "error" in result else "completed")
         return result
@@ -495,22 +496,23 @@ class DockerBashTools(ToolProvider):
     def record(self, result, call_id=None):
         if "task_id" in result:
             self.observed[result["task_id"]] = result
-            self.storage.event("sandbox/task_observed", call_id=call_id, result=result)
+            self.storage.event("tool/bash/task_observed", call_id=call_id, result=result)
 
     def checkpoint(self):
-        self.storage.event("sandbox/shell_state", connection=self.sandbox.identity, **self.save())
+        self.storage.event("tool/bash/shell_state", connection=self.sandbox.identity, **self.save())
 
     def load_events(self, events):
         connection, state, returned = None, {}, set()
         for event in events:
             kind, data = event["type"], event["data"]
-            if kind == "sandbox/connected":
+            kind = kind.replace("sandbox/", "tool/bash/", 1)
+            if kind == "tool/bash/connected":
                 connection = data["connection"]
-            elif kind == "sandbox/shell_state" and data.get("connection", connection) == self.sandbox.identity:
+            elif kind == "tool/bash/shell_state" and data.get("connection", connection) == self.sandbox.identity:
                 state = copy.deepcopy(data)
-            elif kind == "sandbox/task_request" and connection == self.sandbox.identity:
+            elif kind == "tool/bash/task_request" and connection == self.sandbox.identity:
                 state.setdefault("calls", {})[data["call_id"]] = data["task_id"]
-            elif kind == "sandbox/task_observed" and connection == self.sandbox.identity:
+            elif kind == "tool/bash/task_observed" and connection == self.sandbox.identity:
                 result = copy.deepcopy(data["result"])
                 state.setdefault("tasks", {})[result["task_id"]] = result
                 if data.get("call_id"):
@@ -685,7 +687,7 @@ class DockerBashTools(ToolProvider):
         async with self.limit:
             tid = uuid.uuid4().hex
             self.calls[call_id] = tid
-            self.storage.event("sandbox/task_request", call_id=call_id, task_id=tid, action="shell_start")
+            self.storage.event("tool/bash/task_request", call_id=call_id, task_id=tid, action="shell_start")
             args = {
                 "action": "shell_start",
                 "task_id": tid,

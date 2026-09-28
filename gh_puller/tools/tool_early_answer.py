@@ -23,7 +23,9 @@ class EarlyAnswerTool(ToolProvider):
 
     def restore(self, answers):
         self.answers = copy.deepcopy(answers)
-        self.context.recorder.set_agent_facet("early_answers", self.answers)
+        self.context.recorder.event("tool/early_answer/cleared")
+        for answer in self.answers:
+            self.context.recorder.event("tool/early_answer/published", **answer)
 
     def clear_context(self):
         self.restore([])
@@ -32,7 +34,11 @@ class EarlyAnswerTool(ToolProvider):
         answers = []
         for event in events:
             if event["type"] == "agent/set/early_answers":
-                answers = event["data"]["early_answers"]
+                answers = copy.deepcopy(event["data"]["early_answers"])
+            elif event["type"] == "tool/early_answer/cleared":
+                answers = []
+            elif event["type"] == "tool/early_answer/published":
+                answers.append(event["data"])
         self.restore(answers)
 
     @tool(description=DESCRIPTION, parameters={"type": "object", "properties": {
@@ -46,7 +52,7 @@ class EarlyAnswerTool(ToolProvider):
                   "query": self.context.query, "step": self.context.step, "text": text}
         self.answers.append(answer)
         self.storage.event("answer/early", **answer)
-        self.context.recorder.set_agent_facet("early_answers", self.answers)
+        self.context.recorder.event("tool/early_answer/published", **answer)
         if self.on_answer is not None:
             self.on_answer(text)
         return {"published": True}

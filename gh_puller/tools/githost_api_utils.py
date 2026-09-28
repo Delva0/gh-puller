@@ -135,7 +135,13 @@ class APIReads:
         self.scope = self.provider
 
     def event(self, kind, **data):
-        self.storage.event(f"{self.provider}/{kind}", tool=self.scope, **data)
+        self.storage.event(f"tool/{self.scope}/{kind}", tool=self.scope, **data)
+
+    def event_kind(self, event):
+        kind = event["type"]
+        if kind.startswith((f"{self.provider}/", f"tool/{self.provider}_")):
+            return kind.rsplit("/", maxsplit=1)[-1]
+        return None
 
     def remember_response(self, metadata):
         self.responses[metadata["result_id"]] = metadata
@@ -147,10 +153,10 @@ class APIReads:
         """Replay immutable evidence identities; request caches rebuild on demand."""
         self._reads = ReadCache()
         for event in events:
-            kind, data = event["type"], event["data"]
-            if kind == f"{self.provider}/cleared":
+            kind, data = self.event_kind(event), event["data"]
+            if kind == "cleared":
                 self.responses.clear()
-            elif kind == f"{self.provider}/response_saved":
+            elif kind == "response_saved":
                 metadata = (json.loads(self.storage.read(data["path"])) if "path" in data
                             else deepcopy(data["metadata"]))
                 if not self.storage.path(metadata["body_file"]).is_file():
@@ -161,7 +167,7 @@ class APIReads:
                     data = {"tool": data.get("tool", self.scope), "result_id": metadata["result_id"], "path": path}
             else:
                 continue
-            self.storage.event(kind, **data)
+            self.storage.event(f"tool/{data.get('tool', self.scope)}/{kind}", **data)
 
     def _failure(self, exc):
         details = dict(getattr(exc, "details", {}))

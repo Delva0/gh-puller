@@ -205,15 +205,16 @@ async def test_event_prefixes_restore_own_memory_and_foreign_context_only(tmp_pa
         final_prefix = len(events)
         source.clear_context()
     assert any(event["type"] == "artifact/saved" for event in events)
+    assert not any(e["type"].startswith(("io/", "github/", "dsl/", "tool_result/")) for e in events)
     assert not any(event["type"] in {"context/checkpoint", "search/state", "search/artifact"} for event in events)
-    saved_at = next(i for i, e in enumerate(events) if e["type"] == "tool_result/saved")
-    cleared_at = next(i for i, e in enumerate(events) if e["type"] == "tool_result/cleared")
-    response_at = next(i for i, e in enumerate(events) if e["type"] == "github/response_saved")
+    saved_at = next(i for i, e in enumerate(events) if e["type"] == "tool/get_tool_result/saved")
+    cleared_at = next(i for i, e in enumerate(events) if e["type"] == "tool/get_tool_result/cleared")
+    response_at = next(i for i, e in enumerate(events) if e["type"] == "tool/github_rest/response_saved")
     response_id = events[response_at]["data"]["result_id"]
-    response_clear = next(i for i, e in enumerate(events) if e["type"] == "github/cleared")
-    early_at = next(i for i, e in enumerate(events) if e["type"] == "agent/set/early_answers")
+    response_clear = next(i for i, e in enumerate(events) if e["type"] == "tool/github_rest/cleared")
+    early_at = next(i for i, e in enumerate(events) if e["type"] == "tool/early_answer/published")
     early_clear = next(i for i, e in enumerate(events)
-                       if e["type"] == "agent/set/early_answers" and not e["data"]["early_answers"])
+                       if e["type"] == "tool/early_answer/cleared")
     prefixes = range(1, len(events) + 1) if target is GitHubAgent else [final_prefix]
     for end in prefixes:
         options = {"web_search_backend": "duckduckgo", "web_search_interval": 7}

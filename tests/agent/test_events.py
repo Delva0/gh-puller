@@ -187,7 +187,9 @@ async def test_base_agent_records_config_without_inferring_context(tmp_path) -> 
     async with subject.session(session="bare/s"):
         pass
     await _settle()
-    assert next(event for event in events if event["type"] == "agent/set")["data"] == {
+    identity = next(event for event in events if event["type"] == "agent/set")["data"]
+    assert identity.pop("instance")
+    assert identity == {
         "agent": "bare", "config": config,
     }
     assert not any(event["type"].startswith("context/") for event in events)

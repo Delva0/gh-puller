@@ -215,7 +215,7 @@ class GitHubAPI(APIReads):
             data = event["data"]
             if data.get("tool") != self.scope:
                 continue
-            if event["type"] == "github/rate_limited":
+            if self.event_kind(event) == "rate_limited":
                 self.cooldown(data["resource"], data["until"])
 
     def _failure(self, exc):

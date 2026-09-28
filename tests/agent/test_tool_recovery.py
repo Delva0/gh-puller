@@ -13,8 +13,8 @@ from gh_puller.agents import GitHubAgent, WebAgent
 from gh_puller.tools.registry import ToolProvider, ToolRegistry, tool
 from gh_puller.tools.storage import ToolStorage
 from gh_puller.tools.tool_bash import DockerBashTools
-from gh_puller.tools.tool_gitcode import GitCodeTool
-from gh_puller.tools.tool_github import GitHubRESTTool
+from gh_puller.tools.tool_gitcode import GitCodeDSLTool, GitCodeTool
+from gh_puller.tools.tool_github import GitHubDSLTool, GitHubRESTTool
 from gh_puller.tools.tool_offload import OffloadPolicy, ToolOutput, ToolResultStore
 
 
@@ -78,13 +78,14 @@ def test_registry_delegates_once_to_an_independent_provider():
 
 def test_private_replay_uses_execution_boundaries_not_config_observations():
     start = new_event("session/start", label="same")
-    identity = new_event("agent/set", agent="search-github", config={"model": "a"})
-    fact = new_event("github/cleared", tool="github_rest")
-    changed = new_event("agent/set", agent="search-github", config={"model": "b"})
+    identity = new_event("agent/set", agent="search-github", instance="first", config={"model": "a"})
+    fact = new_event("tool/github_rest/cleared", tool="github_rest")
+    changed = new_event("agent/set", agent="search-github", instance="first", config={"model": "b"})
     events = [start, identity, fact, changed]
     assert GitHubAgent.own_events(events) == [fact, changed]
     assert not WebAgent.own_events(events)
-    assert not GitHubAgent.own_events([*events, start, identity])
+    rebuilt = new_event("agent/set", agent="search-github", instance="second", config={})
+    assert not GitHubAgent.own_events([*events, rebuilt])
     foreign = new_event("agent/set", agent="search-web", config={})
     assert not GitHubAgent.own_events([*events, foreign, identity])
 
@@ -155,6 +156,18 @@ async def test_api_tools_restore_evidence_and_rate_limits_with_cold_caches(tmp_p
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("provider", [GitHubDSLTool, GitCodeDSLTool])
+async def test_dsl_clear_is_a_fact_owned_by_the_actual_tool(tmp_path, provider):
+    storage, events = observed_storage(tmp_path)
+    async with httpx.AsyncClient() as client:
+        subject = provider(client, storage, token="")
+        subject.api.responses["old"] = {}
+        subject.clear_context()
+        assert not subject.responses
+        assert events[-1]["type"] == f"tool/{subject.tool_specs[0].name}/cleared"
+
+
+@pytest.mark.asyncio
 async def test_offload_restores_retention_and_attachments_without_reexecuting(tmp_path):
     storage, events = observed_storage(tmp_path / "source")
     storage.write("image.body", b"image bytes")
@@ -213,17 +226,17 @@ async def test_shell_restores_recorded_prefixes_only_for_the_same_container(tmp_
     storage, events = observed_storage(tmp_path / "source")
     sandbox = Sandbox()
     source = DockerBashTools(storage, sandbox)
-    storage.event("sandbox/connected", connection=sandbox.identity)
+    storage.event("tool/bash/connected", connection=sandbox.identity)
     await source.bash("call", "cd subdir")
     expected = source.save()
     for end in range(1, len(events) + 1):
         target = DockerBashTools(ToolStorage(tmp_path / str(end)), sandbox)
         target.load_events(events[:end])
-        if any(e["type"] == "sandbox/task_request" for e in events[:end]):
+        if any(e["type"] == "tool/bash/task_request" for e in events[:end]):
             assert target.calls == source.calls
-        if any(e["type"] == "sandbox/task_observed" for e in events[:end]):
+        if any(e["type"] == "tool/bash/task_observed" for e in events[:end]):
             assert target.observed == source.observed
-        if any(e["type"] == "sandbox/shell_state" for e in events[:end]):
+        if any(e["type"] == "tool/bash/shell_state" for e in events[:end]):
             assert target.save() == expected
         await target.aclose()
     assert len(sandbox.requests) == 1

@@ -8,9 +8,11 @@ from pathlib import Path
 
 import httpx
 import pytest
+from gh_puller.agents import GitHubAgent
 
 from agent_chat.app import create_app
 from agent_chat.config import ServerSettings
+from agent_chat.portable import open_history
 
 from .conftest import login, question
 from .test_app import create, finished
@@ -48,7 +50,8 @@ async def test_own_event_stream_restores_native_memory_and_evidence(harness, kin
     resumed = response.json()["id"]
     body = question("second question", request_id="question-next", backend="" if kind == "web" else "rest")
     after = await query_export(app, client, resumed, body)
-    assert after[:len(events)] == events
+    assert after[:len(events)] == [{**event, "session": resumed} for event in events]
+    assert response.json()["events"] == after[:len(events)]
     assert factory.calls[2]["messages"][1:-1] == messages
     assert not old_root.exists()
     session = app.state.manager.sessions[resumed]
@@ -73,8 +76,9 @@ async def test_cross_agent_roundtrip_keeps_context_without_resurrecting_private_
     assert saved_ids
     response = await client.post("/api/sessions", json={"agent": "web", "events": events, "source_session": first})
     assert response.status_code == 201, response.text
-    assert len(app.state.manager.sessions) == 1 and not before.root.exists()
+    assert len(app.state.manager.sessions) == 1 and before.root.exists()
     second = response.json()["id"]
+    assert second == first
     body = question("web continuation", request_id="question-second", backend="")
     body["credentials"] = {}
     web_events = await query_export(app, client, second, body)
@@ -107,6 +111,66 @@ async def test_edit_prefix_excludes_replaced_turn_and_keeps_original_history(har
     turn = next(event for event in original
                 if event["type"] == "query/start" and event["query_id"] == "question-second")
     assert turn["data"]["prompt"] == "old second"
+
+
+async def test_switches_reuse_the_log_and_only_replacements_change_instance(harness):
+    app, client, factory, _ = harness
+    await login(client)
+    identifier = await create(client, "web")
+    session = app.state.manager.sessions[identifier]
+    inode = session.log.stat().st_ino
+    events = []
+    for index, kind in enumerate(["web", "github", "web", "web"]):
+        if index in {1, 2}:
+            response = await client.post("/api/sessions", json={
+                "agent": kind, "events": events, "source_session": identifier,
+            })
+            assert response.status_code == 201 and response.json()["id"] == identifier
+        prefix = events
+        events = await query_export(app, client, identifier, question(
+            f"question {index}", request_id=f"switch-{index}", backend="" if kind == "web" else "rest"))
+        assert events[:len(prefix)] == prefix
+        assert session.log.stat().st_ino == inode
+    assert len(factory.agents) == 3
+    bindings = [e["data"] for e in events if e["type"] == "agent/set"]
+    assert [e["agent"] for e in bindings] == ["search-web", "search-github", "search-web"]
+    assert len({e["instance"] for e in bindings}) == 3
+    assert [e["type"] for e in events].count("session/start") == 1
+    assert not any(e["type"] == "session/end" for e in events)
+    assert {e["session"] for e in events} == {identifier}
+    requests = [e["data"]["requestId"] for e in events if e["type"] == "model/request"]
+    assert requests == [f"r{n}" for n in range(1, len(requests) + 1)]
+    observed = []
+    write = session.write_event
+
+    def record(event):
+        observed.append(event)
+        write(event)
+
+    session.write_event = record
+    await app.state.manager.delete(session)
+    assert observed[-1]["type"] == "session/end"
+    assert [e["type"] for e in observed].count("session/end") == 1
+    assert not session.root.exists()
+
+
+def test_legacy_lifetimes_migrate_to_bindings_without_changing_observed_facts():
+    facts = [("query/start", {"prompt": "first"}), ("session/start", {}),
+             ("agent/set", {"agent": "search-github", "config": {}}),
+             ("tool/github_rest/cleared", {}), ("session/end", {"outcome": "completed"}),
+             ("session/start", {}), ("agent/set", {"agent": "search-web", "config": {}}),
+             ("session/end", {"outcome": "completed"}), ("session/start", {}),
+             ("agent/set", {"agent": "search-github", "config": {}}),
+             ("tool/github_rest/rate_limited", {"until": 1}), ("session/end", {"outcome": "completed"})]
+    records = [{"seq": n + 1, "type": kind, "data": data, "at": "2026-09-28", "query_id": None}
+               for n, (kind, data) in enumerate(facts)]
+    migrated = open_history(records, "fork")
+    assert [e["type"] for e in migrated].count("session/start") == 1
+    assert migrated[0]["type"] == "session/start"
+    assert not any(e["type"] == "session/end" for e in migrated)
+    assert len({e["data"]["instance"] for e in migrated if e["type"] == "agent/set"}) == 3
+    assert GitHubAgent.own_events(migrated) == migrated[-1:]
+    assert records[-1]["type"] == "session/end" and "instance" not in records[2]["data"]
 
 
 async def test_legacy_history_restores_answers_without_claiming_evidence(harness):
@@ -157,7 +221,7 @@ async def test_invalid_restore_releases_resources_and_never_reads_host_files(har
     assert "fixture-model-secret-value" not in response.text
 
 
-@pytest.mark.parametrize("kind", ["github/response_saved", "tool_result/saved"])
+@pytest.mark.parametrize("kind", ["tool/github_rest/response_saved", "tool/get_tool_result/saved"])
 async def test_tool_owned_restore_rejects_external_files_before_inference(harness, kind, tmp_path):
     app, client, factory, _ = harness
     await login(client)
@@ -167,7 +231,7 @@ async def test_tool_owned_restore_rejects_external_files_before_inference(harnes
     secret = tmp_path / "outside-private-data"
     secret.write_text("must-never-be-read")
     data = next(event["data"] for event in events if event["type"] == kind)
-    if kind == "github/response_saved":
+    if kind == "tool/github_rest/response_saved":
         data["path"] = str(secret)
     else:
         data["artifact"] = str(secret)

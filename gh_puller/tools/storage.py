@@ -214,11 +214,12 @@ class ToolStorage:
         self.event("diagnostic", name=name, value=value, **metadata)
 
     def event(self, kind: str, **data) -> None:
-        """Forward optional tool diagnostics to the caller.
+        """Forward optional tool observations to the caller.
 
         Args:
-            kind: Tool-defined diagnostic kind, independent of canonical agent events.
-            data: Diagnostic details; no storage layout or delivery is implied.
+            kind: Recovery facts use the tool namespace defined by agent.events;
+                other routes are caller-only diagnostics.
+            data: Observed details; no storage layout or delivery is implied.
         """
         if self.observer is not None:
             self.observer(kind, **data)

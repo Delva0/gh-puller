@@ -127,30 +127,32 @@ class ToolResultStore(ToolProvider):
         self.saved.clear()
         self.uses.clear()
         self.user_query = self.tool_query = 0
-        self.storage.event("tool_result/cleared")
+        self.storage.event("tool/get_tool_result/cleared")
 
     def begin_user_query(self) -> None:
         self.user_query += 1
-        self.storage.event("tool_result/user_query", number=self.user_query)
+        self.storage.event("tool/get_tool_result/user_query", number=self.user_query)
 
     def begin_tool_batch(self, count: int) -> range:
         start = self.tool_query + 1
         self.tool_query += count
-        self.storage.event("tool_result/tool_query", number=self.tool_query)
+        self.storage.event("tool/get_tool_result/tool_query", number=self.tool_query)
         return range(start, self.tool_query + 1)
 
     def load_events(self, events):
         self.clear_context()
         for event in events:
             kind, data = event["type"], event["data"]
-            if kind == "tool_result/cleared":
+            if kind.startswith("tool_result/"):
+                kind = "tool/get_tool_result/" + kind.removeprefix("tool_result/")
+            if kind == "tool/get_tool_result/cleared":
                 self.clear_context()
                 continue
-            if kind == "tool_result/user_query":
+            if kind == "tool/get_tool_result/user_query":
                 self.user_query = data["number"]
-            elif kind == "tool_result/tool_query":
+            elif kind == "tool/get_tool_result/tool_query":
                 self.tool_query = data["number"]
-            elif kind == "tool_result/saved":
+            elif kind == "tool/get_tool_result/saved":
                 body = json.loads(self.storage.read(data["artifact"]))
                 for part in body["image_attachments"]:
                     key = {"input_image": "image_url", "input_file": "file_path"}.get(part["type"])
@@ -159,7 +161,7 @@ class ToolResultStore(ToolProvider):
                 call_id = data["call_id"]
                 self.saved[call_id] = SavedResult(data["artifact"], OffloadPolicy(**body["policy"]))
                 self.uses.append(ResultUse(call_id, {}, None, data["user_query"], data["tool_query"]))
-            elif kind == "tool_result/seen":
+            elif kind == "tool/get_tool_result/seen":
                 for use in self.uses:
                     if use.tool_call_id == data["call_id"]:
                         use.seen = True
@@ -198,7 +200,7 @@ class ToolResultStore(ToolProvider):
         }, call_id=tool_call_id)
         self.saved[tool_call_id] = SavedResult(artifact, policy)
         self.uses.append(ResultUse(tool_call_id, message, image_message, self.user_query, tool_query))
-        self.storage.event("tool_result/saved", call_id=tool_call_id, name=name, artifact=artifact,
+        self.storage.event("tool/get_tool_result/saved", call_id=tool_call_id, name=name, artifact=artifact,
                        user_query=self.user_query, tool_query=tool_query)
 
     @tool(description=GET_TOOL_RESULT_DESCRIPTION, parameters=GET_TOOL_RESULT_SCHEMA, returns=BATCH_OUTPUT,
@@ -248,7 +250,7 @@ class ToolResultStore(ToolProvider):
                                tool_images_removed=use.image_message is not None)
             else:
                 if not use.seen:
-                    self.storage.event("tool_result/seen", call_id=use.tool_call_id)
+                    self.storage.event("tool/get_tool_result/seen", call_id=use.tool_call_id)
                 use.seen = True
                 retained.append(use)
         self.uses = retained

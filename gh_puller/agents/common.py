@@ -122,7 +122,8 @@ class CommonAgent(BaseAgent):
             loop, thread = asyncio.get_running_loop(), threading.get_ident()
 
             def record(kind, data):
-                if is_event_type(kind) and kind not in EVENT_TYPES:
+                if ((kind.startswith("tool/") and kind not in EVENT_TYPES and is_event_type(kind))
+                        or kind in {"artifact/allocated", "artifact/saved"}):
                     self._require_event_recorder().event(kind, **data)
 
             async def record_async(kind, data):
@@ -318,18 +319,19 @@ class CommonAgent(BaseAgent):
 
     @classmethod
     def own_events(cls, events):
-        """Select private facts from the latest execution session and identity.
+        """Select private facts from the latest concrete Agent instance.
 
         Args:
             events: Ordered event prefix. Re-observing the same identity/configuration
-                does not start a new instance; ``session/start`` does.
+                does not start a new instance; a changed ``instance`` does.
         """
-        start, identity = 0, None
+        start, identity, instance = 0, None, None
         for index, event in enumerate(events):
-            if event["type"] == "session/start":
-                start, identity = index + 1, None
-            elif event["type"] == "agent/set" and event["data"]["agent"] != identity:
-                start, identity = index + 1, event["data"]["agent"]
+            if event["type"] == "agent/set":
+                data = event["data"]
+                current = data.get("instance", instance)
+                if data["agent"] != identity or current != instance:
+                    start, identity, instance = index + 1, data["agent"], current
         return events[start:] if identity == "search-" + cls.name else []
 
     @classmethod

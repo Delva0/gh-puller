@@ -380,7 +380,7 @@ class CodeAgent(CommonAgent):
         self.sandbox = await DockerSandbox(self.options["container"], self.options["workdir"],
                                           identity=self.config.get("connection")).connect()
         self.config["connection"] = self.sandbox.identity
-        self.storage.event("sandbox/connected", connection=self.sandbox.identity)
+        self.storage.event("tool/bash/connected", connection=self.sandbox.identity)
         self._require_event_recorder().set_agent_facet("connection", self.sandbox.identity)
         self.github_client = self.http_client(self.github_transport)
         self.github_tools = GitHubRESTTool(self.github_client, self.storage, token=self.github_token,

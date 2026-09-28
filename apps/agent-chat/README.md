@@ -123,8 +123,9 @@ Brave 测试会消耗一次搜索请求（按钮悬停提示）。所有 API Key
 
 浏览器中的逻辑会话包含所选事件时间线与历史分支；物理会话是服务端运行与 SSE 的隔离单位。
 同 Agent、同工具配置的续问沿用服务端实例及其内存，刷新后仍可连接；模型和思考参数可在实例内更新。
-切换 Agent、修改 Agent／工具配置、编辑或重新生成、恢复失效会话时，才从所选分支创建物理会话，
-复制仍存活会话的内存凭据并释放旧实例。切换后又切回但未提问，不会触发重建。
+切换 Agent 或修改 Agent／工具配置时，只替换当前物理会话内的 Agent 实例。
+编辑、重新生成或恢复失效会话时，从所选前缀创建物理会话，复制仍存活会话的内存凭据并释放旧实例。
+切换后又切回但未提问，不会触发重建。
 有历史的会话在重建前显示普通确认提示：“将重新构造 Agent，并根据事件流恢复已观测的上下文。
 当前会话 Agent 内存状态可能丢失”。取消会保留原实例和草稿；“本会话不再提示”仅保存在本浏览器，
 不会随历史导出、导入传播。
@@ -135,19 +136,21 @@ Brave 测试会消耗一次搜索请求（按钮悬停提示）。所有 API Key
 也不在提问结束后生成额外检查点。`BaseAgent.load_events()` 折叠 `context/*`，由具体 Agent
 将 Context 转为自己的原生表示。BaseAgent 不决定系统提示、工具或私有状态策略；
 搜索 Agent 的 CommonAgent 保留目标的系统提示、工具和当前配置。
-`agent/set` 仅观测身份与配置，不代表构造实例；搜索 Agent 按 `session/start` 区分执行实例，
-同一身份再次发布完整配置不会丢失前面的私有事件。实例内模型控制通过 `update_config()` 更新并发布
+应用拥有整份日志的 recorder，Agent 通过 `session(recorder=...)` 借用它。替换实例继续写入原日志，
+`session/end` 只在整个会话结束时出现；实例边界遵循主包 `gh_puller.agent.events` 的 `instance` 契约。
+重建或导入后续写的是开放前缀，旧版拼接日志在导入时迁移为实例边界。
+同一实例再次发布完整配置不会丢失前面的私有事件。实例内模型控制通过 `update_config()` 更新并发布
 相应的 `agent/set/<facet>`；没有改变的值不重复发布。应用不直接修改 Agent 的配置字典。
 `CommonAgent` 在加载自身事件流时，还调用已安装工具的 `load_events()`。每个工具解释自己的事件：
 
 | 组件 | 恢复依据 |
 | --- | --- |
 | ToolStorage | `artifact/allocated`、`artifact/saved`：操作编号、文件路径、大小和 SHA-256 引用 |
-| GitHub/GitCode API 工具 | `github/*`、`gitcode/*`：不可变响应的索引引用与限流期限 |
-| Web 工具 | `web/resource_saved`、`web/cleared`、搜索调度及限流事件 |
-| 工具结果 offload | `tool_result/*`：完整结果引用、保留年龄与是否已被模型看到；正文仍来自 Context |
-| 提前回答 | 已有的 `agent/set/early_answers` |
-| 容器 Shell 工具 | 已有的 `sandbox/task_request`、`sandbox/task_observed`、`sandbox/shell_state` |
+| GitHub/GitCode API 工具 | `tool/github_rest/*`、`tool/github_graphql/*`、`tool/github_dsl/*`、`tool/gitcode_api/*`、`tool/gitcode_dsl/*`：证据索引与限流期限 |
+| Web 工具 | `tool/web_fetch/*`：资源索引；`tool/web_search/*`：搜索调度及限流期限 |
+| 工具结果 offload | `tool/get_tool_result/*`：完整结果引用、保留年龄与是否已被模型看到；正文仍来自 Context |
+| 提前回答 | `tool/early_answer/published`、`tool/early_answer/cleared` |
+| 容器 Shell 工具 | `tool/bash/connected`、`tool/bash/task_request`、`tool/bash/task_observed`、`tool/bash/shell_state` |
 
 工具可以独立回放，不依赖搜索 Agent 对其内部字段的了解，也没有统一对象快照。
 跨 Agent 只加载 Context，不带入私有状态；切回时不会复活旧 Agent 的私有内存。

@@ -231,7 +231,7 @@ class GitCodeAPI(APIReads):
     def load_events(self, events):
         super().load_events(events)
         for event in events:
-            if event["type"] == "gitcode/rate_limited" and event["data"].get("tool") == self.scope:
+            if self.event_kind(event) == "rate_limited" and event["data"].get("tool") == self.scope:
                 self.cooldown_until(event["data"]["until"])
 
     def __init__(self, client: httpx.AsyncClient, storage: ToolStorage, *, token: str, concurrency: int = 8):

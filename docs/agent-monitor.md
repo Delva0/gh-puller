@@ -25,7 +25,7 @@ Context = Seq<Item>
 
 | Operation | Payload | Fold effect |
 | --- | --- | --- |
-| `agent/set` | `{agent, config}` | Replace Agent identity and opaque configuration. |
+| `agent/set` | `{agent, config, instance?}` | Replace Agent identity and opaque configuration. |
 | `agent/set/<facet>` | `{<facet>: value}` | Replace one explicitly observed control facet. |
 | `context/set` | `{items}` | Replace the complete Item sequence. |
 | `context/append[/<role>]` | `{items}` | Atomically append an Item sequence. |
@@ -121,7 +121,12 @@ expected convention is one turn per user-level interaction and one step per cont
 preparation, inference, and related tool work. Adapters may place them differently when
 the observed Agent uses another control flow.
 
-`BaseAgent` owns session lifetime. Concrete adapters translate only the facts their
+`BaseAgent` owns session lifetime by default. A caller that replaces Agents in one log
+can instead pass an open `EventRecorder` as `agent.session(recorder=recorder)` and finish
+the recorder after the entire conversation. `EventRecorder.resume(events)` continues
+an open persisted prefix; a completed log must be forked before its terminal event.
+The lifecycle and instance contract is defined in `gh_puller.agent.events`.
+Concrete adapters translate only the facts their
 backends expose. Sequential `stream` and `result` calls may be repeated and mixed inside
 one session; every call appends one user-level turn to the same native conversation.
 

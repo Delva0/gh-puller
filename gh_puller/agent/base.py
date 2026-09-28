@@ -44,23 +44,34 @@ class BaseAgent:
 
     @contextlib.asynccontextmanager
     async def session(self, *, session: str | None = None, run_id: str | None = None,
-                      session_name: str | None = None):
+                      session_name: str | None = None, recorder: EventRecorder | None = None):
         """Bind one reusable Agent client to a canonical observation session.
 
         Args:
             session: Explicit observation-session id.
             run_id: Optional caller correlation recorded on ``session/start``.
             session_name: Human-readable label and fallback id namespace.
+            recorder: Open caller-owned recorder. Binding and releasing this client
+                do not start or end its session; the caller owns its heartbeat too.
+                Bind clients sequentially. Each initializes fresh Context; call
+                ``load_events`` inside the scope to transfer observed Context.
         """
-        event_recorder = self._recorder(
+        event_recorder = recorder or self._recorder(
             session=session, run_id=run_id, session_name=session_name)
-        event_recorder.start()
+        if recorder is None:
+            event_recorder.start()
+        else:
+            if any(value is not None for value in (session, run_id, session_name)):
+                raise ValueError("Recorder owns the session identity")
+            event_recorder.bind_agent(self.agent, self.config)
+            if event_recorder.context():
+                event_recorder.set_context([])
         self._event_recorder = event_recorder
         ok = False
         try:
             try:
                 heartbeat_secs = envs.AGENT_MONITOR_HEARTBEAT_SECS
-                if heartbeat_secs and heartbeat_secs > 0:
+                if recorder is None and heartbeat_secs and heartbeat_secs > 0:
                     event_recorder.start_keepwarm(heartbeat_secs)
                 await self._enter()
             except BaseException as exc:  # Cancellation is a terminal observation, not a swallowed error.
@@ -80,13 +91,17 @@ class BaseAgent:
             ok = True
         finally:
             try:
-                await event_recorder.stop_keepwarm()
+                if recorder is None:
+                    await event_recorder.stop_keepwarm()
             except BaseException as exc:  # Footer delivery is also required when cleanup is interrupted.
                 ok = False
                 event_recorder.error(exc, phase="cleanup")
                 raise
             finally:
-                event_recorder.finish(ok)
+                if recorder is None:
+                    event_recorder.finish(ok)
+                else:
+                    event_recorder.end_turn(outcome="completed" if ok else "failed")
                 self._event_recorder = None
 
     def _require_event_recorder(self) -> EventRecorder:

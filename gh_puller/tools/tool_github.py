@@ -917,8 +917,8 @@ class GitHubDSLTool(APIProvider):
         self.adapter.begin_query()
 
     def clear_context(self):
-        self.api.responses.clear()
-        self.begin_query()
+        self.api.clear_context()
+        self.adapter.begin_query()
 
     @tool(description=DSL_DESCRIPTION, parameters=DSL_SCHEMA, returns=OUTPUT,
           configuration=tuple(GITHUB_CONFIG.credentials))
@@ -937,13 +937,6 @@ class GitHubDSLTool(APIProvider):
             return {"errors": errors}
         if refresh:
             self.begin_query()
-        self.storage.event(
-            "dsl/plan",
-            call_id=call_id,
-            provider=self.api.provider,
-            language=self.adapter.language,
-            operation=operation_name,
-        )
         with self.api.read_scope(), self.adapter.evidence_scope():
             try:
                 result = execute(

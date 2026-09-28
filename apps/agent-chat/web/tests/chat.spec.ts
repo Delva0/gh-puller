@@ -630,7 +630,13 @@ test('unchanged agents reuse live memory across turns and refresh', async ({ pag
     expect(sessions).toHaveLength(1);
     ids.push(sessions[0].id);
   }
-  expect(new Set(ids.slice(0, 3)).size).toBe(3);
+  expect(new Set(ids).size).toBe(1);
+  const timeline = (await page.request.get(`/api/sessions/${ids[0]}/export`).then(response => response.json())).events;
+  const bindings = timeline.filter((event: { type: string }) => event.type === 'agent/set');
+  expect(bindings.map((event: { data: { agent: string } }) => event.data.agent)).toEqual(['search-web', 'search-github', 'search-web']);
+  expect(new Set(bindings.map((event: { data: { instance: string } }) => event.data.instance)).size).toBe(3);
+  expect(timeline.filter((event: { type: string }) => event.type === 'session/start')).toHaveLength(1);
+  expect(timeline.filter((event: { type: string }) => event.type === 'session/end')).toHaveLength(0);
   expect(ids[3]).toBe(ids[2]);
   await page.reload();
   await expect(page.getByLabel('选择 agent')).toHaveText('Web');
@@ -674,7 +680,10 @@ test('rebuild is a neutral confirmation before changes, cancellation retains the
   const exported = await captureDownload(page, '导出事件');
   const starts = exported.events.filter((event: { type: string }) => event.type === 'query/start');
   expect(starts.map((event: { data: { settings: { options: { web_search_interval: number } } } }) => event.data.settings.options.web_search_interval)).toEqual([2, 7]);
-  expect((await page.request.get(`/api/sessions/${original}`)).status()).toBe(404);
+  expect((await page.request.get(`/api/sessions/${original}`)).status()).toBe(200);
+  expect(exported.events.filter((event: { type: string }) => event.type === 'agent/set')).toHaveLength(2);
+  expect(exported.events.filter((event: { type: string }) => event.type === 'session/start')).toHaveLength(1);
+  expect(exported.events.filter((event: { type: string }) => event.type === 'session/end')).toHaveLength(0);
   await page.reload();
   await page.getByLabel('输入问题').fill('remember this conversation');
   await expect(page.getByRole('button', { name: '发送问题', exact: true })).toBeEnabled();

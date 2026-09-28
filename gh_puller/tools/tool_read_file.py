@@ -127,7 +127,6 @@ class ReadFileTool(ToolProvider):
 
     def clear_context(self):
         self.state.clear()
-        self.session.storage.event("sandbox/read_state", state=self.state)
 
     def restore(self, state, returned_calls):
         # Never dedup a read whose result is absent from the recovered conversation.
@@ -143,7 +142,6 @@ class ReadFileTool(ToolProvider):
                  **self.settings, "wait": 130}, call_id)
         if state := result.get("read_state"):
             self.state[state["path"]] = {**state, "call_id": call_id}
-            self.session.storage.event("sandbox/read_state", state=self.state)
         kind, data = result["type"], result["file"]
         if kind == "file_unchanged":
             content = FILE_UNCHANGED.replace("read_file", "Read") if self.legacy_name else FILE_UNCHANGED

@@ -216,6 +216,8 @@ async def test_recorder_redacts_credentials_before_publication() -> None:
 def test_payload_and_correlation_validation() -> None:
     with pytest.raises(TypeError, match="agent/set requires config"):
         new_event("agent/set", agent="x", config=[])
+    with pytest.raises(ValueError, match="instance"):
+        new_event("agent/set", agent="x", config={}, instance="")
     with pytest.raises(ValueError, match="requires mode"):
         new_event("agent/set/mode", value="plan")
     with pytest.raises(TypeError, match="list items"):
@@ -233,3 +235,10 @@ def test_payload_and_correlation_validation() -> None:
         )
     with pytest.raises(ValueError, match="exactly one"):
         new_event("tool/end", callId="c1", result="ok", error={"type": "error"})
+
+
+def test_private_tool_facts_do_not_require_a_call_or_relax_call_validation():
+    assert new_event("tool/gitcode_dsl/rate_limited", until=10)["data"] == {"until": 10}
+    for misspelled in ["tool/strat", "context/appendd", "session/restart"]:
+        with pytest.raises(ValueError, match="unknown event type"):
+            new_event(misspelled)

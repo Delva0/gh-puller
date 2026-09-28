@@ -26,6 +26,7 @@ export const eventSchema = z.object({
   seq: z.number().int().positive(), type: z.string().max(100), at: z.string(),
   query_id: z.string().nullable(), data: z.record(z.string(), z.unknown()),
   source_seq: z.number().optional(), elapsed_ms: z.number().optional(),
+  session: z.string().optional(), ts: z.number().optional(), elapsedMs: z.number().optional(),
 });
 export type ChatEvent = z.infer<typeof eventSchema>;
 export const artifactSchema = z.object({ sha256: z.string().regex(/^[0-9a-f]{64}$/), content: z.string() });
@@ -44,6 +45,7 @@ export interface SessionView {
   has_credentials: boolean; readonly: boolean;
   configured_credentials: string[];
   recovery_warning?: boolean;
+  events?: ChatEvent[];
 }
 export interface ConfigField {
   key: string; default: ConfigValues[string]; type: string; nullable: boolean; description: string;

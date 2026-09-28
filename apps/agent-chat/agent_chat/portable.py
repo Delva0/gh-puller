@@ -1,5 +1,8 @@
 """Validate browser event envelopes and delegate observed-context recovery to the package."""
 
+import uuid
+from datetime import datetime
+
 from gh_puller.agent.events import CONTEXT_APPEND_TYPES, new_event, text_message
 from gh_puller.agents import AGENTS
 from gh_puller.agents.context import message_items
@@ -14,6 +17,37 @@ class HistoryEvent(BaseModel):
     data: dict[str, JsonValue]
     source_seq: int | None = None
     elapsed_ms: float | None = None
+    session: str | None = None
+    ts: float | None = None
+    elapsedMs: float | None = None
+
+
+def open_history(records, session_id):
+    """Fork a resumable prefix and migrate the app's former concatenated lifetimes."""
+    if not records:
+        return []
+    first = next((event for event in records if event["type"] == "session/start"), None)
+    start = first or {**records[0], "type": "session/start", "data": {"label": session_id}, "query_id": None}
+    result = [start]
+    instance, identity, boundary = None, None, True
+    for event in records:
+        kind, data = event["type"], event["data"]
+        if kind in {"session/start", "session/end"}:
+            boundary = True
+            continue
+        if kind == "agent/set":
+            if boundary or identity != data["agent"]:
+                instance = data.get("instance") or uuid.uuid4().hex
+            else:
+                instance = data.get("instance", instance)
+            identity, boundary = data["agent"], False
+            result.append({**event, "data": {**data, "instance": instance}})
+        else:
+            result.append(event)
+    return [{**event, "seq": index + 1, "session": session_id,
+             "ts": event.get("ts", datetime.fromisoformat(event["at"]).timestamp()),
+             "elapsedMs": event.get("elapsedMs", event.get("elapsed_ms", 0))}
+            for index, event in enumerate(result)]
 
 
 def load_history(session, events):
@@ -42,10 +76,13 @@ def load_history(session, events):
         migrated = {**records[-1], "seq": len(records) + 1, "type": "context/set", "data": {"items": items}}
         new_event("context/set", items=items)
         records.append(migrated)
+    records = open_history(records, session.id)
     AGENTS[session.kind].validate_events(records, max_bytes=session.server.storage_bytes)
     session.history = records
     for event in records:
         session.write_event(session.scrubber.clean(event))
+    if records:
+        session.recorder.resume(records)
     return degraded
 
 

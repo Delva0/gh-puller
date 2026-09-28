@@ -14,7 +14,11 @@ The canonical namespaces remain reserved so a misspelled Context operation is re
 Configuration and effect remain separate facts. Credential-shaped Agent configuration
 fields are redacted before reaching any sink. ``agent/set`` observes identity/configuration;
 it neither constructs an Agent nor opens an execution session. Re-observing the same
-identity does not discard its memory. ``session/start`` marks a new execution lifetime.
+identity does not discard its memory. Its optional ``instance`` identifies a concrete
+Agent binding; a new binding changes it, while configuration updates preserve it.
+One log has one ``session/start`` and at most one terminal ``session/end``. Replacing
+an Agent within that session does not end the session. Tool-owned recovery facts use
+``tool/<native tool name>/<fact>``; ``tool/start`` and ``tool/end`` remain call markers.
 
 ``usage`` contains recognized token counters; an absent counter is unknown, while
 an explicit zero remains zero. ``rawUsage`` preserves the adapter-supplied counter
@@ -74,6 +78,7 @@ def is_event_type(event_type: str) -> bool:
     """Accept canonical routes and opaque events under an adapter-owned namespace."""
     reserved = {"agent", "context", "model", "tool", "session", "turn", "step"}
     return (event_type in EVENT_TYPES or _agent_facet(event_type) is not None
+            or re.fullmatch(r"tool/[a-z][a-z0-9_-]*/[a-z][a-z0-9_-]*", event_type) is not None
             or (event_type.split("/", maxsplit=1)[0] not in reserved
                 and re.fullmatch(r"[a-z][a-z0-9_-]*(?:/[a-z][a-z0-9_-]*)+", event_type) is not None))
 
@@ -157,6 +162,8 @@ def new_event(event_type: str, **data) -> dict:
             raise ValueError("agent/set requires agent")
         if not isinstance(data.get("config"), dict):
             raise TypeError("agent/set requires config")
+        if "instance" in data and (not isinstance(data["instance"], str) or not data["instance"]):
+            raise ValueError("agent/set instance must be a nonempty string")
     elif facet is not None:
         if facet not in data:
             raise ValueError(f"{event_type} requires {facet}")
@@ -165,7 +172,7 @@ def new_event(event_type: str, **data) -> dict:
     elif event_type.startswith("model/"):
         if not isinstance(data.get("requestId"), str) or not data["requestId"]:
             raise ValueError(f"{event_type} requires requestId")
-    elif event_type.startswith("tool/"):
+    elif event_type in {"tool/start", "tool/end"}:
         if not isinstance(data.get("callId"), str) or not data["callId"]:
             raise ValueError(f"{event_type} requires callId")
         if event_type == "tool/start" and not isinstance(data.get("name"), str):
@@ -435,7 +442,9 @@ class EventRecorder:
         self.request_n = 0
         self.turn_open = False
         self.step_open = False
+        self.started = False
         self.ended = False
+        self.instance: str | None = None
         self.reason: str | None = None
         self.reason_code: FailureReason | None = None
         self.failure_phase: FailurePhase | None = None
@@ -457,6 +466,8 @@ class EventRecorder:
         Returns:
             The published envelope, or ``None`` when observation is disabled.
         """
+        if self.ended:
+            raise RuntimeError("Cannot append events after session/end")
         bus = _ensure_maybe_bus()
         if bus is None or not bus.enabled:
             return None
@@ -470,12 +481,58 @@ class EventRecorder:
 
     def start(self) -> None:
         """Open the session without imposing turn or step semantics."""
+        if self.started or self.ended:
+            raise RuntimeError("A recorder has exactly one session lifetime")
+        self.started = True
         data = {"label": self.label}
         if self.run_id is not None:
             data["runId"] = self.run_id
         self.event("session/start", **data)
         if self.agent:
-            self.set_agent(self.agent, self.config)
+            self.bind_agent(self.agent, self.config)
+
+    def resume(self, events: list[dict]) -> None:
+        """Continue an open log without publishing another lifecycle marker.
+
+        Args:
+            events: Ordered canonical prefix with one initial start and no end. The
+                caller owns persistence and any branching from a completed log.
+        """
+        if self.started or self.seq:
+            raise RuntimeError("Only a fresh recorder can resume a log")
+        if (not events or events[0]["type"] != "session/start"
+                or sum(event["type"] == "session/start" for event in events) != 1
+                or any(event["type"] == "session/end" for event in events)):
+            raise ValueError("Resume requires one open session prefix")
+        self.started = True
+        self.seq = max(event.get("seq", 0) for event in events) + 1
+        self.started_at -= max(event.get("elapsedMs", 0) for event in events) / 1000
+        self._context = fold_state(events)["context"]
+        for event in events:
+            kind, data = event["type"], event["data"]
+            if kind == "agent/set":
+                self.agent, self.config = data["agent"], data["config"]
+                self.instance = data.get("instance")
+            elif kind in {"turn/start", "turn/end"}:
+                self.turn_open = kind == "turn/start"
+            elif kind in {"step/start", "step/end"}:
+                self.step_open = kind == "step/start"
+            elif kind == "model/request" and re.fullmatch(r"r\d+", data["requestId"]):
+                self.request_n = max(self.request_n, int(data["requestId"][1:]))
+
+    def bind_agent(self, agent: str, config: dict) -> None:
+        """Observe a new concrete Agent instance within the open session.
+
+        Args:
+            agent: Agent identifier.
+            config: Complete initial configuration of this instance.
+        """
+        if not self.started or self.ended:
+            raise RuntimeError("Agent binding requires an open session")
+        self.end_turn(outcome="interrupted")
+        self.instance = uuid.uuid4().hex
+        self._tool_calls_seen.clear()
+        self.set_agent(agent, config)
 
     def set_agent(self, agent: str, config: dict) -> None:
         """Replace the observed Agent identity and opaque configuration.
@@ -484,7 +541,9 @@ class EventRecorder:
             agent: Agent identifier.
             config: Complete configuration without semantic interpretation.
         """
-        self.event("agent/set", agent=agent, config=_redacted(config))
+        self.agent, self.config = agent, dict(config)
+        self.event("agent/set", agent=agent, config=_redacted(config),
+                   **({"instance": self.instance} if self.instance else {}))
 
     def set_agent_facet(self, facet: str, value) -> None:
         """Replace one explicitly observed Agent control facet.
@@ -772,7 +831,6 @@ class EventRecorder:
         """
         if self.ended:
             return
-        self.ended = True
         if self._keepwarm_task is not None:
             self._keepwarm_task.cancel()
             self._keepwarm_task = None
@@ -794,6 +852,7 @@ class EventRecorder:
         if self.result_cost_usd is not None:
             data["costUsd"] = self.result_cost_usd
         self.event("session/end", **data)
+        self.ended = True
 
     def start_keepwarm(self, interval: float) -> None:
         """Touch the session file periodically without adding protocol events.

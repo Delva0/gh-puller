@@ -179,18 +179,18 @@ class WebTools(ToolProvider):
 
     def clear_context(self) -> None:
         self.resources.clear()
-        self.storage.event("web/cleared")
+        self.storage.event("tool/web_fetch/cleared")
 
     def remember_resource(self, resource):
         self.resources[resource["ref"]] = resource
         if self.storage.observer:
             path = self.storage.write(resource["ref"] + ".resource.json", resource)
-            self.storage.event("web/resource_saved", ref=resource["ref"], path=path)
+            self.storage.event("tool/web_fetch/resource_saved", ref=resource["ref"], path=path)
 
     def search_deadline(self, kind, until):
         """Observe wall-clock deadlines so pacing survives a different process clock."""
         remaining = max(0, until - time.time())
-        if kind == "web/search_scheduled":
+        if kind == "tool/web_search/search_scheduled":
             self.next_search = time.monotonic() + remaining
         else:
             self.search_cooldown = time.monotonic() + remaining
@@ -199,9 +199,12 @@ class WebTools(ToolProvider):
     def load_events(self, events):
         for event in events:
             kind, data = event["type"], event["data"]
-            if kind == "web/cleared":
+            if kind.startswith("web/"):
+                owner = "web_search" if kind in {"web/search_scheduled", "web/search_limited"} else "web_fetch"
+                kind = kind.replace("web/", f"tool/{owner}/", 1)
+            if kind == "tool/web_fetch/cleared":
                 self.resources.clear()
-            elif kind == "web/resource_saved":
+            elif kind == "tool/web_fetch/resource_saved":
                 resource = (json.loads(self.storage.read(data["path"])) if "path" in data
                             else dict(data["resource"]))
                 if not self.storage.path(resource["body_file"]).is_file():
@@ -210,7 +213,8 @@ class WebTools(ToolProvider):
                 if "path" not in data:
                     path = self.storage.write(self.storage.allocate("web-resource") + ".resource.json", resource)
                     data = {"ref": resource["ref"], "path": path}
-            elif kind in {"web/search_scheduled", "web/search_limited"} and data["backend"] == self.search_backend:
+            elif (kind in {"tool/web_search/search_scheduled", "tool/web_search/search_limited"}
+                  and data["backend"] == self.search_backend):
                 self.search_deadline(kind, data["until"])
                 continue
             else:
@@ -341,7 +345,7 @@ class WebTools(ToolProvider):
                     if delay > 0:
                         self.storage.event("web/search_wait", operation=operation, seconds=delay)
                         await asyncio.sleep(delay)
-                    self.search_deadline("web/search_scheduled", time.time() + self.search_interval)
+                    self.search_deadline("tool/web_search/search_scheduled", time.time() + self.search_interval)
                 arguments = {"max_results": 10, "region": "us-en", "page": 1, **query}
                 try:
                     if self.search_backend == "brave":
@@ -351,7 +355,7 @@ class WebTools(ToolProvider):
                 except WebError as exc:
                     if exc.details.get("rate_limited"):
                         delay = exc.details.setdefault("retry_after", 60)
-                        self.search_deadline("web/search_limited", time.time() + delay)
+                        self.search_deadline("tool/web_search/search_limited", time.time() + delay)
                     raise
                 items = result["items"]
                 raw_file = self.storage.write(f"{operation}.search-results.json", items)

@@ -179,7 +179,7 @@ export default function App() {
         const last = entries.filter(e => e.type === 'query/start' || e.type === 'query/end').at(-1);
         return { ...chat, events: [...chat.events, ...entries], live: last ? last.type === 'query/start' : chat.live,
           artifacts: Object.keys(artifacts).length ? { ...chat.artifacts, ...artifacts } : chat.artifacts,
-          title: !chat.renamed && !chat.events.length && first ? String(first.data.prompt).replace(/\s+/g, ' ').slice(0, 36) : chat.title };
+          title: !chat.renamed && !chat.events.some(e => e.type === 'query/start') && first ? String(first.data.prompt).replace(/\s+/g, ' ').slice(0, 36) : chat.title };
       });
       for (const event of batch) if (event.type === 'query/start' && pending.current.get(id)?.request_id === event.query_id) {
         pending.current.delete(id); setDraft('');
@@ -296,7 +296,7 @@ export default function App() {
         }
         body.server_id = session.id;
         setRemembered(value => ({ ...value, [session.id]: session.configured_credentials }));
-        update(chat.id, item => ({ ...item, server_id: session.id, source_id: undefined }));
+        update(chat.id, item => ({ ...item, server_id: session.id, source_id: undefined, events: session.events ?? item.events }));
         if (session.recovery_warning) setNotice('已从旧记录恢复对话；历史工具附件不会载入新实例。');
       }
       const { server_id: serverId, ...question } = body;
