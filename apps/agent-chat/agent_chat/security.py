@@ -71,12 +71,11 @@ class PublicTransport(httpx.AsyncHTTPTransport):
     participate in this transport, so they cannot bypass address validation.
     """
 
-    def __init__(self, *, allow_query=False):
+    def __init__(self):
         super().__init__(trust_env=False)
-        self.allow_query = allow_query
 
     async def handle_async_request(self, request):
-        model_url(str(request.url.copy_with(query=None) if self.allow_query else request.url))
+        model_url(str(request.url))
         host = request.url.host
         address = await public_address(host, request.url.port or (443 if request.url.scheme == "https" else 80))
         request.extensions["sni_hostname"] = host

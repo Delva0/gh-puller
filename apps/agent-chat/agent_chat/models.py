@@ -1,4 +1,4 @@
-"""Discover OpenAI-compatible model IDs without retaining connection credentials."""
+"""Discover model IDs and test provider credentials without retaining secrets."""
 
 import json
 
@@ -34,15 +34,15 @@ async def check_credential(connection, transport=None):
         "github_token": (GITHUB_ORIGIN + "/user", {"Authorization": "Bearer " + key}),
         "gitcode_token": (GITCODE_ORIGIN + "/api/v5/user", {"Authorization": "Bearer " + key}),
         "brave_api_key": (BRAVE_SEARCH_URL + "?q=connection+test&count=1",
-                          {"X-Subscription-Token": key}),
+                          {"Accept": "application/json", "X-Subscription-Token": key}),
     }
     if connection.name not in endpoints:
         raise HTTPException(422, "该凭据尚无连接测试接口")
     url, headers = endpoints[connection.name]
     try:
+        # Fixed provider URLs follow the tool clients' proxy policy; model URLs remain DNS-pinned.
         async with (
-            httpx.AsyncClient(transport=transport or PublicTransport(allow_query=True), timeout=15,
-                              follow_redirects=False) as client,
+            httpx.AsyncClient(transport=transport, timeout=15, follow_redirects=False) as client,
             client.stream("GET", url, headers=headers) as response,
         ):
             if response.status_code in {401, 403}:
