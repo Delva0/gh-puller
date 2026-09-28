@@ -179,6 +179,38 @@ class WebTools(ToolProvider):
 
     def clear_context(self) -> None:
         self.resources.clear()
+        self.storage.event("web/cleared")
+
+    def remember_resource(self, resource):
+        self.resources[resource["ref"]] = resource
+        self.storage.event("web/resource_saved", resource=resource)
+
+    def search_deadline(self, kind, until):
+        """Observe wall-clock deadlines so pacing survives a different process clock."""
+        remaining = max(0, until - time.time())
+        if kind == "web/search_scheduled":
+            self.next_search = time.monotonic() + remaining
+        else:
+            self.search_cooldown = time.monotonic() + remaining
+        self.storage.event(kind, backend=self.search_backend, until=until)
+
+    def load_events(self, events):
+        resources, deadlines = {}, {}
+        for event in events:
+            kind, data = event["type"], event["data"]
+            if kind == "web/cleared":
+                resources.clear()
+            elif kind == "web/resource_saved":
+                resource = data["resource"]
+                if not self.storage.path(resource["body_file"]).is_file():
+                    raise ValueError("Observed web resource file is missing")
+                resources[resource["ref"]] = resource
+            elif kind in {"web/search_scheduled", "web/search_limited"} and data["backend"] == self.search_backend:
+                deadlines[kind] = data["until"]
+        for resource in resources.values():
+            self.remember_resource(dict(resource))
+        for kind, until in deadlines.items():
+            self.search_deadline(kind, until)
 
     async def _job(self, call_id, kind, arguments, limit, action):
         operation = self.storage.allocate(kind)
@@ -304,7 +336,7 @@ class WebTools(ToolProvider):
                     if delay > 0:
                         self.storage.event("web/search_wait", operation=operation, seconds=delay)
                         await asyncio.sleep(delay)
-                    self.next_search = time.monotonic() + self.search_interval
+                    self.search_deadline("web/search_scheduled", time.time() + self.search_interval)
                 arguments = {"max_results": 10, "region": "us-en", "page": 1, **query}
                 try:
                     if self.search_backend == "brave":
@@ -314,7 +346,7 @@ class WebTools(ToolProvider):
                 except WebError as exc:
                     if exc.details.get("rate_limited"):
                         delay = exc.details.setdefault("retry_after", 60)
-                        self.search_cooldown = time.monotonic() + delay
+                        self.search_deadline("web/search_limited", time.time() + delay)
                     raise
                 items = result["items"]
                 raw_file = self.storage.write(f"{operation}.search-results.json", items)
@@ -383,8 +415,8 @@ class WebTools(ToolProvider):
                         ref = f"{operation}-inline-{len(assets) + 1}"
                         mime = header[5:].split(";", 1)[0] or "application/octet-stream"
                         filename = self.storage.write(f"{ref}.body", raw, operation=operation, media_type=mime)
-                        self.resources[ref] = {"ref": ref, "url": url, "body_file": filename,
-                                               "headers": {"content-type": mime}, "size": len(raw)}
+                        self.remember_resource({"ref": ref, "url": url, "body_file": filename,
+                                                "headers": {"content-type": mime}, "size": len(raw)})
                         assets.append({"ref": ref, "media_type": mime})
                         tag[attr] = f"resource:{ref}"
                     except ValueError:
@@ -468,7 +500,7 @@ class WebTools(ToolProvider):
         return None, data
 
     def _render(self, resource, operation, member=None):
-        body = (self.storage.root / resource["body_file"]).read_bytes()
+        body = self.storage.read(resource["body_file"])
         mime = resource.get("headers", {}).get("content-type", "").split(";", 1)[0].lower()
         name = unquote(httpx.URL(resource["url"]).path)
         compressed = body.startswith((b"\x1f\x8b", b"BZh", b"\xfd7zXZ\x00"))
@@ -539,7 +571,7 @@ class WebTools(ToolProvider):
             async def action(operation):
                 if "url" in request:
                     resource = {"ref": operation, **await self._download(operation, request["url"])}
-                    self.resources[operation] = resource
+                    self.remember_resource(resource)
                 else:
                     if request["ref"] not in self.resources:
                         raise ValueError("Unknown resource ref in this conversation; fetch its URL again")

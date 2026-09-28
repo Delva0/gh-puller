@@ -1,11 +1,29 @@
 """Shared HTTP, credential validation, JSON Pointer and exact line-excerpt helpers."""
 
+import base64
 import math
 import re
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 
 import httpx
+
+
+def attachment_parts(parts, storage):
+    """Rehydrate observed tool attachments through the caller's bounded file storage."""
+    result = []
+    for part in parts:
+        kind = part["type"]
+        if kind == "input_text":
+            result.append({"type": "text", "text": part["text"]})
+        elif kind in {"input_image", "input_file"}:
+            key = "image_url" if kind == "input_image" else "file_path"
+            encoded = base64.b64encode(storage.read(part[key])).decode("ascii")
+            data = f"data:{part['media_type']};base64,{encoded}"
+            result.append({"type": "image_url", "image_url": {"url": data, "detail": "auto"}}
+                          if kind == "input_image" else
+                          {"type": "file", "file": {"filename": part["filename"], "file_data": data}})
+    return result
 
 
 def retry_delay(value: str | None, *, default: float) -> float:

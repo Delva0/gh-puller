@@ -4,9 +4,10 @@ import json
 
 from gh_puller.agent.context import instruction, system_message, tool_defs
 from gh_puller.agent.events import function_call_item, function_output_item, reasoning_item, text_message
+from gh_puller.tools.utils import attachment_parts
 
 
-def context_messages(items):
+def context_messages(items, *, storage=None, records=None):
     """Read the shared Context vocabulary without importing another agent's private state."""
     messages, group = [], None
     for item in items:
@@ -17,16 +18,21 @@ def context_messages(items):
             output = item["output"]
             messages.append({"role": "tool", "tool_call_id": item["call_id"],
                              "content": output if isinstance(output, str) else json.dumps(output, ensure_ascii=False)})
+            if records is not None:
+                records[id(messages[-1])] = [item]
             group = None
             continue
         if kind not in {"message", "reasoning", "function_call"}:
             continue
         key = item.get("id", "").rsplit("-", 1)[0] or None
         if (not messages or messages[-1]["role"] != role or role == "user"
-                or (key is not None and key != group) or (kind == "message" and messages[-1].get("content"))):
+                or (key is not None and key != group and kind != "function_call")
+                or (kind == "message" and messages[-1].get("content"))):
             messages.append({"role": role, "content": None})
         group = key
         message = messages[-1]
+        if records is not None:
+            records.setdefault(id(message), []).append(item)
         if kind == "function_call":
             message.setdefault("tool_calls", []).append({"id": item["call_id"], "type": "function",
                 "function": {"name": item["name"], "arguments": item["arguments"]}})
@@ -34,7 +40,11 @@ def context_messages(items):
             text = "".join(part.get("text", "<image>" if part["type"] == "input_image" else
                                    "<file>" if part["type"] == "input_file" else "")
                            for part in item.get("content", []))
-            message["reasoning_content" if kind == "reasoning" else "content"] = text
+            parts = item.get("content", [])
+            attachments = storage is not None and any(
+                part["type"] in {"input_image", "input_file"} and part.get("media_type") for part in parts)
+            message["reasoning_content" if kind == "reasoning" else "content"] = (
+                attachment_parts(parts, storage) if attachments else text)
     return messages
 
 
@@ -107,7 +117,8 @@ class ContextMirror:
         if key not in self.records:
             self.sequence += 1
             self.records[key] = (message, f"m{self.sequence}",
-                                 {"query": self.query, "step": self.step, "producer": producer or message["role"]},
+                                 {"query": self.query, "step": self.step, "producer": producer or message["role"],
+                                  **(image_observation or {}).get("metadata", {})},
                                  image_observation)
         _, prefix, metadata, image_observation = self.records[key]
         self.records[key] = (message, prefix, metadata, image_observation)
@@ -117,6 +128,27 @@ class ContextMirror:
     def append(self, message: dict, *, role: str | None = None, image_observation: dict | None = None) -> None:
         self.recorder.append_context(self.project(message, producer=role, image_observation=image_observation),
                                      role=role)
+
+    def load(self, items, system, *, storage=None):
+        """Apply shared Context to native messages, retaining observed attachment ownership."""
+        records = {}
+        messages = [system, *context_messages(items, storage=storage, records=records)]
+        self.records.clear()
+        for message in messages:
+            source = records.get(id(message), [])
+            metadata = source[0].get("metadata", {}) if source else {}
+            self.sequence += 1
+            self.records[self.key(message)] = (message, f"m{self.sequence}", metadata,
+                source[0] if source and isinstance(message.get("content"), list) else None)
+        self.query = max((item.get("metadata", {}).get("query", 0) for item in items), default=0)
+        self.step = max((item.get("metadata", {}).get("step", 0) for item in items
+                         if item.get("metadata", {}).get("query") == self.query), default=0)
+        items[:] = [item for message in messages for item in self.project(message)]
+        return messages
+
+    def tool_images(self):
+        return {metadata["call_id"]: message for message, _, metadata, observation in self.records.values()
+                if observation is not None and "call_id" in metadata}
 
     def synchronize(self, messages: list[dict], *, force: bool = False) -> None:
         """Publish current memory, including removals; keep earlier events as immutable history."""

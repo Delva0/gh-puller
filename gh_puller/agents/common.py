@@ -4,7 +4,6 @@ import asyncio
 import copy
 import json
 import threading
-import time
 from contextlib import AsyncExitStack
 from dataclasses import asdict
 from pathlib import Path
@@ -16,6 +15,7 @@ from jsonschema import ValidationError
 
 from ..agent.adapters.openai import ChatCompletion
 from ..agent.base import BaseAgent, RequestFailedError
+from ..agent.events import CONTEXT_APPEND_TYPES, EVENT_TYPES, fold_state, is_event_type
 from ..configuration import option, positive_integer
 from ..tools.registry import ToolInputError, ToolRegistry, input_error
 from ..tools.storage import ToolStorage
@@ -25,7 +25,6 @@ from ..tools.tool_ptc import PTCTool
 from ..tools.tool_web import WebTools
 from .context import ContextMirror, complete_calls
 from .options import model_id, reasoning_effort
-from .state import MemoryRecorder, read_events, restore
 
 
 class CommonAgent(BaseAgent):
@@ -91,8 +90,6 @@ class CommonAgent(BaseAgent):
         self.on_early_answer = on_early_answer
         self.tool_definitions = []
         self.tool_results = ToolResultStore(storage)
-        self._state_ready = False
-        self._clock_origin = time.time() - time.monotonic()
         self.messages: list[dict] = []
         self.completed_steps: set[tuple[int, int]] = set()
         self.web_tools = self.web_client = None
@@ -125,11 +122,8 @@ class CommonAgent(BaseAgent):
             loop, thread = asyncio.get_running_loop(), threading.get_ident()
 
             def record(kind, data):
-                recorder = self._require_event_recorder()
-                if self._state_ready:
-                    if kind == "artifact/saved":
-                        recorder.artifact(data["path"])
-                    recorder.capture()
+                if is_event_type(kind) and kind not in EVENT_TYPES:
+                    self._require_event_recorder().event(kind, **data)
 
             async def record_async(kind, data):
                 record(kind, data)
@@ -149,7 +143,6 @@ class CommonAgent(BaseAgent):
                                                         for name, policy in self.offload_policies.items()})
             self.messages = [{"role": "system", "content": self.instructions()}]
             self.context.definitions = self.tool_definitions
-            self._state_ready = True
             self.context.append(self.messages[0])
         except BaseException:
             await self.resources.aclose()
@@ -158,9 +151,6 @@ class CommonAgent(BaseAgent):
     def own(self, resource):
         self.resources.push_async_callback(resource.aclose)
         return resource
-
-    def _recorder(self, **kwargs):
-        return MemoryRecorder(self, super()._recorder(**kwargs))
 
     def http_client(self, transport=None):
         return self.own(httpx.AsyncClient(
@@ -243,7 +233,6 @@ class CommonAgent(BaseAgent):
         return RequestFailedError("Tool provider unavailable")
 
     async def _exit(self, exc):
-        self._state_ready = False
         await self.resources.aclose()
 
     async def _call(self, call: dict, *, parent_call_id: str | None = None) -> ToolOutput:
@@ -329,13 +318,13 @@ class CommonAgent(BaseAgent):
 
     @classmethod
     def validate_events(cls, events, *, max_bytes=64 * 1024 * 1024):
-        """Check recoverable observations before allocating an execution instance.
+        """Bound file observations before allocation; tools validate their references on load.
 
         Args:
             events: An ordered prefix of canonical and Agent-owned events.
             max_bytes: Maximum total decoded evidence size accepted by the caller.
         """
-        read_events(events, "search-" + cls.name, max_bytes)
+        ToolStorage.event_files(cls.own_events(events, "search-" + cls.name), max_bytes=max_bytes)
 
     def load_events(self, events, *, max_bytes=64 * 1024 * 1024):
         """Restore own memory or a foreign Agent's Context in a fresh session.
@@ -346,7 +335,38 @@ class CommonAgent(BaseAgent):
                 are not process snapshots; the target keeps its current configuration.
             max_bytes: Maximum total decoded evidence size accepted by the caller.
         """
-        return restore(self, events, max_bytes)
+        own = self.own_events(events, self.agent)
+        self.storage.load_events(own, max_bytes=max_bytes)
+        self.storage.reserve_context_ids(fold_state(events)["context"])
+        self.tool_registry.load_events(own)
+        self.early_answers.load_events(own)
+        self._restore_images = bool(own)
+        super().load_events(events)
+        self.tool_results.bind_messages(self.messages, images=self.context.tool_images())
+        query = step = 0
+        for event in own:
+            kind, data = event["type"], event["data"]
+            if kind == "turn/start":
+                query, step = query + 1, 0
+            elif kind == "step/start":
+                step += 1
+            elif kind == "step/end" and data["outcome"] == "completed":
+                self.completed_steps.add((query, step))
+            elif kind in CONTEXT_APPEND_TYPES | {"context/set"}:
+                positions = [(item.get("metadata", {}).get("query", 0), item.get("metadata", {}).get("step", 0))
+                             for item in data["items"]]
+                query, step = max([(query, step), *positions])
+                if kind == "context/set" and all(item.get("role") == "system" for item in data["items"]):
+                    self.completed_steps.clear()
+        if own:
+            self.context.query, self.context.step = query, step
+
+    def _load_context(self, items):
+        self.messages = self.context.load(items, self.messages[0],
+                                          storage=self.storage if self._restore_images else None)
+        self.final_answer = next((m["content"] for m in reversed(self.messages)
+                                  if m["role"] == "assistant" and not m.get("tool_calls")), "")
+        self.completed_steps.clear()
 
     def set_model(self, model: str) -> None:
         """Change the model between turns, preserving context and request parameters."""
@@ -381,7 +401,8 @@ class CommonAgent(BaseAgent):
         recorder = self._require_event_recorder()
         if prompt is not None:
             self.messages = complete_calls(self.messages)
-            self.tool_results.begin_user_query()
+            if self.offload_policies:
+                self.tool_results.begin_user_query()
             self.begin_query()
         self.context.query += 1
         self.context.step = 0
@@ -419,7 +440,8 @@ class CommonAgent(BaseAgent):
                 return
             fatal = False
             tasks = []
-            tool_queries = self.tool_results.begin_tool_batch(len(calls))
+            tool_queries = (self.tool_results.begin_tool_batch(len(calls))
+                            if self.offload_policies else range(len(calls)))
             try:
                 async with asyncio.TaskGroup() as group:
                     tasks = [group.create_task(self._call(call)) for call in calls]
@@ -446,12 +468,12 @@ class CommonAgent(BaseAgent):
                     self.messages.append(tool_message)
                     self.context.append(tool_message, role="tool")
                     if image_message is not None:
-                        image_messages.append((image_message, output.observations))
+                        image_messages.append((image_message, output.observations, call["id"]))
                 # Keep tool/image ownership separate, with images after ALL paired tool results.
-                for image_message, observations in image_messages:
+                for image_message, observations, call_id in image_messages:
                     self.messages.append(image_message)
                     self.context.append(image_message, role="tool", image_observation={
-                        "type": "message", "role": "user", "content": observations,
+                        "type": "message", "role": "user", "content": observations, "metadata": {"call_id": call_id},
                     })
             if fatal:
                 raise self.fatal_error()

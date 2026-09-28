@@ -28,6 +28,13 @@ class EarlyAnswerTool(ToolProvider):
     def clear_context(self):
         self.restore([])
 
+    def load_events(self, events):
+        answers = []
+        for event in events:
+            if event["type"] == "agent/set/early_answers":
+                answers = event["data"]["early_answers"]
+        self.restore(answers)
+
     @tool(description=DESCRIPTION, parameters={"type": "object", "properties": {
         "text": {"type": "string", "minLength": 1,
                  "description": "The message for the user or calling agent; Markdown supported."},

@@ -1,12 +1,13 @@
 """Define the common Agent lifecycle and caller-visible failure contract."""
 
 import contextlib
+import copy
 import sys
 from collections.abc import AsyncIterator
 from typing import TYPE_CHECKING, Any
 
 from .. import envs
-from .events import EventRecorder, _session_id
+from .events import EventRecorder, _session_id, fold_state
 
 if TYPE_CHECKING:
     from .events import FailureReason
@@ -128,15 +129,38 @@ class BaseAgent:
         """
         raise NotImplementedError
 
-    def load_events(self, events, **options):
-        """Restore observed context using the adapter's own representation.
+    def load_events(self, events):
+        """Replay shared Context while retaining the target's system instructions.
 
         Args:
-            events: Ordered event dictionaries. Restoration covers recorded observations,
-                not unobserved process memory; the target keeps its current configuration.
-            options: Adapter-specific recovery options, such as evidence size limits.
+            events: Ordered event dictionaries, optionally ending mid-turn. Only Context
+                events are read here. Adapters can additionally replay their own tools.
 
         Raises:
-            NotImplementedError: The adapter does not provide event-stream recovery.
+            NotImplementedError: The adapter cannot apply Context to its native client.
         """
-        raise NotImplementedError("This agent does not implement event-stream recovery")
+        recorder = self._require_event_recorder()
+        items = [item for item in recorder.context() if item.get("role") == "system"]
+        items.extend(item for item in fold_state(events)["context"] if item.get("role") != "system")
+        items = copy.deepcopy(items)
+        self._load_context(items)
+        recorder.set_context(items)
+
+    def _load_context(self, items):
+        """Apply canonical items to native memory before publishing the restored Context.
+
+        Args:
+            items: Complete target Context, including its current system instructions.
+        """
+        raise NotImplementedError("This agent cannot apply Context to its native client")
+
+    @staticmethod
+    def own_events(events, identity):
+        """Select the latest Agent's private observations, excluding earlier identities.
+
+        Args:
+            events: Ordered event prefix.
+            identity: Exact target Agent identity; foreign histories yield no private events.
+        """
+        start = max((i for i, event in enumerate(events) if event["type"] == "agent/set"), default=-1)
+        return events[start + 1:] if start >= 0 and events[start]["data"]["agent"] == identity else []

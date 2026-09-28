@@ -371,6 +371,22 @@ class SandboxBashTool(ToolProvider):
     def clear_context(self):
         """Conversation clearing never changes the sandbox or its tasks."""
 
+    def load_events(self, events):
+        connection = None
+        for event in events:
+            kind, data = event["type"], event["data"]
+            if kind == "sandbox/connected":
+                connection = data["connection"]
+            elif connection == self.sandbox.identity:
+                if kind == "sandbox/task_request":
+                    self.calls[data["call_id"]] = data["task_id"]
+                elif kind == "sandbox/task_observed":
+                    result = copy.deepcopy(data["result"])
+                    self.observed[result["task_id"]] = result
+                else:
+                    continue
+                self.storage.event(kind, **data)
+
     def cancelled_output(self, call_id):
         if call_id not in self.calls:
             return {"status": "not_started", "exit_code": None,
@@ -482,7 +498,28 @@ class DockerBashTools(ToolProvider):
             self.storage.event("sandbox/task_observed", call_id=call_id, result=result)
 
     def checkpoint(self):
-        self.storage.event("sandbox/shell_state", **self.save())
+        self.storage.event("sandbox/shell_state", connection=self.sandbox.identity, **self.save())
+
+    def load_events(self, events):
+        connection, state, returned = None, {}, set()
+        for event in events:
+            kind, data = event["type"], event["data"]
+            if kind == "sandbox/connected":
+                connection = data["connection"]
+            elif kind == "sandbox/shell_state" and data.get("connection", connection) == self.sandbox.identity:
+                state = copy.deepcopy(data)
+            elif kind == "sandbox/task_request" and connection == self.sandbox.identity:
+                state.setdefault("calls", {})[data["call_id"]] = data["task_id"]
+            elif kind == "sandbox/task_observed" and connection == self.sandbox.identity:
+                result = copy.deepcopy(data["result"])
+                state.setdefault("tasks", {})[result["task_id"]] = result
+                if data.get("call_id"):
+                    state.setdefault("calls", {})[data["call_id"]] = result["task_id"]
+            elif kind == "tool/end":
+                returned.add(data["callId"])
+        if state:
+            self.restore(state, returned)
+            self.checkpoint()
 
     async def request(self, args, call_id=None):
         operation = self.storage.allocate("sandbox-shell")

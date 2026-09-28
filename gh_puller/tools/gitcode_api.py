@@ -224,6 +224,16 @@ class GitCodeAPI(APIReads):
     provider = "gitcode"
     text_documents = True
 
+    def cooldown_until(self, until):
+        self.cooldown = max(self.cooldown, until)
+        self.event("rate_limited", until=self.cooldown)
+
+    def load_events(self, events):
+        super().load_events(events)
+        for event in events:
+            if event["type"] == "gitcode/rate_limited" and event["data"].get("tool") == self.scope:
+                self.cooldown_until(event["data"]["until"])
+
     def __init__(self, client: httpx.AsyncClient, storage: ToolStorage, *, token: str, concurrency: int = 8):
         super().__init__(client, storage, token=token, concurrency=concurrency)
         self.cooldown = 0.0
@@ -308,7 +318,7 @@ class GitCodeAPI(APIReads):
                 )
                 if limited:
                     until = time.time() + retry_delay(response.headers.get("retry-after"), default=60)
-                    self.cooldown = max(self.cooldown, until)
+                    self.cooldown_until(until)
                     metadata["retry_at"] = self.cooldown
                 metadata.update(
                     error={
@@ -359,7 +369,7 @@ class GitCodeAPI(APIReads):
                     metadata["log_complete"] = not more
                 except (ValueError, KeyError, TypeError) as exc:
                     metadata.update(error={"type": "LogPaginationError", "message": str(exc)}, log_complete=False)
-            self.responses[request_id] = metadata
+            self.remember_response(metadata)
             self.storage.record(f"{request_id}.response.json",
                                 {**metadata, "header_items": response.headers.multi_items()})
             self.storage.event(
@@ -436,7 +446,7 @@ class GitCodeAPI(APIReads):
                         response.status_code == 403 and "retry-after" in response.headers
                     ):
                         until = time.time() + retry_delay(response.headers.get("retry-after"), default=60)
-                        self.cooldown = max(self.cooldown, until)
+                        self.cooldown_until(until)
                         metadata.update(rate_limited=True, retry_at=self.cooldown)
             except BaseException as exc:
                 metadata["error"] = {"type": type(exc).__name__, "message": str(exc)}
@@ -448,7 +458,7 @@ class GitCodeAPI(APIReads):
                 if response is not None:
                     await response.aclose()
                 metadata["body_sha256"] = hashlib.sha256(self._body(metadata)).hexdigest()
-                self.responses[result_id] = metadata
+                self.remember_response(metadata)
                 self.storage.record(result_id + ".response.json", metadata)
                 self.storage.event(
                     "gitcode/http_end",

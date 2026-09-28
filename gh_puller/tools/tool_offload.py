@@ -1,12 +1,12 @@
 """Optional tool-output offload and retrieval without re-executing tools."""
 
-import base64
 import json
 from dataclasses import asdict, dataclass, field
 
 from ..configuration import ToolConfig, option, positive_integer
 from .registry import BATCH_OUTPUT, ToolProvider, tool, tool_definitions
 from .storage import ToolStorage
+from .utils import attachment_parts
 
 GET_TOOL_RESULT_DESCRIPTION = (
     "Retrieve the complete saved outputs of earlier tool calls using tool_call_ids from their offload notices. "
@@ -127,14 +127,63 @@ class ToolResultStore(ToolProvider):
         self.saved.clear()
         self.uses.clear()
         self.user_query = self.tool_query = 0
+        self.storage.event("tool_result/cleared")
 
     def begin_user_query(self) -> None:
         self.user_query += 1
+        self.storage.event("tool_result/user_query", number=self.user_query)
 
     def begin_tool_batch(self, count: int) -> range:
         start = self.tool_query + 1
         self.tool_query += count
+        self.storage.event("tool_result/tool_query", number=self.tool_query)
         return range(start, self.tool_query + 1)
+
+    def load_events(self, events):
+        self.clear_context()
+        for event in events:
+            kind, data = event["type"], event["data"]
+            if kind == "tool_result/cleared":
+                self.clear_context()
+                continue
+            if kind == "tool_result/user_query":
+                self.user_query = data["number"]
+            elif kind == "tool_result/tool_query":
+                self.tool_query = data["number"]
+            elif kind == "tool_result/saved":
+                body = json.loads(self.storage.read(data["artifact"]))
+                for part in body["image_attachments"]:
+                    key = {"input_image": "image_url", "input_file": "file_path"}.get(part["type"])
+                    if key and not self.storage.path(part[key]).is_file():
+                        raise ValueError("Observed tool attachment is missing")
+                call_id = data["call_id"]
+                self.saved[call_id] = SavedResult(data["artifact"], OffloadPolicy(**body["policy"]))
+                self.uses.append(ResultUse(call_id, {}, None, data["user_query"], data["tool_query"]))
+            elif kind == "tool_result/seen":
+                for use in self.uses:
+                    if use.tool_call_id == data["call_id"]:
+                        use.seen = True
+            else:
+                continue
+            self.storage.event(kind, **data)
+
+    def bind_messages(self, messages, *, images=None):
+        """Attach replayed retention facts to Context-owned messages after Context recovery."""
+        by_call = {m["tool_call_id"]: m for m in messages if m["role"] == "tool"}
+        retained = []
+        for use in self.uses:
+            message = by_call.get(use.tool_call_id)
+            body = json.loads(self.storage.read(self.saved[use.tool_call_id].artifact))
+            if message is None or message["content"] != body["content"]:
+                continue
+            use.message = message
+            if images is None:
+                attachments = attachment_parts(body["image_attachments"], self.storage)
+                use.image_message = next((m for m in messages if attachments and m.get("content") == attachments), None)
+            else:
+                use.image_message = images.get(use.tool_call_id)
+            retained.append(use)
+        self.uses = retained
 
     def bind(self, output: ToolOutput, message: dict, image_message: dict | None, *, name: str,
              tool_query: int, policy: OffloadPolicy) -> None:
@@ -148,9 +197,9 @@ class ToolResultStore(ToolProvider):
             "content": output.content, "image_attachments": output.observations, "policy": asdict(policy),
         }, call_id=tool_call_id)
         self.saved[tool_call_id] = SavedResult(artifact, policy)
+        self.uses.append(ResultUse(tool_call_id, message, image_message, self.user_query, tool_query))
         self.storage.event("tool_result/saved", call_id=tool_call_id, name=name, artifact=artifact,
                        user_query=self.user_query, tool_query=tool_query)
-        self.uses.append(ResultUse(tool_call_id, message, image_message, self.user_query, tool_query))
 
     @tool(description=GET_TOOL_RESULT_DESCRIPTION, parameters=GET_TOOL_RESULT_SCHEMA, returns=BATCH_OUTPUT,
           configuration=tuple(TOOL_RESULT_CONFIG.defaults))
@@ -164,20 +213,8 @@ class ToolResultStore(ToolProvider):
                         f"Unknown tool_call_id {tool_call_id!r} in this context; use an ID from an offload notice",
                     )
                 saved = self.saved[tool_call_id]
-                body = json.loads((self.storage.root / saved.artifact).read_text(encoding="utf-8"))
-                attachments = []
-                for part in body["image_attachments"]:
-                    if part["type"] == "input_text":
-                        attachments.append({"type": "text", "text": part["text"]})
-                    elif part["type"] == "input_image":
-                        encoded = base64.b64encode((self.storage.root / part["image_url"]).read_bytes()).decode("ascii")
-                        attachments.append({"type": "image_url", "image_url": {
-                            "url": f"data:{part['media_type']};base64,{encoded}", "detail": "auto",
-                        }})
-                    elif part["type"] == "input_file":
-                        encoded = base64.b64encode((self.storage.root / part["file_path"]).read_bytes()).decode("ascii")
-                        attachments.append({"type": "file", "file": {"filename": part["filename"],
-                                            "file_data": f"data:{part['media_type']};base64,{encoded}"}})
+                body = json.loads(self.storage.read(saved.artifact))
+                attachments = attachment_parts(body["image_attachments"], self.storage)
                 results.append({"tool_call_id": tool_call_id, "content": body["content"]})
             except (OSError, ValueError, KeyError) as exc:
                 results.append({"tool_call_id": tool_call_id, "error": {
@@ -210,6 +247,8 @@ class ToolResultStore(ToolProvider):
                                original_chars=len(use.message["content"]), preview_chars=len(preview),
                                tool_images_removed=use.image_message is not None)
             else:
+                if not use.seen:
+                    self.storage.event("tool_result/seen", call_id=use.tool_call_id)
                 use.seen = True
                 retained.append(use)
         self.uses = retained

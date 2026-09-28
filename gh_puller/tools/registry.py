@@ -86,6 +86,15 @@ class ToolProvider:
         """Providers may accept documented wire coercions without weakening JSON schemas."""
         return args
 
+    def load_events(self, events):
+        """Replay this tool's observations into a fresh provider; stateless tools do nothing.
+
+        Args:
+            events: Ordered observations from the owning Agent, with tool files restored.
+                Implementations read their own routes and publish their restored facts.
+                Network connections and running work are not replayed.
+        """
+
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
         inherited = {spec.name: spec for spec in cls.tool_specs}
@@ -214,6 +223,15 @@ class ToolRegistry:
         for index, result in zip(positions, output["results"], strict=True):
             results[index] = result
         return {**output, "results": results}
+
+    def load_events(self, events):
+        """Restore each provider once, even when it exposes multiple tools or aliases.
+
+        Args:
+            events: Ordered observations from the owning Agent.
+        """
+        for provider in dict.fromkeys(self.providers.values()):
+            provider.load_events(events)
 
     @property
     def definitions(self) -> list[dict]:

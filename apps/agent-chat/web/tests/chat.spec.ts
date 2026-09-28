@@ -428,7 +428,7 @@ test('model popup, branch edits, regeneration, agent switching and portable hist
   await expect(page.locator('.trace-item[data-kind=tool]').last().locator('.trace-description')).toContainText('web_fetch(requests=[{url=');
   const saved = await captureDownload(page, '导出事件');
   expect(saved.events.some((event: { type: string }) => event.type.startsWith('context/append'))).toBe(true);
-  expect(saved.events.some((event: { type: string }) => event.type === 'search/state')).toBe(true);
+  expect(saved.events.some((event: { type: string }) => event.type === 'artifact/saved')).toBe(true);
   expect(saved.events.some((event: { type: string }) => event.type === 'context/checkpoint')).toBe(false);
   expect(saved.events.slice(0, before.events.length)).toEqual(before.events);
   await page.reload();

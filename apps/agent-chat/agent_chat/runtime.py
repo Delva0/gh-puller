@@ -9,6 +9,7 @@ import asyncio
 import contextlib
 import hashlib
 import json
+import sys
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -264,7 +265,14 @@ class SessionManager:
                         session.agent = session.context = None
                         raise
                     if session.history:
-                        restore(session)
+                        try:
+                            restore(session)
+                        except BaseException:
+                            try:
+                                await session.context.__aexit__(*sys.exc_info())
+                            finally:
+                                session.agent = session.context = None
+                            raise
                 else:
                     session.agent.config.update(config)
                     session.agent.set_credentials(session.credentials)

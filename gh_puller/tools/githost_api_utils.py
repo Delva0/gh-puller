@@ -132,6 +132,36 @@ class APIReads:
         self.responses: dict[str, dict] = {}
         self._active_reads = ContextVar(f"{self.provider}_reads", default=None)
         self._reads = ReadCache()
+        self.scope = self.provider
+
+    def event(self, kind, **data):
+        self.storage.event(f"{self.provider}/{kind}", tool=self.scope, **data)
+
+    def remember_response(self, metadata):
+        self.responses[metadata["result_id"]] = metadata
+        self.event("response_saved", metadata=metadata)
+
+    def load_events(self, events):
+        """Replay saved-response identities and query-local cache links, never pending requests."""
+        archive = {}
+        for event in events:
+            kind, data = event["type"], event["data"]
+            if kind == f"{self.provider}/cleared":
+                self.responses.clear()
+                if data.get("tool") == self.scope:
+                    self._reads = ReadCache()
+            elif kind == f"{self.provider}/response_saved" and "metadata" in data:
+                metadata = deepcopy(data["metadata"])
+                if not self.storage.path(metadata["body_file"]).is_file():
+                    raise ValueError("Observed API response file is missing")
+                archive[metadata["result_id"]] = self.responses[metadata["result_id"]] = metadata
+            elif kind == f"{self.provider}/query_started" and data.get("tool") == self.scope:
+                self._reads = ReadCache()
+            elif kind == f"{self.provider}/read_cached" and data.get("tool") == self.scope:
+                self._reads.responses[data["identity"]] = archive[data["result_id"]]
+            else:
+                continue
+            self.storage.event(kind, **data)
 
     def _failure(self, exc):
         details = dict(getattr(exc, "details", {}))
@@ -157,6 +187,7 @@ class APIReads:
 
     def begin_query(self) -> None:
         self._reads = ReadCache()
+        self.event("query_started")
 
     @contextmanager
     def read_scope(self):
@@ -168,6 +199,7 @@ class APIReads:
 
     def clear_context(self) -> None:
         self.responses.clear()
+        self.event("cleared")
         self.begin_query()
 
     async def _job(self, call_id: str, arguments: dict, action) -> dict:
@@ -228,6 +260,7 @@ class APIReads:
             metadata = await asyncio.shield(flight.task)
             if reuse and self._cacheable(metadata):
                 cache.responses[identity] = metadata
+                self.event("read_cached", identity=identity, result_id=metadata["result_id"])
             if shared:
                 self.storage.event(
                     f"{self.provider}/request_shared", operation=operation, source_result_id=metadata["result_id"],
@@ -251,7 +284,7 @@ class APIReads:
         return metadata
 
     def _body(self, metadata: dict) -> bytes:
-        return (self.storage.root / metadata["body_file"]).read_bytes()
+        return self.storage.read(metadata["body_file"])
 
     def _derived(self, operation: str, kind: str, request: dict, data, **details) -> dict:
         """Save a derived document without inventing a native HTTP response status."""
@@ -269,9 +302,8 @@ class APIReads:
             "created_at": datetime.now(UTC).isoformat(),
             **details,
         }
-        self.responses[result_id] = metadata
+        self.remember_response(metadata)
         self.storage.record(result_id + ".response.json", metadata)
-        self.storage.event(f"{self.provider}/response_saved", operation=operation, request=result_id, kind_name=kind)
         return metadata
 
     def _http_metadata(self, request_id, request, response):
@@ -297,6 +329,10 @@ class APIProvider(ToolProvider):
 
     def __init__(self, *args, **kwargs):
         self.api = self.api_type(*args, **kwargs)
+        self.api.scope = self.tool_specs[0].name
+
+    def load_events(self, events):
+        self.api.load_events(events)
 
     @property
     def storage(self):

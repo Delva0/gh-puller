@@ -202,6 +202,25 @@ class GitHubAPI(APIReads):
         self.cooldowns: dict[str, float] = {}
         self.resource_names: dict[tuple[str, str], str] = {}
 
+    def name_resource(self, key, resource):
+        self.resource_names[tuple(key)] = resource
+        self.event("resource_named", key=list(key), resource=resource)
+
+    def cooldown(self, resource, until):
+        self.cooldowns[resource] = max(self.cooldowns.get(resource, 0), until)
+        self.event("rate_limited", resource=resource, until=self.cooldowns[resource])
+
+    def load_events(self, events):
+        super().load_events(events)
+        for event in events:
+            data = event["data"]
+            if data.get("tool") != self.scope:
+                continue
+            if event["type"] == "github/resource_named":
+                self.name_resource(data["key"], data["resource"])
+            elif event["type"] == "github/rate_limited":
+                self.cooldown(data["resource"], data["until"])
+
     def _failure(self, exc):
         result = super()._failure(exc)
         if isinstance(exc, GraphQLError):
@@ -320,7 +339,7 @@ class GitHubAPI(APIReads):
                 metadata.update(search_status(data))
             if response.headers.get("x-ratelimit-resource"):
                 resource = response.headers["x-ratelimit-resource"]
-                self.resource_names[resource_key] = resource
+                self.name_resource(resource_key, resource)
             graphql_errors = data.get("errors") if payload is not None and isinstance(data, dict) else None
             if graphql_errors:
                 metadata.update(graphql_errors=graphql_errors, partial_data=data.get("data") is not None)
@@ -330,7 +349,7 @@ class GitHubAPI(APIReads):
                     reset = float(response.headers["x-ratelimit-reset"]) + 1
                 except (KeyError, ValueError):
                     reset = time.time() + 60
-                self.cooldowns[resource] = max(self.cooldowns.get(resource, 0), reset)
+                self.cooldown(resource, reset)
             if response.is_error or graphql_errors:
                 message = (
                     str(data.get("message", response.reason_phrase))
@@ -364,11 +383,11 @@ class GitHubAPI(APIReads):
                     scope = resource if exhausted else "all"
                     if not exhausted or "retry-after" in response.headers:
                         until = time.time() + retry_delay(response.headers.get("retry-after"), default=60)
-                        self.cooldowns[scope] = max(self.cooldowns.get(scope, 0), until)
+                        self.cooldown(scope, until)
                     metadata["retry_at"] = max(self.cooldowns.get(resource, 0), self.cooldowns.get("all", 0))
                 elif response.status_code in {500, 502, 503, 504} and "retry-after" in response.headers:
                     until = time.time() + retry_delay(response.headers["retry-after"], default=60)
-                    self.cooldowns[resource] = max(self.cooldowns.get(resource, 0), until)
+                    self.cooldown(resource, until)
                     metadata["retry_at"] = self.cooldowns[resource]
                 metadata.update(
                     error={
@@ -411,7 +430,7 @@ class GitHubAPI(APIReads):
                         raise ValueError("Invalid external redirect URL")
                 except (ValueError, httpx.InvalidURL) as exc:
                     metadata["error"] = {"type": type(exc).__name__, "message": str(exc)}
-            self.responses[request_id] = metadata
+            self.remember_response(metadata)
             self.storage.record(f"{request_id}.response.json",
                                 {**metadata, "header_items": response.headers.multi_items()})
             self.storage.event(
@@ -496,11 +515,8 @@ class GitHubAPI(APIReads):
                 if response is not None:
                     await response.aclose()
                 metadata["body_sha256"] = hashlib.sha256(self._body(metadata)).hexdigest()
-                self.responses[result_id] = metadata
+                self.remember_response(metadata)
                 self.storage.record(result_id + ".response.json", metadata)
-                self.storage.event(
-                    "github/response_saved", operation=operation, request=result_id, kind_name="ci_log_download",
-                )
                 self.storage.event(
                     "github/http_end",
                     operation=operation,

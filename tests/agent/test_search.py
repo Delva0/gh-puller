@@ -1,6 +1,7 @@
 """Exercise package search agents without experiment recording or checkout-relative state."""
 
 import asyncio
+import base64
 import copy
 import json
 import subprocess
@@ -10,7 +11,7 @@ import httpx
 import pytest
 
 from gh_puller.agent import sinks
-from gh_puller.agent.events import EventBus, set_active_bus
+from gh_puller.agent.events import EventBus, fold_state, set_active_bus
 from gh_puller.agents import GitCodeAgent, GitHubAgent, WebAgent
 from gh_puller.tools.storage import ToolStorage
 from gh_puller.tools.tool_gitcode import GitCodeTool
@@ -161,7 +162,7 @@ assert fold_state([]) == {"agent": None, "context": []}
 @pytest.mark.asyncio
 @pytest.mark.parametrize("target", [GitHubAgent, GitCodeAgent, WebAgent])
 async def test_event_prefixes_restore_own_memory_and_foreign_context_only(tmp_path, target):
-    events, expected = [], []
+    events = []
     count = 0
     source = None
 
@@ -174,12 +175,6 @@ async def test_event_prefixes_restore_own_memory_and_foreign_context_only(tmp_pa
             if event["session"] != "original":
                 return
             events.append(copy.deepcopy(event))
-            if source._state_ready:
-                expected.append((len(events), copy.deepcopy(source.messages[1:]),
-                                 source.context.query, source.context.step,
-                                 copy.deepcopy(source.early_answers.answers),
-                                 set(source.tool_results.saved),
-                                 set(source.tools.responses), set(source.completed_steps)))
 
     set_active_bus(Observations())
 
@@ -201,30 +196,39 @@ async def test_event_prefixes_restore_own_memory_and_foreign_context_only(tmp_pa
         await source.early_answers.early_answer("early", "An observed partial answer")
         final_prefix = len(events)
         source.clear_context()
-    assert any(event["type"] == "search/artifact" for event in events)
-    assert not any(event["type"] == "context/checkpoint" for event in events)
-    assert any(messages and saved for _, messages, _, _, _, saved, _, _ in expected)
-    if target is not GitHubAgent:
-        expected = [entry for entry in expected if entry[0] == final_prefix]
-    for end, messages, query, step, early, saved, responses, completed in expected:
+    assert any(event["type"] == "artifact/saved" for event in events)
+    assert not any(event["type"] in {"context/checkpoint", "search/state", "search/artifact"} for event in events)
+    saved_at = next(i for i, e in enumerate(events) if e["type"] == "tool_result/saved")
+    cleared_at = next(i for i, e in enumerate(events) if e["type"] == "tool_result/cleared")
+    response_at = next(i for i, e in enumerate(events) if e["type"] == "github/response_saved")
+    response_id = events[response_at]["data"]["metadata"]["result_id"]
+    response_clear = next(i for i, e in enumerate(events) if e["type"] == "github/cleared")
+    early_at = next(i for i, e in enumerate(events) if e["type"] == "agent/set/early_answers")
+    early_clear = next(i for i, e in enumerate(events)
+                       if e["type"] == "agent/set/early_answers" and not e["data"]["early_answers"])
+    prefixes = range(1, len(events) + 1) if target is GitHubAgent else [final_prefix]
+    for end in prefixes:
         options = {"web_search_backend": "duckduckgo", "web_search_interval": 7}
         resumed = target({**config, "agent_options": options}, ToolStorage(tmp_path / f"target-{end}"), api_key="test")
         async with resumed.session(session=f"resumed-{end}"):
             resumed.load_events(events[:end])
             assert resumed.web_tools.search_interval == 7
             assert len([m for m in resumed.messages if m["role"] == "system"]) == 1
+            def conversation(items):
+                return [{k: v for k, v in item.items() if k not in {"id", "metadata"}}
+                        for item in items if item.get("role") != "system"]
+            assert conversation(resumed._require_event_recorder().context()) == conversation(
+                fold_state(events[:end])["context"]), (end, events[end - 1])
             if target is GitHubAgent:
-                assert resumed.messages[1:] == messages, (end, events[end - 1])
-                assert (resumed.context.query, resumed.context.step) == (query, step)
-                assert resumed.early_answers.answers == early
-                assert set(resumed.tool_results.saved) == saved
-                assert set(resumed.tools.responses) == responses
-                assert resumed.completed_steps == completed
-                if saved:
-                    result = await resumed.tool_results.get_tool_result("again", list(saved))
-                    assert all("error" not in item for item in json.loads(result.content)["results"])
+                assert set(resumed.tool_results.saved) == ({"read"} if saved_at < end <= cleared_at else set())
+                assert set(resumed.tools.responses) == ({response_id} if response_at < end <= response_clear else set())
+                assert bool(resumed.early_answers.answers) == (early_at < end <= early_clear)
+                if resumed.tool_results.saved:
+                    result = await resumed.tool_results.get_tool_result("again", ["read"])
+                    assert "evidence" in json.loads(result.content)["results"][0]["content"]
+                if resumed.tools.responses:
+                    assert b"evidence" in resumed.tools._body(resumed.tools._saved(response_id))
             else:
-                assert resumed.messages[1:] == messages
                 assert not resumed.tool_results.saved and not resumed.early_answers.answers
                 assert not list(resumed.storage.root.iterdir())
                 if target is GitCodeAgent:
@@ -240,11 +244,77 @@ async def test_synchronous_provider_artifacts_join_the_same_event_stream(tmp_pat
     source = WebAgent(config, ToolStorage(tmp_path / "source"), api_key="test")
     async with source.session(session="original"):
         await asyncio.to_thread(source.storage.write, "worker.body", b"worker evidence")
-        source.web_tools.resources["worker"] = {"body_file": "worker.body"}
-        source._require_event_recorder().event("search/probe")
+        await asyncio.to_thread(source.web_tools.remember_resource, {"ref": "worker", "body_file": "worker.body"})
     await sinks.flush()
     restored = WebAgent(config, ToolStorage(tmp_path / "restored"), api_key="test")
     async with restored.session(session="restored"):
         restored.load_events(list(events))
-        assert restored.web_tools.resources == {"worker": {"body_file": "worker.body"}}
+        assert restored.web_tools.resources == {"worker": {"ref": "worker", "body_file": "worker.body"}}
         assert restored.storage.read("worker.body") == b"worker evidence"
+
+
+@pytest.mark.asyncio
+async def test_own_image_context_survives_repeated_reconstruction(tmp_path):
+    events = await capture(tmp_path / "events")
+    requests, downloads = [], []
+    png = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a0eoAAAAASUVORK5CYII=")
+
+    def model(request):
+        requests.append(json.loads(request.content))
+        if len(requests) == 1:
+            return completion(call("web_fetch", {"requests": [{"url": "https://example.org/image.png"}]}))
+        return completion({"content": "An image"})
+
+    def download(request):
+        downloads.append(request)
+        return httpx.Response(200, content=png, headers={"content-type": "image/png"})
+
+    config = {"model": "test", "base_url": "https://model.example", "agent_options": {
+        "web_search_backend": "duckduckgo",
+    }}
+    source = WebAgent(config, ToolStorage(tmp_path / "source"), api_key="test",
+                      model_transport=httpx.MockTransport(model), web_transport=httpx.MockTransport(download))
+    async with source.session(session="source"):
+        await source.result("See this image")
+        messages = copy.deepcopy(source.messages[1:])
+    assert any(isinstance(m.get("content"), list) for m in messages)
+    await sinks.flush()
+    history = [e for e in events if e["session"] == "source"]
+    for generation in range(2):
+        name = f"restored-{generation}"
+        target = WebAgent(config, ToolStorage(tmp_path / name), api_key="test",
+                          model_transport=httpx.MockTransport(model))
+        async with target.session(session=name):
+            target.load_events(history)
+            assert target.messages[1:] == messages
+            if generation == 1:
+                await target.result("Continue")
+                assert requests[-1]["messages"][1:-1] == messages
+        await sinks.flush()
+        history = [e for e in events if e["session"] == name]
+    assert len(downloads) == 1
+
+
+@pytest.mark.asyncio
+async def test_foreign_function_calls_keep_pairing_without_shared_item_ids(tmp_path):
+    from gh_puller.agent.events import function_call_item, function_output_item, new_event
+
+    config = {"model": "test", "base_url": "https://model.example", "agent_options": {
+        "web_search_backend": "duckduckgo",
+    }}
+    requests = []
+
+    def model(request):
+        requests.append(json.loads(request.content))
+        return completion({"content": "Continued"})
+
+    items = [{**function_call_item(call_id, "foreign_tool", "{}"), "id": f"item-{index}"}
+             for index, call_id in enumerate(("a", "b"))]
+    items.extend(function_output_item(call_id, result) for call_id, result in (("a", "first"), ("b", "second")))
+    agent = WebAgent(config, ToolStorage(tmp_path), api_key="test", model_transport=httpx.MockTransport(model))
+    async with agent.session():
+        agent.load_events([new_event("context/set", items=items)])
+        await agent.result("Continue")
+        assert [m["content"] for m in requests[0]["messages"] if m["role"] == "tool"] == ["first", "second"]
+        assert not agent.web_tools.resources
