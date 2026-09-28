@@ -1,6 +1,6 @@
 """Own live agent contexts and replayable JSONL events in one backend process.
 
-Portable checkpoints reconnect browser histories to fresh native agent contexts.
+Agent-owned events reconnect browser histories to fresh native agent instances.
 The application installs one synchronous event-bus adapter for its lifetime;
 canonical events are routed by opaque session ID before observation is persisted.
 """
@@ -17,17 +17,13 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from fastapi import HTTPException
-from gh_puller.agent.events import EventBus
+from gh_puller.agent.events import EventBus, is_event_type
 from gh_puller.agents import AGENTS
 
 from .config import Question, ServerSettings, resolve_settings, validate_capabilities
-from .portable import restore, snapshot
+from .portable import restore
 from .security import PublicTransport, SecretFilter
 from .storage import PrivateStorage
-
-OBSERVED = {"model/request", "model/response", "model/error", "model/delta/text", "model/delta/reasoning",
-            "tool/start", "tool/end", "step/start", "step/end", "turn/start", "turn/end", "session/error"}
-MODEL_SETTINGS = {"base_url", "model", "thinking", "reasoning_effort", "max_tokens"}
 
 
 class EventLimitError(RuntimeError):
@@ -124,7 +120,7 @@ class Session:
 
     def receive(self, event):
         kind, data = event["type"], event["data"]
-        if kind not in OBSERVED:
+        if not is_event_type(kind):
             return
         if kind in {"model/delta/text", "model/delta/reasoning"}:
             key = (kind, data["requestId"], data["index"])
@@ -220,8 +216,8 @@ class SessionManager:
             raise HTTPException(422, str(exc)) from None
         if session.public:
             before, after = session.public.model_dump(), public.model_dump()
-            if any(before[key] != after[key] for key in before.keys() - MODEL_SETTINGS):
-                raise HTTPException(409, "会话开始后工具配置固定；请新建会话使用其他工具设置")
+            if before["options"] != after["options"]:
+                raise HTTPException(409, "Agent 配置已改变，请确认重建后继续")
             if before["base_url"] != after["base_url"] and not question.credentials.values().get("api_key"):
                 raise HTTPException(422, "更换模型地址需要重新输入 API Key")
         credentials = {**session.credentials,
@@ -267,7 +263,8 @@ class SessionManager:
                     except BaseException:
                         session.agent = session.context = None
                         raise
-                    restore(session)
+                    if session.history:
+                        restore(session)
                 else:
                     session.agent.config.update(config)
                     session.agent.set_credentials(session.credentials)
@@ -279,11 +276,6 @@ class SessionManager:
         except Exception as exc:  # Expose sanitized failures without logging request bodies or credentials.
             status, error = "failed", str(exc) or type(exc).__name__
         finally:
-            try:
-                if state := snapshot(session):
-                    session.emit("context/checkpoint", state)
-            except Exception as exc:  # Preserve the answer even if portable evidence exceeds retention limits.
-                error = (error + "; " if error else "") + "Context checkpoint unavailable: " + str(exc)
             session.finish(status, error, answer)
 
     async def stop(self, session):

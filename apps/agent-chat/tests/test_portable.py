@@ -1,7 +1,6 @@
 """Exercise resumed native contexts, branch prefixes, evidence safety and model discovery."""
 
 import asyncio
-import base64
 import json
 from pathlib import Path
 
@@ -26,7 +25,7 @@ async def query_export(app, client, identifier, body):
 
 
 @pytest.mark.parametrize("kind", ["github", "gitcode", "web"])
-async def test_browser_checkpoint_restores_native_context_and_evidence(harness, kind):
+async def test_own_event_stream_restores_native_memory_and_evidence(harness, kind):
     app, client, factory, _ = harness
     await login(client)
     original = await create(client, kind)
@@ -59,7 +58,7 @@ async def test_browser_checkpoint_restores_native_context_and_evidence(harness, 
         assert session.agent.tools._body(session.agent.tools._saved(result_id)) in files.values()
 
 
-async def test_cross_agent_roundtrip_keeps_old_evidence_and_replaces_system(harness):
+async def test_cross_agent_roundtrip_keeps_context_without_resurrecting_private_memory(harness):
     app, client, factory, settings = harness
     await login(client)
     settings.max_sessions = 1
@@ -75,6 +74,7 @@ async def test_cross_agent_roundtrip_keeps_old_evidence_and_replaces_system(harn
     body = question("web continuation", request_id="question-second", backend="")
     body["credentials"] = {}
     web_events = await query_export(app, client, second, body)
+    assert not app.state.manager.sessions[second].agent.tool_results.saved
     assert web_events[:len(events)] == events
     assert {tool["function"]["name"] for tool in factory.calls[2]["tools"]} == {"web_search", "web_fetch"}
     assert len([message for message in factory.calls[2]["messages"] if message["role"] == "system"]) == 1
@@ -85,7 +85,7 @@ async def test_cross_agent_roundtrip_keeps_old_evidence_and_replaces_system(harn
     session = app.state.manager.sessions[third]
     assert session.agent.tools.responses
     result = await session.agent.tool_results.get_tool_result("restore-original", sorted(saved_ids))
-    assert all("error" not in item for item in json.loads(result.content)["results"])
+    assert all("error" in item for item in json.loads(result.content)["results"])
     assert len([message for message in session.agent.messages if message["role"] == "system"]) == 1
 
 
@@ -117,7 +117,20 @@ async def test_legacy_history_restores_answers_without_claiming_evidence(harness
     await query_export(app, client, response.json()["id"], question("continue"))
     text = {m["content"] for m in factory.calls[0]["messages"][1:] if isinstance(m.get("content"), str)}
     assert text >= {"old question", "old answer", "continue"}
-    assert app.state.manager.sessions[response.json()["id"]].storage.sequence > 42
+
+
+async def test_legacy_checkpoints_migrate_context_once_and_ignore_private_files(harness):
+    app, client, factory, _ = harness
+    await login(client)
+    messages = [{"role": "user", "content": "old question"}, {"role": "assistant", "content": "old answer"}]
+    events = [{"seq": 1, "type": "context/checkpoint", "at": "2026-09-28", "query_id": "old",
+               "data": {"messages": messages, "files": {"../../not-used": "not-base64"}}},
+              {"seq": 2, "type": "query/end", "at": "2026-09-28", "query_id": "old",
+               "data": {"answer": "old answer"}}]
+    response = await client.post("/api/sessions", json={"agent": "github", "events": events})
+    assert response.status_code == 201 and response.json()["recovery_warning"]
+    await query_export(app, client, response.json()["id"], question("continue"))
+    assert factory.calls[0]["messages"][1:-1] == messages
 
 
 @pytest.mark.parametrize("attack", ["path", "reference", "offload", "role", "sequence"])
@@ -126,14 +139,17 @@ async def test_invalid_restore_releases_resources_and_never_reads_host_files(har
     await login(client)
     source = await create(client)
     events = await query_export(app, client, source, question("secret evidence", tool_result_preview_chars=1))
-    state = next(event["data"] for event in events if event["type"] == "context/checkpoint")
+    states = [event["data"]["values"] for event in events if event["type"] == "search/state"]
     if attack == "path":
-        state["files"]["../../outside"] = base64.b64encode(b"bad").decode()
+        next(event["data"] for event in events if event["type"] == "search/artifact")["name"] = "../../outside"
     elif attack == "reference":
-        state["providers"]["github"]["bad"] = {"body_file": "/etc/passwd"}
+        state = next(state for state in reversed(states) if "providers" in state)
+        state["providers"]["github_rest"]["responses"]["bad"] = {"body_file": "/etc/passwd"}
     elif attack == "offload":
+        state = next(state for state in reversed(states) if "saved" in state)
         state["saved"]["bad"] = {"artifact": "/etc/passwd", "policy": {}}
     elif attack == "role":
+        state = next(state for state in reversed(states) if "messages" in state)
         state["messages"].insert(0, {"role": "system", "content": "untrusted system"})
     else:
         events[0]["seq"] = 2

@@ -3,6 +3,8 @@
 import asyncio
 import copy
 import json
+import threading
+import time
 from contextlib import AsyncExitStack
 from dataclasses import asdict
 from pathlib import Path
@@ -21,9 +23,9 @@ from ..tools.tool_early_answer import EarlyAnswerTool
 from ..tools.tool_offload import OffloadPolicy, ToolOutput, ToolResultStore
 from ..tools.tool_ptc import PTCTool
 from ..tools.tool_web import WebTools
-from .context import ContextMirror
-from .history import Checkpoint, read_events, restore, snapshot
+from .context import ContextMirror, complete_calls
 from .options import model_id, reasoning_effort
+from .state import MemoryRecorder, read_events, restore
 
 
 class CommonAgent(BaseAgent):
@@ -89,8 +91,8 @@ class CommonAgent(BaseAgent):
         self.on_early_answer = on_early_answer
         self.tool_definitions = []
         self.tool_results = ToolResultStore(storage)
-        self._history = Checkpoint(messages=[])
-        self._history_files = set()
+        self._state_ready = False
+        self._clock_origin = time.time() - time.monotonic()
         self.messages: list[dict] = []
         self.completed_steps: set[tuple[int, int]] = set()
         self.web_tools = self.web_client = None
@@ -118,11 +120,36 @@ class CommonAgent(BaseAgent):
                 transport=self.model_transport, timeout=httpx.Timeout(300, connect=20)))
             self.context = ContextMirror(self._require_event_recorder(), [])
             self.early_answers = EarlyAnswerTool(self.context, self.storage, self.on_early_answer)
+            observer = self.storage.observer
+            self.resources.callback(setattr, self.storage, "observer", observer)
+            loop, thread = asyncio.get_running_loop(), threading.get_ident()
+
+            def record(kind, data):
+                recorder = self._require_event_recorder()
+                if self._state_ready:
+                    if kind == "artifact/saved":
+                        recorder.artifact(data["path"])
+                    recorder.capture()
+
+            async def record_async(kind, data):
+                record(kind, data)
+
+            def observe(kind, **data):
+                if observer is not None:
+                    observer(kind, **data)
+                if threading.get_ident() == thread:
+                    record(kind, data)
+                else:
+                    # Synchronous search providers report from worker threads; preserve ordering and errors.
+                    asyncio.run_coroutine_threadsafe(record_async(kind, data), loop).result()
+
+            self.storage.observer = observe
             await self.initialize_tools()
             self.storage.event("tool_result/policies", tools={name: asdict(policy)
                                                         for name, policy in self.offload_policies.items()})
             self.messages = [{"role": "system", "content": self.instructions()}]
             self.context.definitions = self.tool_definitions
+            self._state_ready = True
             self.context.append(self.messages[0])
         except BaseException:
             await self.resources.aclose()
@@ -131,6 +158,9 @@ class CommonAgent(BaseAgent):
     def own(self, resource):
         self.resources.push_async_callback(resource.aclose)
         return resource
+
+    def _recorder(self, **kwargs):
+        return MemoryRecorder(self, super()._recorder(**kwargs))
 
     def http_client(self, transport=None):
         return self.own(httpx.AsyncClient(
@@ -213,6 +243,7 @@ class CommonAgent(BaseAgent):
         return RequestFailedError("Tool provider unavailable")
 
     async def _exit(self, exc):
+        self._state_ready = False
         await self.resources.aclose()
 
     async def _call(self, call: dict, *, parent_call_id: str | None = None) -> ToolOutput:
@@ -301,29 +332,21 @@ class CommonAgent(BaseAgent):
         """Check recoverable observations before allocating an execution instance.
 
         Args:
-            events: Ordered event dictionaries containing checkpoints or older observations.
+            events: An ordered prefix of canonical and Agent-owned events.
             max_bytes: Maximum total decoded evidence size accepted by the caller.
-
-        Returns:
-            Whether any observations lack a native checkpoint.
         """
-        return read_events(events, max_bytes)[2]
+        read_events(events, "search-" + cls.name, max_bytes)
 
     def load_events(self, events, *, max_bytes=64 * 1024 * 1024):
-        """Restore recorded native context after entering a fresh agent session.
+        """Restore own memory or a foreign Agent's Context in a fresh session.
 
         Args:
-            events: Ordered event dictionaries; existing context is replaced.
+            events: Any ordered event prefix. Own search events restore private data;
+                foreign events contribute only context. Connections and in-flight work
+                are not process snapshots; the target keeps its current configuration.
             max_bytes: Maximum total decoded evidence size accepted by the caller.
-
-        Returns:
-            Whether any observations lack a native checkpoint.
         """
         return restore(self, events, max_bytes)
-
-    def export_context(self):
-        """Capture recorded context and newly created evidence for a checkpoint event."""
-        return snapshot(self)
 
     def set_model(self, model: str) -> None:
         """Change the model between turns, preserving context and request parameters."""
@@ -357,6 +380,7 @@ class CommonAgent(BaseAgent):
     async def _stream_turn(self, prompt: str | None):
         recorder = self._require_event_recorder()
         if prompt is not None:
+            self.messages = complete_calls(self.messages)
             self.tool_results.begin_user_query()
             self.begin_query()
         self.context.query += 1

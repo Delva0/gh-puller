@@ -75,7 +75,7 @@ const english: Record<string, string> = {
   '登录已过期或服务已重启，请重新输入访问口令。': 'Your login expired or the service restarted. Please sign in again.',
   '请先在设置中输入模型 API Key。': 'Enter your model API key in Settings first.',
   '设置保存失败，请检查浏览器存储。': 'Could not save settings. Check browser storage.',
-  '旧记录缺少原生检查点，已恢复可用对话；缺失的工具附件需重新获取。': 'Recovered the available conversation. Older records lack native checkpoints; missing tool evidence must be fetched again.',
+  '已从旧记录恢复对话；历史工具附件不会载入新实例。': 'Recovered the conversation from older records. Tool attachments are not loaded into the new instance.',
   '导入失败：请选择本应用导出的历史 JSON。': 'Import failed. Choose a history JSON exported by this app.',
   '导入文件不能超过 32 MB': 'Import file cannot exceed 32 MB',
 };

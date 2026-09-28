@@ -1,5 +1,7 @@
 """Exercise package search agents without experiment recording or checkout-relative state."""
 
+import asyncio
+import copy
 import json
 import subprocess
 import sys
@@ -8,6 +10,7 @@ import httpx
 import pytest
 
 from gh_puller.agent import sinks
+from gh_puller.agent.events import EventBus, set_active_bus
 from gh_puller.agents import GitCodeAgent, GitHubAgent, WebAgent
 from gh_puller.tools.storage import ToolStorage
 from gh_puller.tools.tool_gitcode import GitCodeTool
@@ -157,8 +160,28 @@ assert fold_state([]) == {"agent": None, "context": []}
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("target", [GitHubAgent, GitCodeAgent, WebAgent])
-async def test_package_event_recovery_keeps_evidence_and_uses_target_configuration(tmp_path, target):
+async def test_event_prefixes_restore_own_memory_and_foreign_context_only(tmp_path, target):
+    events, expected = [], []
     count = 0
+    source = None
+
+    class Observations(EventBus):
+        @property
+        def enabled(self):
+            return True
+
+        def publish(self, event):
+            if event["session"] != "original":
+                return
+            events.append(copy.deepcopy(event))
+            if source._state_ready:
+                expected.append((len(events), copy.deepcopy(source.messages[1:]),
+                                 source.context.query, source.context.step,
+                                 copy.deepcopy(source.early_answers.answers),
+                                 set(source.tool_results.saved),
+                                 set(source.tools.responses), set(source.completed_steps)))
+
+    set_active_bus(Observations())
 
     def model(request):
         nonlocal count
@@ -175,19 +198,53 @@ async def test_package_event_recovery_keeps_evidence_and_uses_target_configurati
                          github_transport=httpx.MockTransport(lambda _: httpx.Response(200, json={"name": "evidence"})))
     async with source.session(session="original"):
         await source.result("Read original evidence")
-        messages = source.messages[1:]
-        checkpoint = source.export_context()
-    events = [{"seq": 1, "type": "context/checkpoint", "data": checkpoint}]
-    options = {"web_search_backend": "duckduckgo", "web_search_interval": 7}
-    resumed = target({**config, "agent_options": options}, ToolStorage(tmp_path / "target"), api_key="test")
-    async with resumed.session(session="resumed"):
-        assert not resumed.load_events(events)
-        assert resumed.messages[1:] == messages
-        assert resumed.web_tools.search_interval == 7
-        assert set(resumed.tool_registry.registered_names.values()) == {
-            tool["id"] for tool in target.configuration_tools(resumed.options)}
-        result = await resumed.tool_results.get_tool_result("again", list(checkpoint["saved"]))
-        assert "evidence" in result.content
-        assert not any(item.get("error") for item in json.loads(result.content)["results"])
-        assert not resumed.export_context()["files"]
-    assert source.storage.root != resumed.storage.root
+        await source.early_answers.early_answer("early", "An observed partial answer")
+        final_prefix = len(events)
+        source.clear_context()
+    assert any(event["type"] == "search/artifact" for event in events)
+    assert not any(event["type"] == "context/checkpoint" for event in events)
+    assert any(messages and saved for _, messages, _, _, _, saved, _, _ in expected)
+    if target is not GitHubAgent:
+        expected = [entry for entry in expected if entry[0] == final_prefix]
+    for end, messages, query, step, early, saved, responses, completed in expected:
+        options = {"web_search_backend": "duckduckgo", "web_search_interval": 7}
+        resumed = target({**config, "agent_options": options}, ToolStorage(tmp_path / f"target-{end}"), api_key="test")
+        async with resumed.session(session=f"resumed-{end}"):
+            resumed.load_events(events[:end])
+            assert resumed.web_tools.search_interval == 7
+            assert len([m for m in resumed.messages if m["role"] == "system"]) == 1
+            if target is GitHubAgent:
+                assert resumed.messages[1:] == messages, (end, events[end - 1])
+                assert (resumed.context.query, resumed.context.step) == (query, step)
+                assert resumed.early_answers.answers == early
+                assert set(resumed.tool_results.saved) == saved
+                assert set(resumed.tools.responses) == responses
+                assert resumed.completed_steps == completed
+                if saved:
+                    result = await resumed.tool_results.get_tool_result("again", list(saved))
+                    assert all("error" not in item for item in json.loads(result.content)["results"])
+            else:
+                assert resumed.messages[1:] == messages
+                assert not resumed.tool_results.saved and not resumed.early_answers.answers
+                assert not list(resumed.storage.root.iterdir())
+                if target is GitCodeAgent:
+                    assert not resumed.tools.responses
+
+
+@pytest.mark.asyncio
+async def test_synchronous_provider_artifacts_join_the_same_event_stream(tmp_path):
+    events = await capture(tmp_path / "events")
+    config = {"model": "test", "base_url": "https://model.example", "agent_options": {
+        "web_search_backend": "duckduckgo",
+    }}
+    source = WebAgent(config, ToolStorage(tmp_path / "source"), api_key="test")
+    async with source.session(session="original"):
+        await asyncio.to_thread(source.storage.write, "worker.body", b"worker evidence")
+        source.web_tools.resources["worker"] = {"body_file": "worker.body"}
+        source._require_event_recorder().event("search/probe")
+    await sinks.flush()
+    restored = WebAgent(config, ToolStorage(tmp_path / "restored"), api_key="test")
+    async with restored.session(session="restored"):
+        restored.load_events(list(events))
+        assert restored.web_tools.resources == {"worker": {"body_file": "worker.body"}}
+        assert restored.storage.read("worker.body") == b"worker evidence"

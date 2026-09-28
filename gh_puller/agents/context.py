@@ -1,7 +1,59 @@
 """Project the actual native conversation into observable, replaceable context items."""
 
+import json
+
 from gh_puller.agent.context import instruction, system_message, tool_defs
 from gh_puller.agent.events import function_call_item, function_output_item, reasoning_item, text_message
+
+
+def context_messages(items):
+    """Read the shared Context vocabulary without importing another agent's private state."""
+    messages, group = [], None
+    for item in items:
+        kind, role = item["type"], item.get("role", "assistant")
+        if role not in {"user", "assistant"}:
+            continue
+        if kind == "function_call_output":
+            output = item["output"]
+            messages.append({"role": "tool", "tool_call_id": item["call_id"],
+                             "content": output if isinstance(output, str) else json.dumps(output, ensure_ascii=False)})
+            group = None
+            continue
+        if kind not in {"message", "reasoning", "function_call"}:
+            continue
+        key = item.get("id", "").rsplit("-", 1)[0] or None
+        if (not messages or messages[-1]["role"] != role or role == "user"
+                or (key is not None and key != group) or (kind == "message" and messages[-1].get("content"))):
+            messages.append({"role": role, "content": None})
+        group = key
+        message = messages[-1]
+        if kind == "function_call":
+            message.setdefault("tool_calls", []).append({"id": item["call_id"], "type": "function",
+                "function": {"name": item["name"], "arguments": item["arguments"]}})
+        else:
+            text = "".join(part.get("text", "<image>" if part["type"] == "input_image" else
+                                   "<file>" if part["type"] == "input_file" else "")
+                           for part in item.get("content", []))
+            message["reasoning_content" if kind == "reasoning" else "content"] = text
+    return messages
+
+
+def complete_calls(messages):
+    """Close interrupted calls before a new turn; never invent an unobserved tool result."""
+    result, pending = [], {}
+    for message in [*messages, None]:
+        if message is not None and message["role"] == "tool":
+            if message["tool_call_id"] in pending:
+                result.append(message)
+                pending.pop(message["tool_call_id"])
+            continue
+        result.extend({"role": "tool", "tool_call_id": call_id,
+                       "content": "Tool output was not observed before this history prefix ended."}
+                      for call_id in pending)
+        pending = {call["id"]: None for call in message.get("tool_calls", [])} if message else {}
+        if message is not None:
+            result.append(message)
+    return result
 
 
 def message_items(message: dict, definitions: list[dict], image_observation: dict | None = None) -> list[dict]:

@@ -42,7 +42,7 @@ class PrivateStorage(ToolStorage):
 
     @contextmanager
     def binary(self, name, **metadata):
-        with self.path(name).open("xb") as target:
+        with super().binary(name, **metadata) as target:
             writer = ScrubbedWriter(target, self)
             try:
                 yield writer

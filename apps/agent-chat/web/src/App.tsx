@@ -252,19 +252,30 @@ export default function App() {
     if (!body && !configured.has('api_key')) {
       setNotice('请先在设置中输入模型 API Key。'); setShowSettings(true); return;
     }
-    if (chat && (chat.events.length || chat.server_id || chat.source_id) && !body?.server_id && !confirmed && !chat.rebuild_acknowledged) {
-      setRebuild({ chatId: chat.id, prompt, query, retry }); setRememberRebuild(false); return;
-    }
-    if (!chat) {
-      chat = { id: crypto.randomUUID(), title: t('新会话'), created: new Date().toISOString(), agent: selectedAgent,
-        settings: settingsFor(selectedAgent, preferences, catalog), events: [], readonly: false, branch_id: crypto.randomUUID() };
-      commit([...chatsRef.current, chat]); setActiveId(chat.id); setSearch('');
-    }
-    if (query && !retry) { chat = fork(chat, query); update(chat.id, () => chat!); }
-    body ??= { request_id: crypto.randomUUID(), prompt: prompt.trim(), settings: chat.settings, credentials: { ...credentials } };
-    pending.current.set(chat.id, body);
     setSubmitting(true); setNotice('');
     try {
+      let reuse: SessionView | undefined;
+      if (chat?.server_id && !query && !body?.server_id) {
+        try {
+          const session = await api<SessionView>(`/sessions/${chat.server_id}`);
+          const options = (body?.settings ?? chat.settings).options;
+          const previous = session.settings?.options;
+          if (!session.readonly && session.agent === chat.agent && (!previous ||
+            Object.keys({ ...previous, ...options }).every(key => JSON.stringify(previous[key]) === JSON.stringify(options[key])))) reuse = session;
+        } catch (error) { if (!(error instanceof ApiError) || error.status !== 404) throw error; }
+      }
+      if (chat && (chat.events.length || chat.server_id || chat.source_id) && !reuse && !body?.server_id && !confirmed && !chat.rebuild_acknowledged) {
+        setRebuild({ chatId: chat.id, prompt, query, retry }); setRememberRebuild(false); return;
+      }
+      if (!chat) {
+        chat = { id: crypto.randomUUID(), title: t('新会话'), created: new Date().toISOString(), agent: selectedAgent,
+          settings: settingsFor(selectedAgent, preferences, catalog), events: [], readonly: false, branch_id: crypto.randomUUID() };
+        commit([...chatsRef.current, chat]); setActiveId(chat.id); setSearch('');
+      }
+      if (query && !retry) { chat = fork(chat, query); update(chat.id, () => chat!); }
+      body ??= { request_id: crypto.randomUUID(), prompt: prompt.trim(), settings: chat.settings, credentials: { ...credentials } };
+      body.server_id ??= reuse?.id;
+      pending.current.set(chat.id, body);
       if (!body.server_id) {
         const payload = { agent: chat.agent, events: chat.events, source_session: chat.server_id ?? chat.source_id };
         let session: SessionView;
@@ -276,18 +287,19 @@ export default function App() {
         body.server_id = session.id;
         setRemembered(value => ({ ...value, [session.id]: session.configured_credentials }));
         update(chat.id, item => ({ ...item, server_id: session.id, source_id: undefined }));
-        if (session.recovery_warning) setNotice('旧记录缺少原生检查点，已恢复可用对话；缺失的工具附件需重新获取。');
+        if (session.recovery_warning) setNotice('已从旧记录恢复对话；历史工具附件不会载入新实例。');
       }
       const { server_id: serverId, ...question } = body;
       await api(`/sessions/${serverId}/questions`, 'POST', question);
       pending.current.delete(chat.id); setDraft('');
+      const supplied = Object.keys(body.credentials).filter(key => body!.credentials[key].trim());
       setRemembered(value => ({ ...value, [serverId!]: [...new Set([
-        ...(value[serverId!] ?? []), ...Object.keys(body.credentials).filter(key => body.credentials[key].trim()),
+        ...(value[serverId!] ?? []), ...supplied,
       ])] }));
       update(chat.id, item => ({ ...item, live: true }));
       follow.current = true; setAtBottom(true); setStreamEpoch(n => n + 1);
     } catch (error) {
-      if (error instanceof ApiError && error.status > 0) pending.current.delete(chat.id);
+      if (chat && error instanceof ApiError && error.status > 0) pending.current.delete(chat.id);
       setNotice(errorMessage(error));
       if (error instanceof ApiError && error.status === 422 && !credentials.api_key) setShowSettings(true);
       setStreamEpoch(n => n + 1);

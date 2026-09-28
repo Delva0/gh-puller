@@ -395,6 +395,9 @@ test('model popup, branch edits, regeneration, agent switching and portable hist
   expect(await page.evaluate(() => document.documentElement.scrollHeight <= window.innerHeight)).toBe(true);
   await page.screenshot({ path: info.outputPath('inline-edit.png'), fullPage: true, animations: 'disabled' });
   await page.getByRole('button', { name: '发送', exact: true }).click();
+  const rebuilding = page.getByRole('dialog', { name: '继续会话', exact: true });
+  await rebuilding.getByLabel('本会话不再提示').check();
+  await rebuilding.getByRole('button', { name: '重建并继续', exact: true }).click();
   await expect(page.locator('.execution > summary')).toHaveCount(2);
   await expect(page.getByRole('button', { name: '停止生成' })).not.toBeVisible();
   await expect(page.locator('.execution > summary').last()).toContainText('已完成');
@@ -424,7 +427,9 @@ test('model popup, branch edits, regeneration, agent switching and portable hist
   await expect(page.locator('.trace-item[data-kind=tool]').last().locator('summary')).toContainText('读取网页');
   await expect(page.locator('.trace-item[data-kind=tool]').last().locator('.trace-description')).toContainText('web_fetch(requests=[{url=');
   const saved = await captureDownload(page, '导出事件');
-  expect(saved.events.some((event: { type: string }) => event.type === 'context/checkpoint')).toBe(true);
+  expect(saved.events.some((event: { type: string }) => event.type.startsWith('context/append'))).toBe(true);
+  expect(saved.events.some((event: { type: string }) => event.type === 'search/state')).toBe(true);
+  expect(saved.events.some((event: { type: string }) => event.type === 'context/checkpoint')).toBe(false);
   expect(saved.events.slice(0, before.events.length)).toEqual(before.events);
   await page.reload();
   await expect(model).toHaveText('provider/very-long-model-name-for-research-2026-09-preview');
@@ -598,6 +603,40 @@ test('native tool identities, agent tiles and shared field navigation follow pac
   await page.getByRole('button', { name: '打开设置' }).click();
   await selectTool(page, 'github_graphql');
   await page.screenshot({ path: info.outputPath('shared-tool-config-light.png'), fullPage: true, animations: 'disabled' });
+});
+
+test('unchanged agents reuse live memory across turns and refresh', async ({ page }) => {
+  await login(page); await configure(page);
+  const dialog = page.getByRole('dialog', { name: '继续会话', exact: true });
+  const ids: string[] = [];
+  for (const [index, agent] of ['Web', 'GitHub', 'Web', 'Web'].entries()) {
+    await choose(page, '选择 agent', agent);
+    await page.getByLabel('输入问题').fill(`question ${index + 1}`);
+    await page.getByLabel('输入问题').press('Enter');
+    if (index === 1 || index === 2) {
+      await expect(dialog).toBeVisible();
+      await dialog.getByRole('button', { name: '重建并继续', exact: true }).click();
+    }
+    await expect(page.locator('.execution > summary')).toHaveCount(index + 1);
+    await expect(page.locator('.execution > summary').last()).toContainText('已完成');
+    await expect(dialog).not.toBeVisible();
+    const sessions = await (await page.request.get('/api/sessions')).json();
+    expect(sessions).toHaveLength(1);
+    ids.push(sessions[0].id);
+  }
+  expect(new Set(ids.slice(0, 3)).size).toBe(3);
+  expect(ids[3]).toBe(ids[2]);
+  await page.reload();
+  await expect(page.getByLabel('选择 agent')).toHaveText('Web');
+  await choose(page, '选择 agent', 'GitHub');
+  await choose(page, '选择 agent', 'Web');
+  await choose(page, '思考强度', 'Low');
+  await page.getByLabel('输入问题').fill('same live instance after refresh');
+  await page.getByLabel('输入问题').press('Enter');
+  await expect(page.locator('.execution > summary')).toHaveCount(5);
+  await expect(page.locator('.execution > summary').last()).toContainText('已完成');
+  await expect(dialog).not.toBeVisible();
+  expect((await (await page.request.get('/api/sessions')).json())[0].id).toBe(ids[3]);
 });
 
 test('rebuild is a neutral confirmation before changes, cancellation retains the live instance', async ({ page }, info) => {

@@ -7,6 +7,10 @@ A model inference produces
 that output is a separate Context fact. Lifecycle, turn, and step events are semantic
 markers and never affect the fold.
 
+Adapters may publish JSON facts under their own lowercase slash-separated namespace.
+Custom events are retained during compaction; only their owning adapter interprets them.
+The canonical namespaces remain reserved so a misspelled Context operation is rejected.
+
 Configuration and effect remain separate facts. Credential-shaped Agent configuration
 fields are redacted before reaching any sink.
 
@@ -29,6 +33,7 @@ clock describes server-side token generation; deltas mark adapter receipt.
 
 import asyncio
 import json
+import re
 import time
 import uuid
 from dataclasses import asdict, is_dataclass
@@ -64,8 +69,11 @@ def _agent_facet(event_type: str) -> str | None:
 
 
 def is_event_type(event_type: str) -> bool:
-    """Return whether a type belongs to the canonical language."""
-    return event_type in EVENT_TYPES or _agent_facet(event_type) is not None
+    """Accept canonical routes and opaque events under an adapter-owned namespace."""
+    reserved = {"agent", "context", "model", "tool", "session", "turn", "step"}
+    return (event_type in EVENT_TYPES or _agent_facet(event_type) is not None
+            or (event_type.split("/", maxsplit=1)[0] not in reserved
+                and re.fullmatch(r"[a-z][a-z0-9_-]*(?:/[a-z][a-z0-9_-]*)+", event_type) is not None))
 
 
 def is_compact_event(event_type: str) -> bool:
