@@ -12,7 +12,7 @@ import { useModels } from './useModels';
 import { useValidation } from './useValidation';
 import { availabilityHint } from './ui-model';
 import { fork, selectBranch, versions } from './branches';
-import { deleteChat, exportEvents, download, exportHistory, importHistory, loadHistory, loadSettings, saveChat, saveSettings } from './db';
+import { deleteChat, exportEvents, download, exportHistory, historyBlockedMessage, importHistory, loadHistory, loadSettings, saveChat, saveSettings } from './db';
 import { artifactSchema, emptyCredentials, emptyPreferences, eventSchema, isRunning, publicData, settingsFor,
   type Agent, type Catalog, type ChatEvent, type Conversation, type Credentials, type ModelSettings,
   type Preferences, type SessionView, type Settings } from './types';
@@ -25,6 +25,7 @@ export default function App() {
   const [checking, setChecking] = useState(true);
   const [password, setPassword] = useState('');
   const [loginError, setLoginError] = useState('');
+  const [historyError, setHistoryError] = useState('');
   const [catalog, setCatalog] = useState<Catalog | null>(null);
   const [chats, setChats] = useState<Conversation[]>([]);
   const chatsRef = useRef(chats);
@@ -143,7 +144,10 @@ export default function App() {
         if (disposed) return;
         commit(history, false);
         setActiveId([...history].sort((a, b) => b.created.localeCompare(a.created))[0]?.id ?? '');
-      } catch { setNotice('浏览器历史暂时无法读取，可以继续聊天并导出记录。'); }
+      } catch (error) {
+        if (!disposed) setHistoryError(errorMessage(error) === historyBlockedMessage
+          ? historyBlockedMessage : '浏览器历史暂时无法读取，可以继续聊天并导出记录。');
+      }
       try {
         await api('/auth/me');
         if (!disposed) await connect();
@@ -399,6 +403,7 @@ export default function App() {
       value={password} onChange={e => setPassword(e.target.value)} placeholder={t('输入私人访问口令')} /></label>
       <button className="primary" disabled={checking} type="submit">{checking ? <><LoaderCircle size={17} className="spin" />{t('正在连接服务')}</> : <>{t('进入工作空间')}<ArrowUp size={17} /></>}</button>
     </form>{loginError && <div className="login-error" role="alert"><CircleAlert size={16} />{t(loginError)}</div>}
+    {historyError && <div className="turn-notice" role="status"><CircleAlert size={16} />{t(historyError)}</div>}
   </div><span className="login-corner">{t('循迹 / TRACE THE EVIDENCE')}</span></main></LanguageContext.Provider>;
 
   const modelOptions = [...new Set([composerSettings?.model ?? '', ...discovery.models])].filter(Boolean).map(value => ({ value, label: value }));
@@ -479,7 +484,7 @@ export default function App() {
     <div className="composer-region">
       {!atBottom && <button className="jump-bottom" aria-label={t('回到底部')} onClick={() => { follow.current = true; setAtBottom(true); viewport.current?.scrollTo({ top: viewport.current.scrollHeight, behavior: 'auto' }); }}><ArrowDown size={18} /></button>}
       {connection === 'reconnecting' && <div className="connection-notice" role="status"><LoaderCircle className="spin" size={14} />{t('连接中断，正在重连；查询会在服务端继续运行。')}</div>}
-      {notice && <div className="notice" role="status"><CircleAlert size={15} /><span>{t(notice)}</span><button className="icon-button" aria-label={t('关闭提示')} onClick={() => setNotice('')}><X size={15} /></button></div>}
+      {(notice || historyError) && <div className="notice" role="status"><CircleAlert size={15} /><span>{t(notice || historyError)}</span><button className="icon-button" aria-label={t('关闭提示')} onClick={() => { if (notice) setNotice(''); else setHistoryError(''); }}><X size={15} /></button></div>}
       {active && pending.current.has(active.id) && !submitting && <div className="notice"><span>{t('提交状态未确认，可安全重试同一条问题。')}</span><button className="secondary" onClick={() => void send('', undefined, true)}>{t('重试提交')}</button></div>}
       <form className="composer" onSubmit={e => { e.preventDefault(); void send(); }}>
         <textarea ref={input} aria-label={t('输入问题')} placeholder={t('提出问题，一起循迹…')} rows={2}

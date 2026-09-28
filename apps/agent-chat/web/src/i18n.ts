@@ -72,6 +72,7 @@ const english: Record<string, string> = {
   '操作失败，请重试': 'Operation failed. Please try again.',
   '浏览器历史保存失败。请导出记录，检查可用存储空间。': 'History could not be saved. Export it and check browser storage.',
   '浏览器历史暂时无法读取，可以继续聊天并导出记录。': 'Browser history is unavailable. You can still chat and export results.',
+  '历史数据库正在等待旧标签页释放。请关闭其他 Agent Chat 标签页后刷新，已有历史会保留。': 'History is waiting for an older tab to release the database. Close other Agent Chat tabs and reload. Your history will be preserved.',
   '收到无法识别的事件，请导出记录并重连。': 'Unrecognized event. Export your history and reconnect.',
   '登录已过期或服务已重启，请重新输入访问口令。': 'Your login expired or the service restarted. Please sign in again.',
   '请先在设置中输入模型 API Key。': 'Enter your model API key in Settings first.',

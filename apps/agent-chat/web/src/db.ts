@@ -2,6 +2,7 @@ import { z } from 'zod';
 import { agentSchema, artifactsSchema, emptyPreferences, eventSchema, preferencesSchema, settingsSchema, publicData,
   type Catalog, type Conversation, type Preferences } from './types';
 
+export const historyBlockedMessage = '历史数据库正在等待旧标签页释放。请关闭其他 Agent Chat 标签页后刷新，已有历史会保留。';
 let connection: Promise<IDBDatabase> | undefined;
 const savedEvents = new Map<string, Conversation['events']>();
 const savedArtifacts = new Map<string, Set<string>>();
@@ -14,15 +15,30 @@ function serialize(id: string, operation: () => Promise<void>) {
 function database() {
   if (!connection) connection = new Promise<IDBDatabase>((resolve, reject) => {
     const request = indexedDB.open('trace-agent-chat', 2);
+    let blocked = false;
+    request.onblocked = () => {
+      blocked = true;
+      reject(new Error(historyBlockedMessage));
+    };
     request.onupgradeneeded = () => {
+      if (blocked) { request.transaction!.abort(); return; }
       const db = request.result;
       if (!db.objectStoreNames.contains('chats')) db.createObjectStore('chats', { keyPath: 'id' });
       if (!db.objectStoreNames.contains('events')) db.createObjectStore('events', { keyPath: ['chat_id', 'seq'] });
       if (!db.objectStoreNames.contains('preferences')) db.createObjectStore('preferences');
       if (!db.objectStoreNames.contains('artifacts')) db.createObjectStore('artifacts', { keyPath: ['chat_id', 'sha256'] });
     };
-    request.onsuccess = () => resolve(request.result);
-    request.onerror = () => reject(request.error);
+    request.onsuccess = () => {
+      const db = request.result;
+      if (blocked) { db.close(); connection = undefined; return; }
+      db.onversionchange = () => { db.close(); connection = undefined; };
+      resolve(db);
+    };
+    request.onerror = () => { connection = undefined; reject(request.error); };
+  }).catch(error => {
+    // A blocked open cannot be cancelled; retries would queue behind the same lock.
+    if (error.message !== historyBlockedMessage) connection = undefined;
+    throw error;
   });
   return connection;
 }
