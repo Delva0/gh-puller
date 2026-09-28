@@ -36,6 +36,7 @@ from graphql import (
 from graphql.execution.collect_fields import collect_sub_fields
 from jsonschema import Draft202012Validator
 
+from ..configuration import Credential, ToolConfig
 from .gitcode_api import (
     BACKEND,
     MAX_LOG_BYTES,
@@ -77,6 +78,8 @@ from .githost_dsl import (
 )
 from .registry import BATCH_OUTPUT, ToolInputError, input_error, tool, tool_definitions
 from .utils import select_json
+
+GITCODE_CONFIG = ToolConfig("gitcode", credentials={"gitcode_token": Credential(("GITCODE_TOKEN",))})
 
 API_DESCRIPTION = (
     "Read GitCode with a resource path, ci_logs, or saved result_id; choose one entry per request. "

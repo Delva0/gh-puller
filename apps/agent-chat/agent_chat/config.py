@@ -4,12 +4,12 @@ import os
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
 from urllib.parse import urlsplit
 
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
+from gh_puller.agents import AGENTS
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, RootModel, SecretStr, field_validator
 
-AgentKind = Literal["github", "gitcode", "code", "web"]
+AgentKind = str
 DEFAULT_BASE_URL = "https://st8tp3ajl0df3n8b8l8qu.apigateway-cn-beijing.volceapi.com/v1"
 
 
@@ -29,17 +29,10 @@ class PublicSettings(BaseModel):
 
     base_url: str = Field(default=DEFAULT_BASE_URL, max_length=2048)
     model: str = Field(default="deepseek-v4.1-flash", min_length=1, max_length=200)
-    backend: str = "rest"
-    ptc: Literal["off", "A", "B"] = "off"
-    max_steps: int = Field(default=32, ge=1, le=128)
-    concurrency: int = Field(default=8, ge=1, le=16)
-    reasoning_effort: Literal["low", "high", "max"] = "high"
+    options: dict[str, JsonValue] = Field(default_factory=dict)
+    reasoning_effort: str = "high"
     thinking: bool = True
-    max_tokens: int = Field(default=8192, ge=256, le=32768)
-    web_search_backend: Literal["auto", "brave", "duckduckgo"] = "brave"
-    web_search_concurrency: int = Field(default=1, ge=1, le=8)
-    web_search_interval: float = Field(default=2, ge=0, le=60, allow_inf_nan=False)
-    multimodal: bool = True
+    max_tokens: int = Field(default=0, ge=0)
 
     _url = field_validator("base_url")(model_url)
 
@@ -51,16 +44,19 @@ class PublicSettings(BaseModel):
         return value
 
 
-class Credentials(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+class Credentials(RootModel[dict[str, SecretStr]]):
+    root: dict[str, SecretStr] = Field(default_factory=dict)
 
-    api_key: SecretStr = SecretStr("")
-    github_token: SecretStr = SecretStr("")
-    gitcode_token: SecretStr = SecretStr("")
-    brave_api_key: SecretStr = SecretStr("")
+    @field_validator("root")
+    @classmethod
+    def known_credentials(cls, value):
+        known = {"api_key"} | {key for agent in AGENTS.values() for key in agent.credential_names}
+        if value.keys() - known:
+            raise ValueError("Unknown credentials")
+        return value
 
     def values(self):
-        return {key: getattr(self, key).get_secret_value() for key in type(self).model_fields}
+        return {key: value.get_secret_value() for key, value in self.root.items()}
 
 
 class Question(BaseModel):
@@ -102,27 +98,20 @@ class ServerSettings:
         )
 
 
+def resources(server: ServerSettings):
+    return {"node": bool(shutil.which("node")),
+            "container": server.code_container if shutil.which("docker") else "",
+            "workdir": server.code_workdir}
+
+
+def resolve_settings(kind, settings):
+    options = {**AGENTS[kind].configuration.public_defaults(), **settings.options}
+    return settings.model_copy(update={"options": options})
+
+
 def catalog(server: ServerSettings):
-    node = bool(shutil.which("node"))
-    code = bool(server.code_container and shutil.which("docker"))
-    return [
-        {"id": "github", "name": "GitHub", "available": True, "reason": "",
-         "backends": ["rest", "dsl", "graphql", "split"], "ptc": node, "web": True},
-        {"id": "gitcode", "name": "GitCode", "available": True, "reason": "",
-         "backends": ["rest", "dsl"], "ptc": node, "web": True},
-        {"id": "code", "name": "Code", "available": code,
-         "reason": "" if code else "当前服务未配置 Docker 容器连接",
-         "backends": [], "ptc": False, "web": False},
-        {"id": "web", "name": "Web", "available": True, "reason": "",
-         "backends": [], "ptc": False, "web": True},
-    ]
+    return [agent.configuration.catalog(resources(server)) for agent in AGENTS.values()]
 
 
 def validate_capabilities(kind: AgentKind, settings: PublicSettings, server: ServerSettings):
-    capability = next(item for item in catalog(server) if item["id"] == kind)
-    if not capability["available"]:
-        raise ValueError(capability["reason"])
-    if settings.backend not in (capability["backends"] or [""]):
-        raise ValueError("该 agent 不支持所选查询后端")
-    if settings.ptc != "off" and not capability["ptc"]:
-        raise ValueError("该 agent 或当前服务不支持 PTC")
+    return AGENTS[kind].configuration.resolve(settings.options, resources(server))

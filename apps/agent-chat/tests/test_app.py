@@ -73,8 +73,10 @@ async def test_ownership_and_capabilities(harness):
     code = next(item for item in catalog["agents"] if item["id"] == "code")
     assert not code["available"] and code["reason"]
     assert (await client.post("/api/sessions", json={"agent": "code"})).status_code == 422
-    assert catalog["defaults"]["max_steps"] == 32 and catalog["defaults"]["concurrency"] == 8
-    assert catalog["defaults"]["backend"] == "rest"
+    github = next(item for item in catalog["agents"] if item["id"] == "github")
+    assert github["defaults"]["concurrency"] == 8
+    assert github["defaults"]["backend"] == "rest"
+    assert "max_steps" not in github["defaults"] and catalog["defaults"]["max_tokens"] == 0
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="https://chat.test") as other:
         await login(other)
         assert (await other.get("/api/sessions")).json() == []
@@ -168,7 +170,7 @@ async def test_schema_initialization_keeps_http_and_cancellation_responsive(harn
         started.set()
         release.wait(3)
 
-    monkeypatch.setattr("agent_chat.runtime.github_query_schema", initialize)
+    monkeypatch.setattr("gh_puller.agents.agent_search.query_schema", initialize)
     await login(client)
     first, second = await create(client), await create(client)
     manager = app.state.manager
@@ -181,7 +183,7 @@ async def test_schema_initialization_keeps_http_and_cancellation_responsive(harn
             await client.post(f"/api/sessions/{second}/questions", json=question(backend="dsl"))
             await manager.delete(session)
         assert not session.root.exists()
-        assert not manager.github_schema_task.done()
+        assert not manager.preparations["github_schema"].done()
     finally:
         release.set()
     remaining = await finished(app, second)

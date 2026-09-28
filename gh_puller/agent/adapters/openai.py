@@ -49,6 +49,24 @@ def _system_item(config: dict) -> dict | None:
     return system_message(content) if content else None
 
 
+def _without_images(body: dict) -> dict | None:
+    messages, replaced = [], False
+    for message in body.get("messages", []):
+        content = message.get("content")
+        if isinstance(content, list):
+            parts = []
+            for part in content:
+                if part.get("type") in {"image_url", "input_image"}:
+                    parts.append({"type": "text", "text": "<image>"})
+                    replaced = True
+                else:
+                    parts.append(part)
+            messages.append({**message, "content": parts})
+        else:
+            messages.append(message)
+    return {**body, "messages": messages} if replaced else None
+
+
 class ChatCompletion:
     """Project one streamed inference without owning an Agent loop or its history."""
 
@@ -62,6 +80,8 @@ class ChatCompletion:
             recorder: Active canonical observation recorder.
             body: Native request with one choice. Streaming is enabled; sampling,
                 limits, usage options and tool definitions remain caller-controlled.
+                Zero output-token limits omit the provider limit. Images are sent
+                first; a rejected request can retry once with text placeholders.
             base_url: Chat-completion API root.
             headers: Request-local headers; never included in observation events.
             timeout: Request override; omission uses the client's configured timeout.
@@ -69,6 +89,9 @@ class ChatCompletion:
         """
         self.client, self.recorder = client, recorder
         self.body = body | {"stream": True}
+        for key in ("max_tokens", "max_completion_tokens"):
+            if self.body.get(key) == 0:
+                del self.body[key]
         self.url = base_url.rstrip("/") + "/chat/completions"
         self.options = {"headers": headers}
         if timeout is not None:
@@ -76,13 +99,15 @@ class ChatCompletion:
         self.provider = provider
         self.message: dict = {}
         self.output: list[dict] = []
+        self.started = False
 
     async def result(self) -> dict:
         """Consume the stream and return the complete native assistant message.
 
         Raises:
             RequestFailedError: The stream has no normal, single-choice completion.
-                HTTP and cancellation errors propagate without retries.
+                Image rejection may retry before any output; other HTTP errors
+                and cancellation propagate without retries.
         """
         async for _ in self.stream():
             pass
@@ -94,19 +119,31 @@ class ChatCompletion:
         Call once per instance. ``message`` and ``output`` become available after
         complete consumption. Partial text is not a successful completion.
         """
-        parameters = {key: value for key, value in self.body.items()
-                      if key not in {"model", "messages", "tools", "stream"}}
-        request = {"model": self.body.get("model"), "parameters": parameters,
-                   "requestSha256": sha256(json.dumps(self.body, sort_keys=True).encode()).hexdigest()}
-        if self.provider:
-            request["provider"] = self.provider
-        request_id = self.recorder.model_request(**request)
-        try:
-            async for part in self._stream(request_id):
-                yield part
-        except BaseException as exc:
-            self.recorder.model_error(exc, request_id=request_id)
-            raise
+        for attempt in range(2):
+            parameters = {key: value for key, value in self.body.items()
+                          if key not in {"model", "messages", "tools", "stream"}}
+            request = {"model": self.body.get("model"), "parameters": parameters,
+                       "requestSha256": sha256(json.dumps(self.body, sort_keys=True).encode()).hexdigest()}
+            if self.provider:
+                request["provider"] = self.provider
+            if attempt:
+                request["imageFallback"] = True
+            request_id = self.recorder.model_request(**request)
+            try:
+                async for part in self._stream(request_id):
+                    yield part
+            except BaseException as exc:
+                self.recorder.model_error(exc, request_id=request_id)
+                rejected = (isinstance(exc, httpx.HTTPStatusError)
+                            and exc.response.status_code in {400, 415, 422}) or (
+                    isinstance(exc, RequestFailedError)
+                    and any(word in str(exc).lower() for word in ("image", "vision", "multimodal")))
+                fallback = _without_images(self.body) if rejected and not attempt and not self.started else None
+                if fallback is None:
+                    raise
+                self.body = fallback
+            else:
+                return
 
     async def _stream(self, request_id: str):
         text = reasoning = refusal = ""
@@ -138,6 +175,7 @@ class ChatCompletion:
                 if delta.get("role", "assistant") != "assistant":
                     raise RequestFailedError("Invalid assistant role")
                 refusal += delta.get("refusal") or ""
+                self.started |= any(delta.get(key) for key in ("content", "reasoning_content", "tool_calls", "refusal"))
                 if thought := delta.get("reasoning_content"):
                     reasoning += thought
                     self.recorder.reasoning(thought, request_id=request_id)

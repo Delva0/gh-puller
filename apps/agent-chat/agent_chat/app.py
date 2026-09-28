@@ -17,6 +17,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from gh_puller.agent.events import set_active_bus
+from gh_puller.agents import AGENTS
 from pydantic import BaseModel, Field, SecretStr
 
 from .config import AgentKind, PublicSettings, Question, ServerSettings, catalog
@@ -31,7 +32,7 @@ class Login(BaseModel):
 
 
 class CreateSession(BaseModel):
-    agent: AgentKind = "github"
+    agent: AgentKind = next(iter(AGENTS))
 
 
 class Rename(BaseModel):
@@ -158,6 +159,7 @@ def create_app(settings: ServerSettings | None = None, *, agent_factory=build_ag
     @app.get("/api/catalog")
     async def capabilities(owner: Owner):
         return {"agents": catalog(settings), "defaults": PublicSettings().model_dump(),
+                "default_agent": next(iter(AGENTS)),
                 "revision": settings.revision, "idle_minutes": settings.idle_seconds / 60}
 
     @app.get("/api/sessions")
@@ -166,7 +168,9 @@ def create_app(settings: ServerSettings | None = None, *, agent_factory=build_ag
 
     @app.post("/api/sessions", status_code=201)
     async def create(body: CreateSession, owner: Owner):
-        capability = next(item for item in catalog(settings) if item["id"] == body.agent)
+        capability = next((item for item in catalog(settings) if item["id"] == body.agent), None)
+        if capability is None:
+            raise HTTPException(422, "未知 agent")
         if not capability["available"]:
             raise HTTPException(422, capability["reason"])
         return manager.create(owner, body.agent).view()

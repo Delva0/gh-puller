@@ -1,11 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { ArrowDown, ArrowUp, Check, ChevronDown, CircleAlert, Download, Globe, History, LoaderCircle,
-  LogOut, Menu, MessageSquarePlus, PanelLeftClose, Search, Settings2, Square, Trash2, Upload, X, Pencil } from 'lucide-react';
+import { ArrowDown, ArrowUp, Check, ChevronDown, CircleAlert, Download, History, LoaderCircle,
+  LogOut, Menu, MessageSquarePlus, Moon, PanelLeftClose, Search, Settings2, Square, Sun, Trash2, Upload, X, Pencil } from 'lucide-react';
 import { api, ApiError } from './api';
 import { Mark, Modal, SettingsPanel, TurnView, turnsFrom } from './components';
 import { deleteChat, download, exportHistory, importHistory, loadHistory, loadSettings, saveChat, saveSettings } from './db';
-import { emptyCredentials, eventSchema, fallbackSettings, isRunning, publicData, settingsFor,
-  type Agent, type Catalog, type ChatEvent, type Conversation, type Credentials, type SessionView, type Settings } from './types';
+import { emptyCredentials, emptyPreferences, eventSchema, isRunning, publicData, settingsFor,
+  type Agent, type Catalog, type ChatEvent, type Conversation, type Credentials, type ModelSettings,
+  type Preferences, type SessionView, type Settings } from './types';
 
 type Pending = { request_id: string; prompt: string; settings: Settings; credentials: Credentials };
 const errorMessage = (error: unknown) => error instanceof Error ? error.message : '操作失败，请重试';
@@ -19,9 +20,11 @@ export default function App() {
   const [chats, setChats] = useState<Conversation[]>([]);
   const chatsRef = useRef(chats);
   const [activeId, setActiveId] = useState('');
-  const [preferences, setPreferences] = useState(fallbackSettings);
+  const [preferences, setPreferences] = useState(emptyPreferences);
+  const [theme, setTheme] = useState(() => localStorage.getItem('trace-theme') === 'light' ? 'light' : 'dark');
   const [credentials, setCredentials] = useState<Credentials>(emptyCredentials);
   const keysRef = useRef(credentials);
+  const redactions = useRef(new Set<string>());
   const [remembered, setRemembered] = useState<Record<string, boolean>>({});
   const [notice, setNotice] = useState('');
   const [sidebar, setSidebar] = useState(() => window.innerWidth > 760);
@@ -49,6 +52,10 @@ export default function App() {
   const turns = useMemo(() => turnsFrom(active?.events ?? []), [active?.events]);
   const running = active ? isRunning(active) : false;
   const locked = Boolean(active?.events.length);
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+    localStorage.setItem('trace-theme', theme);
+  }, [theme]);
   const visibleChats = useMemo(() => [...chats].sort((a, b) => b.created.localeCompare(a.created)).filter(chat => {
     const query = search.toLocaleLowerCase();
     return chat.title.toLocaleLowerCase().includes(query) || chat.events.some(e =>
@@ -64,7 +71,7 @@ export default function App() {
     }
   }, []);
   const update = useCallback((id: string, change: (chat: Conversation) => Conversation) => {
-    commit(chatsRef.current.map(chat => chat.id === id ? publicData(change(chat), Object.values(keysRef.current)) : chat));
+    commit(chatsRef.current.map(chat => chat.id === id ? publicData(change(chat), [...redactions.current]) : chat));
   }, [commit]);
 
   function pauseFollow() {
@@ -74,9 +81,10 @@ export default function App() {
     }
   }
 
-  function newChat(settings = preferences) {
+  function newChat(settings = preferences, directory = catalog) {
+    if (!directory) return;
     const chat: Conversation = { id: crypto.randomUUID(), title: '新会话', created: new Date().toISOString(),
-      agent: 'github', settings: settingsFor('github', settings), events: [], readonly: false };
+      agent: directory.default_agent, settings: settingsFor(directory.default_agent, settings, directory), events: [], readonly: false };
     commit([...chatsRef.current, chat]); setActiveId(chat.id); setDraft(''); setNotice('');
     follow.current = true; setAtBottom(true);
     if (window.innerWidth <= 760) setSidebar(false);
@@ -84,20 +92,21 @@ export default function App() {
   }
 
   async function connect() {
-    const [info, sessions, saved] = await Promise.all([
-      api<Catalog>('/catalog'), api<SessionView[]>('/sessions'), loadSettings().catch(() => undefined),
+    const [info, sessions] = await Promise.all([
+      api<Catalog>('/catalog'), api<SessionView[]>('/sessions'),
     ]);
     setCatalog(info);
-    const config = saved ?? info.defaults;
+    const config = await loadSettings(info).catch(() => undefined) ?? emptyPreferences;
     setPreferences(config);
     setRemembered(Object.fromEntries(sessions.map(session => [session.id, session.has_credentials])));
     commit(chatsRef.current.map(chat => {
+      if (!chat.events.length && !chat.readonly) return { ...chat, settings: settingsFor(chat.agent, config, info) };
       if (!chat.server_id) return chat;
       const session = sessions.find(item => item.id === chat.server_id);
       return { ...chat, readonly: !session || session.readonly };
     }));
     setAuthenticated(true); setLoginError(''); setConnection('ready');
-    if (!chatsRef.current.length) newChat(config);
+    if (!chatsRef.current.length) newChat(config, info);
     setStreamEpoch(n => n + 1);
   }
 
@@ -217,6 +226,7 @@ export default function App() {
       setNotice('请先在设置中输入模型 API Key。'); setShowSettings(true); return;
     }
     body ??= { request_id: crypto.randomUUID(), prompt: draft.trim(), settings: active.settings, credentials: { ...credentials } };
+    for (const value of Object.values(body.credentials)) if (value) redactions.current.add(value);
     pending.current.set(active.id, body);
     setSubmitting(true); setNotice('');
     let serverId = active.server_id;
@@ -243,10 +253,10 @@ export default function App() {
     catch (error) { setNotice(errorMessage(error)); }
   }
   async function changeAgent(agent: Agent) {
-    if (!active || locked) return;
+    if (!active || locked || !catalog) return;
     try {
       if (active.server_id) await api(`/sessions/${active.server_id}`, 'DELETE');
-      update(active.id, chat => ({ ...chat, agent, server_id: undefined, settings: settingsFor(agent, chat.settings) }));
+      update(active.id, chat => ({ ...chat, agent, server_id: undefined, settings: settingsFor(agent, preferences, catalog) }));
     } catch (error) { setNotice(errorMessage(error)); }
   }
   async function renameChat(event: React.FormEvent) {
@@ -292,6 +302,25 @@ export default function App() {
     } catch (error) { setNotice(errorMessage(error)); }
   }
 
+  function changePreferences(next: Preferences, keys = keysRef.current) {
+    setCredentials(keys); keysRef.current = keys;
+    if (next === preferences || !catalog) return;
+    const clean = publicData(next);
+    const modelChanged = JSON.stringify(clean.model) !== JSON.stringify(preferences.model);
+    setPreferences(clean);
+    void saveSettings(clean).catch(() => setNotice('设置保存失败，请检查浏览器存储。'));
+    commit(chatsRef.current.map(chat => {
+      if (chat.readonly) return chat;
+      const defaults = settingsFor(chat.agent, clean, catalog);
+      return { ...chat, settings: chat.events.length ? { ...chat.settings, base_url: defaults.base_url,
+        ...(chat.id === activeId && modelChanged ? { model: defaults.model,
+          reasoning_effort: defaults.reasoning_effort, thinking: defaults.thinking } : {}) } : defaults };
+    }));
+  }
+  function changeModel(value: Partial<ModelSettings>) {
+    changePreferences({ ...preferences, model: { ...preferences.model, ...value } });
+  }
+
   if (!authenticated) return <main className="login-page"><div className="login-card">
     <div className="login-brand"><Mark /><span>循迹</span></div><div className="eyebrow">AGENT CHAT</div>
     <h1>从问题出发，<br /><span>循证而答。</span></h1>
@@ -300,12 +329,12 @@ export default function App() {
       value={password} onChange={e => setPassword(e.target.value)} placeholder="输入私人访问口令" /></label>
       <button className="primary" disabled={checking} type="submit">{checking ? <><LoaderCircle size={17} className="spin" />正在连接服务</> : <>进入工作空间<ArrowUp size={17} /></>}</button>
     </form>{loginError && <div className="login-error" role="alert"><CircleAlert size={16} />{loginError}</div>}
-    <p className="login-footnote">免费服务唤醒可能需要约一分钟。</p>
   </div><span className="login-corner">循迹 / TRACE THE EVIDENCE</span></main>;
 
   return <div className={`app ${sidebar ? '' : 'sidebar-hidden'}`}>
-    {sidebar && <button className="sidebar-scrim" aria-label="关闭侧栏" onClick={() => setSidebar(false)} />}
-    <aside className={`sidebar ${sidebar ? 'open' : ''}`}>
+    <button className={`sidebar-scrim ${sidebar ? 'open' : ''}`} aria-label="关闭侧栏" aria-hidden={!sidebar}
+      tabIndex={sidebar ? 0 : -1} onClick={() => setSidebar(false)} />
+    <aside className={`sidebar ${sidebar ? 'open' : ''}`} inert={!sidebar}>
       <div className="sidebar-brand"><button className="brand-button" onClick={() => newChat()}><Mark small /><strong>循迹</strong><span>Agent Chat</span></button>
         <button className="icon-button" aria-label="折叠侧栏" onClick={() => setSidebar(false)}><PanelLeftClose size={19} /></button></div>
       <button className="new-chat" onClick={() => newChat()}><MessageSquarePlus size={19} />新建会话<span>＋</span></button>
@@ -321,19 +350,21 @@ export default function App() {
       <div className="sidebar-bottom"><div className="history-actions"><button onClick={() => fileInput.current?.click()}><Upload size={15} />导入</button>
         <button onClick={() => download('chat-history.json', exportHistory(chats))}><Download size={15} />导出历史</button></div>
         <input ref={fileInput} type="file" accept="application/json,.json" hidden aria-label="导入历史文件" onChange={e => void importFile(e.target.files?.[0])} />
-        <button className="sidebar-setting" onClick={() => setShowSettings(true)}><Settings2 size={18} />设置</button>
+        <button className="sidebar-setting" aria-label="打开设置" onClick={() => setShowSettings(true)}><Settings2 size={18} />设置</button>
         <div className="private-profile"><div className="avatar"><Mark small /></div><div><strong>私人工作空间</strong><small>历史保存在此浏览器</small></div>
           <button className="icon-button" aria-label="退出登录" onClick={() => void logout()}><LogOut size={17} /></button></div>
       </div>
     </aside>
     <main className="main-panel"><header className="main-header"><div className="header-left">
       {!sidebar && <button className="icon-button" aria-label="打开侧栏" onClick={() => setSidebar(true)}><Menu size={21} /></button>}
-      <span className="header-name">{active?.agent === 'github' ? 'GitHub' : active?.agent === 'gitcode' ? 'GitCode' : active?.agent === 'code' ? 'Code' : 'Web'}<ChevronDown size={14} /></span>
+      <span className="header-name">{capability?.name ?? active?.agent ?? '循迹'}<ChevronDown size={14} /></span>
       <span className="header-divider">/</span><span className="header-title">{active?.title ?? '循迹'}</span></div>
       <div className="header-right">{active?.readonly ? <span className="status-pill">只读历史</span> : <span className="status-pill"><i />私人会话</span>}
         {Boolean(active?.events.length) && <button className="icon-button" aria-label="导出事件" title="导出 events.json" onClick={() => download('events.json', {
           version: 1, session: { title: active!.title, agent: active!.agent, settings: active!.settings }, events: active!.events,
-        })}><Download size={18} /></button>}</div>
+        })}><Download size={18} /></button>}
+        <button className="icon-button theme-toggle" aria-label={theme === 'dark' ? '切换为浅色主题' : '切换为深色主题'}
+          onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')}>{theme === 'dark' ? <Sun size={18} /> : <Moon size={18} />}</button></div>
     </header>
     <div className="conversation-scroll" ref={viewport}
       onWheel={e => { if (e.deltaY < 0) pauseFollow(); }}
@@ -354,9 +385,6 @@ export default function App() {
     }}><div className="conversation">
       {!turns.length ? <div className="welcome"><div className="welcome-mark"><Mark /></div><div className="eyebrow">A LITTLE CURIOSITY GOES A LONG WAY</div>
         <h1>今天，想探究什么？</h1><p>从一个问题开始，沿着证据找到答案。</p>
-        <div className="agent-availability">{catalog?.agents.map(item => <button key={item.id} disabled={!item.available || locked || submitting}
-          className={active?.agent === item.id ? 'chosen' : ''} title={item.reason || item.name} onClick={() => void changeAgent(item.id)}>
-          {item.id === 'web' ? <Globe size={15} /> : <span className="agent-dot" />}{item.name}{!item.available && <small>不可用</small>}</button>)}</div>
       </div> : turns.map(turn => <TurnView key={turn.id} turn={turn} readonly={active!.readonly} clock={clock} />)}
       {active?.readonly && <div className="readonly-notice"><History size={17} /><div><strong>此会话为只读历史</strong><p>会话已失效、达到保留上限，或来自导入文件。新建会话后可继续研究。</p></div><button className="secondary" onClick={() => newChat()}>新建会话</button></div>}
     </div></div>
@@ -371,24 +399,26 @@ export default function App() {
             if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) { e.preventDefault(); if (!running) void send(); }
           }} />
         <div className="composer-tools"><div className="composer-options"><select aria-label="选择 agent" disabled={locked || submitting || active?.readonly}
-          value={active?.agent ?? 'github'} onChange={e => void changeAgent(e.target.value as Agent)}>
-          {catalog?.agents.map(item => <option key={item.id} value={item.id} disabled={!item.available}>{item.name}{!item.available ? ' · 未配置 Docker' : ''}</option>)}</select>
-          <span className="composer-model">{active?.settings.backend ? active.settings.backend.toUpperCase() + ' · ' : ''}{active?.settings.model}</span></div>
-          <div className="composer-buttons"><button type="button" className="icon-button" aria-label="打开设置" onClick={() => setShowSettings(true)}><Settings2 size={19} /></button>
+          value={active?.agent ?? catalog?.default_agent} onChange={e => void changeAgent(e.target.value as Agent)}>
+          {catalog?.agents.map(item => <option key={item.id} value={item.id} disabled={!item.available}>{item.name}{!item.available ? ' · 不可用' : ''}</option>)}</select>
+          <input className="composer-model" aria-label="模型名" title={active?.settings.model} value={active?.settings.model ?? ''}
+            disabled={running || submitting || active?.readonly} maxLength={200} placeholder="模型名" onChange={e => changeModel({ model: e.target.value })} />
+          <select aria-label="思考强度" disabled={running || submitting || active?.readonly}
+            value={active?.settings.thinking ? active.settings.reasoning_effort : 'off'} onChange={e => changeModel(
+              e.target.value === 'off' ? { thinking: false } : { thinking: true, reasoning_effort: e.target.value })}>
+            <option value="off">关闭思考</option><option value="low">Low</option><option value="high">High</option><option value="max">Max</option>
+            {active?.settings.thinking && !['off', 'low', 'high', 'max'].includes(active.settings.reasoning_effort) &&
+              <option value={active.settings.reasoning_effort}>{active.settings.reasoning_effort}</option>}
+          </select></div>
+          <div className="composer-buttons">
             {running ? <button type="button" className="send-button stop" aria-label="停止生成" onClick={() => void stop()}><Square size={15} fill="currentColor" /></button> :
               <button className="send-button" aria-label="发送问题" type="submit" disabled={!draft.trim() || submitting || active?.readonly || !catalog}>
                 {submitting ? <LoaderCircle size={19} className="spin" /> : <ArrowUp size={21} />}</button>}</div></div>
       </form><p className="composer-caption"><span>Enter 发送 · Shift + Enter 换行</span><span>以来源为依据，保留自己的判断</span></p>
     </div></main>
-    {showSettings && <SettingsPanel settings={active?.settings ?? preferences} credentials={credentials} capability={capability}
+    {showSettings && catalog && <SettingsPanel preferences={preferences} credentials={credentials} catalog={catalog} agent={active?.agent}
       locked={locked && !active?.readonly} remembered={Boolean(active?.server_id && remembered[active.server_id])} onClose={() => setShowSettings(false)}
-      onSave={(settings, keys) => {
-        setCredentials(keys); keysRef.current = keys;
-        const clean = publicData(settings, Object.values(keys));
-        setPreferences(clean); void saveSettings(clean).catch(() => setNotice('设置保存失败，请检查浏览器存储。'));
-        if (active && !active.readonly) update(active.id, chat => ({ ...chat, settings: clean }));
-        setShowSettings(false); setNotice('设置已更新，密钥仅在当前页面与活跃会话中保留。');
-      }} />}
+      onChange={changePreferences} />}
     {rename && <Modal title="重命名会话" onClose={() => setRename(null)}><form onSubmit={renameChat}>
       <label>会话标题<input autoFocus required maxLength={100} value={renameText} onChange={e => setRenameText(e.target.value)} /></label>
       <footer className="modal-actions"><button type="button" className="secondary" onClick={() => setRename(null)}>取消</button><button className="primary" type="submit"><Check size={16} />保存标题</button></footer>

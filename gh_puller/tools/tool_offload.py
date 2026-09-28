@@ -4,6 +4,7 @@ import base64
 import json
 from dataclasses import asdict, dataclass, field
 
+from ..configuration import ToolConfig, option
 from .common import ToolStorage
 from .registry import BATCH_OUTPUT, ToolProvider, tool, tool_definitions
 
@@ -40,6 +41,13 @@ class OffloadPolicy:
     def __post_init__(self):
         if any(type(value) is not int or value < 1 for value in asdict(self).values()):
             raise ValueError("Tool result retention limits must be positive integers")
+
+
+TOOL_RESULT_CONFIG = ToolConfig("tool_results", {
+    f"tool_result_{key}": option(None, value_type=type(value),
+                               description=f"Inherit the tool policy when unset ({value}).")
+    for key, value in asdict(OffloadPolicy()).items()
+})
 
 
 @dataclass

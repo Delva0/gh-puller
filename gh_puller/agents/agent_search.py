@@ -8,6 +8,7 @@ from typing import ClassVar
 from gh_puller.agent.adapters.openai import ChatCompletion
 from gh_puller.agent.base import RequestFailedError
 
+from ..configuration import option
 from ..tools.githost_api_utils import APIProvider
 from ..tools.github_api import BACKEND as GITHUB_BACKEND
 from ..tools.github_api import GitHubUnavailableError
@@ -26,19 +27,27 @@ from ..tools.tool_early_answer import INSTRUCTIONS as EARLY_ANSWER_INSTRUCTIONS
 from ..tools.tool_fastcode import FastCodeTool
 from ..tools.tool_gitcode import BACKEND as GITCODE_BACKEND
 from ..tools.tool_gitcode import DSL_LANGUAGE as GITCODE_DSL_LANGUAGE
-from ..tools.tool_gitcode import GitCodeDSLTool, GitCodeTool
+from ..tools.tool_gitcode import GITCODE_CONFIG, GitCodeDSLTool, GitCodeTool
 from ..tools.tool_github import DSL_LANGUAGE as GITHUB_DSL_LANGUAGE
-from ..tools.tool_github import SCHEMA_SOURCE, GitHubDSLTool, GitHubGraphQLTool, GitHubRESTTool
+from ..tools.tool_github import (
+    GITHUB_CONFIG,
+    SCHEMA_SOURCE,
+    GitHubDSLTool,
+    GitHubGraphQLTool,
+    GitHubRESTTool,
+    query_schema,
+)
 from ..tools.tool_mcp import MCPTools, load_connection
-from ..tools.tool_offload import OffloadPolicy
+from ..tools.tool_offload import TOOL_RESULT_CONFIG, OffloadPolicy
+from ..tools.tool_web import WEB_CONFIG
 from .common import CommonAgent
 from .options import (
     SEARCH_DEFAULTS,
-    WEB_DEFAULTS,
     normalize_search,
     normalize_web,
     tool_result_policy,
 )
+from .registry import register
 
 EARLY_ANSWER_ENABLED = False
 
@@ -64,17 +73,24 @@ GITHUB_BACKENDS = ("gh-cli", "rest", "graphql", "dsl", "gh-mcp", "split")
 GITHUB_API_PROVIDERS = {"rest": GitHubRESTTool, "graphql": GitHubGraphQLTool, "dsl": GitHubDSLTool}
 
 
+@register
 class GitHubAgent(CommonAgent):
     name = "github"
-    defaults: ClassVar[dict] = {**SEARCH_DEFAULTS, "backend": "dsl", "mcp_mode": None, "mcp_config": None}
-    credential_names: ClassVar[dict] = {"github_token": ("GH_TOKEN", "GITHUB_TOKEN")}
+    defaults: ClassVar[dict] = {
+        **SEARCH_DEFAULTS,
+        "backend": option("rest", choices=GITHUB_BACKENDS,
+                          requires={"gh-cli": ("host_commands",), "gh-mcp": ("mcp_config",)}),
+        "mcp_mode": option(None, binding="mcp_mode"), "mcp_config": option(None, binding="mcp_config"),
+    }
+    tool_configs = (GITHUB_CONFIG, WEB_CONFIG, TOOL_RESULT_CONFIG)
+    backends = GITHUB_BACKENDS
     data_boundary = "Live GitHub resources, public web search and HTTP(S) downloads."
 
     @classmethod
     def normalize_options(cls, options):
         options = normalize_search(super().normalize_options(options))
-        if options["backend"] not in GITHUB_BACKENDS:
-            raise ValueError(f"backend must be one of {', '.join(GITHUB_BACKENDS)}")
+        if options["backend"] not in cls.backends:
+            raise ValueError(f"backend must be one of {', '.join(cls.backends)}")
         if options["backend"] == "gh-mcp":
             options["mcp_mode"] = options["mcp_mode"] or "r"
             if options["mcp_mode"] not in {"r", "rw"}:
@@ -92,6 +108,20 @@ class GitHubAgent(CommonAgent):
         super().__init__(config, storage, **kwargs)
         self.github_token, self.github_transport = github_token, github_transport
         self.github_client = self.mcp_tools = self.graphql_tool = None
+
+    @classmethod
+    async def prepare(cls, config, tasks):
+        if config["agent_options"]["backend"] == "dsl":
+            if "github_schema" not in tasks:
+                tasks["github_schema"] = asyncio.create_task(asyncio.to_thread(query_schema))
+            await asyncio.shield(tasks["github_schema"])
+
+    def set_credentials(self, credentials):
+        super().set_credentials(credentials)
+        self.github_token = credentials.get("github_token", "")
+        for provider in (self.tools, self.graphql_tool):
+            if hasattr(provider, "api"):
+                provider.api.token = self.github_token
 
     async def initialize_tools(self):
         name = None
@@ -114,8 +144,7 @@ class GitHubAgent(CommonAgent):
                    {"url": connection["url"], "header_names": list(connection.get("headers", {}))}),
             })
             self.mcp_tools = self.own(MCPTools(
-                self.storage, server="github", **connection, concurrency=self.config["concurrency"],
-                is_llm_multi_modal=self.options["is_llm_multi_modal"]))
+                self.storage, server="github", **connection, concurrency=self.config["concurrency"]))
             self.tools = await self.mcp_tools.connect()
         else:
             self.github_client = self.http_client(self.github_transport)
@@ -181,22 +210,28 @@ class GitHubAgent(CommonAgent):
                 "web": self.web_tools.metadata()}
 
 
+@register
 class GitCodeAgent(CommonAgent):
     name = "gitcode"
-    defaults: ClassVar[dict] = {**SEARCH_DEFAULTS, "backend": "dsl"}
-    credential_names: ClassVar[dict] = {"gitcode_token": ("GITCODE_TOKEN",)}
+    backends = ("rest", "dsl")
+    defaults: ClassVar[dict] = {**SEARCH_DEFAULTS, "backend": option("rest", choices=backends)}
+    tool_configs = (GITCODE_CONFIG, WEB_CONFIG, TOOL_RESULT_CONFIG)
     data_boundary = "Live GitCode resources, public web search and HTTP(S) downloads."
 
     @classmethod
     def normalize_options(cls, options):
         options = normalize_search(super().normalize_options(options))
-        if options["backend"] not in {"rest", "dsl"}:
+        if options["backend"] not in cls.backends:
             raise ValueError("GitCode backend must be rest or dsl")
         return options
 
     def __init__(self, config, storage=None, *, gitcode_token="", gitcode_transport=None, **kwargs):
         super().__init__(config, storage, **kwargs)
         self.gitcode_token, self.gitcode_transport = gitcode_token, gitcode_transport
+
+    def set_credentials(self, credentials):
+        super().set_credentials(credentials)
+        self.gitcode_token = self.tools.api.token = credentials.get("gitcode_token", "")
 
     async def initialize_tools(self):
         self.gitcode_client = self.http_client(self.gitcode_transport)
@@ -221,9 +256,10 @@ class GitCodeAgent(CommonAgent):
                 **({"language": GITCODE_DSL_LANGUAGE} if self.options["backend"] == "dsl" else {})}
 
 
+@register
 class WebAgent(CommonAgent):
     name = "web"
-    defaults: ClassVar[dict] = WEB_DEFAULTS
+    tool_configs = (WEB_CONFIG,)
     data_boundary = "Public web search and HTTP(S) downloads; no repository tools or prior knowledge store."
 
     @classmethod
@@ -274,12 +310,14 @@ class FastCodeRecorder:
         return getattr(self.recorder, name)
 
 
+@register
 class CodeAgent(CommonAgent):
     """Search and understand code through a persistent container and GitHub evidence."""
 
     name = "code"
-    defaults: ClassVar[dict] = {"container": None, "workdir": "/workspace"}
-    credential_names: ClassVar[dict] = {"github_token": ("GH_TOKEN", "GITHUB_TOKEN")}
+    defaults: ClassVar[dict] = {"container": option(None, binding="container", required=True),
+                              "workdir": option("/workspace", binding="workdir")}
+    tool_configs = (GITHUB_CONFIG,)
     data_boundary = "The connected persistent container filesystem, its operator-configured network and GitHub REST."
 
     def __init__(self, config, *args, github_token="", github_transport=None, **kwargs):
@@ -339,6 +377,10 @@ class CodeAgent(CommonAgent):
 
     def begin_query(self):
         self.github_tools.begin_query()
+
+    def set_credentials(self, credentials):
+        super().set_credentials(credentials)
+        self.github_token = self.github_tools.api.token = credentials.get("github_token", "")
 
     def clear_resources(self):
         super().clear_resources()

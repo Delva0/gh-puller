@@ -24,6 +24,7 @@ from markdownify import MarkdownConverter
 from PIL import Image
 from pypdf import PdfReader
 
+from ..configuration import Credential, ToolConfig, option
 from .common import ToolStorage, page_excerpt
 from .registry import BATCH_OUTPUT, ToolProvider, tool, tool_definitions
 from .utils import retry_delay
@@ -34,6 +35,11 @@ MAX_ARCHIVE_MEMBERS = 5000
 MAX_IMAGE_PIXELS = 25_000_000
 DEFAULT_SEARCH_INTERVAL = 2.0
 SEARCH_BACKENDS = ("auto", "brave", "duckduckgo")
+WEB_CONFIG = ToolConfig("web", {
+    "web_search_backend": option("brave", choices=SEARCH_BACKENDS),
+    "web_search_concurrency": 1,
+    "web_search_interval": option(DEFAULT_SEARCH_INTERVAL, description="Search interval in seconds."),
+}, {"brave_api_key": Credential(("BRAVE_SEARCH_API_KEY", "BRAVE_API_KEY"), {"web_search_backend": "brave"})})
 BRAVE_SEARCH_URL = "https://api.search.brave.com/res/v1/web/search"
 
 WEB_SEARCH_SCHEMA = {

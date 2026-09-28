@@ -1,6 +1,5 @@
 import { expect, test, type Page, type Download } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
-import { fallbackSettings } from '../src/types';
 
 const secret = 'fixture-model-secret-value';
 
@@ -13,11 +12,12 @@ async function login(page: Page) {
 async function configure(page: Page) {
   await page.getByRole('button', { name: '打开设置' }).click();
   await page.getByLabel('模型地址').fill('https://model.example/v1');
-  await page.getByLabel('模型名', { exact: true }).fill('fixture-model');
   await page.getByLabel('模型 API Key').fill(secret);
-  await expect(page.getByLabel('查询后端')).toHaveValue('rest');
-  await page.getByLabel('搜索服务').selectOption('duckduckgo');
-  await page.getByRole('button', { name: '保存设置' }).click();
+  await page.getByRole('tab', { name: '工具', exact: true }).click();
+  await page.locator('[name="web_search_backend"]').selectOption('"duckduckgo"');
+  await page.getByRole('button', { name: '关闭', exact: true }).click();
+  await expect(page.getByRole('dialog')).not.toBeVisible();
+  await page.getByLabel('模型名', { exact: true }).fill('fixture-model');
 }
 async function send(page: Page, prompt: string) {
   await page.getByLabel('输入问题').fill(prompt);
@@ -58,7 +58,9 @@ test('credentials, streaming, traces, history management and refresh', async ({ 
   const errors: string[] = [];
   page.on('pageerror', error => errors.push(error.message));
   await login(page);
-  await expect(page.getByRole('button', { name: 'Code 不可用' })).toBeDisabled();
+  await expect(page.locator('select[aria-label="选择 agent"] option[value=code]')).toBeDisabled();
+  await expect(page.locator('.welcome button')).toHaveCount(0);
+  await expect(page.getByRole('button', { name: '打开设置' })).toHaveCount(1);
   await configure(page);
   await page.getByLabel('输入问题').fill('secret evidence');
   await page.getByLabel('输入问题').press('Shift+Enter');
@@ -73,10 +75,12 @@ test('credentials, streaming, traces, history management and refresh', async ({ 
   const tool = page.locator('.trace-item').filter({ hasText: 'github' });
   await tool.locator('summary').click();
   await expect(tool).toContainText('/repos/o/r');
-  await page.locator('.trace-item').filter({ hasText: '思考 1' }).locator('summary').click();
+  expect(await page.locator('.trace-item').evaluateAll(items => items.map(item => item.getAttribute('data-kind')))).toEqual(['model', 'tool', 'model']);
+  await page.locator('.trace-item[data-kind=model]').first().locator('summary').click();
+  await expect(page.locator('.trace-item[data-kind=model]').first().locator('.trace-body pre')).toBeInViewport({ ratio: 1 });
   await expect(page.locator('.trace')).toContainText('先核对原始资料。');
   await expect(page.locator('.trace')).not.toContainText(secret);
-  await page.screenshot({ path: info.outputPath('desktop-trace.png'), fullPage: true });
+  await page.screenshot({ path: info.outputPath('desktop-trace.png'), fullPage: true, animations: 'disabled' });
   await page.getByRole('button', { name: '复制代码' }).click();
   await expect.poll(() => page.evaluate(() => navigator.clipboard.readText())).toContain('follow_evidence');
 
@@ -100,9 +104,10 @@ test('credentials, streaming, traces, history management and refresh', async ({ 
   await page.getByRole('button', { name: '新建会话' }).click();
   await expect(page.getByLabel('选择 agent')).toHaveValue('github');
   await page.getByRole('button', { name: '打开设置' }).click();
-  await expect(page.getByLabel('查询后端')).toHaveValue('rest');
-  await page.getByLabel('查询后端').selectOption('dsl');
-  await page.getByRole('button', { name: '保存设置' }).click();
+  await page.getByRole('tab', { name: 'Agent', exact: true }).click();
+  await page.locator('[name=backend]').selectOption('"dsl"');
+  await page.getByRole('button', { name: '关闭', exact: true }).click();
+  await expect(page.getByRole('dialog')).not.toBeVisible();
   await page.getByLabel('选择 agent').selectOption('gitcode');
   await configure(page);
   await send(page, 'GitCode evidence');
@@ -114,8 +119,10 @@ test('credentials, streaming, traces, history management and refresh', async ({ 
   await page.locator('.chat-open').filter({ hasText: '证据笔记' }).click();
   await page.getByRole('button', { name: '打开设置' }).click();
   await expect(page.getByLabel('模型 API Key')).toHaveValue('');
-  await expect(page.getByLabel('查询后端')).toBeDisabled();
+  await page.getByRole('tab', { name: 'Agent', exact: true }).click();
+  await expect(page.getByText(/修改将在新会话生效/)).toBeVisible();
   await page.getByRole('button', { name: '关闭', exact: true }).click();
+  await expect(page.getByRole('dialog')).not.toBeVisible();
   await send(page, 'continue context');
   await expect(page.locator('.execution > summary').last()).toContainText('已完成');
   await expect(page.locator('.markdown').last()).toContainText('已有上下文');
@@ -165,6 +172,7 @@ test('mobile drawer, long histories, code, tables and inert HTML', async ({ page
   await expect(page.getByRole('button', { name: '打开侧栏' })).toBeVisible();
   await page.getByRole('button', { name: '打开侧栏' }).click();
   await expect(page.getByLabel('搜索历史')).toBeVisible();
+  const directory = await (await page.request.get('/api/catalog')).json();
   const at = new Date().toISOString();
   const answer = '# 长内容也可以从容阅读\n\n'
     + '<img src=x onerror="window.HTML_EXECUTED=true"><script>window.HTML_EXECUTED=true</script>\n\n'
@@ -173,7 +181,7 @@ test('mobile drawer, long histories, code, tables and inert HTML', async ({ page
     + '```python\nsource = "' + 'x'.repeat(500) + '"\n```\n\n'
     + '保留足够的留白，让信息容易阅读。\n\n'.repeat(65);
   const conversations = Array.from({ length: 42 }, (_, index) => ({
-    title: `研究笔记 ${index + 1}`, agent: 'github', created: at, settings: fallbackSettings,
+    title: `研究笔记 ${index + 1}`, agent: 'github', created: at, settings: directory.defaults,
     events: [
       { seq: 1, type: 'query/start', at, query_id: 'imported-question', data: { prompt: '核对长代码与表格的展示' } },
       { seq: 2, type: 'query/end', at, query_id: 'imported-question', data: { status: 'completed', answer, duration_ms: 1300 } },
@@ -181,7 +189,7 @@ test('mobile drawer, long histories, code, tables and inert HTML', async ({ page
   }));
   await page.getByLabel('导入历史文件').setInputFiles({ name: 'long-history.json', mimeType: 'application/json', buffer: Buffer.from(JSON.stringify({ version: 1, conversations })) });
   await expect(page.locator('.chat-open')).toHaveCount(43);
-  await page.screenshot({ path: info.outputPath('mobile-drawer.png'), fullPage: true });
+  await page.screenshot({ path: info.outputPath('mobile-drawer.png'), fullPage: true, animations: 'disabled' });
   await page.getByRole('button', { name: '折叠侧栏' }).click();
   await page.locator('.conversation-scroll').evaluate(element => { element.scrollTop = 0; });
   await expect(page.getByRole('button', { name: '回到底部' })).toBeVisible();
@@ -190,7 +198,7 @@ test('mobile drawer, long histories, code, tables and inert HTML', async ({ page
   expect(await page.locator('.code-block pre').evaluate(e => e.scrollWidth > e.clientWidth)).toBe(true);
   expect(await page.locator('.table-scroll').evaluate(e => e.scrollWidth > e.clientWidth)).toBe(true);
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
-  await page.screenshot({ path: info.outputPath('mobile-content.png'), fullPage: true });
+  await page.screenshot({ path: info.outputPath('mobile-content.png'), fullPage: true, animations: 'disabled' });
   await page.getByRole('button', { name: '回到底部' }).click();
   await expect(page.getByText('此会话为只读历史')).toBeVisible();
   await expect(page.getByRole('button', { name: '回到底部' })).not.toBeVisible();
@@ -212,4 +220,100 @@ test('scrolling upward during output preserves the reading position', async ({ p
   await page.getByRole('button', { name: '回到底部' }).click();
   await expect(page.locator('.execution > summary')).toContainText('已完成');
   await expect.poll(() => view.evaluate(e => e.scrollHeight - e.clientHeight - e.scrollTop)).toBeLessThan(90);
+});
+
+test('configuration is discovered, independently saved, and dialog drag does not dismiss', async ({ page }, info) => {
+  await login(page);
+  await configure(page);
+  await page.getByRole('button', { name: '打开设置' }).click();
+  await expect(page.getByRole('button', { name: /保存设置|取消/ })).toHaveCount(0);
+  const input = await page.getByLabel('模型地址').boundingBox();
+  await page.mouse.move(input!.x + 60, input!.y + 15);
+  await page.mouse.down();
+  await page.mouse.move(5, 5, { steps: 8 });
+  await page.mouse.up();
+  await expect(page.getByRole('dialog', { name: '设置' })).toBeVisible();
+  await page.getByRole('tab', { name: 'Agent', exact: true }).click();
+  await expect(page.locator('[name=backend]')).toHaveValue('"rest"');
+  await page.locator('[name=ptc]').selectOption('"A"');
+  await page.locator('[name=concurrency]').fill('128');
+  await page.getByLabel('配置 agent').selectOption('gitcode');
+  await expect(page.locator('[name=ptc]')).toHaveValue('false');
+  await expect(page.locator('[name=concurrency]')).toHaveValue('8');
+  await page.locator('[name=ptc]').selectOption('"B"');
+  await page.getByLabel('配置 agent').selectOption('github');
+  await expect(page.locator('[name=ptc]')).toHaveValue('"A"');
+  await expect(page.locator('[name=concurrency]')).toHaveValue('128');
+  await page.getByRole('button', { name: '恢复主包默认配置' }).click();
+  await expect(page.locator('[name=ptc]')).toHaveValue('false');
+  await page.getByLabel('配置 agent').selectOption('fixture_research');
+  await page.locator('[name=strategy]').selectOption('"deep"');
+  await page.locator('[name=candidate_count]').fill('1234');
+  await page.locator('[name=follow_links]').uncheck();
+  await page.screenshot({ path: info.outputPath('desktop-settings.png'), fullPage: true, animations: 'disabled' });
+  await page.mouse.click(5, 5);
+  await expect(page.getByRole('dialog', { name: '设置' })).not.toBeVisible();
+  await page.getByLabel('选择 agent').selectOption('fixture_research');
+  await page.getByLabel('思考强度').selectOption('off');
+  await send(page, 'discovered agent fields');
+  await expect(page.locator('.execution > summary')).toContainText('已完成');
+  const record = await captureDownload(page, '导出事件');
+  expect(record.session.settings.options).toMatchObject({ strategy: 'deep', candidate_count: 1234, follow_links: false });
+  expect(record.events.find((event: { type: string }) => event.type === 'model/request').data.parameters).not.toHaveProperty('reasoning_effort');
+  expect(record.events.find((event: { type: string }) => event.type === 'model/request').data.parameters).not.toHaveProperty('max_tokens');
+  await page.getByRole('button', { name: '切换为浅色主题' }).click();
+  await expect(page.locator('html')).toHaveAttribute('data-theme', 'light');
+  await page.screenshot({ path: info.outputPath('desktop-light.png'), fullPage: true, animations: 'disabled' });
+  await page.reload();
+  await expect(page.locator('html')).toHaveAttribute('data-theme', 'light');
+  await page.getByRole('button', { name: '打开设置' }).click();
+  await expect(page.getByLabel('模型 API Key')).toHaveValue('');
+  await page.getByRole('tab', { name: 'Agent', exact: true }).click();
+  await expect(page.locator('[name=strategy]')).toHaveValue('"deep"');
+  await page.getByLabel('配置 agent').selectOption('gitcode');
+  await expect(page.locator('[name=ptc]')).toHaveValue('"B"');
+  await page.getByRole('button', { name: '关闭', exact: true }).click();
+  await expect(page.getByRole('dialog')).not.toBeVisible();
+  await page.getByRole('button', { name: '折叠侧栏' }).click();
+  await expect(page.locator('.sidebar')).toHaveCSS('visibility', 'hidden');
+  await page.getByRole('button', { name: '打开侧栏' }).click();
+  await expect(page.locator('.sidebar')).toHaveCSS('opacity', '1');
+  expect(await browserRecords(page)).not.toContain(secret);
+});
+
+test('legacy flat preferences migrate without rewriting archived settings', async ({ page }) => {
+  await login(page);
+  const old = { base_url: 'https://legacy.example/v1', model: 'legacy-model', thinking: true, reasoning_effort: 'custom',
+    max_tokens: 8192, max_steps: 32, concurrency: 4, backend: 'dsl', ptc: 'B', multimodal: false,
+    web_search_backend: 'duckduckgo', web_search_concurrency: 3, web_search_interval: 5 };
+  await page.evaluate(async settings => {
+    const db = await new Promise<IDBDatabase>(resolve => {
+      const open = indexedDB.open('trace-agent-chat'); open.onsuccess = () => resolve(open.result);
+    });
+    const tx = db.transaction('preferences', 'readwrite');
+    tx.objectStore('preferences').put(settings, 'settings');
+    await new Promise<void>(resolve => { tx.oncomplete = () => resolve(); }); db.close();
+  }, old);
+  await page.reload();
+  await expect(page.getByLabel('模型名', { exact: true })).toHaveValue('legacy-model');
+  await expect(page.getByLabel('思考强度')).toHaveValue('custom');
+  await page.getByRole('button', { name: '打开设置' }).click();
+  await expect(page.getByLabel('模型地址')).toHaveValue(old.base_url);
+  await page.getByRole('tab', { name: 'Agent', exact: true }).click();
+  await expect(page.locator('[name=backend]')).toHaveValue('"rest"');
+  await expect(page.locator('[name=ptc]')).toHaveValue('false');
+  await page.getByRole('tab', { name: '工具', exact: true }).click();
+  await expect(page.locator('[name=web_search_concurrency]')).toHaveValue('3');
+  await page.getByRole('button', { name: '关闭', exact: true }).click();
+  await expect(page.getByRole('dialog')).not.toBeVisible();
+  const at = new Date().toISOString();
+  await page.getByLabel('导入历史文件').setInputFiles({ name: 'old.json', mimeType: 'application/json', buffer: Buffer.from(JSON.stringify({
+    version: 1, conversations: [{ title: '旧版研究', agent: 'github', created: at, settings: old, events: [
+      { seq: 1, type: 'query/start', at, query_id: 'old-query', data: { prompt: '旧问题' } },
+      { seq: 2, type: 'query/end', at, query_id: 'old-query', data: { answer: '旧答案', status: 'completed', duration_ms: 1 } },
+    ] }],
+  })) });
+  await expect(page.getByText('此会话为只读历史')).toBeVisible();
+  const saved = await captureDownload(page, '导出历史');
+  expect(saved.conversations.find((chat: { title: string }) => chat.title === '旧版研究').settings).toMatchObject(old);
 });

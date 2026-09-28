@@ -14,6 +14,7 @@ from jsonschema import ValidationError
 
 from ..agent.adapters.openai import ChatCompletion
 from ..agent.base import BaseAgent, RequestFailedError
+from ..configuration import option
 from ..tools.registry import ToolInputError, ToolRegistry, input_error
 from ..tools.storage import ToolStorage
 from ..tools.tool_early_answer import EarlyAnswerTool
@@ -29,6 +30,12 @@ class CommonAgent(BaseAgent):
 
     name = ""
     defaults: ClassVar[dict] = {}
+    runtime_defaults: ClassVar[dict] = {
+        "concurrency": option(8, description="Per-agent concurrency budget supplied to each tool provider."),
+        "max_steps": option(0, internal=True),
+    }
+    tool_configs: ClassVar[tuple] = ()
+    backends: ClassVar[tuple] = ()
     credential_names: ClassVar[dict] = {}
     data_boundary = ""
 
@@ -50,8 +57,9 @@ class CommonAgent(BaseAgent):
             on_early_answer: Optional callback receiving published early-answer text.
             brave_api_key: Credential used only for Brave web search.
         """
-        config = {"concurrency": 8, "max_steps": 0, "parameters": {}, "environment": {},
+        config = {**self.runtime_defaults, "parameters": {}, "environment": {},
                   **copy.deepcopy(config)}
+        self.normalize_runtime(config)
         options = self.normalize_options({**self.defaults, **{k: config[k] for k in self.defaults if k in config},
                                           **config.get("agent_options", {})})
         if config.get("agent", self.name) != self.name:
@@ -75,7 +83,17 @@ class CommonAgent(BaseAgent):
         self.web_tools = self.web_client = None
 
     @classmethod
+    def normalize_runtime(cls, config):
+        if type(config["concurrency"]) is not int or config["concurrency"] < 1:
+            raise ValueError("concurrency must be a positive integer")
+        if type(config["max_steps"]) is not int or config["max_steps"] < 0:
+            raise ValueError("max_steps must be a non-negative integer; zero means unlimited")
+        return config
+
+    @classmethod
     def normalize_options(cls, options):
+        # Image support is negotiated by inference; older callers may still pass this flag.
+        options.pop("is_llm_multi_modal", None)
         unknown = options.keys() - cls.defaults.keys()
         if unknown:
             raise ValueError(f"Unsupported {cls.name} options: {', '.join(sorted(unknown))}")
@@ -112,8 +130,7 @@ class CommonAgent(BaseAgent):
             self.web_client, self.storage, concurrency=self.config["concurrency"],
             search_concurrency=self.options["web_search_concurrency"],
             search_interval=self.options["web_search_interval"],
-            search_backend=self.options["web_search_backend"], brave_api_key=self.brave_api_key,
-            is_llm_multi_modal=self.options["is_llm_multi_modal"])
+            search_backend=self.options["web_search_backend"], brave_api_key=self.brave_api_key)
         return self.web_tools
 
     def install_tools(self, *providers, ptc=False, early_answer=False, offload: OffloadPolicy | None = None,
@@ -143,6 +160,27 @@ class CommonAgent(BaseAgent):
 
     async def initialize_tools(self):
         raise NotImplementedError
+
+    @classmethod
+    async def prepare(cls, config, tasks):
+        """Prepare shared dependencies without attaching them to one conversation.
+
+        Args:
+            config: Resolved native configuration for the next conversation.
+            tasks: Caller-owned preparation tasks, awaited on service shutdown.
+                Cancelling a conversation must not cancel shared preparation.
+        """
+
+    def set_credentials(self, credentials):
+        """Replace in-memory credentials between turns without rebuilding context.
+
+        Args:
+            credentials: Model and tool credential values supplied by the caller.
+        """
+        self.api_key = credentials["api_key"]
+        self.brave_api_key = credentials.get("brave_api_key", "")
+        if self.web_tools:
+            self.web_tools.brave_api_key = self.brave_api_key
 
     def instructions(self):
         raise NotImplementedError

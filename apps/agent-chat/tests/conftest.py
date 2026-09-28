@@ -27,6 +27,7 @@ async def login(client):
 
 def question(prompt="Find evidence", *, request_id="request-0001", backend="rest", **settings):
     return {"request_id": request_id, "prompt": prompt,
-            "settings": {"base_url": "https://model.example/v1", "model": "fixture-model", "backend": backend,
-                         "web_search_backend": "duckduckgo", "multimodal": False, **settings},
+            "settings": {"base_url": "https://model.example/v1", "model": "fixture-model",
+                         "options": {"web_search_backend": "duckduckgo",
+                                     **({"backend": backend} if backend else {}), **settings}},
             "credentials": {"api_key": "fixture-model-secret-value"}}

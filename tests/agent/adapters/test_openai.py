@@ -1,11 +1,14 @@
 """Test the OpenAI-compatible Agent adapter contract."""
 
 import json
+from copy import deepcopy
 from typing import ClassVar
 
+import httpx
 import pytest
 
 from gh_puller import agent
+from gh_puller.agent.adapters.openai import ChatCompletion
 from gh_puller.agent.context import instruction, tool_defs
 from gh_puller.agent.events import fold_state, function_call_item, reasoning_item, text_message
 from tests.agent._support import (
@@ -217,3 +220,66 @@ async def test_openai_correlates_a_failed_stream(monkeypatch, tmp_path) -> None:
     assert failure["data"]["requestId"] == request["data"]["requestId"]
     assert failure["data"]["error"]["type"] == "RequestFailedError"
     assert not any(event["type"] == "model/response" for event in events)
+
+
+@pytest.mark.asyncio
+async def test_images_retry_as_placeholders_without_changing_history_or_limits(tmp_path):
+    events = await _capture(tmp_path)
+    requests = []
+    body = {"model": "any-model", "reasoning_effort": "provider-custom-value", "max_tokens": 0,
+            "max_completion_tokens": 0, "tools": [], "messages": [
+                {"role": "tool", "tool_call_id": "evidence", "content": "original evidence"},
+                {"role": "user", "content": [{"type": "text", "text": "inspect"},
+                                            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}}]},
+            ]}
+    original = deepcopy(body)
+
+    def respond(request):
+        requests.append(json.loads(request.content))
+        if len(requests) == 1:
+            return httpx.Response(400, json={"error": "vision unsupported"})
+        return httpx.Response(200, text='data: {"choices":[{"delta":{"content":"answer"},"finish_reason":"stop"}]}\n\n')
+
+    subject = agent.OpenAI({"model": "any-model", "base_url": "https://model.example"})
+    async with subject.session(session="images"), httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+        completion = ChatCompletion(client, subject._require_event_recorder(), body=body,
+                                    base_url="https://model.example")
+        assert (await completion.result())["content"] == "answer"
+    await _settle()
+    assert body == original
+    assert requests[0]["messages"][1]["content"][1]["type"] == "image_url"
+    assert requests[1]["messages"][1]["content"][1] == {"type": "text", "text": "<image>"}
+    for request in requests:
+        assert "max_tokens" not in request and "max_completion_tokens" not in request
+        assert request["reasoning_effort"] == "provider-custom-value"
+        assert request["messages"][0] == original["messages"][0]
+    starts = [event["data"] for event in events if event["type"] == "model/request"]
+    assert len(starts) == 2 and starts[1]["imageFallback"]
+    assert starts[0]["requestSha256"] != starts[1]["requestSha256"]
+    ends = {event["type"]: event["data"] for event in events if event["type"] in {"model/error", "model/response"}}
+    assert ends["model/error"]["requestId"] == starts[0]["requestId"]
+    assert ends["model/response"]["requestId"] == starts[1]["requestId"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["authentication", "partial", "rejected_twice"])
+async def test_image_fallback_does_not_retry_auth_partial_output_or_loop(tmp_path, failure):
+    await _capture(tmp_path)
+    requests = []
+
+    def respond(request):
+        requests.append(request)
+        if failure == "partial":
+            return httpx.Response(200, text='data: {"choices":[{"delta":{"content":"partial"}}]}\n\n'
+                                  'data: {"error":"image unsupported"}\n\n')
+        return httpx.Response(401 if failure == "authentication" else 422, text="unsupported")
+
+    body = {"model": "any", "messages": [{"role": "user", "content": [
+        {"type": "image_url", "image_url": {"url": "https://example.org/a.png"}},
+    ]}]}
+    subject = agent.OpenAI({"model": "any", "base_url": "https://model.example"})
+    async with subject.session(session="failure"), httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+        with pytest.raises((httpx.HTTPStatusError, agent.RequestFailedError)):
+            await ChatCompletion(client, subject._require_event_recorder(), body=body,
+                                 base_url="https://model.example").result()
+    assert len(requests) == (2 if failure == "rejected_twice" else 1)

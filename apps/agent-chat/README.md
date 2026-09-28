@@ -33,10 +33,14 @@ Python 依赖锁在 `uv.lock`，前端依赖锁在 `web/package-lock.json`。本
   第一次提交后 agent 和工具配置固定，模型配置和密钥仍可更新。
 - GitHub 支持 REST、DSL、GraphQL、Split；GitCode 支持 REST、DSL；Web 提供搜索和下载。
   PTC A/B 需要服务端 Node；Code 需要显式配置 Docker 容器连接，免费部署中显示为不可用。
-- 设置默认沿用实验的模型地址与 `deepseek-v4.1-flash`，最大步数 32、工具并发 8。
+- 设置默认沿用实验的模型地址与 `deepseek-v4.1-flash`；模型名和思考强度在输入框底栏调整。
+  主包默认不限步数，输出 token 限制为 0 时不向供应商发送限额；供应商仍可能有自身限制。
   Brave 需要密钥，也可选择 Auto / DuckDuckGo。模型供应商须支持所选 thinking / reasoning 参数。
 - Enter 发送，Shift+Enter 换行。执行区域显示实际模型、reasoning 与工具事件。停止会取消服务端任务；关闭页面或 SSE 断线不会取消任务。
-- GitHub DSL 首次初始化在后台线程完成，页面显示实际初始化状态，期间仍可停止查询或访问健康检查。
+- GitHub DSL 首次初始化在共享后台线程完成，期间仍可停止查询或访问健康检查。
+- 设置分为全局、Agent、工具三页，输入即保存。Agent 配置分别保留；工具配置与凭据在使用者之间共享。
+  模型默认发送工具返回的图片，若请求被拒绝，在未输出内容时以 `<image>` 占位重试一次。
+- 右上角切换深浅主题。思考与工具按实际事件顺序展示，可展开查看。
 - 同一浏览器的历史、事件与非敏感设置保存在 IndexedDB。搜索、重命名、删除与 JSON 导入导出均可在侧栏操作。
   导入只生成只读历史，不将展示消息写回 agent 上下文。
 - 模型和平台密钥只在页面与活跃服务端会话内存中保留。刷新不回填密钥；服务端上下文仍存在时可继续使用。
@@ -65,6 +69,30 @@ sequenceDiagram
 16 MiB 事件记录与 64 MiB 临时工具文件。超限会给出明确状态，导出后新建会话。
 模型 URL 只接受公网 HTTP(S) 地址、80/443 端口，无 URL 凭据；每次连接检查 DNS 并固定实际地址。
 Markdown 不执行原始 HTML，远程图片显示为链接。
+
+## 配置从主包发现
+
+主包的 `@register` 收集 agent 的 `defaults`、`runtime_defaults` 与 `tool_configs`。
+普通默认值自动推断类型，`option()` 只补充枚举、依赖、可空类型及运行环境绑定。
+工具模块中的 `ToolConfig` 定义共享配置和凭据名称，实际密钥始终由调用者提供。
+
+```python
+@register
+class ResearchAgent(CommonAgent):
+    name = "research"
+    defaults = {"strategy": option("fast", choices=("fast", "deep")), "candidates": 20}
+    tool_configs = (WEB_CONFIG,)
+```
+
+`/api/catalog` 直接读取注册目录；设置提交为通用 `options` 字典，由主包校验和构造运行配置。
+App 不维护 agent 字段、默认值、枚举或凭据清单，只负责通用控件、排版及模型连接设置。
+新增配置通常只改主包声明；新增独立 agent 模块还需由主包导入，使装饰器执行。
+`concurrency` 属于 agent，是提供给各工具执行器的并发预算；搜索工具另有自己的并发与间隔。
+容器连接等操作环境由部署提供，不能通过浏览器任意指定宿主路径。
+
+浏览器仅把用户实际修改的偏好保存为覆盖值；未修改项跟随主包默认值。
+旧版平面设置迁移保留模型与共享工具偏好，agent 选项从主包重新取默认值。
+已有会话的工具配置和历史事件不因包默认值变化而改写。
 
 ## 镜像
 
@@ -157,4 +185,4 @@ npm test
 `CHAT_ACCESS_PASSWORD`、`OPENAI_API_KEY`、`GH_TOKEN`、`GITCODE_TOKEN`、`BRAVE_SEARCH_API_KEY`，
 然后从 `web/` 执行 `node scripts/live-acceptance.mjs`。可选 `OPENAI_BASE_URL` 和 `CHAT_TEST_MODEL` 覆盖模型设置。
 脚本不启用浏览器 trace、不输出密钥；脱敏事件与截图保存到忽略的 `verification/live-browser/`。
-该脚本会发生真实供应商调用费用；每条验收查询最多 8 步、4096 输出 tokens。结束后退出并释放测试会话。
+该脚本会发生真实供应商调用费用；验收使用主包默认配置和页面模型设置，每条查询最多等待 240 秒；结束后退出并释放测试会话。

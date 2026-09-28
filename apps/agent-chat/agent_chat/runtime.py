@@ -18,17 +18,15 @@ from tempfile import TemporaryDirectory
 
 from fastapi import HTTPException
 from gh_puller.agent.events import EventBus
-from gh_puller.agents import CodeAgent, GitCodeAgent, GitHubAgent, WebAgent
-from gh_puller.tools.tool_github import query_schema as github_query_schema
+from gh_puller.agents import AGENTS
 
-from .config import Question, ServerSettings, validate_capabilities
+from .config import Question, ServerSettings, resolve_settings, validate_capabilities
 from .security import PublicTransport, SecretFilter
 from .storage import PrivateStorage
 
-AGENTS = {"github": GitHubAgent, "gitcode": GitCodeAgent, "code": CodeAgent, "web": WebAgent}
 OBSERVED = {"model/request", "model/response", "model/error", "model/delta/text", "model/delta/reasoning",
             "tool/start", "tool/end", "step/start", "step/end", "turn/start", "turn/end", "session/error"}
-MODEL_SETTINGS = {"base_url", "model", "max_steps", "thinking", "reasoning_effort", "max_tokens"}
+MODEL_SETTINGS = {"base_url", "model", "thinking", "reasoning_effort", "max_tokens"}
 
 
 class EventLimitError(RuntimeError):
@@ -40,31 +38,18 @@ def now():
 
 
 def native_config(kind, public, server):
-    options = {}
-    if kind in {"github", "gitcode"}:
-        options.update(backend=public.backend, ptc=False if public.ptc == "off" else public.ptc)
-    if kind != "code":
-        options.update(web_search_backend=public.web_search_backend,
-                       web_search_concurrency=public.web_search_concurrency,
-                       web_search_interval=public.web_search_interval, is_llm_multi_modal=public.multimodal)
-    else:
-        options.update(container=server.code_container, workdir=server.code_workdir)
     return {"model": public.model, "base_url": public.base_url,
-            "max_steps": public.max_steps, "concurrency": public.concurrency, "agent_options": options,
+            **validate_capabilities(kind, public, server),
             "environment": {"date_utc": str(datetime.now(UTC).date())},
             "parameters": {"thinking": {"type": "enabled" if public.thinking else "disabled"},
-                           "reasoning_effort": public.reasoning_effort, "max_tokens": public.max_tokens,
+                           **({"reasoning_effort": public.reasoning_effort} if public.thinking else {}),
+                           "max_tokens": public.max_tokens,
                            "stream_options": {"include_usage": True}}}
 
 
 def build_agent(kind, config, credentials, storage):
     connection = {"api_key": credentials["api_key"], "model_transport": PublicTransport()}
-    if kind in {"github", "code"}:
-        connection["github_token"] = credentials.get("github_token", "")
-    elif kind == "gitcode":
-        connection["gitcode_token"] = credentials.get("gitcode_token", "")
-    if kind != "code":
-        connection["brave_api_key"] = credentials.get("brave_api_key", "")
+    connection.update({key: credentials.get(key, "") for key in AGENTS[kind].credential_names})
     return AGENTS[kind](config, storage, **connection)
 
 
@@ -188,7 +173,7 @@ class SessionManager:
         self.settings, self.factory = settings, factory
         self.sessions = {}
         self.bus = SessionBus(self)
-        self.github_schema_task = None
+        self.preparations = {}
 
     def create(self, owner, kind):
         if len(self.sessions) >= self.settings.max_sessions:
@@ -206,8 +191,9 @@ class SessionManager:
         return session
 
     def submit(self, session, question: Question):
+        public = resolve_settings(session.kind, question.settings)
         fingerprint = hashlib.sha256(json.dumps(
-            {"prompt": question.prompt, "settings": question.settings.model_dump()}, sort_keys=True,
+            {"prompt": question.prompt, "settings": public.model_dump()}, sort_keys=True,
         ).encode()).hexdigest()
         if question.request_id in session.requests:
             if session.requests[question.request_id] != fingerprint:
@@ -219,7 +205,6 @@ class SessionManager:
             raise HTTPException(409, "会话达到保留上限，请新建会话")
         if sum(item.running for item in self.sessions.values()) >= self.settings.max_running:
             raise HTTPException(429, "服务正在处理其他请求，请稍后重试")
-        public = question.settings
         try:
             validate_capabilities(session.kind, public, self.settings)
         except ValueError as exc:
@@ -228,14 +213,16 @@ class SessionManager:
             before, after = session.public.model_dump(), public.model_dump()
             if any(before[key] != after[key] for key in before.keys() - MODEL_SETTINGS):
                 raise HTTPException(409, "会话开始后工具配置固定；请新建会话使用其他工具设置")
-            if before["base_url"] != after["base_url"] and not question.credentials.api_key.get_secret_value():
+            if before["base_url"] != after["base_url"] and not question.credentials.values().get("api_key"):
                 raise HTTPException(422, "更换模型地址需要重新输入 API Key")
         credentials = {**session.credentials,
                        **{key: value for key, value in question.credentials.values().items() if value}}
         if not credentials.get("api_key"):
             raise HTTPException(422, "请在设置中输入模型 API Key")
-        if session.kind != "code" and public.web_search_backend == "brave" and not credentials.get("brave_api_key"):
-            raise HTTPException(422, "Brave 搜索需要 API Key，或将搜索配置改为 Auto / DuckDuckGo")
+        try:
+            AGENTS[session.kind].configuration.validate_credentials(public.options, credentials)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from None
         session.credentials, session.public = credentials, public
         session.scrubber.add(credentials.values())
         session.requests[question.request_id] = fingerprint
@@ -257,14 +244,8 @@ class SessionManager:
         status, error, answer = "completed", "", ""
         try:
             async with asyncio.timeout(self.settings.run_seconds):
-                if session.kind == "github" and session.public.backend == "dsl":
-                    if self.github_schema_task is None:
-                        self.github_schema_task = asyncio.create_task(asyncio.to_thread(github_query_schema))
-                    if not self.github_schema_task.done():
-                        session.emit("query/status", {"message": "正在初始化 GitHub 查询结构"})
-                    # Shared immutable schema construction must not block HTTP or belong to one query's cancellation.
-                    await asyncio.shield(self.github_schema_task)
                 config = native_config(session.kind, session.public, self.settings)
+                await AGENTS[session.kind].prepare(config, self.preparations)
                 if session.agent is None:
                     session.agent = self.factory(session.kind, config, session.credentials, session.storage)
                     session.context = session.agent.session(session=session.id)
@@ -275,15 +256,7 @@ class SessionManager:
                         raise
                 else:
                     session.agent.config.update(config)
-                    session.agent.api_key = session.credentials["api_key"]
-                    for provider in (getattr(session.agent, "tools", None),
-                                     getattr(session.agent, "graphql_tool", None),
-                                     getattr(session.agent, "github_tools", None)):
-                        if hasattr(provider, "api"):
-                            provider.api.token = session.credentials.get(
-                                "gitcode_token" if session.kind == "gitcode" else "github_token", "")
-                    if session.agent.web_tools:
-                        session.agent.web_tools.brave_api_key = session.credentials.get("brave_api_key", "")
+                    session.agent.set_credentials(session.credentials)
                 answer = await session.agent.result(prompt)
         except asyncio.CancelledError:
             status, error = "cancelled", "已停止"
@@ -332,6 +305,5 @@ class SessionManager:
         for session in list(self.sessions.values()):
             with contextlib.suppress(Exception):
                 await self.delete(session)
-        if self.github_schema_task:
-            with contextlib.suppress(Exception):
-                await self.github_schema_task
+        if self.preparations:
+            await asyncio.gather(*self.preparations.values(), return_exceptions=True)

@@ -1,5 +1,6 @@
 import { z } from 'zod';
-import { agentSchema, eventSchema, settingsSchema, publicData, type Conversation, type Settings } from './types';
+import { agentSchema, emptyPreferences, eventSchema, preferencesSchema, settingsSchema, publicData,
+  type Catalog, type Conversation, type Preferences } from './types';
 
 let connection: Promise<IDBDatabase> | undefined;
 const savedSeq = new Map<string, number>();
@@ -63,16 +64,22 @@ export async function deleteChat(id: string) {
   await complete(tx);
   savedSeq.delete(id);
 }
-export async function saveSettings(settings: Settings) {
+export async function saveSettings(settings: Preferences) {
   const db = await database();
   const tx = db.transaction('preferences', 'readwrite');
-  tx.objectStore('preferences').put(settingsSchema.parse(settings), 'settings');
+  tx.objectStore('preferences').put(preferencesSchema.parse(settings), 'settings');
   await complete(tx);
 }
-export async function loadSettings(): Promise<Settings | undefined> {
+export async function loadSettings(catalog: Catalog): Promise<Preferences | undefined> {
   const db = await database();
   const value = await result(db.transaction('preferences').objectStore('preferences').get('settings'));
-  return value ? settingsSchema.parse(value) : undefined;
+  if (!value) return undefined;
+  if (value.version === 2) return preferencesSchema.parse(value);
+  const old = settingsSchema.parse(value);
+  return { ...emptyPreferences, connection: { base_url: old.base_url },
+    model: { model: old.model, reasoning_effort: old.reasoning_effort, thinking: old.thinking },
+    tools: Object.fromEntries(catalog.agents.flatMap(agent => agent.fields)
+      .filter(field => field.tool && field.key in old).map(field => [field.key, old[field.key]])) as Preferences['tools'] };
 }
 
 const exportChat = z.object({

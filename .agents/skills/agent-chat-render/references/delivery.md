@@ -14,7 +14,8 @@ npm test
 ```
 
 主包变更额外运行相关主包测试。纯文档修改不要求重跑模型或重建镜像。
-前端默认值变更同时检查服务端 `PublicSettings` / catalog、前端 fallback、`settingsFor`、新会话初始化和已保存偏好。
+Agent 默认值、枚举、配置归属只在主包声明；App 通过 catalog 和通用 options 反映它们。
+修改时核对主包注册目录、`settingsFor`、新会话初始化和已保存偏好，不再增加 App 字段清单或 fallback 默认值。
 首次提问后工具配置固定；不要为了迁移默认值改写旧会话的工具上下文。
 
 只提交本次任务涉及的文件。验证后的主仓提交推送到部署分支：
@@ -67,7 +68,8 @@ docker build -f apps/agent-chat/Dockerfile \
 应用脚本 `apps/agent-chat/web/scripts/live-acceptance.mjs` 操作真实网页与主仓 agents，
 验证登录、Cookie 属性、GitHub / GitCode / Web、工具展开、刷新续问、停止、导出与事件去重。
 它使用真实模型与工具，不开启浏览器 trace；每次会产生供应商调用费用。
-验收参数目前为最多 8 步、4096 输出 tokens；不要与交互默认 32 步 / 8192 tokens 或其他实验参数直接比较耗时。
+验收使用主包默认 agent 配置与页面模型参数，步数默认无限制，输出 token 限制为 0 时不发送供应商限额。
+脚本单条查询等待最多 240 秒，结束或失败后退出并释放会话；报告实际请求参数，不与其他实验直接比较耗时。
 
 在本来就包含公网验收的任务中复用已有授权。只查询状态或编写说明时不顺带调用模型。
 凭据只从用户允许的环境 / 文件读取；必需 `CHAT_ACCESS_PASSWORD`、`OPENAI_API_KEY`，

@@ -47,6 +47,7 @@ from graphql.execution.values import get_argument_values, get_directive_values
 from graphql.language import Visitor, visit
 from jsonschema import Draft202012Validator
 
+from ..configuration import Credential, ToolConfig
 from .githost_api_utils import (
     DISPLAY_OPTIONS,
     APIProvider,
@@ -94,6 +95,8 @@ from .github_api import (
 )
 from .registry import BATCH_OUTPUT, ToolInputError, tool, tool_definitions
 from .utils import select_json
+
+GITHUB_CONFIG = ToolConfig("github", credentials={"github_token": Credential(("GH_TOKEN", "GITHUB_TOKEN"))})
 
 NATIVE_READ_FIELDS = {
     "result_id": {

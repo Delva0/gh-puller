@@ -3,7 +3,8 @@ import Markdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import rehypeHighlight from 'rehype-highlight';
 import { Check, ChevronDown, Copy, LoaderCircle, X, CircleAlert, Terminal, Brain, Square } from 'lucide-react';
-import type { Capability, ChatEvent, Credentials, Settings } from './types';
+import { settingsFor, type Catalog, type ChatEvent, type ConfigField, type ConfigValues, type Credentials,
+  type Preferences } from './types';
 
 export function Mark({ small = false }: { small?: boolean }) {
   return <svg className={small ? 'brand-mark small' : 'brand-mark'} viewBox="0 0 40 40" fill="none" aria-hidden="true">
@@ -17,12 +18,24 @@ export function Modal({ title, children, onClose, wide = false }: {
   title: string; children: ReactNode; onClose: () => void; wide?: boolean;
 }) {
   const ref = useRef<HTMLDialogElement>(null);
+  const outsidePress = useRef(false);
+  const timer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const [closing, setClosing] = useState(false);
   const id = useId();
-  useEffect(() => { ref.current?.showModal(); }, []);
-  return <dialog ref={ref} className={`modal ${wide ? 'wide' : ''}`} aria-labelledby={id}
-    onCancel={e => { e.preventDefault(); onClose(); }} onClick={e => { if (e.target === e.currentTarget) onClose(); }}>
+  useEffect(() => { ref.current?.showModal(); return () => clearTimeout(timer.current); }, []);
+  function close() {
+    if (timer.current) return;
+    setClosing(true);
+    timer.current = setTimeout(onClose, matchMedia('(prefers-reduced-motion: reduce)').matches ? 0 : 160);
+  }
+  return <dialog ref={ref} className={`modal ${wide ? 'wide' : ''} ${closing ? 'closing' : ''}`} aria-labelledby={id}
+    onCancel={e => { e.preventDefault(); close(); }}
+    onPointerDown={e => {
+      const box = e.currentTarget.getBoundingClientRect();
+      outsidePress.current = e.clientX < box.left || e.clientX > box.right || e.clientY < box.top || e.clientY > box.bottom;
+    }} onClick={e => { if (outsidePress.current && e.target === e.currentTarget) close(); }}>
     <div className="modal-inner"><header><h2 id={id}>{title}</h2>
-      <button className="icon-button" onClick={onClose} aria-label="关闭"><X size={20} /></button></header>
+      <button className="icon-button" onClick={close} aria-label="关闭"><X size={20} /></button></header>
       {children}
     </div>
   </dialog>;
@@ -62,8 +75,10 @@ function outputText(output: unknown, type: string): string {
 }
 export interface TraceModel { id: string; model: string; reasoning: string; text: string; error: string }
 export interface TraceTool { id: string; name: string; args: unknown; result?: unknown; error?: unknown }
+type TraceEntry = { kind: 'model'; value: TraceModel } | { kind: 'tool'; value: TraceTool };
 export interface Turn {
   id: string; prompt: string; started: string; models: TraceModel[]; tools: TraceTool[];
+  trace: TraceEntry[];
   stage?: string;
   end?: { status: string; answer: string; error: string; duration: number };
 }
@@ -73,7 +88,7 @@ export function turnsFrom(events: ChatEvent[]): Turn[] {
     if (!event.query_id) continue;
     const d = event.data;
     if (event.type === 'query/start') {
-      turns.set(event.query_id, { id: event.query_id, prompt: str(d.prompt), started: event.at, models: [], tools: [] });
+      turns.set(event.query_id, { id: event.query_id, prompt: str(d.prompt), started: event.at, models: [], tools: [], trace: [] });
     }
     const turn = turns.get(event.query_id);
     if (!turn) continue;
@@ -81,7 +96,10 @@ export function turnsFrom(events: ChatEvent[]): Turn[] {
     if (event.type.startsWith('model/')) {
       const id = str(d.requestId);
       let model = turn.models.find(m => m.id === id);
-      if (!model) { model = { id, model: str(d.model), reasoning: '', text: '', error: '' }; turn.models.push(model); }
+      if (!model) {
+        model = { id, model: str(d.model), reasoning: '', text: '', error: '' };
+        turn.models.push(model); turn.trace.push({ kind: 'model', value: model });
+      }
       if (d.model) model.model = str(d.model);
       if (event.type === 'model/delta/text') model.text += str(d.text);
       if (event.type === 'model/delta/reasoning') model.reasoning += str(d.text);
@@ -91,7 +109,10 @@ export function turnsFrom(events: ChatEvent[]): Turn[] {
       }
       if (event.type === 'model/error') model.error = pretty(d.error);
     }
-    if (event.type === 'tool/start') turn.tools.push({ id: str(d.callId), name: str(d.name), args: d.arguments });
+    if (event.type === 'tool/start') {
+      const tool = { id: str(d.callId), name: str(d.name), args: d.arguments };
+      turn.tools.push(tool); turn.trace.push({ kind: 'tool', value: tool });
+    }
     if (event.type === 'tool/end') {
       const tool = turn.tools.find(t => t.id === d.callId);
       if (tool) { tool.result = d.result; tool.error = d.error; }
@@ -119,16 +140,17 @@ export function TurnView({ turn, readonly, clock }: { turn: Turn; readonly: bool
         <div className="trace">
           <div className="trace-count">{turn.models.length} 次模型请求 · {turn.tools.length} 次工具调用
             {turn.tools.some(t => t.error !== undefined) && ` · ${turn.tools.filter(t => t.error !== undefined).length} 次失败`}</div>
-          {turn.models.map((model, index) => <details className="trace-item" key={model.id}>
-            <summary><Brain size={15} /><span>思考 {index + 1}</span><small>{model.model}</small><ChevronDown size={14} /></summary>
-            <div className="trace-body"><pre>{model.reasoning || '模型未返回 reasoning 内容'}</pre>
-              {model.error && <pre className="error-text">{model.error}</pre>}</div>
-          </details>)}
-          {turn.tools.map(tool => <details className="trace-item" key={tool.id}>
-            <summary><Terminal size={15} /><span>{tool.name}</span><small className={tool.error !== undefined ? 'error-text' : ''}>
-              {tool.error !== undefined ? '失败' : tool.result !== undefined ? '完成' : running ? '执行中' : '未完成'}</small><ChevronDown size={14} /></summary>
-            <div className="trace-body"><h4>参数</h4><pre>{pretty(tool.args)}</pre><h4>结果</h4>
-              <pre className={tool.error !== undefined ? 'error-text' : ''}>{pretty(tool.error ?? tool.result) || '尚无结果'}</pre></div>
+          {turn.trace.map(entry => entry.kind === 'model' ? <details className="trace-item" data-kind="model" key={`model-${entry.value.id}`}>
+            <summary><Brain size={15} /><span className="trace-title">思考</span>
+              <span className="trace-description">{entry.value.reasoning.trimStart().split(/\r?\n/, 1)[0]}</span><ChevronDown size={14} /></summary>
+            <div className="trace-body"><pre>{entry.value.reasoning || '模型未返回 reasoning 内容'}</pre>
+              {entry.value.error && <pre className="error-text">{entry.value.error}</pre>}</div>
+          </details> : <details className="trace-item" data-kind="tool" key={`tool-${entry.value.id}`}>
+            <summary><Terminal size={15} /><span className="trace-title">{entry.value.name}</span><span className="trace-description" />
+              <small className={entry.value.error !== undefined ? 'error-text' : ''}>
+                {entry.value.error !== undefined ? '失败' : entry.value.result !== undefined ? '完成' : running ? '执行中' : '未完成'}</small><ChevronDown size={14} /></summary>
+            <div className="trace-body"><h4>参数</h4><pre>{pretty(entry.value.args)}</pre><h4>结果</h4>
+              <pre className={entry.value.error !== undefined ? 'error-text' : ''}>{pretty(entry.value.error ?? entry.value.result) || '尚无结果'}</pre></div>
           </details>)}
           {!turn.models.length && <p className="muted">{running ? turn.stage || '准备查询与模型连接' : '未记录模型请求'}</p>}
         </div>
@@ -141,48 +163,96 @@ export function TurnView({ turn, readonly, clock }: { turn: Turn; readonly: bool
   </article>;
 }
 
-export function SettingsPanel({ settings, credentials, capability, locked, onSave, onClose, remembered }: {
-  settings: Settings; credentials: Credentials; capability?: Capability; locked: boolean;
-  onSave: (settings: Settings, credentials: Credentials) => void; onClose: () => void; remembered: boolean;
+const fieldName = (key: string) => key.split('_').map(word => word.length <= 3 ? word.toUpperCase() : word[0].toUpperCase() + word.slice(1)).join(' ');
+const choiceName = (value: unknown) => value === false ? '关闭' : value === true ? '开启' : value === null ? '默认' : String(value);
+
+function ConfigInput({ field, value, onChange }: {
+  field: ConfigField; value: ConfigValues[string]; onChange: (value: ConfigValues[string]) => void;
 }) {
-  const [value, setValue] = useState(settings);
-  const [keys, setKeys] = useState(credentials);
-  const field = <K extends keyof Settings>(key: K, next: Settings[K]) => setValue(v => ({ ...v, [key]: next }));
-  const keyField = (key: keyof Credentials, label: string) => <label>{label}<input type="password" autoComplete="off"
-    value={keys[key]} onChange={e => setKeys({ ...keys, [key]: e.target.value })} placeholder={remembered ? '当前服务端会话已保留，留空可继续使用' : '仅当前页面与活跃会话保留'} /></label>;
-  return <Modal title="设置" wide onClose={onClose}><form onSubmit={e => { e.preventDefault(); onSave(value, keys); }}>
-    <p className="settings-note">密钥仅保留在当前页面和服务端活跃会话内存，刷新页面后不会回填。</p>
-    <section className="settings-section"><h3>模型连接</h3>
-      <label>模型地址<input type="url" required value={value.base_url} onChange={e => field('base_url', e.target.value)} placeholder="https://api.example.com/v1" /></label>
-      <div className="form-grid"><label>模型名<input required value={value.model} onChange={e => field('model', e.target.value)} /></label>
-        {keyField('api_key', '模型 API Key')}</div>
-      <div className="form-grid three"><label>最大步数<input type="number" min="1" max="128" value={value.max_steps} onChange={e => field('max_steps', +e.target.value)} /></label>
-        <label>最大输出 tokens<input type="number" min="256" max="32768" value={value.max_tokens} onChange={e => field('max_tokens', +e.target.value)} /></label>
-        <label>思考强度<select value={value.reasoning_effort} onChange={e => field('reasoning_effort', e.target.value as Settings['reasoning_effort'])}>
-          <option value="low">Low</option><option value="high">High</option><option value="max">Max</option></select></label></div>
-      <label className="check-label"><input type="checkbox" checked={value.thinking} onChange={e => field('thinking', e.target.checked)} />启用模型思考</label>
-    </section>
-    <section className="settings-section"><h3>Agent 与工具</h3>
-      {locked && <p className="settings-note">当前会话的工具配置已固定；新建会话可调整。模型配置和密钥仍可更新。</p>}
-      <div className="form-grid three">
-        {Boolean(capability?.backends.length) && <label>查询后端<select disabled={locked} value={value.backend} onChange={e => field('backend', e.target.value)}>
-          {capability!.backends.map(backend => <option key={backend} value={backend}>{backend.toUpperCase()}</option>)}</select></label>}
-        <label>工具并发<input type="number" disabled={locked} min="1" max="16" value={value.concurrency} onChange={e => field('concurrency', +e.target.value)} /></label>
-        <label>PTC<select disabled={locked || !capability?.ptc} value={value.ptc} onChange={e => field('ptc', e.target.value as Settings['ptc'])}>
-          <option value="off">关闭{!capability?.ptc ? '（不可用）' : ''}</option><option value="A">A</option><option value="B">B</option></select></label>
-      </div>
-      {(capability?.id === 'github' || capability?.id === 'code') && keyField('github_token', 'GitHub Token')}
-      {capability?.id === 'gitcode' && keyField('gitcode_token', 'GitCode Token')}
-      {capability?.web && <>
-        <div className="form-grid"><label>搜索服务<select disabled={locked} value={value.web_search_backend}
-          onChange={e => field('web_search_backend', e.target.value as Settings['web_search_backend'])}>
-          <option value="brave">Brave（需要 API Key）</option><option value="auto">Auto</option><option value="duckduckgo">DuckDuckGo</option></select></label>
-          {value.web_search_backend !== 'duckduckgo' && keyField('brave_api_key', 'Brave API Key')}</div>
-        <div className="form-grid"><label>搜索并发<input type="number" disabled={locked} min="1" max="8" value={value.web_search_concurrency} onChange={e => field('web_search_concurrency', +e.target.value)} /></label>
-          <label>搜索间隔（秒）<input type="number" disabled={locked} min="0" max="60" step="0.1" value={value.web_search_interval} onChange={e => field('web_search_interval', +e.target.value)} /></label></div>
-        <label className="check-label"><input type="checkbox" disabled={locked} checked={value.multimodal} onChange={e => field('multimodal', e.target.checked)} />允许向模型提供图片</label>
-      </>}
-    </section>
-    <footer className="modal-actions"><button type="button" className="secondary" onClick={onClose}>取消</button><button className="primary" type="submit">保存设置</button></footer>
-  </form></Modal>;
+  const format = (v: ConfigValues[string]) => v === null ? '' : typeof v === 'object' ? JSON.stringify(v) : String(v);
+  const [text, setText] = useState(format(value));
+  useEffect(() => setText(format(value)), [value]);
+  const label = fieldName(field.key);
+  const shared = { name: field.key, 'aria-label': label };
+  let control: ReactNode;
+  if (field.choices.length) {
+    control = <select {...shared} value={JSON.stringify(value)} onChange={e => onChange(JSON.parse(e.target.value))}>
+      {field.choices.map(choice => <option key={JSON.stringify(choice.value)} value={JSON.stringify(choice.value)} disabled={Boolean(choice.reason)}>
+        {choiceName(choice.value)}{choice.reason ? ` · ${choice.reason}` : ''}</option>)}
+    </select>;
+  } else if (field.type === 'boolean') {
+    control = <input {...shared} type="checkbox" role="switch" checked={Boolean(value)} onChange={e => onChange(e.target.checked)} />;
+  } else if (field.type === 'integer' || field.type === 'number') {
+    control = <input {...shared} type="number" step={field.type === 'integer' ? 1 : 'any'} value={text} placeholder={field.nullable ? '默认' : ''}
+      onChange={e => {
+        setText(e.target.value);
+        const next = Number(e.target.value);
+        if (!e.target.value && field.nullable) onChange(null);
+        else if (e.target.value && Number.isFinite(next) && (field.type !== 'integer' || Number.isInteger(next))) onChange(next);
+      }} onBlur={() => setText(format(value))} />;
+  } else if (field.type === 'string') {
+    control = <input {...shared} value={String(value ?? '')} onChange={e => onChange(e.target.value)} />;
+  } else {
+    control = <textarea {...shared} value={text} placeholder="JSON" onChange={e => {
+      setText(e.target.value);
+      try { onChange(JSON.parse(e.target.value)); } catch { /* Keep incomplete JSON in the input only. */ }
+    }} onBlur={() => setText(format(value))} />;
+  }
+  return <label className={`config-field ${field.type === 'boolean' && !field.choices.length ? 'switch-field' : ''}`}>
+    <span>{label}</span>{control}{field.description && <small>{field.description}</small>}
+  </label>;
+}
+
+export function SettingsPanel({ preferences, credentials, catalog, agent, locked, onChange, onClose, remembered }: {
+  preferences: Preferences; credentials: Credentials; catalog: Catalog; agent?: string; locked: boolean;
+  onChange: (preferences: Preferences, credentials: Credentials) => void; onClose: () => void; remembered: boolean;
+}) {
+  const [tab, setTab] = useState('global');
+  const [selected, setSelected] = useState(agent ?? catalog.default_agent);
+  const capability = catalog.agents.find(item => item.id === selected) ?? catalog.agents[0];
+  const value = settingsFor(capability.id, preferences, catalog);
+  const tools = [...new Map(catalog.agents.flatMap(item => item.tools).map(tool => [tool.id, tool])).values()];
+  const toolFields = [...new Map(catalog.agents.flatMap(item => item.fields).filter(field => field.tool).map(field => [field.key, field])).values()];
+  const changeAgent = (key: string, next: ConfigValues[string]) => onChange({ ...preferences,
+    agents: { ...preferences.agents, [selected]: { ...preferences.agents[selected], [key]: next } } }, credentials);
+  const changeTool = (key: string, next: ConfigValues[string]) => onChange({ ...preferences,
+    tools: { ...preferences.tools, [key]: next } }, credentials);
+  const keyField = (key: string, label: string) => <label key={key}>{label}<input type="password" autoComplete="off" name={key}
+    value={credentials[key] ?? ''} onChange={e => onChange(preferences, { ...credentials, [key]: e.target.value })}
+    placeholder={remembered ? '当前服务端会话已保留，留空可继续使用' : '仅当前页面与活跃会话保留'} /></label>;
+  return <Modal title="设置" wide onClose={onClose}>
+    <p className="settings-note">输入即保存。密钥仅保留在当前页面和活跃会话内存。</p>
+    <div className="settings-layout"><nav className="settings-tabs" role="tablist" aria-label="设置分类">
+      {[['global', '全局'], ['agent', 'Agent'], ['tools', '工具']].map(([id, label]) =>
+        <button key={id} type="button" role="tab" aria-selected={tab === id} aria-controls={`settings-${id}`}
+          id={`settings-tab-${id}`} onClick={() => setTab(id)}>{label}</button>)}
+    </nav><div className="settings-page" key={tab} role="tabpanel" id={`settings-${tab}`} aria-labelledby={`settings-tab-${tab}`}>
+      {tab === 'global' && <section><h3>模型连接</h3>
+        <label>模型地址<input type="url" value={preferences.connection.base_url ?? catalog.defaults.base_url}
+          onChange={e => onChange({ ...preferences, connection: { base_url: e.target.value } }, credentials)}
+          placeholder="https://api.example.com/v1" /></label>
+        {keyField('api_key', '模型 API Key')}
+      </section>}
+      {tab === 'agent' && <section><h3>Agent 配置</h3>
+        <label>配置 agent<select value={capability.id} onChange={e => setSelected(e.target.value)}>
+          {catalog.agents.map(item => <option key={item.id} value={item.id}>{item.name}</option>)}
+        </select></label>
+        <p className="settings-note">每个 agent 分别保存自己的配置。{locked && '当前会话的工具配置已固定，修改将在新会话生效。'}</p>
+        {!capability.available && <p className="settings-note">{capability.reason}</p>}
+        {capability.fields.filter(field => !field.tool).map(field => <ConfigInput key={`${selected}-${field.key}`}
+          field={field} value={value.options[field.key]} onChange={next => changeAgent(field.key, next)} />)}
+        <button className="text-button" type="button" onClick={() => {
+          const agents = { ...preferences.agents }; delete agents[selected];
+          onChange({ ...preferences, agents }, credentials);
+        }}>恢复主包默认配置</button>
+      </section>}
+      {tab === 'tools' && tools.map(tool => <section className="settings-section" key={tool.id}>
+        <h3>{catalog.agents.find(item => item.id === tool.id)?.name ?? fieldName(tool.id)}</h3>
+        {tool.credentials.map(key => keyField(key, fieldName(key)))}
+        {toolFields.filter(field => field.tool === tool.id).map(field => <ConfigInput key={field.key} field={field}
+          value={field.key in preferences.tools ? preferences.tools[field.key] : field.default} onChange={next => changeTool(field.key, next)} />)}
+        <p className="settings-note">使用此工具的 agent 共用这些配置；已开始的会话保留原配置。</p>
+      </section>)}
+    </div></div>
+  </Modal>;
 }

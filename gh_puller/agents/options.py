@@ -3,20 +3,15 @@
 import math
 from dataclasses import asdict, replace
 
+from ..configuration import option
 from ..tools.tool_offload import OffloadPolicy
 from ..tools.tool_ptc import normalize_ptc
-from ..tools.tool_web import DEFAULT_SEARCH_INTERVAL, SEARCH_BACKENDS
-
-REASONING_EFFORTS = ("low", "high", "max")
+from ..tools.tool_web import SEARCH_BACKENDS
 
 TOOL_RESULT_OPTIONS = {f"tool_result_{name}": name for name in asdict(OffloadPolicy())}
 
 
-WEB_DEFAULTS = {"is_llm_multi_modal": True, "web_search_backend": "brave", "web_search_concurrency": 1,
-                "web_search_interval": DEFAULT_SEARCH_INTERVAL}
-
-
-SEARCH_DEFAULTS = {"ptc": False, **WEB_DEFAULTS, **dict.fromkeys(TOOL_RESULT_OPTIONS)}
+SEARCH_DEFAULTS = {"ptc": option(False, choices=(False, "A", "B"), requires={"A": ("node",), "B": ("node",)})}
 
 
 def tool_result_policy(policy, options):
@@ -43,9 +38,6 @@ def normalize_web(options):
 
 
 def reasoning_effort(value: str) -> str:
-    value = value.strip().lower()
-    if value not in REASONING_EFFORTS:
-        raise ValueError(f"Reasoning effort must be one of: {', '.join(REASONING_EFFORTS)}")
     return value
 
 

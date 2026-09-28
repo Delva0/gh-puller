@@ -50,19 +50,20 @@ try {
     if (agent !== 'github') await page.locator('.new-chat').click();
     await page.getByLabel('选择 agent').selectOption(agent);
     await page.getByRole('button', { name: '打开设置' }).click();
-    if (agent !== 'web') await expect(page.getByLabel('查询后端')).toHaveValue('rest');
     await page.getByLabel('模型 API Key').fill(key);
     if (process.env.OPENAI_BASE_URL) await page.getByLabel('模型地址').fill(process.env.OPENAI_BASE_URL);
-    if (process.env.CHAT_TEST_MODEL) await page.getByLabel('模型名', { exact: true }).fill(process.env.CHAT_TEST_MODEL);
-    await page.getByLabel('最大步数').fill('8');
-    await page.getByLabel('最大输出 tokens').fill('4096');
-    if (agent === 'github' && process.env.GH_TOKEN) await page.getByLabel('GitHub Token').fill(process.env.GH_TOKEN);
-    if (agent === 'gitcode' && process.env.GITCODE_TOKEN) await page.getByLabel('GitCode Token').fill(process.env.GITCODE_TOKEN);
+    await page.getByRole('tab', { name: 'Agent', exact: true }).click();
+    if (agent !== 'web') await expect(page.locator('[name=backend]')).toHaveValue('"rest"');
+    await page.getByRole('tab', { name: '工具', exact: true }).click();
+    if (agent === 'github' && process.env.GH_TOKEN) await page.locator('[name=github_token]').fill(process.env.GH_TOKEN);
+    if (agent === 'gitcode' && process.env.GITCODE_TOKEN) await page.locator('[name=gitcode_token]').fill(process.env.GITCODE_TOKEN);
     if (process.env.BRAVE_SEARCH_API_KEY) {
-      await page.getByLabel('搜索服务').selectOption('brave');
-      await page.getByLabel('Brave API Key').fill(process.env.BRAVE_SEARCH_API_KEY);
-    } else await page.getByLabel('搜索服务').selectOption('duckduckgo');
-    await page.getByRole('button', { name: '保存设置' }).click();
+      await page.locator('[name=web_search_backend]').selectOption('"brave"');
+      await page.locator('[name=brave_api_key]').fill(process.env.BRAVE_SEARCH_API_KEY);
+    } else await page.locator('[name=web_search_backend]').selectOption('"duckduckgo"');
+    await page.getByRole('button', { name: '关闭', exact: true }).click();
+    await expect(page.getByRole('dialog')).not.toBeVisible();
+    if (process.env.CHAT_TEST_MODEL) await page.getByLabel('模型名', { exact: true }).fill(process.env.CHAT_TEST_MODEL);
     console.log('Running real ' + agent + ' query');
     await submit(prompt);
     await expect(page.locator('.execution > summary').last()).toContainText(/已完成|执行失败|已停止/, { timeout: 240_000 });
@@ -72,7 +73,7 @@ try {
     const toolStarts = record.events.filter(event => event.type === 'tool/start');
     const toolEnds = record.events.filter(event => event.type === 'tool/end');
     assert.equal(end.type, 'query/end');
-    const summary = { agent, backend: record.session.settings.backend, prompt,
+    const summary = { agent, settings: record.session.settings, prompt,
       status: end.data.status, error: end.data.error, duration_ms: end.data.duration_ms,
       models: record.events.filter(event => event.type === 'model/request').length,
       tools: toolStarts.map(event => event.data.name),
@@ -80,10 +81,11 @@ try {
     report.queries.push(summary);
     console.log(clean(summary));
     assert.equal(end.data.status, 'completed');
+    assert(record.events.filter(event => event.type === 'model/request').every(event => !('max_tokens' in event.data.parameters)));
     assert(toolEnds.some(event => 'result' in event.data), 'No successful tool observation');
     await page.locator('.execution > summary').last().click();
     await expect(page.locator('.trace-item').filter({ hasText: agent === 'web' ? 'web_search' : agent }).first()).toBeVisible();
-    await page.screenshot({ path: resolve(output, agent + '.png'), fullPage: true });
+    await page.screenshot({ path: resolve(output, agent + '.png'), fullPage: true, animations: 'disabled' });
   }
 
   await page.reload();
@@ -91,6 +93,7 @@ try {
   await page.getByRole('button', { name: '打开设置' }).click();
   await expect(page.getByLabel('模型 API Key')).toHaveValue('');
   await page.getByRole('button', { name: '关闭', exact: true }).click();
+  await expect(page.getByRole('dialog')).not.toBeVisible();
   await submit('请用更短的一句话重述刚才的回答，不需要再次调用工具。');
   await expect(page.locator('.execution > summary').last()).toContainText(/已完成|执行失败|已停止/, { timeout: 120_000 });
   await expect(page.locator('.execution > summary').last()).toContainText('已完成');
