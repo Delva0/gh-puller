@@ -12,7 +12,8 @@ from .fakes import FakeFactory
 @pytest.fixture
 async def harness(tmp_path):
     factory = FakeFactory()
-    settings = ServerSettings(password="test-private-passphrase", temp_root=str(tmp_path))
+    settings = ServerSettings(password="test-private-passphrase", temp_root=str(tmp_path),
+                              static_dir=tmp_path / "unbuilt-web")
     app = create_app(settings, agent_factory=factory)
     async with (
         app.router.lifespan_context(app),

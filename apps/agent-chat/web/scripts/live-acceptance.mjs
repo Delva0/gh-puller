@@ -26,9 +26,15 @@ async function exported() {
   await page.getByRole('button', { name: '导出事件', exact: true }).click();
   return JSON.parse(await readFile(await (await pending).path(), 'utf8'));
 }
+async function choose(label, value) {
+  await page.getByRole('combobox', { name: label, exact: true }).click();
+  await page.getByRole('option', { name: value, exact: true }).click();
+}
 async function submit(prompt) {
+  const count = await page.locator('.turn').count();
   await page.getByLabel('输入问题').fill(prompt);
   await page.getByLabel('输入问题').press('Enter');
+  await expect(page.locator('.turn')).toHaveCount(count + 1, { timeout: 30_000 });
 }
 
 try {
@@ -48,12 +54,12 @@ try {
   ];
   for (const [agent, prompt] of queries) {
     if (agent !== 'github') await page.locator('.new-chat').click();
-    await page.getByLabel('选择 agent').selectOption(agent);
+    await choose('选择 agent', { github: 'GitHub', gitcode: 'GitCode', web: 'Web' }[agent]);
     await page.getByRole('button', { name: '打开设置' }).click();
     await page.getByLabel('模型 API Key').fill(key);
     if (process.env.OPENAI_BASE_URL) await page.getByLabel('模型地址').fill(process.env.OPENAI_BASE_URL);
     await page.getByRole('tab', { name: 'Agent', exact: true }).click();
-    if (agent !== 'web') await expect(page.locator('[name=backend]')).toHaveValue('"rest"');
+    if (agent !== 'web') await expect(page.locator('[name=backend]').nth(agent === 'github' ? 0 : 1)).toHaveValue('"rest"');
     await page.getByRole('tab', { name: '工具', exact: true }).click();
     if (agent === 'github' && process.env.GH_TOKEN) await page.locator('[name=github_token]').fill(process.env.GH_TOKEN);
     if (agent === 'gitcode' && process.env.GITCODE_TOKEN) await page.locator('[name=gitcode_token]').fill(process.env.GITCODE_TOKEN);
@@ -63,7 +69,7 @@ try {
     } else await page.locator('[name=web_search_backend]').selectOption('"duckduckgo"');
     await page.getByRole('button', { name: '关闭', exact: true }).click();
     await expect(page.getByRole('dialog')).not.toBeVisible();
-    if (process.env.CHAT_TEST_MODEL) await page.getByLabel('模型名', { exact: true }).fill(process.env.CHAT_TEST_MODEL);
+    if (process.env.CHAT_TEST_MODEL) await choose('模型名', process.env.CHAT_TEST_MODEL);
     console.log('Running real ' + agent + ' query');
     await submit(prompt);
     await expect(page.locator('.execution > summary').last()).toContainText(/已完成|执行失败|已停止/, { timeout: 240_000 });

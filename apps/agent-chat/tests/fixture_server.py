@@ -2,6 +2,7 @@
 
 from typing import ClassVar
 
+import httpx
 from gh_puller.agents import WebAgent, register
 from gh_puller.configuration import option
 
@@ -18,4 +19,7 @@ class ResearchAgent(WebAgent):
                                "candidate_count": 20, "follow_links": True}
 
 
-app = create_app(ServerSettings(password="test-private-passphrase", secure_cookie=False), agent_factory=FakeFactory())
+app = create_app(ServerSettings(password="test-private-passphrase", secure_cookie=False), agent_factory=FakeFactory(),
+                 model_transport=httpx.MockTransport(lambda request: httpx.Response(200, json={"data": [
+                     {"id": "fixture-model"}, {"id": "provider/very-long-model-name-for-research-2026-09-preview"},
+                 ]})))

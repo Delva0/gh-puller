@@ -1,10 +1,11 @@
-import { Children, isValidElement, useEffect, useId, useRef, useState, type ReactNode } from 'react';
+import { Children, isValidElement, useContext, useEffect, useId, useRef, useState, type ReactNode } from 'react';
 import Markdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import rehypeHighlight from 'rehype-highlight';
-import { Check, ChevronDown, Copy, LoaderCircle, X, CircleAlert, Terminal, Brain, Square } from 'lucide-react';
-import { settingsFor, type Catalog, type ChatEvent, type ConfigField, type ConfigValues, type Credentials,
-  type Preferences } from './types';
+import { Check, ChevronDown, ChevronLeft, ChevronRight, Copy, LoaderCircle, X, CircleAlert, Terminal, Brain, Square, Pencil, RotateCcw } from 'lucide-react';
+import { type ChatEvent } from './types';
+import { LanguageContext, useText } from './i18n';
+import { functionDescription, toolLabel } from './ui-model';
 
 export function Mark({ small = false }: { small?: boolean }) {
   return <svg className={small ? 'brand-mark small' : 'brand-mark'} viewBox="0 0 40 40" fill="none" aria-hidden="true">
@@ -18,6 +19,7 @@ export function Modal({ title, children, onClose, wide = false }: {
   title: string; children: ReactNode; onClose: () => void; wide?: boolean;
 }) {
   const ref = useRef<HTMLDialogElement>(null);
+  const t = useText();
   const outsidePress = useRef(false);
   const timer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const [closing, setClosing] = useState(false);
@@ -35,7 +37,7 @@ export function Modal({ title, children, onClose, wide = false }: {
       outsidePress.current = e.clientX < box.left || e.clientX > box.right || e.clientY < box.top || e.clientY > box.bottom;
     }} onClick={e => { if (outsidePress.current && e.target === e.currentTarget) close(); }}>
     <div className="modal-inner"><header><h2 id={id}>{title}</h2>
-      <button className="icon-button" onClick={close} aria-label="关闭"><X size={20} /></button></header>
+      <button className="icon-button" onClick={close} aria-label={t('关闭')}><X size={20} /></button></header>
       {children}
     </div>
   </dialog>;
@@ -47,18 +49,20 @@ function nodeText(node: ReactNode): string {
   return Children.toArray(node).map(child => isValidElement(child) ? nodeText(child) : String(child)).join('');
 }
 export function CopyButton({ text, label = '复制' }: { text: string; label?: string }) {
+  const t = useText();
   const [state, setState] = useState('');
   useEffect(() => { if (state) { const timer = setTimeout(() => setState(''), 2000); return () => clearTimeout(timer); } }, [state]);
-  return <button className="copy-button" aria-label={label} title={label} onClick={async () => {
+  return <button type="button" className="copy-button icon-button" aria-label={t(label)} title={t(state || label)} onClick={async () => {
     try { await navigator.clipboard.writeText(text); setState('已复制'); } catch { setState('复制失败'); }
-  }}>{state === '已复制' ? <Check size={14} /> : <Copy size={14} />}<span>{state || label}</span></button>;
+  }}>{state === '已复制' ? <Check size={15} /> : <Copy size={15} />}<span className="sr-only" role="status">{t(state)}</span></button>;
 }
 export function MarkdownBody({ text }: { text: string }) {
+  const t = useText();
   return <div className="markdown"><Markdown skipHtml remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeHighlight]}
     components={{
       a: ({ children, ...props }) => <a {...props} target="_blank" rel="noopener noreferrer">{children}</a>,
-      img: ({ src, alt }) => <a href={src} target="_blank" rel="noopener noreferrer">{alt || '查看图片'}</a>,
-      pre: ({ children }) => <div className="code-block"><div className="code-toolbar"><span>代码</span>
+      img: ({ src, alt }) => <a href={src} target="_blank" rel="noopener noreferrer">{alt || t('查看图片')}</a>,
+      pre: ({ children }) => <div className="code-block"><div className="code-toolbar"><span>{t('代码')}</span>
         <CopyButton text={nodeText(children)} label="复制代码" /></div><pre>{children}</pre></div>,
       table: ({ children }) => <div className="table-scroll"><table>{children}</table></div>,
     }}>{text}</Markdown></div>;
@@ -124,135 +128,66 @@ export function turnsFrom(events: ChatEvent[]): Turn[] {
   return [...turns.values()];
 }
 
-export function TurnView({ turn, readonly, clock }: { turn: Turn; readonly: boolean; clock: number }) {
-  const running = !turn.end && !readonly;
+export function TurnView({ turn, interrupted, clock, busy, onEdit, onRegenerate, version, onVersion }: {
+  turn: Turn; interrupted: boolean; clock: number; busy: boolean;
+  onEdit: (text: string) => void; onRegenerate: () => void;
+  version: { index: number; count: number }; onVersion: (index: number) => void;
+}) {
+  const t = useText();
+  const language = useContext(LanguageContext);
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(turn.prompt);
+  const running = !turn.end && !interrupted;
   const state = turn.end?.status === 'completed' ? '已完成' : turn.end?.status === 'cancelled' ? '已停止' :
-    turn.end ? '执行失败' : readonly ? '执行中断' : '处理中';
-  const duration = turn.end?.duration ?? (readonly ? 0 : Math.max(0, clock - Date.parse(turn.started)));
+    turn.end ? '执行失败' : interrupted ? '执行中断' : '处理中';
+  const duration = turn.end?.duration ?? (interrupted ? 0 : Math.max(0, clock - Date.parse(turn.started)));
   const answer = turn.end?.answer || turn.models.at(-1)?.text || '';
   return <article className="turn" data-testid="turn">
-    <div className="user-message"><div>{turn.prompt}</div></div>
+    {editing ? <form className="message-editor" onSubmit={event => {
+      event.preventDefault(); if (draft.trim()) { onEdit(draft.trim()); setEditing(false); }
+    }}><textarea aria-label={t('编辑消息')} value={draft} onChange={event => setDraft(event.target.value)} autoFocus rows={4} maxLength={16000} />
+      <div><button className="secondary" type="button" onClick={() => setEditing(false)}>{t('取消')}</button>
+        <button className="primary" type="submit" disabled={!draft.trim() || busy}>{t('发送')}</button></div></form> :
+      <div className="user-message"><div>{turn.prompt}</div></div>}
+    <div className="user-actions">
+      <CopyButton text={turn.prompt} label="复制问题" />
+      <button className="icon-button" aria-label={t('编辑问题')} title={t('编辑问题')} disabled={busy} onClick={() => { setDraft(turn.prompt); setEditing(true); }}><Pencil size={15} /></button>
+      {version.count > 1 && <div className="version-control">
+        <button className="icon-button" aria-label={t('上一版本')} disabled={busy || version.index <= 0} onClick={() => onVersion(version.index - 1)}><ChevronLeft size={16} /></button>
+        <span>{version.index + 1} / {version.count}</span>
+        <button className="icon-button" aria-label={t('下一版本')} disabled={busy || version.index >= version.count - 1} onClick={() => onVersion(version.index + 1)}><ChevronRight size={16} /></button>
+      </div>}
+    </div>
     <div className="assistant-message">
       <details className="execution">
         <summary><span className="execution-state">{running ? <LoaderCircle size={15} className="spin" /> :
-          turn.end?.status === 'failed' ? <CircleAlert size={15} /> : <Check size={15} />}{state}
-          {duration > 0 && <span> · {(duration / 1000).toFixed(1)} 秒</span>}</span><ChevronDown size={15} /></summary>
+          turn.end?.status === 'failed' ? <CircleAlert size={15} /> : <Check size={15} />}{t(state)}
+          {duration > 0 && <span> · {(duration / 1000).toFixed(1)} {t('秒')}</span>}</span><ChevronDown size={15} /></summary>
         <div className="trace">
-          <div className="trace-count">{turn.models.length} 次模型请求 · {turn.tools.length} 次工具调用
-            {turn.tools.some(t => t.error !== undefined) && ` · ${turn.tools.filter(t => t.error !== undefined).length} 次失败`}</div>
+          <div className="trace-count">{turn.models.length} {t('次模型请求')} · {turn.tools.length} {t('次工具调用')}
+            {turn.tools.some(tool => tool.error !== undefined) && ` · ${turn.tools.filter(tool => tool.error !== undefined).length} ${t('次失败')}`}</div>
           {turn.trace.map(entry => entry.kind === 'model' ? <details className="trace-item" data-kind="model" key={`model-${entry.value.id}`}>
-            <summary><Brain size={15} /><span className="trace-title">思考</span>
+            <summary><Brain size={15} /><span className="trace-title">{t('思考')}</span>
               <span className="trace-description">{entry.value.reasoning.trimStart().split(/\r?\n/, 1)[0]}</span><ChevronDown size={14} /></summary>
-            <div className="trace-body"><pre>{entry.value.reasoning || '模型未返回 reasoning 内容'}</pre>
+            <div className="trace-body"><pre>{entry.value.reasoning || t('模型未返回 reasoning 内容')}</pre>
               {entry.value.error && <pre className="error-text">{entry.value.error}</pre>}</div>
           </details> : <details className="trace-item" data-kind="tool" key={`tool-${entry.value.id}`}>
-            <summary><Terminal size={15} /><span className="trace-title">{entry.value.name}</span><span className="trace-description" />
+            <summary><Terminal size={15} /><span className="trace-title">{toolLabel(entry.value.name, language)}</span>
+              <span className="trace-description">{functionDescription(entry.value.name, entry.value.args)}</span>
               <small className={entry.value.error !== undefined ? 'error-text' : ''}>
-                {entry.value.error !== undefined ? '失败' : entry.value.result !== undefined ? '完成' : running ? '执行中' : '未完成'}</small><ChevronDown size={14} /></summary>
-            <div className="trace-body"><h4>参数</h4><pre>{pretty(entry.value.args)}</pre><h4>结果</h4>
-              <pre className={entry.value.error !== undefined ? 'error-text' : ''}>{pretty(entry.value.error ?? entry.value.result) || '尚无结果'}</pre></div>
+                {t(entry.value.error !== undefined ? '失败' : entry.value.result !== undefined ? '完成' : running ? '执行中' : '未完成')}</small><ChevronDown size={14} /></summary>
+            <div className="trace-body"><h4>{t('参数')}</h4><pre>{pretty(entry.value.args)}</pre><h4>{t('结果')}</h4>
+              <pre className={entry.value.error !== undefined ? 'error-text' : ''}>{pretty(entry.value.error ?? entry.value.result) || t('尚无结果')}</pre></div>
           </details>)}
-          {!turn.models.length && <p className="muted">{running ? turn.stage || '准备查询与模型连接' : '未记录模型请求'}</p>}
+          {!turn.models.length && <p className="muted">{running ? turn.stage || t('准备查询与模型连接') : t('未记录模型请求')}</p>}
         </div>
       </details>
       {answer && <MarkdownBody text={answer} />}
-      {turn.end?.error && <div className="turn-notice" role="status">{turn.end.status === 'cancelled' ? <Square size={13} /> : <CircleAlert size={15} />}{turn.end.error}</div>}
-      {readonly && !turn.end && <div className="turn-notice">会话已失效，保留最后收到的输出。</div>}
-      {turn.end && answer && <div className="answer-actions"><CopyButton text={answer} label="复制回答" /></div>}
+      {turn.end?.error && <div className="turn-notice" role="status">{turn.end.status === 'cancelled' ? <Square size={13} /> : <CircleAlert size={15} />}{t(turn.end.error)}</div>}
+      {interrupted && !turn.end && <div className="turn-notice">{t('保留最后收到的输出，可继续提问。')}</div>}
+      {!running && <div className="answer-actions">{answer && <CopyButton text={answer} label="复制回答" />}
+        <button className="icon-button" aria-label={t('重新生成')} title={t('重新生成')} disabled={busy} onClick={onRegenerate}><RotateCcw size={16} /></button>
+      </div>}
     </div>
   </article>;
-}
-
-const fieldName = (key: string) => key.split('_').map(word => word.length <= 3 ? word.toUpperCase() : word[0].toUpperCase() + word.slice(1)).join(' ');
-const choiceName = (value: unknown) => value === false ? '关闭' : value === true ? '开启' : value === null ? '默认' : String(value);
-
-function ConfigInput({ field, value, onChange }: {
-  field: ConfigField; value: ConfigValues[string]; onChange: (value: ConfigValues[string]) => void;
-}) {
-  const format = (v: ConfigValues[string]) => v === null ? '' : typeof v === 'object' ? JSON.stringify(v) : String(v);
-  const [text, setText] = useState(format(value));
-  useEffect(() => setText(format(value)), [value]);
-  const label = fieldName(field.key);
-  const shared = { name: field.key, 'aria-label': label };
-  let control: ReactNode;
-  if (field.choices.length) {
-    control = <select {...shared} value={JSON.stringify(value)} onChange={e => onChange(JSON.parse(e.target.value))}>
-      {field.choices.map(choice => <option key={JSON.stringify(choice.value)} value={JSON.stringify(choice.value)} disabled={Boolean(choice.reason)}>
-        {choiceName(choice.value)}{choice.reason ? ` · ${choice.reason}` : ''}</option>)}
-    </select>;
-  } else if (field.type === 'boolean') {
-    control = <input {...shared} type="checkbox" role="switch" checked={Boolean(value)} onChange={e => onChange(e.target.checked)} />;
-  } else if (field.type === 'integer' || field.type === 'number') {
-    control = <input {...shared} type="number" step={field.type === 'integer' ? 1 : 'any'} value={text} placeholder={field.nullable ? '默认' : ''}
-      onChange={e => {
-        setText(e.target.value);
-        const next = Number(e.target.value);
-        if (!e.target.value && field.nullable) onChange(null);
-        else if (e.target.value && Number.isFinite(next) && (field.type !== 'integer' || Number.isInteger(next))) onChange(next);
-      }} onBlur={() => setText(format(value))} />;
-  } else if (field.type === 'string') {
-    control = <input {...shared} value={String(value ?? '')} onChange={e => onChange(e.target.value)} />;
-  } else {
-    control = <textarea {...shared} value={text} placeholder="JSON" onChange={e => {
-      setText(e.target.value);
-      try { onChange(JSON.parse(e.target.value)); } catch { /* Keep incomplete JSON in the input only. */ }
-    }} onBlur={() => setText(format(value))} />;
-  }
-  return <label className={`config-field ${field.type === 'boolean' && !field.choices.length ? 'switch-field' : ''}`}>
-    <span>{label}</span>{control}{field.description && <small>{field.description}</small>}
-  </label>;
-}
-
-export function SettingsPanel({ preferences, credentials, catalog, agent, locked, onChange, onClose, remembered }: {
-  preferences: Preferences; credentials: Credentials; catalog: Catalog; agent?: string; locked: boolean;
-  onChange: (preferences: Preferences, credentials: Credentials) => void; onClose: () => void; remembered: boolean;
-}) {
-  const [tab, setTab] = useState('global');
-  const [selected, setSelected] = useState(agent ?? catalog.default_agent);
-  const capability = catalog.agents.find(item => item.id === selected) ?? catalog.agents[0];
-  const value = settingsFor(capability.id, preferences, catalog);
-  const tools = [...new Map(catalog.agents.flatMap(item => item.tools).map(tool => [tool.id, tool])).values()];
-  const toolFields = [...new Map(catalog.agents.flatMap(item => item.fields).filter(field => field.tool).map(field => [field.key, field])).values()];
-  const changeAgent = (key: string, next: ConfigValues[string]) => onChange({ ...preferences,
-    agents: { ...preferences.agents, [selected]: { ...preferences.agents[selected], [key]: next } } }, credentials);
-  const changeTool = (key: string, next: ConfigValues[string]) => onChange({ ...preferences,
-    tools: { ...preferences.tools, [key]: next } }, credentials);
-  const keyField = (key: string, label: string) => <label key={key}>{label}<input type="password" autoComplete="off" name={key}
-    value={credentials[key] ?? ''} onChange={e => onChange(preferences, { ...credentials, [key]: e.target.value })}
-    placeholder={remembered ? '当前服务端会话已保留，留空可继续使用' : '仅当前页面与活跃会话保留'} /></label>;
-  return <Modal title="设置" wide onClose={onClose}>
-    <p className="settings-note">输入即保存。密钥仅保留在当前页面和活跃会话内存。</p>
-    <div className="settings-layout"><nav className="settings-tabs" role="tablist" aria-label="设置分类">
-      {[['global', '全局'], ['agent', 'Agent'], ['tools', '工具']].map(([id, label]) =>
-        <button key={id} type="button" role="tab" aria-selected={tab === id} aria-controls={`settings-${id}`}
-          id={`settings-tab-${id}`} onClick={() => setTab(id)}>{label}</button>)}
-    </nav><div className="settings-page" key={tab} role="tabpanel" id={`settings-${tab}`} aria-labelledby={`settings-tab-${tab}`}>
-      {tab === 'global' && <section><h3>模型连接</h3>
-        <label>模型地址<input type="url" value={preferences.connection.base_url ?? catalog.defaults.base_url}
-          onChange={e => onChange({ ...preferences, connection: { base_url: e.target.value } }, credentials)}
-          placeholder="https://api.example.com/v1" /></label>
-        {keyField('api_key', '模型 API Key')}
-      </section>}
-      {tab === 'agent' && <section><h3>Agent 配置</h3>
-        <label>配置 agent<select value={capability.id} onChange={e => setSelected(e.target.value)}>
-          {catalog.agents.map(item => <option key={item.id} value={item.id}>{item.name}</option>)}
-        </select></label>
-        <p className="settings-note">每个 agent 分别保存自己的配置。{locked && '当前会话的工具配置已固定，修改将在新会话生效。'}</p>
-        {!capability.available && <p className="settings-note">{capability.reason}</p>}
-        {capability.fields.filter(field => !field.tool).map(field => <ConfigInput key={`${selected}-${field.key}`}
-          field={field} value={value.options[field.key]} onChange={next => changeAgent(field.key, next)} />)}
-        <button className="text-button" type="button" onClick={() => {
-          const agents = { ...preferences.agents }; delete agents[selected];
-          onChange({ ...preferences, agents }, credentials);
-        }}>恢复主包默认配置</button>
-      </section>}
-      {tab === 'tools' && tools.map(tool => <section className="settings-section" key={tool.id}>
-        <h3>{catalog.agents.find(item => item.id === tool.id)?.name ?? fieldName(tool.id)}</h3>
-        {tool.credentials.map(key => keyField(key, fieldName(key)))}
-        {toolFields.filter(field => field.tool === tool.id).map(field => <ConfigInput key={field.key} field={field}
-          value={field.key in preferences.tools ? preferences.tools[field.key] : field.default} onChange={next => changeTool(field.key, next)} />)}
-        <p className="settings-note">使用此工具的 agent 共用这些配置；已开始的会话保留原配置。</p>
-      </section>)}
-    </div></div>
-  </Modal>;
 }

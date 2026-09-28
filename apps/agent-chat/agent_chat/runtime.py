@@ -1,6 +1,6 @@
 """Own live agent contexts and replayable JSONL events in one backend process.
 
-Browser histories are projections, never input for reconstructing a lost agent.
+Portable checkpoints reconnect browser histories to fresh native agent contexts.
 The application installs one synchronous event-bus adapter for its lifetime;
 canonical events are routed by opaque session ID before observation is persisted.
 """
@@ -21,6 +21,7 @@ from gh_puller.agent.events import EventBus
 from gh_puller.agents import AGENTS
 
 from .config import Question, ServerSettings, resolve_settings, validate_capabilities
+from .portable import Checkpoint, restore, snapshot
 from .security import PublicTransport, SecretFilter
 from .storage import PrivateStorage
 
@@ -77,6 +78,9 @@ class Session:
     closed: bool = False
     limited: bool = False
     log_size: int = 0
+    portable: Checkpoint = field(default_factory=lambda: Checkpoint(messages=[]))
+    portable_files: set = field(default_factory=set)
+    credential_base_url: str = ""
 
     def __post_init__(self):
         self.directory = TemporaryDirectory(prefix="agent-chat-", dir=self.server.temp_root)
@@ -101,6 +105,10 @@ class Session:
             return
         event = {"seq": len(self.offsets) + 1, "type": kind, "at": now(), "query_id": self.query_id,
                  "data": self.scrubber.clean(data), **extra}
+        self.write_event(event)
+
+    def write_event(self, event):
+        kind = event["type"]
         encoded = (json.dumps(event, ensure_ascii=False) + "\n").encode()
         if kind != "query/end" and self.log_size + len(encoded) > self.server.event_bytes:
             if self.limited:
@@ -175,8 +183,8 @@ class SessionManager:
         self.bus = SessionBus(self)
         self.preparations = {}
 
-    def create(self, owner, kind):
-        if len(self.sessions) >= self.settings.max_sessions:
+    def create(self, owner, kind, *, replacing=None):
+        if len(self.sessions) - bool(replacing) >= self.settings.max_sessions:
             raise HTTPException(429, "服务的活跃会话已满，请删除不再使用的会话后重试")
         session = Session(owner, kind, self.settings)
         self.sessions[session.id] = session
@@ -185,7 +193,7 @@ class SessionManager:
     def get(self, owner, session_id, *, touch=True):
         session = self.sessions.get(session_id)
         if session is None or session.owner != owner or session.closed:
-            raise HTTPException(404, "会话已失效，浏览器历史仅可阅读，请新建会话")
+            raise HTTPException(404, "执行会话已失效，可从浏览器历史恢复")
         if touch:
             session.touched = time.monotonic()
         return session
@@ -217,6 +225,9 @@ class SessionManager:
                 raise HTTPException(422, "更换模型地址需要重新输入 API Key")
         credentials = {**session.credentials,
                        **{key: value for key, value in question.credentials.values().items() if value}}
+        if (session.credential_base_url and session.credential_base_url != public.base_url
+                and not question.credentials.values().get("api_key")):
+            raise HTTPException(422, "更换模型地址需要重新输入 API Key")
         if not credentials.get("api_key"):
             raise HTTPException(422, "请在设置中输入模型 API Key")
         try:
@@ -224,6 +235,7 @@ class SessionManager:
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from None
         session.credentials, session.public = credentials, public
+        session.credential_base_url = public.base_url
         session.scrubber.add(credentials.values())
         session.requests[question.request_id] = fingerprint
         session.query_id = question.request_id
@@ -254,6 +266,7 @@ class SessionManager:
                     except BaseException:
                         session.agent = session.context = None
                         raise
+                    restore(session)
                 else:
                     session.agent.config.update(config)
                     session.agent.set_credentials(session.credentials)
@@ -265,6 +278,12 @@ class SessionManager:
         except Exception as exc:  # Expose sanitized failures without logging request bodies or credentials.
             status, error = "failed", str(exc) or type(exc).__name__
         finally:
+            try:
+                if state := snapshot(session):
+                    session.emit("context/checkpoint", state)
+                    session.portable_files.update(state["files"])
+            except Exception as exc:  # Preserve the answer even if portable evidence exceeds retention limits.
+                error = (error + "; " if error else "") + "Context checkpoint unavailable: " + str(exc)
             session.finish(status, error, answer)
 
     async def stop(self, session):

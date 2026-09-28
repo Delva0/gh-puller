@@ -17,9 +17,11 @@ export type ModelSettings = z.infer<typeof modelSettingsSchema>;
 export const preferencesSchema = z.object({
   version: z.literal(2), connection: z.object({ base_url: z.string().max(2048) }).partial(),
   model: modelSettingsSchema.partial(), agents: z.record(z.string(), valuesSchema), tools: valuesSchema,
+  agent: z.string().optional(), language: z.enum(['zh', 'en']).default('zh'),
+  sidebar_width: z.number().min(220).max(480).default(280),
 });
 export type Preferences = z.infer<typeof preferencesSchema>;
-export const emptyPreferences: Preferences = { version: 2, connection: {}, model: {}, agents: {}, tools: {} };
+export const emptyPreferences: Preferences = { version: 2, connection: {}, model: {}, agents: {}, tools: {}, language: 'zh', sidebar_width: 280 };
 export const eventSchema = z.object({
   seq: z.number().int().positive(), type: z.string().max(100), at: z.string(),
   query_id: z.string().nullable(), data: z.record(z.string(), z.unknown()),
@@ -27,17 +29,21 @@ export const eventSchema = z.object({
 });
 export type ChatEvent = z.infer<typeof eventSchema>;
 export interface Conversation {
-  id: string; server_id?: string; title: string; created: string; agent: Agent;
+  id: string; server_id?: string; source_id?: string; title: string; created: string; agent: Agent;
   settings: Settings; events: ChatEvent[]; readonly: boolean; renamed?: boolean;
+  branches?: Branch[]; branch_id?: string; live?: boolean;
 }
+export interface Branch { id: string; events: ChatEvent[]; agent: Agent; settings: Settings }
 export interface SessionView {
   id: string; agent: Agent; title: string; created: string; running: boolean;
   query_id: string | null; seq: number; settings: Settings | null;
   has_credentials: boolean; readonly: boolean;
+  recovery_warning?: boolean;
 }
 export interface ConfigField {
   key: string; default: ConfigValues[string]; type: string; nullable: boolean; description: string;
   choices: { value: ConfigValues[string]; reason: string }[]; tool: string | null;
+  effective_default?: ConfigValues[string];
 }
 export interface ToolConfig { id: string; credentials: string[] }
 export interface Capability {
@@ -60,8 +66,7 @@ export function settingsFor(agent: Agent, preferences: Preferences, catalog: Cat
 }
 
 export function isRunning(chat: Conversation): boolean {
-  const last = chat.events.filter(e => e.type === 'query/start' || e.type === 'query/end').at(-1);
-  return last?.type === 'query/start' && !chat.readonly;
+  return Boolean(chat.live);
 }
 
 export function publicData<T>(input: T, values: string[] = []): T {

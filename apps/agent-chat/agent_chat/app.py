@@ -21,6 +21,8 @@ from gh_puller.agents import AGENTS
 from pydantic import BaseModel, Field, SecretStr
 
 from .config import AgentKind, PublicSettings, Question, ServerSettings, catalog
+from .models import CredentialCheck, ModelConnection, check_credential, discover
+from .portable import HistoryEvent, load_history
 from .runtime import SessionManager, build_agent
 
 COOKIE = "agent_chat_access"
@@ -33,13 +35,15 @@ class Login(BaseModel):
 
 class CreateSession(BaseModel):
     agent: AgentKind = next(iter(AGENTS))
+    events: list[HistoryEvent] = Field(default_factory=list, max_length=100000)
+    source_session: str | None = None
 
 
 class Rename(BaseModel):
     title: str = Field(min_length=1, max_length=100)
 
 
-def create_app(settings: ServerSettings | None = None, *, agent_factory=build_agent):
+def create_app(settings: ServerSettings | None = None, *, agent_factory=build_agent, model_transport=None):
     """Create one process-local application; test factories never enter production configuration."""
     settings = settings or ServerSettings.from_env()
     manager = SessionManager(settings, agent_factory)
@@ -75,7 +79,8 @@ def create_app(settings: ServerSettings | None = None, *, agent_factory=build_ag
                 return JSONResponse({"detail": "请求必须使用 JSON"}, status_code=415)
             body = bytearray()
             async for chunk in request.stream():
-                if len(body) + len(chunk) > 128 * 1024:
+                limit = settings.event_bytes if request.url.path == "/api/sessions" else 128 * 1024
+                if len(body) + len(chunk) > limit:
                     return JSONResponse({"detail": "请求过大"}, status_code=413)
                 body.extend(chunk)
             # Starlette's cached request replays this bounded body to downstream handlers.
@@ -166,6 +171,14 @@ def create_app(settings: ServerSettings | None = None, *, agent_factory=build_ag
     async def list_sessions(owner: Owner):
         return [session.view() for session in manager.sessions.values() if session.owner == owner]
 
+    @app.post("/api/models")
+    async def models(body: ModelConnection, owner: Owner):
+        return await discover(body, manager, owner, model_transport)
+
+    @app.post("/api/credentials/test")
+    async def credential_test(body: CredentialCheck, owner: Owner):
+        return await check_credential(body, model_transport)
+
     @app.post("/api/sessions", status_code=201)
     async def create(body: CreateSession, owner: Owner):
         capability = next((item for item in catalog(settings) if item["id"] == body.agent), None)
@@ -173,7 +186,22 @@ def create_app(settings: ServerSettings | None = None, *, agent_factory=build_ag
             raise HTTPException(422, "未知 agent")
         if not capability["available"]:
             raise HTTPException(422, capability["reason"])
-        return manager.create(owner, body.agent).view()
+        source = manager.get(owner, body.source_session) if body.source_session else None
+        if source and source.running:
+            raise HTTPException(409, "请先停止当前查询")
+        session = manager.create(owner, body.agent, replacing=source)
+        if source:
+            session.credentials = source.credentials.copy()
+            session.credential_base_url = source.credential_base_url
+            session.scrubber.add(session.credentials.values())
+        try:
+            degraded = load_history(session, body.events)
+        except Exception as exc:  # Invalid imported state must release all partially restored resources.
+            await manager.delete(session)
+            raise HTTPException(422, "会话恢复数据无效或超过保留上限") from exc
+        if source:
+            await manager.delete(source)
+        return {**session.view(), "recovery_warning": degraded}
 
     @app.get("/api/sessions/{session_id}")
     async def get_session(session_id: str, owner: Owner):
@@ -241,7 +269,7 @@ def create_app(settings: ServerSettings | None = None, *, agent_factory=build_ag
         snapshot = len(session.offsets)
 
         async def download():
-            yield json.dumps({"version": 1, "session": session.view()}, ensure_ascii=False)[:-1] + ',"events":['
+            yield json.dumps({"version": 2, "session": session.view()}, ensure_ascii=False)[:-1] + ',"events":['
             cursor = 0
             while cursor < snapshot:
                 for event in session.replay(cursor, min(200, snapshot - cursor)):
