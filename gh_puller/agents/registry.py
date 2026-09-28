@@ -59,6 +59,7 @@ class AgentConfiguration:
                 "available": not missing, "reason": "Requires: " + ", ".join(missing) if missing else "",
                 "defaults": self.public_defaults(), "fields": fields,
                 "tools": self.agent.configuration_tools(self.defaults()),
+                "tool_catalog": self.agent.configuration_tools(),
                 "credentials": {key: {"required_when": spec.required_when, "active_when": spec.active_when,
                                       "testable": spec.validator is not None}
                                 for key, spec in self.credentials.items()}}
@@ -91,16 +92,19 @@ class AgentConfiguration:
             tools = self.agent.configuration_tools(options)
         except (KeyError, ValueError, TypeError):
             tools = self.agent.configuration_tools(self.defaults())
-        for tool in tools:
+        catalog = self.agent.configuration_tools()
+        for tool in [*tools, *catalog]:
             failures = {key: fields[key] for key in tool["configuration"] if not fields[key]["valid"]}
             tool.update(valid=not failures, issues=failures)
-        issues = {key: value for key, value in fields.items() if not value["valid"]}
+        active = {key for tool in tools for key in tool["configuration"]}
+        issues = {key: value for key, value in fields.items()
+                  if not value["valid"] and (key not in self.owners or key in active)}
         if not issues:
             try:
                 self.resolve(values, resources)
             except (ValueError, TypeError) as exc:
                 issues["configuration"] = {"valid": False, "reason": str(exc)}
-        return {"valid": not issues, "issues": issues, "fields": fields, "tools": tools}
+        return {"valid": not issues, "issues": issues, "fields": fields, "tools": tools, "tool_catalog": catalog}
 
     def resolve(self, values, resources):
         """Validate public overrides and inject only declared operator resource bindings.
@@ -110,7 +114,8 @@ class AgentConfiguration:
             resources: Available runtime resources; bindings can supply container IDs
                 or paths, while choice dependencies only test resource availability.
         """
-        defaults = self.public_defaults()
+        defaults = {key: value for key, value in self.defaults().items()
+                    if not self.fields[key].binding and (not self.fields[key].internal or key in self.owners)}
         if unknown := values.keys() - defaults.keys():
             raise ValueError(f"Unsupported {self.agent.name} options: {', '.join(sorted(unknown))}")
         resolved = {**self.defaults(), **values}
@@ -119,8 +124,11 @@ class AgentConfiguration:
                 resolved[key] = resources.get(spec.binding, spec.default)
                 if spec.required and not resolved[key]:
                     raise ValueError(f"Requires: {spec.binding}")
-            else:
+            elif key not in self.owners:
                 spec.validate(key, resolved[key], resources)
+        active = {key for tool in self.agent.configuration_tools(resolved) for key in tool["configuration"]}
+        for key in active & self.owners.keys():
+            self.fields[key].validate(key, resolved[key], resources)
         native = {key: resolved[key] for key in self.agent.defaults}
         native = self.agent.normalize_options(native)
         return self.agent.normalize_runtime({**{key: resolved[key] for key in self.agent.runtime_defaults},

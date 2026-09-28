@@ -7,7 +7,7 @@ import { download } from './db';
 import { availabilityHint, credentialTestHint, fieldDescription, fieldValue, numericPolicy, uiLabel, validPreferences } from './ui-model';
 import type { Availability } from './availability';
 import { api } from './api';
-import { emptyCredentials, emptyPreferences, preferencesSchema, settingsFor, type Catalog, type ConfigField,
+import { configuredValue, emptyCredentials, emptyPreferences, preferencesSchema, settingsFor, type Catalog, type ConfigField,
   type ConfigValues, type Credentials, type Preferences, type ToolDefinition } from './types';
 import type { ModelDiscovery } from './useModels';
 import type { ConfigurationValidation } from './useValidation';
@@ -171,22 +171,22 @@ export function SettingsPanel({ preferences, credentials, catalog, onChange, onC
   }
   return <Modal title={t('设置')} wide onClose={onClose}>
     <div className="settings-layout"><nav className="settings-tabs" role="tablist" aria-label={t('设置')}>
-      {[['model', t('模型'), '输入即保存。密钥仅保留在当前页面和活跃会话内存。'], ['agent', 'Agent', '每个 agent 分别保存自己的配置。'],
+      {[['general', t('通用'), '界面偏好'], ['model', t('模型'), '输入即保存。密钥仅保留在当前页面和活跃会话内存。'], ['agent', 'Agent', '每个 agent 分别保存自己的配置。'],
         ['tools', t('工具'), '共享配置由使用它的工具共同引用；修改在下次提问时生效。']].map(([id, label, tip]) =>
         <button key={id} type="button" role="tab" aria-selected={tab === id} aria-controls={`settings-${id}`}
           title={t(tip)} id={`settings-tab-${id}`} onClick={() => setTab(id)}>{label}</button>)}
     </nav><div className="settings-page" key={tab} role="tabpanel" id={`settings-${tab}`} aria-labelledby={`settings-tab-${tab}`}>
-      {tab === 'model' && <><section><h3>{t('模型连接')}</h3>
+      {tab === 'general' && <section><h3>{t('语言')}</h3><select aria-label={t('语言')} value={preferences.language}
+        onChange={e => onChange({ ...preferences, language: e.target.value as Preferences['language'] }, credentials)}>
+        <option value="zh">简体中文</option><option value="en">English</option></select></section>}
+      {tab === 'model' && <section><h3>{t('模型连接')}</h3>
         <label>{t('模型地址')}<input type="url" value={preferences.connection.base_url ?? catalog.defaults.base_url}
           onChange={e => onChange({ ...preferences, connection: { base_url: e.target.value } }, credentials)}
           onBlur={() => void testKey('api_key', credentials.api_key ?? '')} placeholder="https://api.example.com/v1" /></label>
         {keyField('api_key', t('模型 API Key'))}
         {discovery.status !== 'idle' && <p className={`settings-note ${discovery.status === 'error' ? 'error-text' : ''}`} role="status">
           {discovery.status === 'loading' ? t('检测模型中…') : discovery.status === 'success' ? `${t('连接成功')} · ${discovery.models.length} ${t('模型')}` : t(discovery.error)}</p>}
-      </section><section className="settings-section"><h3>{t('语言')}</h3><select aria-label={t('语言')} value={preferences.language}
-          onChange={e => onChange({ ...preferences, language: e.target.value as Preferences['language'] }, credentials)}>
-          <option value="zh">简体中文</option><option value="en">English</option></select>
-      </section></>}
+      </section>}
       {tab === 'agent' && <>
         <div className="tool-index agent-index" aria-label="Agent">
           {catalog.agents.map(agent => <button key={agent.id} type="button" className="tool-node" data-agent={agent.id}
@@ -208,7 +208,7 @@ export function SettingsPanel({ preferences, credentials, catalog, onChange, onC
         {visibleKeys.map(key => <section className="shared-config" data-config={key} key={key}>
           {credentialSpecs[key] ? keyField(key, uiLabel(key, language), consumers(key)) : <ConfigInput
             field={toolFields.find(field => field.key === key)!}
-            value={key in preferences.tools ? preferences.tools[key] : toolFields.find(field => field.key === key)!.default}
+            value={configuredValue(toolFields.find(field => field.key === key)!, preferences.tools)}
             consumers={consumers(key)} onDraft={reason => onDraft(`tool:${key}`, reason)}
             onChange={next => onChange({ ...preferences, tools: { ...preferences.tools, [key]: next } }, credentials)} />}
         </section>)}

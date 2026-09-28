@@ -7,6 +7,7 @@ import pytest
 from gh_puller.agents import AGENTS, GitCodeAgent, GitHubAgent, WebAgent, register
 from gh_puller.configuration import option
 from gh_puller.tools.storage import ToolStorage
+from gh_puller.tools.tool_offload import OffloadPolicy
 
 
 def test_added_fields_and_inherited_metadata_need_no_application_schema(monkeypatch, tmp_path):
@@ -65,15 +66,63 @@ def test_tool_discovery_preserves_registered_identity_under_runtime_aliases(back
     name = "github_" + ("rest" if backend == "split" else backend)
     assert not {"github", "web", "tool_results"} & tools.keys()
     assert "github_token" in tools[name]
-    assert "tool_result_preview_chars" in tools[name]
+    assert name + ".tool_result_preview_chars" in tools[name]
     assert ("github_graphql" in tools) == (backend in {"split", "graphql"})
     installed = next(item for item in GitHubAgent.configuration_tools(options) if item["id"] == name)
     assert installed["call_name"] == "github"
     if backend == "split":
-        assert tools["github_rest"] == tools["github_graphql"]
+        assert set(tools["github_rest"]) & set(tools["github_graphql"]) == {"github_token"}
     ptc = {item["id"]: item["configuration"]
            for item in GitHubAgent.configuration_tools({**options, "ptc": "A"})}
     assert {"github_token", "brave_api_key"} <= set(ptc["run_code"])
+
+
+def test_complete_catalog_and_inactive_tool_settings_are_independent_of_agent_selection():
+    config = GitHubAgent.configuration
+    catalog = config.catalog({})
+    fields = {field["key"]: field for field in catalog["fields"]}
+    assert "tool_result_preview_chars" not in fields
+    assert fields["github_dsl.tool_result_preview_chars"]["effective_default"] == 2000
+    expected = {item["id"] for item in catalog["tool_catalog"]}
+    assert {"github_rest", "github_graphql", "github_dsl", "run_code"} <= expected
+    options = {"web_search_backend": "duckduckgo", "github_dsl.tool_result_preview_chars": 0}
+    report = config.validate(options, {}, {})
+    assert report["valid"]
+    assert {item["id"] for item in report["tool_catalog"]} == expected
+    assert not next(item for item in report["tool_catalog"] if item["id"] == "github_dsl")["valid"]
+    config.resolve(options, {})
+    options["backend"] = "dsl"
+    assert not config.validate(options, {}, {})["valid"]
+    with pytest.raises(ValueError, match="positive"):
+        config.resolve(options, {})
+    with pytest.raises(ValueError, match="backend"):
+        config.resolve({"backend": "unknown"}, {})
+    with pytest.raises(ValueError, match="Unsupported"):
+        config.resolve({"max_steps": 1}, {})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ["rest", "graphql", "dsl", "split"])
+async def test_tool_result_overrides_follow_registered_tool_identity_under_aliases(tmp_path, backend):
+    options = {"backend": backend, "web_search_backend": "duckduckgo",
+               "tool_result_preview_lines": 3, "github_rest.tool_result_preview_chars": 37,
+               "github_graphql.tool_result_preview_chars": 59, "github_dsl.tool_result_preview_chars": 83,
+               "web_fetch.tool_result_preview_lines": 7}
+    native = GitHubAgent.configuration.resolve(options, {})
+    agent = GitHubAgent({"model": "test", "base_url": "https://model.example/v1", **native},
+                        ToolStorage(tmp_path), api_key="")
+    async with agent.session():
+        expected = {"rest": 37, "graphql": 59, "dsl": 83, "split": 37}[backend]
+        assert agent.offload_policies["github"].preview_chars == expected
+        assert agent.offload_policies["github"].preview_lines == 3
+        assert agent.offload_policies["web_fetch"].preview_chars == 2000
+        assert agent.offload_policies["web_fetch"].preview_lines == 7
+        assert agent.offload_policies["web_search"].preview_lines == 3
+        if backend == "split":
+            assert agent.offload_policies["github_graphql"].preview_chars == 59
+        agent.install_tools((agent.tools, "github"), offload=OffloadPolicy(preview_lines=17))
+        assert agent.offload_policies["github"].preview_lines == 17
+        assert agent.offload_policies["github"].preview_chars == expected
 
 
 def test_native_validators_control_tools_and_agent_without_network_calls():

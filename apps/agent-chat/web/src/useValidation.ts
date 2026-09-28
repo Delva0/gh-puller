@@ -30,7 +30,7 @@ export function useValidation(catalog: Catalog | null, preferences: Preferences,
   }, [payload, identity, catalog, enabled]);
   const current = result?.identity === identity;
   const report = result?.report;
-  const tools = report?.tools ?? [...new Map(catalog?.agents.flatMap(agent => agent.tools).map(tool => [tool.id, tool])).values()];
+  const tools = report?.tools ?? [...new Map(catalog?.agents.flatMap(agent => agent.tool_catalog).map(tool => [tool.id, tool])).values()];
   function state(value?: ValidationState, issues: Record<string, string> = {}) {
     if (current && result.error) return availability({ valid: false, issues: { validation: { valid: false, reason: result.error } } }, issues);
     return availability(current ? value : undefined, issues);
@@ -43,7 +43,7 @@ export function useValidation(catalog: Catalog | null, preferences: Preferences,
   }
   function agent(id: string) {
     const capability = catalog?.agents.find(agent => agent.id === id);
-    const fields = new Set(capability?.fields.filter(field => field.tool).map(field => field.key));
+    const fields = new Set((report?.agents[id]?.tools ?? capability?.tools ?? []).flatMap(tool => tool.configuration));
     const errors = Object.fromEntries(Object.entries(drafts).filter(([key]) => key.startsWith(`agent:${id}:`) ||
       key.startsWith('tool:') && fields.has(key.slice(5))).map(([key, value]) => [key.split(':').at(-1)!, value]));
     return state(report?.agents[id], errors);

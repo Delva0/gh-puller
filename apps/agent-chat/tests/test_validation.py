@@ -69,15 +69,27 @@ async def test_configuration_graph_and_native_errors_follow_current_agent_option
                             tools={"web_search_backend": "duckduckgo", "web_search_concurrency": 0})
     tools = {item["id"]: item for item in report["tools"]}
     assert len(tools) == len(report["tools"])
-    assert tools["github_rest"]["configuration"] == tools["github_graphql"]["configuration"]
+    assert set(tools["github_rest"]["configuration"]) & set(
+        tools["github_graphql"]["configuration"]) == {"github_token"}
     assert "github_token" in tools["github_rest"]["configuration"]
     assert tools["github_rest"]["valid"] and tools["web_fetch"]["valid"]
     assert set(tools["web_search"]["issues"]) == {"web_search_concurrency"}
     assert set(report["agents"]["github"]["issues"]) == {"web_search_concurrency"}
     updated = await validate(client, agents={"github": {"backend": "dsl"}, "gitcode": {"backend": "dsl"}})
+    assert {item["id"] for item in updated["tools"]} == set(tools)
     for name in ("github", "gitcode"):
         installed = {item["id"] for item in updated["agents"][name]["tools"]}
         assert name + "_dsl" in installed and name + "_rest" not in installed and name not in installed
+
+
+async def test_inactive_tool_can_be_configured_without_disabling_other_agents(validation_client):
+    _, client, _ = validation_client
+    await login(client)
+    report = await validate(client, tools={"web_search_backend": "duckduckgo",
+                                          "github_dsl.tool_result_preview_chars": 0})
+    assert report["agents"]["github"]["valid"] and report["agents"]["gitcode"]["valid"]
+    tools = {item["id"]: item for item in report["tools"]}
+    assert tools["github_rest"]["valid"] and not tools["github_dsl"]["valid"]
 
 
 async def test_validated_session_keys_are_private_and_logout_discards_checks(validation_client):

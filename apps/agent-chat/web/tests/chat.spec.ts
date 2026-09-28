@@ -1,7 +1,91 @@
 import { expect, test, type Page, type Download } from '@playwright/test';
-import { readFile } from 'node:fs/promises';
+import { readFile, writeFile } from 'node:fs/promises';
 
 const secret = 'fixture-model-secret-value';
+
+test('tool catalog stays complete and result settings remain independent across backend selection', async ({ page }) => {
+  await login(page); await configure(page);
+  await page.getByRole('button', { name: '打开设置' }).click();
+  await expect(page.getByLabel('语言', { exact: true })).toHaveCount(0);
+  await page.getByRole('tab', { name: '通用', exact: true }).click();
+  await expect(page.getByLabel('语言', { exact: true })).toBeVisible();
+  await selectTool(page, 'github_rest');
+  const ids = await page.locator('#settings-tools .tool-node').evaluateAll(nodes => nodes.map(node => node.getAttribute('data-tool')));
+  expect(ids).toEqual(expect.arrayContaining(['github_rest', 'github_graphql', 'github_dsl', 'gitcode_api', 'gitcode_dsl']));
+  await page.getByLabel('工具结果预览字符数', { exact: true }).fill('37');
+  await expect(page.locator('[data-config="github_rest.tool_result_preview_chars"] .config-consumers')).toHaveCount(0);
+  await selectTool(page, 'github_graphql');
+  await expect(page.getByLabel('工具结果预览字符数', { exact: true })).toHaveValue('2000');
+  await page.getByLabel('工具结果预览字符数', { exact: true }).fill('59');
+  await page.getByRole('tab', { name: 'Agent', exact: true }).click();
+  await page.locator('[name=backend]').selectOption('"dsl"');
+  await expect(page.locator('.agent-tools [data-tool=github_dsl]')).toBeVisible();
+  await expect(page.locator('.agent-tools [data-tool=github_rest]')).toHaveCount(0);
+  await selectTool(page, 'github_rest');
+  await expect(page.getByLabel('工具结果预览字符数', { exact: true })).toHaveValue('37');
+  expect(await page.locator('#settings-tools .tool-node').evaluateAll(nodes => nodes.map(node => node.getAttribute('data-tool')))).toEqual(ids);
+  const config = await captureDownload(page, '导出配置');
+  expect(config.preferences.tools).toMatchObject({ 'github_rest.tool_result_preview_chars': 37, 'github_graphql.tool_result_preview_chars': 59 });
+});
+
+test('interim answers remain during subsequent reasoning and sources open a persistent right panel', async ({ page }, info) => {
+  await login(page); await configure(page);
+  await send(page, 'interim sources');
+  await expect(page.locator('.markdown')).toContainText('阶段回答一');
+  await page.locator('.execution > summary').click();
+  await expect(page.locator('.trace-description').filter({ hasText: '继续核对第二处来源。' })).toBeVisible();
+  await expect(page.locator('.markdown')).toContainText('阶段回答一');
+  await expect(page.locator('.markdown')).toContainText('阶段回答二');
+  await expect(page.locator('.trace-description').filter({ hasText: '资料已返回，整理可验证的结论。' })).toBeVisible();
+  await expect(page.locator('.markdown')).toContainText('阶段回答二');
+  await expect(page.locator('.execution > summary')).toContainText('已完成');
+  await expect(page.locator('.markdown')).toContainText('找到了可以核对的依据');
+  await expect(page.locator('.markdown')).not.toContainText('阶段回答');
+  const badge = page.locator('.source-badge').first();
+  const card = page.locator('.trace-item[data-kind=tool]').first();
+  await expect(card).not.toHaveAttribute('open', '');
+  await badge.click();
+  await expect(card).not.toHaveAttribute('open', '');
+  const panel = page.getByRole('complementary', { name: '来源', exact: true });
+  await expect(panel).toBeVisible();
+  await expect(panel.locator('.source-card')).toHaveCount(3);
+  await expect(panel.locator('.source-card').first()).toHaveAttribute('href', 'https://github.com/o/r');
+  await expect(panel).toContainText('可核对的仓库说明。');
+  await expect(badge).toHaveAttribute('aria-expanded', 'true');
+  const main = await page.locator('.main-panel').boundingBox(), bounds = await panel.boundingBox();
+  expect(bounds!.x).toBeGreaterThanOrEqual(main!.x + main!.width - 1);
+  await page.screenshot({ path: info.outputPath('sources-desktop-dark.png'), fullPage: true, animations: 'disabled' });
+  await page.getByRole('button', { name: '切换为浅色主题' }).click();
+  await page.screenshot({ path: info.outputPath('sources-desktop-light.png'), fullPage: true, animations: 'disabled' });
+  await page.getByRole('button', { name: '打开设置' }).click();
+  await page.keyboard.press('Escape');
+  await expect(page.getByRole('dialog')).not.toBeVisible();
+  await expect(panel).toBeVisible();
+  await page.keyboard.press('Escape');
+  await expect(panel).toHaveCount(0);
+  await expect(badge).toBeFocused();
+  await page.getByRole('button', { name: '折叠侧栏', exact: true }).click();
+  await page.setViewportSize({ width: 390, height: 844 });
+  await badge.click();
+  await expect(panel).toBeVisible();
+  await expect(panel).toHaveCSS('transform', 'none');
+  const mobile = await panel.boundingBox();
+  expect(mobile!.x).toBeGreaterThanOrEqual(0);
+  expect(mobile!.x + mobile!.width).toBeLessThanOrEqual(391);
+  await page.screenshot({ path: info.outputPath('sources-mobile.png'), fullPage: true, animations: 'disabled' });
+  await panel.getByRole('button', { name: '关闭来源面板' }).click();
+  await expect(panel).toHaveCount(0);
+  await page.setViewportSize({ width: 1440, height: 1000 });
+  const record = await captureDownload(page, '导出事件');
+  await writeFile(info.outputPath('source-replay.json'), JSON.stringify(record, null, 2));
+  await page.getByRole('button', { name: '打开侧栏', exact: true }).click();
+  await page.getByLabel('导入历史文件').setInputFiles({ name: 'source-replay.json', mimeType: 'application/json', buffer: Buffer.from(JSON.stringify(record)) });
+  await page.locator('.execution > summary').click();
+  await page.locator('.source-badge').first().click();
+  await expect(panel.locator('.source-card').first()).toHaveAttribute('href', 'https://github.com/o/r');
+  await page.getByRole('button', { name: '新建会话' }).click();
+  await expect(panel).toHaveCount(0);
+});
 
 async function login(page: Page) {
   await page.goto('/');
@@ -288,8 +372,8 @@ test('configuration discovery, fixed panels, ranges, keys, import/export and lan
   await page.locator('[name=web_search_backend]').selectOption('"brave"');
   await expect(page.locator('[name=brave_api_key]')).toBeVisible();
   await page.locator('[name=web_search_backend]').selectOption('"duckduckgo"');
-  await expect(page.locator('[name=tool_result_num_user_query]')).toHaveValue('1');
-  await expect(page.locator('[name=tool_result_preview_chars]')).toHaveValue('2000');
+  await expect(page.getByLabel('工具结果保留提问数', { exact: true })).toHaveValue('1');
+  await expect(page.getByLabel('工具结果预览字符数', { exact: true })).toHaveValue('2000');
   const config = await captureDownload(page, '导出配置');
   expect(JSON.stringify(config)).not.toContain(secret);
   await page.getByRole('button', { name: '恢复默认配置' }).click();
@@ -323,7 +407,7 @@ test('configuration discovery, fixed panels, ranges, keys, import/export and lan
   await expect(page.locator('[name=strategy]')).toHaveValue('"deep"');
   await page.locator('[data-agent=gitcode]').click();
   await expect(page.locator('[name=ptc]')).toHaveValue('"B"');
-  await page.getByRole('tab', { name: '模型', exact: true }).click();
+  await page.getByRole('tab', { name: '通用', exact: true }).click();
   await page.getByLabel('语言').selectOption('en');
   await expect(page.getByRole('dialog', { name: 'Settings' })).toBeVisible();
   await page.getByRole('button', { name: 'Close', exact: true }).click();
@@ -341,7 +425,7 @@ test('legacy flat preferences migrate without rewriting archived settings', asyn
   await login(page);
   const old = { base_url: 'https://legacy.example/v1', model: 'legacy-model', thinking: true, reasoning_effort: 'custom',
     max_tokens: 8192, max_steps: 32, concurrency: 4, backend: 'dsl', ptc: 'B', multimodal: false,
-    web_search_backend: 'duckduckgo', web_search_concurrency: 3, web_search_interval: 5 };
+    web_search_backend: 'duckduckgo', web_search_concurrency: 3, web_search_interval: 5, tool_result_preview_chars: 71 };
   await page.evaluate(async settings => {
     const db = await new Promise<IDBDatabase>(resolve => {
       const open = indexedDB.open('trace-agent-chat'); open.onsuccess = () => resolve(open.result);
@@ -360,6 +444,12 @@ test('legacy flat preferences migrate without rewriting archived settings', asyn
   await expect(page.locator('[name=ptc]').first()).toHaveValue('false');
   await selectTool(page, 'web_search');
   await expect(page.locator('[name=web_search_concurrency]')).toHaveValue('3');
+  await expect(page.getByLabel('工具结果预览字符数', { exact: true })).toHaveValue('71');
+  await selectTool(page, 'github_rest');
+  await expect(page.getByLabel('工具结果预览字符数', { exact: true })).toHaveValue('71');
+  await page.getByLabel('工具结果预览字符数', { exact: true }).fill('37');
+  await selectTool(page, 'github_graphql');
+  await expect(page.getByLabel('工具结果预览字符数', { exact: true })).toHaveValue('71');
   await page.getByRole('button', { name: '关闭', exact: true }).click();
   await expect(page.getByRole('dialog')).not.toBeVisible();
   const at = new Date().toISOString();
@@ -477,15 +567,15 @@ test('mobile settings scroll independently and compact pickers fit the viewport'
   await page.locator('[name=github_token]').fill('tool-test-key');
   await page.getByRole('button', { name: '测试连接 GitHub API Key', exact: true }).click();
   await expect(page.getByRole('tabpanel')).toContainText('连接成功');
-  await page.locator('[name=tool_result_preview_chars]').scrollIntoViewIfNeeded();
-  await page.locator('[data-config=tool_result_preview_chars] .config-consumers > button').click();
+  await page.getByLabel('工具结果预览字符数', { exact: true }).scrollIntoViewIfNeeded();
+  await page.locator('[data-config=github_token] .config-consumers > button').click();
   const sharedPopup = await page.locator('.consumer-list').boundingBox();
   expect(sharedPopup!.x).toBeGreaterThanOrEqual(0);
   expect(sharedPopup!.x + sharedPopup!.width).toBeLessThanOrEqual(390);
   expect((await page.getByRole('dialog').boundingBox())!.height).toBe(bounds!.height);
   expect(await page.getByRole('dialog').evaluate(element => element.scrollTop)).toBe(0);
   await page.screenshot({ path: info.outputPath('mobile-settings.png'), fullPage: true, animations: 'disabled' });
-  await page.locator('[data-config=tool_result_preview_chars] .config-consumers > button').press('Escape');
+  await page.locator('[data-config=github_token] .config-consumers > button').press('Escape');
   await expect(page.locator('.consumer-list')).toHaveCount(0);
   await expect(page.getByRole('dialog')).toBeVisible();
   await page.getByRole('button', { name: '关闭', exact: true }).click();
@@ -585,9 +675,9 @@ test('native tool identities, agent tiles and shared field navigation follow pac
   await expect(page.locator('#settings-tools [aria-pressed=true]')).toHaveCount(1);
   await expect(page.locator('[name=github_token]')).toHaveCount(1);
   const shared = page.locator('[data-config=github_token]');
-  await expect(shared.locator('.config-consumers')).toHaveText('2 个工具');
+  await expect(shared.locator('.config-consumers')).toHaveText('5 个工具');
   await page.locator('[name=github_token]').fill('shared-github-token');
-  await shared.getByRole('button', { name: '2 个工具', exact: true }).click();
+  await shared.getByRole('button', { name: '5 个工具', exact: true }).click();
   await expect(shared.getByRole('group')).toContainText('github_rest');
   await expect(shared.getByRole('group')).toContainText('github_graphql');
   await page.screenshot({ path: info.outputPath('shared-tool-config-dark.png'), fullPage: true, animations: 'disabled' });
@@ -715,7 +805,7 @@ test('API keys test once on paste or blur, never while typing', async ({ page },
   await login(page);
   await page.getByRole('button', { name: '打开设置' }).click();
   await page.getByLabel('模型地址').fill('https://model.example/v1');
-  await expect(page.getByRole('heading', { name: '语言', exact: true })).toHaveJSProperty('tagName', 'H3');
+  await expect(page.getByRole('heading', { name: '语言', exact: true })).toHaveCount(0);
   const bounds = await page.getByRole('dialog').boundingBox();
   expect(bounds!.height).toBe(820);
   for (const key of ['api_key', 'github_token', 'gitcode_token', 'brave_api_key']) {

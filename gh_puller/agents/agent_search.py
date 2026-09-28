@@ -39,7 +39,7 @@ from ..tools.tool_github import (
     query_schema,
 )
 from ..tools.tool_mcp import MCPTools, load_connection
-from ..tools.tool_offload import TOOL_RESULT_CONFIG, OffloadPolicy, ToolResultStore
+from ..tools.tool_offload import TOOL_RESULT_CONFIG, OffloadPolicy, ToolResultStore, tool_result_config
 from ..tools.tool_ptc import PTCTool
 from ..tools.tool_web import WEB_CONFIG, WebTools
 from .common import CommonAgent
@@ -76,13 +76,20 @@ GITHUB_API_PROVIDERS = {"rest": GitHubRESTTool, "graphql": GitHubGraphQLTool, "d
 
 
 def search_tool_configuration(options, *providers):
-    result = tool_configuration(*providers, WebTools, ToolResultStore, shared=tuple(TOOL_RESULT_CONFIG.defaults))
+    result = tool_configuration(*providers, WebTools, ToolResultStore)
     if options.get("ptc"):
         result.extend(tool_configuration(PTCTool, shared=tuple(dict.fromkeys(
             key for item in result for key in item["configuration"]))))
+    for item in result:
+        item["configuration"].extend(tool_result_config(item["id"]).defaults)
     if EARLY_ANSWER_ENABLED:
         result.extend(tool_configuration(EarlyAnswerTool))
     return result
+
+
+def search_tool_configs(*providers):
+    return (TOOL_RESULT_CONFIG, *(tool_result_config(item["id"]) for item in
+                                 search_tool_configuration({"ptc": True}, *providers)))
 
 
 @register
@@ -94,12 +101,16 @@ class GitHubAgent(CommonAgent):
                           requires={"gh-cli": ("host_commands",), "gh-mcp": ("mcp_config",)}),
         "mcp_mode": option(None, binding="mcp_mode"), "mcp_config": option(None, binding="mcp_config"),
     }
-    tool_configs = (GITHUB_CONFIG, WEB_CONFIG, TOOL_RESULT_CONFIG)
+    tool_configs = (GITHUB_CONFIG, WEB_CONFIG, *search_tool_configs(*GITHUB_API_PROVIDERS.values(), BashTool))
     backends = GITHUB_BACKENDS
     data_boundary = "Live GitHub resources, public web search and HTTP(S) downloads."
 
     @classmethod
-    def configuration_tools(cls, options):
+    def configuration_tools(cls, options=None):
+        if options is None:
+            result = search_tool_configuration({"ptc": True}, *GITHUB_API_PROVIDERS.values(), BashTool)
+            next(item for item in result if item["id"] == "bash")["configuration"].extend(GITHUB_CONFIG.credentials)
+            return result
         backend = options["backend"]
         if backend == "gh-cli":
             result = search_tool_configuration(options, BashTool)
@@ -240,11 +251,13 @@ class GitCodeAgent(CommonAgent):
     name = "gitcode"
     backends = ("rest", "dsl")
     defaults: ClassVar[dict] = {**SEARCH_DEFAULTS, "backend": option("rest", choices=backends)}
-    tool_configs = (GITCODE_CONFIG, WEB_CONFIG, TOOL_RESULT_CONFIG)
+    tool_configs = (GITCODE_CONFIG, WEB_CONFIG, *search_tool_configs(GitCodeTool, GitCodeDSLTool))
     data_boundary = "Live GitCode resources, public web search and HTTP(S) downloads."
 
     @classmethod
-    def configuration_tools(cls, options):
+    def configuration_tools(cls, options=None):
+        if options is None:
+            return search_tool_configuration({"ptc": True}, GitCodeTool, GitCodeDSLTool)
         provider = GitCodeDSLTool if options["backend"] == "dsl" else GitCodeTool
         return search_tool_configuration(options, (provider, "gitcode"))
 
@@ -293,7 +306,7 @@ class WebAgent(CommonAgent):
     data_boundary = "Public web search and HTTP(S) downloads; no repository tools or prior knowledge store."
 
     @classmethod
-    def configuration_tools(cls, options):
+    def configuration_tools(cls, options=None):
         return tool_configuration(WebTools)
 
     @classmethod
@@ -355,7 +368,7 @@ class CodeAgent(CommonAgent):
     data_boundary = "The connected persistent container filesystem, its operator-configured network and GitHub REST."
 
     @classmethod
-    def configuration_tools(cls, options):
+    def configuration_tools(cls, options=None):
         return [*tool_configuration(DockerBashTools, shared=("container", "workdir")),
                 *tool_configuration((GitHubRESTTool, "github"))]
 

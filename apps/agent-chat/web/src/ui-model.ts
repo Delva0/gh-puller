@@ -1,4 +1,4 @@
-import type { Catalog, ConfigField, ConfigValues, Preferences } from './types';
+import { configuredValue, type Catalog, type ConfigField, type ConfigValues, type Preferences } from './types';
 import { translator, type Language } from './i18n';
 import type { Availability } from './availability';
 
@@ -32,8 +32,9 @@ const tools: Record<string, [string, string]> = {
   codebase: ['检索代码库', 'Search the codebase'],
 };
 const readable = (key: string) => key.split('_').map(word => word.length <= 3 ? word.toUpperCase() : word[0].toUpperCase() + word.slice(1)).join(' ');
-export const uiLabel = (key: string, language: Language) => (fields[key]?.label ?? labels[key])?.[language === 'zh' ? 0 : 1] ?? readable(key);
-export const fieldDescription = (field: ConfigField, language: Language) => fields[field.key]?.description?.[language === 'zh' ? 0 : 1] ?? field.description;
+export const uiLabel = (key: string, language: Language): string => key.includes('.') ? uiLabel(key.split('.').at(-1)!, language)
+  : (fields[key]?.label ?? labels[key])?.[language === 'zh' ? 0 : 1] ?? readable(key);
+export const fieldDescription = (field: ConfigField, language: Language) => fields[field.key.split('.').at(-1)!]?.description?.[language === 'zh' ? 0 : 1] ?? field.description;
 export const toolLabel = (key: string, language: Language) => tools[key]?.[language === 'zh' ? 0 : 1] ?? readable(key);
 export function availabilityHint(status: Availability, language: Language) {
   const t = translator(language);
@@ -42,7 +43,7 @@ export function availabilityHint(status: Availability, language: Language) {
 }
 export const fieldValue = (field: ConfigField, value: ConfigValues[string]) => value ?? field.effective_default ?? field.default;
 export function numericPolicy(field: ConfigField) {
-  const rule = fields[field.key];
+  const rule = fields[field.key.split('.').at(-1)!];
   return { min: rule?.min ?? 0, max: rule?.max ?? 1000000, step: rule?.step ?? (field.type === 'integer' ? 1 : 'any') };
 }
 export function credentialTestHint(key: string, language: Language) {
@@ -51,7 +52,7 @@ export function credentialTestHint(key: string, language: Language) {
 export function validPreferences(value: Preferences, catalog: Catalog) {
   for (const agent of catalog.agents) for (const field of agent.fields) {
     const saved = field.tool ? value.tools : value.agents[agent.id];
-    const item = saved?.[field.key];
+    const item = configuredValue(field, saved);
     if (item === undefined || item === null && field.nullable) continue;
     if (field.choices.length) {
       if (!field.choices.some(choice => JSON.stringify(choice.value) === JSON.stringify(item) && !choice.reason)) return false;

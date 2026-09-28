@@ -62,7 +62,7 @@ export interface ValidationReport {
 }
 export interface Capability {
   id: Agent; name: string; available: boolean; reason: string;
-  defaults: ConfigValues; fields: ConfigField[]; tools: ToolDefinition[];
+  defaults: ConfigValues; fields: ConfigField[]; tools: ToolDefinition[]; tool_catalog: ToolDefinition[];
   credentials: Record<string, { required_when: ConfigValues; active_when: ConfigValues; testable: boolean }>;
 }
 export interface Catalog {
@@ -75,9 +75,14 @@ export function settingsFor(agent: Agent, preferences: Preferences, catalog: Cat
   const options: ConfigValues = {};
   for (const field of capability?.fields ?? []) {
     const saved = field.tool ? preferences.tools : preferences.agents[agent];
-    options[field.key] = saved && field.key in saved ? saved[field.key] : field.default;
+    options[field.key] = configuredValue(field, saved);
   }
   return { ...catalog.defaults, ...preferences.connection, ...preferences.model, options };
+}
+
+export function configuredValue(field: ConfigField, values: ConfigValues = {}) {
+  const key = field.key in values ? field.key : field.key.split('.').at(-1)!;
+  return key in values ? values[key] : field.default;
 }
 
 export function isRunning(chat: Conversation): boolean {

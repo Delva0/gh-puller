@@ -6,9 +6,39 @@ import { Check, ChevronDown, ChevronLeft, ChevronRight, Copy, LoaderCircle, X, C
 import { type ChatEvent } from './types';
 import { LanguageContext, useText } from './i18n';
 import { functionDescription, toolLabel } from './ui-model';
+import { SourceBadge } from './Sources';
+import type { SourceSelection } from './sources';
 
-export function Mark({ small = false }: { small?: boolean }) {
-  return <svg className={small ? 'brand-mark small' : 'brand-mark'} viewBox="0 0 40 40" fill="none" aria-hidden="true">
+export function Mark({ small = false, animated = false }: { small?: boolean; animated?: boolean }) {
+  const ref = useRef<SVGSVGElement>(null);
+  useEffect(() => {
+    if (!animated) return;
+    const svg = ref.current!;
+    const motion = matchMedia('(prefers-reduced-motion: reduce)');
+    let frame = 0, start = 0;
+    const draw = (phase: number) => {
+      const angle = Math.sin(phase) * .18;
+      const points = [[8, 29], [19, 7], [32, 17], [21, 33], [22, 17]].map(([x, y], index) => {
+        const offset = index * 1.3;
+        const dx = x - 20 + 1.8 * (Math.sin(phase + offset) - Math.sin(offset));
+        const dy = y - 20 + 1.5 * (Math.cos(phase + offset) - Math.cos(offset));
+        return [20 + dx * Math.cos(angle) - dy * Math.sin(angle), 20 + dx * Math.sin(angle) + dy * Math.cos(angle)];
+      });
+      svg.children[0].setAttribute('d', `M${points.slice(0, 4).map(point => point.join(' ')).join('L')}Z`);
+      svg.children[1].setAttribute('d', `M${points[0]}L${points[4]}L${points[2]}M${points[1]}L${points[4]}L${points[3]}`);
+      svg.children[2].setAttribute('cx', String(points[4][0]));
+      svg.children[2].setAttribute('cy', String(points[4][1]));
+    };
+    const tick = (time: number) => {
+      start ||= time;
+      draw((time - start) % 4000 / 4000 * Math.PI * 2);
+      frame = requestAnimationFrame(tick);
+    };
+    const reset = () => { cancelAnimationFrame(frame); start = 0; draw(0); if (!motion.matches) frame = requestAnimationFrame(tick); };
+    reset(); motion.addEventListener('change', reset);
+    return () => { cancelAnimationFrame(frame); motion.removeEventListener('change', reset); draw(0); };
+  }, [animated]);
+  return <svg ref={ref} className={small ? 'brand-mark small' : 'brand-mark'} viewBox="0 0 40 40" fill="none" aria-hidden="true">
     <path d="M8 29 19 7l13 10-11 16L8 29Z" stroke="currentColor" strokeWidth="1.6" />
     <path d="m8 29 14-12 10 0M19 7l3 10-1 16" stroke="currentColor" strokeWidth="1.6" />
     <circle cx="22" cy="17" r="3" fill="currentColor" />
@@ -128,10 +158,11 @@ export function turnsFrom(events: ChatEvent[]): Turn[] {
   return [...turns.values()];
 }
 
-export function TurnView({ turn, interrupted, clock, busy, onEdit, onRegenerate, version, onVersion }: {
+export function TurnView({ turn, interrupted, clock, busy, onEdit, onRegenerate, version, onVersion, sources, onSources }: {
   turn: Turn; interrupted: boolean; clock: number; busy: boolean;
   onEdit: (text: string) => void; onRegenerate: () => void;
   version: { index: number; count: number }; onVersion: (index: number) => void;
+  sources: SourceSelection | null; onSources: (selection: SourceSelection | null) => void;
 }) {
   const t = useText();
   const language = useContext(LanguageContext);
@@ -141,7 +172,7 @@ export function TurnView({ turn, interrupted, clock, busy, onEdit, onRegenerate,
   const state = turn.end?.status === 'completed' ? '已完成' : turn.end?.status === 'cancelled' ? '已停止' :
     turn.end ? '执行失败' : interrupted ? '执行中断' : '处理中';
   const duration = turn.end?.duration ?? (interrupted ? 0 : Math.max(0, clock - Date.parse(turn.started)));
-  const answer = turn.end?.answer || turn.models.at(-1)?.text || '';
+  const answer = turn.end?.answer || [...turn.models].reverse().find(model => model.text.trim())?.text || '';
   return <article className="turn" data-testid="turn">
     {editing ? <form className="message-editor" onSubmit={event => {
       event.preventDefault(); if (draft.trim()) { onEdit(draft.trim()); setEditing(false); }
@@ -174,6 +205,9 @@ export function TurnView({ turn, interrupted, clock, busy, onEdit, onRegenerate,
           </details> : <details className="trace-item" data-kind="tool" key={`tool-${entry.value.id}`}>
             <summary><Terminal size={15} /><span className="trace-title">{toolLabel(entry.value.name, language)}</span>
               <span className="trace-description">{functionDescription(entry.value.name, entry.value.args)}</span>
+              <SourceBadge tool={entry.value} selected={sources?.turnId === turn.id && sources.callId === entry.value.id}
+                onClick={() => onSources(sources?.turnId === turn.id && sources.callId === entry.value.id
+                  ? null : { turnId: turn.id, callId: entry.value.id })} />
               <small className={entry.value.error !== undefined ? 'error-text' : ''}>
                 {t(entry.value.error !== undefined ? '失败' : entry.value.result !== undefined ? '完成' : running ? '执行中' : '未完成')}</small><ChevronDown size={14} /></summary>
             <div className="trace-body"><h4>{t('参数')}</h4><pre>{pretty(entry.value.args)}</pre><h4>{t('结果')}</h4>

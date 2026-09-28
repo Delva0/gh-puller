@@ -7,7 +7,6 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from gh_puller.agents import AGENTS
-from gh_puller.tools.tool_offload import OffloadPolicy
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, RootModel, SecretStr, field_validator
 
 AgentKind = str
@@ -111,13 +110,7 @@ def resolve_settings(kind, settings):
 
 
 def catalog(server: ServerSettings):
-    entries = [agent.configuration.catalog(resources(server)) for agent in AGENTS.values()]
-    for entry in entries:
-        for item in entry["fields"]:
-            if item["tool"] == "tool_results" and item["default"] is None:
-                item["effective_default"] = getattr(OffloadPolicy(), item["key"].removeprefix("tool_result_"))
-                item["description"] = ""
-    return entries
+    return [agent.configuration.catalog(resources(server)) for agent in AGENTS.values()]
 
 
 def validate_capabilities(kind: AgentKind, settings: PublicSettings, server: ServerSettings):

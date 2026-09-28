@@ -21,12 +21,14 @@ class Option:
     value_type: type | None = None
     description: str = ""
     validator: Callable | None = None
+    effective_default: object = None
 
     def schema(self, key, resources):
         kind = self.value_type or type(self.default)
         return {"key": key, "default": self.default,
                 "type": {str: "string", bool: "boolean", int: "integer", float: "number"}.get(kind, "json"),
                 "nullable": self.default is None, "description": self.description,
+                **({"effective_default": self.effective_default} if self.effective_default is not None else {}),
                 "choices": [{"value": value, "reason": self.unavailable(value, resources)}
                             for value in self.choices]}
 

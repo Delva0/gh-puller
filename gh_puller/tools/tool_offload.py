@@ -44,10 +44,24 @@ class OffloadPolicy:
 
 
 TOOL_RESULT_CONFIG = ToolConfig("tool_results", {
-    f"tool_result_{key}": option(None, value_type=type(value),
+    f"tool_result_{key}": option(None, value_type=type(value), internal=True,
                                description=f"Inherit the tool policy when unset ({value}).", validator=positive_integer)
     for key, value in asdict(OffloadPolicy()).items()
 })
+
+
+def tool_result_config(name, policy=None):
+    """Declare retention overrides owned by one registered tool, independent of its call alias.
+
+    Args:
+        name: Registered tool identity used to namespace the public option keys.
+        policy: Tool defaults inherited when an override is unset.
+    """
+    return ToolConfig(name, {
+        f"{name}.tool_result_{key}": option(None, value_type=int, effective_default=value,
+                                          validator=positive_integer)
+        for key, value in asdict(policy or OffloadPolicy()).items()
+    })
 
 
 @dataclass
@@ -203,8 +217,7 @@ class ToolResultStore(ToolProvider):
         self.storage.event("tool/get_tool_result/saved", call_id=tool_call_id, name=name, artifact=artifact,
                        user_query=self.user_query, tool_query=tool_query)
 
-    @tool(description=GET_TOOL_RESULT_DESCRIPTION, parameters=GET_TOOL_RESULT_SCHEMA, returns=BATCH_OUTPUT,
-          configuration=tuple(TOOL_RESULT_CONFIG.defaults))
+    @tool(description=GET_TOOL_RESULT_DESCRIPTION, parameters=GET_TOOL_RESULT_SCHEMA, returns=BATCH_OUTPUT)
     async def get_tool_result(self, call_id: str, tool_call_ids: list[str]) -> ToolOutput:
         """Rehydrate only saved tool attachments; native user images never enter this store."""
         results, images, observations = [], [], []

@@ -24,7 +24,7 @@ from ..tools.tool_offload import OffloadPolicy, ToolOutput, ToolResultStore
 from ..tools.tool_ptc import PTCTool
 from ..tools.tool_web import WebTools
 from .context import ContextMirror, complete_calls
-from .options import model_id, reasoning_effort
+from .options import model_id, reasoning_effort, tool_result_policy
 
 
 class CommonAgent(BaseAgent):
@@ -43,11 +43,12 @@ class CommonAgent(BaseAgent):
     data_boundary = ""
 
     @classmethod
-    def configuration_tools(cls, options):
+    def configuration_tools(cls, options=None):
         """Discover configured tools without opening connections or allocating tool storage.
 
         Args:
-            options: Effective native options, including the selected backend.
+            options: Effective native options, including the selected backend. None
+                discovers the complete tool catalog independently of active options.
         """
         return []
 
@@ -190,7 +191,7 @@ class CommonAgent(BaseAgent):
         for definition in self.tool_definitions:
             name = definition["function"]["name"]
             if (policy := overrides.get(name, offload)) is not None:
-                self.offload_policies[name] = policy
+                self.offload_policies[name] = tool_result_policy(policy, self.options, registry.registered_names[name])
 
     async def initialize_tools(self):
         raise NotImplementedError

@@ -106,7 +106,8 @@ export async function loadSettings(catalog: Catalog): Promise<Preferences | unde
   return { ...emptyPreferences, connection: { base_url: old.base_url },
     model: { model: old.model, reasoning_effort: old.reasoning_effort, thinking: old.thinking },
     tools: Object.fromEntries(catalog.agents.flatMap(agent => agent.fields)
-      .filter(field => field.tool && field.key in old).map(field => [field.key, old[field.key]])) as Preferences['tools'] };
+      .filter(field => field.tool && (field.key in old || field.key.split('.').at(-1)! in old))
+      .map(field => [field.key, old[field.key] ?? old[field.key.split('.').at(-1)!]])) as Preferences['tools'] };
 }
 
 const exportChat = z.object({

@@ -3,6 +3,7 @@ import { createContext, useContext } from 'react';
 export type Language = 'zh' | 'en';
 export const LanguageContext = createContext<Language>('zh');
 const english: Record<string, string> = {
+  '通用': 'General', '界面偏好': 'Interface preferences', '来源': 'Sources', '个来源': 'sources', '关闭来源面板': 'Close sources panel',
   '所需工具': 'Tools used', '个工具': 'tools', '继续会话': 'Continue conversation',
   '重建并继续': 'Rebuild and continue', '本会话不再提示': 'Do not show again for this conversation',
   '将重新构造 Agent，并根据事件流恢复已观测的上下文。当前会话 Agent 内存状态可能丢失': 'The agent will be reconstructed using the observed context from the event stream. Some in-memory agent state may be lost.',

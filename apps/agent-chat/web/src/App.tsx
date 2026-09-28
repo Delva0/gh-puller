@@ -4,6 +4,8 @@ import { ArrowDown, ArrowUp, Check, ChevronDown, CircleAlert, Download, History,
 import { api, ApiError } from './api';
 import { Mark, Modal, TurnView, turnsFrom } from './components';
 import { SettingsPanel } from './SettingsPanel';
+import { SourcePanel } from './Sources';
+import type { SourceSelection } from './sources';
 import { CompactSelect, PasswordInput } from './controls';
 import { LanguageContext, translator } from './i18n';
 import { useModels } from './useModels';
@@ -40,6 +42,7 @@ export default function App() {
   const [removing, setRemoving] = useState<string[]>([]);
   const [search, setSearch] = useState('');
   const [showSettings, setShowSettings] = useState(false);
+  const [sources, setSources] = useState<SourceSelection | null>(null);
   const [rebuild, setRebuild] = useState<{ chatId: string; prompt: string; query?: string; retry: boolean } | null>(null);
   const [rememberRebuild, setRememberRebuild] = useState(false);
   const [draft, setDraft] = useState('');
@@ -64,6 +67,8 @@ export default function App() {
   const capability = catalog?.agents.find(item => item.id === selectedAgent);
   const composerSettings = active?.settings ?? (catalog ? settingsFor(selectedAgent, preferences, catalog) : undefined);
   const turns = useMemo(() => turnsFrom(active?.events ?? []), [active?.events]);
+  const sourceTool = turns.find(turn => turn.id === sources?.turnId)?.tools.find(tool => tool.id === sources?.callId);
+  useEffect(() => setSources(null), [activeId, active?.branch_id]);
   const running = active ? isRunning(active) : false;
   const credentialSource = active?.server_id ?? active?.source_id;
   const configured = new Set([...Object.keys(credentials).filter(key => credentials[key].trim()),
@@ -400,7 +405,7 @@ export default function App() {
   const effort = composerSettings?.thinking ? composerSettings.reasoning_effort : 'off';
   const efforts = [{ value: 'off', label: t('关闭思考') }, ...['low', 'high', 'max'].map(value => ({ value, label: value[0].toUpperCase() + value.slice(1) }))];
   if (effort && !efforts.some(item => item.value === effort)) efforts.push({ value: effort, label: effort });
-  return <LanguageContext.Provider value={preferences.language}><div className={`app ${sidebar ? '' : 'sidebar-hidden'} ${resizing ? 'resizing' : ''}`} style={{ '--sidebar-width': `${preferences.sidebar_width}px` } as CSSProperties}>
+  return <LanguageContext.Provider value={preferences.language}><div className={`app ${sidebar ? '' : 'sidebar-hidden'} ${resizing ? 'resizing' : ''} ${sourceTool ? 'sources-open' : ''}`} style={{ '--sidebar-width': `${preferences.sidebar_width}px` } as CSSProperties}>
     <button className={`sidebar-scrim ${sidebar ? 'open' : ''}`} aria-label={t('关闭侧栏')} aria-hidden={!sidebar}
       tabIndex={sidebar ? 0 : -1} onClick={() => setSidebar(false)} />
     <aside className={`sidebar ${sidebar ? 'open' : ''}`} inert={!sidebar}>
@@ -458,12 +463,13 @@ export default function App() {
       lastScrollTop.current = element.scrollTop;
       setAtBottom(bottom);
     }}><div className="conversation">
-      {!turns.length ? <div className="welcome"><div className="welcome-mark"><Mark /></div><div className="eyebrow">A LITTLE CURIOSITY GOES A LONG WAY</div>
+      {!turns.length ? <div className="welcome"><div className="welcome-mark"><Mark animated /></div><div className="eyebrow">A LITTLE CURIOSITY GOES A LONG WAY</div>
         <h1>{t('今天，想探究什么？')}</h1><p>{t('从一个问题开始，沿着证据找到答案。')}</p>
       </div> : turns.map((turn, index) => {
         const variants = versions(active!, index);
         const selected = variants.findIndex(branch => branch.events.some(event => event.type === 'query/start' && event.query_id === turn.id));
         return <TurnView key={turn.id} turn={turn} interrupted={!running} clock={clock} busy={running || submitting}
+          sources={sources} onSources={setSources}
           onEdit={text => void send(text, turn.id)} onRegenerate={() => void send(turn.prompt, turn.id)}
           version={{ index: selected, count: variants.length }} onVersion={position => {
             update(active!.id, chat => selectBranch(chat, variants[position])); setDraft('');
@@ -498,6 +504,8 @@ export default function App() {
               {submitting ? <LoaderCircle size={19} className="spin" /> : <ArrowUp size={21} />}</button>}</div></div>
       </form><p className="composer-caption"><span>{t('Enter 发送 · Shift + Enter 换行')}</span><span>{t('以来源为依据，保留自己的判断')}</span></p>
     </div></main>
+    {sourceTool && <><button className="source-scrim" aria-label={t('关闭来源面板')} tabIndex={-1} onClick={() => setSources(null)} />
+      <SourcePanel key={`${sources!.turnId}:${sources!.callId}`} tool={sourceTool} onClose={() => setSources(null)} /></>}
     {showSettings && catalog && <SettingsPanel preferences={preferences} credentials={credentials} catalog={catalog}
       configured={configured} discovery={discovery} validation={validation} currentAgent={selectedAgent}
       onDraft={(key, reason) => setConfigDrafts(value => {

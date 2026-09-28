@@ -13,10 +13,11 @@ TOOL_RESULT_OPTIONS = {f"tool_result_{name}": name for name in asdict(OffloadPol
 SEARCH_DEFAULTS = {"ptc": option(False, choices=(False, "A", "B"), requires={"A": ("node",), "B": ("node",)})}
 
 
-def tool_result_policy(policy, options):
-    """Resolve session limits before the agent registers its tools."""
-    return replace(policy, **{field: options[option] for option, field in TOOL_RESULT_OPTIONS.items()
-                             if options.get(option) is not None})
+def tool_result_policy(policy, options, name=""):
+    """Resolve legacy session limits or overrides for one registered tool."""
+    prefix = f"{name}." if name else ""
+    return replace(policy, **{field: options[prefix + key] for key, field in TOOL_RESULT_OPTIONS.items()
+                             if options.get(prefix + key) is not None})
 
 
 def normalize_search(options):

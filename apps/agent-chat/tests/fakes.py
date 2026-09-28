@@ -62,6 +62,8 @@ class FakeFactory:
                 tool, arguments = "web_fetch", {"requests": [{"url": "https://example.org/evidence"}]}
                 if config["agent_options"].get("backend") == "rest":
                     tool, arguments = kind, {"requests": [{"path": "/repos/o/r"}]}
+                    if "interim" in prompt:
+                        arguments = {"requests": [{"path": "/search/repositories", "params": {"q": "evidence"}}]}
                 if config["agent_options"].get("ptc"):
                     tool, arguments = "run_code", {"code": f"return await tools.{tool}({json.dumps(arguments)});"}
                 call = {"tool_calls": [{"index": 0, "id": f"call-{len(self.calls)}", "type": "function",
@@ -70,7 +72,15 @@ class FakeFactory:
                 deltas = [({"reasoning_content": "先核对原始资料。"}, None)]
                 if "secret" in prompt:
                     deltas += [({"reasoning_content": key[:5]}, None), ({"reasoning_content": key[5:]}, None)]
+                if "interim" in prompt:
+                    deltas.append(({"content": "阶段回答一：已找到初步线索。"}, None))
                 deltas.append((call, "tool_calls"))
+            elif "interim" in prompt and sum(message["role"] == "tool" for message in messages[index + 1:]) == 1:
+                deltas = [({"reasoning_content": "继续核对第二处来源。"}, None)] * 60
+                deltas.append(({"content": "阶段回答二：已交叉核对来源。"}, None))
+                deltas.append(({"tool_calls": [{"index": 0, "id": f"call-{len(self.calls)}", "type": "function",
+                    "function": {"name": "web_fetch", "arguments": json.dumps({"requests": [
+                        {"url": "https://example.org/second-evidence"}]})}}]}, "tool_calls"))
             else:
                 answer = ANSWER + ("\n已有上下文。" if index > 1 else "")
                 if "long scroll" in prompt:
@@ -78,6 +88,8 @@ class FakeFactory:
                 if "secret" in prompt:
                     answer += credentials["api_key"]
                 deltas = [({"reasoning_content": "资料已返回，整理可验证的结论。"}, None)]
+                if "interim" in prompt:
+                    deltas *= 60
                 deltas += [({"content": answer[i:i + 25]}, None) for i in range(0, len(answer), 25)]
                 deltas.append(({}, "stop"))
             if "no reasoning" in prompt:
@@ -93,7 +105,14 @@ class FakeFactory:
             if request.url.host == "example.org":
                 return httpx.Response(200, text=f"<html><body><h1>{evidence}</h1></body></html>",
                                       headers={"Content-Type": "text/html"})
-            return httpx.Response(200, json={"id": 1, "name": evidence})
+            if request.url.path == "/search/repositories":
+                return httpx.Response(200, json={"total_count": 35, "items": [
+                    {"id": index, "full_name": f"o/{name}", "html_url": f"https://github.com/o/{name}",
+                     "description": "可核对的仓库说明。保留原始文档、版本信息与相关讨论，便于继续核对。"}
+                    for index, name in enumerate(("r", "research", "references"), 1)
+                ]})
+            return httpx.Response(200, json={"id": 1, "name": evidence, "html_url": "https://github.com/o/r",
+                                            "description": "可核对的仓库说明。"})
 
         connection = {"api_key": credentials["api_key"], "model_transport": httpx.MockTransport(model),
                       "web_transport": httpx.MockTransport(source),

@@ -59,7 +59,7 @@ def validate_configuration(body, manager, owner, checks):
         reports[name] = report
         for key in (*config.owners, *config.credentials):
             fields[key] = report["fields"][key]
-        for item in report["tools"]:
+        for item in report["tool_catalog"]:
             previous = tools.get(item["id"])
             if previous:
                 merged = {**item,
