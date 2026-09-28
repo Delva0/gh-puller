@@ -4,9 +4,9 @@ import base64
 import json
 from dataclasses import asdict, dataclass, field
 
-from ..configuration import ToolConfig, option
-from .common import ToolStorage
+from ..configuration import ToolConfig, option, positive_integer
 from .registry import BATCH_OUTPUT, ToolProvider, tool, tool_definitions
+from .storage import ToolStorage
 
 GET_TOOL_RESULT_DESCRIPTION = (
     "Retrieve the complete saved outputs of earlier tool calls using tool_call_ids from their offload notices. "
@@ -45,7 +45,7 @@ class OffloadPolicy:
 
 TOOL_RESULT_CONFIG = ToolConfig("tool_results", {
     f"tool_result_{key}": option(None, value_type=type(value),
-                               description=f"Inherit the tool policy when unset ({value}).")
+                               description=f"Inherit the tool policy when unset ({value}).", validator=positive_integer)
     for key, value in asdict(OffloadPolicy()).items()
 })
 
@@ -152,7 +152,8 @@ class ToolResultStore(ToolProvider):
                        user_query=self.user_query, tool_query=tool_query)
         self.uses.append(ResultUse(tool_call_id, message, image_message, self.user_query, tool_query))
 
-    @tool(description=GET_TOOL_RESULT_DESCRIPTION, parameters=GET_TOOL_RESULT_SCHEMA, returns=BATCH_OUTPUT)
+    @tool(description=GET_TOOL_RESULT_DESCRIPTION, parameters=GET_TOOL_RESULT_SCHEMA, returns=BATCH_OUTPUT,
+          configuration=tuple(TOOL_RESULT_CONFIG.defaults))
     async def get_tool_result(self, call_id: str, tool_call_ids: list[str]) -> ToolOutput:
         """Rehydrate only saved tool attachments; native user images never enter this store."""
         results, images, observations = [], [], []

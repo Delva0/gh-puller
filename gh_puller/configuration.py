@@ -5,6 +5,8 @@ bindings; tool groups share settings and credential declarations across agents.
 Credentials describe environment names, never secret values.
 """
 
+import math
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 
 
@@ -18,6 +20,7 @@ class Option:
     internal: bool = False
     value_type: type | None = None
     description: str = ""
+    validator: Callable | None = None
 
     def schema(self, key, resources):
         kind = self.value_type or type(self.default)
@@ -42,6 +45,8 @@ class Option:
             if kind in {str, bool, int, float} and not (
                     type(value) is kind or (kind is float and type(value) is int)):
                 raise ValueError(f"{key} must be {kind.__name__}")
+        if self.validator and value is not None:
+            self.validator(value)
 
 
 def option(default, **metadata):
@@ -60,6 +65,27 @@ def option(default, **metadata):
 class Credential:
     env: tuple[str, ...]
     required_when: dict = field(default_factory=dict)
+    validator: Callable | None = None
+    active_when: dict = field(default_factory=dict)
+
+    def validate(self, value, options, checked=None):
+        """Validate presence and a caller-held remote check without issuing network requests.
+
+        Args:
+            value: Memory-only credential value; empty optional credentials allow anonymous access.
+            options: Effective native configuration, used for conditional requirements.
+            checked: Result of this declaration's async validator for this exact value, or None.
+        """
+        active = matches(self.active_when, options)
+        required = bool(self.required_when) and matches(self.required_when, options)
+        if not active or (not value and not required):
+            return {"valid": True, "active": active, "reason": ""}
+        if not value or not value.strip():
+            return {"valid": False, "active": active, "reason": "Required credential"}
+        if self.validator and checked is None:
+            return {"valid": False, "active": active, "pending": True, "reason": "Credential not validated"}
+        return {"valid": checked is None or checked.get("valid", False), "active": active,
+                "reason": checked.get("reason", "") if checked else ""}
 
 
 @dataclass(frozen=True)
@@ -74,3 +100,18 @@ def declarations(values, inherited=None):
     return {key: value if isinstance(value, Option) else
             replace(inherited[key], default=value) if key in inherited else option(value)
             for key, value in values.items()}
+
+
+def matches(conditions, values):
+    return all(values.get(key) in expected if isinstance(expected, (tuple, list)) else values.get(key) == expected
+               for key, expected in conditions.items())
+
+
+def positive_integer(value):
+    if type(value) is not int or value < 1:
+        raise ValueError("Must be a positive integer")
+
+
+def nonnegative_number(value):
+    if type(value) not in {int, float} or not math.isfinite(value) or value < 0:
+        raise ValueError("Must be finite and non-negative")

@@ -21,9 +21,10 @@ from gh_puller.agents import AGENTS
 from pydantic import BaseModel, Field, SecretStr
 
 from .config import AgentKind, PublicSettings, Question, ServerSettings, catalog
-from .models import CredentialCheck, ModelConnection, check_credential, discover
+from .models import CredentialCheck, ModelConnection, discover
 from .portable import HistoryEvent, load_history
 from .runtime import SessionManager, build_agent
+from .validation import ConfigurationCheck, CredentialChecks, validate_configuration
 
 COOKIE = "agent_chat_access"
 LOGIN_TTL = 7 * 24 * 3600
@@ -49,6 +50,7 @@ def create_app(settings: ServerSettings | None = None, *, agent_factory=build_ag
     manager = SessionManager(settings, agent_factory)
     identities = {}
     attempts = defaultdict(deque)
+    credential_checks = CredentialChecks()
 
     @asynccontextmanager
     async def lifespan(app):
@@ -62,6 +64,7 @@ def create_app(settings: ServerSettings | None = None, *, agent_factory=build_ag
                 await cleanup
             await manager.close()
             identities.clear()
+            credential_checks.results.clear()
             set_active_bus(None)
 
     app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
@@ -154,6 +157,7 @@ def create_app(settings: ServerSettings | None = None, *, agent_factory=build_ag
             if session.owner == owner:
                 await manager.delete(session)
         identities.pop(request.cookies.get(COOKIE, ""), None)
+        credential_checks.forget(owner)
         response.delete_cookie(COOKIE, path="/", secure=settings.secure_cookie, httponly=True, samesite="strict")
         return {"authenticated": False}
 
@@ -177,7 +181,11 @@ def create_app(settings: ServerSettings | None = None, *, agent_factory=build_ag
 
     @app.post("/api/credentials/test")
     async def credential_test(body: CredentialCheck, owner: Owner):
-        return await check_credential(body, model_transport)
+        return await credential_checks.test(owner, body.name, body.value.get_secret_value(), model_transport)
+
+    @app.post("/api/configuration/validate")
+    async def configuration_test(body: ConfigurationCheck, owner: Owner):
+        return validate_configuration(body, manager, owner, credential_checks)
 
     @app.post("/api/sessions", status_code=201)
     async def create(body: CreateSession, owner: Owner):

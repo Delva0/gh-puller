@@ -46,10 +46,18 @@ export interface ConfigField {
   choices: { value: ConfigValues[string]; reason: string }[]; tool: string | null;
   effective_default?: ConfigValues[string];
 }
-export interface ToolConfig { id: string; credentials: string[]; credential_requirements: Record<string, ConfigValues> }
+export interface ToolDefinition { id: string; configuration: string[] }
+export interface FieldValidation { valid: boolean; reason: string; active?: boolean; pending?: boolean }
+export interface ValidationState { valid: boolean; issues: Record<string, FieldValidation> }
+export interface ValidationReport {
+  agents: Record<string, ValidationState & { fields: Record<string, FieldValidation> }>;
+  tools: (ToolDefinition & ValidationState)[];
+  fields: Record<string, FieldValidation>;
+}
 export interface Capability {
   id: Agent; name: string; available: boolean; reason: string;
-  defaults: ConfigValues; fields: ConfigField[]; tools: ToolConfig[];
+  defaults: ConfigValues; fields: ConfigField[]; tools: ToolDefinition[];
+  credentials: Record<string, { required_when: ConfigValues; active_when: ConfigValues; testable: boolean }>;
 }
 export interface Catalog {
   agents: Capability[]; defaults: Settings; default_agent: string;

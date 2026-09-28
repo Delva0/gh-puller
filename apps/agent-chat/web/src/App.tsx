@@ -7,7 +7,7 @@ import { SettingsPanel } from './SettingsPanel';
 import { CompactSelect, PasswordInput } from './controls';
 import { LanguageContext, translator } from './i18n';
 import { useModels } from './useModels';
-import { agentAvailability } from './availability';
+import { useValidation } from './useValidation';
 import { availabilityHint } from './ui-model';
 import { fork, selectBranch, versions } from './branches';
 import { deleteChat, exportEvents, download, exportHistory, importHistory, loadHistory, loadSettings, saveChat, saveSettings } from './db';
@@ -33,6 +33,7 @@ export default function App() {
   const [credentials, setCredentials] = useState<Credentials>(emptyCredentials);
   const keysRef = useRef(credentials);
   const [remembered, setRemembered] = useState<Record<string, string[]>>({});
+  const [configDrafts, setConfigDrafts] = useState<Record<string, string>>({});
   const [notice, setNotice] = useState('');
   const [sidebar, setSidebar] = useState(() => window.innerWidth > 760);
   const [resizing, setResizing] = useState(false);
@@ -65,7 +66,8 @@ export default function App() {
   const credentialSource = active?.server_id ?? active?.source_id;
   const configured = new Set([...Object.keys(credentials).filter(key => credentials[key].trim()),
     ...(credentialSource ? remembered[credentialSource] ?? [] : [])]);
-  const available = catalog && capability ? agentAvailability(capability, preferences, catalog, configured) : undefined;
+  const validation = useValidation(catalog, preferences, credentials, credentialSource, authenticated, configDrafts);
+  const available = validation.agent(selectedAgent);
   const discovery = useModels(preferences.connection.base_url ?? catalog?.defaults.base_url ?? '', credentials.api_key ?? '',
     credentialSource && remembered[credentialSource]?.includes('api_key') ? credentialSource : undefined, authenticated);
   useEffect(() => {
@@ -294,7 +296,7 @@ export default function App() {
   function changeAgent(agent: Agent) {
     if (running || !catalog) return;
     const target = catalog.agents.find(item => item.id === agent);
-    if (!target || !agentAvailability(target, preferences, catalog, configured).available) return;
+    if (!target || !validation.agent(agent).available) return;
     const next = { ...preferences, agent };
     changePreferences(next);
     if (active) update(active.id, chat => ({ ...chat, agent, settings: settingsFor(agent, next, catalog) }));
@@ -454,7 +456,7 @@ export default function App() {
         <div className="composer-tools"><CompactSelect label={t('选择 agent')} disabled={running || submitting}
           value={selectedAgent} onChange={changeAgent}
           options={catalog?.agents.map(item => {
-            const status = agentAvailability(item, preferences, catalog, configured);
+            const status = validation.agent(item.id);
             return { value: item.id, label: item.name, disabled: !status.available, reason: availabilityHint(status, preferences.language) };
           }) ?? []} />
           <div className="composer-right"><CompactSelect className="model-select" label={t('模型名')} value={composerSettings?.model ?? ''}
@@ -470,7 +472,10 @@ export default function App() {
       </form><p className="composer-caption"><span>{t('Enter 发送 · Shift + Enter 换行')}</span><span>{t('以来源为依据，保留自己的判断')}</span></p>
     </div></main>
     {showSettings && catalog && <SettingsPanel preferences={preferences} credentials={credentials} catalog={catalog}
-      configured={configured} discovery={discovery} onClose={() => setShowSettings(false)} onChange={changePreferences} />}
+      configured={configured} discovery={discovery} validation={validation}
+      onDraft={(key, reason) => setConfigDrafts(value => {
+        const next = { ...value }; if (reason) next[key] = reason; else delete next[key]; return next;
+      })} onClose={() => { setShowSettings(false); setConfigDrafts({}); }} onChange={changePreferences} />}
     {rename && <Modal title={t('重命名会话')} onClose={() => setRename(null)}><form onSubmit={renameChat}>
       <label>{t('会话标题')}<input autoFocus required maxLength={100} value={renameText} onChange={e => setRenameText(e.target.value)} /></label>
       <footer className="modal-actions"><button type="button" className="secondary" onClick={() => setRename(null)}>{t('取消')}</button><button className="primary" type="submit"><Check size={16} />{t('保存标题')}</button></footer>

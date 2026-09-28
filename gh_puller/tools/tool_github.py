@@ -94,9 +94,15 @@ from .github_api import (
     search_status,
 )
 from .registry import BATCH_OUTPUT, ToolInputError, tool, tool_definitions
-from .utils import select_json
+from .utils import select_json, validate_http_credential
 
-GITHUB_CONFIG = ToolConfig("github", credentials={"github_token": Credential(("GH_TOKEN", "GITHUB_TOKEN"))})
+
+async def validate_github_token(value, *, transport=None):
+    return await validate_http_credential(value, url=API_ORIGIN + "/user", transport=transport)
+
+
+GITHUB_CONFIG = ToolConfig("github", credentials={
+    "github_token": Credential(("GH_TOKEN", "GITHUB_TOKEN"), validator=validate_github_token)})
 
 NATIVE_READ_FIELDS = {
     "result_id": {
@@ -409,7 +415,8 @@ REST_VALIDATOR = Draft202012Validator(REST_SCHEMA["properties"]["requests"]["ite
 class GitHubRESTTool(APIProvider):
     api_type = GitHubAPI
 
-    @tool(description=REST_DESCRIPTION, parameters=REST_SCHEMA, returns=BATCH_OUTPUT, batch_parameter="requests")
+    @tool(description=REST_DESCRIPTION, parameters=REST_SCHEMA, returns=BATCH_OUTPUT, batch_parameter="requests",
+          configuration=tuple(GITHUB_CONFIG.credentials))
     async def github_rest(self, call_id: str, requests: list[dict]) -> dict:
         """Read REST resources with their native methods and pagination."""
 
@@ -681,7 +688,8 @@ GRAPHQL_VALIDATOR = Draft202012Validator(GRAPHQL_SCHEMA["properties"]["requests"
 class GitHubGraphQLTool(APIProvider):
     api_type = GitHubAPI
 
-    @tool(description=GRAPHQL_DESCRIPTION, parameters=GRAPHQL_SCHEMA, returns=BATCH_OUTPUT, batch_parameter="requests")
+    @tool(description=GRAPHQL_DESCRIPTION, parameters=GRAPHQL_SCHEMA, returns=BATCH_OUTPUT, batch_parameter="requests",
+          configuration=tuple(GITHUB_CONFIG.credentials))
     async def github_graphql(self, call_id: str, requests: list[dict]) -> dict:
         """Send a read-only document to POST /graphql, or inspect a saved response."""
 
@@ -912,7 +920,8 @@ class GitHubDSLTool(APIProvider):
         self.api.responses.clear()
         self.begin_query()
 
-    @tool(description=DSL_DESCRIPTION, parameters=DSL_SCHEMA, returns=OUTPUT)
+    @tool(description=DSL_DESCRIPTION, parameters=DSL_SCHEMA, returns=OUTPUT,
+          configuration=tuple(GITHUB_CONFIG.credentials))
     async def github_dsl(self, call_id, query, variables=None, operation_name=None, max_chars=16000, refresh=False):
         """Execute a DSL query; resolvers call GitHub REST and GraphQL APIs as needed."""
         schema = self.adapter.schema()

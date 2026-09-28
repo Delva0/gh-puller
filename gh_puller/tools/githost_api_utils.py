@@ -16,8 +16,8 @@ from functools import cached_property
 import httpx
 from jsonschema import ValidationError
 
-from .common import ToolStorage
 from .registry import ToolInputError, ToolProvider, input_error
+from .storage import ToolStorage
 from .utils import json_pointer, replace_pointer, select_json
 
 

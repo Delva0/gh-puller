@@ -14,11 +14,11 @@ from urllib.parse import urljoin
 import httpx
 from jsonschema import Draft202012Validator
 
-from .common import ToolStorage
 from .githost_api_utils import (
     APIReads,
     ResponseContent,
 )
+from .storage import ToolStorage
 from .utils import retry_delay
 
 

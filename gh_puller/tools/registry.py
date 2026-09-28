@@ -45,6 +45,7 @@ class ToolSpec:
     parameters: dict
     returns: dict
     batch_parameter: str | None = None
+    configuration: tuple[str, ...] = ()
 
     @property
     def definition(self) -> dict:
@@ -54,11 +55,20 @@ class ToolSpec:
 
 
 def tool(*, description: str, parameters: dict, returns: dict | None = None,
-         batch_parameter: str | None = None):
-    """Register metadata without wrapping the implementation or changing its signature."""
+         batch_parameter: str | None = None, configuration: tuple[str, ...] = ()):
+    """Register metadata without wrapping the implementation or changing its signature.
+
+    Args:
+        description: Tool instructions included in the model-facing definition.
+        parameters: JSON Schema for tool inputs, excluding the injected call ID.
+        returns: Output schema used by programmatic tool calling.
+        batch_parameter: Input array whose items consume individual concurrency slots.
+        configuration: Native option and credential keys required by this tool; discovery
+            metadata only, excluded from the model-facing definition.
+    """
     def decorate(function):
         function.tool_spec = ToolSpec(function.__name__, description, parameters, returns or {"type": "object"},
-                                      batch_parameter)
+                                      batch_parameter, configuration)
         return function
 
     return decorate
@@ -110,6 +120,18 @@ def installed_specs(provider, name=None):
 def tool_definitions(*providers) -> list[dict]:
     """Accept providers or (provider, public name) pairs, just like ToolRegistry."""
     return [spec.definition for entry in providers
+            for _, spec in installed_specs(*(entry if isinstance(entry, tuple) else (entry, None)))]
+
+
+def tool_configuration(*providers, shared=()):
+    """Discover real tool names and configuration dependencies without constructing providers.
+
+    Args:
+        providers: Provider classes or instances with the same aliases used by ToolRegistry.
+        shared: Configuration keys applied to all outputs by the enclosing agent.
+    """
+    return [{"id": spec.name, "configuration": list(dict.fromkeys((*spec.configuration, *shared)))}
+            for entry in providers
             for _, spec in installed_specs(*(entry if isinstance(entry, tuple) else (entry, None)))]
 
 

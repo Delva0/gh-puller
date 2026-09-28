@@ -19,7 +19,14 @@ class ResearchAgent(WebAgent):
                                "candidate_count": 20, "follow_links": True}
 
 
+def connection(request):
+    if "invalid-tool-key" in (request.headers.get("Authorization", "").removeprefix("Bearer "),
+                              request.headers.get("X-Subscription-Token", "")):
+        return httpx.Response(401)
+    return httpx.Response(200, json={"data": [
+        {"id": "fixture-model"}, {"id": "provider/very-long-model-name-for-research-2026-09-preview"},
+    ]})
+
+
 app = create_app(ServerSettings(password="test-private-passphrase", secure_cookie=False), agent_factory=FakeFactory(),
-                 model_transport=httpx.MockTransport(lambda request: httpx.Response(200, json={"data": [
-                     {"id": "fixture-model"}, {"id": "provider/very-long-model-name-for-research-2026-09-preview"},
-                 ]})))
+                 model_transport=httpx.MockTransport(connection))

@@ -1,9 +1,11 @@
-"""Independent HTTP header and JSON Pointer helpers."""
+"""Shared HTTP, credential validation, JSON Pointer and exact line-excerpt helpers."""
 
 import math
 import re
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
+
+import httpx
 
 
 def retry_delay(value: str | None, *, default: float) -> float:
@@ -47,3 +49,49 @@ def replace_pointer(value, at, replacement):
     tail = tail.replace("~1", "/").replace("~0", "~")
     parent[int(tail) if isinstance(parent, list) else tail] = replacement
     return value
+
+
+def page_excerpt(document: dict, start_line: int = 1, max_lines: int = 180, find: str = "") -> dict:
+    """Return exact contiguous source lines; pagination and text continuation are independent."""
+    lines = document["text"].splitlines()
+    matches = [i + 1 for i, line in enumerate(lines) if find and find.casefold() in line.casefold()]
+    if matches:
+        start_line = max(1, matches[0] - 8)
+    start = min(start_line - 1, len(lines))
+    selected, chars = [], 0
+    for index in range(start, min(start + max_lines, len(lines))):
+        # Preserve individual source lines, including long Markdown table rows.
+        if selected and chars + len(lines[index]) > 26000:
+            break
+        selected.append(f"L{index + 1}: {lines[index]}")
+        chars += len(lines[index])
+    end = start + len(selected)
+    return {key: value for key, value in document.items() if key != "text"} | {
+        "total_lines": len(lines), "start_line": start + 1, "end_line": end,
+        "next_line": end + 1 if end < len(lines) else None,
+        "headings": [{"line": i + 1, "text": line} for i, line in enumerate(lines) if re.match(r"^#{1,6} ", line)],
+        "find": find, "matches": matches, "content": "\n".join(selected),
+    }
+
+
+async def validate_http_credential(value, *, url, header="Authorization", prefix="Bearer ", transport=None):
+    """Probe an operator-declared provider endpoint using the tools' outbound network policy.
+
+    Args:
+        value: Credential to send in the declared header, never in the URL.
+        url: Fixed provider endpoint declared by the tool module, not supplied by an end user.
+        header: Provider authentication header.
+        prefix: Header value prefix, empty for subscription-token APIs.
+        transport: Optional HTTP transport for callers and tests.
+    """
+    try:
+        async with (
+            httpx.AsyncClient(transport=transport, timeout=15, follow_redirects=False) as client,
+            client.stream("GET", url, headers={"Accept": "application/json", header: prefix + value}) as response,
+        ):
+            if response.status_code in {401, 403}:
+                return {"valid": False, "reason": "API Key 验证失败"}
+            response.raise_for_status()
+            return {"valid": True, "reason": ""}
+    except httpx.HTTPError:
+        return {"valid": False, "reason": "连接测试失败，请检查凭据、额度和网络"}

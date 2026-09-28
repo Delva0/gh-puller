@@ -58,10 +58,49 @@ class AgentConfiguration:
         return {"id": self.agent.name, "name": self.agent.__name__.removesuffix("Agent"),
                 "available": not missing, "reason": "Requires: " + ", ".join(missing) if missing else "",
                 "defaults": self.public_defaults(), "fields": fields,
-                "tools": [{"id": tool.name, "credentials": list(tool.credentials),
-                           "credential_requirements": {key: spec.required_when for key, spec in tool.credentials.items()
-                                                       if spec.required_when}}
-                          for tool in self.agent.tool_configs]}
+                "tools": self.agent.configuration_tools(self.defaults()),
+                "credentials": {key: {"required_when": spec.required_when, "active_when": spec.active_when,
+                                      "testable": spec.validator is not None}
+                                for key, spec in self.credentials.items()}}
+
+    def validate(self, values, credentials, resources, checks=None):
+        """Evaluate configuration and tool readiness using the same declarations as construction.
+
+        Args:
+            values: Native public overrides. No application presentation ranges are imposed.
+            credentials: In-memory secret values, never returned in the report.
+            resources: Operator-owned runtime bindings and capabilities.
+            checks: Exact-value results from credential validators, retained by the calling application.
+        """
+        options = {**self.defaults(), **values}
+        fields = {}
+        for key, spec in self.fields.items():
+            try:
+                if spec.binding:
+                    options[key] = resources.get(spec.binding, spec.default)
+                    if spec.required and not options[key]:
+                        raise ValueError(f"Requires: {spec.binding}")
+                else:
+                    spec.validate(key, options[key], resources)
+                fields[key] = {"valid": True, "reason": ""}
+            except (ValueError, TypeError) as exc:
+                fields[key] = {"valid": False, "reason": str(exc)}
+        for key, spec in self.credentials.items():
+            fields[key] = spec.validate(credentials.get(key, ""), options, (checks or {}).get(key))
+        try:
+            tools = self.agent.configuration_tools(options)
+        except (KeyError, ValueError, TypeError):
+            tools = self.agent.configuration_tools(self.defaults())
+        for tool in tools:
+            failures = {key: fields[key] for key in tool["configuration"] if not fields[key]["valid"]}
+            tool.update(valid=not failures, issues=failures)
+        issues = {key: value for key, value in fields.items() if not value["valid"]}
+        if not issues:
+            try:
+                self.resolve(values, resources)
+            except (ValueError, TypeError) as exc:
+                issues["configuration"] = {"valid": False, "reason": str(exc)}
+        return {"valid": not issues, "issues": issues, "fields": fields, "tools": tools}
 
     def resolve(self, values, resources):
         """Validate public overrides and inject only declared operator resource bindings.

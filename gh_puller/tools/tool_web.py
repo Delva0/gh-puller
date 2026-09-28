@@ -24,10 +24,10 @@ from markdownify import MarkdownConverter
 from PIL import Image
 from pypdf import PdfReader
 
-from ..configuration import Credential, ToolConfig, option
-from .common import ToolStorage, page_excerpt
+from ..configuration import Credential, ToolConfig, nonnegative_number, option, positive_integer
 from .registry import BATCH_OUTPUT, ToolProvider, tool, tool_definitions
-from .utils import retry_delay
+from .storage import ToolStorage
+from .utils import page_excerpt, retry_delay, validate_http_credential
 
 MAX_DOWNLOAD_BYTES = 50 * 1024 * 1024
 MAX_MEMBER_BYTES = 20 * 1024 * 1024
@@ -35,12 +35,21 @@ MAX_ARCHIVE_MEMBERS = 5000
 MAX_IMAGE_PIXELS = 25_000_000
 DEFAULT_SEARCH_INTERVAL = 2.0
 SEARCH_BACKENDS = ("auto", "brave", "duckduckgo")
+BRAVE_SEARCH_URL = "https://api.search.brave.com/res/v1/web/search"
+
+
+async def validate_brave_key(value, *, transport=None):
+    return await validate_http_credential(value, url=BRAVE_SEARCH_URL + "?q=connection+test&count=1",
+                                          header="X-Subscription-Token", prefix="", transport=transport)
+
+
 WEB_CONFIG = ToolConfig("web", {
     "web_search_backend": option("brave", choices=SEARCH_BACKENDS),
-    "web_search_concurrency": 1,
-    "web_search_interval": option(DEFAULT_SEARCH_INTERVAL, description="Search interval in seconds."),
-}, {"brave_api_key": Credential(("BRAVE_SEARCH_API_KEY", "BRAVE_API_KEY"), {"web_search_backend": "brave"})})
-BRAVE_SEARCH_URL = "https://api.search.brave.com/res/v1/web/search"
+    "web_search_concurrency": option(1, validator=positive_integer),
+    "web_search_interval": option(DEFAULT_SEARCH_INTERVAL, description="Search interval in seconds.",
+                                  validator=nonnegative_number),
+}, {"brave_api_key": Credential(("BRAVE_SEARCH_API_KEY", "BRAVE_API_KEY"), {"web_search_backend": "brave"},
+                               validator=validate_brave_key, active_when={"web_search_backend": ("auto", "brave")})})
 
 WEB_SEARCH_SCHEMA = {
     "type": "object", "properties": {
@@ -283,7 +292,7 @@ class WebTools(ToolProvider):
         return {"items": items, "query_info": payload.get("query", {})}
 
     @tool(description=WEB_SEARCH_DESCRIPTION, parameters=WEB_SEARCH_SCHEMA, returns=BATCH_OUTPUT,
-          batch_parameter="queries")
+          batch_parameter="queries", configuration=(*WEB_CONFIG.defaults, *WEB_CONFIG.credentials))
     async def web_search(self, call_id: str, queries: list[dict]) -> dict:
         async def one(query):
             async def action(operation):

@@ -38,6 +38,7 @@ from jsonschema import Draft202012Validator
 
 from ..configuration import Credential, ToolConfig
 from .gitcode_api import (
+    API_ORIGIN,
     BACKEND,
     MAX_LOG_BYTES,
     STEP_LOG_PATH,
@@ -77,9 +78,15 @@ from .githost_dsl import (
     schema_request,
 )
 from .registry import BATCH_OUTPUT, ToolInputError, input_error, tool, tool_definitions
-from .utils import select_json
+from .utils import select_json, validate_http_credential
 
-GITCODE_CONFIG = ToolConfig("gitcode", credentials={"gitcode_token": Credential(("GITCODE_TOKEN",))})
+
+async def validate_gitcode_token(value, *, transport=None):
+    return await validate_http_credential(value, url=API_ORIGIN + "/api/v5/user", transport=transport)
+
+
+GITCODE_CONFIG = ToolConfig("gitcode", credentials={
+    "gitcode_token": Credential(("GITCODE_TOKEN",), validator=validate_gitcode_token)})
 
 API_DESCRIPTION = (
     "Read GitCode with a resource path, ci_logs, or saved result_id; choose one entry per request. "
@@ -409,7 +416,8 @@ REQUEST_VALIDATOR = Draft202012Validator(API_SCHEMA["properties"]["requests"]["i
 class GitCodeTool(APIProvider):
     api_type = GitCodeAPI
 
-    @tool(description=API_DESCRIPTION, parameters=API_SCHEMA, returns=BATCH_OUTPUT, batch_parameter="requests")
+    @tool(description=API_DESCRIPTION, parameters=API_SCHEMA, returns=BATCH_OUTPUT, batch_parameter="requests",
+          configuration=tuple(GITCODE_CONFIG.credentials))
     async def gitcode_api(self, call_id: str, requests: list[dict]) -> dict:
         """Read REST resources with their native methods and pagination."""
 
@@ -563,7 +571,8 @@ class GitCodeDSLTool(APIProvider):
         self.api.responses.clear()
         self.begin_query()
 
-    @tool(description=DSL_DESCRIPTION, parameters=DSL_SCHEMA, returns=OUTPUT)
+    @tool(description=DSL_DESCRIPTION, parameters=DSL_SCHEMA, returns=OUTPUT,
+          configuration=tuple(GITCODE_CONFIG.credentials))
     async def gitcode_dsl(self, call_id, query, variables=None, operation_name=None, max_chars=16000, refresh=False):
         """Execute a DSL query; resolvers call GitCode REST endpoints as needed."""
         schema = self.adapter.schema()

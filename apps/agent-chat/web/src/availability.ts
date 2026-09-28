@@ -1,16 +1,9 @@
-import { settingsFor, type Capability, type Catalog, type ConfigValues, type Preferences, type ToolConfig } from './types';
+import type { ValidationState } from './types';
 
-export interface Availability { available: boolean; missing: string[]; reason?: string }
+export interface Availability { available: boolean; pending: boolean; issues: ValidationState['issues']; reason?: string }
 
-export function toolAvailability(tool: ToolConfig, values: ConfigValues, configured: Set<string>): Availability {
-  const missing = Object.entries(tool.credential_requirements).filter(([key, when]) =>
-    Object.entries(when).every(([name, value]) => JSON.stringify(values[name]) === JSON.stringify(value)) && !configured.has(key),
-  ).map(([key]) => key);
-  return { available: !missing.length, missing };
-}
-
-export function agentAvailability(agent: Capability, preferences: Preferences, catalog: Catalog, configured: Set<string>): Availability {
-  const values = settingsFor(agent.id, preferences, catalog).options;
-  const missing = [...new Set(agent.tools.flatMap(tool => toolAvailability(tool, values, configured).missing))];
-  return { available: agent.available && !missing.length, missing, reason: agent.reason };
+export function availability(report?: ValidationState, drafts: Record<string, string> = {}): Availability {
+  const issues: ValidationState['issues'] = { ...report?.issues, ...Object.fromEntries(Object.entries(drafts).map(([key, reason]) => [key, { valid: false, reason }])) };
+  return { available: Boolean(report?.valid && !Object.keys(issues).length), issues,
+    pending: Object.keys(issues).length ? Object.values(issues).every(issue => issue.pending) : !report };
 }

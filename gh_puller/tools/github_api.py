@@ -13,11 +13,11 @@ from graphql import (
     GraphQLError,
 )
 
-from .common import ToolStorage
 from .githost_api_utils import (
     APIReads,
     ResponseContent,
 )
+from .storage import ToolStorage
 from .utils import retry_delay
 
 

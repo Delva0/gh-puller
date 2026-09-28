@@ -1,5 +1,5 @@
 import type { Catalog, ConfigField, ConfigValues, Preferences } from './types';
-import type { Language } from './i18n';
+import { translator, type Language } from './i18n';
 import type { Availability } from './availability';
 
 // Presentation policy belongs here; availability and actual defaults come from the package catalog.
@@ -36,16 +36,14 @@ export const uiLabel = (key: string, language: Language) => (fields[key]?.label 
 export const fieldDescription = (field: ConfigField, language: Language) => fields[field.key]?.description?.[language === 'zh' ? 0 : 1] ?? field.description;
 export const toolLabel = (key: string, language: Language) => tools[key]?.[language === 'zh' ? 0 : 1] ?? readable(key);
 export function availabilityHint(status: Availability, language: Language) {
-  return [status.reason, status.missing.length ? `${language === 'zh' ? '请配置' : 'Configure'}: ${status.missing.map(key => uiLabel(key, language)).join(', ')}` : '']
-    .filter(Boolean).join(' · ') || (language === 'zh' ? '可用' : 'Available');
+  const t = translator(language);
+  return Object.entries(status.issues).map(([key, issue]) => `${uiLabel(key, language)}: ${t(issue.reason)}`).join(' · ')
+    || t(status.pending ? '正在校验配置' : status.available ? '可用' : '不可用');
 }
 export const fieldValue = (field: ConfigField, value: ConfigValues[string]) => value ?? field.effective_default ?? field.default;
 export function numericPolicy(field: ConfigField) {
   const rule = fields[field.key];
   return { min: rule?.min ?? 0, max: rule?.max ?? 1000000, step: rule?.step ?? (field.type === 'integer' ? 1 : 'any') };
-}
-export function credentialVisible(key: string, values: ConfigValues) {
-  return key !== 'brave_api_key' || values.web_search_backend !== 'duckduckgo';
 }
 export function credentialTestHint(key: string, language: Language) {
   return key === 'brave_api_key' ? (language === 'zh' ? '测试连接（会使用一次搜索请求）' : 'Test connection (uses one search request)') : '';

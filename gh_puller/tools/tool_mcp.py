@@ -19,8 +19,8 @@ from mcp.client.stdio import stdio_client
 from mcp.client.streamable_http import streamable_http_client
 from pydantic import AnyUrl
 
-from .common import ToolStorage
 from .registry import ToolProvider, ToolSpec
+from .storage import ToolStorage
 from .tool_offload import ToolOutput
 
 CALL_ID = ContextVar("mcp_call_id", default=None)

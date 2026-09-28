@@ -3,6 +3,9 @@ import { createContext, useContext } from 'react';
 export type Language = 'zh' | 'en';
 export const LanguageContext = createContext<Language>('zh');
 const english: Record<string, string> = {
+  '共享配置': 'Shared configuration', '全部配置': 'All settings', '使用此配置的工具': 'Tools using this setting',
+  '筛选工具配置': 'Filter settings for tool', '此工具无需浏览器配置': 'This tool has no browser settings',
+  '正在校验配置': 'Validating configuration', '待校验': 'Pending validation',
   '请先输入模型 API Key': 'Enter your model API key first', '请先输入 API Key': 'Enter an API key first',
   '模型 API Key 验证失败': 'Model API key authentication failed', 'API Key 验证失败': 'API key authentication failed',
   '该模型服务未提供 /models 列表接口': 'This provider does not offer a /models endpoint',
@@ -73,6 +76,10 @@ const english: Record<string, string> = {
   '导入文件不能超过 32 MB': 'Import file cannot exceed 32 MB',
 };
 export function translator(language: Language) {
-  return (text: string, fallback?: string) => language === 'en' ? english[text] ?? fallback ?? text : text;
+  const native: Record<string, string> = {
+    'Required credential': '缺少必填密钥', 'Credential not validated': '密钥尚未通过验证',
+    'Must be a positive integer': '必须是正整数', 'Must be finite and non-negative': '必须是有限的非负数',
+  };
+  return (text: string, fallback?: string) => language === 'en' ? english[text] ?? fallback ?? text : native[text] ?? text;
 }
 export function useText() { return translator(useContext(LanguageContext)); }

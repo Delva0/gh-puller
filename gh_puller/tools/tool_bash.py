@@ -14,7 +14,6 @@ from dataclasses import replace
 from pathlib import Path
 from xml.sax.saxutils import escape
 
-from .common import ToolStorage
 from .registry import ToolInputError, ToolProvider, tool, tool_definitions
 from .sandbox_worker import TERMINAL
 from .shell_contract import BASH_SCHEMA as SHELL_BASH_SCHEMA
@@ -27,6 +26,7 @@ from .shell_contract import (
     normalize_arguments,
     shell_settings,
 )
+from .storage import ToolStorage
 from .tool_offload import ToolOutput
 from .tool_read_file import media_output
 

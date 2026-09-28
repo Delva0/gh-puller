@@ -12,7 +12,7 @@ from ..configuration import option
 from ..tools.githost_api_utils import APIProvider
 from ..tools.github_api import BACKEND as GITHUB_BACKEND
 from ..tools.github_api import GitHubUnavailableError
-from ..tools.registry import tool_definitions
+from ..tools.registry import tool_configuration, tool_definitions
 from ..tools.shell_contract import shell_settings
 from ..tools.tool_bash import (
     CONTRACT,
@@ -24,6 +24,7 @@ from ..tools.tool_bash import (
     SandboxBashTool,
 )
 from ..tools.tool_early_answer import INSTRUCTIONS as EARLY_ANSWER_INSTRUCTIONS
+from ..tools.tool_early_answer import EarlyAnswerTool
 from ..tools.tool_fastcode import FastCodeTool
 from ..tools.tool_gitcode import BACKEND as GITCODE_BACKEND
 from ..tools.tool_gitcode import DSL_LANGUAGE as GITCODE_DSL_LANGUAGE
@@ -38,8 +39,9 @@ from ..tools.tool_github import (
     query_schema,
 )
 from ..tools.tool_mcp import MCPTools, load_connection
-from ..tools.tool_offload import TOOL_RESULT_CONFIG, OffloadPolicy
-from ..tools.tool_web import WEB_CONFIG
+from ..tools.tool_offload import TOOL_RESULT_CONFIG, OffloadPolicy, ToolResultStore
+from ..tools.tool_ptc import PTCTool
+from ..tools.tool_web import WEB_CONFIG, WebTools
 from .common import CommonAgent
 from .options import (
     SEARCH_DEFAULTS,
@@ -73,6 +75,16 @@ GITHUB_BACKENDS = ("gh-cli", "rest", "graphql", "dsl", "gh-mcp", "split")
 GITHUB_API_PROVIDERS = {"rest": GitHubRESTTool, "graphql": GitHubGraphQLTool, "dsl": GitHubDSLTool}
 
 
+def search_tool_configuration(options, *providers):
+    result = tool_configuration(*providers, WebTools, ToolResultStore, shared=tuple(TOOL_RESULT_CONFIG.defaults))
+    if options.get("ptc"):
+        result.extend(tool_configuration(PTCTool, shared=tuple(dict.fromkeys(
+            key for item in result for key in item["configuration"]))))
+    if EARLY_ANSWER_ENABLED:
+        result.extend(tool_configuration(EarlyAnswerTool))
+    return result
+
+
 @register
 class GitHubAgent(CommonAgent):
     name = "github"
@@ -85,6 +97,19 @@ class GitHubAgent(CommonAgent):
     tool_configs = (GITHUB_CONFIG, WEB_CONFIG, TOOL_RESULT_CONFIG)
     backends = GITHUB_BACKENDS
     data_boundary = "Live GitHub resources, public web search and HTTP(S) downloads."
+
+    @classmethod
+    def configuration_tools(cls, options):
+        backend = options["backend"]
+        if backend == "gh-cli":
+            result = search_tool_configuration(options, BashTool)
+            result[0]["configuration"].extend(GITHUB_CONFIG.credentials)
+            return result
+        if backend == "gh-mcp":
+            return search_tool_configuration(options)
+        provider = GITHUB_API_PROVIDERS["rest" if backend == "split" else backend]
+        return search_tool_configuration(options, (provider, "github"),
+                                         *((GitHubGraphQLTool, "github_graphql"),) if backend == "split" else ())
 
     @classmethod
     def normalize_options(cls, options):
@@ -219,6 +244,11 @@ class GitCodeAgent(CommonAgent):
     data_boundary = "Live GitCode resources, public web search and HTTP(S) downloads."
 
     @classmethod
+    def configuration_tools(cls, options):
+        provider = GitCodeDSLTool if options["backend"] == "dsl" else GitCodeTool
+        return search_tool_configuration(options, (provider, "gitcode"))
+
+    @classmethod
     def normalize_options(cls, options):
         options = normalize_search(super().normalize_options(options))
         if options["backend"] not in cls.backends:
@@ -261,6 +291,10 @@ class WebAgent(CommonAgent):
     name = "web"
     tool_configs = (WEB_CONFIG,)
     data_boundary = "Public web search and HTTP(S) downloads; no repository tools or prior knowledge store."
+
+    @classmethod
+    def configuration_tools(cls, options):
+        return tool_configuration(WebTools)
 
     @classmethod
     def normalize_options(cls, options):
@@ -319,6 +353,11 @@ class CodeAgent(CommonAgent):
                               "workdir": option("/workspace", binding="workdir")}
     tool_configs = (GITHUB_CONFIG,)
     data_boundary = "The connected persistent container filesystem, its operator-configured network and GitHub REST."
+
+    @classmethod
+    def configuration_tools(cls, options):
+        return [*tool_configuration(DockerBashTools, shared=("container", "workdir")),
+                *tool_configuration((GitHubRESTTool, "github"))]
 
     def __init__(self, config, *args, github_token="", github_transport=None, **kwargs):
         config = {"bash_contract": CONTRACT, **config}

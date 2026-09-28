@@ -25,8 +25,11 @@ def test_added_fields_and_inherited_metadata_need_no_application_schema(monkeypa
     assert fields["follow_links"]["type"] == "boolean"
     assert fields["strategy"]["choices"] == [{"value": value, "reason": ""} for value in ("fast", "deep")]
     assert "max_steps" not in fields
-    web = next(tool for tool in catalog["tools"] if tool["id"] == "web")
-    assert web["credential_requirements"] == {"brave_api_key": {"web_search_backend": "brave"}}
+    tools = {tool["id"]: tool["configuration"] for tool in catalog["tools"]}
+    assert set(tools) == {"web_search", "web_fetch"}
+    assert "brave_api_key" in tools["web_search"] and not tools["web_fetch"]
+    assert catalog["credentials"]["brave_api_key"]["required_when"] == {"web_search_backend": "brave"}
+    assert catalog["credentials"]["brave_api_key"]["testable"]
     assert ResearchAgent.defaults["strategy"] == "fast"
     native = config.resolve({"candidate_count": 100000, "strategy": "deep"}, {})
     subject = ResearchAgent({"model": "arbitrary", "base_url": "https://example.org", **native},
@@ -53,3 +56,41 @@ def test_shared_tools_defaults_and_operator_only_bindings():
         GitHubAgent.configuration.resolve({"mcp_config": "/private/file"}, {})
     with pytest.raises(ValueError, match="brave_api_key"):
         WebAgent.configuration.validate_credentials(WebAgent.defaults, {})
+
+
+@pytest.mark.parametrize("backend", ["rest", "graphql", "dsl", "split"])
+def test_tool_discovery_uses_runtime_aliases_and_shared_configuration(backend):
+    options = {**GitHubAgent.defaults, "backend": backend}
+    tools = {item["id"]: item["configuration"] for item in GitHubAgent.configuration_tools(options)}
+    assert "web" not in tools and "tool_results" not in tools
+    assert "github_token" in tools["github"]
+    assert "tool_result_preview_chars" in tools["github"]
+    assert ("github_graphql" in tools) == (backend == "split")
+    if backend == "split":
+        assert tools["github"] == tools["github_graphql"]
+    ptc = {item["id"]: item["configuration"]
+           for item in GitHubAgent.configuration_tools({**options, "ptc": "A"})}
+    assert {"github_token", "brave_api_key"} <= set(ptc["run_code"])
+
+
+def test_native_validators_control_tools_and_agent_without_network_calls():
+    config = WebAgent.configuration
+    missing = config.validate({}, {}, {})
+    tools = {item["id"]: item for item in missing["tools"]}
+    assert not missing["valid"] and not tools["web_search"]["valid"]
+    assert tools["web_fetch"]["valid"]
+    assert missing["issues"]["brave_api_key"]["reason"] == "Required credential"
+    supplied = {"brave_api_key": "memory-only"}
+    pending = config.validate({}, supplied, {})
+    assert pending["issues"]["brave_api_key"]["pending"]
+    rejected = {"brave_api_key": {"valid": False, "reason": "Rejected by provider"}}
+    assert not config.validate({}, supplied, {}, rejected)["valid"]
+    assert config.validate({}, supplied, {}, {"brave_api_key": {"valid": True}})["valid"]
+    inactive = config.validate({"web_search_backend": "duckduckgo"}, supplied, {}, rejected)
+    assert inactive["valid"] and not inactive["fields"]["brave_api_key"]["active"]
+    assert config.validate({"web_search_backend": "auto"}, {}, {})["valid"]
+    invalid = config.validate({"web_search_backend": "duckduckgo", "web_search_interval": -1}, {}, {})
+    assert set(invalid["issues"]) == {"web_search_interval"}
+    assert not next(item for item in invalid["tools"] if item["id"] == "web_search")["valid"]
+    with pytest.raises(ValueError, match="non-negative"):
+        config.resolve({"web_search_interval": -1}, {})

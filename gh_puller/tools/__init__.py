@@ -1,7 +1,7 @@
 """Tool providers and catalogs; the agent chooses the active providers for each session."""
 
-from .common import ToolStorage
 from .github_api import API_VERSION, BACKEND, GitHubUnavailableError
+from .storage import ToolStorage
 from .tool_bash import BASH_DEFINITIONS, BashTool
 from .tool_gitcode import API_TOOL_DEFINITIONS as GITCODE_TOOL_DEFINITIONS
 from .tool_gitcode import BACKEND as GITCODE_BACKEND

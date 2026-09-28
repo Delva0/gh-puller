@@ -4,9 +4,6 @@ import json
 
 import httpx
 from fastapi import HTTPException
-from gh_puller.tools.gitcode_api import API_ORIGIN as GITCODE_ORIGIN
-from gh_puller.tools.github_api import API_ORIGIN as GITHUB_ORIGIN
-from gh_puller.tools.tool_web import BRAVE_SEARCH_URL
 from pydantic import BaseModel, Field, SecretStr, field_validator
 
 from .config import model_url
@@ -24,33 +21,6 @@ class ModelConnection(BaseModel):
 class CredentialCheck(BaseModel):
     name: str = Field(max_length=100)
     value: SecretStr
-
-
-async def check_credential(connection, transport=None):
-    key = connection.value.get_secret_value()
-    if not key:
-        raise HTTPException(422, "请先输入 API Key")
-    endpoints = {
-        "github_token": (GITHUB_ORIGIN + "/user", {"Authorization": "Bearer " + key}),
-        "gitcode_token": (GITCODE_ORIGIN + "/api/v5/user", {"Authorization": "Bearer " + key}),
-        "brave_api_key": (BRAVE_SEARCH_URL + "?q=connection+test&count=1",
-                          {"Accept": "application/json", "X-Subscription-Token": key}),
-    }
-    if connection.name not in endpoints:
-        raise HTTPException(422, "该凭据尚无连接测试接口")
-    url, headers = endpoints[connection.name]
-    try:
-        # Fixed provider URLs follow the tool clients' proxy policy; model URLs remain DNS-pinned.
-        async with (
-            httpx.AsyncClient(transport=transport, timeout=15, follow_redirects=False) as client,
-            client.stream("GET", url, headers=headers) as response,
-        ):
-            if response.status_code in {401, 403}:
-                raise HTTPException(422, "API Key 验证失败")
-            response.raise_for_status()
-            return {"ok": True}
-    except (httpx.HTTPError, ValueError):
-        raise HTTPException(502, "连接测试失败，请检查凭据、额度和网络") from None
 
 
 async def discover(connection, manager, owner, transport=None):

@@ -80,6 +80,8 @@ class FakeFactory:
                 deltas = [({"reasoning_content": "资料已返回，整理可验证的结论。"}, None)]
                 deltas += [({"content": answer[i:i + 25]}, None) for i in range(0, len(answer), 25)]
                 deltas.append(({}, "stop"))
+            if "no reasoning" in prompt:
+                deltas = [(delta, stop) for delta, stop in deltas if "reasoning_content" not in delta]
             return httpx.Response(200, stream=Packets(deltas))
 
         async def source(request):

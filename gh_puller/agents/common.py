@@ -14,7 +14,7 @@ from jsonschema import ValidationError
 
 from ..agent.adapters.openai import ChatCompletion
 from ..agent.base import BaseAgent, RequestFailedError
-from ..configuration import option
+from ..configuration import option, positive_integer
 from ..tools.registry import ToolInputError, ToolRegistry, input_error
 from ..tools.storage import ToolStorage
 from ..tools.tool_early_answer import EarlyAnswerTool
@@ -31,13 +31,23 @@ class CommonAgent(BaseAgent):
     name = ""
     defaults: ClassVar[dict] = {}
     runtime_defaults: ClassVar[dict] = {
-        "concurrency": option(8, description="Per-agent concurrency budget supplied to each tool provider."),
+        "concurrency": option(8, description="Per-agent concurrency budget supplied to each tool provider.",
+                              validator=positive_integer),
         "max_steps": option(0, internal=True),
     }
     tool_configs: ClassVar[tuple] = ()
     backends: ClassVar[tuple] = ()
     credential_names: ClassVar[dict] = {}
     data_boundary = ""
+
+    @classmethod
+    def configuration_tools(cls, options):
+        """Discover configured tools without opening connections or allocating tool storage.
+
+        Args:
+            options: Effective native options, including the selected backend.
+        """
+        return []
 
     def __init__(self, config: dict, storage: ToolStorage | None = None, *, api_key: str,
                  model_transport: httpx.AsyncBaseTransport | None = None,

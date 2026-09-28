@@ -26,6 +26,7 @@ async function configure(page: Page) {
 }
 async function send(page: Page, prompt: string) {
   await page.getByLabel('输入问题').fill(prompt);
+  await expect(page.getByRole('button', { name: '发送问题', exact: true })).toBeEnabled();
   await page.getByLabel('输入问题').press('Enter');
 }
 async function downloaded(item: Download) {
@@ -170,6 +171,7 @@ test('disconnect leaves the query running, stop works after refresh, expired his
   expect((await (await page.request.get(`/api/sessions/${id}`)).json()).running).toBe(true);
   await page.getByRole('button', { name: '停止生成' }).click();
   await expect(page.locator('.execution > summary')).toContainText('已停止');
+  await expect(page.locator('.turn-notice')).toHaveCount(0);
   await send(page, 'continue after cancel');
   await expect(page.locator('.execution > summary').last()).toContainText('已完成');
   const data = await captureDownload(page, '导出事件');
@@ -477,19 +479,27 @@ test('required tool credentials control agent availability, including retained s
   await page.getByRole('tab', { name: 'Agent', exact: true }).click();
   const agent = page.locator('section').filter({ has: page.getByRole('heading', { name: 'GitHub', exact: true }) });
   await expect(agent.getByRole('img', { name: '不可用', exact: true })).toHaveAttribute('title', /Brave API Key/);
-  await expect(agent.locator('.config-field').first().locator('span')).toHaveAttribute('title', '此 Agent 向各工具提供的并发预算。');
+  await expect(agent.locator('.config-field').first().locator('[title]')).toHaveAttribute('title', '此 Agent 向各工具提供的并发预算。');
   await expect(agent.locator('.config-field small')).toHaveCount(0);
   await page.getByRole('tab', { name: '工具', exact: true }).click();
-  const web = page.locator('section').filter({ has: page.getByRole('heading', { name: 'web', exact: true }) });
-  await expect(page.getByRole('heading', { name: 'github', exact: true })).toBeVisible();
+  const web = page.locator('.tool-node[data-tool=web_search]');
+  await expect(page.locator('.tool-node[data-tool=github]')).toBeVisible();
+  await expect(page.locator('.tool-node[data-tool=web], .tool-node[data-tool=tool_results]')).toHaveCount(0);
   await expect(web.getByRole('img', { name: '不可用', exact: true })).toBeVisible();
+  await expect(page.locator('.tool-node[data-tool=web_fetch]').getByRole('img', { name: '可用', exact: true })).toBeVisible();
   await page.locator('[name=web_search_backend]').selectOption('"auto"');
   await expect(web.getByRole('img', { name: '可用', exact: true })).toBeVisible();
   await page.locator('[name=web_search_backend]').selectOption('"brave"');
+  await page.locator('[name=brave_api_key]').fill('invalid-tool-key');
+  await expect(web.getByRole('img', { name: '待校验', exact: true })).toBeVisible();
+  await page.locator('[name=brave_api_key]').blur();
+  await expect(page.locator('[data-config=brave_api_key]')).toContainText('API Key 验证失败');
+  await expect(web.getByRole('img', { name: '不可用', exact: true })).toBeVisible();
   await page.locator('[name=brave_api_key]').fill('fixture-brave-secret');
-  await expect(web.getByRole('img', { name: '可用', exact: true })).toBeVisible();
+  await expect(web.getByRole('img', { name: '待校验', exact: true })).toBeVisible();
   await page.locator('[name=web_search_backend]').focus();
-  await expect(web).toContainText('连接成功');
+  await expect(page.locator('[data-config=brave_api_key]')).toContainText('连接成功');
+  await expect(web.getByRole('img', { name: '可用', exact: true })).toBeVisible();
   await expect(page.locator('[name=web_search_backend]')).toHaveCSS('outline-style', 'none');
   await page.screenshot({ path: info.outputPath('settings-tool-availability.png'), fullPage: true, animations: 'disabled' });
   await page.getByRole('button', { name: '关闭', exact: true }).click();
@@ -513,6 +523,52 @@ test('required tool credentials control agent availability, including retained s
   await expect(page.getByRole('option', { name: /^Web\b/ })).toBeDisabled();
   await page.keyboard.press('Escape');
   expect(await browserRecords(page)).not.toContain('fixture-brave-secret');
+});
+
+test('shared configuration links real tools without duplicate fields and validates drafts', async ({ page }, info) => {
+  await login(page); await configure(page);
+  await page.getByRole('button', { name: '打开设置' }).click();
+  await page.getByRole('tab', { name: 'Agent', exact: true }).click();
+  await page.locator('[name=backend]').first().selectOption('"split"');
+  await page.getByRole('tab', { name: '工具', exact: true }).click();
+  const github = page.locator('.tool-node[data-tool=github]');
+  await expect(github.getByRole('img', { name: '可用', exact: true })).toBeVisible();
+  await expect(page.locator('.tool-node[data-tool=github_graphql]')).toBeVisible();
+  await expect(page.locator('[name=github_token]')).toHaveCount(1);
+  const shared = page.locator('[data-config=github_token]');
+  await expect(shared.locator('.config-consumers')).toContainText('github');
+  await expect(shared.locator('.config-consumers')).toContainText('github_graphql');
+  await github.click();
+  await expect(page.locator('[name=github_token]')).toBeVisible();
+  await expect(page.locator('[name=web_search_backend]')).toHaveCount(0);
+  await page.screenshot({ path: info.outputPath('shared-tool-config-dark.png'), fullPage: true, animations: 'disabled' });
+  await page.getByRole('button', { name: '全部配置', exact: true }).click();
+  const search = page.locator('.tool-node[data-tool=web_search]');
+  await search.click();
+  await expect(page.locator('[name=github_token]')).toHaveCount(0);
+  await page.locator('[name=web_search_concurrency]').fill('0');
+  await expect(search.getByRole('img', { name: '不可用', exact: true })).toBeVisible();
+  await page.locator('[name=web_search_concurrency]').blur();
+  await expect(page.locator('[name=web_search_concurrency]')).toHaveValue('1');
+  await expect(search.getByRole('img', { name: '可用', exact: true })).toBeVisible();
+  await page.getByRole('button', { name: '全部配置', exact: true }).click();
+  await page.getByRole('button', { name: '关闭', exact: true }).click();
+  await expect(page.getByRole('dialog')).not.toBeVisible();
+  await page.getByRole('button', { name: '切换为浅色主题' }).click();
+  await page.getByRole('button', { name: '打开设置' }).click();
+  await page.getByRole('tab', { name: '工具', exact: true }).click();
+  await page.screenshot({ path: info.outputPath('shared-tool-config-light.png'), fullPage: true, animations: 'disabled' });
+});
+
+test('models without reasoning do not render empty thought cards', async ({ page }) => {
+  await login(page); await configure(page);
+  await send(page, 'no reasoning');
+  await expect(page.locator('.execution > summary')).toContainText('已完成');
+  await page.locator('.execution > summary').click();
+  await expect(page.locator('.trace-count')).toContainText('2 次模型请求 · 1 次工具调用');
+  await expect(page.locator('.trace-item[data-kind=model]')).toHaveCount(0);
+  await expect(page.locator('.trace-item[data-kind=tool]')).toHaveCount(1);
+  await expect(page.locator('.trace')).not.toContainText('模型未返回 reasoning 内容');
 });
 
 test('API keys test once on paste or blur, never while typing', async ({ page }, info) => {

@@ -2,7 +2,7 @@ import { Children, isValidElement, useContext, useEffect, useId, useRef, useStat
 import Markdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import rehypeHighlight from 'rehype-highlight';
-import { Check, ChevronDown, ChevronLeft, ChevronRight, Copy, LoaderCircle, X, CircleAlert, Terminal, Brain, Square, Pencil, RotateCcw } from 'lucide-react';
+import { Check, ChevronDown, ChevronLeft, ChevronRight, Copy, LoaderCircle, X, CircleAlert, Terminal, Brain, Pencil, RotateCcw } from 'lucide-react';
 import { type ChatEvent } from './types';
 import { LanguageContext, useText } from './i18n';
 import { functionDescription, toolLabel } from './ui-model';
@@ -166,10 +166,10 @@ export function TurnView({ turn, interrupted, clock, busy, onEdit, onRegenerate,
         <div className="trace">
           <div className="trace-count">{turn.models.length} {t('次模型请求')} · {turn.tools.length} {t('次工具调用')}
             {turn.tools.some(tool => tool.error !== undefined) && ` · ${turn.tools.filter(tool => tool.error !== undefined).length} ${t('次失败')}`}</div>
-          {turn.trace.map(entry => entry.kind === 'model' ? <details className="trace-item" data-kind="model" key={`model-${entry.value.id}`}>
+          {turn.trace.filter(entry => entry.kind !== 'model' || entry.value.reasoning.trim()).map(entry => entry.kind === 'model' ? <details className="trace-item" data-kind="model" key={`model-${entry.value.id}`}>
             <summary><Brain size={15} /><span className="trace-title">{t('思考')}</span>
               <span className="trace-description">{entry.value.reasoning.trimStart().split(/\r?\n/, 1)[0]}</span><ChevronDown size={14} /></summary>
-            <div className="trace-body"><pre>{entry.value.reasoning || t('模型未返回 reasoning 内容')}</pre>
+            <div className="trace-body"><pre>{entry.value.reasoning}</pre>
               {entry.value.error && <pre className="error-text">{entry.value.error}</pre>}</div>
           </details> : <details className="trace-item" data-kind="tool" key={`tool-${entry.value.id}`}>
             <summary><Terminal size={15} /><span className="trace-title">{toolLabel(entry.value.name, language)}</span>
@@ -183,7 +183,7 @@ export function TurnView({ turn, interrupted, clock, busy, onEdit, onRegenerate,
         </div>
       </details>
       {answer && <MarkdownBody text={answer} />}
-      {turn.end?.error && <div className="turn-notice" role="status">{turn.end.status === 'cancelled' ? <Square size={13} /> : <CircleAlert size={15} />}{t(turn.end.error)}</div>}
+      {turn.end?.error && turn.end.status !== 'cancelled' && <div className="turn-notice" role="status"><CircleAlert size={15} />{t(turn.end.error)}</div>}
       {interrupted && !turn.end && <div className="turn-notice">{t('保留最后收到的输出，可继续提问。')}</div>}
       {!running && <div className="answer-actions">{answer && <CopyButton text={answer} label="复制回答" />}
         <button className="icon-button" aria-label={t('重新生成')} title={t('重新生成')} disabled={busy} onClick={onRegenerate}><RotateCcw size={16} /></button>

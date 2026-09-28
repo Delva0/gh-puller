@@ -1,12 +1,11 @@
 """Validate search-agent runtime options independently of application configuration."""
 
-import math
 from dataclasses import asdict, replace
 
-from ..configuration import option
+from ..configuration import declarations, option
 from ..tools.tool_offload import OffloadPolicy
 from ..tools.tool_ptc import normalize_ptc
-from ..tools.tool_web import SEARCH_BACKENDS
+from ..tools.tool_web import WEB_CONFIG
 
 TOOL_RESULT_OPTIONS = {f"tool_result_{name}": name for name in asdict(OffloadPolicy())}
 
@@ -27,13 +26,8 @@ def normalize_search(options):
 
 
 def normalize_web(options):
-    if options["web_search_backend"] not in SEARCH_BACKENDS:
-        raise ValueError(f"web_search_backend must be one of {', '.join(SEARCH_BACKENDS)}")
-    if options["web_search_concurrency"] < 1:
-        raise ValueError("web_search_concurrency must be positive")
-    interval = options["web_search_interval"]
-    if not math.isfinite(interval) or interval < 0:
-        raise ValueError("web_search_interval must be finite and non-negative")
+    for key, spec in declarations(WEB_CONFIG.defaults).items():
+        spec.validate(key, options[key], {})
     return options
 
 
