@@ -3,6 +3,7 @@ import { agentSchema, artifactsSchema, emptyPreferences, eventSchema, preference
   type Catalog, type Conversation, type Preferences } from './types';
 
 export const historyBlockedMessage = '历史数据库正在等待旧标签页释放。请关闭其他 Agent Chat 标签页后刷新，已有历史会保留。';
+export const historyTimeoutMessage = '浏览器历史读取超时。请关闭其他 Agent Chat 标签页后刷新，已有历史会保留。';
 let connection: Promise<IDBDatabase> | undefined;
 const savedEvents = new Map<string, Conversation['events']>();
 const savedArtifacts = new Map<string, Set<string>>();
@@ -15,13 +16,19 @@ function serialize(id: string, operation: () => Promise<void>) {
 function database() {
   if (!connection) connection = new Promise<IDBDatabase>((resolve, reject) => {
     const request = indexedDB.open('trace-agent-chat', 2);
-    let blocked = false;
+    let abandoned = false;
+    // Opens queued behind another upgrade may never receive a blocked event.
+    const timer = setTimeout(() => {
+      abandoned = true;
+      reject(new Error(historyTimeoutMessage));
+    }, 5000);
     request.onblocked = () => {
-      blocked = true;
+      clearTimeout(timer);
+      abandoned = true;
       reject(new Error(historyBlockedMessage));
     };
     request.onupgradeneeded = () => {
-      if (blocked) { request.transaction!.abort(); return; }
+      if (abandoned) { request.transaction!.abort(); return; }
       const db = request.result;
       if (!db.objectStoreNames.contains('chats')) db.createObjectStore('chats', { keyPath: 'id' });
       if (!db.objectStoreNames.contains('events')) db.createObjectStore('events', { keyPath: ['chat_id', 'seq'] });
@@ -29,15 +36,16 @@ function database() {
       if (!db.objectStoreNames.contains('artifacts')) db.createObjectStore('artifacts', { keyPath: ['chat_id', 'sha256'] });
     };
     request.onsuccess = () => {
+      clearTimeout(timer);
       const db = request.result;
-      if (blocked) { db.close(); connection = undefined; return; }
+      if (abandoned) { db.close(); connection = undefined; return; }
       db.onversionchange = () => { db.close(); connection = undefined; };
       resolve(db);
     };
-    request.onerror = () => { connection = undefined; reject(request.error); };
+    request.onerror = () => { clearTimeout(timer); connection = undefined; reject(request.error); };
   }).catch(error => {
-    // A blocked open cannot be cancelled; retries would queue behind the same lock.
-    if (error.message !== historyBlockedMessage) connection = undefined;
+    // A pending open cannot be cancelled; retries would queue behind the same lock.
+    if (![historyBlockedMessage, historyTimeoutMessage].includes(error.message)) connection = undefined;
     throw error;
   });
   return connection;

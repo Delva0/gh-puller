@@ -4,7 +4,7 @@ test.afterEach(async ({ page }) => {
   await page.request.post('/api/auth/logout', { data: {} });
 });
 
-test('an older tab blocking history upgrades cannot leave login spinning or erase history', async ({ page, context }) => {
+for (const queued of [false, true]) test(`history ${queued ? 'queued behind another upgrade' : 'blocked by an older tab'} cannot leave login spinning or erase history`, async ({ page, context }) => {
   const older = await context.newPage();
   await older.goto('/api/health');
   await older.evaluate(() => new Promise<void>((resolve, reject) => {
@@ -13,7 +13,7 @@ test('an older tab blocking history upgrades cannot leave login spinning or eras
       const db = request.result;
       const chats = db.createObjectStore('chats', { keyPath: 'id' });
       const events = db.createObjectStore('events', { keyPath: ['chat_id', 'seq'] });
-      db.createObjectStore('preferences');
+      db.createObjectStore('preferences').put({ version: 2, connection: {}, model: { model: 'retained-model' }, agents: {}, tools: {} }, 'settings');
       chats.put({ id: 'retained', title: '保留的历史', created: '2026-09-28T00:00:00Z', agent: 'github',
         settings: { base_url: 'https://model.example/v1', model: 'fixture-model', reasoning_effort: 'high',
           thinking: true, max_tokens: 0, options: {} } });
@@ -28,9 +28,15 @@ test('an older tab blocking history upgrades cannot leave login spinning or eras
     };
     request.onerror = () => reject(request.error);
   }));
+  if (queued) await older.evaluate(() => new Promise<void>((resolve, reject) => {
+    const request = indexedDB.open('trace-agent-chat', 2);
+    request.onblocked = () => resolve();
+    request.onerror = () => reject(request.error);
+  }));
   await page.goto('/');
   await expect(page.getByRole('button', { name: '进入工作空间' })).toBeEnabled();
   await expect(page.getByRole('status')).toContainText('请关闭其他 Agent Chat 标签页后刷新');
+  await expect(page.getByRole('status')).toContainText(queued ? '读取超时' : '等待旧标签页释放');
   await page.getByLabel('访问口令').fill('test-private-passphrase');
   await page.getByRole('button', { name: '进入工作空间' }).click();
   await expect(page.getByLabel('输入问题')).toBeVisible();
@@ -42,6 +48,7 @@ test('an older tab blocking history upgrades cannot leave login spinning or eras
   await expect(page.locator('.chat-open')).toContainText('保留的历史');
   await expect(page.locator('.user-message')).toContainText('原来的问题');
   await expect(page.locator('.markdown')).toContainText('原来的回答');
+  await expect(page.getByRole('combobox', { name: '模型名' })).toContainText('retained-model');
   await expect(page.getByText('已有历史会保留', { exact: false })).toHaveCount(0);
 });
 

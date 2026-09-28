@@ -12,7 +12,7 @@ import { useModels } from './useModels';
 import { useValidation } from './useValidation';
 import { availabilityHint } from './ui-model';
 import { fork, selectBranch, versions } from './branches';
-import { deleteChat, exportEvents, download, exportHistory, historyBlockedMessage, importHistory, loadHistory, loadSettings, saveChat, saveSettings } from './db';
+import { deleteChat, exportEvents, download, exportHistory, historyBlockedMessage, historyTimeoutMessage, importHistory, loadHistory, loadSettings, saveChat, saveSettings } from './db';
 import { artifactSchema, emptyCredentials, emptyPreferences, eventSchema, isRunning, publicData, settingsFor,
   type Agent, type Catalog, type ChatEvent, type Conversation, type Credentials, type ModelSettings,
   type Preferences, type SessionView, type Settings } from './types';
@@ -22,7 +22,7 @@ const errorMessage = (error: unknown) => error instanceof Error ? error.message 
 
 export default function App() {
   const [authenticated, setAuthenticated] = useState(false);
-  const [checking, setChecking] = useState(true);
+  const [checking, setChecking] = useState('正在读取浏览器历史');
   const [password, setPassword] = useState('');
   const [loginError, setLoginError] = useState('');
   const [historyError, setHistoryError] = useState('');
@@ -145,15 +145,17 @@ export default function App() {
         commit(history, false);
         setActiveId([...history].sort((a, b) => b.created.localeCompare(a.created))[0]?.id ?? '');
       } catch (error) {
-        if (!disposed) setHistoryError(errorMessage(error) === historyBlockedMessage
-          ? historyBlockedMessage : '浏览器历史暂时无法读取，可以继续聊天并导出记录。');
+        if (!disposed) setHistoryError([historyBlockedMessage, historyTimeoutMessage].includes(errorMessage(error))
+          ? errorMessage(error) : '浏览器历史暂时无法读取，可以继续聊天并导出记录。');
       }
+      if (disposed) return;
+      setChecking('正在连接服务');
       try {
         await api('/auth/me');
         if (!disposed) await connect();
       } catch (error) {
         if (!disposed && (!(error instanceof ApiError) || error.status !== 401)) setLoginError(errorMessage(error));
-      } finally { if (!disposed) setChecking(false); }
+      } finally { if (!disposed) setChecking(''); }
     }
     void initialize();
     return () => { disposed = true; };
@@ -255,10 +257,10 @@ export default function App() {
   }, [draft]);
 
   async function login(event: React.FormEvent) {
-    event.preventDefault(); setChecking(true); setLoginError('');
+    event.preventDefault(); setChecking('正在连接服务'); setLoginError('');
     try { await api('/auth/login', 'POST', { password }); setPassword(''); await connect(); }
     catch (error) { setLoginError(errorMessage(error)); }
-    finally { setChecking(false); }
+    finally { setChecking(''); }
   }
   async function send(prompt = draft, query?: string, retry = false, confirmed = false) {
     let chat = chatsRef.current.find(item => item.id === activeId);
@@ -401,7 +403,7 @@ export default function App() {
     <p className="login-description">{t('你的私人研究空间。连接代码、社区与网络，')}<br />{t('让每一个回答有迹可循。')}</p>
     <form onSubmit={login}><label>{t('访问口令')}<PasswordInput aria-label={t('访问口令')} autoComplete="current-password" required
       value={password} onChange={e => setPassword(e.target.value)} placeholder={t('输入私人访问口令')} /></label>
-      <button className="primary" disabled={checking} type="submit">{checking ? <><LoaderCircle size={17} className="spin" />{t('正在连接服务')}</> : <>{t('进入工作空间')}<ArrowUp size={17} /></>}</button>
+      <button className="primary" disabled={Boolean(checking)} type="submit">{checking ? <><LoaderCircle size={17} className="spin" />{t(checking)}</> : <>{t('进入工作空间')}<ArrowUp size={17} /></>}</button>
     </form>{loginError && <div className="login-error" role="alert"><CircleAlert size={16} />{t(loginError)}</div>}
     {historyError && <div className="turn-notice" role="status"><CircleAlert size={16} />{t(historyError)}</div>}
   </div><span className="login-corner">{t('循迹 / TRACE THE EVIDENCE')}</span></main></LanguageContext.Provider>;
