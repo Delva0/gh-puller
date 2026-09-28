@@ -28,7 +28,7 @@ export function Mark({ small = false, animated = false }: { small?: boolean; ani
       // Keep the silhouette centered while each vertex follows its own closed, irregular path.
       const center = [0, 1].map(axis => drift.slice(0, 4).reduce((sum, point) => sum + point[axis], 0) / 4);
       const points = anchors.map(([x, y], index) => {
-        const scale = index === 4 ? .5 : 1;
+        const scale = index === 4 ? .9 : 1.8;
         return [x + (drift[index][0] - center[0]) * scale, y + (drift[index][1] - center[1]) * scale];
       });
       svg.children[0].setAttribute('d', `M${points.slice(0, 4).map(point => point.join(' ')).join('L')}Z`);
